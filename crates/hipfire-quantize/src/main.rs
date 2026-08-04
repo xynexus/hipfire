@@ -5481,6 +5481,7 @@ fn run_hfq_source_pipeline(
                 let err =
                     hipfire_quantize::mixed_precision::oq4_sensitivity(&f32d, m, k, &im, &s1, &s2);
                 cands.push(TierCandidate {
+                    base_bpw: Some(oq_floor_bpw_for(&t.name)),
                     name: t.name.clone(),
                     numel: m * k,
                     err_oq2: err, // unused at floor=Oq4; the oq2 step never fires
@@ -6371,6 +6372,26 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
 /// The container already supports this: OqPlusCompact stores `N_out` implicitly
 /// in the block length (`130 + 2·N_out`), derived per tensor on read, so a
 /// per-layer budget needs no format change.
+/// Bits-per-weight this tensor actually costs at the oq4 floor.
+///
+/// Plain oq4 is 4.0625 (130 B/256-group). An `oq<BITS>++` base additionally
+/// stores `N_out` W8 overlays per group in a `130 + 2*N_out` byte block, so it
+/// costs `4.0625 + N_out/16` — and `N_out` is per tensor when
+/// `HIPFIRE_OUTLIERS_BY_LAYER` is in play. Returns the plain rate when this is
+/// not an OQ+ run (`OQPLUS_W8_FRAC` unset).
+///
+/// The mixed-precision allocator needs this: charging the plain rate for an
+/// oq4.25++ base understates realized b/w by 0.1875 AND hands that difference
+/// back as budget, promoting more tensors than the target actually allows.
+fn oq_floor_bpw_for(name: &str) -> f64 {
+    let Some(&default_frac) = OQPLUS_W8_FRAC.get() else {
+        return hipfire_quantize::mixed_precision::OQ4_BPW;
+    };
+    let frac = outliers_per_group_for(name, default_frac);
+    let outliers = ((frac * 256.0).round() as usize).clamp(1, 255);
+    4.0625 + outliers as f64 / 16.0
+}
+
 fn outliers_per_group_for(name: &str, default_frac: f32) -> f32 {
     let Some(spec) = hipfire_env::OUTLIERS_BY_LAYER.get() else {
         return default_frac;
@@ -8535,6 +8556,8 @@ fn main() {
                         numel: m * k,
                         err_oq2: oq2_sensitivity(&w, m, k, &imat, &s1, &s2),
                         err_oq4: oq4_sensitivity(&w, m, k, &imat, &s1, &s2),
+                        // Plain-tier sweep: the base carries no W8 overlays.
+                        base_bpw: None,
                     });
                 }
             }
