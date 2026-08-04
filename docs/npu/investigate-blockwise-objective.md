@@ -106,9 +106,15 @@ f32 per tensor, already in a register.
 
 Two gaps to close, both mechanical rather than novel:
 
-1. `down_guided_capture` only wires `mlp.down_proj`. The adjoints for the other
-   five projections are already returned in `BlockAdjoints` and simply not
-   consumed — o_proj's is `d_attn`, which is the one that matters most here.
+1. `down_guided_capture` only wires `mlp.down_proj`, and the reason is worth
+   knowing before touching it: the capture loop calls plain `block_backward`,
+   grabbing down_proj's adjoint from `d_x` *before* the block consumes it,
+   because down_proj's output IS the block output pre-residual. It gets that one
+   for free and never constructs `BlockAdjoints` at all.
+
+   So the change is to switch that loop to `block_backward_capture` — which
+   `model_guided_adjoints` already demonstrates — and consume the other five.
+   o_proj's adjoint is `d_attn`, and it is the one that matters most here.
 2. Nothing emits `gamma` into the `.calib.hfq`. It needs a slot beside
    `<name>.imatrix` / `<name>.hessian`.
 
