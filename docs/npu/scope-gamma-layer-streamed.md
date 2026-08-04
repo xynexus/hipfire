@@ -39,6 +39,38 @@ engine, and it already carries every concept this needs:
 
 None of that has to be invented. What is missing is the reverse walk.
 
+## CORRECTION 2026-08-04 — there are TWO gaps, not one
+
+This document said "the forward half already exists", which is true of the
+CALIBRATION engine in `hipfire-runtime` and misleading about the thing that
+actually has to run. The backward lives in `hipfire-train`, and:
+
+    $ grep -rin "expert|moe|router" crates/hipfire-train/src/
+    (nothing)
+
+**`hipfire-train` has no MoE support whatsoever.** `block.rs` is a dense
+pre-norm LLaMA block: rmsnorm, GQA attention, SwiGLU MLP. No router, no routed
+experts, no top-k dispatch, and therefore no backward for any of it.
+
+So per-expert gamma is not an extension of the streaming work, it is a second
+project of comparable or larger size — implementing MoE forward AND backward in
+the training crate. The per-expert plumbing in `hipfire-runtime`
+(`LayerExpert`, `ExpertCaptureQuota`, `ExpertLayerTelemetry`) exists on the
+FORWARD/capture side and does not supply any of it.
+
+Splitting the work accordingly:
+
+    A. Layer-streamed reverse walk, DENSE.   Removes the f32 depth ceiling.
+                                             Validates against the known 1B
+                                             per-model gamma table.
+    B. MoE block forward + backward.         New. Required for the 35B, and
+                                             independent of A.
+
+A is worth doing on its own: `Llama-3.1-8B-Instruct--bf16.hfq` is ~32 GB in f32,
+which fits but painfully, and A makes depth free. It is also the foundation B
+would plug into, and it can be validated against an answer we already have —
+the streamed walk must reproduce the per-model gamma table on 1B.
+
 ## What has to be built
 
 **A backward that streams layers in reverse.** The forward commits boundary
