@@ -320,12 +320,22 @@ A plain oq4++ base (4.0625, no outliers) fails even at 4.497 b/w with 38 tensors
 promoted — KLD 0.038826. The outlier base is not optional.
 
 `mixed_precision.rs` is now wired behind `--mixed-bpw <target>` (hipfire
-`fbead4163`) and works, but UNDERPERFORMS hand-picking: auto at ~4.72 b/w gives
-KLD 0.030071 against hand-picked v+o's 0.025025 at 4.578 — better KLD for fewer
-bits, by hand. It ranks with `oq4_sensitivity`, which is imatrix-weighted
-RECONSTRUCTION error, and reconstruction error has mispredicted output quality
-repeatedly on this model. Ranking by an output-error measure (the Hessian is
-already loaded for LDLQ) is the fix.
+`fbead4163`) and works, but UNDERPERFORMS hand-picking: auto gives KLD 0.030071
+against hand-picked v+o's 0.025025 at 4.578 — better KLD for fewer bits, by
+hand. It ranks with `oq4_sensitivity`, which is imatrix-weighted RECONSTRUCTION
+error, and reconstruction error has mispredicted output quality repeatedly on
+this model. Ranking by an output-error measure (the Hessian is already loaded
+for LDLQ) is the fix.
+
+**CORRECTION (hipfire `6d8a840fd`): that auto run's b/w was recorded as ~4.72
+and the true figure is ~4.88.** `assign_tiers` charged every unpromoted tensor
+at plain oq4 (4.0625) when the base was oq4.25++ (4.25, the `130 + 2*N_out`
+block). Back out the reported 4.72 and 83.6% of weights were unpromoted, so the
+true cost is `4.25*0.836 + 8.0625*0.164` = 4.877. The same 0.1875 b/w was also
+handed back as spendable budget, so the allocator overspent its target — the run
+was never a 4.72 run in the first place. The conclusion is unchanged and in fact
+stronger: auto spent ~0.30 b/w MORE than hand-picking to land a WORSE KLD, and
+at 4.88 it is close enough to q4nx's 5.0 to be uninteresting.
 
 `mixed_precision.rs` already implements exactly this search — rank dense-linear
 tensors by the output error incurred when DEMOTED, promote greedily under a bit
