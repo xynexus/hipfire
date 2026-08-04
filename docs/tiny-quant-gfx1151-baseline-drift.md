@@ -48,17 +48,52 @@ The higher `qwen3_5_moe` KLD is the truthful number, not a regression.
 
 ## What to do
 
-Re-record the gfx1151 rows (`tiny-quant-gate.sh --record`). Not done here
-because re-recording admission evidence bakes in whatever is currently true —
-if any of these cells is ALSO carrying a real regression, recording hides it
-permanently, and the gate stops being able to tell anyone. The five
-improvements are individually plausible as fix effects, but "plausible" is not
-the standard for a baseline.
+Re-record the gfx1151 rows (`tiny-quant-gate.sh --record`) — EXCEPT the two
+cells below, which should be fixed or dropped rather than recorded. Recording
+a vacuous cell enshrines it: it will pass forever and can never report the
+regression it names.
 
-Worth checking before recording: `minimax mq4` now reads exactly 0.000000,
-down from 0.00104174. A quantized model matching its own reference to the last
-digit is more likely a collapsed or short-circuited eval path than a perfect
-quantizer.
+## Two cells compare an artifact against itself
+
+Both were traced by rebuilding the fixtures and diffing the artifacts. Neither
+is a quantizer defect — both are deliberate policy meeting a gate that assumes
+`--format` decides everything.
+
+### `minimax/kld:mq4` measures nothing
+
+`--format q8f16` and `--format mq4` on the minimax fixture emit the SAME dtype
+histogram: `{F16: 11, Q8_0: 11, MQ4G256: 48, BF16: 1}`. The 48 expert tensors
+are `MQ4G256` in both. `main.rs:9944` says so outright — *"Expert format by
+--format: mq2-lloyd, mq6 (oracle check), else mq4 (MQ4G256, validated
+baseline)"* — so `q8f16` lands in `else` and gets 4-bit experts.
+
+The two artifacts differ in 18,860 bytes, all of it metadata plus lossless
+bf16-recode packing, so they are numerically identical and the KLD is exactly
+0. The "near-full-precision anchor" is not near-full-precision: it carries the
+same 4-bit experts as the candidate.
+
+The 2026-07-22 baseline of 0.00104174 was NOT signal. It predates the recoded
+embed/lm_head fix, when the two runs decoded that tensor differently — the
+nonzero reading came from the bug, and fixing the bug revealed the cell had
+nothing in it.
+
+### `qwen3_5_moe/kld:mq6` duplicates `kld:mq4`
+
+The two artifacts differ by 18 bytes, all inside the metadata string
+(`"quant_format":"mq4"` vs `"mq6"`). Both emit `MQ6G256` for all 59 quantized
+tensors, and the mq4 artifact is LARGER than its own q8f16 anchor
+(5,106,402 B vs 5,008,100 B).
+
+This is K-map promotion working as designed: `main.rs:10171` promotes routed
+experts to MQ6 under `(kmap_promote && use_mq4g256)`. On this fixture every
+G256-eligible tensor is a routed expert, so mq4 and mq6 converge completely.
+The dense `qwen3_5` fixture behaves correctly — mq4 emits `MQ4G256` and mq6
+emits `MQ6G256`, 1.5 MB of differing payload — which is what isolates this to
+the MoE split path.
+
+Identical baselines on BOTH arches (gfx1103 and gfx1151 each record
+0.21510008 for mq4 and mq6) are the fingerprint: it has always been one cell
+wearing two names.
 
 ## Not caused by hipfire-train
 
