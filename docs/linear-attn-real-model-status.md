@@ -291,18 +291,29 @@ reproducible. Comparing last-position logits after `0..63`:
 cos 0.566. The runtime continues the count — 64 after 0..63. This
 implementation's second choice is 63: the CURRENT token.
 
-That is the signature of a model whose layers barely move the residual stream.
-With tied embeddings the logits are `h . E^T`, so if `h` stays close to the
-input embedding the argmax is whatever token was just read. The measured branch
-magnitudes say exactly that: attention 0.0135 and MLP 0.0011 against a residual
-of 0.0206, where the runtime roughly triples the stream in layer 0 alone.
+### Correction: "the branches are four times too weak" was wrong
 
-So the question is now specific: **why are the branches four times too weak?**
-Not "which stage is wrong" but "what makes every stage's output too small". That
-is a different search, and it fits every observation so far — the near-uniform
-loss, the position-indifference of rope (a branch that contributes little cannot
-care about position), and the current-token predictions from both this
-implementation and the broken hidden-state dump.
+That reading came from comparing branch magnitudes against the hidden-state
+dumper's per-layer rms — and that dumper is the component just shown to be
+broken. Reasoning from its numbers was a mistake; measurements taken with only
+trustworthy sources say something different:
+
+| measurement | value |
+|---|---|
+| `cos(final h, embedding of the current token)` | **0.14** |
+| `\|final h\|` vs `\|embedding\|` | 5.37 vs 0.71 |
+| `logit[64]` (the correct next token) — mine / runtime | **+2.78** / +16.15 |
+| `logit[63]` (the current token) — mine / runtime | +9.84 / +13.63 |
+
+The residual stream grows 7.5x through the network and ends up nearly
+orthogonal to the current token's embedding, so the layers are emphatically not
+inert. The real symptom is narrower: **both models rank 63 highly, and only the
+runtime also promotes 64.** This implementation fails to produce the increment,
+not to produce a signal.
+
+Logit magnitudes are comparable (rms 3.11 vs 3.28), so this is a ranking
+failure rather than a scale failure. That rules out a uniform magnitude bug —
+which is what the retracted reading would have sent me looking for.
 
 ## Superseded: the old next-step
 
