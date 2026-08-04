@@ -321,11 +321,11 @@ pub const ENV_HIPFIRE_BENCH_SKIP_PARITY: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/examples/bench_gemv_bf16l3.rs:120",
 };
 
-/// `HIPFIRE_BF16L3_RESIDENT` — Runtime variable controlling bf16l3 resident in hipfire
+/// `HIPFIRE_BF16L3_RESIDENT` — Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding them at load. Set to anything except `0`. Only `Bf16Lut3` can stay resident — Huffman codes are bit-serial and are always expanded. Requires kernels that decode the packed form natively (`gemv_bf16l3`); a gather-read table (a tied embed/lm_head) has no such path and will fail to load. Buys ~1.18x weight bandwidth only once the working set exceeds the GPU's last-level cache, and is a measured slowdown below.
 pub const ENV_HIPFIRE_BF16L3_RESIDENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16L3_RESIDENT",
-    description: "Runtime variable controlling bf16l3 resident in hipfire",
-    source: "crates/hipfire-runtime/src/hfq.rs:895",
+    description: "Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding them at load. Set to anything except `0`. Only `Bf16Lut3` can stay resident — Huffman codes are bit-serial and are always expanded. Requires kernels that decode the packed form natively (`gemv_bf16l3`); a gather-read table (a tied embed/lm_head) has no such path and will fail to load. Buys ~1.18x weight bandwidth only once the working set exceeds the GPU's last-level cache, and is a measured slowdown below.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
@@ -342,11 +342,11 @@ pub const ENV_HIPFIRE_BF16_MOE_M256: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/dispatch/overlays/gfx1151.rs:162",
 };
 
-/// `HIPFIRE_BF16_WEIGHTS` — path for correctness. "HIPFIRE_BF16_WEIGHTS=f32" forces the old
+/// `HIPFIRE_BF16_WEIGHTS` — Set `f32` to force F16 weights to upcast to F32 at load instead of staying native. Native F16 lets `weight_gemm` take the batched `gemm_f16_x_f32_wmma` path; the upcast falls back to a per-token GEMV. Rollback switch for that change.
 pub const ENV_HIPFIRE_BF16_WEIGHTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_WEIGHTS",
-    description: "path for correctness. \"HIPFIRE_BF16_WEIGHTS=f32\" forces the old",
-    source: "crates/hipfire-runtime/src/hfq.rs:2420",
+    description: "Set `f32` to force F16 weights to upcast to F32 at load instead of staying native. Native F16 lets `weight_gemm` take the batched `gemm_f16_x_f32_wmma` path; the upcast falls back to a per-token GEMV. Rollback switch for that change.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_BLOB_FORCE` — Graph / capture / deterministic
@@ -2028,14 +2028,14 @@ pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4086",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4100",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
 pub const ENV_HIPFIRE_GPU_SLAB_MIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_MIB",
     description: "Parses \"HIPFIRE_GPU_SLAB_MIB\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2412",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2426",
 };
 
 /// `HIPFIRE_GPU_TOPK` — HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU
@@ -3016,7 +3016,7 @@ pub const ENV_HIPFIRE_NPU_ATTN_GATE_CONFIGS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_NPU_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NPU_DIR",
     description: "Defaults to target/npu when unset",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:438",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:452",
 };
 
 /// `HIPFIRE_NPU_GEMM_BASIS_COL0` — Parses "HIPFIRE_NPU_GEMM_BASIS_COL0" with fallback defaults
@@ -3866,7 +3866,7 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
     description:
         "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4357",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4371",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values

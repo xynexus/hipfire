@@ -439,6 +439,22 @@ env_vars! {
         "Comma-separated MiniMax layer ranges forced UP to MQ6. Same form and \
          mechanism as `HIPFIRE_MINIMAX_PROMOTE_MQ4`.";
 
+    // ── Lossless BF16 recodings (hipfire-runtime) ───────────────────────────
+    BF16L3_RESIDENT = "HIPFIRE_BF16L3_RESIDENT", Developer,
+        "Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding \
+         them at load. Set to anything except `0`. Only `Bf16Lut3` can stay \
+         resident — Huffman codes are bit-serial and are always expanded. \
+         Requires kernels that decode the packed form natively (`gemv_bf16l3`); \
+         a gather-read table (a tied embed/lm_head) has no such path and will \
+         fail to load. Buys ~1.18x weight bandwidth only once the working set \
+         exceeds the GPU's last-level cache, and is a measured slowdown below.";
+
+    BF16_WEIGHTS = "HIPFIRE_BF16_WEIGHTS", Developer,
+        "Set `f32` to force F16 weights to upcast to F32 at load instead of \
+         staying native. Native F16 lets `weight_gemm` take the batched \
+         `gemm_f16_x_f32_wmma` path; the upcast falls back to a per-token GEMV. \
+         Rollback switch for that change.";
+
     // ── Quantizer: Opus container layout (hipfire-quantize) ─────────────────
     OQ_RAGGED_Q8 = "HIPFIRE_OQ_RAGGED_Q8", Developer,
         "Set (to any value) to emit Opus tensors whose K is not a multiple of \
