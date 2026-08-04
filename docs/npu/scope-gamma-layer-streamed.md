@@ -197,3 +197,55 @@ regression check, then `gradcheck_moe_block` added for the new path.
 
 None of that is derivation; it is wiring against pieces that now exist and are
 tested.
+
+
+## CORRECTION 2026-08-05 — the MoE MLP was not the whole gap
+
+Part B's MLP half is built and gradchecked (hipfire `de033b4fe`, `9839ab130`,
+`d26af85da`). Then it turned out no locally available MoE model matches the
+topology it assumes. Surveying what is actually on this box:
+
+    model                    arch          blocker
+    BLS-Mini-Code-1.0        cohere2-moe   PARALLEL block: input_layernorm only,
+                                           no post_attention_layernorm. Topology
+                                           is x + attn(norm(x)) + mlp(norm(x)),
+                                           not LLaMA's sequential pre-norm.
+    zaya1-8b                 zaya          fused gate_up_proj, AND the router is
+                                           an MLP (fc1/fc2/norm/out_proj plus
+                                           balancing_biases), not a linear.
+    Qwen3.6-35B-A3B          qwen3.6       30 of 40 layers are `linear_attn` —
+                                           DeltaNet/SSM (A_log, conv1d, dt_bias,
+                                           in_proj_{a,b,qkv,z}). Only 10 are
+                                           self_attn. Also: no unquantized source
+                                           exists here, fused gate_up_proj, and a
+                                           shared expert.
+
+**The MoE MLP targets a Mixtral-style topology that none of these use.** The
+math is correct and gradchecked; what is missing is a compatible model.
+
+### What this means for the 35B specifically
+
+`hipfire-train`'s block is GQA softmax attention. The 35B is a HYBRID: three
+quarters of its layers are linear attention. Running gamma on it needs a
+DeltaNet forward AND backward — SSM recurrence, conv1d, gating — which is a
+larger piece of work than the MoE MLP was, and none of it exists in that crate.
+
+So "add MoE to hipfire-train" was never sufficient for this target, and this
+document said it was. The error was scoping from the MLP naming without checking
+the ATTENTION the target uses. A topology survey costs minutes and should come
+before any block-level work, not after.
+
+### Where that leaves things
+
+    done and verified   layer-streamed DENSE gamma (bit-identical to whole-model)
+                        MoE MLP fwd/bwd (gradchecked, no compatible model yet)
+                        MoE block assembly (gradchecked)
+                        loader + dispatch (dense path bit-identical)
+
+    open fork           (1) implement DeltaNet fwd/bwd — unblocks the real target
+                        (2) fetch a Mixtral-style MoE to validate what exists
+                        (3) stop; the dense path already serves 8B-class models
+
+The dense work stands on its own regardless: it removed the f32 depth ceiling and
+is verified bit-identical, and the gamma objective it feeds is what took auto
+mixed precision from losing to hand-picking to matching it.
