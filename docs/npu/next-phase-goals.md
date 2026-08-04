@@ -249,6 +249,40 @@ KLD AT 8.4% FEWER BITS.**
 
 Recipe: `--format oq4.25++ --awq-alpha 0.45 --ldlq --awq`
         `--tensor-format '*v_proj*=oq8++' --tensor-format '*o_proj*=oq8++'`
+        `--embed-precision bf16 --bf16-codec lut3`
+
+**ADD THE LUT3 EMBED CODEC — IT IS 11.9% OF THE ARTIFACT FOR ZERO QUALITY
+COST.** Llama-3.2-1B is TIED: one `model.embed_tokens.weight [128256, 2048]`
+serves both the embedding gather and the output matmul, and it was being stored
+F16 UNCOMPRESSED at 525.3 MB — about 40% of the artifact. It cannot be oq4 (a
+block-packed layout is not valid embedding-lookup storage), but it can be
+losslessly recoded:
+
+    embed table   525.3 MB -> 379.7 MB   1.3834x, 11.57 effective bits
+    artifact     1225034900 -> 1079440309 bytes   -145.6 MB, -11.9%
+    PPL             17.1157 -> 17.1157   unchanged
+    KLD            0.025025 -> 0.025025  unchanged
+
+Bit-identical because the values began life as bf16: bf16 checkpoint -> f16
+`.hfq` -> bf16 embed, and bf16->f16 is EXACT (f16 carries 10 mantissa bits to
+bf16's 7; only exponent range could bite, and weights are small). So the round
+trip recovers the original bits and `lut3` codes them losslessly.
+
+Two bugs blocked this and are fixed in hipfire `4e6166cca`. `tensor_data`
+refuses compressed tensors by design, and the embed loader `.expect(...)`ed on
+it — so a present-but-recoded table reported as **"embed_tokens not found"**.
+That is why an earlier attempt at qt 49/50 this session concluded the format was
+broken and fell back to fp16 export. The serving path had the same misuse
+silently: its `lm_qt` probe read `info.quant_type` through `tensor_data` and got
+None, dropping lm_head from the batched-kernel whitelist with no error.
+
+**The saving is DISK AND TRANSFER ONLY, not resident memory.** LUT3 is expanded
+at load. `HIPFIRE_BF16L3_RESIDENT=1` keeps it packed, but that is built for the
+GEMV path (`gemv_bf16l3`), and a TIED table routes through the embedding gather
+/ f32 loader instead — which has no `Bf16Lut3` branch and panics in
+`load_f16_tensor`. Not worth wiring for a 1B model: the residency note says the
+packed form only pays above the GPU's last-level cache and is a measured
+slowdown below it.
 
 **PER-LAYER TREATMENT IS THE LEVER, VIA PRECISION TIER — not clip policy, not
 outlier allocation.** Both of those were tested and lost (see below). Promoting
