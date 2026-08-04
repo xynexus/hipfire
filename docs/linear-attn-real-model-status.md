@@ -141,6 +141,39 @@ quantization (bf16 and oq8 score within 0.007). What has never been checked
 against anything is the ASSEMBLY around the verified core — norm1, the four
 input projections, out_proj, and the two residual joins.
 
+## A third implementation says the UNDERSTANDING is wrong, not the code
+
+`tools/qwen35_layer0_oracle.py` recomputes layer 0 in numpy straight from the
+bf16 safetensors, following the documented formulas. Comparing all three:
+
+| pair | cosine |
+|---|---|
+| numpy vs the Rust walk | **0.9953** |
+| numpy vs the runtime | 0.4515 |
+| the Rust walk vs the runtime | 0.4609 |
+
+The Rust faithfully implements what I understand the layer to be. What I
+understand it to be is wrong. Those need different fixes, and every hypothesis
+is now a seconds-long numpy edit instead of a rebuild.
+
+Ruled out by this, on top of what was already cleared:
+
+- The gated norm. Five variants tried; the current one (`rmsnorm * w * silu(z)`)
+  is the best by a wide margin — 0.4515 against 0.0254 ungated, 0.1294 with
+  `sigmoid(z)`, 0.3162 with an l2 norm, 0.3564 with a `sqrt(hv)` rescale. That
+  agrees with the kernel cross-check.
+- Position ordering in the reference dump. Checked all 64 rotations and
+  per-row best matches; there is no offset that aligns them, so the two are
+  genuinely different states rather than misaligned ones.
+- The reference's meaning. `decode_layers.rs:949` writes `s.x` into the ring
+  buffer immediately after the "LinearAttention residual" trace point, so it
+  IS the post-layer residual stream, as assumed.
+
+One unexplained observation worth chasing: in this implementation the MLP
+branch contributes almost nothing — rms 0.0011 against the attention branch's
+0.0135 and the residual's 0.0206. A dense SwiGLU MLP contributing 5% of the
+stream is not normal.
+
 ## Two fixes the oracle itself needed
 
 - `dump_qwen35_hidden_states` asked `HiddenStateRingBuffer::new` for all 24
