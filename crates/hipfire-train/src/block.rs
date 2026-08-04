@@ -27,12 +27,29 @@ pub struct BlockDims {
     pub head_dim: usize,
     pub inter: usize,
     pub rope_base: f32,
+    /// Rotary width per head. `0` means the whole head, which is llama's
+    /// behaviour and what every caller wanted before qwen3.5 turned up.
+    ///
+    /// qwen3.5 sets `partial_rotary_factor` 0.25, so only `head_dim/4` of each
+    /// head is rotated and the rest passes through untouched
+    /// (`qwen35/lowered.rs:370`; the config field's own comment reads "only
+    /// 64/256 dims get RoPE"). Rotating the full head instead is silent — the
+    /// shapes are identical and it stays differentiable.
+    pub rotary_dim: usize,
     pub eps: f32,
     pub lora_scale: f32,
     pub lora_rank: usize,
 }
 
 impl BlockDims {
+    /// Rotary width, resolving the `0 = full head` default.
+    pub fn n_rot(&self) -> usize {
+        if self.rotary_dim == 0 {
+            self.head_dim
+        } else {
+            self.rotary_dim.min(self.head_dim)
+        }
+    }
     pub fn q_dim(&self) -> usize {
         self.n_heads * self.head_dim
     }
@@ -154,6 +171,50 @@ pub fn block_forward_attn_only(
     layer_idx: usize,
 ) -> HipResult<(GpuTensor, BlockActivations)> {
     block_forward_inner(gpu, x, w, lora, dims, pos_host, layer_idx, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Rope only the first `n_rot` dims of each head, leaving the rest untouched.
+///
+/// `rope_forward` rotates a whole head, so the rotary slice is gathered into a
+/// compact `[rows, n_rot]` buffer (stride `head_dim` in, `n_rot` out), rotated
+/// there, and scattered back over a copy of the input. The pass-through tail
+/// is why the copy comes first.
+#[allow(clippy::too_many_arguments)]
+fn rope_partial(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    out: &GpuTensor,
+    pos: &GpuTensor,
+    rows: usize,
+    n_heads: usize,
+    head_dim: usize,
+    n_rot: usize,
+    base: f32,
+    backward: bool,
+) -> HipResult<()> {
+    if n_rot == head_dim {
+        return if backward {
+            rope_backward(gpu, x, out, pos, rows, n_heads, head_dim, base)
+        } else {
+            rope_forward(gpu, x, out, pos, rows, n_heads, head_dim, base)
+        };
+    }
+    let n = rows * head_dim;
+    gpu.memcpy_dtod_auto(&out.buf, &x.buf, n * 4)?;
+    let src = gpu.zeros(&[rows * n_rot], DType::F32)?;
+    let dst = gpu.zeros(&[rows * n_rot], DType::F32)?;
+    // (src, src_off, src_stride, dst, dst_off, dst_stride, rows, cols, accum)
+    gpu.strided_copy_2d(x, 0, head_dim, &src, 0, n_rot, rows, n_rot, false)?;
+    if backward {
+        rope_backward(gpu, &src, &dst, pos, rows, n_heads, n_rot, base)?;
+    } else {
+        rope_forward(gpu, &src, &dst, pos, rows, n_heads, n_rot, base)?;
+    }
+    gpu.strided_copy_2d(&dst, 0, n_rot, out, 0, head_dim, rows, n_rot, false)?;
+    gpu.free_tensor(src)?;
+    gpu.free_tensor(dst)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,7 +350,7 @@ fn block_forward_inner(
     // rope(q), rope(k)
     let pos = gpu.upload_f32(pos_host, &[seq])?;
     let q_r = gpu.zeros(&[seq * qd], DType::F32)?;
-    rope_forward(
+    rope_partial(
         gpu,
         &q,
         &q_r,
@@ -297,10 +358,12 @@ fn block_forward_inner(
         seq * dims.n_heads,
         dims.n_heads,
         dims.head_dim,
+        dims.n_rot(),
         dims.rope_base,
+        false,
     )?;
     let k_r = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_forward(
+    rope_partial(
         gpu,
         &k,
         &k_r,
@@ -308,7 +371,9 @@ fn block_forward_inner(
         seq * dims.n_kv,
         dims.n_kv,
         dims.head_dim,
+        dims.n_rot(),
         dims.rope_base,
+        false,
     )?;
 
     // KV-compression sim-noise (KVarN-4bit + CASK merge) on post-RoPE K and V,
@@ -752,7 +817,7 @@ fn block_backward_inner(
     )?;
     // rope backward
     let d_q = gpu.zeros(&[seq * qd], DType::F32)?;
-    rope_backward(
+    rope_partial(
         gpu,
         &d_q_r,
         &d_q,
@@ -760,10 +825,12 @@ fn block_backward_inner(
         seq * dims.n_heads,
         dims.n_heads,
         dims.head_dim,
+        dims.n_rot(),
         dims.rope_base,
+        true,
     )?;
     let d_k = gpu.zeros(&[seq * kvd], DType::F32)?;
-    rope_backward(
+    rope_partial(
         gpu,
         &d_k_r,
         &d_k,
@@ -771,7 +838,9 @@ fn block_backward_inner(
         seq * dims.n_kv,
         dims.n_kv,
         dims.head_dim,
+        dims.n_rot(),
         dims.rope_base,
+        true,
     )?;
 
     // QK-norm backward: rope's input was the NORMED q/k, so its adjoint has to

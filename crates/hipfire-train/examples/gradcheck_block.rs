@@ -51,6 +51,7 @@ fn dims() -> BlockDims {
         head_dim: HD,
         inter: INTER,
         rope_base: 10000.0,
+        rotary_dim: 0,
         eps: 1e-6,
         lora_scale: 1.0,
         lora_rank: R,
@@ -72,9 +73,10 @@ fn loss(
     bv: &GpuTensor,
     g: &[f32],
     pos: &[f32],
+    d_rot: &BlockDims,
 ) -> HipResult<f32> {
     let lora = BlockLora { aq, bq, av, bv };
-    let (x_out, _) = block_forward(gpu, x, w, &lora, &dims(), pos, 0)?;
+    let (x_out, _) = block_forward(gpu, x, w, &lora, d_rot, pos, 0)?;
     let ov = gpu.download_f32(&x_out)?;
     Ok(ov.iter().zip(g).map(|(p, q)| p * q).sum())
 }
@@ -137,7 +139,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run twice: QK-norm sits between wq and rope, so a wrong QK-norm backward
     // shows up in dAq/dBq while dAv/dBv (which never cross it) stay clean.
-    for (label, w) in [("no qk-norm", &w_plain), ("qk-norm", &w_qk)] {
+    // The third pass rotates only half of each head. A partial rope is still a
+    // smooth function of q and k, so nothing but a check like this notices if
+    // the gather/scatter around the rotary slice is wrong.
+    for (label, w, rot) in [
+        ("no qk-norm", &w_plain, 0usize),
+        ("qk-norm", &w_qk, 0),
+        ("qk-norm + partial rope", &w_qk, HD / 2),
+    ] {
+        let d_rot = BlockDims {
+            rotary_dim: rot,
+            ..dims()
+        };
         // Analytic
         let lora = BlockLora {
             aq: &aq,
@@ -145,9 +158,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             av: &av,
             bv: &bv,
         };
-        let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &dims(), &pos, 0)?;
+        let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &d_rot, &pos, 0)?;
         let d_x_out = up(&mut gpu, &gh)?;
-        let (_dx, grads) = block_backward(&mut gpu, &d_x_out, &x, &w, &lora, &acts, &dims())?;
+        let (_dx, grads) = block_backward(&mut gpu, &d_x_out, &x, &w, &lora, &acts, &d_rot)?;
         let daq = gpu.download_f32(&grads.daq)?;
         let dbq = gpu.download_f32(&grads.dbq)?;
         let dav = gpu.download_f32(&grads.dav)?;
@@ -166,20 +179,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let md = gpu.upload_f32(&hm, &[host.len()])?;
                 let (lp, lm) = match which {
                     0 => (
-                        loss(gpu, &x, &w, &pd, &bq, &av, &bv, &gh, &pos)?,
-                        loss(gpu, &x, &w, &md, &bq, &av, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &pd, &bq, &av, &bv, &gh, &pos, &d_rot)?,
+                        loss(gpu, &x, &w, &md, &bq, &av, &bv, &gh, &pos, &d_rot)?,
                     ),
                     1 => (
-                        loss(gpu, &x, &w, &aq, &pd, &av, &bv, &gh, &pos)?,
-                        loss(gpu, &x, &w, &aq, &md, &av, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &pd, &av, &bv, &gh, &pos, &d_rot)?,
+                        loss(gpu, &x, &w, &aq, &md, &av, &bv, &gh, &pos, &d_rot)?,
                     ),
                     2 => (
-                        loss(gpu, &x, &w, &aq, &bq, &pd, &bv, &gh, &pos)?,
-                        loss(gpu, &x, &w, &aq, &bq, &md, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &bq, &pd, &bv, &gh, &pos, &d_rot)?,
+                        loss(gpu, &x, &w, &aq, &bq, &md, &bv, &gh, &pos, &d_rot)?,
                     ),
                     _ => (
-                        loss(gpu, &x, &w, &aq, &bq, &av, &pd, &gh, &pos)?,
-                        loss(gpu, &x, &w, &aq, &bq, &av, &md, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &bq, &av, &pd, &gh, &pos, &d_rot)?,
+                        loss(gpu, &x, &w, &aq, &bq, &av, &md, &gh, &pos, &d_rot)?,
                     ),
                 };
                 e = e.max(((lp - lm) / (2.0 * eps) - ana[i]).abs());

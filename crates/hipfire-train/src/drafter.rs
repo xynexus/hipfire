@@ -161,6 +161,7 @@ impl Drafter {
             head_dim: cfg.head_dim,
             inter: cfg.inter,
             rope_base: cfg.rope_base,
+            rotary_dim: 0,
             eps: cfg.eps,
             lora_scale: 1.0 / 4.0,
             lora_rank: 4,

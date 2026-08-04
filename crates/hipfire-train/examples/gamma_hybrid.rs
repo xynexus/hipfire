@@ -91,6 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         head_dim: cfg.head_dim,
         inter: cfg.intermediate_size,
         rope_base: cfg.rope_theta,
+        // qwen3.5 rotates only part of each head; see BlockDims::rotary_dim.
+        rotary_dim: (cfg.head_dim as f64
+            * raw["rope_parameters"]["partial_rotary_factor"]
+                .as_f64()
+                .unwrap_or(1.0)) as usize,
         eps: cfg.rms_norm_eps,
         lora_scale: 1.0,
         lora_rank: 1,

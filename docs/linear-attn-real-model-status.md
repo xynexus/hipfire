@@ -108,13 +108,24 @@ comparison taken through a forward that is still broken.
 
 ## Still open
 
-- **The attention block defect itself.** Not located. The gate table above says
-  the gate is involved but not that removing it is right.
-- **`partial_rotary_factor` = 0.25 is not honored.** `n_rot = head_dim * 0.25`
-  = 64 of 256 (`qwen35/lowered.rs:370`, and the config field comment says "only
-  64/256 dims get RoPE"). This block rotates all 256. A confirmed discrepancy
-  regardless of how little rope currently moves the loss — worth fixing before
-  further bisection, so the next measurement is not taken through it.
+- **The attention block defect itself.** Not located, and variant-guessing has
+  now failed twice (rope, then the gate table). Stop guessing and use the
+  oracle: `hipfire-runtime/examples/dump_qwen35_hidden_states.rs` dumps
+  per-layer hidden states from the runtime's own forward in a documented binary
+  format. Comparing this walk's per-layer output against it pinpoints the first
+  divergent layer — and, within a layer, whether it diverges before or after
+  the attention block — in one run instead of a variant at a time.
+
+  That rope contributes almost nothing (0.01 nats either way) is itself
+  diagnostic: if attention were working, positional information would matter a
+  great deal. An attention output that is indifferent to position is one whose
+  context is already wrong.
+- ~~`partial_rotary_factor` = 0.25 is not honored.~~ FIXED: `BlockDims::
+  rotary_dim` (0 = full head), gathered/rotated/scattered around the rotary
+  slice, gradchecked, and falsified (a wrong scatter stride shows as dAq 2.6e-1
+  while dAv, which never crosses rope, stays 3e-4). It did NOT move the loss:
+  13.34 -> 13.39. Correct, and not the defect — as the rope-disable measurement
+  had already predicted.
 - **mrope.** `rope_parameters` has `mrope_interleaved: true` and
   `mrope_section: [11, 11, 10]`. Unexamined.
 - **`linear_num_key_heads` vs `linear_num_value_heads`.** Equal (16/16) on the

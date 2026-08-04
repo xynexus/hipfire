@@ -141,6 +141,7 @@ impl LlamaModel {
             head_dim: cfg.head_dim,
             inter: cfg.intermediate_size,
             rope_base: cfg.rope_theta,
+            rotary_dim: 0,
             eps: cfg.rms_norm_eps,
             lora_scale: lora_alpha / r as f32,
             lora_rank: r,
