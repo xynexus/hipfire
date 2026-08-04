@@ -255,10 +255,42 @@ That leaves two things needing explanation rather than one:
    decode path. The runtime ships working Qwen3.5 inference with KLD baselines,
    so the dumper is the more likely culprit than the engine.
 
-Next: validate the runtime independently of the dumper — generate text from this
-artifact through the normal serving path. If generation is coherent, the dumper
-is at fault and a different capture point is needed; if it is not, the artifact
-or its config handling is implicated and that is a much bigger finding.
+**Resolved: the engine is fine, the dumper is not.** Generating from the same
+`qwen3.5-0.8b.oq8++.hfq` through the normal path (`hipfire chat`) produces
+correct, coherent output — "The capital of France is Paris", with a sensible
+reasoning trace, 138 tokens at 68 tok/s. The forward that ships is right.
+
+So `dump_qwen35_hidden_states` is producing bad hidden states: its NLL 6.08 is a
+property of that path, not of the model or the artifact. Three bugs have now
+turned up in that example (the ring-buffer constructor, the stale kldref magic,
+and now the states themselves), which is a fair characterisation of how much it
+had rotted.
+
+That retires the second unexplained thing. The first stands unchanged and on its
+own evidence: this implementation is wrong, with the walk at 13.34 and an
+independent numpy forward at 11.70 against a uniform 12.42 — neither of which
+involves the oracle at all.
+
+Note for anyone running the CLI here: the user config sets `dflash_mode: on`
+globally, and a model without a DFlash sidecar fails to load with
+"dflash_mode=on but no explicit, embedded, or sibling DFLASH component". Run
+with a shadow `HOME` whose `.hipfire/config.json` sets it off rather than
+editing the real config.
+
+## Next: a trustworthy oracle
+
+Per-layer states are what localise a defect, and that source is now known-bad.
+Two options, in order of cost:
+
+1. `dump_logits_qwen35` — if the runtime's LOGITS score a sane NLL on these
+   tokens, that is a valid end-to-end oracle immediately, though it only says
+   "wrong", not "wrong from layer N".
+2. Fix the hidden-state dumper. More work, but per-layer comparison is what
+   actually finds this.
+
+Either way the target is the same: something in the architecture reading is
+wrong in a way three implementations share, and the runtime — which is correct
+— is the only thing that can say what.
 
 ## Two fixes the oracle itself needed
 
