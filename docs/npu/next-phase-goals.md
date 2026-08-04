@@ -766,12 +766,41 @@ Each of these produced a confident wrong result that survived at least one check
     0 input/1 output channels near centroid column 0`, at 8 with `no available
     compute tiles`.
 
-    Read that error against the platform constants above — `shim budget 16 in /
-    16 out, 8 shim tiles x 2 each way, HARD`. The device HAS the channels; the
-    example asks for them all `near centroid column 0`. So the blocker is
-    placement LOCALITY, not device DMA capacity, and a multi-core GEMV is within
-    budget provided it spreads its shim endpoints across columns. That is a
-    smaller problem than "needs a new design".
+    **MEASURED 2026-08-04 with `tools/npu/bench_gemv_multicore.py`**, which is
+    the upstream example with `n_cores` exposed and each core's shim endpoints
+    pinned to its own column via `prod(tile=Tile(col=i))` / `cons(tile=...)`.
+    M=K=2048, int16, weights 8.39 MB streamed per call, result checked against
+    numpy before every timing:
+
+        cores   spread GB/s   no-spread GB/s   gain
+            1          4.41             4.35    +1%
+            2          9.91             6.84   +45%
+            4         13.42            10.33   +30%
+            8         20.00            15.51   +29%
+           16      (verification failed — past the 8 shim tiles)
+
+    **Two corrections to what this note said before.**
+
+    First, spreading is NOT a placement blocker. The claim that multi-core needs
+    spread endpoints to place at all does not reproduce: `--no-spread` places
+    fine at every core count in this harness. Whatever made the upstream example
+    fail at `n_cores=4` was something else in its device-setup path, not shim
+    locality. What spreading actually buys is THROUGHPUT — a consistent 29-45%
+    once there is more than one core, and ~0% at one core, which is the shape
+    you would expect if it is relieving contention rather than enabling
+    placement.
+
+    Second, and the point of the exercise: **8 cores reach 20.0 GB/s, not 54.7.**
+    Scaling is sublinear and flattening (8 cores buys 4.5x over one), and 8 is
+    the practical ceiling — it matches the 8 shim tiles, and 16 does not produce
+    a correct result. So the projection's bandwidth premise is NOT supported at
+    decode shape on this path; it is short by 2.7x.
+
+    Caveat that keeps this from being the final word: this is the stock int16
+    `kernels.mv`, not an `oq4++` tile shape, so it bounds THIS path rather than
+    proving anything about oq4++ directly. But it is the same DMA fabric, and
+    bytes/second is the quantity in question, so a 2.7x gap is not something a
+    format change plausibly closes.
 
     Two further gaps to be aware of before trusting any number from this path:
     `kernels.mv` documents `np.int16` inputs ONLY, so it cannot express the
