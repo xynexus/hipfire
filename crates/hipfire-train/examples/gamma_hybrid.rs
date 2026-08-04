@@ -49,6 +49,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = raw.get("config").cloned().unwrap_or(raw);
     // Qwen3.5-VL wraps the decoder config; the geometry lives in text_config.
     let raw = raw.get("text_config").cloned().unwrap_or(raw);
+    // A pure-MoE config carries no dense `intermediate_size`. LlamaConfig
+    // requires one, and BlockDims.inter is only read on a DENSE mlp path that
+    // such a model never takes, so borrow the MoE width rather than invent a
+    // number — if it is ever actually used, it will be the right order.
+    let mut raw = raw;
+    if raw.get("intermediate_size").is_none() {
+        if let Some(mi) = raw.get("moe_intermediate_size").cloned() {
+            raw["intermediate_size"] = mi;
+        }
+    }
     let cfg = hipfire_train::config::LlamaConfig::from_json_value(&raw)?;
     let n_experts = raw["num_experts"].as_u64().unwrap_or(0) as usize;
     let top_k = raw["num_experts_per_tok"].as_u64().unwrap_or(1) as usize;

@@ -451,11 +451,12 @@ impl WeightSource for DequantHfq<'_> {
                 bytes_to_f32(dt, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?
             }
             3 => hipfire_runtime::quant::dequant_q8f16(bytes.as_ref(), n),
+            34 => hipfire_runtime::quant::dequant_oq4g256(bytes.as_ref(), n),
             35 => hipfire_runtime::quant::dequant_oq8g256(bytes.as_ref(), n),
             other => {
                 return Err(format!(
                     "tensor {name}: quant_type {other} has no host dequantizer here; \
-                     Oq8G256 (35) and Q8F16 (3) are wired, Oq4 (34) is not"
+                     Oq4G256 (34), Oq8G256 (35) and Q8F16 (3) are wired"
                 ))
             }
         };
@@ -683,8 +684,15 @@ pub fn load_moe_layer_fp32<S: WeightSource + ?Sized>(
     let p = format!("{prefix}layers.{layer}.mlp");
     let router = upload_tensor(gpu, src, &format!("{p}.gate.weight"), &[n_experts, h])?;
 
+    // Three layouts in the wild, all seen on real artifacts:
+    //   experts.N.gate_proj + up_proj      per-expert, unfused (BLS, Mixtral)
+    //   experts.N.gate_up_proj  [2*I, H]   per-expert, FUSED   (what
+    //                                      hipfire-quantize emits for MoE)
+    //   experts.gate_up_proj    [E, 2I, H] stacked + fused     (HF export)
     let (experts, inter) = if src.has(&format!("{p}.experts.0.gate_proj.weight")) {
         load_experts_per_tensor(gpu, src, &p, layer, h, n_experts)?
+    } else if src.has(&format!("{p}.experts.0.gate_up_proj.weight")) {
+        load_experts_per_expert_fused(gpu, src, &p, layer, h, n_experts)?
     } else {
         load_experts_stacked(gpu, src, &p, layer, h, n_experts)?
     };
@@ -742,6 +750,52 @@ fn load_experts_per_tensor<S: WeightSource + ?Sized>(
         experts.push((
             upload_tensor(gpu, src, &format!("{ep}.gate_proj.weight"), &[inter, h])?,
             upload_tensor(gpu, src, &format!("{ep}.up_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{ep}.down_proj.weight"), &[h, inter])?,
+        ));
+    }
+    Ok((experts, inter))
+}
+
+/// Per-expert but FUSED: `experts.N.gate_up_proj.weight` is `[2*inter, h]`.
+///
+/// This is what `hipfire-quantize` emits for a routed MoE — it splits the
+/// stacked HF tensor per expert but leaves gate and up fused, deferring the
+/// halving to the runtime. Same `(gate || up)` order as the stacked form
+/// (`qwen35/layout.rs`, and `moe_gate_up_unscatter_k8.hip` reads rows
+/// `0..mi` as gate).
+fn load_experts_per_expert_fused<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
+    let gu0 = src
+        .shape_of(&format!("{p}.experts.0.gate_up_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no experts.0.gate_up_proj"))?;
+    if gu0.len() != 2 || gu0[1] != h || gu0[0] % 2 != 0 {
+        return Err(format!(
+            "layer {layer}: experts.0.gate_up_proj shape {gu0:?} is not [2*inter, {h}]"
+        ));
+    }
+    let inter = gu0[0] / 2;
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let ep = format!("{p}.experts.{e}");
+        let (shape, gu) = src.fetch_f32(&format!("{ep}.gate_up_proj.weight"))?;
+        if shape != vec![2 * inter, h] {
+            return Err(format!(
+                "layer {layer} expert {e}: gate_up shape {shape:?} != [{}, {h}]",
+                2 * inter
+            ));
+        }
+        experts.push((
+            gpu.upload_f32(&gu[..inter * h], &[inter, h])
+                .map_err(|r| format!("upload expert {e} gate: {r}"))?,
+            gpu.upload_f32(&gu[inter * h..], &[inter, h])
+                .map_err(|r| format!("upload expert {e} up: {r}"))?,
             upload_tensor(gpu, src, &format!("{ep}.down_proj.weight"), &[h, inter])?,
         ));
     }
