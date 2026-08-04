@@ -12,7 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::codecs::{dequant_oq2g256, dequant_oq4g256, quantize_oq2g256, quantize_oq4g256};
+use crate::codecs::{
+    dequant_oq2g256, dequant_oq4g256, dequant_oq8g256, quantize_oq2g256, quantize_oq4g256,
+    quantize_oq8g256,
+};
 
 /// On-disk / in-kernel-VRAM bits-per-weight of the three Opus tiers (block
 /// overhead folded in): oq2 = 66 B/256, oq4 = 130 B/256, oq8 = 258 B/256. These
@@ -160,6 +163,38 @@ pub fn oq2_sensitivity(
     debug_assert_eq!(weights_f32.len(), m * k);
     let q = quantize_oq2g256(weights_f32, signs1, signs2);
     let deq = dequant_oq2g256(&q, m * k, signs1, signs2);
+    let mut per_col = vec![0.0f64; k];
+    for row in 0..m {
+        let base = row * k;
+        for c in 0..k {
+            let d = (weights_f32[base + c] - deq[base + c]) as f64;
+            per_col[c] += d * d;
+        }
+    }
+    (0..k)
+        .map(|c| per_col[c] * imatrix_col.get(c).copied().unwrap_or(1.0) as f64)
+        .sum()
+}
+
+/// imatrix-weighted output error at oq8 — the RESIDUAL that promotion cannot
+/// remove.
+///
+/// `assign_tiers` credits an oq4 -> oq8 promotion with the whole of `err_oq4`,
+/// which assumes oq8 is lossless. It is near-lossless (3.5e-4 KLD from bf16) but
+/// not zero, so a tensor whose oq4 error is mostly irreducible gets
+/// over-credited and outranks one whose error would actually go away. The
+/// honest gain is `err_oq4 - err_oq8`.
+pub fn oq8_sensitivity(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    imatrix_col: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> f64 {
+    debug_assert_eq!(weights_f32.len(), m * k);
+    let q = quantize_oq8g256(weights_f32, signs1, signs2);
+    let deq = dequant_oq8g256(&q, m * k, signs1, signs2);
     let mut per_col = vec![0.0f64; k];
     for row in 0..m {
         let base = row * k;

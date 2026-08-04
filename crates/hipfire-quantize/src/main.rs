@@ -5460,6 +5460,8 @@ fn run_hfq_source_pipeline(
             let s1 = gen_fwht_signs(42, 256);
             let s2 = gen_fwht_signs(1042, 256);
             let mut cands: Vec<TierCandidate> = Vec::new();
+            // Parallel to `cands`; only populated under the ranking dump.
+            let mut oq8_residual: Vec<f64> = Vec::new();
             for t in &hfq.tensors {
                 if t.shape.len() != 2 || !should_quantize(&t.name) {
                     continue;
@@ -5482,6 +5484,14 @@ fn run_hfq_source_pipeline(
                 };
                 let err =
                     hipfire_quantize::mixed_precision::oq4_sensitivity(&f32d, m, k, &im, &s1, &s2);
+                // Residual that promotion CANNOT remove. Only computed for the
+                // ranking dump for now — see the note in assign_tiers.
+                let err8 = if hipfire_env::MIXED_BPW_RANK.flag() {
+                    hipfire_quantize::mixed_precision::oq8_sensitivity(&f32d, m, k, &im, &s1, &s2)
+                } else {
+                    0.0
+                };
+                oq8_residual.push(err8);
                 cands.push(TierCandidate {
                     base_bpw: Some(oq_floor_bpw_for(&t.name)),
                     name: t.name.clone(),
@@ -5524,14 +5534,24 @@ fn run_hfq_source_pipeline(
                     ranked.len(),
                     total as f64 / 1e6
                 );
-                eprintln!("{:>4}  {:>12}  {:>12}  {:>9}  {}", "rank", "density", "err_oq4", "numel", "tensor");
+                let res: std::collections::HashMap<&str, f64> = cands
+                    .iter()
+                    .zip(oq8_residual.iter())
+                    .map(|(c, &e8)| (c.name.as_str(), e8))
+                    .collect();
+                eprintln!(
+                    "{:>4}  {:>12}  {:>12}  {:>12}  {:>7}  {}",
+                    "rank", "density", "err_oq4", "err_oq8", "removed", "tensor"
+                );
                 for (i, c) in ranked.iter().enumerate() {
+                    let e8 = res.get(c.name.as_str()).copied().unwrap_or(0.0);
                     eprintln!(
-                        "{:>4}  {:>12.4e}  {:>12.4e}  {:>9}  {}",
+                        "{:>4}  {:>12.4e}  {:>12.4e}  {:>12.4e}  {:>6.2}%  {}",
                         i + 1,
                         c.err_oq4 / c.numel.max(1) as f64,
                         c.err_oq4,
-                        c.numel,
+                        e8,
+                        if c.err_oq4 > 0.0 { 100.0 * (c.err_oq4 - e8) / c.err_oq4 } else { 0.0 },
                         c.name
                     );
                 }
