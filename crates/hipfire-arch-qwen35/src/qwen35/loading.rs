@@ -47,9 +47,23 @@ fn qwen35_tensor_data_vec<'a>(
     None
 }
 
-fn qwen35_tensor_data<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensorInfo, &'a [u8])> {
+/// Borrow a tensor's logical bytes, decoding a lossless BF16 recoding if that is
+/// how it is stored.
+///
+/// Use this — not [`qwen35_tensor_data`] — for `embed_tokens` / `lm_head`.
+/// `--bf16-codec` defaults to `huff` and `is_gather_shaped` steers exactly those
+/// two to LUT3, so they are the tensors MOST likely to be compressed, and the
+/// borrowing accessor returns `None` for them. That `None` was reaching an
+/// `.expect("embed_tokens not found")` (a present tensor reported missing) and,
+/// worse, an `if let Some(..) = .. else { tied }` on `lm_head` — where it
+/// silently selected the tied-embedding path and would have used the embedding
+/// table as an untied model's output weights.
+fn qwen35_tensor_data_cow<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
     for candidate in qwen35_tensor_name_candidates(name) {
-        if let Some(found) = hfq.tensor_data(&candidate) {
+        if let Some(found) = hfq.tensor_data_cow(&candidate) {
             return Some(found);
         }
     }
@@ -5431,7 +5445,9 @@ fn load_token_embd_into(
             config.mrope_interleaved, config.mrope_section
         );
     }
-    let embd_info = qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+    let embd_info =
+        qwen35_tensor_data_cow(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+    let embd_info = (embd_info.0, embd_info.1.as_ref());
     Ok(if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
@@ -5469,7 +5485,8 @@ fn load_output_into(
     // GemmaRMSNorm `+= 1.0` bake applies uniformly for dense and MoE.
     let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
-    let lm_head_info = qwen35_tensor_data(hfq, "lm_head.weight");
+    let lm_head_owned = qwen35_tensor_data_cow(hfq, "lm_head.weight");
+    let lm_head_info = lm_head_owned.as_ref().map(|(i, d)| (*i, d.as_ref()));
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!(
             "  loading output (separate lm_head, qt={})...",
@@ -5484,7 +5501,8 @@ fn load_output_into(
         )?
     } else {
         let embd_info =
-            qwen35_tensor_data(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+            qwen35_tensor_data_cow(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+        let embd_info = (embd_info.0, embd_info.1.as_ref());
         eprintln!(
             "  loading output (tied embeddings, qt={})...",
             embd_info.0.quant_type
