@@ -56,6 +56,52 @@ impl QuantType {
     }
 }
 
+/// The type a stored payload should be held as *in memory* when weights are
+/// kept compressed in VRAM, or `None` when it must be expanded.
+///
+/// Only [`QuantType::Bf16Lut3`] is GPU-decodable: its planes are fixed-size and
+/// indexable, so `gemv_bf16l3` reads them in place. Huffman is bit-serial and
+/// cannot be, but it compresses better on disk (1.50x vs 1.38x on Qwen3-1.7B),
+/// so the useful combination is Huffman on disk and LUT3 resident — which is
+/// what [`transcode_resident`] produces.
+pub const fn resident_type(stored: QuantType) -> Option<QuantType> {
+    match stored {
+        QuantType::Bf16Lut3 => Some(QuantType::Bf16Lut3),
+        QuantType::Bf16Huff => Some(QuantType::Bf16Lut3),
+        _ => None,
+    }
+}
+
+/// Recode a stored payload into its [`resident_type`] form.
+///
+/// `Bf16Lut3` is already resident-shaped and is returned borrowed — no work, no
+/// copy. `Bf16Huff` is decoded and re-encoded as LUT3, which is the only case
+/// that costs anything: a bit-serial decode (parallelised over the format's
+/// chunk table) plus a LUT3 encode.
+///
+/// Both codings are exactly lossless, so the round trip reproduces every input
+/// `u16` bit-for-bit — including zeros, denormals, infinities and NaN payloads.
+/// The result is therefore the same bytes `gemv_bf16l3` would have read had the
+/// artifact been written as LUT3 in the first place.
+///
+/// `None` means the payload is corrupt or truncated, or that `stored` has no
+/// resident form — check [`resident_type`] first to tell those apart.
+pub fn transcode_resident(
+    stored: QuantType,
+    raw: &[u8],
+    n_elems: usize,
+    threads: usize,
+) -> Option<Cow<'_, [u8]>> {
+    match stored {
+        QuantType::Bf16Lut3 => Some(Cow::Borrowed(raw)),
+        QuantType::Bf16Huff => {
+            let bf16 = hipfire_primitives::bf16_huff::decode_par(raw, n_elems, threads)?;
+            Some(Cow::Owned(hipfire_primitives::bf16_lut3::encode(&bf16)))
+        }
+        _ => None,
+    }
+}
+
 /// Expand a stored payload to its logical bytes.
 ///
 /// Returns the input borrowed for every ordinary type, and owned decoded bytes
@@ -83,6 +129,85 @@ pub fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Weights with a realistic exponent spread — a flat run would give LUT3
+    /// zero escapes and hide the escape-plane handling.
+    fn sample_bf16(n: usize) -> Vec<u8> {
+        (0..n as u32)
+            .flat_map(|i| {
+                // Vary the exponent over ~12 values so some blocks exceed the
+                // 7-entry LUT and take the escape path.
+                let exp = 0x3c00u16 + (((i % 12) as u16) << 7);
+                (exp | (i as u16 & 0x7f)).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// Huffman on disk must transcode to exactly the LUT3 bytes a LUT3-authored
+    /// artifact would have had. If this drifts, a resident Huffman tensor and a
+    /// resident LUT3 tensor of the same weights would decode differently in the
+    /// kernel.
+    #[test]
+    fn huff_transcodes_to_the_same_lut3_bytes_as_direct_encoding() {
+        let src = sample_bf16(4096);
+        let n = src.len() / 2;
+        let huff = hipfire_primitives::bf16_huff::encode(&src);
+        let direct = hipfire_primitives::bf16_lut3::encode(&src);
+
+        let via_huff = transcode_resident(QuantType::Bf16Huff, &huff, n, 4)
+            .expect("huffman must have a resident form");
+        assert_eq!(
+            via_huff.as_ref(),
+            direct.as_slice(),
+            "huff->lut3 must equal direct lut3 encoding"
+        );
+        // And the whole path is lossless back to the original weights.
+        assert_eq!(
+            hipfire_primitives::bf16_lut3::decode(&via_huff, n).unwrap(),
+            src
+        );
+    }
+
+    #[test]
+    fn lut3_is_already_resident_and_is_not_copied() {
+        let src = sample_bf16(2048);
+        let n = src.len() / 2;
+        let lut3 = hipfire_primitives::bf16_lut3::encode(&src);
+        let out = transcode_resident(QuantType::Bf16Lut3, &lut3, n, 4).unwrap();
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "an already-resident coding must not be re-encoded"
+        );
+    }
+
+    /// `resident_type` and `transcode_resident` must agree, or a caller that
+    /// checks the first and calls the second gets a surprise `None`.
+    #[test]
+    fn resident_type_agrees_with_transcode() {
+        let src = sample_bf16(512);
+        let n = src.len() / 2;
+        for code in 0u8..=255 {
+            let Some(qt) = QuantType::from_code(code) else {
+                continue;
+            };
+            let packed = match qt {
+                QuantType::Bf16Lut3 => hipfire_primitives::bf16_lut3::encode(&src),
+                QuantType::Bf16Huff => hipfire_primitives::bf16_huff::encode(&src),
+                _ => continue,
+            };
+            let claimed = resident_type(qt).is_some();
+            let actual = transcode_resident(qt, &packed, n, 2).is_some();
+            assert_eq!(claimed, actual, "{qt:?}: resident_type disagrees");
+            // Whatever it claims, it must claim a GPU-decodable target.
+            if let Some(t) = resident_type(qt) {
+                assert_eq!(
+                    t,
+                    QuantType::Bf16Lut3,
+                    "{qt:?}: resident target must be GPU-decodable"
+                );
+            }
+        }
+    }
 
     /// Every stored byte that maps to a different logical type must round-trip
     /// through `expand`. This is the guard that makes a new recoding impossible
