@@ -2010,6 +2010,13 @@ pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-quantize/src/main.rs:13319",
 };
 
+/// `HIPFIRE_GPU_CHOLESKY` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GPU_CHOLESKY",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-quantize/src/ldlq.rs:309",
+};
+
 /// `HIPFIRE_GPU_SLAB_LOAD` — Runtime variable controlling gpu slab load in hipfire
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
@@ -5510,6 +5517,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_GFX942_MFMA_PREFILL,
     ENV_HIPFIRE_GFX942_RMSNORM_SPLIT,
     ENV_HIPFIRE_GPTQ_DAMPING,
+    ENV_HIPFIRE_GPU_CHOLESKY,
     ENV_HIPFIRE_GPU_SLAB_LOAD,
     ENV_HIPFIRE_GPU_SLAB_MIB,
     ENV_HIPFIRE_GPU_TOPK,
