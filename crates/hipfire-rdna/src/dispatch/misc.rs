@@ -1196,4 +1196,71 @@ impl Gpu {
         }
         result
     }
+
+    /// Expand a `BF16H` (Huffman-coded exponent) payload to plain BF16 on device.
+    ///
+    /// `packed` holds the whole payload as produced by
+    /// `hipfire_primitives::bf16_huff::encode`; `out` receives `n` little-endian
+    /// BF16 values, so it must be at least `2 * n` bytes.
+    ///
+    /// Parallelism is one thread per format chunk (`bf16_huff::CHUNK` = 8192
+    /// elements), which is what the chunk table exists to enable — a chunk's
+    /// codes start at a known bit offset and its mantissa bytes are directly
+    /// indexed. Decode WITHIN a chunk is serial because the code is
+    /// variable-length; that is inherent to the format, not a kernel choice.
+    ///
+    /// This materialises BF16 in VRAM. It is not the `gemv_bf16l3` trick of
+    /// decoding in registers to save weight bandwidth — Huffman cannot support
+    /// that. Use it to skip the host round-trip at load.
+    pub fn bf16_huff_decode(
+        &mut self,
+        packed: &GpuTensor,
+        out: &GpuTensor,
+        n_chunks: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "bf16_huff_decode",
+            kernels::BF16_HUFF_DECODE_SRC,
+            "bf16_huff_decode",
+        )?;
+        let func = &self.functions["bf16_huff_decode"];
+        let pp = packed.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nn = n as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        // Cap concurrent decoders rather than launching one per chunk.
+        //
+        // Every live thread is an independent bit cursor walking its own region
+        // of the bitstream, so thread count IS working-set size. Measured on
+        // gfx1151: one-chunk-per-thread ran 0.3 ns/element while the stream fit
+        // the last-level cache and 6.9 ns/element once it did not — 20x worse
+        // than linear. Capping the grid keeps the aggregate window resident and
+        // gives each thread a contiguous run of chunks instead.
+        //
+        // Sweep at 262M elements (the Llama-3.2-1B tied embed):
+        //   cap    256    512   1024   2048   4096   8192  16384  32768(uncapped)
+        //   s     0.315  0.156  0.097  0.099  0.340  1.153  1.600  1.805
+        // An 18x spread from thread count alone, with a broad optimum at
+        // 1024-2048. Too few threads leaves the machine idle; too many and the
+        // independent bit cursors stop fitting the last-level cache.
+        const MAX_DECODERS: usize = 1024;
+        let threads = n_chunks.min(MAX_DECODERS).max(1);
+        let n_wgs = threads.div_ceil(64).max(1) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_wgs, 1, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
 }

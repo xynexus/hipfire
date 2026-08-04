@@ -243,8 +243,7 @@ pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qti
 /// the state->value map differs (3INST, excess kurtosis -0.111, vs 1MAD's
 /// -0.312). A distinct kernel because the codebook is part of the wire format:
 /// decoding one with the other silently yields noise.
-pub const GEMV_QTIP3G256I3_SRC: &str =
-    include_str!("../../../kernels/src/gemv_qtip3g256i3.hip");
+pub const GEMV_QTIP3G256I3_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256i3.hip");
 /// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
 /// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
 pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
@@ -4354,6 +4353,14 @@ pub const LMHEAD_COARSE_COMPACT_SRC: &str =
     include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
 pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
+
+/// Expand a BF16H (Huffman-coded exponent) payload to plain BF16 on device.
+///
+/// Unlike [`GEMV_BF16L3_SRC`] this does NOT decode inside a GEMV — a
+/// variable-length code has no random access, so the tensor is materialised as
+/// BF16 in VRAM. What it removes is the host round-trip and host-side decode at
+/// load, not weight bandwidth.
+pub const BF16_HUFF_DECODE_SRC: &str = include_str!("../../../kernels/src/bf16_huff_decode.hip");
 pub const GEMV_BF16_VEC8_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_vec8.hip");
 pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
 pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
