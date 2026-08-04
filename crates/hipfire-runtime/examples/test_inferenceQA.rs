@@ -384,7 +384,7 @@ fn classify_qwen35_candidate(hfq: &HfqFile) -> Result<String, CaseOutcome> {
         .unwrap_or("unknown");
 
     let qwen35_layout = hfq
-        .tensor_data("model.language_model.embed_tokens.weight")
+        .find_tensor_info("model.language_model.embed_tokens.weight")
         .is_some();
     if model_type.starts_with("qwen3_5") || model_type == "qwen3.5" || qwen35_layout {
         Ok(model_type.to_string())

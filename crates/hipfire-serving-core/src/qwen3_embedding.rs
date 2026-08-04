@@ -370,12 +370,15 @@ fn select_last_real_tokens(
     Ok(selected)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BlobEntry<'a> {
     role: u16,
     layer: u32,
     info: &'a HfqTensorInfo,
-    data: &'a [u8],
+    /// `Cow`, not `&[u8]`: a losslessly recoded (LUT3/Huffman) tensor has to be
+    /// decoded into an owned buffer, and the entry outlives the read. Borrowed
+    /// for every ordinary tensor, so this costs nothing in the common case.
+    data: std::borrow::Cow<'a, [u8]>,
 }
 
 fn build_qwen3_encoder_weight_blob(hfq: &HfqFile, config: &LlamaConfig) -> Result<Vec<u8>, String> {
@@ -427,8 +430,11 @@ fn push_entry<'a>(
     name: &str,
     matrix: bool,
 ) -> Result<(), String> {
+    // `tensor_data_cow`: a losslessly recoded BF16 tensor is stored compressed and
+    // the borrowing accessor returns None for it, which would report a present
+    // tensor as "missing".
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_cow(name)
         .ok_or_else(|| format!("Qwen3 embedding encoder tensor {name} is missing"))?;
     if matrix && !matches!(info.quant_type, 35 | 43) {
         return Err(format!(
@@ -497,16 +503,22 @@ fn encode_blob(config: &LlamaConfig, entries: &[BlobEntry<'_>]) -> Result<Vec<u8
         put_u32(&mut blob, descriptor + 24, entry.info.group_size);
         put_u64(&mut blob, descriptor + 32, payload_offset as u64);
         put_u64(&mut blob, descriptor + 40, entry.data.len() as u64);
-        blob[payload_offset..payload_offset + entry.data.len()].copy_from_slice(entry.data);
+        blob[payload_offset..payload_offset + entry.data.len()]
+            .copy_from_slice(entry.data.as_ref());
         payload_offset += entry.data.len().div_ceil(64) * 64;
     }
     Ok(blob)
 }
 
 fn load_token_embeddings_bf16(hfq: &HfqFile, config: &LlamaConfig) -> Result<Vec<u16>, String> {
+    // The embed table is BF16 here by construction, and `--bf16-codec` defaults to
+    // `huff` with gather-shaped tensors steered to LUT3 — so this table is stored
+    // compressed in any recent artifact and MUST be read through the decoding
+    // accessor. `tensor_data` would return None and report it as absent.
     let (info, data) = hfq
-        .tensor_data("model.embed_tokens.weight")
+        .tensor_data_cow("model.embed_tokens.weight")
         .ok_or_else(|| "Qwen3 embedding artifact has no model.embed_tokens.weight".to_string())?;
+    let data = data.as_ref();
     if info.shape != [config.vocab_size as u32, config.dim as u32] {
         return Err(format!(
             "Qwen3 embedding table shape {:?} does not match [{}, {}]",

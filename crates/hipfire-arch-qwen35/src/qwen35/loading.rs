@@ -1318,14 +1318,17 @@ fn load_weight_tensor(
         let (info, data, matched_name) = {
             let mut found = None;
             for candidate in qwen35_tensor_name_candidates(name) {
-                if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                // Decoding accessor: this branch keeps the mmap (drop_mmap is
+                // unix-only), but a losslessly recoded tensor is still stored
+                // compressed and the borrowing accessor refuses it.
+                if let Some((info, data)) = hfq.tensor_data_cow(&candidate) {
                     found = Some((info, data, candidate));
                     break;
                 }
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data.as_ref(), m, k)?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));

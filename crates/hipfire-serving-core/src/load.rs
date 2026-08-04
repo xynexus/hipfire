@@ -2376,7 +2376,7 @@ pub fn load_model(
         // PR 9: bring-up triple now goes through the Qwen35Vl trait impl;
         // forward (`qwen35_vl::vision_forward`) stays a direct static call.
         let has_vision_tensors = hfq
-            .tensor_data("model.visual.patch_embed.proj.weight")
+            .find_tensor_info("model.visual.patch_embed.proj.weight")
             .is_some();
         let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq).ok();
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
@@ -3544,7 +3544,7 @@ pub fn load_model_pp(
     }
     if qwen35_vl::vision_config_from_hfq(&hfq).is_some()
         && hfq
-            .tensor_data("model.visual.patch_embed.proj.weight")
+            .find_tensor_info("model.visual.patch_embed.proj.weight")
             .is_some()
     {
         return Err(

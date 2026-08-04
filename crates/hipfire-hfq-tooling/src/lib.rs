@@ -243,7 +243,33 @@ impl<'a> HfqFileComponentView<'a> {
     }
 
     pub fn entry(&self, original_name: &str) -> Option<&'a hipfire_runtime::hfq::HfqTensorInfo> {
-        self.tensor_data(original_name).map(|(entry, _)| entry)
+        // Metadata only — no bytes, so storage coding is irrelevant. Routing this
+        // through `tensor_data` returned None for a losslessly recoded tensor and
+        // made a present entry look absent.
+        self.file.find_tensor_info(self.stored_name(original_name)?)
+    }
+
+    fn stored_name(&self, original_name: &str) -> Option<&str> {
+        Some(
+            self.component
+                .stored_entries
+                .iter()
+                .find(|entry| entry.original_name == original_name)?
+                .stored_name
+                .as_str(),
+        )
+    }
+
+    /// Borrow a component tensor's logical bytes, decoding a lossless BF16
+    /// recoding if that is how it is stored.
+    pub fn tensor_data_cow(
+        &self,
+        original_name: &str,
+    ) -> Option<(
+        &'a hipfire_runtime::hfq::HfqTensorInfo,
+        std::borrow::Cow<'a, [u8]>,
+    )> {
+        self.file.tensor_data_cow(self.stored_name(original_name)?)
     }
 
     pub fn tensor_data(
