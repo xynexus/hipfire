@@ -18,7 +18,43 @@ or the SEARCH (how many bits it spends). They need different fixes, and we have
 not yet established which is at fault. That ordering matters more than anything
 else below.
 
-## Step 0 — the diagnostic that might end this project (~1 hour)
+## Step 0 — DONE 2026-08-04. The answer is the RANKING.
+
+Ran via `HIPFIRE_MIXED_BPW_RANK=1` (hipfire), which dumps the ranking and exits
+before quantizing. Rank span by tensor type, 1 = most sensitive of 113:
+
+    embed         1 ..   1
+    k_proj        2 ..  34     <- ranked top
+    down_proj    16 .. 112
+    q_proj       18 ..  41
+    v_proj       29 ..  85
+    gate_proj    36 ..  82
+    up_proj      39 ..  83
+    o_proj       79 .. 113     <- ranked BOTTOM THIRD
+
+Measured ground truth from the promotion sweep: **o_proj alone is the single
+biggest win at -15.1% KLD**, v_proj alone -13.4%, together -28.4%. The current
+objective puts o_proj in the bottom third of 113 — it would essentially never be
+promoted. Meanwhile k_proj monopolises the top, and v+k measured only -16.0%
+against v+o's -28.4%.
+
+So this is not a proxy that needs refining. **For the tensor with the largest
+measured gain, the diagonal proxy is close to anti-correlated with reality.**
+That is the same failure mode this project has recorded six times over
+(reconstruction error mispredicting output quality), now localised to a specific
+tensor type.
+
+The mechanism is visible in the shapes: `o_proj` is 2048x2048 with low
+reconstruction error per weight, but it sits on the attention output path where
+that error reaches the residual stream directly. Per-weight reconstruction
+cannot see that; `tr(dW H dW^T)` with the off-diagonal terms can, because H
+carries the cross-channel correlation the attention output induces.
+
+**This justifies option A below.** The search is not exonerated, but it cannot be
+assessed until the ranking is fixed — a greedy fill given a mis-ordered list will
+look broken no matter how good it is.
+
+## Step 0 (original plan, retained for context)
 
 Dump the current ranking and see where `v_proj` / `o_proj` actually land.
 
