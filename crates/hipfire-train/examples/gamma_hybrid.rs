@@ -153,11 +153,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let pos: Vec<f32> = (0..seq).map(|i| i as f32).collect();
 
+    // Optional oracle export: a token shim in the format
+    // dump_qwen35_hidden_states reads (it wants HFKLDR, while every kldref on
+    // disk is now HFQM or HFKREF — it only pulls tokens from that file), plus
+    // this walk's own per-layer states in the dumper's HFHIDDEN format. Same
+    // tokens on both sides is the whole point.
+    if let Ok(dir) = std::env::var("HIPFIRE_GH_ORACLE_DIR") {
+        let d = std::path::Path::new(&dir);
+        std::fs::create_dir_all(d)?;
+        let mut shim = Vec::new();
+        shim.extend_from_slice(b"HFKLDR\0\0");
+        let mut hdr = [0u8; 24];
+        hdr[4..8].copy_from_slice(&(seq as u32).to_le_bytes()); // n_ctx
+        hdr[12..16].copy_from_slice(&1u32.to_le_bytes()); // n_chunk
+        shim.extend_from_slice(&hdr);
+        for t in &tokens {
+            shim.extend_from_slice(&t.to_le_bytes());
+        }
+        std::fs::write(d.join("tokens.hfkldr"), &shim)?;
+        eprintln!("oracle: wrote token shim ({seq} tokens) to {}", d.display());
+    }
+
     let mut acc = GammaAccum {
         sum: Default::default(),
         n: 0,
     };
-    let (loss, kinds) = gamma_hybrid_streamed(
+    let (loss, kinds, layer_inputs) = gamma_hybrid_streamed(
         &mut gpu,
         src,
         prefix,
@@ -174,6 +195,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         top_k,
         &mut acc,
     )?;
+
+    // Oracle export, matching dump_qwen35_hidden_states' HFHIDDEN format.
+    // These are layer INPUTS, so mine[i+1] lines up with the runtime's output
+    // of layer i.
+    if let Ok(dir) = std::env::var("HIPFIRE_GH_ORACLE_DIR") {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"HFHIDDEN");
+        out.extend_from_slice(&(layer_inputs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(seq as u32).to_le_bytes());
+        out.extend_from_slice(&(h as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for li in &layer_inputs {
+            for v in li {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        std::fs::write(std::path::Path::new(&dir).join("mine_hidden.bin"), &out)?;
+        eprintln!("oracle: wrote {} layer inputs", layer_inputs.len());
+    }
 
     println!("hybrid stack: {} layers, seq={seq}, h={h}", kinds.len());
     for (i, k) in kinds.iter().enumerate() {

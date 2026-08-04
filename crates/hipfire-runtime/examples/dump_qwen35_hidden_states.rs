@@ -219,16 +219,20 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
 
     // -------- HiddenStateRingBuffer, overriding extract_layers to all layers --------
-    let mut hidden_rb = HiddenStateRingBuffer::new(
+    // new() derives the layer ids from dflash_extract_layer_ids, which spaces
+    // num_extract picks across 1..n_layers-3 — asking it for ALL layers makes
+    // the rounding collide and the constructor rejects the duplicate ids. The
+    // explicit-list constructor is the right one when the list is known.
+    let hidden_rb = HiddenStateRingBuffer::new_for_layers(
         &mut gpu,
         config.n_layers, // num_target_layers
-        config.n_layers, // num_extract == all
-        config.dim,      // hidden_dim
-        n_ctx,           // max_positions = exactly fits one chunk
-        1,               // max_batch = 1 (per-token forward)
+        (0..config.n_layers).collect(),
+        config.dim, // hidden_dim
+        n_ctx,      // max_positions = exactly fits one chunk
+        1,          // max_batch = 1 (per-token forward)
     )
     .expect("hidden rb");
-    hidden_rb.extract_layers = (0..config.n_layers).collect();
+    let mut hidden_rb = hidden_rb;
     eprintln!(
         "hidden_rb: {} layers x {} positions x {} hidden = {:.1} MB",
         hidden_rb.extract_layers.len(),

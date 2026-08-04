@@ -106,6 +106,53 @@ The code still applies the gate per-head interleaved, because that is what
 lesson from the AWQ episode is not to overturn a documented contract on a loss
 comparison taken through a forward that is still broken.
 
+## The oracle says layer 0 — and that supersedes the bisect above
+
+`dump_qwen35_hidden_states` now runs (it needed two fixes, below) and dumps the
+runtime's own per-layer states on the SAME 64 tokens this walk uses. Comparing
+cosine similarity, aligning this walk's layer INPUTS against the runtime's
+layer outputs:
+
+| layer | ref rms | mine rms | cos |
+|---|---|---|---|
+| 0 | 0.0582 | 0.0258 | +0.46 |
+| 1 | 0.0745 | 0.0302 | +0.34 |
+| 2 | 0.0798 | 0.0282 | +0.26 |
+| 9 | 0.0719 | 0.0452 | +0.03 |
+| 23 | 0.4063 | — | — |
+
+Divergence is immediate. Layer 0 — a `linear_attn` + dense-MLP layer — already
+produces the wrong output, and the residual stream never recovers.
+
+The embedding is NOT the cause and is now positively verified: the walk's
+layer-0 input matches the raw bf16 `embed_tokens` row for the same token id at
+cosine 0.99999 (the residual is the oq8 quantization of the embed table). So
+the divergence is entirely inside layer 0's own computation.
+
+This supersedes the layer-type bisect above. That measurement said attention
+layers hurt, and they may well, but "removing a wrong layer helps" is not the
+same as "the wrong layer is the only wrong one" — the linear_attn path is
+also wrong, from the very first layer, and it is the one to fix first because
+everything downstream inherits it.
+
+What is NOT implicated, each positively checked: the embedding lookup, the
+conv/activation/gated-norm/recurrence math (all match kernels to ~1e-7), and
+quantization (bf16 and oq8 score within 0.007). What has never been checked
+against anything is the ASSEMBLY around the verified core — norm1, the four
+input projections, out_proj, and the two residual joins.
+
+## Two fixes the oracle itself needed
+
+- `dump_qwen35_hidden_states` asked `HiddenStateRingBuffer::new` for all 24
+  layers. That derives ids via `dflash_extract_layer_ids`, which spaces
+  `num_extract` picks across `1..n_layers-3` — for all-layers the rounding
+  collides and the constructor rejects duplicate ids. Switched to
+  `new_for_layers` with an explicit list.
+- It expects a `HFKLDR` kldref, while every kldref on disk is now `HFQM` or
+  `HFKREF`. Rather than guess at those layouts, `gamma_hybrid` writes a minimal
+  token shim in the format the dumper does read — which also guarantees both
+  sides run the identical token sequence.
+
 ## Still open
 
 - **The attention block defect itself.** Not located, and variant-guessing has

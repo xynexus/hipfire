@@ -142,8 +142,10 @@ pub fn accumulate_gamma_linear_attn(
 
 /// One layer-streamed forward+backward over a hybrid stack, accumulating gamma.
 ///
-/// Returns the summed cross-entropy and the per-layer kinds, so a caller can
-/// report what the stack actually was rather than assuming.
+/// Returns the summed cross-entropy, the per-layer kinds (so a caller can
+/// report what the stack actually was rather than assuming), and each layer's
+/// INPUT hidden state — which is what a comparison against the runtime's own
+/// `dump_qwen35_hidden_states` needs to locate a divergence.
 pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
     src: &S,
@@ -160,7 +162,7 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     n_experts: usize,
     top_k: usize,
     acc: &mut GammaAccum,
-) -> Result<(f32, Vec<LayerKind>), String> {
+) -> Result<(f32, Vec<LayerKind>, Vec<Vec<f32>>), String> {
     let (seq, h) = (dims.seq, dims.h);
     let vocab = cfg.vocab_size;
     let n_layers = cfg.num_hidden_layers;
@@ -253,7 +255,7 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     }
 
     acc.n += 1;
-    Ok((loss_sum, kinds))
+    Ok((loss_sum, kinds, layer_inputs))
 }
 
 /// One layer forward. Returns the layer output; drops everything else.
