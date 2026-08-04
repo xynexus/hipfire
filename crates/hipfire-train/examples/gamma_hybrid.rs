@@ -109,22 +109,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let corpus = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "benchmarks/calib/calib-1m.txt".into());
-    let real = hfq.as_ref().and_then(|f| {
-        let meta: serde_json::Value = serde_json::from_str(f.metadata_json()).ok()?;
-        let tj = meta.get("tokenizer")?.as_str()?.to_string();
+    let real = (|| {
+        // An .hfq embeds its tokenizer; a restored HF directory has the file.
+        let tok_path = match &hfq {
+            Some(f) => {
+                let meta: serde_json::Value = serde_json::from_str(f.metadata_json()).ok()?;
+                let tj = meta.get("tokenizer")?.as_str()?.to_string();
+                let tmp = std::env::temp_dir().join("hipfire_gamma_hybrid_tok.json");
+                std::fs::write(&tmp, tj).ok()?;
+                tmp
+            }
+            None => path.join("tokenizer.json"),
+        };
         let text = std::fs::read_to_string(&corpus).ok()?;
-        let tmp = std::env::temp_dir().join("hipfire_gamma_hybrid_tok.json");
-        std::fs::write(&tmp, tj).ok()?;
-        let tok = hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tmp).ok()??;
+        let tok = hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tok_path).ok()??;
         let ids = tok.encode(&text[..text.len().min(20000)]);
         (ids.len() > seq).then(|| ids[..seq].to_vec())
-    });
+    })();
     let synthetic = real.is_none();
     let tokens: Vec<u32> = real.unwrap_or_else(|| {
         (0..seq)
             .map(|i| ((i * 37 + 11) % cfg.vocab_size) as u32)
             .collect()
     });
+    eprintln!("first ids: {:?}", &tokens[..tokens.len().min(12)]);
     eprintln!(
         "tokens: {}",
         if synthetic {

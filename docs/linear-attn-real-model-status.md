@@ -58,13 +58,65 @@ The general lesson, which cost two wrong conclusions here: **do not tune
 sub-decisions by loss while the forward is broken.** Every variant is being
 scored through the same unknown defect.
 
-## Next
+## Bisected: the defect is in the FULL-ATTENTION path
 
-The remaining defect is not yet located. Untested candidates, roughly ordered:
+The bf16 source turned out to be on disk after all —
+`/srv/hipfire/archives/models--Qwen--Qwen3.5-0.8B.hfa`, which
+`hipfire-coexistence repack` restores losslessly to an HF directory. That
+removes quantization from the picture entirely, and the first thing it says is
+that quantization was never the problem:
 
-- rope on the full-attention layers. This is a VL checkpoint; `head_dim` is
-  256 and mrope/partial-rope handling has not been checked against the arch.
-- `linear_num_key_heads` vs `linear_num_value_heads`. The inference path calls
-  `repeat_interleave_qk_f32` when key heads < value heads; this loader derives
-  one head count for both. Equal on the 0.8B, NOT verified on the 35B.
-- the embedding/lm_head tie, and whether any scale applies on either side.
+| source | mean loss, real text |
+|---|---|
+| oq8++ artifact (dequantized, AWQ folded) | 13.331 |
+| bf16 source, no quantization anywhere | 13.338 |
+
+Identical. So the AWQ fold question is moot for this defect, and the earlier
+retraction stands for a second reason: the fold was never what was wrong.
+
+Skipping whole layer types localizes it:
+
+| configuration | mean loss |
+|---|---|
+| everything on | 13.34 |
+| linear_attn layers skipped (pass-through) | 22.33 |
+| **full-attention layers skipped** | **11.44** |
+| uniform, ln(248320) | 12.42 |
+
+The linear_attn layers are working — removing them costs 9 nats. The
+full-attention layers are ACTIVELY CORRUPTING: the model is better off without
+them. That is where the remaining defect lives.
+
+Inside that block, narrowing further:
+
+| variant | mean loss |
+|---|---|
+| attn_output_gate applied, per-head interleaved (current) | 13.34 |
+| gate not applied at all | 10.21 |
+| gate applied, Q/gate halves swapped | 10.23 |
+| gate applied, block layout `[all Q | all gate]` | 10.71 |
+| rope disabled entirely (theta 1e30) | 13.35 |
+
+Two readings. Rope is NOT the dominant issue — disabling it moves the loss by
+0.01. And every gate variant is worse than not applying the gate at all, so the
+gate handling is wrong in a way that guessing has not resolved.
+
+The code still applies the gate per-head interleaved, because that is what
+`kernels/src/deinterleave.hip` documents and `qwen35/lowered.rs` calls, and the
+lesson from the AWQ episode is not to overturn a documented contract on a loss
+comparison taken through a forward that is still broken.
+
+## Still open
+
+- **The attention block defect itself.** Not located. The gate table above says
+  the gate is involved but not that removing it is right.
+- **`partial_rotary_factor` = 0.25 is not honored.** `n_rot = head_dim * 0.25`
+  = 64 of 256 (`qwen35/lowered.rs:370`, and the config field comment says "only
+  64/256 dims get RoPE"). This block rotates all 256. A confirmed discrepancy
+  regardless of how little rope currently moves the loss — worth fixing before
+  further bisection, so the next measurement is not taken through it.
+- **mrope.** `rope_parameters` has `mrope_interleaved: true` and
+  `mrope_section: [11, 11, 10]`. Unexamined.
+- **`linear_num_key_heads` vs `linear_num_value_heads`.** Equal (16/16) on the
+  0.8B, so not implicated here; still unverified on the 35B, where the
+  inference path calls `repeat_interleave_qk_f32` when they differ.
