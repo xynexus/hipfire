@@ -7,15 +7,33 @@ implementation applied `w` plainly.
 | | mean loss, real text |
 |---|---|
 | before | 13.34 (uniform is 12.42) |
-| **after** | **4.03** |
+| after, block + final norms | 4.03 |
+| **after, also q/k norms** | **3.52** |
 
 At one token, against the runtime's own prefill logits: cos 0.7896 -> **0.9994**.
 
-It applies to `input_layernorm`, `post_attention_layernorm` and the final norm,
-and NOT to `q_norm`, `k_norm` or `linear_attn.norm` — offsetting those too drops
-the same measurement back to 0.7840. The weights say the same thing:
-layer-0 `input_layernorm` centres at +0.24 where a plain weight would centre at
-1, while `linear_attn.norm` centres at +0.96.
+The runtime settles exactly which norms take it, and it is not uniform:
+
+| tensor | offset? | how the runtime loads it |
+|---|---|---|
+| `input_layernorm`, `post_attention_layernorm` | yes | `load_norm_weight` (`loading.rs:4419`) |
+| final `norm.weight` | yes | `load_norm_weight` (`loading.rs:4210`) |
+| `q_norm`, `k_norm` | yes | `load_norm_weight` (`loading.rs:4571`) |
+| `linear_attn.norm` | **no** | `load_any_as_f32` (`loading.rs:4475`) |
+
+The q/k row is worth dwelling on: a one-token measurement CANNOT see it, because
+softmax over a single key ignores q and k entirely. The measurement that found
+the main bug was structurally blind to this part of it, and only the runtime's
+loader settles it. Adding it took the loss from 4.03 to 3.52.
+
+The stored weights corroborate the split — layer-0 `input_layernorm` centres at
++0.24 where a plain weight would centre at 1, while `linear_attn.norm` centres
+at +0.96.
+
+The runtime also records that skipping the offset on MoE final norms was tried
+and reverted: it "under-scaled the MoE final norm by ~38% ... 1.63 instead of
+the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce", and the symptom it was
+masking had a different root cause entirely.
 
 ## Why it took so long
 
@@ -42,9 +60,11 @@ token, where rope and QK-norm are provably irrelevant).
 
 The `1 + w` variant had in fact been measured 6 commits earlier and set aside,
 because no unit offset appears in `rmsnorm.hip` and the runtime ships working
-inference. That reasoning was sound but the conclusion was wrong: hipfire
-applies the offset somewhere other than that kernel. Where is worth finding, and
-is now the only open question about this norm.
+inference. The reasoning was sound; the conclusion was wrong. hipfire bakes the
+offset at LOAD time (`qwen35/loading.rs:717`), not in the kernel — so searching
+the kernels for `1.0 +` was searching the wrong layer of the stack. Searching
+for the CONCEPT instead ("GemmaRMSNorm", named in `dump_norms.rs`'s own doc
+comment) would have found it immediately.
 
 ## What is verified now
 

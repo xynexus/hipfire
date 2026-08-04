@@ -298,6 +298,13 @@ pub fn load_llama_layer_fp32_pfx_off<S: WeightSource + ?Sized>(
     if unit_offset {
         apply_unit_offset(gpu, &input_layernorm)?;
         apply_unit_offset(gpu, &post_attention_layernorm)?;
+        // q_norm/k_norm take the offset too — qwen35/loading.rs:4571 loads them
+        // with the same `load_norm_weight` as the block norms. A one-token
+        // measurement CANNOT see this (softmax over a single key ignores q and
+        // k entirely), which is why it needed the runtime's loader to settle.
+        for t in [q_norm.as_ref(), k_norm.as_ref()].into_iter().flatten() {
+            apply_unit_offset(gpu, t)?;
+        }
     }
     Ok(LlamaLayerF32 {
         input_layernorm,
@@ -522,9 +529,9 @@ impl WeightSource for DequantHfq<'_> {
 /// worse. Measured against the runtime's own prefill logits at one token, the
 /// difference is cos 0.7896 plain vs 0.9994 with the offset.
 ///
-/// It does NOT apply to `q_norm`, `k_norm` or `linear_attn.norm` — those are
-/// stored as ordinary weights (linear_attn.norm centres near +0.96), and
-/// offsetting them too drops the same measurement back to 0.7840.
+/// It also covers `q_norm`/`k_norm` (`qwen35/loading.rs:4571`), but NOT
+/// `linear_attn.norm`, which the runtime loads via plain `load_any_as_f32`
+/// (`loading.rs:4475`) and whose weights centre near +0.96 rather than 0.
 pub fn uses_unit_offset_norm(model_type: &str) -> bool {
     model_type.starts_with("qwen3_5") || model_type.starts_with("qwen3_next")
 }
