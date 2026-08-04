@@ -755,6 +755,33 @@ Each of these produced a confident wrong result that survived at least one check
 
   - Does an `oq4++` tile shape hit the same 54.7 GB/s? The projections assume it
     does. Measure a single GEMV at the new format before porting 16 layers.
+
+    **Partially probed 2026-08-04 — the stock tooling cannot answer it, and the
+    reason is specific.** IRON's `matrix_vector` example does run at decode
+    shape on NPU2 (M=K=2048, int16): 1538.7 us, which is 8.39 MB of weights in
+    1.54 ms = **5.45 GB/s**. But that design is SINGLE-CORE by construction
+    (`n_cores = 1` is a local, not a parameter), so it is not comparable to
+    54.7 GB/s, which is a whole-device figure. Raising `n_cores` does not work:
+    at 4 it fails placement with `no ShimNOCTile has sufficient DMA capacity for
+    0 input/1 output channels`, at 8 with `no available compute tiles`. The
+    blocker is shim DMA channel allocation, so a real answer needs a
+    purpose-built multi-core GEMV that distributes weight streaming across shim
+    tiles — design work, not a flag.
+
+    Two further gaps to be aware of before trusting any number from this path:
+    `kernels.mv` documents `np.int16` inputs ONLY, so it cannot express the
+    int8 W4A8 activation path; and `oq_gemm_design` (the int8 GEMM) asserts
+    `n % t == 0` against the kernel's mac dims, so it cannot express B=1 at all
+    — it is a prefill probe. Its numbers (B=32: 250 GFLOP/s, 3.9 GB/s weight BW;
+    B=64: 352 GFLOP/s, 2.8 GB/s) are NOT evidence about decode: batched GEMM
+    reuses weights across the batch, so it is compute/dispatch-bound by
+    construction and low weight-BW there is expected, not a finding.
+
+    Worth one note as a hypothesis and not a claim: 5.45 GB/s x 10 cores is
+    54.5, suspiciously close to the 54.7 figure. If that number was derived from
+    roughly ten cores' worth of shim DMA rather than an aggregate device
+    ceiling, the projection may be self-consistent — but that should be checked
+    against wherever 54.7 came from, not assumed from one coincidence.
   - Prefill is UNEXAMINED. Everything here is decode. Prefill is compute-bound
     and batched — a different regime where the format argument above does not
     apply, and where FLM may still have something to teach.
