@@ -364,7 +364,11 @@ impl CalibCollector {
         // shared scratch tensor at `n = 1`; requiring an exact stride there
         // would reject correct callers, so only the lower bound is enforced.
         let row_stride = input.numel() / n;
-        let stride_ok = if n == 1 { row_stride >= k } else { row_stride == k };
+        let stride_ok = if n == 1 {
+            row_stride >= k
+        } else {
+            row_stride == k
+        };
         if !stride_ok {
             return Err(contracts::CalibError::InvalidCapture(format!(
                 "capture {} input row stride {row_stride} != width {k} \
