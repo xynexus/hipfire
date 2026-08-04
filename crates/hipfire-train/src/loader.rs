@@ -247,16 +247,33 @@ pub struct MoeLayerF32 {
     pub router: GpuTensor,
     /// Per expert, in expert order: (gate, up, down).
     pub experts: Vec<(GpuTensor, GpuTensor, GpuTensor)>,
+    /// The always-on shared branch, when the architecture has one.
+    pub shared: Option<SharedLayerF32>,
+}
+
+/// One layer's shared-expert weights. `scalar_gate` is `[1, h]` and is NOT the
+/// SwiGLU gate — see `ops::moe::SharedExpert`.
+pub struct SharedLayerF32 {
+    pub scalar_gate: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
+    pub inter: usize,
 }
 
 /// Is layer `l` routed? Detected from the artifact rather than the config,
 /// because hybrid models exist — BLS-Mini-Code-1.0 has a DENSE layer 0 and
 /// routed layers 1..49, so a per-model flag would be wrong for it.
 pub fn layer_is_moe(hfq: &HfqFile, prefix: &str, layer: usize) -> bool {
-    hfq.find_tensor_info(&format!(
-        "{prefix}layers.{layer}.mlp.experts.0.down_proj.weight"
-    ))
-    .is_some()
+    let p = format!("{prefix}layers.{layer}.mlp.experts");
+    // Two on-disk shapes: per-expert tensors (BLS, Mixtral) and the stacked
+    // form qwen3.5/3.6 uses, where all experts live in one 3-D tensor.
+    hfq.find_tensor_info(&format!("{p}.0.down_proj.weight"))
+        .is_some()
+        || hfq.find_tensor_info(&format!("{p}.down_proj")).is_some()
+        || hfq
+            .find_tensor_info(&format!("{p}.down_proj.weight"))
+            .is_some()
 }
 
 /// Tensor-name prefix an artifact uses: `model.` or `model.language_model.`
@@ -288,11 +305,64 @@ pub fn load_moe_layer_fp32_hfq(
 ) -> Result<(MoeLayerF32, usize), String> {
     let p = format!("{prefix}layers.{layer}.mlp");
     let router = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.gate.weight"), &[n_experts, h])?;
+
+    let (experts, inter) = if hfq
+        .find_tensor_info(&format!("{p}.experts.0.gate_proj.weight"))
+        .is_some()
+    {
+        load_experts_per_tensor(gpu, hfq, &p, layer, h, n_experts)?
+    } else {
+        load_experts_stacked(gpu, hfq, &p, layer, h, n_experts)?
+    };
+
+    // Shared branch is optional: qwen3.5/3.6 has one, BLS does not.
+    let sp = format!("{p}.shared_expert");
+    let shared = match hfq.find_tensor_info(&format!("{sp}.down_proj.weight")) {
+        None => None,
+        Some(info) => {
+            // [h, shared_inter] — the shared intermediate is its own size and
+            // need not match the routed experts'.
+            let si = info.shape[1] as usize;
+            Some(SharedLayerF32 {
+                scalar_gate: load_tensor_f32_hfq(
+                    gpu,
+                    hfq,
+                    &format!("{p}.shared_expert_gate.weight"),
+                    &[1, h],
+                )?,
+                gate: load_tensor_f32_hfq(gpu, hfq, &format!("{sp}.gate_proj.weight"), &[si, h])?,
+                up: load_tensor_f32_hfq(gpu, hfq, &format!("{sp}.up_proj.weight"), &[si, h])?,
+                down: load_tensor_f32_hfq(gpu, hfq, &format!("{sp}.down_proj.weight"), &[h, si])?,
+                inter: si,
+            })
+        }
+    };
+
+    Ok((
+        MoeLayerF32 {
+            router,
+            experts,
+            shared,
+        },
+        inter,
+    ))
+}
+
+type ExpertTriples = Vec<(GpuTensor, GpuTensor, GpuTensor)>;
+
+/// BLS/Mixtral shape: one tensor per expert per projection.
+fn load_experts_per_tensor(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
     let probe = hfq
         .find_tensor_info(&format!("{p}.experts.0.gate_proj.weight"))
         .ok_or_else(|| format!("layer {layer}: no experts.0.gate_proj"))?;
     let inter = probe.shape[0] as usize;
-
     let mut experts = Vec::with_capacity(n_experts);
     for e in 0..n_experts {
         let ep = format!("{p}.experts.{e}");
@@ -302,7 +372,71 @@ pub fn load_moe_layer_fp32_hfq(
             load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.down_proj.weight"), &[h, inter])?,
         ));
     }
-    Ok((MoeLayerF32 { router, experts }, inter))
+    Ok((experts, inter))
+}
+
+/// qwen3.5/3.6 shape: all experts stacked into one 3-D tensor, with gate and up
+/// fused into `gate_up_proj`.
+///
+/// `gate_up_proj` is `[n_experts, 2*inter, h]` and the layout comment in
+/// `qwen35/layout.rs` pins the fusion as `(gate || up)` — gate is the FIRST
+/// `inter` rows, not interleaved. `inter` is derived from that tensor rather
+/// than from config, and `down_proj` is then required to agree, so a
+/// transposed or interleaved variant fails loudly here instead of training
+/// silently on scrambled weights.
+fn load_experts_stacked(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
+    let gu_name = [
+        format!("{p}.experts.gate_up_proj"),
+        format!("{p}.experts.gate_up_proj.weight"),
+    ]
+    .into_iter()
+    .find(|n| hfq.find_tensor_info(n).is_some())
+    .ok_or_else(|| format!("layer {layer}: no per-expert or stacked gate_up_proj"))?;
+    let dn_name = gu_name.replace("gate_up_proj", "down_proj");
+
+    let (gu_shape, gu) = fetch_f32_hfq(hfq, &gu_name)?;
+    let (dn_shape, dn) = fetch_f32_hfq(hfq, &dn_name)?;
+    if gu_shape.len() != 3 || gu_shape[0] != n_experts || gu_shape[2] != h {
+        return Err(format!(
+            "layer {layer}: {gu_name} shape {gu_shape:?} is not [{n_experts}, 2*inter, {h}]"
+        ));
+    }
+    if gu_shape[1] % 2 != 0 {
+        return Err(format!(
+            "layer {layer}: fused gate_up rows {} are odd, so it is not (gate || up)",
+            gu_shape[1]
+        ));
+    }
+    let inter = gu_shape[1] / 2;
+    if dn_shape != vec![n_experts, h, inter] {
+        return Err(format!(
+            "layer {layer}: {dn_name} shape {dn_shape:?} != [{n_experts}, {h}, {inter}]"
+        ));
+    }
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let base = e * 2 * inter * h;
+        let g = &gu[base..base + inter * h];
+        let u = &gu[base + inter * h..base + 2 * inter * h];
+        let d = &dn[e * h * inter..(e + 1) * h * inter];
+        experts.push((
+            gpu.upload_f32(g, &[inter, h])
+                .map_err(|e| format!("upload expert gate: {e}"))?,
+            gpu.upload_f32(u, &[inter, h])
+                .map_err(|e| format!("upload expert up: {e}"))?,
+            gpu.upload_f32(d, &[h, inter])
+                .map_err(|e| format!("upload expert down: {e}"))?,
+        ));
+    }
+    Ok((experts, inter))
 }
 
 /// Free one streamed MoE layer.
@@ -313,6 +447,12 @@ pub fn free_moe_layer_fp32(gpu: &mut Gpu, l: MoeLayerF32) -> Result<(), String> 
         for t in [g, u, d] {
             gpu.free_tensor(t)
                 .map_err(|e| format!("free expert tensor: {e}"))?;
+        }
+    }
+    if let Some(sh) = l.shared {
+        for t in [sh.scalar_gate, sh.gate, sh.up, sh.down] {
+            gpu.free_tensor(t)
+                .map_err(|e| format!("free shared expert tensor: {e}"))?;
         }
     }
     Ok(())
@@ -342,6 +482,31 @@ pub fn free_llama_layer_fp32(gpu: &mut Gpu, l: LlamaLayerF32) -> Result<(), Stri
 /// Uses `tensor_data_cow`, not `tensor_data`: `--bf16-codec` defaults to `huff`,
 /// so a bf16 artifact's tensors may be losslessly recoded, and the borrowing
 /// accessor returns None for those — reporting a present tensor as missing.
+/// Decode one hfq tensor to fp32 on the host, returning its shape alongside.
+///
+/// Split out from [`load_tensor_f32_hfq`] because the stacked MoE tensors have
+/// to be sliced per expert (and the fused `gate_up` halved) before upload, and
+/// doing that through the upload path would mean decoding the whole stack once
+/// per expert.
+fn fetch_f32_hfq(hfq: &HfqFile, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let (info, bytes) = hfq
+        .tensor_data_cow(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+    let dtype = match info.quant_type {
+        1 => "F16",
+        2 => "F32",
+        16 => "BF16",
+        other => {
+            return Err(format!(
+                "tensor {name}: quant_type {other} is not an unquantized float;                  the fp32 training base needs an f16/f32/bf16 artifact"
+            ))
+        }
+    };
+    let f32s = bytes_to_f32(dtype, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?;
+    Ok((shape, f32s))
+}
+
 fn load_tensor_f32_hfq(
     gpu: &mut Gpu,
     hfq: &HfqFile,

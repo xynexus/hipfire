@@ -25,11 +25,17 @@
 //!     how many coordinates were skipped for a flip rather than averaging them
 //!     in silently.
 //!
+//! Runs the whole check TWICE: once routed-only (BLS shape) and once with the
+//! always-on shared expert qwen3.5/3.6 adds. The shared branch has its own
+//! sigmoid scalar gate whose adjoint is a dot product against the unscaled
+//! branch output, and getting that wrong leaves the routed gradient untouched
+//! — so it only shows up in the second pass.
+//!
 //! Run: cargo run --release -p hipfire-train --example gradcheck_moe
 
 use hipfire_rdna::Gpu;
 use hipfire_train::ops::moe::{
-    free_moe_acts, moe_backward, moe_forward, ExpertWeights, MoeDims, MoeWeights,
+    free_moe_acts, moe_backward, moe_forward, ExpertWeights, MoeDims, MoeWeights, SharedExpert,
 };
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -73,6 +79,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|v| gpu.upload_f32(v, &[h * inter]).unwrap())
         .collect();
+    // Shared-expert weights. `sinter` deliberately differs from `inter`: the
+    // shared intermediate is its own size in the real config, and equal sizes
+    // would hide a dimension mix-up.
+    let sinter = inter + 8;
+    let sg = gpu.upload_f32(&rnd(sinter * h, &mut s), &[sinter * h])?;
+    let su = gpu.upload_f32(&rnd(sinter * h, &mut s), &[sinter * h])?;
+    let sd = gpu.upload_f32(&rnd(h * sinter, &mut s), &[h * sinter])?;
+    let ssg = gpu.upload_f32(&rnd(h, &mut s), &[h])?;
+
     let w = MoeWeights {
         router: &router,
         experts: (0..ne)
@@ -82,80 +97,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wdown: &dts[e],
             })
             .collect(),
+        shared: None,
+    };
+    let w_shared = MoeWeights {
+        router: &router,
+        experts: (0..ne)
+            .map(|e| ExpertWeights {
+                wgate: &gts[e],
+                wup: &uts[e],
+                wdown: &dts[e],
+            })
+            .collect(),
+        shared: Some(SharedExpert {
+            w_scalar_gate: &ssg,
+            wgate: &sg,
+            wup: &su,
+            wdown: &sd,
+            inter: sinter,
+        }),
     };
 
-    // Analytic gradient.
-    let x = gpu.upload_f32(&x_host, &[seq * h])?;
-    let (out, acts) = moe_forward(&mut gpu, &x, &w, &d)?;
-    let routing: Vec<u32> = acts.idx.clone();
-    let d_out = gpu.upload_f32(&seed, &[seq * h])?;
-    let (d_x, adj) = moe_backward(&mut gpu, &d_out, &w, &acts, &d)?;
-    let d_x_host = gpu.download_f32(&d_x)?;
-    let base: f32 = gpu
-        .download_f32(&out)?
-        .iter()
-        .zip(seed.iter())
-        .map(|(a, b)| a * b)
-        .sum();
-    free_moe_acts(&mut gpu, acts)?;
+    for (label, w) in [("routed-only", &w), ("with shared expert", &w_shared)] {
+        // Analytic gradient.
+        let x = gpu.upload_f32(&x_host, &[seq * h])?;
+        let (out, acts) = moe_forward(&mut gpu, &x, w, &d)?;
+        let routing: Vec<u32> = acts.idx.clone();
+        let d_out = gpu.upload_f32(&seed, &[seq * h])?;
+        let (d_x, adj) = moe_backward(&mut gpu, &d_out, w, &acts, &d)?;
+        let d_x_host = gpu.download_f32(&d_x)?;
+        let base: f32 = gpu
+            .download_f32(&out)?
+            .iter()
+            .zip(seed.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        free_moe_acts(&mut gpu, acts)?;
 
-    println!(
-        "MoE gradcheck: seq={seq} h={h} inter={inter} experts={ne} top_k={}",
-        d.top_k
-    );
-    println!("  loss {base:.6}");
-    let served: Vec<usize> = (0..ne).map(|e| adj.d_expert_out[e].len() / h).collect();
-    println!("  rows per expert: {served:?}");
+        println!(
+            "MoE gradcheck [{label}]: seq={seq} h={h} inter={inter} experts={ne} top_k={}",
+            d.top_k
+        );
+        println!("  loss {base:.6}");
+        let served: Vec<usize> = (0..ne).map(|e| adj.d_expert_out[e].len() / h).collect();
+        println!("  rows per expert: {served:?}");
 
-    // Central differences, skipping any coordinate whose perturbation flips the
-    // routing — there the function is genuinely discontinuous.
-    let eps = 1e-3f32;
-    let mut worst = 0.0f32;
-    let mut worst_i = 0usize;
-    let mut flips = 0usize;
-    let mut checked = 0usize;
-    for i in (0..seq * h).step_by(7) {
-        let probe =
-            |delta: f32, gpu: &mut Gpu| -> Result<(f32, bool), Box<dyn std::error::Error>> {
-                let mut xp = x_host.clone();
-                xp[i] += delta;
-                let xt = gpu.upload_f32(&xp, &[seq * h])?;
-                let (o, a) = moe_forward(gpu, &xt, &w, &d)?;
-                let flipped = a.idx != routing;
-                let l: f32 = gpu
-                    .download_f32(&o)?
-                    .iter()
-                    .zip(seed.iter())
-                    .map(|(p, q)| p * q)
-                    .sum();
-                free_moe_acts(gpu, a)?;
-                gpu.free_tensor(o)?;
-                gpu.free_tensor(xt)?;
-                Ok((l, flipped))
-            };
-        let (lp, f1) = probe(eps, &mut gpu)?;
-        let (lm, f2) = probe(-eps, &mut gpu)?;
-        if f1 || f2 {
-            flips += 1;
-            continue;
+        // Central differences, skipping any coordinate whose perturbation flips the
+        // routing — there the function is genuinely discontinuous.
+        let eps = 1e-3f32;
+        let mut worst = 0.0f32;
+        let mut worst_i = 0usize;
+        let mut flips = 0usize;
+        let mut checked = 0usize;
+        for i in (0..seq * h).step_by(7) {
+            let probe =
+                |delta: f32, gpu: &mut Gpu| -> Result<(f32, bool), Box<dyn std::error::Error>> {
+                    let mut xp = x_host.clone();
+                    xp[i] += delta;
+                    let xt = gpu.upload_f32(&xp, &[seq * h])?;
+                    let (o, a) = moe_forward(gpu, &xt, w, &d)?;
+                    let flipped = a.idx != routing;
+                    let l: f32 = gpu
+                        .download_f32(&o)?
+                        .iter()
+                        .zip(seed.iter())
+                        .map(|(p, q)| p * q)
+                        .sum();
+                    free_moe_acts(gpu, a)?;
+                    gpu.free_tensor(o)?;
+                    gpu.free_tensor(xt)?;
+                    Ok((l, flipped))
+                };
+            let (lp, f1) = probe(eps, &mut gpu)?;
+            let (lm, f2) = probe(-eps, &mut gpu)?;
+            if f1 || f2 {
+                flips += 1;
+                continue;
+            }
+            let num = (lp - lm) / (2.0 * eps);
+            let ana = d_x_host[i];
+            let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-4);
+            if rel > worst {
+                worst = rel;
+                worst_i = i;
+            }
+            checked += 1;
         }
-        let num = (lp - lm) / (2.0 * eps);
-        let ana = d_x_host[i];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-4);
-        if rel > worst {
-            worst = rel;
-            worst_i = i;
-        }
-        checked += 1;
-    }
 
-    println!("  checked {checked} coords, {flips} skipped (routing flip)");
-    println!("  worst relative error {worst:.3e} at coord {worst_i}");
-    if worst < 2e-2 && checked > 0 {
-        println!("\nPASS");
-        Ok(())
-    } else {
-        println!("\nFAIL");
-        std::process::exit(1)
+        println!("  checked {checked} coords, {flips} skipped (routing flip)");
+        println!("  worst relative error {worst:.3e} at coord {worst_i}");
+        if worst >= 2e-2 || checked == 0 {
+            println!("\nFAIL [{label}]");
+            std::process::exit(1)
+        }
+        println!("  PASS [{label}]");
     }
+    println!("\nPASS");
+    Ok(())
 }

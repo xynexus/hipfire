@@ -35,10 +35,26 @@ pub struct ExpertWeights<'a> {
     pub wdown: &'a GpuTensor, // [h, inter]
 }
 
+/// The always-on shared expert qwen3.5/3.6 runs alongside the routed ones.
+///
+/// `w_scalar_gate` projects to a SINGLE scalar per token, not to `inter` —
+/// `shared_expert_gate: [1, hidden]` in the layout. Its sigmoid scales the
+/// whole shared branch, and it is a separate tensor from `wgate`, which is the
+/// SwiGLU gate half. Conflating the two is the obvious way to get this wrong.
+pub struct SharedExpert<'a> {
+    pub w_scalar_gate: &'a GpuTensor, // [1, h]
+    pub wgate: &'a GpuTensor,         // [shared_inter, h]
+    pub wup: &'a GpuTensor,           // [shared_inter, h]
+    pub wdown: &'a GpuTensor,         // [h, shared_inter]
+    pub inter: usize,
+}
+
 /// Router plus experts for one MoE layer.
 pub struct MoeWeights<'a> {
     pub router: &'a GpuTensor, // [n_experts, h]
     pub experts: Vec<ExpertWeights<'a>>,
+    /// `None` for BLS-style layers with no shared branch.
+    pub shared: Option<SharedExpert<'a>>,
 }
 
 pub struct MoeDims {
@@ -68,6 +84,18 @@ pub struct MoeActivations {
     /// Per-expert output rows `[n_rows, h]`, BEFORE the gate scaling — this is
     /// the down_proj output, which is what a per-expert adjoint is taken at.
     pub e_out: Vec<GpuTensor>,
+    /// Shared-expert saved state, when the layer has one.
+    pub shared: Option<SharedActs>,
+}
+
+/// Shared-expert forward state. Every tensor is full-sequence: the branch is
+/// always on, so there is no gather and no per-expert row bookkeeping.
+pub struct SharedActs {
+    pub s_gate: GpuTensor, // [seq, inter] SwiGLU gate half
+    pub s_up: GpuTensor,   // [seq, inter]
+    pub s_act: GpuTensor,  // [seq, inter] post-SwiGLU
+    pub s_out: GpuTensor,  // [seq, h] down_proj output, BEFORE the scalar gate
+    pub scalar: Vec<f32>,  // [seq] sigmoid(w_scalar_gate . x)
 }
 
 /// Softmax over the full router row, then top-k with renormalisation.
@@ -166,6 +194,45 @@ pub fn moe_forward(
         e_in.push(xin);
         e_out.push(o);
     }
+    // Shared branch: y += sigmoid(w_sg . x) * SwiGLU_shared(x), every token.
+    let shared = match &w.shared {
+        None => None,
+        Some(sh) => {
+            let si = sh.inter;
+            let sg = gpu.zeros(&[seq * si], DType::F32)?;
+            let su = gpu.zeros(&[seq * si], DType::F32)?;
+            let sa = gpu.zeros(&[seq * si], DType::F32)?;
+            let so = gpu.zeros(&[seq * h], DType::F32)?;
+            linear_forward(gpu, x, sh.wgate, &sg, seq, h, si)?;
+            linear_forward(gpu, x, sh.wup, &su, seq, h, si)?;
+            swiglu_forward(gpu, &sg, &su, &sa, seq * si)?;
+            linear_forward(gpu, &sa, sh.wdown, &so, seq, si, h)?;
+
+            let sgl = gpu.zeros(&[seq], DType::F32)?;
+            linear_forward(gpu, x, sh.w_scalar_gate, &sgl, seq, h, 1)?;
+            let scalar: Vec<f32> = gpu
+                .download_f32(&sgl)?
+                .iter()
+                .map(|v| 1.0 / (1.0 + (-v).exp()))
+                .collect();
+            gpu.free_tensor(sgl)?;
+
+            let so_host = gpu.download_f32(&so)?;
+            for t in 0..seq {
+                for c in 0..h {
+                    out_host[t * h + c] += scalar[t] * so_host[t * h + c];
+                }
+            }
+            Some(SharedActs {
+                s_gate: sg,
+                s_up: su,
+                s_act: sa,
+                s_out: so,
+                scalar,
+            })
+        }
+    };
+
     let out = gpu.upload_f32(&out_host, &[seq * h])?;
 
     Ok((
@@ -180,6 +247,7 @@ pub fn moe_forward(
             e_act,
             e_in,
             e_out,
+            shared,
         },
     ))
 }
@@ -259,6 +327,53 @@ pub fn moe_backward(
         }
     }
 
+    // Shared branch backward. Two paths reach x: through the SwiGLU chain
+    // (scaled by the scalar gate) and through the scalar gate itself, whose
+    // adjoint is <d_out[t], s_out[t]> — the dot with the UNSCALED branch
+    // output, exactly as the routed gate's adjoint is taken against e_out.
+    if let (Some(sh), Some(sa)) = (&w.shared, &a.shared) {
+        let si = sh.inter;
+        let so_host = gpu.download_f32(&sa.s_out)?;
+        let mut d_so = vec![0.0f32; seq * h];
+        let mut d_scalar_pre = vec![0.0f32; seq];
+        for t in 0..seq {
+            let mut dot = 0.0f32;
+            for c in 0..h {
+                let g = d_out_host[t * h + c];
+                d_so[t * h + c] = sa.scalar[t] * g;
+                dot += g * so_host[t * h + c];
+            }
+            // sigmoid' = s(1-s)
+            d_scalar_pre[t] = dot * sa.scalar[t] * (1.0 - sa.scalar[t]);
+        }
+
+        let d_so_t = gpu.upload_f32(&d_so, &[seq * h])?;
+        let d_sa = gpu.zeros(&[seq * si], DType::F32)?;
+        linear_backward_x(gpu, &d_so_t, sh.wdown, &d_sa, seq, si, h, false)?;
+        let d_sg = gpu.zeros(&[seq * si], DType::F32)?;
+        let d_su = gpu.zeros(&[seq * si], DType::F32)?;
+        swiglu_backward(gpu, &d_sa, &sa.s_gate, &sa.s_up, &d_sg, &d_su, seq * si)?;
+
+        let d_xs = gpu.zeros(&[seq * h], DType::F32)?;
+        linear_backward_x(gpu, &d_sg, sh.wgate, &d_xs, seq, h, si, false)?;
+        let mut acc = gpu.download_f32(&d_xs)?;
+        linear_backward_x(gpu, &d_su, sh.wup, &d_xs, seq, h, si, false)?;
+        for (v, u) in acc.iter_mut().zip(gpu.download_f32(&d_xs)?.iter()) {
+            *v += *u;
+        }
+        let d_sp = gpu.upload_f32(&d_scalar_pre, &[seq])?;
+        linear_backward_x(gpu, &d_sp, sh.w_scalar_gate, &d_xs, seq, h, 1, false)?;
+        for (v, u) in acc.iter_mut().zip(gpu.download_f32(&d_xs)?.iter()) {
+            *v += *u;
+        }
+        for (v, u) in d_x_host.iter_mut().zip(acc.iter()) {
+            *v += *u;
+        }
+        for t in [d_so_t, d_sa, d_sg, d_su, d_xs, d_sp] {
+            gpu.free_tensor(t)?;
+        }
+    }
+
     // Router backward. Softmax-then-renormalise over the kept set is, for the
     // kept entries, algebraically a softmax restricted to those entries — so
     // the standard softmax Jacobian applies with the renormalised gates, and
@@ -299,6 +414,11 @@ pub fn moe_backward(
 pub fn free_moe_acts(gpu: &mut Gpu, a: MoeActivations) -> HipResult<()> {
     for v in [a.e_gate, a.e_up, a.e_act, a.e_in, a.e_out] {
         for t in v {
+            gpu.free_tensor(t)?;
+        }
+    }
+    if let Some(s) = a.shared {
+        for t in [s.s_gate, s.s_up, s.s_act, s.s_out] {
             gpu.free_tensor(t)?;
         }
     }

@@ -1005,6 +1005,13 @@ fn moe_weights_of(l: &crate::loader::MoeLayerF32) -> crate::ops::moe::MoeWeights
                 wdown: d,
             })
             .collect(),
+        shared: l.shared.as_ref().map(|s| crate::ops::moe::SharedExpert {
+            w_scalar_gate: &s.scalar_gate,
+            wgate: &s.gate,
+            wup: &s.up,
+            wdown: &s.down,
+            inter: s.inter,
+        }),
     }
 }
 

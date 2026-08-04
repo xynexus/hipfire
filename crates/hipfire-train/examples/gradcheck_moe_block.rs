@@ -139,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wdown: &ed[e],
             })
             .collect(),
+        shared: None,
     };
 
     let pos: Vec<f32> = (0..SEQ).map(|i| i as f32).collect();
