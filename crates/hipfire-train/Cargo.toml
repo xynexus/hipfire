@@ -46,3 +46,7 @@ path = "examples/dspark_labels.rs"
 [[example]]
 name = "verify_deltanet_vs_kernel"
 required-features = ["deltanet"]
+
+[[example]]
+name = "verify_la_core_vs_kernels"
+required-features = ["deltanet"]

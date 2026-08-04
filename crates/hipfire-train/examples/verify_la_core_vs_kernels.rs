@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: Apache-2.0
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Cross-check the rest of the `linear_attn` core against the inference
+//! kernels, the way `verify_deltanet_vs_kernel` does for the recurrence.
+//!
+//! Those two together cover the whole core. What each of these settles is a
+//! LAYOUT or FORMULA question that no self-consistent host test can reach:
+//!
+//!   * **conv1d + SiLU + split.** Which tap is "now" and which is three tokens
+//!     back, and whether the channel block order is `[Q|K|V]`. Reversing the
+//!     taps is still a valid causal conv over the same weights, and swapping Q
+//!     with K is shape-identical whenever `hd_k == hd_v` — which the 35B has.
+//!   * **gated norm.** Whether `weight` multiplies the normalised value or the
+//!     gate, and whether the gate is `silu(z)` or `sigmoid(z)`. Both variants
+//!     are smooth, both train, and the wrong one is only visibly wrong in the
+//!     logits.
+//!   * **alpha / beta.** That `alpha = exp(softplus(a + dt_bias) * -exp(A_log))`
+//!     and `beta = sigmoid(b)`, against the kernel that computes them.
+//!
+//! Run: cargo run --release -p hipfire-train --features deltanet \
+//!        --example verify_la_core_vs_kernels
+
+use hipfire_rdna::{DType, Gpu};
+use hipfire_train::ops::deltanet::{linear_attn_core_forward, LinearAttnCore, LinearAttnDims};
+
+fn lcg(s: &mut u64) -> f32 {
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+}
+
+fn worst(a: &[f32], b: &[f32]) -> (f32, f32) {
+    let mut w = 0.0f32;
+    let mut mag = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        w = w.max((x - y).abs());
+        mag = mag.max(y.abs());
+    }
+    (w, w / mag.max(1e-6))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut gpu = Gpu::init()?;
+    // head_dim 128 for both k and v: the real geometry, and the width the
+    // recurrence kernel is compiled for.
+    let d = LinearAttnDims {
+        seq: 5,
+        h: 64,
+        n_heads: 2,
+        hd_k: 128,
+        hd_v: 128,
+        conv_k: 4,
+        eps: 1e-6,
+    };
+    let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
+    let qkv_dim = nh * (2 * hk + hv);
+    let (k_dim, v_dim) = (nh * hk, nh * hv);
+
+    let mut s = 0xc0ffee_u64;
+    let rnd = |n: usize, s: &mut u64, k: f32| (0..n).map(|_| k * lcg(s)).collect::<Vec<f32>>();
+
+    let qkv = rnd(seq * qkv_dim, &mut s, 0.5);
+    let a_raw = rnd(seq * nh, &mut s, 0.5);
+    let b_raw = rnd(seq * nh, &mut s, 0.5);
+    let z = rnd(seq * nh * hv, &mut s, 0.5);
+    let conv1d = rnd(qkv_dim * d.conv_k, &mut s, 0.5);
+    let a_log = rnd(nh, &mut s, 0.3);
+    let dt_bias = rnd(nh, &mut s, 0.3);
+    let norm: Vec<f32> = (0..hv).map(|_| 1.0 + 0.2 * lcg(&mut s)).collect();
+
+    let core = LinearAttnCore {
+        conv1d: &conv1d,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        norm: &norm,
+    };
+    let (normed, acts) = linear_attn_core_forward(&qkv, &a_raw, &b_raw, &z, &core, &d);
+
+    println!("linear_attn core vs inference kernels: seq={seq} heads={nh} hd={hk}");
+    let mut ok = true;
+
+    // ── conv1d + SiLU + [Q|K|V] split ────────────────────────────────────
+    {
+        let inp = gpu.upload_f32(&qkv, &[seq * qkv_dim])?;
+        let w = gpu.upload_f32(&conv1d, &[qkv_dim * d.conv_k])?;
+        // Ring buffer of conv_k-1 past samples per channel, zero for a fresh
+        // sequence — which is what the host's left zero-padding means.
+        let state = gpu.zeros(&[qkv_dim * (d.conv_k - 1)], DType::F32)?;
+        let qo = gpu.zeros(&[seq * k_dim], DType::F32)?;
+        let ko = gpu.zeros(&[seq * k_dim], DType::F32)?;
+        let vo = gpu.zeros(&[seq * v_dim], DType::F32)?;
+        gpu.conv1d_silu_split_f32_n(&qo, &ko, &vo, &inp, &w, &state, k_dim, v_dim, seq)?;
+        let (gq, gk, gv) = (
+            gpu.download_f32(&qo)?,
+            gpu.download_f32(&ko)?,
+            gpu.download_f32(&vo)?,
+        );
+        for (name, host, dev) in [
+            ("q", &acts.q, &gq),
+            ("k", &acts.k, &gk),
+            ("v", &acts.v, &gv),
+        ] {
+            let (abs, rel) = worst(host, dev);
+            println!("  conv+silu+split {name}: worst {abs:.3e} (rel {rel:.3e})");
+            ok &= rel < 1e-5;
+        }
+        for t in [inp, w, state, qo, ko, vo] {
+            gpu.free_tensor(t)?;
+        }
+    }
+
+    // ── alpha / beta activations ─────────────────────────────────────────
+    {
+        // The kernel transforms in place, one token at a time.
+        let mut host_alpha = Vec::with_capacity(seq * nh);
+        let mut host_beta = Vec::with_capacity(seq * nh);
+        let dtb = gpu.upload_f32(&dt_bias, &[nh])?;
+        let alg = gpu.upload_f32(&a_log, &[nh])?;
+        for t in 0..seq {
+            let bt = gpu.upload_f32(&b_raw[t * nh..(t + 1) * nh], &[nh])?;
+            let at = gpu.upload_f32(&a_raw[t * nh..(t + 1) * nh], &[nh])?;
+            gpu.fused_sigmoid_alpha_gate_f32(&bt, &at, &dtb, &alg, nh)?;
+            host_beta.extend(gpu.download_f32(&bt)?);
+            // The kernel leaves the GATE in the alpha buffer; the recurrence
+            // exponentiates it. The host stores the same pre-exp quantity.
+            host_alpha.extend(gpu.download_f32(&at)?);
+            gpu.free_tensor(bt)?;
+            gpu.free_tensor(at)?;
+        }
+        gpu.free_tensor(dtb)?;
+        gpu.free_tensor(alg)?;
+        let (ab, rb) = worst(&acts.beta, &host_beta);
+        let (aa, ra) = worst(&acts.gate, &host_alpha);
+        println!("  beta = sigmoid(b): worst {ab:.3e} (rel {rb:.3e})");
+        println!("  gate = softplus(a+dt)*-exp(A_log): worst {aa:.3e} (rel {ra:.3e})");
+        ok &= rb < 1e-5 && ra < 1e-5;
+    }
+
+    // ── gated norm ───────────────────────────────────────────────────────
+    {
+        let x = gpu.upload_f32(&acts.dn_out, &[seq * nh * hv])?;
+        let zt = gpu.upload_f32(&z, &[seq * nh * hv])?;
+        let w = gpu.upload_f32(&norm, &[hv])?;
+        let out = gpu.zeros(&[seq * nh * hv], DType::F32)?;
+        gpu.gated_norm_f32_batched(&x, &zt, &w, &out, nh, hv, d.eps, seq)?;
+        let g = gpu.download_f32(&out)?;
+        let (abs, rel) = worst(&normed, &g);
+        println!("  gated norm rmsnorm(x)*w*silu(z): worst {abs:.3e} (rel {rel:.3e})");
+        ok &= rel < 1e-5;
+        for t in [x, zt, w, out] {
+            gpu.free_tensor(t)?;
+        }
+    }
+
+    if ok {
+        println!("\nPASS — the core's layouts and formulas are the inference path's");
+        Ok(())
+    } else {
+        println!("\nFAIL");
+        std::process::exit(1)
+    }
+}
