@@ -770,6 +770,203 @@ pub fn model_gamma_backward(
     Ok(loss_sum)
 }
 
+/// Layer-STREAMED gamma capture: one layer resident at a time.
+///
+/// [`model_gamma_backward`] needs the whole model in f32 — ~5 GB for a 1B, but
+/// ~140 GB for a 35B against 128 GB of UMA, so it is a small-model instrument.
+/// Here each layer's weights are paged in, used, and dropped, so peak residency
+/// is the embedding table plus ONE layer plus the boundary activations
+/// (seq*h floats per layer, negligible). Depth becomes free.
+///
+/// Two passes over the layers, which is the standard gradient-checkpointing
+/// trade: the forward saves only each layer's INPUT, and the reverse walk
+/// recomputes that layer's internals from it rather than storing every
+/// activation for every layer. Costs one extra forward, saves O(depth) memory.
+///
+/// DENSE ONLY. `block_forward`/`block_backward_capture` are a pre-norm LLaMA
+/// block with no router or routed experts, so this cannot run a MoE — see
+/// docs/npu/scope-gamma-layer-streamed.md.
+#[allow(clippy::too_many_arguments)]
+pub fn model_gamma_streamed(
+    gpu: &mut Gpu,
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    cfg: &crate::config::LlamaConfig,
+    embed: &GpuTensor,
+    lm_head: Option<&GpuTensor>,
+    final_norm: &GpuTensor,
+    dims: &BlockDims,
+    token_ids: &[u32],
+    pos_host: &[f32],
+    targets: &[f32],
+    ignore_index: i32,
+    acc: &mut GammaAccum,
+) -> Result<f32, String> {
+    use crate::loader::{free_llama_layer_fp32, load_llama_layer_fp32_hfq};
+    let (seq, h) = (dims.seq, dims.h);
+    let vocab = cfg.vocab_size;
+    let n_layers = cfg.num_hidden_layers;
+    let e = |r: hipfire_rdna::HipError| format!("{r}");
+
+    // Zero LoRA (rank 1, B = 0) so the block runs exactly at the base weights.
+    let r = dims.lora_rank.max(1);
+    let qd = dims.q_dim();
+    let kvd = dims.kv_dim();
+    let zl = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32).map_err(e);
+    let lora = LayerLora {
+        aq: zl(gpu, r * h)?,
+        bq: zl(gpu, qd * r)?,
+        av: zl(gpu, r * h)?,
+        bv: zl(gpu, kvd * r)?,
+    };
+
+    // Embedding lookup.
+    let mut x = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    for (t, &tok) in token_ids.iter().enumerate() {
+        // (src, src_off, src_stride, dst, dst_off, dst_stride, rows, cols, accumulate)
+        gpu.strided_copy_2d(embed, tok as usize * h, h, &x, t * h, h, 1, h, false)
+            .map_err(e)?;
+    }
+
+    // Forward, keeping only each layer's INPUT on the host.
+    let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        layer_inputs.push(gpu.download_f32(&x).map_err(e)?);
+        let lw = load_llama_layer_fp32_hfq(gpu, hfq, cfg, i)?;
+        let (x_out, acts) =
+            block_forward(gpu, &x, &block_of(&lw), &lora.as_block(), dims, pos_host, i)
+                .map_err(e)?;
+        crate::block::free_block_acts(gpu, acts).map_err(e)?;
+        gpu.free_tensor(x).map_err(e)?;
+        x = x_out;
+        free_llama_layer_fp32(gpu, lw)?;
+    }
+
+    // Head: final norm -> logits -> CE -> back to the last block's output.
+    let x_last = x;
+    let xn = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    let rinv = gpu.zeros(&[seq], DType::F32).map_err(e)?;
+    rmsnorm_forward(gpu, &x_last, final_norm, &xn, &rinv, seq, h, dims.eps).map_err(e)?;
+    let logits = gpu.zeros(&[seq * vocab], DType::F32).map_err(e)?;
+    let out_proj = lm_head.unwrap_or(embed);
+    linear_forward(gpu, &xn, out_proj, &logits, seq, h, vocab).map_err(e)?;
+
+    let tgt = gpu.upload_f32(targets, &[seq]).map_err(e)?;
+    let loss = gpu.zeros(&[seq], DType::F32).map_err(e)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32).map_err(e)?;
+    cross_entropy(
+        gpu,
+        &logits,
+        &tgt,
+        &loss,
+        &d_logits,
+        seq,
+        vocab,
+        ignore_index,
+    )
+    .map_err(e)?;
+    let loss_sum: f32 = gpu.download_f32(&loss).map_err(e)?.iter().sum();
+
+    let d_xf = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false).map_err(e)?;
+    let mut d_x = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    let dw_dummy = gpu.zeros(&[h], DType::F32).map_err(e)?;
+    rmsnorm_backward(
+        gpu, &d_xf, &x_last, final_norm, &rinv, &d_x, &dw_dummy, seq, h,
+    )
+    .map_err(e)?;
+
+    // Reverse walk: page the layer back in, recompute its internals from the
+    // saved input, capture the adjoints, drop it.
+    for i in (0..n_layers).rev() {
+        let lw = load_llama_layer_fp32_hfq(gpu, hfq, cfg, i)?;
+        let x_in = gpu.upload_f32(&layer_inputs[i], &[seq * h]).map_err(e)?;
+        let (x_out, acts) = block_forward(
+            gpu,
+            &x_in,
+            &block_of(&lw),
+            &lora.as_block(),
+            dims,
+            pos_host,
+            i,
+        )
+        .map_err(e)?;
+        gpu.free_tensor(x_out).map_err(e)?;
+
+        let d_down = gpu.download_f32(&d_x).map_err(e)?;
+        let (d_in, _g, mut adj) = block_backward_capture(
+            gpu,
+            &d_x,
+            &x_in,
+            &block_of(&lw),
+            &lora.as_block(),
+            &acts,
+            dims,
+        )
+        .map_err(e)?;
+        adj.d_down = d_down;
+        accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, dims.inter);
+
+        crate::block::free_block_acts(gpu, acts).map_err(e)?;
+        gpu.free_tensor(x_in).map_err(e)?;
+        gpu.free_tensor(d_x).map_err(e)?;
+        d_x = d_in;
+        free_llama_layer_fp32(gpu, lw)?;
+    }
+    acc.n += 1;
+    Ok(loss_sum)
+}
+
+/// `BlockWeights` borrowed from a streamed `LlamaLayerF32`, so the streamed walk
+/// needs no owned `LayerWeights` copy of a layer it is about to drop.
+fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
+    BlockWeights {
+        norm1: &l.input_layernorm,
+        wq: &l.q_proj,
+        wk: &l.k_proj,
+        wv: &l.v_proj,
+        wo: &l.o_proj,
+        norm2: &l.post_attention_layernorm,
+        wgate: &l.gate_proj,
+        wup: &l.up_proj,
+        wdown: &l.down_proj,
+    }
+}
+
+/// Fold one layer's adjoints into the accumulator. Shared with
+/// [`model_gamma_backward`] so the streamed and whole-model paths cannot drift.
+pub fn accumulate_gamma(
+    acc: &mut GammaAccum,
+    layer: usize,
+    a: &BlockAdjoints,
+    seq: usize,
+    h: usize,
+    qd: usize,
+    kvd: usize,
+    inter: usize,
+) {
+    let p = format!("model.layers.{layer}");
+    for (name, d, width) in [
+        (format!("{p}.self_attn.q_proj"), &a.d_q, qd),
+        (format!("{p}.self_attn.k_proj"), &a.d_k, kvd),
+        (format!("{p}.self_attn.v_proj"), &a.d_v, kvd),
+        (format!("{p}.self_attn.o_proj"), &a.d_attn, h),
+        (format!("{p}.mlp.gate_proj"), &a.d_gate, inter),
+        (format!("{p}.mlp.up_proj"), &a.d_up, inter),
+        (format!("{p}.mlp.down_proj"), &a.d_down, h),
+    ] {
+        if width == 0 || d.len() < seq * width {
+            continue;
+        }
+        let mut tot = 0.0f64;
+        for r in 0..seq {
+            let row = &d[r * width..(r + 1) * width];
+            let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            tot += ss / width as f64;
+        }
+        *acc.sum.entry(name).or_insert(0.0) += tot / seq.max(1) as f64;
+    }
+}
+
 /// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.
 pub fn flatten_lora_grads(grads: &[BlockLoraGrad]) -> Vec<&GpuTensor> {
     let mut v = Vec::with_capacity(grads.len() * 4);

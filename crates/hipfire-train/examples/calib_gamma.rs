@@ -26,7 +26,8 @@ use hipfire_model::tokenizer::Tokenizer;
 use hipfire_rdna::Gpu;
 use hipfire_train::loader::{load_llama_fp32, load_llama_fp32_hfq};
 use hipfire_train::model::{
-    free_model_acts, model_forward, model_gamma_backward, GammaAccum, LlamaModel,
+    free_model_acts, model_forward, model_gamma_backward, model_gamma_streamed, GammaAccum,
+    LlamaModel,
 };
 use std::path::Path;
 
@@ -34,6 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Positional: <model_dir> <out.calib.hfq> [seq] [n_seq]; flag: --text <file>.
     let mut text_path: Option<String> = None;
     let mut tok_dir: Option<String> = None;
+    // Page one layer at a time instead of holding the model. Must produce the
+    // SAME gamma table as the whole-model path — that equality is the test.
+    let mut streamed = false;
     let mut plain = false; // --plain ⇒ w≡1 baseline (plain XᵀX over the same tokens)
     let mut skip_seq = 0usize; // --skip N ⇒ drop the first N sequences (held-out split)
     let mut pos_args: Vec<String> = Vec::new();
@@ -42,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match a.as_str() {
             "--text" => text_path = it.next(),
             "--tokenizer" => tok_dir = it.next(),
+            "--streamed" => streamed = true,
             "--plain" => plain = true,
             "--skip" => skip_seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             _ => pos_args.push(a),
@@ -131,9 +136,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             targets[t] = toks[t + 1] as f32;
         }
         targets[seq - 1] = -1.0;
-        let acts = model_forward(&mut gpu, &model, toks, &pos)?;
-        let loss = model_gamma_backward(&mut gpu, &model, &acts, &targets, -1, &mut acc)?;
-        free_model_acts(&mut gpu, acts)?;
+        let loss = if streamed {
+            let hfq = hipfire_runtime::hfq::HfqFile::open(dpath)?;
+            model_gamma_streamed(
+                &mut gpu,
+                &hfq,
+                &cfg,
+                &model.embed,
+                model.lm_head.as_ref(),
+                &model.final_norm,
+                &model.dims,
+                toks,
+                &pos,
+                &targets,
+                -1,
+                &mut acc,
+            )?
+        } else {
+            let acts = model_forward(&mut gpu, &model, toks, &pos)?;
+            let l = model_gamma_backward(&mut gpu, &model, &acts, &targets, -1, &mut acc)?;
+            free_model_acts(&mut gpu, acts)?;
+            l
+        };
         total += loss;
         eprintln!(
             "seq {}/{}  ce/tok {:.3}",

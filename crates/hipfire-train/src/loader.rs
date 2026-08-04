@@ -160,6 +160,60 @@ pub fn load_llama_fp32_hfq(
     ))
 }
 
+/// Load ONE layer's weights from a `.hfq`, for the layer-streamed gamma walk.
+///
+/// The per-model loader holds every layer at once, which is what caps
+/// `calib_gamma` at models that fit f32 (~5 GB for a 1B, ~140 GB for a 35B
+/// against 128 GB of UMA). Streaming one layer at a time makes peak residency
+/// independent of depth: one layer's weights plus the boundary activations,
+/// which are seq*hidden floats per layer and negligible beside them.
+///
+/// The caller is responsible for freeing the returned tensors before loading
+/// the next layer — that is the entire point.
+pub fn load_llama_layer_fp32_hfq(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    cfg: &LlamaConfig,
+    layer: usize,
+) -> Result<LlamaLayerF32, String> {
+    let h = cfg.hidden_size;
+    let q = cfg.q_dim();
+    let kv = cfg.kv_dim();
+    let inter = cfg.intermediate_size;
+    let p = format!("model.layers.{layer}");
+    let mut load = |name: String, want: Vec<usize>| load_tensor_f32_hfq(gpu, hfq, &name, &want);
+    Ok(LlamaLayerF32 {
+        input_layernorm: load(format!("{p}.input_layernorm.weight"), vec![h])?,
+        q_proj: load(format!("{p}.self_attn.q_proj.weight"), vec![q, h])?,
+        k_proj: load(format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?,
+        v_proj: load(format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?,
+        o_proj: load(format!("{p}.self_attn.o_proj.weight"), vec![h, q])?,
+        post_attention_layernorm: load(format!("{p}.post_attention_layernorm.weight"), vec![h])?,
+        gate_proj: load(format!("{p}.mlp.gate_proj.weight"), vec![inter, h])?,
+        up_proj: load(format!("{p}.mlp.up_proj.weight"), vec![inter, h])?,
+        down_proj: load(format!("{p}.mlp.down_proj.weight"), vec![h, inter])?,
+    })
+}
+
+/// Free one streamed layer's tensors.
+pub fn free_llama_layer_fp32(gpu: &mut Gpu, l: LlamaLayerF32) -> Result<(), String> {
+    for t in [
+        l.input_layernorm,
+        l.q_proj,
+        l.k_proj,
+        l.v_proj,
+        l.o_proj,
+        l.post_attention_layernorm,
+        l.gate_proj,
+        l.up_proj,
+        l.down_proj,
+    ] {
+        gpu.free_tensor(t)
+            .map_err(|e| format!("free layer tensor: {e}"))?;
+    }
+    Ok(())
+}
+
 /// `load_tensor_f32` against an HFQ artifact.
 ///
 /// Uses `tensor_data_cow`, not `tensor_data`: `--bf16-codec` defaults to `huff`,
