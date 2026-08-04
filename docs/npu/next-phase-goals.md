@@ -249,9 +249,9 @@ KLD AT 8.4% FEWER BITS.**
 
 Recipe: `--format oq4.25++ --awq-alpha 0.45 --ldlq --awq`
         `--tensor-format '*v_proj*=oq8++' --tensor-format '*o_proj*=oq8++'`
-        `--embed-precision bf16 --bf16-codec lut3`
+        `--embed-precision bf16`
 
-**ADD THE LUT3 EMBED CODEC — IT IS 11.9% OF THE ARTIFACT FOR ZERO QUALITY
+**ADD `--embed-precision bf16` — IT IS 11.9% OF THE ARTIFACT FOR ZERO QUALITY
 COST.** Llama-3.2-1B is TIED: one `model.embed_tokens.weight [128256, 2048]`
 serves both the embedding gather and the output matmul, and it was being stored
 F16 UNCOMPRESSED at 525.3 MB — about 40% of the artifact. It cannot be oq4 (a
@@ -267,6 +267,18 @@ Bit-identical because the values began life as bf16: bf16 checkpoint -> f16
 `.hfq` -> bf16 embed, and bf16->f16 is EXACT (f16 carries 10 mantissa bits to
 bf16's 7; only exponent range could bite, and weights are small). So the round
 trip recovers the original bits and `lut3` codes them losslessly.
+
+**Only the precision flag is needed — the codec policy was already right.**
+`--bf16-codec` ALREADY defaults to `huff`, and `compress_bf16_tensor` already
+steers gather-shaped tensors (`is_gather_shaped` = `lm_head` / `embed_tokens`)
+to `lut3` instead, because Huffman exposes whole-tensor decode only while LUT3
+is planar and block-addressable. Verified: `--embed-precision bf16` alone logs
+`1 gather-shaped as lut3` and produces a BYTE-IDENTICAL artifact (1079440309)
+to passing `--bf16-codec lut3` explicitly. So the reason the headline artifact
+missed this was never policy — the codec only touches `QuantType::BF16`, and
+`--embed-precision` defaults to `source`, so our F16 intermediate
+(`npuwork--fp16.hfq`) kept the table at F16 where no codec applies. A model
+whose source is genuinely bf16 gets this with no flags at all.
 
 Two bugs blocked this and are fixed in hipfire `4e6166cca`. `tensor_data`
 refuses compressed tensors by design, and the embed loader `.expect(...)`ed on
