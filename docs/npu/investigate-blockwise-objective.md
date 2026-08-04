@@ -72,6 +72,46 @@ scales) and needs a differentiable objective per step. **We only need to RANK
 loop. That collapses "wire the runtime into the allocator" down to "capture one
 extra scalar during calibration".
 
+## The capture ALREADY EXISTS — and normalizes away the one number we need
+
+This is the finding that matters. `hipfire-train` already implements every piece,
+because someone built GuidedQuant support:
+
+* `block_backward_capture` returns `BlockAdjoints { d_q, d_k, d_v, d_attn,
+  d_gate, d_up }` — "Per-linear OUTPUT adjoints (∂ℓ/∂z) captured during
+  backward". Those ARE the `g` in `G = E[g g^T]`, per projection.
+* `model_guided_adjoints` runs the whole forward+backward and returns them in
+  layer order.
+* `Gpu::calib_row_meansq_f32` computes `w[n] = (1/K) Σ_c d[n,c]²` — the
+  mean-square output gradient per token.
+* `CalibCollector::capture_weighted` accumulates `H̄ = Σ_n w[n]·xₙxₙᵀ`.
+
+So the gradient energy is computed today. But `down_guided_capture` then does:
+
+    let mean = download(w).sum() / seq;      // <- this IS gamma
+    if mean > 0.0 { gpu.scale_f32(&w, 1.0 / mean)?; }   // <- and discards it
+
+**The weights are normalized to mean 1 per tensor.** That is correct for
+GuidedQuant's own purpose — it wants which TOKENS matter within a layer, and
+normalizing keeps the guided and plain Hessians comparable for the
+guided-vs-plain diagnostic in `hipfire-quantize`. But it deliberately removes
+the per-tensor MAGNITUDE, and the magnitude is precisely the cross-tensor factor
+the allocator is missing.
+
+`mean` on that line is exactly `gamma_i`: mean over tokens of the mean-over-
+channels squared output gradient. It is computed and thrown away.
+
+**So the change is to record that scalar, not to build a backward pass.** One
+f32 per tensor, already in a register.
+
+Two gaps to close, both mechanical rather than novel:
+
+1. `down_guided_capture` only wires `mlp.down_proj`. The adjoints for the other
+   five projections are already returned in `BlockAdjoints` and simply not
+   consumed — o_proj's is `d_attn`, which is the one that matters most here.
+2. Nothing emits `gamma` into the `.calib.hfq`. It needs a slot beside
+   `<name>.imatrix` / `<name>.hessian`.
+
 ## Feasibility
 
 Backward machinery exists and is not hypothetical:
