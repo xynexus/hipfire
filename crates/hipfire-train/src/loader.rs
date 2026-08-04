@@ -9,6 +9,7 @@
 use crate::config::LlamaConfig;
 use hipfire_model::ModelSource;
 use hipfire_rdna::{Gpu, GpuTensor};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use std::path::Path;
 
@@ -88,6 +89,118 @@ pub fn load_llama_fp32(
             lm_head,
         },
     ))
+}
+
+/// Load an fp32 LLaMA from a `.hfq` artifact instead of a safetensors directory.
+///
+/// Exists because the models we actually measure are `.hfq` — the HF snapshots on
+/// this box ship Meta `.pth`, and `hipfire-coexistence export safetensors`
+/// implements only `zaya`. Config comes from the artifact's own metadata via
+/// [`LlamaConfig::from_hfq_metadata`], so the base is the exact served artifact.
+///
+/// Weights are widened to f32 on load. That is EXACT for a bf16 or f16 source —
+/// both are strict subsets of f32 — so it costs memory, not fidelity: ~4 GB for
+/// a 1B model. It does not scale, and deliberately so: a 35B would want bf16
+/// STORAGE through the forward and backward, which is a real change (the block
+/// keeps f32 master weights and the backward is f32 by design; note
+/// `HIPFIRE_TRAIN_LOWP=bf16` is bf16 COMPUTE over f32 storage and does not help
+/// here). This path is for models that fit.
+pub fn load_llama_fp32_hfq(
+    gpu: &mut Gpu,
+    path: &Path,
+) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
+    let hfq = HfqFile::open(path).map_err(|e| format!("open hfq {}: {e}", path.display()))?;
+    let cfg = LlamaConfig::from_hfq_metadata(hfq.metadata_json())?;
+
+    let load = |gpu: &mut Gpu, name: &str, want: &[usize]| -> Result<GpuTensor, String> {
+        load_tensor_f32_hfq(gpu, &hfq, name, want)
+    };
+
+    let h = cfg.hidden_size;
+    let q = cfg.q_dim();
+    let kv = cfg.kv_dim();
+    let inter = cfg.intermediate_size;
+
+    let embed_tokens = load(gpu, "model.embed_tokens.weight", &[cfg.vocab_size, h])?;
+    let final_norm = load(gpu, "model.norm.weight", &[h])?;
+    let lm_head = if cfg.tie_word_embeddings {
+        None
+    } else {
+        Some(load(gpu, "lm_head.weight", &[cfg.vocab_size, h])?)
+    };
+
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        let p = format!("model.layers.{i}");
+        layers.push(LlamaLayerF32 {
+            input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
+            k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
+            v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
+            o_proj: load(gpu, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?,
+            post_attention_layernorm: load(
+                gpu,
+                &format!("{p}.post_attention_layernorm.weight"),
+                &[h],
+            )?,
+            gate_proj: load(gpu, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
+            up_proj: load(gpu, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
+            down_proj: load(gpu, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+        });
+    }
+
+    Ok((
+        cfg,
+        LlamaWeightsF32 {
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        },
+    ))
+}
+
+/// `load_tensor_f32` against an HFQ artifact.
+///
+/// Uses `tensor_data_cow`, not `tensor_data`: `--bf16-codec` defaults to `huff`,
+/// so a bf16 artifact's tensors may be losslessly recoded, and the borrowing
+/// accessor returns None for those — reporting a present tensor as missing.
+fn load_tensor_f32_hfq(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    name: &str,
+    want_shape: &[usize],
+) -> Result<GpuTensor, String> {
+    let (info, bytes) = hfq
+        .tensor_data_cow(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+    if shape != want_shape {
+        return Err(format!(
+            "tensor {name}: shape {shape:?} != expected {want_shape:?}"
+        ));
+    }
+    // Only unquantized sources make sense as a training base.
+    let dtype = match info.quant_type {
+        1 => "F16",
+        2 => "F32",
+        16 => "BF16",
+        other => {
+            return Err(format!(
+                "tensor {name}: quant_type {other} is not an unquantized float;                  the fp32 training base needs an f16/f32/bf16 artifact"
+            ))
+        }
+    };
+    let f32s = bytes_to_f32(dtype, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?;
+    let expected: usize = want_shape.iter().product();
+    if f32s.len() != expected {
+        return Err(format!(
+            "tensor {name}: {} elements != expected {expected}",
+            f32s.len()
+        ));
+    }
+    gpu.upload_f32(&f32s, want_shape)
+        .map_err(|e| format!("upload {name}: {e}"))
 }
 
 /// Fetch a tensor's raw bytes, convert to fp32, validate shape, upload.

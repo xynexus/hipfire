@@ -16,7 +16,7 @@
 //! the per-token weights to mean 1 within each tensor — correct for its own
 //! purpose, but it discards exactly the cross-tensor magnitude wanted here.
 //!
-//!   calib_gamma <model_dir> <out.json> [seq] [n_seq] [--text <file>]
+//!   calib_gamma <model_dir-or-.hfq> <out.json> [seq] [n_seq] [--text <file>]
 //!
 //! With `--text`, the model's `tokenizer.json` encodes the file into real
 //! calibration sequences (meaningful Fisher weights). Without it, tokens are
@@ -24,7 +24,7 @@
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_rdna::Gpu;
-use hipfire_train::loader::load_llama_fp32;
+use hipfire_train::loader::{load_llama_fp32, load_llama_fp32_hfq};
 use hipfire_train::model::{
     free_model_acts, model_forward, model_gamma_backward, GammaAccum, LlamaModel,
 };
@@ -33,6 +33,7 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Positional: <model_dir> <out.calib.hfq> [seq] [n_seq]; flag: --text <file>.
     let mut text_path: Option<String> = None;
+    let mut tok_dir: Option<String> = None;
     let mut plain = false; // --plain ⇒ w≡1 baseline (plain XᵀX over the same tokens)
     let mut skip_seq = 0usize; // --skip N ⇒ drop the first N sequences (held-out split)
     let mut pos_args: Vec<String> = Vec::new();
@@ -40,12 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--text" => text_path = it.next(),
+            "--tokenizer" => tok_dir = it.next(),
             "--plain" => plain = true,
             "--skip" => skip_seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             _ => pos_args.push(a),
         }
     }
     let fisher = !plain;
+    let _ = fisher;
     let dir = pos_args
         .first()
         .cloned()
@@ -55,7 +58,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_seq: usize = pos_args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let (cfg, w) = load_llama_fp32(&mut gpu, Path::new(&dir))?;
+    // Accept either a safetensors dir or a .hfq artifact — on this box the
+    // measured models are .hfq (HF snapshots ship Meta .pth).
+    let dpath = Path::new(&dir);
+    let (cfg, w) = if dpath.extension().is_some_and(|e| e == "hfq") {
+        load_llama_fp32_hfq(&mut gpu, dpath)?
+    } else {
+        load_llama_fp32(&mut gpu, dpath)?
+    };
     let vocab = cfg.vocab_size;
     // rank-1 LoRA (B=0 ⇒ zero contribution); the backward computes + discards
     // its grads — this path drives the weighted-Hessian capture, not training.
@@ -64,8 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build calibration sequences.
     let sequences: Vec<Vec<u32>> = if let Some(tp) = &text_path {
-        let tok = Tokenizer::from_tokenizer_json(&Path::new(&dir).join("tokenizer.json"))?
-            .ok_or("no tokenizer.json in model dir")?;
+        // For a .hfq input there is no sibling tokenizer.json; allow
+        // --tokenizer to point at the HF snapshot that has one.
+        let tok_path = tok_dir
+            .as_ref()
+            .map(|d| Path::new(d).join("tokenizer.json"))
+            .unwrap_or_else(|| Path::new(&dir).join("tokenizer.json"));
+        let tok =
+            Tokenizer::from_tokenizer_json(&tok_path)?.ok_or("no tokenizer.json in model dir")?;
         let text = std::fs::read_to_string(tp)?;
         let ids = tok.encode(&text);
         eprintln!("tokenized {} chars -> {} tokens", text.len(), ids.len());
