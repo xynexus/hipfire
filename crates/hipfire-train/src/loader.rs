@@ -395,6 +395,104 @@ pub struct LinearAttnLayerF32 {
     pub conv_k: usize,
 }
 
+/// Load a dense MLP's `(gate, up, down)` for one layer, with `inter` taken
+/// from the tensor rather than config — a hybrid's linear_attn layers can
+/// carry a different MLP width than its attention layers.
+pub fn load_dense_mlp_fp32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    layer: usize,
+    h: usize,
+) -> Result<(GpuTensor, GpuTensor, GpuTensor, usize), String> {
+    let p = format!("{prefix}layers.{layer}.mlp");
+    let inter = src
+        .shape_of(&format!("{p}.gate_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no mlp.gate_proj"))?[0];
+    Ok((
+        upload_tensor(gpu, src, &format!("{p}.gate_proj.weight"), &[inter, h])?,
+        upload_tensor(gpu, src, &format!("{p}.up_proj.weight"), &[inter, h])?,
+        upload_tensor(gpu, src, &format!("{p}.down_proj.weight"), &[h, inter])?,
+        inter,
+    ))
+}
+
+/// A [`WeightSource`] that DEQUANTIZES on read.
+///
+/// `HfqFile`'s own impl deliberately refuses quantized tensors: training on
+/// dequantized weights is a different thing from training on the source, and
+/// that guard should stay. This wrapper is the explicit opt-in, and it exists
+/// for one job — running the hybrid assembly against a REAL model when no
+/// unquantized hybrid is on disk.
+///
+/// **Gamma captured through this is not production gamma.** It measures the
+/// quantized model's sensitivities, not the source's, which is the wrong input
+/// for deciding where to spend bits. It is a validation tool.
+pub struct DequantHfq<'a>(pub &'a HfqFile);
+
+impl WeightSource for DequantHfq<'_> {
+    fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.0.shape_of(name)
+    }
+    fn fetch_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        let (info, bytes) = self
+            .0
+            .tensor_data_cow(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+        let n: usize = shape.iter().product();
+        let mut w = match info.quant_type {
+            1 | 2 | 16 => {
+                let dt = match info.quant_type {
+                    1 => "F16",
+                    2 => "F32",
+                    _ => "BF16",
+                };
+                bytes_to_f32(dt, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?
+            }
+            3 => hipfire_runtime::quant::dequant_q8f16(bytes.as_ref(), n),
+            35 => hipfire_runtime::quant::dequant_oq8g256(bytes.as_ref(), n),
+            other => {
+                return Err(format!(
+                    "tensor {name}: quant_type {other} has no host dequantizer here; \
+                     Oq8G256 (35) and Q8F16 (3) are wired, Oq4 (34) is not"
+                ))
+            }
+        };
+        if w.len() != n {
+            return Err(format!("tensor {name}: decoded {} != {n}", w.len()));
+        }
+
+        // AWQ fold. The artifact stores W*s and the runtime computes
+        // (W*s)*(x/s) — see hfq.rs::load_awq_scale. This forward takes plain x,
+        // so the scale has to come back out of the WEIGHT, per input column.
+        // Getting the axis wrong here is silent: the shapes still line up.
+        if shape.len() == 2 {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
+            let sidecar = format!("{stem}.awq_scale.weight");
+            if let Some((si, sb)) = self.0.tensor_data_cow(&sidecar) {
+                let k = shape[1];
+                let sdt = match si.quant_type {
+                    1 => "F16",
+                    2 => "F32",
+                    16 => "BF16",
+                    o => return Err(format!("{sidecar}: unexpected quant_type {o}")),
+                };
+                let sc = bytes_to_f32(sdt, sb.as_ref()).map_err(|e| format!("{sidecar}: {e}"))?;
+                if sc.len() != k {
+                    return Err(format!("{sidecar}: len {} != K {k}", sc.len()));
+                }
+                for r in 0..shape[0] {
+                    for c in 0..k {
+                        w[r * k + c] /= sc[c];
+                    }
+                }
+            }
+        }
+        Ok((shape, w))
+    }
+}
+
 /// Load `embed_tokens` as fp32 from any weight source.
 pub fn load_embed_f32<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
@@ -558,7 +656,10 @@ pub fn layer_is_moe<S: WeightSource + ?Sized>(src: &S, prefix: &str, layer: usiz
 /// Tensor-name prefix an artifact uses: `model.` or `model.language_model.`
 /// (the multimodal wrapper). Probed once rather than guessed.
 pub fn detect_prefix<S: WeightSource + ?Sized>(src: &S) -> &'static str {
-    if src.has("model.language_model.layers.0.self_attn.q_proj.weight") {
+    // Probe input_layernorm, not self_attn: a hybrid can have linear_attn at
+    // layer 0 and no self_attn there at all, which made the old probe report
+    // the wrong prefix for exactly the models this crate now targets.
+    if src.has("model.language_model.layers.0.input_layernorm.weight") {
         "model.language_model."
     } else {
         "model."

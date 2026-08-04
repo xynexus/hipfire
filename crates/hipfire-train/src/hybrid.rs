@@ -26,8 +26,8 @@ use crate::la_block::{
 };
 use crate::loader::{
     free_linear_attn_layer_fp32, free_llama_layer_fp32, free_moe_layer_fp32, layer_is_linear_attn,
-    layer_is_moe, load_linear_attn_layer_fp32, load_llama_layer_fp32_hfq_pfx, load_moe_layer_fp32,
-    LinearAttnLayerF32, WeightSource,
+    layer_is_moe, load_dense_mlp_fp32, load_linear_attn_layer_fp32, load_llama_layer_fp32_hfq_pfx,
+    load_moe_layer_fp32, LinearAttnLayerF32, WeightSource,
 };
 use crate::model::GammaAccum;
 use crate::ops::cross_entropy::cross_entropy;
@@ -35,6 +35,7 @@ use crate::ops::deltanet::LinearAttnDims;
 use crate::ops::linear::{linear_backward_x, linear_forward};
 use crate::ops::moe::{free_moe_acts, moe_backward, moe_forward, MoeDims};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
+use crate::ops::swiglu::{swiglu_backward, swiglu_forward};
 
 /// What each layer of the stack turned out to be. Recorded on the forward pass
 /// so the reverse walk reloads the same thing rather than re-probing.
@@ -295,10 +296,14 @@ fn run_layer_forward<S: WeightSource + ?Sized>(
             drop(mw);
             free_moe_layer_fp32(gpu, ml)?;
         } else {
-            return Err(format!(
-                "layer {i}: linear_attn with a DENSE mlp is not wired; \
-                 no artifact in hand has that combination"
-            ));
+            // linear_attn + dense SwiGLU MLP — the Qwen3.5-0.8B shape.
+            let (wg, wu, wd, inter) = load_dense_mlp_fp32(gpu, src, prefix, i, h)?;
+            let mlp = dense_mlp_forward(gpu, &acts.xn2, &wg, &wu, &wd, seq, h, inter)?;
+            gpu.add_f32(&acts.x_mid, &mlp.out, &x_out).map_err(e)?;
+            free_dense_mlp_acts(gpu, mlp)?;
+            for t in [wg, wu, wd] {
+                gpu.free_tensor(t).map_err(e)?;
+            }
         }
         free_la_block_acts(gpu, acts).map_err(e)?;
         free_linear_attn_layer_fp32(gpu, l)?;
@@ -373,29 +378,39 @@ fn run_layer_backward<S: WeightSource + ?Sized>(
         let w = la_weights(&l);
         let acts = la_block_forward(gpu, x_in, &w, &d).map_err(e)?;
 
-        let (ml, inter) = load_moe_layer_fp32(gpu, src, prefix, i, h, n_experts)?;
-        let mw = crate::model::moe_weights_of(&ml);
-        let md = MoeDims {
-            seq,
-            h,
-            inter,
-            n_experts,
-            top_k,
+        let d_xn2 = if kind.is_moe() {
+            let (ml, inter) = load_moe_layer_fp32(gpu, src, prefix, i, h, n_experts)?;
+            let mw = crate::model::moe_weights_of(&ml);
+            let md = MoeDims {
+                seq,
+                h,
+                inter,
+                n_experts,
+                top_k,
+            };
+            let (moe_out, macts) = moe_forward(gpu, &acts.xn2, &mw, &md).map_err(e)?;
+            let (dx2, moe_adj) = moe_backward(gpu, d_x, &mw, &macts, &md).map_err(e)?;
+            crate::model::accumulate_gamma_moe(acc, i, &moe_adj, h, n_experts);
+            free_moe_acts(gpu, macts).map_err(e)?;
+            gpu.free_tensor(moe_out).map_err(e)?;
+            drop(mw);
+            free_moe_layer_fp32(gpu, ml)?;
+            dx2
+        } else {
+            let (wg, wu, wd, inter) = load_dense_mlp_fp32(gpu, src, prefix, i, h)?;
+            let mlp = dense_mlp_forward(gpu, &acts.xn2, &wg, &wu, &wd, seq, h, inter)?;
+            let (dx2, d_down) = dense_mlp_backward(gpu, d_x, &wg, &wu, &wd, &mlp, seq, h, inter)?;
+            accumulate_gamma_dense_mlp(acc, i, &d_down, seq, h);
+            free_dense_mlp_acts(gpu, mlp)?;
+            for t in [wg, wu, wd] {
+                gpu.free_tensor(t).map_err(e)?;
+            }
+            dx2
         };
-        let (_moe_out, macts) = moe_forward(gpu, &acts.xn2, &mw, &md).map_err(e)?;
-        let (d_xn2, moe_adj) = moe_backward(gpu, d_x, &mw, &macts, &md).map_err(e)?;
         let (d_in, la_adj) = la_block_backward(gpu, d_x, &d_xn2, x_in, &w, &acts, &d).map_err(e)?;
-
         accumulate_gamma_linear_attn(acc, i, &la_adj, seq, h, l.n_heads, l.hd_k, l.hd_v);
-        crate::model::accumulate_gamma_moe(acc, i, &moe_adj, h, n_experts);
-
-        free_moe_acts(gpu, macts).map_err(e)?;
         free_la_block_acts(gpu, acts).map_err(e)?;
-        for t in [_moe_out, d_xn2] {
-            gpu.free_tensor(t).map_err(e)?;
-        }
-        drop(mw);
-        free_moe_layer_fp32(gpu, ml)?;
+        gpu.free_tensor(d_xn2).map_err(e)?;
         free_linear_attn_layer_fp32(gpu, l)?;
         return Ok(d_in);
     }
@@ -471,6 +486,96 @@ fn run_layer_backward<S: WeightSource + ?Sized>(
     drop(bw);
     free_llama_layer_fp32(gpu, lw)?;
     Ok(d_in)
+}
+
+/// Saved dense-MLP state for one layer.
+pub struct DenseMlpActs {
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub act: GpuTensor,
+    pub out: GpuTensor,
+}
+
+/// `down(swiglu(gate(x), up(x)))` — the dense half of a hybrid layer whose
+/// attention side is linear_attn. `crate::block` only offers this fused into a
+/// full self-attention block, which a linear_attn layer cannot use.
+fn dense_mlp_forward(
+    gpu: &mut Gpu,
+    xn2: &GpuTensor,
+    wg: &GpuTensor,
+    wu: &GpuTensor,
+    wd: &GpuTensor,
+    seq: usize,
+    h: usize,
+    inter: usize,
+) -> Result<DenseMlpActs, String> {
+    let e = |r: hipfire_rdna::HipError| format!("{r}");
+    let gate = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    let up = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    let act = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    let out = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    linear_forward(gpu, xn2, wg, &gate, seq, h, inter).map_err(e)?;
+    linear_forward(gpu, xn2, wu, &up, seq, h, inter).map_err(e)?;
+    swiglu_forward(gpu, &gate, &up, &act, seq * inter).map_err(e)?;
+    linear_forward(gpu, &act, wd, &out, seq, inter, h).map_err(e)?;
+    Ok(DenseMlpActs { gate, up, act, out })
+}
+
+/// Returns `(d_xn2, d_down)` — the MLP's input gradient, and `down_proj`'s
+/// OUTPUT adjoint, which is where every path in this crate takes MLP gamma.
+fn dense_mlp_backward(
+    gpu: &mut Gpu,
+    d_out: &GpuTensor,
+    wg: &GpuTensor,
+    wu: &GpuTensor,
+    wd: &GpuTensor,
+    a: &DenseMlpActs,
+    seq: usize,
+    h: usize,
+    inter: usize,
+) -> Result<(GpuTensor, Vec<f32>), String> {
+    let e = |r: hipfire_rdna::HipError| format!("{r}");
+    // x_out = x_mid + mlp(xn2), so down_proj's output adjoint IS d_out.
+    let d_down = gpu.download_f32(d_out).map_err(e)?;
+    let d_act = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    linear_backward_x(gpu, d_out, wd, &d_act, seq, inter, h, false).map_err(e)?;
+    let d_gate = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    let d_up = gpu.zeros(&[seq * inter], DType::F32).map_err(e)?;
+    swiglu_backward(gpu, &d_act, &a.gate, &a.up, &d_gate, &d_up, seq * inter).map_err(e)?;
+    // gate and up both read xn2, so the second call ACCUMULATES (true).
+    let d_xn2 = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    linear_backward_x(gpu, &d_gate, wg, &d_xn2, seq, h, inter, false).map_err(e)?;
+    linear_backward_x(gpu, &d_up, wu, &d_xn2, seq, h, inter, true).map_err(e)?;
+    for t in [d_act, d_gate, d_up] {
+        gpu.free_tensor(t).map_err(e)?;
+    }
+    Ok((d_xn2, d_down))
+}
+
+fn free_dense_mlp_acts(gpu: &mut Gpu, a: DenseMlpActs) -> Result<(), String> {
+    for t in [a.gate, a.up, a.act, a.out] {
+        gpu.free_tensor(t).map_err(|r| format!("{r}"))?;
+    }
+    Ok(())
+}
+
+/// `down_proj`'s output-gradient energy, keyed exactly as the dense and routed
+/// paths key theirs so the table joins uniformly.
+fn accumulate_gamma_dense_mlp(
+    acc: &mut GammaAccum,
+    layer: usize,
+    d_down: &[f32],
+    seq: usize,
+    h: usize,
+) {
+    let mut tot = 0.0f64;
+    for r in 0..seq {
+        let row = &d_down[r * h..(r + 1) * h];
+        tot += row.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / h as f64;
+    }
+    *acc.sum
+        .entry(format!("model.layers.{layer}.mlp.down_proj"))
+        .or_insert(0.0) += tot / seq.max(1) as f64;
 }
 
 /// Group a finished gamma table by layer, for reporting.

@@ -16,7 +16,9 @@
 //!
 //! Run: cargo run --release -p hipfire-train --example gamma_hybrid
 
+use hipfire_model::ModelSource;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use hipfire_train::block::BlockDims;
 use hipfire_train::hybrid::{gamma_by_layer, gamma_hybrid_streamed, LayerKind};
@@ -31,14 +33,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("fixture {dir} not present — skipping");
         return Ok(());
     }
-    let raw: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path.join("config.json"))?)?;
+    // Either a safetensors directory or an .hfq. A quantized .hfq goes through
+    // DequantHfq, which is a VALIDATION path — see its doc comment: the gamma
+    // it yields describes the quantized model, not the source.
+    let is_hfq = path.extension().map(|e| e == "hfq").unwrap_or(false);
+    let hfq = if is_hfq {
+        Some(HfqFile::open(path)?)
+    } else {
+        None
+    };
+    let raw: serde_json::Value = match &hfq {
+        Some(f) => serde_json::from_str(f.metadata_json())?,
+        None => serde_json::from_str(&std::fs::read_to_string(path.join("config.json"))?)?,
+    };
+    let raw = raw.get("config").cloned().unwrap_or(raw);
+    // Qwen3.5-VL wraps the decoder config; the geometry lives in text_config.
+    let raw = raw.get("text_config").cloned().unwrap_or(raw);
     let cfg = hipfire_train::config::LlamaConfig::from_json_value(&raw)?;
     let n_experts = raw["num_experts"].as_u64().unwrap_or(0) as usize;
     let top_k = raw["num_experts_per_tok"].as_u64().unwrap_or(1) as usize;
 
-    let src = SafetensorsSource::open(path)?;
     let mut gpu = Gpu::init()?;
+    let st = if is_hfq {
+        None
+    } else {
+        Some(SafetensorsSource::open(path)?)
+    };
+    let dq = hfq.as_ref().map(hipfire_train::loader::DequantHfq);
+    let src: &dyn hipfire_train::loader::WeightSource = match (&dq, &st) {
+        (Some(d), _) => d,
+        (_, Some(s)) => s,
+        _ => unreachable!(),
+    };
+    let prefix = hipfire_train::loader::detect_prefix(src);
+    eprintln!(
+        "source: {} prefix {prefix:?}",
+        if is_hfq { "hfq" } else { "safetensors" }
+    );
 
     let seq = 8usize;
     let h = cfg.hidden_size;
@@ -55,11 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lora_rank: 1,
     };
 
-    let embed = hipfire_train::loader::load_embed_f32(&mut gpu, &src, "model.", cfg.vocab_size, h)?;
-    let final_norm = hipfire_train::loader::load_final_norm_f32(&mut gpu, &src, "model.", h)?;
+    let embed = hipfire_train::loader::load_embed_f32(&mut gpu, src, prefix, cfg.vocab_size, h)?;
+    let final_norm = hipfire_train::loader::load_final_norm_f32(&mut gpu, src, prefix, h)?;
 
     // A deterministic token window; targets are next-token.
-    let tokens: Vec<u32> = (0..seq).map(|i| ((i * 37 + 11) % 4096) as u32).collect();
+    let tokens: Vec<u32> = (0..seq)
+        .map(|i| ((i * 37 + 11) % cfg.vocab_size) as u32)
+        .collect();
     let targets: Vec<f32> = (0..seq)
         .map(|i| tokens[(i + 1) % seq] as f32)
         .collect::<Vec<_>>();
@@ -71,8 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (loss, kinds) = gamma_hybrid_streamed(
         &mut gpu,
-        &src,
-        "model.",
+        src,
+        prefix,
         &cfg,
         &dims,
         &embed,
