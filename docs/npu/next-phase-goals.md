@@ -790,17 +790,35 @@ Each of these produced a confident wrong result that survived at least one check
     you would expect if it is relieving contention rather than enabling
     placement.
 
-    Second, and the point of the exercise: **8 cores reach 20.0 GB/s, not 54.7.**
-    Scaling is sublinear and flattening (8 cores buys 4.5x over one), and 8 is
-    the practical ceiling — it matches the 8 shim tiles, and 16 does not produce
-    a correct result. So the projection's bandwidth premise is NOT supported at
-    decode shape on this path; it is short by 2.7x.
+    Second — and correcting a wrong reading this note carried for one commit —
+    **20.0 GB/s at 8 cores CORROBORATES the 54.7 figure rather than
+    contradicting it.** The temptation is to compare 20.0 against 54.7 and
+    conclude the premise is 2.7x optimistic. That is wrong on two counts: 54.7
+    was MEASURED, not projected (the two-pass lm_head above pins it directly),
+    and it was measured on the fused design across **32 cores**, against this
+    probe's 8.
 
-    Caveat that keeps this from being the final word: this is the stock int16
-    `kernels.mv`, not an `oq4++` tile shape, so it bounds THIS path rather than
-    proving anything about oq4++ directly. But it is the same DMA fabric, and
-    bytes/second is the quantity in question, so a 2.7x gap is not something a
-    format change plausibly closes.
+    Fit the scaling instead. Over 1 -> 8 cores the exponent is 0.727
+    (4.41 -> 20.00 GB/s), which extrapolates to:
+
+        16 cores   33.1 GB/s
+        32 cores   54.8 GB/s      vs 54.7 measured
+
+    Landing within 0.2% of an independently measured number, from a different
+    design on the same fabric, is meaningful corroboration — the sublinear curve
+    is the real shape of this DMA fabric, and the fused design sits exactly
+    where that curve predicts at its core count.
+
+    Treat the extrapolation as support, not proof: it is two doublings past the
+    last measured point and the curve could flatten further. The way to close it
+    is a 16-core run, which needs more than raising `n_cores` — 16 failed
+    verification here, since one shim endpoint pair per core exhausts the 8 shim
+    tiles and cores must start sharing columns.
+
+    Also note this is the stock int16 `kernels.mv`, not an `oq4++` tile shape.
+    It bounds this path rather than proving oq4++ directly — but since it lands
+    on the same fabric ceiling, the format question is back to being about bytes
+    moved, which is what the top of this document already argues.
 
     Two further gaps to be aware of before trusting any number from this path:
     `kernels.mv` documents `np.int16` inputs ONLY, so it cannot express the
