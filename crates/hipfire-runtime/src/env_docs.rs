@@ -2028,14 +2028,14 @@ pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4100",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4103",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
 pub const ENV_HIPFIRE_GPU_SLAB_MIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_MIB",
     description: "Parses \"HIPFIRE_GPU_SLAB_MIB\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2426",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2429",
 };
 
 /// `HIPFIRE_GPU_TOPK` — HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU
@@ -2259,7 +2259,7 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_ROTATE",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:7105",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:7115",
 };
 
 /// `HIPFIRE_KVARN_SIM` — Environment toggle value controls runtime behavior
@@ -3866,7 +3866,7 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
     description:
         "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4371",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4374",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values

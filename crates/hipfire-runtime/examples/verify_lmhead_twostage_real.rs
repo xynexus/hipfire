@@ -45,8 +45,8 @@ fn main() {
 
     let hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let (info, bytes) = hfq
-        .tensor_data("lm_head.weight")
-        .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+        .tensor_data_cow("lm_head.weight")
+        .or_else(|| hfq.tensor_data_cow("model.embed_tokens.weight"))
         .expect("no lm_head.weight / embed_tokens.weight tensor");
     assert_eq!(
         info.quant_type, 16,
@@ -63,7 +63,7 @@ fn main() {
 
     // Upload the raw bf16 weight as a BF16 GpuTensor.
     let mut lmhead = gpu
-        .upload_raw(bytes, &[bytes.len()])
+        .upload_raw(bytes.as_ref(), &[bytes.len()])
         .expect("upload lm_head");
     lmhead.dtype = DType::BF16;
 

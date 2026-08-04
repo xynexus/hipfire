@@ -121,7 +121,7 @@ fn load_all(path: &str) -> (u32, String, Vec<Tensor>) {
     let tensors = names
         .into_iter()
         .map(|(name, qt, shape, gs)| {
-            let (_, data) = hfq.tensor_data(&name).expect("tensor data");
+            let (_, data) = hfq.tensor_data_cow(&name).expect("tensor data");
             Tensor {
                 name,
                 quant_type: qt,

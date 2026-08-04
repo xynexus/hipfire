@@ -153,8 +153,9 @@ impl VisionWeights {
 
 fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_cow(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
+    let data = data.as_ref();
     let mut vals: Vec<f32> = match info.quant_type {
         1 => data
             .chunks_exact(2)
@@ -181,8 +182,9 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_cow(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
+    let data = data.as_ref();
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
         1 => {
@@ -267,7 +269,7 @@ pub fn load_vision_weights(
     // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load
     // time for the gemm_f16 path — there is no GPU HFQ4 kernel for vision yet.
     // See CHANGELOG.md "v0.1.7-alpha.4 / Vision" for details.
-    if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
+    if let Some(info) = hfq.find_tensor_info("model.visual.patch_embed.proj.weight") {
         let fmt = match info.quant_type {
             1 => "F16 (direct)",
             6 => "HFQ4-G256 (dequanting to F16 on load)",

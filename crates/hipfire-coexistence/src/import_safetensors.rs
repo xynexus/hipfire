@@ -141,13 +141,13 @@ fn convert_zaya(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         &entries,
         |i, w| {
             let name = &sources[i];
-            let (_, bytes) = hf.tensor_data(name).ok_or_else(|| {
+            let (_, bytes) = hf.tensor_data_cow(name).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("no data for source tensor {name:?}"),
                 )
             })?;
-            w.write_all(bytes)
+            w.write_all(bytes.as_ref())
         },
     )?;
     Ok(())
@@ -211,7 +211,11 @@ mod tests {
             &dir.join("model.safetensors"),
             &[
                 ("model.final_norm.weight", vec![4], final_norm.clone()),
-                ("model.layers.0.input_norm.weight", vec![4], input_norm.clone()),
+                (
+                    "model.layers.0.input_norm.weight",
+                    vec![4],
+                    input_norm.clone(),
+                ),
                 (
                     "model.layers.1.res_scale.residual_scale",
                     vec![2],
