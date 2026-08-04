@@ -70,6 +70,7 @@ from aie.iron import (  # noqa: E402
     Out,
     Program,
     Runtime,
+    TaskGroup,
     Worker,
     kernels,
     str_to_dtype,
@@ -192,9 +193,11 @@ def int_matmul(
     C_tiles = TensorTiler2D.group_tiler((M, N), (m, n), (rows_per_block // 2, N_div_n), prune_step=False)
     c_index = 0
 
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(worker)
+    # IRON v1.4: the runtime sequence is a CALLBACK, not a context manager, and
+    # fill/drain moved onto the fifo handles. Mirrors
+    # programming_examples/basic/matrix_multiplication/single_core.
+    def sequence(A, B, C, inA_h, inB_h, outC_h):
+        nonlocal c_index
         tgs = []
         for tile_row_block in range(iron.ceildiv(M_div_m, rows_per_block)):
             for pingpong in [0, 1]:
@@ -202,20 +205,22 @@ def int_matmul(
                 num_tile_rows = min([rows_per_block // 2, M_div_m - row_base])
                 if num_tile_rows <= 0:
                     break
-                tgs.append(rt.task_group())
+                tgs.append(TaskGroup())
                 for tile_row in range(num_tile_rows):
                     tile_offset = (row_base + tile_row) % len(A_tiles)
-                    rt.fill(inA.prod(), A, tap=A_tiles[tile_offset], task_group=tgs[-1])
-                    rt.fill(inB.prod(), B, tap=b_tap, task_group=tgs[-1])
-                rt.drain(outC.cons(), C, tap=C_tiles[c_index], task_group=tgs[-1], wait=True)
+                    inA_h.fill(A, tap=A_tiles[tile_offset], group=tgs[-1])
+                    inB_h.fill(B, tap=b_tap, group=tgs[-1])
+                outC_h.drain(C, tap=C_tiles[c_index], group=tgs[-1], wait=True)
                 c_index += 1
                 if tile_row_block > 0 or (tile_row_block == 0 and pingpong > 0):
-                    rt.finish_task_group(tgs[-2])
+                    tgs[-2].finish()
                     del tgs[-2]
-        rt.finish_task_group(tgs[-1])
+        tgs[-1].finish()
         del tgs[-1]
 
-    return Program(iron.get_current_device(), rt).resolve_program()
+    rt = Runtime(sequence, [A_ty, B_ty, C_ty, inA.prod(), inB.prod(), outC.cons()])
+    # `rt.start(worker)` is gone; workers are declared on the Program now.
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
 
 
 # Default micro-tile (per-core) dims. int8 AIE2 mac_dims are (4,8,8); these
