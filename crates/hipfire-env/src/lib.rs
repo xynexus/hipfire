@@ -434,6 +434,14 @@ env_vars! {
          allocator loses to hand-picked promotions — the two need different \
          fixes and the dump costs only the sensitivity pass.";
 
+    MIXED_BPW_FULL_H = "HIPFIRE_MIXED_BPW_FULL_H", Developer,
+        "Set 1 to rank `--mixed-bpw` candidates by the FULL Hessian output error \
+         `tr(dW H dW^T)` instead of its diagonal (imatrix) approximation. Off by \
+         default because it was measured not to matter: it reorders 38 of 113 \
+         tensors by at most 3 places and does not move o_proj out of the bottom \
+         third, for several minutes of extra work. Any tr(dW H dW^T) is \
+         layer-local, and o_proj matters through error propagated downstream.";
+
     // ── Quantizer: MiniMax expert precision (hipfire-quantize) ──────────────
     // Presence-only switches: these are read with `is_set`, so `=0` still counts
     // as set. That is the pre-existing `var_os` behaviour, kept deliberately.

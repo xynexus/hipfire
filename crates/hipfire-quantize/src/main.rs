@@ -5462,6 +5462,10 @@ fn run_hfq_source_pipeline(
             let mut cands: Vec<TierCandidate> = Vec::new();
             // Parallel to `cands`; only populated under the ranking dump.
             let mut oq8_residual: Vec<f64> = Vec::new();
+            // Diagonal proxy alongside whatever `err_oq4` ended up being, so the
+            // dump can show how the two objectives rank differently.
+            let mut diag_err: Vec<f64> = Vec::new();
+            let mut n_full = 0usize;
             for t in &hfq.tensors {
                 if t.shape.len() != 2 || !should_quantize(&t.name) {
                     continue;
@@ -5482,8 +5486,33 @@ fn run_hfq_source_pipeline(
                         &ones
                     }
                 };
-                let err =
+                // Full-Hessian output error where a Hessian is available, else
+                // the diagonal (imatrix) proxy. The diagonal mis-ranks o_proj to
+                // the bottom third despite it being the largest measured
+                // promotion win — see docs/npu/scope-auto-mixed-precision.md.
+                let err_diag =
                     hipfire_quantize::mixed_precision::oq4_sensitivity(&f32d, m, k, &im, &s1, &s2);
+                // OFF by default. Measured 2026-08-04: the full Hessian moves
+                // 38 of 113 tensors by at most 3 places and leaves o_proj at
+                // 79..113, so it costs ~4 min of sensitivity pass to change
+                // nothing. Kept because it is the honest layer-local objective
+                // and it is what rules the layer-local family out — see
+                // docs/npu/scope-auto-mixed-precision.md.
+                let err_full = hipfire_env::MIXED_BPW_FULL_H
+                    .flag()
+                    .then(|| ())
+                    .and(OQ4_LDLQ_HESSIAN.get())
+                    .and_then(|idx| ldlq_hessian_for_tensor(idx, &t.name, k))
+                    .and_then(|h| {
+                        hipfire_quantize::mixed_precision::oq4_output_sensitivity(
+                            &f32d, m, k, &h, &s1, &s2,
+                        )
+                    });
+                if err_full.is_some() {
+                    n_full += 1;
+                }
+                let err = err_full.unwrap_or(err_diag);
+                diag_err.push(err_diag);
                 // Residual that promotion CANNOT remove. Only computed for the
                 // ranking dump for now — see the note in assign_tiers.
                 let err8 = if hipfire_env::MIXED_BPW_RANK.flag() {
@@ -5500,6 +5529,11 @@ fn run_hfq_source_pipeline(
                     err_oq4: err,
                 });
             }
+            eprintln!(
+                "mixed-bpw: full-Hessian objective on {} of {} tensors (rest fall back to diag)",
+                n_full,
+                cands.len()
+            );
             let plan = assign_tiers(&cands, target, Tier::Oq4);
             let promoted: Vec<&TierCandidate> = cands
                 .iter()
@@ -5539,19 +5573,31 @@ fn run_hfq_source_pipeline(
                     .zip(oq8_residual.iter())
                     .map(|(c, &e8)| (c.name.as_str(), e8))
                     .collect();
+                // Rank each tensor under the DIAGONAL objective too, so the two
+                // orderings can be compared without running a quantize.
+                let mut by_diag: Vec<(&str, f64)> = cands
+                    .iter()
+                    .zip(diag_err.iter())
+                    .map(|(c, &d)| (c.name.as_str(), d / c.numel.max(1) as f64))
+                    .collect();
+                by_diag.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let diag_rank: std::collections::HashMap<&str, usize> = by_diag
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, _))| (*n, i + 1))
+                    .collect();
                 eprintln!(
-                    "{:>4}  {:>12}  {:>12}  {:>12}  {:>7}  {}",
-                    "rank", "density", "err_oq4", "err_oq8", "removed", "tensor"
+                    "{:>4}  {:>9}  {:>12}  {:>12}  {}",
+                    "rank", "diag_rank", "density", "err_oq4", "tensor"
                 );
+                let _ = &res;
                 for (i, c) in ranked.iter().enumerate() {
-                    let e8 = res.get(c.name.as_str()).copied().unwrap_or(0.0);
                     eprintln!(
-                        "{:>4}  {:>12.4e}  {:>12.4e}  {:>12.4e}  {:>6.2}%  {}",
+                        "{:>4}  {:>9}  {:>12.4e}  {:>12.4e}  {}",
                         i + 1,
+                        diag_rank.get(c.name.as_str()).copied().unwrap_or(0),
                         c.err_oq4 / c.numel.max(1) as f64,
                         c.err_oq4,
-                        e8,
-                        if c.err_oq4 > 0.0 { 100.0 * (c.err_oq4 - e8) / c.err_oq4 } else { 0.0 },
                         c.name
                     );
                 }

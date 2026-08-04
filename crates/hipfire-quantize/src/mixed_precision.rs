@@ -10,6 +10,7 @@
 //! bits-per-weight budget. The result is a per-tensor format map the quantizer
 //! consults so oq2 only ever carries the least-important weights.
 
+use faer::Mat;
 use std::collections::{HashMap, HashSet};
 
 use crate::codecs::{
@@ -174,6 +175,60 @@ pub fn oq2_sensitivity(
     (0..k)
         .map(|c| per_col[c] * imatrix_col.get(c).copied().unwrap_or(1.0) as f64)
         .sum()
+}
+
+/// TRUE layer output error at oq4: `tr(dW H dW^T)` with the FULL Hessian.
+///
+/// [`oq4_sensitivity`] computes this quantity's DIAGONAL approximation — the
+/// captured imatrix is `diag(H) = E[x_j^2]` — which is the standard GPTQ/imatrix
+/// proxy. The diagonal drops every cross-channel term, and measurement says that
+/// is not a small omission here: ranked by the diagonal proxy, `o_proj` lands
+/// 79th-113th of 113 while being the single largest measured promotion win
+/// (-15.1% KLD alone). It has low per-weight reconstruction error but feeds the
+/// residual stream directly, and only the off-diagonal sees that.
+///
+/// `dW` is already in the ORIGINAL basis: `quantize_oq4g256` rotates and
+/// `dequant_oq4g256` rotates back, so the round-trip error needs no inverse
+/// transform and `hessian` is the raw captured `H`, not a rebased one. That is
+/// what makes this affordable — no O(k^3) congruence, just the contraction.
+///
+/// Cost is `m*k^2` MACs. `hessian` is row-major `k*k`.
+///
+/// Known approximation, unchanged from the diagonal version: this quantizes the
+/// RAW weights, while the pipeline applies AWQ scaling first. It measures what
+/// 4-bit costs at this layer, not what one particular artifact's AWQ choices
+/// cost.
+pub fn oq4_output_sensitivity(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    hessian: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Option<f64> {
+    debug_assert_eq!(weights_f32.len(), m * k);
+    if hessian.len() != k * k {
+        return None;
+    }
+    let q = quantize_oq4g256(weights_f32, signs1, signs2);
+    let deq = dequant_oq4g256(&q, m * k, signs1, signs2);
+
+    // E (m x k) and H (k x k) in f32: f64 would be 537 MB for a k=8192 Hessian,
+    // and this is a ranking statistic, not a solve.
+    let e = Mat::<f32>::from_fn(m, k, |r, c| weights_f32[r * k + c] - deq[r * k + c]);
+    let h = Mat::<f32>::from_fn(k, k, |i, j| hessian[i * k + j]);
+
+    // tr(E H E^T) = sum over all entries of (E H) elementwise-times E. faer's
+    // matmul is blocked and threaded; a rayon-over-rows matvec would re-stream
+    // the whole Hessian per row (268 MB at k=8192).
+    let eh = &e * &h;
+    let mut acc = 0.0f64;
+    for r in 0..m {
+        for c in 0..k {
+            acc += (eh[(r, c)] as f64) * (e[(r, c)] as f64);
+        }
+    }
+    Some(acc)
 }
 
 /// imatrix-weighted output error at oq8 — the RESIDUAL that promotion cannot
