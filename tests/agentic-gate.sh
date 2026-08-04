@@ -160,31 +160,23 @@ MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 
 find_model_file() {
+    # Canonical artifact names only (AGENTS.md: `<family>-<size>--<quant>.hfq`).
+    # The legacy dotted/lowercase fallbacks that used to live here matched
+    # nothing on disk and made this gate SKIP silently while reporting success.
     local name="$1"
-    local stem alt dot_alt dir cand
-    stem="${name%.hfq}"
-    alt="${stem/-mq4.hfq/-mq4}"
-    dot_alt="${stem/-mq4/-mq4.hfq}"
+    local dir cand
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        for cand in \
-            "$dir/$name" \
-            "$dir/$stem" \
-            "$dir/$stem.hfq" \
-            "$dir/$alt" \
-            "$dir/$alt.hfq" \
-            "$dir/$dot_alt" \
-            "$dir/$dot_alt.hfq"; do
-            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
-        done
+        cand="$dir/$name"
+        [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
     done
     return 1
 }
 
-A3B_35="$(find_model_file "qwen3.5-35b-a3b-mq4.hfq" || true)"
+A3B_35="$(find_model_file "Qwen3.5-35B-A3B--mq4.hfq" || true)"
 # Defaults to the Qwen3.6 A3B artifact. If the old zero-token issue recurs,
 # set HIPFIRE_AGENTIC_GATE_QWEN36_MODEL=qwen3.6-27b-mq4.hfq to force the dense
 # predicate-only fallback without changing the script.
-A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-qwen3.6-35b-a3b-mq4.hfq}" || true)"
+A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-Qwen3.6-35B-A3B--mq4.hfq}" || true)"
 PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
