@@ -680,6 +680,89 @@ pub fn model_calib_down_backward(
     Ok(loss_sum)
 }
 
+/// Mean squared OUTPUT gradient per linear, accumulated over calibration
+/// sequences — the `gamma` in the K-FAC factorization
+/// `dL ~= 1/2 tr(dW^T G dW H)` under the approximation `G ~= gamma*I`.
+///
+/// Why this is not already available: [`down_guided_capture`] computes exactly
+/// this quantity and then NORMALIZES it away (`w /= mean`) before handing the
+/// weights to `capture_weighted`. That is right for GuidedQuant, which wants
+/// which TOKENS matter within a layer and needs guided/plain Hessians on a
+/// comparable scale. But it discards the per-tensor MAGNITUDE, and the
+/// magnitude is the whole cross-tensor signal — it is what says o_proj matters
+/// more than k_proj.
+///
+/// Keyed by HFQ tensor name without `.weight`, matching the imatrix/hessian
+/// convention so the quantizer joins them the same way.
+#[derive(Debug, Default, Clone)]
+pub struct GammaAccum {
+    pub sum: std::collections::HashMap<String, f64>,
+    pub n: usize,
+}
+
+impl GammaAccum {
+    /// Mean over accumulated sequences.
+    pub fn finish(&self) -> std::collections::HashMap<String, f32> {
+        let d = self.n.max(1) as f64;
+        self.sum
+            .iter()
+            .map(|(k, v)| (k.clone(), (v / d) as f32))
+            .collect()
+    }
+}
+
+/// Forward+backward accumulating per-linear output-gradient energy for every
+/// projection, via [`block_backward_capture`].
+///
+/// The plain [`model_calib_down_backward`] path uses `block_backward` and can
+/// only see `down_proj`, because down_proj's output IS the block output
+/// pre-residual and its adjoint is `d_x` before the block consumes it. Every
+/// other projection's adjoint exists only inside the backward, which is what
+/// [`BlockAdjoints`] exposes.
+pub fn model_gamma_backward(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    targets: &[f32],
+    ignore_index: i32,
+    acc: &mut GammaAccum,
+) -> HipResult<f32> {
+    let (loss_sum, adjoints) = model_guided_adjoints(gpu, model, acts, targets, ignore_index)?;
+    let (seq, h) = (model.dims.seq, model.dims.h);
+    // q is n_heads*head_dim, k/v are n_kv*head_dim (GQA).
+    let qd = model.dims.n_heads * model.dims.head_dim;
+    let kvd = model.dims.n_kv * model.dims.head_dim;
+    let inter = model.dims.inter;
+
+    for (i, a) in adjoints.iter().enumerate() {
+        let p = format!("model.layers.{i}");
+        // (name, adjoint rows, per-row width). Mean over rows of the
+        // mean-over-channels square — the same statistic
+        // `calib_row_meansq_f32` forms, kept UNNORMALISED.
+        for (name, d, width) in [
+            (format!("{p}.self_attn.q_proj"), &a.d_q, qd),
+            (format!("{p}.self_attn.k_proj"), &a.d_k, kvd),
+            (format!("{p}.self_attn.v_proj"), &a.d_v, kvd),
+            (format!("{p}.self_attn.o_proj"), &a.d_attn, h),
+            (format!("{p}.mlp.gate_proj"), &a.d_gate, inter),
+            (format!("{p}.mlp.up_proj"), &a.d_up, inter),
+        ] {
+            if width == 0 || d.len() < seq * width {
+                continue;
+            }
+            let mut tot = 0.0f64;
+            for r in 0..seq {
+                let row = &d[r * width..(r + 1) * width];
+                let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                tot += ss / width as f64;
+            }
+            *acc.sum.entry(name).or_insert(0.0) += tot / seq.max(1) as f64;
+        }
+    }
+    acc.n += 1;
+    Ok(loss_sum)
+}
+
 /// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.
 pub fn flatten_lora_grads(grads: &[BlockLoraGrad]) -> Vec<&GpuTensor> {
     let mut v = Vec::with_capacity(grads.len() * 4);
