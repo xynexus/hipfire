@@ -169,6 +169,50 @@ Ruled out by this, on top of what was already cleared:
   buffer immediately after the "LinearAttention residual" trace point, so it
   IS the post-layer residual stream, as assumed.
 
+### Position 0 diverges, which narrows it hard
+
+`cos(numpy, ref)` at position 0 is 0.489 — and at position 0 the recurrence has
+no history and the conv sees a single token, so the whole layer collapses to a
+closed form. The defect is in the PER-TOKEN math, not in sequential state
+handling. That eliminates the conv ring buffer, the state carry, and every
+ordering question about time.
+
+### Variant sweep at layer 0
+
+Each is one edit in the numpy oracle (`VAR` argument), scored as mean cosine
+against the runtime over 64 positions:
+
+| variant | pos0 | mean | last |
+|---|---|---|---|
+| base (current) | 0.489 | 0.452 | 0.298 |
+| **`input_layernorm` as `1 + w`** | **0.552** | **0.619** | **0.633** |
+| no `input_layernorm` | 0.438 | 0.284 | 0.086 |
+| conv taps reversed | 0.440 | 0.430 | 0.305 |
+| q/k swapped in the split | 0.489 | 0.439 | 0.229 |
+| `[V|Q|K]` split order | 0.435 | 0.247 | 0.036 |
+| no conv at all | 0.282 | 0.165 | -0.001 |
+| no silu after conv | 0.510 | 0.454 | 0.290 |
+
+Everything except the unit-offset norm is worse, which is further confirmation
+for the conv, the split order, and silu.
+
+### The `1 + w` lead is NOT acted on
+
+It is the one variant that improves, and substantially. But:
+
+- No unit-offset appears anywhere in hipfire's qwen35 rmsnorm path, and the
+  runtime ships working Qwen3.5 inference, so plain `w` is what actually runs.
+- The weight statistics are ambiguous rather than supporting: layer-0
+  `input_layernorm` centres on +0.24 and layer 5 on +0.43 — neither the ~0 a
+  `1 + w` convention implies nor the ~1 of a plain weight. The final norm
+  centres on +3.31, which fits neither.
+
+So this is recorded as a lead, not a change. Acting on a metric improvement
+that contradicts the implementation is exactly the mistake the AWQ retraction
+above was about, and one improving number is not worth repeating it. What
+would settle it: find where the runtime applies these two norms and read
+whether anything is added to the weight.
+
 One unexplained observation worth chasing: in this implementation the MLP
 branch contributes almost nothing — rms 0.0011 against the attention branch's
 0.0135 and the residual's 0.0206. A dense SwiGLU MLP contributing 5% of the
