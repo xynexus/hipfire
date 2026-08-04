@@ -2093,6 +2093,17 @@ impl Gpu {
         })
     }
 
+    /// Owning counterpart of [`Self::upload_raw`]. Needed wherever a raw upload
+    /// happens in a LOOP: `GpuTensor` has no `Drop`, so the non-owning form
+    /// retains every buffer for the life of the process.
+    pub fn upload_raw_owned(&mut self, data: &[u8], shape: &[usize]) -> HipResult<OwnedTensor> {
+        let inner = self.upload_raw(data, shape)?;
+        Ok(OwnedTensor {
+            inner,
+            mailbox: Arc::clone(&self.free_mailbox),
+        })
+    }
+
     /// Return every buffer enqueued by dropped `OwnedTensor`s to the pool.
     ///
     /// EXPLICIT and graph-gated. While any graph state is live

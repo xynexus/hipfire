@@ -70,7 +70,7 @@ async fn assemble_health_json(state: &SharedState) -> Value {
         Some(false) => "degraded",
         _ => "ok",
     };
-    let diffusion = diffusion_health_payload(state).await;
+    let diffusion = diffusion_health_payload(&state).await;
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));

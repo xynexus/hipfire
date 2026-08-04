@@ -1871,6 +1871,213 @@ impl Gpu {
             &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
         )
     }
+    /// OBS error propagation: `residual[r, f] -= sum_c err[r, c] * L[f, c0+c]`
+    /// for every `f >= c1`. `residual` is `[m, k]` f32 row-major and updated in
+    /// place, so it can stay device-resident across every block of a tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qtip_obs_propagate(
+        &mut self,
+        residual: &GpuTensor,
+        err: &GpuTensor,
+        l: &GpuTensor,
+        m: usize,
+        k: usize,
+        c0: usize,
+        c1: usize,
+    ) -> HipResult<()> {
+        if c1 >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qtip_obs_propagate",
+            kernels::QTIP_OBS_PROPAGATE_SRC,
+            "qtip_obs_propagate",
+        )?;
+        let r_ptr = residual.buf.as_ptr();
+        let e_ptr = err.buf.as_ptr();
+        let l_ptr = l.buf.as_ptr();
+        let (mi, ki, c0i, c1i) = (m as i32, k as i32, c0 as i32, c1 as i32);
+        let cols = k - c1;
+        let gx = cols.div_ceil(256) as u32;
+        self.launch_kernargs(
+            "qtip_obs_propagate",
+            [gx, m as u32, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr r_ptr, ptr e_ptr, ptr l_ptr, i32 mi, i32 ki, i32 c0i, i32 c1i],
+        )
+    }
+    /// Right-looking Cholesky trailing update: `A[i,j] -= sum_t L[i,j0+t]·L[j,j0+t]`
+    /// over the LOWER triangle of the trailing submatrix. `a` is `[k, k]` f32
+    /// row-major and updated in place.
+    pub fn chol_syrk_trailing(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        let g = n.div_ceil(16) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
+    /// Gather the Cholesky panel (rows `j0..k`, cols `j0..j0+jb`) into a
+    /// contiguous `[rows, jb]` buffer.
+    pub fn chol_panel_gather(
+        &mut self,
+        a: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_panel_gather",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_panel_gather",
+        )?;
+        let (a_ptr, o_ptr) = (a.buf.as_ptr(), out.buf.as_ptr());
+        let (ki, j0i, jbi, ri) = (k as i32, j0 as i32, jb as i32, rows as i32);
+        self.launch_kernargs(
+            "chol_panel_gather",
+            [jb.div_ceil(64) as u32, rows as u32, 1],
+            [64, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr o_ptr, i32 ki, i32 j0i, i32 jbi, i32 ri],
+        )
+    }
+    /// Scatter a factored panel back into the device matrix, lower triangle only.
+    pub fn chol_panel_scatter(
+        &mut self,
+        a: &GpuTensor,
+        src: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_panel_scatter",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_panel_scatter",
+        )?;
+        let (a_ptr, s_ptr) = (a.buf.as_ptr(), src.buf.as_ptr());
+        let (ki, j0i, jbi, ri) = (k as i32, j0 as i32, jb as i32, rows as i32);
+        self.launch_kernargs(
+            "chol_panel_scatter",
+            [jb.div_ceil(64) as u32, rows as u32, 1],
+            [64, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr s_ptr, i32 ki, i32 j0i, i32 jbi, i32 ri],
+        )
+    }
+    /// Gather block `[c0, c0+256)` from a device-resident `[m, k]` residual into
+    /// a contiguous `[m, 256]` buffer for the trellis encoder.
+    pub fn qtip_gather_block(
+        &mut self,
+        residual: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        k: usize,
+        c0: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qtip_gather_block",
+            kernels::QTIP_OBS_PROPAGATE_SRC,
+            "qtip_gather_block",
+        )?;
+        let r_ptr = residual.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let (mi, ki, c0i) = (m as i32, k as i32, c0 as i32);
+        self.launch_kernargs(
+            "qtip_gather_block",
+            [m as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr r_ptr, ptr o_ptr, i32 mi, i32 ki, i32 c0i],
+        )
+    }
+    /// QTIP-3 GEMV, 3INST codebook (`Qtip3G256I3`). Byte-identical contract to
+    /// [`Self::gemv_qtip3g256`] — same layout, same pre-rotated x — decoded with
+    /// the 3INST map instead of 1MAD.
+    pub fn gemv_qtip3g256i3(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip3g256i3",
+            kernels::GEMV_QTIP3G256I3_SRC,
+            "gemv_qtip3g256i3",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        self.launch_kernargs(
+            "gemv_qtip3g256i3",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
+        )
+    }
+    /// QTIP-3 3INST GEMV with fused residual add (y += W·x).
+    pub fn gemv_qtip3g256i3_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip3g256i3",
+            kernels::GEMV_QTIP3G256I3_SRC,
+            "gemv_qtip3g256i3_residual",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        self.launch_kernargs(
+            "gemv_qtip3g256i3_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
+        )
+    }
     /// QTIP-4 GEMV (plain, y = W·x). The 4-bit sibling of `gemv_qtip3g256`:
     /// same computed 1MAD codebook / 12-bit trellis, 132 B/group nibble packing.
     /// x must be pre-FWHT-rotated by the caller (rotate_x_mq_for), same contract.
@@ -1944,12 +2151,38 @@ impl Gpu {
         n_groups: usize,
         bits: u32,
     ) -> HipResult<()> {
+        self.qtip_viterbi_encode_cb(w, symbols, backptr, scales, n_groups, bits, false)
+    }
+    /// As [`Self::qtip_viterbi_encode`], but `use_3inst` selects the 3INST
+    /// codebook encoder. The choice MUST match the codebook the artifact will be
+    /// decoded with (Qtip3G256 = 1MAD, Qtip3G256I3 = 3INST) — the encoder picks
+    /// symbols to minimise error against whichever it bakes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qtip_viterbi_encode_cb(
+        &mut self,
+        w: &GpuTensor,
+        symbols: &GpuTensor,
+        backptr: &GpuTensor,
+        scales: &GpuTensor,
+        n_groups: usize,
+        bits: u32,
+        use_3inst: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "qtip_viterbi_encode",
-            kernels::QTIP_VITERBI_ENCODE_SRC,
-            "qtip_viterbi_encode",
-        )?;
+        let (key, src, entry) = if use_3inst {
+            (
+                "qtip_viterbi_encode_i3",
+                kernels::QTIP_VITERBI_ENCODE_I3_SRC,
+                "qtip_viterbi_encode_i3",
+            )
+        } else {
+            (
+                "qtip_viterbi_encode",
+                kernels::QTIP_VITERBI_ENCODE_SRC,
+                "qtip_viterbi_encode",
+            )
+        };
+        self.ensure_kernel(key, src, entry)?;
         let w_ptr = w.buf.as_ptr();
         let sym_ptr = symbols.buf.as_ptr();
         let bp_ptr = backptr.buf.as_ptr();
@@ -1957,7 +2190,7 @@ impl Gpu {
         let ng = n_groups as i32;
         let b = bits as i32;
         self.launch_kernargs(
-            "qtip_viterbi_encode",
+            entry,
             [n_groups as u32, 1, 1],
             [256, 1, 1],
             0,
@@ -4818,6 +5051,47 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.launch_gemv_generic("gemv_bf16_bf16", kernels::GEMV_BF16_BF16_SRC, w, x, y, m, k)
+    }
+
+    /// Plain-BF16 GEMV with the same 8-elements-per-lane access shape as
+    /// [`Self::gemv_bf16l3`]. Same maths as [`Self::gemv_bf16_bf16`]; exists as
+    /// the like-for-like baseline that separates the BF16L3 compression win
+    /// from the coalescing win. Requires `k % 256 == 0`.
+    pub fn gemv_bf16_vec8(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_bf16_vec8 requires K % 256 == 0, got K={k}"
+        );
+        self.launch_gemv_generic("gemv_bf16_vec8", kernels::GEMV_BF16_VEC8_SRC, w, x, y, m, k)
+    }
+
+    /// GEMV against BF16L3-compressed weights, decoded in-kernel: `w` is the
+    /// packed payload of the logical [M,K] BF16 matrix (see
+    /// `hipfire_primitives::bf16_lut3`), `x` [K] BF16, `y` [M] BF16.
+    ///
+    /// Bit-identical to [`Self::gemv_bf16_bf16`] on the same weights — the
+    /// format is lossless — while reading ~1.38× fewer weight bytes.
+    ///
+    /// `k` must be a multiple of `bf16_lut3::BLOCK` (256): the format blocks the
+    /// flattened tensor, so rows begin on a block boundary only then.
+    pub fn gemv_bf16l3(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 256, 0, "gemv_bf16l3 requires K % 256 == 0, got K={k}");
+        self.launch_gemv_generic("gemv_bf16l3", kernels::GEMV_BF16L3_SRC, w, x, y, m, k)
     }
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(

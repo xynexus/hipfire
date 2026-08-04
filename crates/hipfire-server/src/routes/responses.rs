@@ -66,6 +66,20 @@ pub struct ResponsesRequest {
     /// renders its tool block — without this the template's `{% if tools %}` branch
     /// never fires and the model is never told any tools exist.
     pub tools: Option<Value>,
+    /// Scheduler priority band, same top-level field the chat route reads.
+    pub priority: Option<i64>,
+    /// Client metadata. Only `hipfire_priority` is read (see `request_priority`) —
+    /// Corrode carries the band here.
+    pub metadata: Option<Value>,
+}
+
+/// Scheduler priority for this request. The top-level `priority` field (the chat
+/// route's convention) wins; `metadata.hipfire_priority` is accepted as a fallback
+/// carrier. Absent or malformed -> None, and the scheduler applies its default —
+/// clamping happens downstream, exactly as on the chat path.
+fn request_priority(body: &ResponsesRequest) -> Option<i64> {
+    body.priority
+        .or_else(|| body.metadata.as_ref()?.get("hipfire_priority")?.as_i64())
 }
 
 /// Whether the client asked to keep reasoning inline in the visible text. Mirrors the
@@ -238,7 +252,7 @@ async fn execute_responses_owned(
         frequency_penalty: body.frequency_penalty,
         max_tokens: body.max_output_tokens.or(body.max_tokens),
         stop: body.stop.clone(),
-        priority: None,
+        priority: request_priority(&body),
         tools: normalize_tools(body.tools.clone()),
         system: None,
         reasoning_effort: body.reasoning_effort.clone(),
@@ -472,7 +486,7 @@ async fn stream_responses(
             &req_id,
             &loaded.model_path,
             &chat_messages,
-            None,
+            request_priority(&body),
             scheduler_owner,
         )
         .await
@@ -533,7 +547,9 @@ async fn stream_responses(
             .await;
 
         let mut engine_guard = state.engine.lock().await;
-        let mut engine = match engine_guard.take() {
+        // Borrowed, never moved out — an owned `DaemonEngine` dropped on any
+        // early exit would `kill_on_drop` (SIGKILL) the inference worker.
+        let engine = match engine_guard.as_mut() {
             Some(engine) => engine,
             None => {
                 let _ = tx
@@ -548,7 +564,6 @@ async fn stream_responses(
 
         if !loaded.cache_capable {
             if let Err(e) = engine.reset().await {
-                *engine_guard = Some(engine);
                 let _ = tx
                     .send(Ok(sse_json_event(
                         "error",
@@ -566,6 +581,9 @@ async fn stream_responses(
         // the whole reasoning block as answer text.
         let mut think_filter = ThinkStreamFilter::started_in_think();
         let mut reasoning_text = String::new();
+        // Captured before the move so a client disconnect can cooperatively
+        // cancel this exact request in the worker (SIGUSR1 + drain).
+        let gen_req_id = gen_req.id.clone();
         let result = engine
             .generate_streaming_events_controlled(gen_req, |event| {
                 if tx.is_closed() {
@@ -609,7 +627,6 @@ async fn stream_responses(
                         0,
                     );
                 }
-                *engine_guard = Some(engine);
                 // Already split by the stream filter — reasoning went out on its own
                 // event, so there is nothing left to strip here.
                 let mut stored = messages;
@@ -658,17 +675,31 @@ async fn stream_responses(
                     .await;
             }
             Ok(None) => {
-                tracing::info!(
-                    response_id = %response_id,
-                    "responses stream client disconnected; dropping daemon"
-                );
-                *state.loaded_model_path.lock().await = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-                drop(engine);
+                // Cooperatively cancel and keep the worker + loaded model
+                // resident, as the chat routes do; only discard the engine
+                // (SIGKILL-on-drop) if the drain fails, since unread events
+                // would corrupt the next request.
+                let drained = engine.abort_and_drain(&gen_req_id).await;
+                match drained {
+                    Ok(()) => {
+                        tracing::info!(
+                            response_id = %response_id,
+                            "responses stream client disconnected; cancelled generation, worker retained"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            response_id = %response_id, error = %e,
+                            "responses stream cancel/drain failed; dropping daemon"
+                        );
+                        *state.loaded_model_path.lock().await = None;
+                        *state.loaded_model_cache_capable.lock().await = None;
+                        *state.loaded_model_max_seq.lock().await = None;
+                        *engine_guard = None;
+                    }
+                }
             }
             Err(e) => {
-                *engine_guard = Some(engine);
                 let _ = tx
                     .send(Ok(sse_json_event(
                         "error",
@@ -1212,6 +1243,33 @@ mod tests {
         let builtin = json!([{"type": "web_search"}]);
         assert_eq!(normalize_tools(Some(builtin.clone())).unwrap(), builtin);
         assert!(normalize_tools(None).is_none());
+    }
+
+    // The scheduler band must survive the wire: top-level `priority` (chat convention)
+    // wins, Corrode's `metadata.hipfire_priority` is honored as the fallback, and
+    // anything absent or malformed falls through to None so the scheduler's default
+    // applies — never an error.
+    #[test]
+    fn request_priority_reads_body_field_then_metadata_then_defaults() {
+        let request = |body: Value| serde_json::from_value::<ResponsesRequest>(body).unwrap();
+
+        // metadata carrier, exactly as Corrode sends it
+        let body = request(json!({"input": "hi", "metadata": {"hipfire_priority": 255}}));
+        assert_eq!(request_priority(&body), Some(255));
+
+        // top-level field wins over metadata
+        let body =
+            request(json!({"input": "hi", "priority": 0, "metadata": {"hipfire_priority": 255}}));
+        assert_eq!(request_priority(&body), Some(0));
+
+        // absent -> None -> scheduler default downstream
+        assert_eq!(request_priority(&request(json!({"input": "hi"}))), None);
+
+        // garbage -> None, not an error
+        let body = request(json!({"input": "hi", "metadata": {"hipfire_priority": "high"}}));
+        assert_eq!(request_priority(&body), None);
+        let body = request(json!({"input": "hi", "metadata": "not-an-object"}));
+        assert_eq!(request_priority(&body), None);
     }
 
     #[test]

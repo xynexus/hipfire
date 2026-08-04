@@ -59,12 +59,24 @@ the relevant docs under `docs/`.
   The former pre-fork `master` history is preserved as the archival
   `master-prefork` branch; do not base new work on it or merge it wholesale into
   `master` unless the user explicitly requests historical recovery work.
-- Start feature and fix work from an up-to-date `upstream/master` on a descriptive
+- **`origin` (github.com/xynexus/hipfire) is the only baseline.** `upstream`
+  (github.com/Kaden-Schutt/hipfire) is the pre-fork original and is
+  **disconnected** — we do not track, fetch, rebase onto, or merge from it. If
+  the remote is still configured locally, ignore it. Comparing against it is
+  actively misleading: it has 23 crates to our ~99, differs by 1500+ files, and
+  lacks whole crates this tree depends on, so a diff against `upstream/master`
+  will report an unrelated codebase rather than in-flight work.
+- Start feature and fix work from an up-to-date `origin/master` on a descriptive
   topic branch. Prefer reviewed pull requests for integration; commit or push
   directly to `master` only when the user explicitly requests that workflow.
-- Before meaningful changes, fetch `upstream` and rebase or merge the topic branch
-  onto the latest `upstream/master` when the worktree state allows it. Do not
-  rewrite published shared history without explicit approval.
+- Before meaningful changes, fetch `origin` and rebase or merge the topic branch
+  onto the latest `origin/master` when the worktree state allows it. Check
+  `origin/master` — never `upstream` — for competing in-flight work before a
+  refactor. Do not rewrite published shared history without explicit approval.
+- `git stash` is unusable in this repo: the untracked `.agents/` symlink tree
+  makes it fail, and a failed `stash` followed by `stash pop` will restore an
+  unrelated older stash over your work. Use `git show HEAD:<path>` or
+  `git diff <path>` to compare against HEAD instead.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 
@@ -79,9 +91,24 @@ the relevant docs under `docs/`.
   suites first. Shell gates should remain enforcement wrappers when they still
   provide baseline comparison or hook integration.
 - Non-daemon GPU binaries do not self-lock. Coordinate GPU examples, benches,
-  `hipfire eval`, and `hipfire-quantize` with
-  `hipfire lock {acquire,release,status}` unless the called gate already does
-  so.
+  and `hipfire-quantize` with `hipfire lock {acquire,release,status}` unless the
+  called gate already does so.
+- `hipfire-eval` is the exception: it loads through the daemon, which acquires
+  the resource lock itself. Do NOT wrap it in `hipfire lock` — it deadlocks
+  against the caller's own holder, and the failure names your own label as the
+  blocker (`resource hip-gpu-0 ... is locked by <your label> ... mode=run`).
+  Run it directly.
+- The lock itself is sound: `flock(2)` is kernel state and is released when its
+  holder dies, so a crashed job never wedges the lock. The daemon acquires with
+  a real `try_lock`, not by reading anything.
+- But the holder LINE in `~/.hipfire/locks/hip-gpu-0.lock` is file contents, not
+  kernel state, so it outlives its writer — and it is what the "is locked by
+  ..." message NAMES. A stale line therefore makes a genuine contention error
+  point at a long-dead pid, which is badly misleading when the real holder is
+  something else (a wrapper you started, a daemon that outlived its run).
+  `hipfire lock kill` now clears such a line when it can prove the writer is
+  gone; if you are staring at an error naming a pid that `ps` does not show,
+  run it and read the message again.
 
 ## Artifact Names
 

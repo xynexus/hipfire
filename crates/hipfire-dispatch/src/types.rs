@@ -111,7 +111,7 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd
         | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
         // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
         // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
@@ -131,7 +131,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
         | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
             GemvVariant::Prerotated
         }
@@ -214,6 +214,8 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq3G256Prerotated,
     GemvQtip3G256Prerotated,
+    /// 3INST-codebook sibling of [`Self::GemvQtip3G256Prerotated`].
+    GemvQtip3G256I3Prerotated,
     GemvQtip4G256Prerotated,
     GemvMq2G256Prerotated,
     GemvMq6G256Prerotated,
@@ -236,6 +238,7 @@ pub enum KernelKey {
     GemvMq4G256Residual,
     GemvMq3G256Residual,
     GemvQtip3G256Residual,
+    GemvQtip3G256I3Residual,
     GemvQtip4G256Residual,
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
@@ -247,6 +250,7 @@ pub enum KernelKey {
     GemvMq4G256SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
     GemvQtip3G256SwiGLUResidual,
+    GemvQtip3G256I3SwiGLUResidual,
     GemvQtip4G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
@@ -595,6 +599,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             Qtip3G256 => Ok(Self::GemvQtip3G256Prerotated),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3Prerotated),
             Qtip4G256 => Ok(Self::GemvQtip4G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
@@ -642,6 +647,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
             Qtip3G256 => Ok(Self::GemvQtip3G256Residual),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3Residual),
             Qtip4G256 => Ok(Self::GemvQtip4G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
@@ -664,6 +670,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
             Qtip3G256 => Ok(Self::GemvQtip3G256SwiGLUResidual),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3SwiGLUResidual),
             Qtip4G256 => Ok(Self::GemvQtip4G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
@@ -700,7 +707,7 @@ impl KernelKey {
             MQ3G256 => ArchPredicate::HasWmma,
             // QTIP-3/4 decode is pure integer hash + fp mul-add (no WMMA/dot/sdot
             // intrinsics), so the gemv_qtip{3,4}g256 kernels run on every arch.
-            Qtip3G256 | Qtip4G256 => ArchPredicate::Always,
+            Qtip3G256 | Qtip3G256I3 | Qtip4G256 => ArchPredicate::Always,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             // Opus Quant W4A4 / W8A8 (grouped, FWHT-rotated) — int activations +
@@ -763,6 +770,13 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ4G128
             | MQ3G256
             | Qtip3G256
+            // I3 weights are FWHT-rotated exactly like Qtip3G256 — only the
+            // codebook differs. Omitting it here made this return false, taking
+            // the no-rotation early return in weight_gemv/run_auto: activations
+            // unrotated AND the AWQ divide skipped, KLD 8.27. The sibling
+            // dtype_rotation_plan / dtype_post_rotation_variant already listed it,
+            // so the three were inconsistent.
+            | Qtip3G256I3
             | MQ2G256
             | MQ6G256
             | MQ8G256

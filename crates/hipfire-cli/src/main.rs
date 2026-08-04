@@ -46,6 +46,8 @@ enum Command {
     Bench(commands::bench::BenchArgs),
     /// Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
     Doctor(commands::doctor::DoctorArgs),
+    /// List the environment variables hipfire reads, with descriptions
+    Env(commands::env::EnvArgs),
     /// Measure host, GPU-copy, and model storage bandwidth
     HostProfile(commands::forward::HostProfileArgs),
     /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
@@ -216,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
         Some(Command::Bench(args)) => commands::bench::run(args, loaded_config).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, loaded_config).await,
+        Some(Command::Env(args)) => commands::env::run(args),
         Some(Command::HostProfile(args)) => {
             commands::forward::run_host_profile(args, loaded_config)
         }

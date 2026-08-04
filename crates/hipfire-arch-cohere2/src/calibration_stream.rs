@@ -6,7 +6,8 @@ use hipfire_model::{ModelSource, ARCH_ID_COHERE2_MOE};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::calibration::contracts::{
     CalibError, CalibrationJob, CaptureAdmission, CaptureDescriptor, CaptureId, CapturePolicy,
-    CaptureRegistry, ExpertCaptureRole, ExpertTelemetry, ProjectionRole, SampleRow,
+    CaptureRegistry, ExpertCaptureRole, ExpertTelemetry, ProjectionRole, RoutedRowContext,
+    SampleRow,
 };
 use hipfire_runtime::calibration::schedule::LayerMicrobatch;
 use hipfire_runtime::calibration::source::{
@@ -1234,9 +1235,11 @@ pub(crate) fn execute_cohere2_row(
                     .iter()
                     .map(|(_, weight)| *weight)
                     .collect::<Vec<_>>();
+                // No row provenance in scope; load/gate statistics only, matching
+                // this call's behavior before the context parameter existed.
                 telemetry.record_router_selection(
                     layer,
-                    hipfire_runtime::calibration::contracts::RoutedRowContext::unknown(),
+                    RoutedRowContext::unknown(),
                     &indices,
                     &route_weights,
                 )?;

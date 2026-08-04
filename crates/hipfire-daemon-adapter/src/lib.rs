@@ -285,6 +285,35 @@ impl DaemonTransport for StdioTransport {
     }
 }
 
+/// Ask the worker at `pid` to stop its in-flight generation: SIGUSR1, whose
+/// handler sets the process-global atomic the per-token decode loop polls. The
+/// worker stays resident (model loaded) and emits its normal terminal `done`.
+///
+/// Synchronous, so a `Drop` impl can call it. A request future cancelled by a
+/// client disconnect gets no chance to await [`DaemonEngine::abort_and_drain`],
+/// and the abandoned generation would otherwise decode to completion into a pipe
+/// nobody reads — burning GPU and stalling the next request behind it. Frames
+/// already queued stay in the stream; the next request skips them by id.
+pub fn signal_worker_cancel(pid: u32) -> anyhow::Result<()> {
+    // SAFETY: `kill(2)` with SIGUSR1 to the worker we spawned. The worker's
+    // handler only sets an atomic; delivery is harmless even if the worker has
+    // just finished (the flag is reset at the next request start).
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("failed to SIGUSR1 worker pid {pid}: {err}");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        anyhow::bail!("cooperative cancel unsupported on this platform")
+    }
+}
+
 /// A connection to an ALREADY-RUNNING daemon over its unix socket.
 ///
 /// The counterpart to [`StdioTransport`], which spawns a private daemon and owns
@@ -410,13 +439,6 @@ impl DaemonEngine {
         })
     }
 
-    /// Whether the inference worker process is still alive. Logs the worker's
-    /// exit status once when it is first observed dead. Used by `/health` so the
-    /// server reports `degraded` instead of `ok` when the worker has crashed.
-    pub fn worker_alive(&mut self) -> bool {
-        self.transport.is_worker_alive()
-    }
-
     /// Ask the daemon what its scheduler has done.
     ///
     /// These counters only exist inside the daemon: reply ordering observed by a
@@ -492,6 +514,13 @@ impl DaemonEngine {
         Self::spawn(bin).await
     }
 
+    /// Whether the inference worker process is still alive. Logs the worker's
+    /// exit status once when it is first observed dead. Used by `/health` so the
+    /// server reports `degraded` instead of `ok` when the worker has crashed.
+    pub fn worker_alive(&mut self) -> bool {
+        self.transport.is_worker_alive()
+    }
+
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {
         self.transport.send_json(req).await
     }
@@ -540,22 +569,7 @@ impl DaemonEngine {
             .worker_pid()
             .ok_or_else(|| anyhow::anyhow!("cannot cancel: worker pid unavailable"))?;
 
-        // SAFETY: `kill(2)` with SIGUSR1 to the worker we spawned. The worker's
-        // handler only sets an atomic; delivery is harmless even if the worker
-        // has just finished (the flag is reset at the next request start).
-        #[cfg(unix)]
-        {
-            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                anyhow::bail!("failed to SIGUSR1 worker pid {pid}: {err}");
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pid;
-            anyhow::bail!("cooperative cancel unsupported on this platform");
-        }
+        signal_worker_cancel(pid)?;
 
         // Drain until the terminal frame for this request. Cancellation is fast,
         // so a short bound is enough; on timeout the caller discards the engine.
@@ -2370,6 +2384,72 @@ mod tests {
 
         assert!(done.is_none());
         assert_eq!(seen, vec!["first"]);
+    }
+
+    /// A client disconnect cancels the worker's generation but leaves the frames
+    /// it already queued in the stream — including that request's terminal
+    /// `done`. The next request must skip all of them by id and still return its
+    /// own result, or a cancelled request would poison its successor.
+    #[tokio::test]
+    async fn generate_skips_an_abandoned_requests_leftover_frames() {
+        let leftover_done = DoneEvent {
+            id: "cancelled-req".to_string(),
+            tokens: 7,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("cancelled".to_string()),
+            response_id: None,
+            extra: Default::default(),
+        };
+        let mut engine = mock_engine(vec![
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "cancelled-req".to_string(),
+                text: "abandoned".to_string(),
+            }),
+            DaemonResponse::Done(leftover_done),
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "req-2".to_string(),
+                text: "mine".to_string(),
+            }),
+            DaemonResponse::Done(DoneEvent {
+                id: "req-2".to_string(),
+                tokens: 1,
+                tok_s: None,
+                prefill_tokens: None,
+                prefill_ms: None,
+                prefill_tok_s: None,
+                decode_tok_s: None,
+                ttft_ms: None,
+                finish_reason: Some("stop".to_string()),
+                response_id: None,
+                extra: Default::default(),
+            }),
+        ]);
+
+        let req = GenerateTextRequest::from_prompt(
+            "req-2".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        );
+        let mut seen = Vec::new();
+        let done = engine
+            .generate_streaming_events_controlled(req, |event| {
+                if let GenerateStreamEvent::Token(text) = event {
+                    seen.push(text);
+                }
+                GenerateStreamControl::Continue
+            })
+            .await
+            .unwrap()
+            .expect("own done");
+
+        assert_eq!(seen, vec!["mine"]);
+        assert_eq!(done.id, "req-2");
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]

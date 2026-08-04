@@ -225,6 +225,165 @@ pub fn beam_encode_group(
     beam_encode_group_bits(weights, scale, codebook, beam_width, BITS_PER_WEIGHT)
 }
 
+/// Beam-search trellis encode with a PER-POSITION cost weight (formulation 3:
+/// "Hessian-weighted cost").
+///
+/// Identical to [`beam_encode_group_bits`] except each step's squared error is
+/// scaled by `w_diag[i]`. The caller supplies the diagonal of the ROTATED
+/// Hessian for this group — rotated, because the trellis sees FWHT-rotated
+/// weights and an unrotated per-channel diagonal does not describe positions in
+/// that frame.
+///
+/// Expected to be weak, and worth knowing why: the FWHT is applied precisely to
+/// make the error isotropic across the group (incoherence processing), so the
+/// rotated diagonal is much flatter than the original. A near-flat weight is a
+/// near-no-op. This is the cheap end of the design space, measured rather than
+/// assumed.
+pub fn beam_encode_group_bits_weighted(
+    weights: &[f32],
+    scale: f32,
+    codebook: &[f32],
+    beam_width: usize,
+    bits: u32,
+    w_diag: &[f64],
+) -> Vec<u8> {
+    let num_symbols = 1usize << bits;
+    let n = weights.len();
+    let mut beam: Vec<(u32, f64)> = vec![(0u32, 0.0)];
+    let mut steps: Vec<Vec<(u32, u32, u8)>> = Vec::with_capacity(n);
+    let mut cand: Vec<(u32, f64, u32, u8)> = Vec::with_capacity(beam_width * num_symbols);
+
+    for (i, &w) in weights.iter().enumerate() {
+        let w = w as f64;
+        let hw = w_diag.get(i).copied().unwrap_or(1.0).max(0.0);
+        cand.clear();
+        for (bi, &(s_prev, c_prev)) in beam.iter().enumerate() {
+            let base = (s_prev << bits) & STATE_MASK;
+            for sym in 0..num_symbols as u32 {
+                let s_new = base | sym;
+                let diff = w - scale as f64 * codebook[s_new as usize] as f64;
+                cand.push((s_new, c_prev + hw * diff * diff, bi as u32, sym as u8));
+            }
+        }
+        cand.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
+        cand.dedup_by_key(|c| c.0);
+        if cand.len() > beam_width {
+            cand.select_nth_unstable_by(beam_width, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            cand.truncate(beam_width);
+        }
+        let mut rec = Vec::with_capacity(cand.len());
+        let mut next_beam = Vec::with_capacity(cand.len());
+        for &(st, c, pi, sy) in cand.iter() {
+            rec.push((st, pi, sy));
+            next_beam.push((st, c));
+        }
+        steps.push(rec);
+        beam = next_beam;
+    }
+    backtrack(&beam, &steps, n)
+}
+
+/// Beam-search trellis encode carrying a PER-CANDIDATE residual (formulation 1:
+/// "LDLQ inside the beam").
+///
+/// This is the faithful composition of LDLQ with a trellis. Plain LDLQ can feed
+/// each position's error forward because it knows which value was chosen; a beam
+/// does not — it keeps `beam_width` live paths, and each implies a DIFFERENT
+/// residual for the positions still to come. So the residual travels with the
+/// candidate: choosing symbol `q` at position `i` updates that candidate's own
+/// view of every future position by `-err_i * L[f, i]`, exactly the oq3 update
+/// restricted to within the group.
+///
+/// `l_block` is the [n, n] lower-triangular sub-block of the rotated inverse
+/// Cholesky for this group, row-major, so `l_block[f*n + c]` is `L[f, c]`.
+///
+/// COST: the residual makes each candidate O(n) state instead of O(1), so a step
+/// is O(beam * symbols * n) rather than O(beam * symbols). At n=256 that is a
+/// ~256x slowdown per step, which is why the caller is expected to drop the beam
+/// width hard (4-8, not 128) to pay for it. Whether the feedback buys more than
+/// the narrowed beam loses is the entire question this formulation asks.
+pub fn beam_encode_group_bits_ldlq(
+    weights: &[f32],
+    scale: f32,
+    codebook: &[f32],
+    beam_width: usize,
+    bits: u32,
+    l_block: &[f64],
+) -> Vec<u8> {
+    let num_symbols = 1usize << bits;
+    let n = weights.len();
+    assert_eq!(l_block.len(), n * n, "l_block must be [n, n] row-major");
+    // Candidate: (state, cost, residual-for-remaining-positions).
+    let mut beam: Vec<(u32, f64, Vec<f64>)> =
+        vec![(0u32, 0.0, weights.iter().map(|&w| w as f64).collect())];
+    let mut steps: Vec<Vec<(u32, u32, u8)>> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let mut cand: Vec<(u32, f64, u32, u8, Vec<f64>)> = Vec::new();
+        let lii = l_block[i * n + i];
+        for (bi, (s_prev, c_prev, res)) in beam.iter().enumerate() {
+            let base = (s_prev << bits) & STATE_MASK;
+            // This candidate's own view of position i, after every earlier
+            // choice on ITS path fed error forward.
+            let w_i = res[i];
+            for sym in 0..num_symbols as u32 {
+                let s_new = base | sym;
+                let rec = scale as f64 * codebook[s_new as usize] as f64;
+                let diff = w_i - rec;
+                let mut next_res = res.clone();
+                if lii > 0.0 && i + 1 < n {
+                    let err = diff / lii;
+                    for f in (i + 1)..n {
+                        let lfc = l_block[f * n + i];
+                        if lfc != 0.0 {
+                            next_res[f] -= err * lfc;
+                        }
+                    }
+                }
+                cand.push((s_new, c_prev + diff * diff, bi as u32, sym as u8, next_res));
+            }
+        }
+        // Dedup by state keeping min cost, then keep the best `beam_width`.
+        cand.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
+        cand.dedup_by_key(|c| c.0);
+        if cand.len() > beam_width {
+            cand.select_nth_unstable_by(beam_width, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            cand.truncate(beam_width);
+        }
+        let mut rec = Vec::with_capacity(cand.len());
+        let mut next_beam = Vec::with_capacity(cand.len());
+        for (st, c, pi, sy, res) in cand.into_iter() {
+            rec.push((st, pi, sy));
+            next_beam.push((st, c, res));
+        }
+        steps.push(rec);
+        beam = next_beam;
+    }
+
+    let slim: Vec<(u32, f64)> = beam.iter().map(|(s, c, _)| (*s, *c)).collect();
+    backtrack(&slim, &steps, n)
+}
+
+/// Shared backtrack: pick the min-cost final slot and walk the step records back.
+fn backtrack(beam: &[(u32, f64)], steps: &[Vec<(u32, u32, u8)>], n: usize) -> Vec<u8> {
+    let mut best_idx = 0usize;
+    let mut best_cost = f64::INFINITY;
+    for (i, &(_, c)) in beam.iter().enumerate() {
+        if c < best_cost {
+            best_cost = c;
+            best_idx = i;
+        }
+    }
+    let mut symbols = vec![0u8; n];
+    let mut idx = best_idx;
+    for step in (0..n).rev() {
+        let (_, prev_idx, sym) = steps[step][idx];
+        symbols[step] = sym;
+        idx = prev_idx as usize;
+    }
+    symbols
+}
+
 /// `bits`-parametric beam-search trellis encode. See `beam_encode_group`.
 pub fn beam_encode_group_bits(
     weights: &[f32],
@@ -633,6 +792,30 @@ pub fn optimal_scale_bits(weights: &[f32], symbols: &[u8], codebook: &[f32], bit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_3inst_baked_affine_matches_the_builder() {
+        // The HIP kernel (gemv_qtip3g256i3.hip) cannot call build_codebook_3inst
+        // — it recomputes the value from the state and applies a BAKED affine.
+        // This mirrors that arithmetic exactly and asserts it reproduces the
+        // builder for every reachable state. A wrong constant here would not
+        // crash: it would dequantize every weight slightly off, which reads as
+        // "the 3INST codebook is not better" rather than as a bug.
+        const KERNEL_MEAN: f64 = -0.0002955198;
+        const KERNEL_INV_STD: f64 = 0.8089565944;
+        let cb = build_codebook_3inst();
+        let mut worst = 0.0f64;
+        for state in 0..NUM_STATES as u32 {
+            let raw = decode_3inst(state) as f64;
+            let raw = if raw.is_finite() { raw } else { 0.0 };
+            let kernel_val = (raw - KERNEL_MEAN) * KERNEL_INV_STD;
+            worst = worst.max((kernel_val - cb[state as usize] as f64).abs());
+        }
+        assert!(
+            worst < 1e-5,
+            "baked affine drifts from build_codebook_3inst by {worst}"
+        );
+    }
 
     #[test]
     fn codebook_3inst_is_sane_and_more_gaussian() {
@@ -1109,6 +1292,51 @@ mod tests {
         assert_eq!(
             seq, par,
             "kernel window decode must match sequential trellis"
+        );
+    }
+
+    #[test]
+    fn ldlq_beam_with_identity_l_matches_the_plain_beam() {
+        // With L = I every off-diagonal is zero, so the residual update
+        // `res[f] -= err * L[f, i]` is a no-op and the LDLQ beam must reproduce
+        // the plain beam EXACTLY. This pins both failure modes at once: symbols
+        // that differ mean the feedback corrupts the target; a run where the
+        // feedback path is never taken would also pass here, so the companion
+        // assert below uses a non-trivial L and requires the output to CHANGE.
+        let n = 64usize;
+        let cb = build_codebook_3inst();
+        let w: Vec<f32> = (0..n).map(|i| ((i * 37 % 23) as f32 - 11.0) / 11.0).collect();
+        let scale = group_scale(&w);
+        let mut l_id = vec![0.0f64; n * n];
+        for i in 0..n {
+            l_id[i * n + i] = 1.0;
+        }
+        let plain = beam_encode_group_bits(&w, scale, &cb, 16, BITS_PER_WEIGHT);
+        let ldlq = beam_encode_group_bits_ldlq(&w, scale, &cb, 16, BITS_PER_WEIGHT, &l_id);
+        assert_eq!(plain, ldlq, "identity L must be a no-op");
+
+        // Non-trivial lower-triangular L: feedback must actually reach the
+        // target. If this ever equals `plain`, the residual is not being used.
+        let mut l = l_id.clone();
+        for f in 1..n {
+            l[f * n + (f - 1)] = 0.5;
+        }
+        let fed = beam_encode_group_bits_ldlq(&w, scale, &cb, 16, BITS_PER_WEIGHT, &l);
+        assert_ne!(plain, fed, "error feedback changed nothing — residual unused");
+    }
+
+    #[test]
+    fn weighted_beam_is_a_no_op_under_a_flat_weight() {
+        // A flat (all-ones) weight vector must reproduce the unweighted encode;
+        // anything else means the weighting is not merely reweighting the cost.
+        let n = 64usize;
+        let cb = build_codebook_3inst();
+        let w: Vec<f32> = (0..n).map(|i| ((i * 17 % 19) as f32 - 9.0) / 9.0).collect();
+        let scale = group_scale(&w);
+        let flat = vec![1.0f64; n];
+        assert_eq!(
+            beam_encode_group_bits(&w, scale, &cb, 16, BITS_PER_WEIGHT),
+            beam_encode_group_bits_weighted(&w, scale, &cb, 16, BITS_PER_WEIGHT, &flat),
         );
     }
 

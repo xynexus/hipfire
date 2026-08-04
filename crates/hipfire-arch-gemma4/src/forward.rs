@@ -19,7 +19,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::calibration::contracts::{
     CaptureAdmission, CaptureId, CaptureRegistry, ExpertCaptureRole, ExpertTelemetry,
-    ProjectionRole,
+    ProjectionRole, RoutedRowContext,
 };
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
@@ -1007,9 +1007,13 @@ fn moe_ffn_finish(
                 .map(|(_, weight)| *weight)
                 .collect::<Vec<_>>();
             telemetry
+                // No row provenance in scope here (this is the resident forward,
+                // not the streamed calibration path that carries token/stratum),
+                // so only load and gate statistics accrue — the same information
+                // this call recorded before the context parameter existed.
                 .record_router_selection(
                     calibration.logical_layer,
-                    hipfire_runtime::calibration::contracts::RoutedRowContext::unknown(),
+                    RoutedRowContext::unknown(),
                     &indices,
                     &weights,
                 )

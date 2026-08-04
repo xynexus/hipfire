@@ -1563,6 +1563,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-kld",
  "hipfire-model",
  "hipfire-npu",
@@ -1733,6 +1734,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-diffusion",
  "hipfire-diffusion-coexist",
+ "hipfire-env",
  "hipfire-generate",
  "hipfire-hfq-tooling",
  "hipfire-lock",
@@ -1760,17 +1762,18 @@ dependencies = [
 name = "hipfire-coexistence"
 version = "0.3.0"
 dependencies = [
- "chrono",
  "hipfire-arch-cohere2",
  "hipfire-arch-gemma3",
  "hipfire-arch-gemma4",
  "hipfire-arch-qwen35",
+ "hipfire-arch-specs",
  "hipfire-arch-zaya",
  "hipfire-daemon-adapter",
  "hipfire-hash",
  "hipfire-lock",
  "hipfire-lora-hfq",
  "hipfire-model",
+ "hipfire-primitives",
  "hipfire-quant-format",
  "hipfire-quantize",
  "hipfire-rdna",
@@ -1781,7 +1784,6 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -1944,6 +1946,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-env"
+version = "0.3.0"
+
+[[package]]
 name = "hipfire-eval"
 version = "0.3.0"
 dependencies = [
@@ -2086,6 +2092,7 @@ dependencies = [
  "byteorder",
  "hipfire-arch-api",
  "hipfire-config",
+ "hipfire-env",
  "hipfire-hash",
  "hipfire-prompt",
  "memmap2",
@@ -2153,6 +2160,9 @@ dependencies = [
 [[package]]
 name = "hipfire-quant-format"
 version = "0.3.0"
+dependencies = [
+ "hipfire-primitives",
+]
 
 [[package]]
 name = "hipfire-quantize"
@@ -2162,6 +2172,7 @@ dependencies = [
  "faer",
  "hipfire-arch-api",
  "hipfire-arch-specs",
+ "hipfire-env",
  "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-model",
@@ -2226,9 +2237,9 @@ dependencies = [
  "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-evidence",
  "hipfire-generate",
- "hipfire-hash",
  "hipfire-hneurons",
  "hipfire-kld",
  "hipfire-kvquant",

@@ -22,16 +22,11 @@ static TOKENIZER_CONFIG: OnceLock<TokenizerConfig> = OnceLock::new();
 
 fn tokenizer_config() -> &'static TokenizerConfig {
     TOKENIZER_CONFIG.get_or_init(|| {
-        let normalize_prompt = match std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() {
-            Some("0") | Some("false") | Some("off") | Some("no") => false,
-            _ => true,
-        };
-        let prompt_heat_json =
-            std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1");
-        let prompt_heat_limit = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
+        // `is_off` rather than `!flag()`: unset must mean "on" here, so only an
+        // explicit 0/false/off/no disables normalization.
+        let normalize_prompt = !hipfire_env::NORMALIZE_PROMPT.is_off();
+        let prompt_heat_json = hipfire_env::PROMPT_HEAT_JSON.flag();
+        let prompt_heat_limit = hipfire_env::PROMPT_HEAT_LIMIT.parse_or(64);
 
         TokenizerConfig {
             normalize_prompt,
@@ -1573,11 +1568,10 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
-    if matches!(
-        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
-        Some("0") | Some("false") | Some("off") | Some("no")
-    ) {
+    // Default ON. Explicit "0" / "false" / "off" / "no" opts out. Read live
+    // rather than through `tokenizer_config()` so tests that set the var after
+    // the `OnceLock` has been initialised still observe it.
+    if hipfire_env::NORMALIZE_PROMPT.is_off() {
         return Cow::Borrowed(s);
     }
     if !tokenizer_config().normalize_prompt {

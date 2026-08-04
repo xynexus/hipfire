@@ -6,3 +6,4 @@ license = "Apache-2.0"
 description = "Canonical on-disk HFQ quant_type byte-contract, shared by the offline quantizer (writer) and the engine loaders (readers)."
 
 [dependencies]
+hipfire-primitives = { path = "../hipfire-primitives" }

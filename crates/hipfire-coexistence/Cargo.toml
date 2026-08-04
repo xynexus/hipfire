@@ -17,15 +17,16 @@ hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-quantize = { path = "../hipfire-quantize" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-cohere2 = { path = "../hipfire-arch-cohere2" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
+hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-hash = { path = "../hipfire-hash" }
 hipfire-lock = { path = "../hipfire-lock" }
-hipfire-quant-format = { path = "../hipfire-quant-format" }
 serde.workspace = true
 serde_json = "1"
 sha2 = "0.10"
@@ -34,3 +35,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 hipfire-xdna = { path = "../hipfire-xdna" }
 libc.workspace = true
+
+[dev-dependencies]
+# The arch-spec registry reaches the real binary transitively through
+# hipfire-quantize, but rlib pruning drops the `register_arch!` registrations in
+# the lib test binary, so `from_safetensors` finds no spec for the source. Link
+# the aggregation crate directly for tests.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }

@@ -5,6 +5,8 @@ pub mod artifact;
 pub mod calibrate;
 pub mod calibration_audit;
 pub mod calibration_compare;
+pub mod export_safetensors;
+pub mod repack;
 pub mod import_safetensors;
 pub mod induction;
 pub mod residual_compare;

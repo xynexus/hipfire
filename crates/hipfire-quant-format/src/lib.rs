@@ -20,6 +20,8 @@
 //! `hipfire_runtime::quant::dtype_for_quant_type`, which matches on the
 //! variants here.
 
+pub mod storage;
+
 /// On-disk HFQ weight encoding id (`#[repr(u8)]`; the stored byte is the
 /// discriminant). Reserved/retired ids are documented inline — DO NOT REUSE.
 #[repr(u8)]
@@ -155,6 +157,13 @@ pub enum QuantType {
     /// Non-rotated (plain-basis) Opus W4 storage used by DFLASH/NPU artifacts.
     /// Per G256 block: `[f16 scale][128 signed int4 nibbles]` = 130 bytes.
     Oq4Plain = 47,
+    // Renumbered 44/45/46 -> 48/49/50 when this topic branch merged
+    // origin/master, which had independently assigned 44-47 to the
+    // OpaqueBytes/Oq*Plain family below. origin/master won the contested bytes
+    // because artifacts already exist carrying them (a DFlash artifact stores
+    // qt=47); no artifact had ever been written with 44/45/46 from this branch,
+    // so renumbering here was free. Ids 44-47 belong to the block below — DO NOT
+    // REUSE them for these types.
     /// Coarse lm_head shortlist tier: row-wise L2-normalized, 3σ-clipped
     /// symmetric Q4 with one f16 scale per ROW. **Planar**, not blocked:
     /// `[rows*cols/2 nibble bytes][rows*2 f16 scale bytes]`, nibble `2i` in the
@@ -167,8 +176,62 @@ pub enum QuantType {
     /// the true argmax inside a small top-K (measured recall@8 = 100%).
     /// It always accompanies a full-precision fine tier that rescores the
     /// shortlist; it is never the sole storage for a tensor.
-    /// (Renumbered 44 -> 48 on the port to master, where 44 is `OpaqueBytes`.)
     CoarseQ4Row = 48,
+    /// BF16 with the exponent coded as a 3-bit per-block LUT index + escape —
+    /// **losslessly** the same weights as [`QuantType::BF16`], ~1.38× smaller.
+    /// Measured bit-exact end-to-end: 1.401× on a pure-BF16 artifact, 1.377× on
+    /// a MedGemma-27B VL tower. Ceiling is 1.4066× (zero escapes).
+    ///
+    /// Payload = `[u32 n_blocks][u32 × n_blocks offsets]` then, per 256-element
+    /// block, `[8 B LUT][256 B sign+mantissa][96 B codes][e B escapes]`; codec
+    /// `hipfire_primitives::bf16_lut3`. Blocks are independently decodable so a
+    /// kernel can consume this **compressed in VRAM** — the ratio applies to
+    /// weight bandwidth, not just file size. The escape plane is data-dependent,
+    /// so byte length does not follow from the shape: `block_bytes() == None`.
+    ///
+    /// Readers must take an owned copy (`tensor_data_vec`), never the zero-copy
+    /// `tensor_data` mmap slice, unless they decode blockwise on the GPU.
+    ///
+    /// Do NOT apply to Hessians: measured only 1.075× on a MedGemma-27B
+    /// `.calib.hfq` bf16 tril, because `XᵀX` spans far more octaves than
+    /// weights. `bf16_lut3::encode_if_smaller` is the guard.
+    Bf16Lut3 = 49,
+    /// BF16 with the exponent **Huffman**-coded — losslessly the same weights as
+    /// [`QuantType::BF16`], ~1.50× smaller. The sibling of
+    /// [`QuantType::Bf16Lut3`]: same idea (code the exponent, leave sign and
+    /// mantissa as a raw byte), better coder. Measured 1.4995× on Qwen3-1.7B
+    /// against a 1.521× order-0 entropy floor.
+    ///
+    /// Alphabet is the 15 most frequent exponents plus an escape carrying a raw
+    /// 8-bit literal — indistinguishable from coding all 256 exponents (1.4995×
+    /// vs 1.4997×) but it caps code depth at 13 instead of 26, which is what
+    /// keeps the decode table small. Codec `hipfire_primitives::bf16_huff`.
+    ///
+    /// **This is the format to write to disk.** Variable-length codes are
+    /// bit-serial, so it is decoded once at load and expanded to plain BF16 in
+    /// RAM; it is chunked every 8192 elements so that expansion parallelises.
+    /// When weights must stay compressed in VRAM and be decoded inside a GEMV,
+    /// use [`QuantType::Bf16Lut3`] — its byte-aligned fixed-width code is what
+    /// makes in-kernel decode affordable.
+    ///
+    /// Byte length is data-dependent, so `block_bytes() == None`. Readers must
+    /// take an owned copy (`tensor_data_vec`), never the zero-copy mmap slice.
+    Bf16Huff = 50,
+    /// QTIP-3 with the 3INST computed codebook. Byte-identical LAYOUT to
+    /// [`QuantType::Qtip3G256`] — 100 B/group, same 12-bit trellis, same FWHT —
+    /// and differing ONLY in the state→value map the decoder computes: 3INST
+    /// (excess kurtosis -0.111) instead of 1MAD (-0.312), i.e. closer to the
+    /// Gaussian the rotated weights actually follow.
+    ///
+    /// It is a SEPARATE TYPE rather than a flag on `Qtip3G256` because the
+    /// codebook is part of the wire contract: nothing in the block distinguishes
+    /// them, so a 3INST artifact read by a 1MAD kernel dequantizes to noise while
+    /// every length, checksum and shape check still passes. Two codes make that
+    /// mismatch a load error instead of silent garbage.
+    ///
+    /// Codec/kernel pending — the encoder can emit this; `gemv_qtip3g256`
+    /// computes 1MAD on-device and must gain a 3INST path before it can serve.
+    Qtip3G256I3 = 51,
 }
 
 impl QuantType {
@@ -222,6 +285,7 @@ impl QuantType {
             29 => PARO4G128T,
             30 => MQ4G256Lloyd,
             31 => Qtip3G256,
+            51 => Qtip3G256I3,
             33 => OqPlusG256,
             34 => Oq4G256,
             35 => Oq8G256,
@@ -238,6 +302,8 @@ impl QuantType {
             46 => Oq4MixedPlain,
             47 => Oq4Plain,
             48 => CoarseQ4Row,
+            49 => Bf16Lut3,
+            50 => Bf16Huff,
             _ => return None,
         })
     }
@@ -252,7 +318,7 @@ impl QuantType {
     pub const fn group_size(self) -> usize {
         use QuantType::*;
         match self {
-            F16 | F32 | BF16 | OpaqueBytes => 1,
+            F16 | F32 | BF16 | OpaqueBytes | Bf16Lut3 | Bf16Huff => 1,
             // Per-ROW scale: the group is the row, whose width is shape-dependent,
             // so there is no constant group width. block_bytes() is None.
             CoarseQ4Row => 1,
@@ -305,6 +371,7 @@ impl QuantType {
             OpaqueBytes => Some(1),
             // QTIP trellis (f32 scale + packed symbols)
             Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
+            Qtip3G256I3 => Some(100), // identical layout to Qtip3G256; only the codebook differs
             Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
             // Variable-length or not-yet-single-sourced here:
             //  - Q8HFQ: row-dependent
@@ -313,8 +380,10 @@ impl QuantType {
             //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
             //  - CoarseQ4Row: planar (nibble plane + f16 row-scale plane)
+            //  - Bf16Lut3 / Bf16Huff: coded-exponent length is data-dependent
             Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4MixedPlain
-            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row => None,
+            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row
+            | Bf16Lut3 | Bf16Huff => None,
         }
     }
 
@@ -404,6 +473,7 @@ mod tests {
             (QuantType::Oq8Plain, 258),
             (QuantType::Oq4Plain, 130),
             (QuantType::Qtip3G256, 100),
+            (QuantType::Qtip3G256I3, 100),
             (QuantType::Qtip4G256, 132),
         ];
         for (qt, bytes) in cases {
@@ -425,6 +495,8 @@ mod tests {
             QuantType::PARO4G128,
             QuantType::PARO4G128T,
             QuantType::TidI32,
+            QuantType::Bf16Lut3,
+            QuantType::Bf16Huff,
         ] {
             assert_eq!(qt.block_bytes(), None, "{qt:?} must be variable-layout");
             assert_eq!(qt.tensor_bytes(1024), None, "{qt:?} tensor_bytes");
@@ -464,6 +536,13 @@ mod tests {
         // On-disk contract: these bytes must never move.
         assert_eq!(QuantType::F16.code(), 1);
         assert_eq!(QuantType::Qtip3G256.code(), 31);
+        assert_eq!(QuantType::Qtip3G256I3.code(), 51);
+        // Same geometry, different codebook — the distinction is the whole point.
+        assert_eq!(
+            QuantType::Qtip3G256I3.block_bytes(),
+            QuantType::Qtip3G256.block_bytes()
+        );
+        assert_ne!(QuantType::Qtip3G256I3.code(), QuantType::Qtip3G256.code());
         assert_eq!(QuantType::OqPlusG256.code(), 33);
         assert_eq!(QuantType::Oq4G256.code(), 34);
         assert_eq!(QuantType::Oq8G256.code(), 35);
@@ -479,5 +558,8 @@ mod tests {
         assert_eq!(QuantType::Oq8Plain.code(), 45);
         assert_eq!(QuantType::Oq4MixedPlain.code(), 46);
         assert_eq!(QuantType::Oq4Plain.code(), 47);
+        assert_eq!(QuantType::CoarseQ4Row.code(), 48);
+        assert_eq!(QuantType::Bf16Lut3.code(), 49);
+        assert_eq!(QuantType::Bf16Huff.code(), 50);
     }
 }
