@@ -163,3 +163,69 @@ comes out only partly fixed, the k x k G is the next rung rather than a refutati
 Second risk: the loss used for the backward matters. KLD against fp16 is the
 right target because it is our bar; using next-token cross-entropy instead would
 measure a different thing and could rank differently.
+
+
+## MEASURED 2026-08-04 — gamma is real and large, and the SCALAR form is not enough
+
+Captured for all six projections via `model_gamma_backward` / `calib_gamma`
+(hipfire `493a55932`+), run on `Llama-3.2-1B-Instruct--bf16.hfq`, 4 sequences of
+256 tokens from the wikitext slice, CE loss, mean ce/tok 3.33.
+
+**The prediction held.** Measured gamma, relative to o_proj, against what the
+implied-G table above required:
+
+    type        measured   predicted
+    o_proj         1.000       1.000
+    v_proj         0.450       0.169
+    k_proj         0.007       0.005
+
+o_proj has the largest output-gradient energy, k_proj is ~140x smaller, and the
+ordering o > v >> k is exactly what the theory said. Two independent routes —
+inverting the measured promotion gains, and directly measuring the backward —
+agree. The propagation hypothesis is confirmed.
+
+**But the ranking is only partly fixed.** Re-ranking by `gamma * H-density`:
+
+    type       gamma-weighted   was (H-only)   measured gain
+    v_proj          1 .. 19        29 .. 85         -13.4%
+    k_proj         13 .. 34         2 .. 33          -2.6%
+    o_proj         26 .. 66        79 .. 113        -15.1%
+
+o_proj climbs 53 places out of the unpickable tail, and v_proj — the other big
+win — goes to the top. But the order is v > k > o where truth is o > v > k, so
+k_proj is still ranked above the tensor that matters most.
+
+The arithmetic shows why, at layer 5:
+
+    o_proj   H-density 1.419e-08   gamma 3.658e-02   product 5.190e-10
+    k_proj   H-density 4.249e-06   gamma 6.830e-04   product 2.902e-09
+
+**o_proj's per-weight reconstruction error is 300x lower than k_proj's, while
+its gamma is only 54x higher.** o_proj's input is the post-softmax attention
+context, which is a weighted average and therefore small in magnitude, so its H
+is tiny. The product still favours k by 5.6x, where the measured per-bit
+efficiency favours o by about 1.4x — roughly 8x unaccounted for.
+
+### Which risk this was
+
+The risk section above named two, and the result does not distinguish them yet:
+
+1. **`G ~= gamma*I` discards the gradient's directional structure.** The full
+   `k x k` G is the next rung. Note this is NOT the same as the full-H work that
+   failed — that refined the input side, which measurement says is not where the
+   error is.
+2. **The loss is wrong.** `calib_gamma` backprops CROSS-ENTROPY, while our bar is
+   KLD against fp16. Those weight tokens differently, and the doc flagged this
+   before the run. This is much cheaper to test than (2) and should go first.
+
+### Standing assessment
+
+Do not ship the scalar gamma as the ranking objective yet: it fixes v_proj and
+demotes k_proj correctly, but still under-ranks o_proj, so a greedy fill would
+promote the wrong tensors first. It is a large step in the right direction from
+a proxy that was anti-correlated.
+
+Also incomplete: `BlockAdjoints` carries no `d_down`, so down_proj (16 tensors)
+and the embed table are absent from the gamma table — 96 of 113 candidates are
+covered. down_proj's adjoint is available on the existing path
+(`down_guided_capture` takes it from `d_x`) and just needs folding in.
