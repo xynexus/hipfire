@@ -17,6 +17,11 @@
 //!     logits.
 //!   * **alpha / beta.** That `alpha = exp(softplus(a + dt_bias) * -exp(A_log))`
 //!     and `beta = sigmoid(b)`, against the kernel that computes them.
+//!   * **q/k L2 norm + q scale.** Whether that stage exists at all. It was
+//!     missing from this core until a real model at seq 64 produced NaN and a
+//!     worse-than-uniform loss — the state is unbounded without it. Nothing
+//!     self-consistent could have found that: the layer gradchecked clean,
+//!     stayed causal, and ran.
 //!
 //! Run: cargo run --release -p hipfire-train --features deltanet \
 //!        --example verify_la_core_vs_kernels
@@ -97,9 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu.download_f32(&ko)?,
             gpu.download_f32(&vo)?,
         );
+        // acts.q/k are POST-L2-norm; the conv kernel emits the pre-norm value,
+        // which the core keeps as q_raw/k_raw.
         for (name, host, dev) in [
-            ("q", &acts.q, &gq),
-            ("k", &acts.k, &gk),
+            ("q", &acts.q_raw, &gq),
+            ("k", &acts.k_raw, &gk),
             ("v", &acts.v, &gv),
         ] {
             let (abs, rel) = worst(host, dev);
@@ -109,6 +116,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for t in [inp, w, state, qo, ko, vo] {
             gpu.free_tensor(t)?;
         }
+    }
+
+    // ── q/k L2 norm + q scale ────────────────────────────────────────────
+    {
+        // The stage between the conv split and the recurrence. Omitting it
+        // entirely still gradchecks and still runs; it shows up only as an
+        // unbounded state on a real model at real sequence length.
+        let qt = gpu.upload_f32(&acts.q_raw, &[seq * nh * hk])?;
+        let kt = gpu.upload_f32(&acts.k_raw, &[seq * nh * hk])?;
+        gpu.fused_qk_l2_norm_scale_f32_batched(
+            &qt,
+            &kt,
+            nh,
+            hk,
+            1.0 / (hk as f32).sqrt(),
+            d.eps,
+            seq,
+        )?;
+        let (gq, gk) = (gpu.download_f32(&qt)?, gpu.download_f32(&kt)?);
+        let (aq, rq) = worst(&acts.q, &gq);
+        let (ak, rk) = worst(&acts.k, &gk);
+        println!("  l2norm(q)*1/sqrt(hd): worst {aq:.3e} (rel {rq:.3e})");
+        println!("  l2norm(k):            worst {ak:.3e} (rel {rk:.3e})");
+        ok &= rq < 1e-5 && rk < 1e-5;
+        gpu.free_tensor(qt)?;
+        gpu.free_tensor(kt)?;
     }
 
     // ── alpha / beta activations ─────────────────────────────────────────

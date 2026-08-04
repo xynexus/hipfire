@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_hfq { "hfq" } else { "safetensors" }
     );
 
-    let seq = 8usize;
+    let seq = 64usize;
     let h = cfg.hidden_size;
     let dims = BlockDims {
         seq,
@@ -99,10 +99,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embed = hipfire_train::loader::load_embed_f32(&mut gpu, src, prefix, cfg.vocab_size, h)?;
     let final_norm = hipfire_train::loader::load_final_norm_f32(&mut gpu, src, prefix, h)?;
 
-    // A deterministic token window; targets are next-token.
-    let tokens: Vec<u32> = (0..seq)
-        .map(|i| ((i * 37 + 11) % cfg.vocab_size) as u32)
-        .collect();
+    // Real tokens when we can get them. An .hfq embeds its tokenizer, and a
+    // real model over real text should land at a language-model loss (~2-4),
+    // not near ln(vocab). That is the strongest end-to-end check available
+    // without a reference implementation: every layout question this assembly
+    // had to answer — the fused gate/up halves, the conv tap direction, the
+    // [Q|K|V] split — wrecks the loss if answered wrong, because a model with
+    // scrambled weights cannot predict text.
+    let corpus = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "benchmarks/calib/calib-1m.txt".into());
+    let real = hfq.as_ref().and_then(|f| {
+        let meta: serde_json::Value = serde_json::from_str(f.metadata_json()).ok()?;
+        let tj = meta.get("tokenizer")?.as_str()?.to_string();
+        let text = std::fs::read_to_string(&corpus).ok()?;
+        let tmp = std::env::temp_dir().join("hipfire_gamma_hybrid_tok.json");
+        std::fs::write(&tmp, tj).ok()?;
+        let tok = hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tmp).ok()??;
+        let ids = tok.encode(&text[..text.len().min(20000)]);
+        (ids.len() > seq).then(|| ids[..seq].to_vec())
+    });
+    let synthetic = real.is_none();
+    let tokens: Vec<u32> = real.unwrap_or_else(|| {
+        (0..seq)
+            .map(|i| ((i * 37 + 11) % cfg.vocab_size) as u32)
+            .collect()
+    });
+    eprintln!(
+        "tokens: {}",
+        if synthetic {
+            "SYNTHETIC (no embedded tokenizer or corpus) — loss is not meaningful"
+        } else {
+            "real, from the artifact's own tokenizer over the calib corpus"
+        }
+    );
+    // Last position has no next token: mark it ignored rather than wrapping,
+    // which would train/measure on a fabricated transition.
     let targets: Vec<f32> = (0..seq)
         .map(|i| tokens[(i + 1) % seq] as f32)
         .collect::<Vec<_>>();

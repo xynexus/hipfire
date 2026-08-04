@@ -218,8 +218,13 @@ fn sigmoid(x: f32) -> f32 {
 /// Saved state for [`linear_attn_backward`].
 pub struct LinearAttnActs {
     pub qkv_pre: Vec<f32>, // conv1d output BEFORE silu, [seq, qkv_dim]
+    /// q/k AFTER the per-head L2 norm (and q's 1/sqrt(hd) scale) — what the
+    /// recurrence actually consumed.
     pub q: Vec<f32>,
     pub k: Vec<f32>,
+    /// q/k BEFORE that norm, which its backward needs.
+    pub q_raw: Vec<f32>,
+    pub k_raw: Vec<f32>,
     pub v: Vec<f32>,
     pub a_raw: Vec<f32>, // Wa·x, pre dt_bias/softplus
     pub b_raw: Vec<f32>, // Wb·x, pre sigmoid
@@ -381,12 +386,38 @@ pub fn linear_attn_core_forward(
         }
     }
 
+    // Per-head L2 norm on q and k, plus q's 1/sqrt(hd) scale — the
+    // `fused_qk_l2_norm_scale_f32` stage that sits between the conv split and
+    // the recurrence. Omitting it leaves the delta-rule state unbounded: on a
+    // real model at seq 64 the state grows until the backward overflows, and
+    // the loss sits at ln(vocab). A short random fixture never shows it.
+    let (q_raw, k_raw) = (q.clone(), k.clone());
+    let q_scale = 1.0 / (hk as f32).sqrt();
+    for t in 0..seq {
+        for hh in 0..nh {
+            let o = t * nh * hk + hh * hk;
+            let qs: f32 = (0..hk).map(|i| q[o + i] * q[o + i]).sum();
+            let ks: f32 = (0..hk).map(|i| k[o + i] * k[o + i]).sum();
+            let qg = 1.0 / (qs + d.eps).sqrt();
+            let kg = 1.0 / (ks + d.eps).sqrt();
+            for i in 0..hk {
+                q[o + i] *= qg * q_scale;
+                k[o + i] *= kg;
+            }
+        }
+    }
+
     let mut gate = vec![0.0f32; seq * nh];
     let mut beta = vec![0.0f32; seq * nh];
     for t in 0..seq {
         for hh in 0..nh {
             let i = t * nh + hh;
-            let sp = (1.0 + (a_raw[i] + w.dt_bias[hh]).exp()).ln();
+            // Numerically stable softplus. The naive ln(1+exp(x)) overflows
+            // to inf for x > ~88 in f32, and then gate = -inf makes
+            // d_a_log += dgate * gate evaluate 0 * -inf = NaN in the backward.
+            // A small random fixture never reaches that; real dt_bias does.
+            let x = a_raw[i] + w.dt_bias[hh];
+            let sp = x.max(0.0) + (1.0 + (-x.abs()).exp()).ln();
             gate[i] = sp * -(w.a_log[hh].exp());
             beta[i] = sigmoid(b_raw[i]);
         }
@@ -412,6 +443,8 @@ pub fn linear_attn_core_forward(
             qkv_pre,
             q,
             k,
+            q_raw,
+            k_raw,
             v,
             a_raw: a_raw.to_vec(),
             b_raw: b_raw.to_vec(),
@@ -470,8 +503,30 @@ pub fn linear_attn_core_backward(
         }
     }
 
-    let (dq, dk, dv, dgate, dbeta) =
+    let (dq_n, dk_n, dv, dgate, dbeta) =
         deltanet_backward(&d_dn, &a.q, &a.k, &a.v, &a.beta, &a.dn, seq, nh, hk, hv);
+
+    // L2-norm backward. y = c*x*g with g = (sum(x^2)+eps)^-1/2, so
+    // dx = c*g*(dy - x * g^2 * <dy, x>). c is 1/sqrt(hd) for q, 1 for k.
+    let mut dq = vec![0.0f32; seq * nh * hk];
+    let mut dk = vec![0.0f32; seq * nh * hk];
+    let q_scale = 1.0 / (hk as f32).sqrt();
+    for t in 0..seq {
+        for hh in 0..nh {
+            let o = t * nh * hk + hh * hk;
+            for (src, dst, xr, c) in [
+                (&dq_n, &mut dq, &a.q_raw, q_scale),
+                (&dk_n, &mut dk, &a.k_raw, 1.0),
+            ] {
+                let ss: f32 = (0..hk).map(|i| xr[o + i] * xr[o + i]).sum();
+                let g = 1.0 / (ss + d.eps).sqrt();
+                let dot: f32 = (0..hk).map(|i| src[o + i] * xr[o + i]).sum();
+                for i in 0..hk {
+                    dst[o + i] = c * g * (src[o + i] - xr[o + i] * g * g * dot);
+                }
+            }
+        }
+    }
 
     let mut d_a_raw = vec![0.0f32; seq * nh];
     let mut d_b_raw = vec![0.0f32; seq * nh];
