@@ -428,6 +428,12 @@ env_vars! {
         "roughquant4-sim: set 1 to simulate Q8 on embed/lm_head for an honest \
          mq4 comparison. Same purpose as the roughquant2 switch.";
 
+    MIXED_BPW_RANK = "HIPFIRE_MIXED_BPW_RANK", Developer,
+        "Set 1 to dump the `--mixed-bpw` sensitivity ranking and exit before \
+         quantizing. Separates a bad RANKING from a bad SEARCH when the \
+         allocator loses to hand-picked promotions — the two need different \
+         fixes and the dump costs only the sensitivity pass.";
+
     // ── Quantizer: MiniMax expert precision (hipfire-quantize) ──────────────
     // Presence-only switches: these are read with `is_set`, so `=0` still counts
     // as set. That is the pre-existing `var_os` behaviour, kept deliberately.

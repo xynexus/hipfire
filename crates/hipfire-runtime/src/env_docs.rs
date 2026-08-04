@@ -2711,6 +2711,13 @@ pub const ENV_HIPFIRE_MINIMAX_PROMOTE_MQ6: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
+/// `HIPFIRE_MIXED_BPW_RANK` — Set 1 to dump the `--mixed-bpw` sensitivity ranking and exit before quantizing. Separates a bad RANKING from a bad SEARCH when the allocator loses to hand-picked promotions — the two need different fixes and the dump costs only the sensitivity pass.
+pub const ENV_HIPFIRE_MIXED_BPW_RANK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MIXED_BPW_RANK",
+    description: "Set 1 to dump the `--mixed-bpw` sensitivity ranking and exit before quantizing. Separates a bad RANKING from a bad SEARCH when the allocator loses to hand-picked promotions — the two need different fixes and the dump costs only the sensitivity pass.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_MMQ` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_MMQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MMQ",
@@ -5708,6 +5715,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_MINIMAX_EXPERT_MQ6,
     ENV_HIPFIRE_MINIMAX_PROMOTE_MQ4,
     ENV_HIPFIRE_MINIMAX_PROMOTE_MQ6,
+    ENV_HIPFIRE_MIXED_BPW_RANK,
     ENV_HIPFIRE_MMQ,
     ENV_HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY,
     ENV_HIPFIRE_MMQ_SCREEN,

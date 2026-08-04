@@ -5505,6 +5505,38 @@ fn run_hfq_source_pipeline(
             for c in &promoted {
                 eprintln!("  promote: {}", c.name);
             }
+            // HIPFIRE_MIXED_BPW_RANK=1 dumps the full ranking and exits before
+            // quantizing. The allocator losing to hand-picking is consistent
+            // with EITHER a bad ranking or a bad search, and those need
+            // different fixes — this separates them for the cost of the
+            // sensitivity pass alone (~1 G ops) instead of a full 6.5 min run.
+            if hipfire_env::MIXED_BPW_RANK.flag() {
+                let total: usize = cands.iter().map(|c| c.numel).sum();
+                let mut ranked: Vec<&TierCandidate> = cands.iter().collect();
+                // Same key the greedy uses: error removed per extra bit spent.
+                ranked.sort_by(|a, b| {
+                    let da = a.err_oq4 / a.numel.max(1) as f64;
+                    let db = b.err_oq4 / b.numel.max(1) as f64;
+                    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                eprintln!(
+                    "\nmixed-bpw ranking by density (err_oq4 / numel), {} tensors, {:.1} M weights:",
+                    ranked.len(),
+                    total as f64 / 1e6
+                );
+                eprintln!("{:>4}  {:>12}  {:>12}  {:>9}  {}", "rank", "density", "err_oq4", "numel", "tensor");
+                for (i, c) in ranked.iter().enumerate() {
+                    eprintln!(
+                        "{:>4}  {:>12.4e}  {:>12.4e}  {:>9}  {}",
+                        i + 1,
+                        c.err_oq4 / c.numel.max(1) as f64,
+                        c.err_oq4,
+                        c.numel,
+                        c.name
+                    );
+                }
+                std::process::exit(0);
+            }
             promoted
                 .iter()
                 .map(|c| TensorFormatOverride {
