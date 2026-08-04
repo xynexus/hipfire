@@ -361,6 +361,13 @@ Margins are thin — 0.23% PPL, 0.26% KLD — so this is "clears the bar", not
 DETERMINISTIC: the same artifact reproduced KLD 0.088172 and 0.152725 exactly
 across repeated runs all session, so a 0.26% difference between artifacts is real.
 
+Determinism holds across a REBUILD, not just repeated runs: after hipfire
+`09cc1d48e` rewrote all 67 environment reads in the quantizer (including the
+outlier, clip-policy and AWQ knobs), the headline recipe re-quantised and
+re-scored to PPL 17.1157 / KLD 0.025025 — bit-identical. Worth knowing that a
+whole-quantizer refactor lands on the same numbers, because it means a future
+diff in these tables is a real quality change and not build noise.
+
 **THE BAR ITSELF WAS FINALLY MEASURED ON OUR HARNESS** (q4nx dequantised to dense
 f16 and scored through perplexity.rs against the same .pkld). Until then it was
 inferred from relative PPL degradation across two different harnesses, and that
