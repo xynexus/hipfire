@@ -249,3 +249,48 @@ before any block-level work, not after.
 The dense work stands on its own regardless: it removed the f32 depth ceiling and
 is verified bit-identical, and the gamma objective it feeds is what took auto
 mixed precision from losing to hand-picking to matching it.
+
+
+## MiniMax-M2 IS the topological match (2026-08-05)
+
+Surveying further: `hipfire-arch-minimax` is MiniMax-M2, described in its own
+header as a Mixtral-style MoE, and its block is
+
+    h += attn(input_layernorm(h));  h += moe(post_attention_layernorm(h))
+
+which is EXACTLY the sequential pre-norm topology `moe_block_forward`
+implements. Not parallel (BLS), not an MLP router (zaya), not linear attention
+(Qwen3.6). The deltas are small and known:
+
+    experts live under `.block_sparse_moe.experts.N.`, not `.mlp.experts.N.`
+        -> one change to the probe and the name format
+    per-layer QK-norm on the attention half
+        -> a contained addition to block_forward/backward, not a rewrite
+
+So the MoE work already built is validatable against a supported architecture.
+The cost is the artifact: `/srv/hipfire/archives/models--MiniMaxAI--MiniMax-M2.7.hfa`
+is 133 GB, and whether an unquantized form is extractable at a workable size has
+not been checked.
+
+### And the tiny fixture is a DELTANET target, not a MoE-block one
+
+`/srv/hipfire/fixtures/qwen3_5_moe-tiny` (config.json + 11.7 MB safetensors) is
+NOT a Mixtral-style MoE. Its config says
+
+    layer_types: [linear_attention, linear_attention, linear_attention, full_attention]
+    attn_output_gate: true
+
+i.e. it mirrors Qwen3.6-35B-A3B's hybrid architecture in miniature — three
+quarters linear attention, one quarter full. That makes it the right
+DEVELOPMENT fixture for the DeltaNet work: small, fast, safetensors-loadable,
+and structurally identical to the real target. It cannot validate the MoE block.
+
+### The fork, sharpened
+
+    (1) DeltaNet fwd/bwd     the only path to Qwen3.6-35B-A3B. Largest piece.
+                             qwen3_5_moe-tiny makes development tractable.
+    (2) MiniMax-M2           proves the MoE work already built. Topology matches;
+                             needs QK-norm + the block_sparse_moe naming. 133 GB
+                             archive is the open cost.
+    (3) Stop                 the dense path is done, verified, and is what fed
+                             the auto mixed-precision result that landed.
