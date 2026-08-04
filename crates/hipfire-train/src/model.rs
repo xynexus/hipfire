@@ -799,9 +799,17 @@ pub fn model_gamma_streamed(
     pos_host: &[f32],
     targets: &[f32],
     ignore_index: i32,
+    // 0 for a dense model. Routed-ness is still probed PER LAYER — hybrid
+    // models exist (BLS-Mini-Code-1.0 is dense at layer 0, routed above).
+    n_experts: usize,
+    top_k: usize,
     acc: &mut GammaAccum,
 ) -> Result<f32, String> {
-    use crate::loader::{free_llama_layer_fp32, load_llama_layer_fp32_hfq};
+    use crate::loader::{
+        detect_prefix, free_llama_layer_fp32, free_moe_layer_fp32, layer_is_moe,
+        load_llama_layer_fp32_hfq_pfx, load_moe_layer_fp32_hfq,
+    };
+    let prefix = detect_prefix(hfq);
     let (seq, h) = (dims.seq, dims.h);
     let vocab = cfg.vocab_size;
     let n_layers = cfg.num_hidden_layers;
@@ -831,7 +839,7 @@ pub fn model_gamma_streamed(
     let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
         layer_inputs.push(gpu.download_f32(&x).map_err(e)?);
-        let lw = load_llama_layer_fp32_hfq(gpu, hfq, cfg, i)?;
+        let lw = load_llama_layer_fp32_hfq_pfx(gpu, hfq, prefix, cfg, i, true)?;
         let (x_out, acts) =
             block_forward(gpu, &x, &block_of(&lw), &lora.as_block(), dims, pos_host, i)
                 .map_err(e)?;
@@ -878,35 +886,86 @@ pub fn model_gamma_streamed(
     // Reverse walk: page the layer back in, recompute its internals from the
     // saved input, capture the adjoints, drop it.
     for i in (0..n_layers).rev() {
-        let lw = load_llama_layer_fp32_hfq(gpu, hfq, cfg, i)?;
+        let moe = n_experts > 0 && layer_is_moe(hfq, prefix, i);
+        let lw = load_llama_layer_fp32_hfq_pfx(gpu, hfq, prefix, cfg, i, !moe)?;
         let x_in = gpu.upload_f32(&layer_inputs[i], &[seq * h]).map_err(e)?;
-        let (x_out, acts) = block_forward(
-            gpu,
-            &x_in,
-            &block_of(&lw),
-            &lora.as_block(),
-            dims,
-            pos_host,
-            i,
-        )
-        .map_err(e)?;
-        gpu.free_tensor(x_out).map_err(e)?;
 
-        let d_down = gpu.download_f32(&d_x).map_err(e)?;
-        let (d_in, _g, mut adj) = block_backward_capture(
-            gpu,
-            &d_x,
-            &x_in,
-            &block_of(&lw),
-            &lora.as_block(),
-            &acts,
-            dims,
-        )
-        .map_err(e)?;
-        adj.d_down = d_down;
-        accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, dims.inter);
+        let d_in = if moe {
+            let (ml, inter) = load_moe_layer_fp32_hfq(gpu, hfq, prefix, i, h, n_experts)?;
+            let mw = moe_weights_of(&ml);
+            let md = crate::ops::moe::MoeDims {
+                seq,
+                h,
+                inter,
+                n_experts,
+                top_k,
+            };
+            let (x_out, acts, macts) = crate::block::moe_block_forward(
+                gpu,
+                &x_in,
+                &block_of(&lw),
+                &mw,
+                &lora.as_block(),
+                dims,
+                &md,
+                pos_host,
+                i,
+            )
+            .map_err(e)?;
+            gpu.free_tensor(x_out).map_err(e)?;
+            let (d_in, adj, moe_adj) = crate::block::moe_block_backward_capture(
+                gpu,
+                &d_x,
+                &x_in,
+                &block_of(&lw),
+                &mw,
+                &lora.as_block(),
+                &acts,
+                &macts,
+                dims,
+                &md,
+            )
+            .map_err(e)?;
+            // Attention-side gamma is identical to the dense case. The MLP side
+            // comes from the experts rather than one down_proj, so `d_down` is
+            // left empty and `accumulate_gamma` is passed inter = 0 to skip the
+            // dense gate/up entries that do not exist on this layer.
+            accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, 0);
+            accumulate_gamma_moe(acc, i, &moe_adj, h, n_experts);
+            crate::block::free_block_acts(gpu, acts).map_err(e)?;
+            crate::ops::moe::free_moe_acts(gpu, macts).map_err(e)?;
+            drop(mw);
+            free_moe_layer_fp32(gpu, ml)?;
+            d_in
+        } else {
+            let (x_out, acts) = block_forward(
+                gpu,
+                &x_in,
+                &block_of(&lw),
+                &lora.as_block(),
+                dims,
+                pos_host,
+                i,
+            )
+            .map_err(e)?;
+            gpu.free_tensor(x_out).map_err(e)?;
+            let d_down = gpu.download_f32(&d_x).map_err(e)?;
+            let (d_in, _g, mut adj) = block_backward_capture(
+                gpu,
+                &d_x,
+                &x_in,
+                &block_of(&lw),
+                &lora.as_block(),
+                &acts,
+                dims,
+            )
+            .map_err(e)?;
+            adj.d_down = d_down;
+            accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, dims.inter);
+            crate::block::free_block_acts(gpu, acts).map_err(e)?;
+            d_in
+        };
 
-        crate::block::free_block_acts(gpu, acts).map_err(e)?;
         gpu.free_tensor(x_in).map_err(e)?;
         gpu.free_tensor(d_x).map_err(e)?;
         d_x = d_in;
@@ -929,6 +988,23 @@ fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
         wgate: &l.gate_proj,
         wup: &l.up_proj,
         wdown: &l.down_proj,
+    }
+}
+
+/// `MoeWeights` borrowed from a streamed layer, so nothing is copied for a
+/// layer that is about to be dropped.
+fn moe_weights_of(l: &crate::loader::MoeLayerF32) -> crate::ops::moe::MoeWeights<'_> {
+    crate::ops::moe::MoeWeights {
+        router: &l.router,
+        experts: l
+            .experts
+            .iter()
+            .map(|(g, u, d)| crate::ops::moe::ExpertWeights {
+                wgate: g,
+                wup: u,
+                wdown: d,
+            })
+            .collect(),
     }
 }
 

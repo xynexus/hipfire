@@ -176,23 +176,146 @@ pub fn load_llama_layer_fp32_hfq(
     cfg: &LlamaConfig,
     layer: usize,
 ) -> Result<LlamaLayerF32, String> {
+    load_llama_layer_fp32_hfq_pfx(gpu, hfq, "model.", cfg, layer, true)
+}
+
+/// As [`load_llama_layer_fp32_hfq`], with an explicit name prefix and the
+/// option to skip the dense MLP.
+///
+/// A routed layer has no `mlp.{gate,up,down}_proj` at all — its MLP is the
+/// experts — so `dense_mlp = false` substitutes 1-element placeholders. Nothing
+/// reads them: `block_forward_attn_only` and `block_backward_from_dxn2` skip the
+/// dense MLP entirely.
+pub fn load_llama_layer_fp32_hfq_pfx(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    prefix: &str,
+    cfg: &LlamaConfig,
+    layer: usize,
+    dense_mlp: bool,
+) -> Result<LlamaLayerF32, String> {
     let h = cfg.hidden_size;
     let q = cfg.q_dim();
     let kv = cfg.kv_dim();
     let inter = cfg.intermediate_size;
-    let p = format!("model.layers.{layer}");
-    let mut load = |name: String, want: Vec<usize>| load_tensor_f32_hfq(gpu, hfq, &name, &want);
+    let p = format!("{prefix}layers.{layer}");
+    // Sequential rather than a closure: a `|..| load_tensor_f32_hfq(gpu, ..)`
+    // closure holds `&mut gpu` for its whole life, which blocks the placeholder
+    // allocations below.
+    let input_layernorm =
+        load_tensor_f32_hfq(gpu, hfq, &format!("{p}.input_layernorm.weight"), &[h])?;
+    let q_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?;
+    let k_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?;
+    let v_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?;
+    let o_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?;
+    let post_attention_layernorm = load_tensor_f32_hfq(
+        gpu,
+        hfq,
+        &format!("{p}.post_attention_layernorm.weight"),
+        &[h],
+    )?;
+
+    let (gate_proj, up_proj, down_proj) = if dense_mlp {
+        (
+            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
+            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
+            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+        )
+    } else {
+        let z = |g: &mut Gpu| {
+            g.zeros(&[1], hipfire_rdna::DType::F32)
+                .map_err(|e| e.to_string())
+        };
+        (z(gpu)?, z(gpu)?, z(gpu)?)
+    };
+
     Ok(LlamaLayerF32 {
-        input_layernorm: load(format!("{p}.input_layernorm.weight"), vec![h])?,
-        q_proj: load(format!("{p}.self_attn.q_proj.weight"), vec![q, h])?,
-        k_proj: load(format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?,
-        v_proj: load(format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?,
-        o_proj: load(format!("{p}.self_attn.o_proj.weight"), vec![h, q])?,
-        post_attention_layernorm: load(format!("{p}.post_attention_layernorm.weight"), vec![h])?,
-        gate_proj: load(format!("{p}.mlp.gate_proj.weight"), vec![inter, h])?,
-        up_proj: load(format!("{p}.mlp.up_proj.weight"), vec![inter, h])?,
-        down_proj: load(format!("{p}.mlp.down_proj.weight"), vec![h, inter])?,
+        input_layernorm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        post_attention_layernorm,
+        gate_proj,
+        up_proj,
+        down_proj,
     })
+}
+
+/// One MoE layer's frozen weights: router plus every expert's SwiGLU.
+pub struct MoeLayerF32 {
+    pub router: GpuTensor,
+    /// Per expert, in expert order: (gate, up, down).
+    pub experts: Vec<(GpuTensor, GpuTensor, GpuTensor)>,
+}
+
+/// Is layer `l` routed? Detected from the artifact rather than the config,
+/// because hybrid models exist — BLS-Mini-Code-1.0 has a DENSE layer 0 and
+/// routed layers 1..49, so a per-model flag would be wrong for it.
+pub fn layer_is_moe(hfq: &HfqFile, prefix: &str, layer: usize) -> bool {
+    hfq.find_tensor_info(&format!(
+        "{prefix}layers.{layer}.mlp.experts.0.down_proj.weight"
+    ))
+    .is_some()
+}
+
+/// Tensor-name prefix an artifact uses: `model.` or `model.language_model.`
+/// (the multimodal wrapper). Probed once rather than guessed.
+pub fn detect_prefix(hfq: &HfqFile) -> &'static str {
+    if hfq
+        .find_tensor_info("model.language_model.layers.0.self_attn.q_proj.weight")
+        .is_some()
+    {
+        "model.language_model."
+    } else {
+        "model."
+    }
+}
+
+/// Load one MoE layer's router and experts.
+///
+/// `inter` here is the EXPERT intermediate size, which differs from the dense
+/// `intermediate_size` in config (BLS: 768 per expert against a 3072 dense
+/// layer 0), so it is taken from the expert tensor's own shape rather than the
+/// config.
+pub fn load_moe_layer_fp32_hfq(
+    gpu: &mut Gpu,
+    hfq: &HfqFile,
+    prefix: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(MoeLayerF32, usize), String> {
+    let p = format!("{prefix}layers.{layer}.mlp");
+    let router = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.gate.weight"), &[n_experts, h])?;
+    let probe = hfq
+        .find_tensor_info(&format!("{p}.experts.0.gate_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no experts.0.gate_proj"))?;
+    let inter = probe.shape[0] as usize;
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let ep = format!("{p}.experts.{e}");
+        experts.push((
+            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.gate_proj.weight"), &[inter, h])?,
+            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.up_proj.weight"), &[inter, h])?,
+            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.down_proj.weight"), &[h, inter])?,
+        ));
+    }
+    Ok((MoeLayerF32 { router, experts }, inter))
+}
+
+/// Free one streamed MoE layer.
+pub fn free_moe_layer_fp32(gpu: &mut Gpu, l: MoeLayerF32) -> Result<(), String> {
+    gpu.free_tensor(l.router)
+        .map_err(|e| format!("free router: {e}"))?;
+    for (g, u, d) in l.experts {
+        for t in [g, u, d] {
+            gpu.free_tensor(t)
+                .map_err(|e| format!("free expert tensor: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Free one streamed layer's tensors.

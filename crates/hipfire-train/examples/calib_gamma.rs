@@ -23,6 +23,7 @@
 //! seeded-synthetic (proves the pipeline only).
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_model::ModelSource;
 use hipfire_rdna::Gpu;
 use hipfire_train::loader::{load_llama_fp32, load_llama_fp32_hfq};
 use hipfire_train::model::{
@@ -75,6 +76,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rank-1 LoRA (B=0 ⇒ zero contribution); the backward computes + discards
     // its grads — this path drives the weighted-Hessian capture, not training.
     let model = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, seq, 1, 1.0)?;
+    // MoE geometry from the artifact's metadata; 0 experts ⇒ a dense model.
+    // Routed-ness is probed per LAYER inside the walk, since hybrid models
+    // (dense layer 0, routed above) exist.
+    let (n_experts, top_k) = {
+        let meta: serde_json::Value =
+            serde_json::from_str(hipfire_runtime::hfq::HfqFile::open(dpath)?.metadata_json())
+                .unwrap_or(serde_json::Value::Null);
+        let c = meta.get("config").unwrap_or(&meta);
+        let g = |k: &str| c.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let ne = g("num_experts").max(g("num_local_experts"));
+        let tk = g("num_experts_per_tok").max(g("experts_per_tok"));
+        (ne, tk.max(if ne > 0 { 1 } else { 0 }))
+    };
+    if n_experts > 0 {
+        eprintln!("MoE: {n_experts} experts, top_k {top_k}");
+    }
     let mut acc = GammaAccum::default();
 
     // Build calibration sequences.
@@ -150,6 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &pos,
                 &targets,
                 -1,
+                n_experts,
+                top_k,
                 &mut acc,
             )?
         } else {
