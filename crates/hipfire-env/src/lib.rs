@@ -442,6 +442,13 @@ env_vars! {
          third, for several minutes of extra work. Any tr(dW H dW^T) is \
          layer-local, and o_proj matters through error propagated downstream.";
 
+    MIXED_BPW_GAMMA = "HIPFIRE_MIXED_BPW_GAMMA", Developer,
+        "Path to a `calib_gamma` JSON table of per-tensor output-gradient energy. \
+         Multiplies the `--mixed-bpw` sensitivity, supplying the K-FAC output \
+         factor the H-side objective omits. A tensor absent from the table \
+         scores 0 rather than keeping an unscaled score, which would let it \
+         dominate. Unset leaves the objective input-covariance only.";
+
     // ── Quantizer: MiniMax expert precision (hipfire-quantize) ──────────────
     // Presence-only switches: these are read with `is_set`, so `=0` still counts
     // as set. That is the pre-existing `var_os` behaviour, kept deliberately.

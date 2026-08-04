@@ -5459,6 +5459,14 @@ fn run_hfq_source_pipeline(
             use hipfire_quantize::mixed_precision::{assign_tiers, Tier, TierCandidate};
             let s1 = gen_fwht_signs(42, 256);
             let s2 = gen_fwht_signs(1042, 256);
+            // HIPFIRE_MIXED_BPW_GAMMA=<gamma.json> from `calib_gamma`.
+            let gamma_tbl: Option<HashMap<String, f32>> = hipfire_env::MIXED_BPW_GAMMA
+                .get()
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|t| serde_json::from_str::<HashMap<String, f32>>(&t).ok());
+            if let Some(g) = gamma_tbl.as_ref() {
+                eprintln!("mixed-bpw: gamma weighting from {} entries", g.len());
+            }
             let mut cands: Vec<TierCandidate> = Vec::new();
             // Parallel to `cands`; only populated under the ranking dump.
             let mut oq8_residual: Vec<f64> = Vec::new();
@@ -5511,7 +5519,20 @@ fn run_hfq_source_pipeline(
                 if err_full.is_some() {
                     n_full += 1;
                 }
-                let err = err_full.unwrap_or(err_diag);
+                let mut err = err_full.unwrap_or(err_diag);
+                // Output-gradient energy (K-FAC's G ~= gamma*I). The H-side
+                // objective implicitly sets G = I, which measured leaves the
+                // ranking anti-correlated for o_proj. See
+                // docs/npu/investigate-blockwise-objective.md.
+                if let Some(g) = gamma_tbl.as_ref() {
+                    let base = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                    match g.get(base) {
+                        Some(&v) => err *= v as f64,
+                        // A tensor with no gamma would otherwise keep an
+                        // unscaled score and dominate the ranking outright.
+                        None => err = 0.0,
+                    }
+                }
                 diag_err.push(err_diag);
                 // Residual that promotion CANNOT remove. Only computed for the
                 // ranking dump for now — see the note in assign_tiers.

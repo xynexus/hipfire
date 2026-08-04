@@ -2718,6 +2718,13 @@ pub const ENV_HIPFIRE_MIXED_BPW_FULL_H: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
+/// `HIPFIRE_MIXED_BPW_GAMMA` — Path to a `calib_gamma` JSON table of per-tensor output-gradient energy. Multiplies the `--mixed-bpw` sensitivity, supplying the K-FAC output factor the H-side objective omits. A tensor absent from the table scores 0 rather than keeping an unscaled score, which would let it dominate. Unset leaves the objective input-covariance only.
+pub const ENV_HIPFIRE_MIXED_BPW_GAMMA: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MIXED_BPW_GAMMA",
+    description: "Path to a `calib_gamma` JSON table of per-tensor output-gradient energy. Multiplies the `--mixed-bpw` sensitivity, supplying the K-FAC output factor the H-side objective omits. A tensor absent from the table scores 0 rather than keeping an unscaled score, which would let it dominate. Unset leaves the objective input-covariance only.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_MIXED_BPW_RANK` — Set 1 to dump the `--mixed-bpw` sensitivity ranking and exit before quantizing. Separates a bad RANKING from a bad SEARCH when the allocator loses to hand-picked promotions — the two need different fixes and the dump costs only the sensitivity pass.
 pub const ENV_HIPFIRE_MIXED_BPW_RANK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MIXED_BPW_RANK",
@@ -5723,6 +5730,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_MINIMAX_PROMOTE_MQ4,
     ENV_HIPFIRE_MINIMAX_PROMOTE_MQ6,
     ENV_HIPFIRE_MIXED_BPW_FULL_H,
+    ENV_HIPFIRE_MIXED_BPW_GAMMA,
     ENV_HIPFIRE_MIXED_BPW_RANK,
     ENV_HIPFIRE_MMQ,
     ENV_HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY,
