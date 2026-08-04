@@ -1384,17 +1384,33 @@ impl HfqFile {
         Some(&self.tensors[idx])
     }
 
+    /// Borrow a tensor's bytes. Returns `None` for a losslessly recoded tensor —
+    /// prefer [`Self::tensor_data_cow`] unless you know the tensor is never one.
+    ///
+    /// `--bf16-codec` DEFAULTS to `huff`, so any BF16 tensor in any recent
+    /// artifact may be stored compressed, and `is_gather_shaped` steers
+    /// `embed_tokens` / `lm_head` to LUT3 specifically — the big tensors are the
+    /// likeliest to be recoded, not the least.
+    ///
+    /// The `None` is the trap: callers wrote `.expect("<name> not found")` and
+    /// reported a PRESENT tensor as missing, or tested `.is_some()` and silently
+    /// took a fallback path. Both shapes shipped (see the sweep in commits
+    /// 4e6166cca / 226bb66b2 / 9a6a5bbd3), and one loaded an embedding table as
+    /// an untied model's output weights with no error at all.
+    ///
+    /// For metadata alone use [`Self::find_tensor_info`] — it needs no bytes and
+    /// so does not care how the tensor is stored.
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
         // A BF16L3 tensor's bytes are compressed; there is no BF16 buffer in the
         // file to borrow. Returning the packed bytes here would hand back
-        // garbage tagged as BF16, so refuse and make the caller use the owned
-        // path (`tensor_data_vec` / `tensor_data_pread`), which decodes.
+        // garbage tagged as BF16, so refuse and make the caller use a decoding
+        // path (`tensor_data_cow` / `tensor_data_vec` / `tensor_data_pread`).
         if self.bf16_packed[idx].is_some() {
             debug_assert!(
                 false,
-                "tensor_data() on compressed-BF16 tensor {name} — use tensor_data_vec()/_pread()"
+                "tensor_data() on compressed-BF16 tensor {name} — use tensor_data_cow()"
             );
             return None;
         }
