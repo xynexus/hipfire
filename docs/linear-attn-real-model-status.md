@@ -218,6 +218,48 @@ branch contributes almost nothing — rms 0.0011 against the attention branch's
 0.0135 and the residual's 0.0206. A dense SwiGLU MLP contributing 5% of the
 stream is not normal.
 
+## A whole-model numpy forward fails the same way — and the oracle is suspect
+
+`tools/qwen35_full_forward_oracle.py` implements all 24 layers independently in
+numpy: linear_attn and full attention, QK-norm, partial rope, GQA, the output
+gate. Next-token NLL **11.70** against a uniform 12.42 — the same failure as the
+Rust walk's 13.34. Three implementations now agree with each other and all fail,
+so the defect is in the reading of the architecture, not in either codebase.
+
+Also settled this round, by reading rather than measuring: `kernels/src/rmsnorm.hip`
+computes `out[idx] = x[idx] * weight[i] * rms`. Plain weight, no unit offset. The
+`1 + w` improvement recorded above is an artifact, and not acting on it was right.
+
+**But the oracle itself does not pass a basic sanity check.** Putting the
+runtime's own final hidden state through the final norm and tied lm_head:
+
+| predicts | NLL | acc |
+|---|---|---|
+| token[i-1] | 7.14 | 0.06 |
+| token[i] | 6.08 | 0.22 |
+| token[i+1] (next-token) | 8.16 | 0.06 |
+
+A working Qwen3.5-0.8B should score ~2-3. No shift rescues it, and hidden-state
+alignment confirms no offset (shift 0 is the best match at every layer). So the
+reference states cannot predict text either.
+
+Cleared while establishing that: tokenization round-trips exactly (ids decode
+back to the corpus text), and the embedding matches raw weights at cos 0.99999.
+
+That leaves two things needing explanation rather than one:
+
+1. This implementation is wrong — established independently of the oracle, since
+   the walk and the numpy forward both sit near uniform on their own.
+2. The oracle is wrong, or `dump_qwen35_hidden_states` is. Two bugs have already
+   been found in that example this session, and it drives an unusual per-token
+   decode path. The runtime ships working Qwen3.5 inference with KLD baselines,
+   so the dumper is the more likely culprit than the engine.
+
+Next: validate the runtime independently of the dumper — generate text from this
+artifact through the normal serving path. If generation is coherent, the dumper
+is at fault and a different capture point is needed; if it is not, the artifact
+or its config handling is implicated and that is a much bigger finding.
+
 ## Two fixes the oracle itself needed
 
 - `dump_qwen35_hidden_states` asked `HiddenStateRingBuffer::new` for all 24
