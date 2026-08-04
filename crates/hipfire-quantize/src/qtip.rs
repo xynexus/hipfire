@@ -990,9 +990,9 @@ mod tests {
     ///       real_weights_quality_gate -- --nocapture
     #[test]
     fn real_weights_quality_gate() {
-        let path = match std::env::var("HIPFIRE_QTIP_EVAL_ST") {
-            Ok(p) => p,
-            Err(_) => {
+        let path = match hipfire_env::QTIP_EVAL_ST.get() {
+            Some(p) => p,
+            None => {
                 eprintln!("skip real_weights_quality_gate (set HIPFIRE_QTIP_EVAL_ST)");
                 return;
             }
@@ -1074,9 +1074,9 @@ mod tests {
     ///       whole_model_quality_gate -- --nocapture
     #[test]
     fn whole_model_quality_gate() {
-        let path = match std::env::var("HIPFIRE_QTIP_EVAL_ST") {
-            Ok(p) => p,
-            Err(_) => {
+        let path = match hipfire_env::QTIP_EVAL_ST.get() {
+            Some(p) => p,
+            None => {
                 eprintln!("skip whole_model_quality_gate (set HIPFIRE_QTIP_EVAL_ST)");
                 return;
             }
@@ -1305,7 +1305,9 @@ mod tests {
         // assert below uses a non-trivial L and requires the output to CHANGE.
         let n = 64usize;
         let cb = build_codebook_3inst();
-        let w: Vec<f32> = (0..n).map(|i| ((i * 37 % 23) as f32 - 11.0) / 11.0).collect();
+        let w: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) / 11.0)
+            .collect();
         let scale = group_scale(&w);
         let mut l_id = vec![0.0f64; n * n];
         for i in 0..n {
@@ -1322,7 +1324,10 @@ mod tests {
             l[f * n + (f - 1)] = 0.5;
         }
         let fed = beam_encode_group_bits_ldlq(&w, scale, &cb, 16, BITS_PER_WEIGHT, &l);
-        assert_ne!(plain, fed, "error feedback changed nothing — residual unused");
+        assert_ne!(
+            plain, fed,
+            "error feedback changed nothing — residual unused"
+        );
     }
 
     #[test]

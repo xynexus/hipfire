@@ -306,7 +306,7 @@ thread_local! {
 fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     #[cfg(feature = "gpu")]
     {
-        if std::env::var("HIPFIRE_GPU_CHOLESKY").as_deref() == Ok("1") {
+        if hipfire_env::GPU_CHOLESKY.flag() {
             let out = CHOL_GPU.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 if slot.is_none() {
@@ -1185,14 +1185,20 @@ mod chol_tests {
 
         let got = super::llt_lower_right_looking_gpu(&mut gpu, &h, k).expect("gpu llt");
 
-        let scale = (0..k).map(|i| reference[(i, i)].abs()).fold(0.0f64, f64::max);
+        let scale = (0..k)
+            .map(|i| reference[(i, i)].abs())
+            .fold(0.0f64, f64::max);
         let mut worst = 0.0f64;
         for i in 0..k {
             for j in 0..=i {
                 worst = worst.max((reference[(i, j)] - got[i * k + j]).abs());
             }
         }
-        println!("  gpu-vs-faer worst |dL| = {:.3e} (rel {:.3e})", worst, worst / scale);
+        println!(
+            "  gpu-vs-faer worst |dL| = {:.3e} (rel {:.3e})",
+            worst,
+            worst / scale
+        );
         assert!(
             worst / scale < 1e-4,
             "GPU factorization differs by rel {:.3e} — f32 trailing update is not \
@@ -1227,7 +1233,11 @@ mod chol_tests {
             let f = (k as f64).powi(3) / 3.0;
             println!(
                 "  k={k}  faer {:.3}s ({:.1} GF/s)   gpu {:.3}s ({:.1} GF/s)   speedup {:.2}x",
-                cpu, f / cpu / 1e9, gpu_s, f / gpu_s / 1e9, cpu / gpu_s
+                cpu,
+                f / cpu / 1e9,
+                gpu_s,
+                f / gpu_s / 1e9,
+                cpu / gpu_s
             );
         }
     }
@@ -1265,7 +1275,10 @@ mod chol_tests {
                     worst = worst.max((cpu[(i, j)] - got[(i, j)]).abs());
                 }
             }
-            println!("  k={k} ridge={ridge}: worst |dL| rel = {:.3e}", worst / scale);
+            println!(
+                "  k={k} ridge={ridge}: worst |dL| rel = {:.3e}",
+                worst / scale
+            );
             assert!(
                 worst / scale < 5e-3,
                 "gpu inv-cholesky differs by rel {:.3e} (k={k})",
@@ -1885,7 +1898,8 @@ pub fn llt_lower_right_looking_gpu(
     while j0 < k {
         let jb = JB.min(k - j0);
         let rows = k - j0;
-        gpu.chol_panel_gather(&dev, &panel_dev, k, j0, jb, rows).ok()?;
+        gpu.chol_panel_gather(&dev, &panel_dev, k, j0, jb, rows)
+            .ok()?;
         gpu.device_synchronize().ok()?;
         let flat = gpu.download_f32(&panel_dev).ok()?;
         let mut panel = vec![0.0f64; rows * jb];
@@ -1918,7 +1932,8 @@ pub fn llt_lower_right_looking_gpu(
         // Write the factored panel back and let the GPU take the trailing update.
         let back: Vec<f32> = panel.iter().map(|&v| v as f32).collect();
         let back_dev = gpu.upload_owned_f32(&back, &[rows, jb]).ok()?;
-        gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows).ok()?;
+        gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows)
+            .ok()?;
         gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
         gpu.device_synchronize().ok()?;
         j0 += jb;

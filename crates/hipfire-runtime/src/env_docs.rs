@@ -237,39 +237,39 @@ pub const ENV_HIPFIRE_ALLOW_MIXED_ARCH: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/config.rs:110",
 };
 
-/// `HIPFIRE_ALLOW_MQ2` — Enabled when set to 1
+/// `HIPFIRE_ALLOW_MQ2` — Set 1 to allow `--format mq2`, equivalent to `--allow-mq2`. Gated because the uniform 4-level codebook collapses at every model size validated locally (0.8B/4B/9B Qwen 3.5 produced mojibake on all four coherence-gate prompts).
 pub const ENV_HIPFIRE_ALLOW_MQ2: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:7872",
+    description: "Set 1 to allow `--format mq2`, equivalent to `--allow-mq2`. Gated because the uniform 4-level codebook collapses at every model size validated locally (0.8B/4B/9B Qwen 3.5 produced mojibake on all four coherence-gate prompts).",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_ALLOW_MQ2_LLOYD` — Enabled when set to 1
+/// `HIPFIRE_ALLOW_MQ2_LLOYD` — Set 1 to allow the Lloyd-Max MQ2 formats, equivalent to `--allow-mq2-lloyd`. Research-only: better than uniform MQ2 but still text-collapse.
 pub const ENV_HIPFIRE_ALLOW_MQ2_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ2_LLOYD",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:7907",
+    description: "Set 1 to allow the Lloyd-Max MQ2 formats, equivalent to `--allow-mq2-lloyd`. Research-only: better than uniform MQ2 but still text-collapse.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_ALLOW_MQ3_LLOYD` — Enabled when set to 1
+/// `HIPFIRE_ALLOW_MQ3_LLOYD` — Set 1 to allow the Lloyd-Max MQ3 formats, equivalent to `--allow-mq3-lloyd`. Research-only: 8-entry codebook + 3-bit indices (112 B/group, +7.7% over uniform MQ3).
 pub const ENV_HIPFIRE_ALLOW_MQ3_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ3_LLOYD",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:7892",
+    description: "Set 1 to allow the Lloyd-Max MQ3 formats, equivalent to `--allow-mq3-lloyd`. Research-only: 8-entry codebook + 3-bit indices (112 B/group, +7.7% over uniform MQ3).",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_ALLOW_MQ4_LLOYD` — Enabled when set to 1
+/// `HIPFIRE_ALLOW_MQ4_LLOYD` — Set 1 to allow the Lloyd-Max MQ4 format, equivalent to `--allow-mq4-lloyd`. Research-only: 16-entry codebook + 4-bit indices (160 B/group, +17.6% over uniform MQ4), quality not yet validated.
 pub const ENV_HIPFIRE_ALLOW_MQ4_LLOYD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_MQ4_LLOYD",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:7942",
+    description: "Set 1 to allow the Lloyd-Max MQ4 format, equivalent to `--allow-mq4-lloyd`. Research-only: 16-entry codebook + 4-bit indices (160 B/group, +17.6% over uniform MQ4), quality not yet validated.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_ALLOW_UNIT_IMATRIX` — Environment toggle value controls runtime behavior
+/// `HIPFIRE_ALLOW_UNIT_IMATRIX` — Set 1 to let the GPTQ-all formats run WITHOUT `--imatrix`, using unit column weights. Intended for DeepSeek V4, where no imatrix exists yet; quality is strictly worse than a real imatrix.
 pub const ENV_HIPFIRE_ALLOW_UNIT_IMATRIX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ALLOW_UNIT_IMATRIX",
-    description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-quantize/src/main.rs:7433",
+    description: "Set 1 to let the GPTQ-all formats run WITHOUT `--imatrix`, using unit column weights. Intended for DeepSeek V4, where no imatrix exists yet; quality is strictly worse than a real imatrix.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
@@ -279,11 +279,11 @@ pub const ENV_HIPFIRE_ATTN_FLASH: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:666",
 };
 
-/// `HIPFIRE_AWQ_F1_ONLY` — F1-vs-F2 A/B gate. When "HIPFIRE_AWQ_F1_ONLY=1" is set, the F2
+/// `HIPFIRE_AWQ_F1_ONLY` — Set 1 to restrict AWQ to the F1 whitelist (attention input projections and gate/up only), excluding the F2 additions (o_proj / wo / out_proj / down_proj / w_down). Produces an F1-equivalent quant for A/B comparison against the same binary's F2 output. Unset applies the full F2 list.
 pub const ENV_HIPFIRE_AWQ_F1_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_AWQ_F1_ONLY",
-    description: "F1-vs-F2 A/B gate. When \"HIPFIRE_AWQ_F1_ONLY=1\" is set, the F2",
-    source: "crates/hipfire-quantize/src/main.rs:6399",
+    description: "Set 1 to restrict AWQ to the F1 whitelist (attention input projections and gate/up only), excluding the F2 additions (o_proj / wo / out_proj / down_proj / w_down). Produces an F1-equivalent quant for A/B comparison against the same binary's F2 output. Unset applies the full F2 list.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_BASELINE_ARCH` — Best-effort: try amdgpu-arch, then KFD topology, then "unknown"
@@ -2003,18 +2003,18 @@ pub const ENV_HIPFIRE_GFX942_RMSNORM_SPLIT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/feature_flags.rs:250",
 };
 
-/// `HIPFIRE_GPTQ_DAMPING` — Inject env override since the quantizer reads it at fn entry
+/// `HIPFIRE_GPTQ_DAMPING` — Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 (the default) the pass is a no-op and output is byte-identical to plain `quantize_mq2g256_lloyd_weighted`.
 pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPTQ_DAMPING",
-    description: "Inject env override since the quantizer reads it at fn entry",
-    source: "crates/hipfire-quantize/src/main.rs:13319",
+    description: "Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 (the default) the pass is a no-op and output is byte-identical to plain `quantize_mq2g256_lloyd_weighted`.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_GPU_CHOLESKY` — Environment toggle value controls runtime behavior
+/// `HIPFIRE_GPU_CHOLESKY` — Set 1 to run the LDLQ Cholesky factorization on the GPU. Measured quality-neutral but 34x SLOWER than the CPU path end to end: the trailing update is faster on device, but ~4500 block iterations each pay two device syncs and a ~4 MB panel round-trip. Off by default; needs the `gpu` feature.
 pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_CHOLESKY",
-    description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-quantize/src/ldlq.rs:309",
+    description: "Set 1 to run the LDLQ Cholesky factorization on the GPU. Measured quality-neutral but 34x SLOWER than the CPU path end to end: the trailing update is faster on device, but ~4500 block iterations each pay two device syncs and a ~4 MB panel round-trip. Off by default; needs the `gpu` feature.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_GPU_SLAB_LOAD` — Runtime variable controlling gpu slab load in hipfire
@@ -2550,11 +2550,11 @@ pub const ENV_HIPFIRE_LLOYD_GFX12: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/prefill_microbench.rs:167",
 };
 
-/// `HIPFIRE_LLOYD_K3` — Fallback to HFQ2-G128 for non-256-aligned (no rotation)
+/// `HIPFIRE_LLOYD_K3` — Set 1 to encode MQ2-Lloyd with a ternary 3-level codebook ("MQ1.58") instead of 4 levels. Reuses the same kernel and block layout.
 pub const ENV_HIPFIRE_LLOYD_K3: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_K3",
-    description: "Fallback to HFQ2-G128 for non-256-aligned (no rotation)",
-    source: "crates/hipfire-quantize/src/main.rs:11133",
+    description: "Set 1 to encode MQ2-Lloyd with a ternary 3-level codebook (\"MQ1.58\") instead of 4 levels. Reuses the same kernel and block layout.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_LLOYD_MB4` — Force MB4=0 to skip the size-gated routing
@@ -2613,11 +2613,11 @@ pub const ENV_HIPFIRE_LOCAL: EnvVarDoc = EnvVarDoc {
     source: "README.md:962",
 };
 
-/// `HIPFIRE_LOWRANK_R` — Runtime variable controlling lowrank r in hipfire
+/// `HIPFIRE_LOWRANK_R` — Rank of a low-rank correction of the quantization error added back into the emitted weight (LQER / CALDERA residual probe). Simulates W4 plus a 2-WMMA UV correction. 0 (the default) disables it.
 pub const ENV_HIPFIRE_LOWRANK_R: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LOWRANK_R",
-    description: "Runtime variable controlling lowrank r in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:12913",
+    description: "Rank of a low-rank correction of the quantization error added back into the emitted weight (LQER / CALDERA residual probe). Simulates W4 plus a 2-WMMA UV correction. 0 (the default) disables it.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_MAX_GEN` — Runtime variable controlling max gen in hipfire
@@ -2655,11 +2655,11 @@ pub const ENV_HIPFIRE_MINIMAX_CAPTURE_POSTATTN: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-minimax/src/forward.rs:206",
 };
 
-/// `HIPFIRE_MINIMAX_DOWN_FORMAT` — env knobs (which target MQ-base models). Per-expert LDLQ does not
+/// `HIPFIRE_MINIMAX_DOWN_FORMAT` — Promote ONLY the MiniMax expert `w2` (down) tensors to this format (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The forward dispatches each on its own dtype, so they may differ.
 pub const ENV_HIPFIRE_MINIMAX_DOWN_FORMAT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_DOWN_FORMAT",
-    description: "env knobs (which target MQ-base models). Per-expert LDLQ does not",
-    source: "crates/hipfire-quantize/src/main.rs:9830",
+    description: "Promote ONLY the MiniMax expert `w2` (down) tensors to this format (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The forward dispatches each on its own dtype, so they may differ.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ` — down-AWQ harmful (shared s_down bad approx); opt-in
@@ -2669,25 +2669,39 @@ pub const ENV_HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-minimax/src/minimax.rs:794",
 };
 
-/// `HIPFIRE_MINIMAX_EXPERT_MQ2L` — dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
+/// `HIPFIRE_MINIMAX_EXPERT_MQ2L` — Set (to any value) to emit MiniMax routed experts as MQ2-Lloyd, the sub-4-bit hipx target. Equivalent to `--format mq2-lloyd` for the experts alone.
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ2L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ2L",
-    description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "crates/hipfire-quantize/src/main.rs:9809",
+    description: "Set (to any value) to emit MiniMax routed experts as MQ2-Lloyd, the sub-4-bit hipx target. Equivalent to `--format mq2-lloyd` for the experts alone.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_MINIMAX_EXPERT_MQ3L` — dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
+/// `HIPFIRE_MINIMAX_EXPERT_MQ3L` — Set (to any value) to emit MiniMax routed experts as MQ3-Lloyd. Equivalent to `--format mq3-lloyd` for the experts alone.
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ3L: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ3L",
-    description: "dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model",
-    source: "crates/hipfire-quantize/src/main.rs:9811",
+    description: "Set (to any value) to emit MiniMax routed experts as MQ3-Lloyd. Equivalent to `--format mq3-lloyd` for the experts alone.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_MINIMAX_EXPERT_MQ6` — _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
+/// `HIPFIRE_MINIMAX_EXPERT_MQ6` — Set (to any value) to emit MiniMax routed experts as MQ6 — the oracle check against the MQ4 baseline. Equivalent to `--format mq6` for the experts alone.
 pub const ENV_HIPFIRE_MINIMAX_EXPERT_MQ6: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_EXPERT_MQ6",
-    description: "_MQ6 hold comma-separated layer ranges (\"12-45,50\") whose experts are",
-    source: "crates/hipfire-quantize/src/main.rs:9807",
+    description: "Set (to any value) to emit MiniMax routed experts as MQ6 — the oracle check against the MQ4 baseline. Equivalent to `--format mq6` for the experts alone.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
+/// `HIPFIRE_MINIMAX_PROMOTE_MQ4` — Comma-separated MiniMax layer ranges (`12-45,50`, inclusive) whose experts are forced UP to MQ4 regardless of the base `--format`. The forward dispatches expert dtype per layer, so a model can carry an MQ2-Lloyd base with MQ4 on the quant-sensitive middle layers.
+pub const ENV_HIPFIRE_MINIMAX_PROMOTE_MQ4: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MINIMAX_PROMOTE_MQ4",
+    description: "Comma-separated MiniMax layer ranges (`12-45,50`, inclusive) whose experts are forced UP to MQ4 regardless of the base `--format`. The forward dispatches expert dtype per layer, so a model can carry an MQ2-Lloyd base with MQ4 on the quant-sensitive middle layers.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
+/// `HIPFIRE_MINIMAX_PROMOTE_MQ6` — Comma-separated MiniMax layer ranges forced UP to MQ6. Same form and mechanism as `HIPFIRE_MINIMAX_PROMOTE_MQ4`.
+pub const ENV_HIPFIRE_MINIMAX_PROMOTE_MQ6: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MINIMAX_PROMOTE_MQ6",
+    description: "Comma-separated MiniMax layer ranges forced UP to MQ6. Same form and mechanism as `HIPFIRE_MINIMAX_PROMOTE_MQ4`.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_MMQ` — Selects behavior from recognized values
@@ -2956,11 +2970,11 @@ pub const ENV_HIPFIRE_NORM_PLUS1: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-train/examples/qwen35_mlp_norm_recovery.rs:212",
 };
 
-/// `HIPFIRE_NO_CLIP_LAYERS` — Runtime variable controlling no clip layers in hipfire
+/// `HIPFIRE_NO_CLIP_LAYERS` — Comma-separated tensor-name suffixes to EXCLUDE from clip search, e.g. `down_proj,o_proj`. Unset keeps the uniform behaviour of clipping every tensor. Only meaningful where clipping is lossy — on a bf16 or oq8++ tier it matters, on an oq4++ tier it is close to a no-op.
 pub const ENV_HIPFIRE_NO_CLIP_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NO_CLIP_LAYERS",
-    description: "Runtime variable controlling no clip layers in hipfire",
-    source: "crates/hipfire-quantize/src/codecs.rs:500",
+    description: "Comma-separated tensor-name suffixes to EXCLUDE from clip search, e.g. `down_proj,o_proj`. Unset keeps the uniform behaviour of clipping every tensor. Only meaningful where clipping is lossy — on a bf16 or oq8++ tier it matters, on an oq4++ tier it is close to a no-op.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_NO_COARSE_LMHEAD` — Set to any value to stop the quantizer emitting the `<embed>.coarse.weight` shortlist tier. Equivalent to `--no-coarse-lmhead`. Default is to emit it.
@@ -2970,11 +2984,11 @@ pub const ENV_HIPFIRE_NO_COARSE_LMHEAD: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_NO_EXPERT_AWQ` — experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the
+/// `HIPFIRE_NO_EXPERT_AWQ` — Set 1 to suppress per-expert AWQ smoothing so routed experts fall back to plain MQ4/MQ8. An A/B knob for measuring the expert-AWQ quality delta; dense tensors are unaffected.
 pub const ENV_HIPFIRE_NO_EXPERT_AWQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NO_EXPERT_AWQ",
-    description: "experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the",
-    source: "crates/hipfire-quantize/src/main.rs:10125",
+    description: "Set 1 to suppress per-expert AWQ smoothing so routed experts fall back to plain MQ4/MQ8. An A/B knob for measuring the expert-AWQ quality delta; dense tensors are unaffected.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_NO_QUANT` — Environment toggle value controls runtime behavior
@@ -3110,25 +3124,25 @@ pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/weights.rs:667",
 };
 
-/// `HIPFIRE_OQ8_ROUTER` — OQ8-W8A16 router promotion (opt-in HIPFIRE_OQ8_ROUTER): keep
+/// `HIPFIRE_OQ8_ROUTER` — Set 1 to promote the MoE router (`mlp.gate`, `mlp.shared_expert_gate`) to OQ8 W8A16 under any Opus format. The router is precision-sensitive and tiny, so the bit cost is negligible.
 pub const ENV_HIPFIRE_OQ8_ROUTER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ8_ROUTER",
-    description: "OQ8-W8A16 router promotion (opt-in HIPFIRE_OQ8_ROUTER): keep",
-    source: "crates/hipfire-quantize/src/main.rs:10576",
+    description: "Set 1 to promote the MoE router (`mlp.gate`, `mlp.shared_expert_gate`) to OQ8 W8A16 under any Opus format. The router is precision-sensitive and tiny, so the bit cost is negligible.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_OQ_RAGGED_Q8` — Runtime variable controlling oq ragged Q8 in hipfire
+/// `HIPFIRE_OQ_RAGGED_Q8` — Set (to any value) to emit Opus tensors whose K is not a multiple of 256 as Q8 rather than zero-padding them to a 256 group. The GPU serving loaders assert `K % 256 == 0`, so padded ragged Opus tensors load only on the NPU-native path; this keeps such artifacts GPU-loadable. Default stays padded-Opus.
 pub const ENV_HIPFIRE_OQ_RAGGED_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ_RAGGED_Q8",
-    description: "Runtime variable controlling oq ragged Q8 in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:10330",
+    description: "Set (to any value) to emit Opus tensors whose K is not a multiple of 256 as Q8 rather than zero-padding them to a 256 group. The GPU serving loaders assert `K % 256 == 0`, so padded ragged Opus tensors load only on the NPU-native path; this keeps such artifacts GPU-loadable. Default stays padded-Opus.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_OUTLIERS_BY_LAYER` — Runtime variable controlling outliers by layer in hipfire
+/// `HIPFIRE_OUTLIERS_BY_LAYER` — Per-layer outlier budget for `oq<BITS>++`, as comma-separated `<suffix>=<frac>` entries with an optional bare `<frac>` fallback. `OqPlusCompact` stores the count implicitly in the block length (`130 + 2*N_out`), so varying it per tensor needs no format change.
 pub const ENV_HIPFIRE_OUTLIERS_BY_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OUTLIERS_BY_LAYER",
-    description: "Runtime variable controlling outliers by layer in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:6372",
+    description: "Per-layer outlier budget for `oq<BITS>++`, as comma-separated `<suffix>=<frac>` entries with an optional bare `<frac>` fallback. `OqPlusCompact` stores the count implicitly in the block length (`130 + 2*N_out`), so varying it per tensor needs no format change.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_PACK_IDENTITY` — Runtime variable controlling pack identity in hipfire
@@ -3635,60 +3649,60 @@ pub const ENV_HIPFIRE_QA_KV_MODES: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/test_inferenceQA.rs:770",
 };
 
-/// `HIPFIRE_QTIP_BBT_ALPHA` — BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α
+/// `HIPFIRE_QTIP_BBT_ALPHA` — BBT spectral influence exponent (SpectralLLM): per-channel scaling by spectral activation energy from the calibration Hessian before the trellis, math-invariant. 0.5 is the paper default; unset disables BBT.
 pub const ENV_HIPFIRE_QTIP_BBT_ALPHA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_BBT_ALPHA",
-    description: "BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α",
-    source: "crates/hipfire-quantize/src/main.rs:11687",
+    description: "BBT spectral influence exponent (SpectralLLM): per-channel scaling by spectral activation energy from the calibration Hessian before the trellis, math-invariant. 0.5 is the paper default; unset disables BBT.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_BEAM` — K-map gate: applies to MoE models by default. Dense models opt in
+/// `HIPFIRE_QTIP_BEAM` — Beam width for the QTIP trellis encoder. Default 128. Lower trades quality for a large encode speedup on big models — the beam search is the offline bottleneck. `--beam` sets this, so the `.hfq`-requantize and direct-source paths agree.
 pub const ENV_HIPFIRE_QTIP_BEAM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_BEAM",
-    description: "K-map gate: applies to MoE models by default. Dense models opt in",
-    source: "crates/hipfire-quantize/src/main.rs:7836",
+    description: "Beam width for the QTIP trellis encoder. Default 128. Lower trades quality for a large encode speedup on big models — the beam search is the offline bottleneck. `--beam` sets this, so the `.hfq`-requantize and direct-source paths agree.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_CODEBOOK` — Environment toggle value controls runtime behavior
+/// `HIPFIRE_QTIP_CODEBOOK` — Set `3inst` to use the 3INST computed codebook instead of 1MAD. The encoder codebook, artifact quant type and decode kernel all derive from this one read, so they cannot drift apart — a 3INST block under a 1MAD kernel would dequantize to noise with every structural check passing.
 pub const ENV_HIPFIRE_QTIP_CODEBOOK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_CODEBOOK",
-    description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-quantize/src/main.rs:7204",
+    description: "Set `3inst` to use the 3INST computed codebook instead of 1MAD. The encoder codebook, artifact quant type and decode kernel all derive from this one read, so they cannot drift apart — a 3INST block under a 1MAD kernel would dequantize to noise with every structural check passing.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_COND` — Selects behavior from recognized values
+/// `HIPFIRE_QTIP_COND` — Hessian conditioning for the QTIP trellis: `weighted`, `greedy`, or `beamldlq`. All three need `--hessian`; without one the tensor falls back to the plain unweighted beam, which is also the unset default.
 pub const ENV_HIPFIRE_QTIP_COND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_COND",
-    description: "Selects behavior from recognized values",
-    source: "crates/hipfire-quantize/src/main.rs:4901",
+    description: "Hessian conditioning for the QTIP trellis: `weighted`, `greedy`, or `beamldlq`. All three need `--hessian`; without one the tensor falls back to the plain unweighted beam, which is also the unset default.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_CPU_ENCODE` — the encoder swap alone. Set HIPFIRE_QTIP_CPU_ENCODE=1 to hold the encoder
+/// `HIPFIRE_QTIP_CPU_ENCODE` — Set 1 to force the CPU beam encoder even when the GPU encoder is available. Conditioning arms otherwise swap the ENCODER and the conditioning at once, so a conditioned arm could lose on the encoder change alone — this holds the encoder fixed across arms.
 pub const ENV_HIPFIRE_QTIP_CPU_ENCODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_CPU_ENCODE",
-    description: "the encoder swap alone. Set HIPFIRE_QTIP_CPU_ENCODE=1 to hold the encoder",
-    source: "crates/hipfire-quantize/src/main.rs:4977",
+    description: "Set 1 to force the CPU beam encoder even when the GPU encoder is available. Conditioning arms otherwise swap the ENCODER and the conditioning at once, so a conditioned arm could lose on the encoder change alone — this holds the encoder fixed across arms.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_EVAL_ST` — Selects behavior from recognized values
+/// `HIPFIRE_QTIP_EVAL_ST` — Path to a `model.safetensors` for the QTIP real-weight quality-gate tests. Unset skips them rather than failing.
 pub const ENV_HIPFIRE_QTIP_EVAL_ST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_EVAL_ST",
-    description: "Selects behavior from recognized values",
-    source: "crates/hipfire-quantize/src/qtip.rs:1077",
+    description: "Path to a `model.safetensors` for the QTIP real-weight quality-gate tests. Unset skips them rather than failing.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_HESSIAN` — Stamp the QTIP calib signature into the output metadata, same
+/// `HIPFIRE_QTIP_HESSIAN` — Path to a Hessian sidecar enabling LDLQ error feedback for the QTIP and roughquant simulation paths. Unset disables LDLQ.
 pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_HESSIAN",
-    description: "Stamp the QTIP calib signature into the output metadata, same",
-    source: "crates/hipfire-quantize/src/main.rs:7226",
+    description: "Path to a Hessian sidecar enabling LDLQ error feedback for the QTIP and roughquant simulation paths. Unset disables LDLQ.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_QTIP_LM_HEAD` — Enabled when set to 1
+/// `HIPFIRE_QTIP_LM_HEAD` — Set 1 to trellis-quantize the lm_head as well. Off by default because the head is output-sensitive and usually wants a higher tier.
 pub const ENV_HIPFIRE_QTIP_LM_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_LM_HEAD",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:4933",
+    description: "Set 1 to trellis-quantize the lm_head as well. Off by default because the head is output-sensitive and usually wants a higher tier.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_QUALITY_COMPARE_BIN` — Runtime variable controlling quality compare bin in hipfire
@@ -3719,11 +3733,11 @@ pub const ENV_HIPFIRE_QUANT_CANDS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/tests/quant.rs:396",
 };
 
-/// `HIPFIRE_QUANT_DIAG_PATH` — Runtime variable controlling quant diag path in hipfire
+/// `HIPFIRE_QUANT_DIAG_PATH` — `.hfq` artifact the `#[ignore]`d quantizer diagnostic tests open (metadata dump, weight-distribution sample, tensor inventory, block range). Defaults to a local DeepSeek V4 path that will not exist on another machine, so set it when running those tests.
 pub const ENV_HIPFIRE_QUANT_DIAG_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_DIAG_PATH",
-    description: "Runtime variable controlling quant diag path in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:15044",
+    description: "`.hfq` artifact the `#[ignore]`d quantizer diagnostic tests open (metadata dump, weight-distribution sample, tensor inventory, block range). Defaults to a local DeepSeek V4 path that will not exist on another machine, so set it when running those tests.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_QUANT_SRC` — Runtime variable controlling quant src in hipfire
@@ -3733,11 +3747,11 @@ pub const ENV_HIPFIRE_QUANT_SRC: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/tests/quant.rs:393",
 };
 
-/// `HIPFIRE_QUANT_THREADS` — Runtime variable controlling quant threads in hipfire
+/// `HIPFIRE_QUANT_THREADS` — Rayon worker threads for the quantizer. `--threads` wins over this; unset uses the default pool size. Lower it when a quantize run has to share the machine with serving traffic.
 pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_THREADS",
-    description: "Runtime variable controlling quant threads in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:6885",
+    description: "Rayon worker threads for the quantizer. `--threads` wins over this; unset uses the default pool size. Lower it when a quantize run has to share the machine with serving traffic.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH` — Defaults to auto when unset
@@ -4282,158 +4296,158 @@ pub const ENV_HIPFIRE_ROPE_INTERLEAVED_LEGACY: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/feature_flags.rs:296",
 };
 
-/// `HIPFIRE_RQ2_BULK_BITS` — Runtime variable controlling rq2 bulk bits in hipfire
+/// `HIPFIRE_RQ2_BULK_BITS` — roughquant2-sim: trellis bit-width for the rotated bulk. Default 3.
 pub const ENV_HIPFIRE_RQ2_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_BULK_BITS",
-    description: "Runtime variable controlling rq2 bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11893",
+    description: "roughquant2-sim: trellis bit-width for the rotated bulk. Default 3.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ2_DAMP` — De-risk B: single shared, foldable residual-stream rotation. With
+/// `HIPFIRE_RQ2_DAMP` — roughquant2-sim: Hessian ridge before the eigensolve, as a fraction of the diagonal mean. Default 0.01.
 pub const ENV_HIPFIRE_RQ2_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_DAMP",
-    description: "De-risk B: single shared, foldable residual-stream rotation. With",
-    source: "crates/hipfire-quantize/src/main.rs:11897",
+    description: "roughquant2-sim: Hessian ridge before the eigensolve, as a fraction of the diagonal mean. Default 0.01.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ2_PROTECT_FRAC` — Runtime variable controlling rq2 protect frac in hipfire
+/// `HIPFIRE_RQ2_PROTECT_FRAC` — roughquant2-sim (PCA rotation): fraction of highest-energy columns kept at full precision. Default 0.015. Tensors without a Hessian, or whose eigensolve fails, stay at the staged bf16.
 pub const ENV_HIPFIRE_RQ2_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_PROTECT_FRAC",
-    description: "Runtime variable controlling rq2 protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11889",
+    description: "roughquant2-sim (PCA rotation): fraction of highest-energy columns kept at full precision. Default 0.015. Tensors without a Hessian, or whose eigensolve fails, stay at the staged bf16.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ2_Q8_EMBED` — Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,
+/// `HIPFIRE_RQ2_Q8_EMBED` — roughquant2-sim: set 1 to simulate Q8 on embed/lm_head instead of leaving them bf16. Without it the mq4 comparison is confounded — mq4 uses Q8 there, worth ~20% of params on a tied-embedding 0.8B.
 pub const ENV_HIPFIRE_RQ2_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_Q8_EMBED",
-    description: "Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,",
-    source: "crates/hipfire-quantize/src/main.rs:12015",
+    description: "roughquant2-sim: set 1 to simulate Q8 on embed/lm_head instead of leaving them bf16. Without it the mq4 comparison is confounded — mq4 uses Q8 there, worth ~20% of params on a tied-embedding 0.8B.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ2_SHARE_RESID` — HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual
+/// `HIPFIRE_RQ2_SHARE_RESID` — roughquant2-sim: set 1 to force one SHARED residual-stream rotation across true residual readers (the foldable ResQ-U_A design) instead of a per-weight rotation. Weights reading internal activations keep their own. Tests whether foldability preserves the win.
 pub const ENV_HIPFIRE_RQ2_SHARE_RESID: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ2_SHARE_RESID",
-    description: "HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual",
-    source: "crates/hipfire-quantize/src/main.rs:11911",
+    description: "roughquant2-sim: set 1 to force one SHARED residual-stream rotation across true residual readers (the foldable ResQ-U_A design) instead of a per-weight rotation. Weights reading internal activations keep their own. Tests whether foldability preserves the win.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ3_BULK_BITS` — Runtime variable controlling rq3 bulk bits in hipfire
+/// `HIPFIRE_RQ3_BULK_BITS` — roughquant3-sim: trellis bit-width for the bulk. Default 3.
 pub const ENV_HIPFIRE_RQ3_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_BULK_BITS",
-    description: "Runtime variable controlling rq3 bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:12052",
+    description: "roughquant3-sim: trellis bit-width for the bulk. Default 3.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ3_PROTECT_FRAC` — Runtime variable controlling rq3 protect frac in hipfire
+/// `HIPFIRE_RQ3_PROTECT_FRAC` — roughquant3-sim (permutation + protection): protected fraction. Default 0.03. A permutation folds for free, so this is the foldable analog of roughquant2 minus the channel-mixing decorrelation.
 pub const ENV_HIPFIRE_RQ3_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_PROTECT_FRAC",
-    description: "Runtime variable controlling rq3 protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:12048",
+    description: "roughquant3-sim (permutation + protection): protected fraction. Default 0.03. A permutation folds for free, so this is the foldable analog of roughquant2 minus the channel-mixing decorrelation.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ3_Q8_EMBED` — Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)
+/// `HIPFIRE_RQ3_Q8_EMBED` — roughquant3-sim: set 1 to simulate Q8 on embed/lm_head for an honest mq4 comparison. Same purpose as the roughquant2 switch.
 pub const ENV_HIPFIRE_RQ3_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ3_Q8_EMBED",
-    description: "Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A)",
-    source: "crates/hipfire-quantize/src/main.rs:12114",
+    description: "roughquant3-sim: set 1 to simulate Q8 on embed/lm_head for an honest mq4 comparison. Same purpose as the roughquant2 switch.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_BULK` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
+/// `HIPFIRE_RQ4_BULK` — roughquant4-sim bulk codec: `mq4` for the real mq4 format (with a protected fraction of 0 this is the plain-mq4 baseline), `void` to zero the bulk, anything else for QTIP at the configured bulk bit-width.
 pub const ENV_HIPFIRE_RQ4_BULK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK",
-    description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "crates/hipfire-quantize/src/main.rs:12155",
+    description: "roughquant4-sim bulk codec: `mq4` for the real mq4 format (with a protected fraction of 0 this is the plain-mq4 baseline), `void` to zero the bulk, anything else for QTIP at the configured bulk bit-width.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_BULK_BITS` — Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
+/// `HIPFIRE_RQ4_BULK_BITS` — roughquant4-sim: trellis bit-width for the bulk. Default 3.
 pub const ENV_HIPFIRE_RQ4_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_BULK_BITS",
-    description: "Bulk codec: \"mq4\" → real mq4 format (fair mq4+protect-vs-mq4 test, set",
-    source: "crates/hipfire-quantize/src/main.rs:12149",
+    description: "roughquant4-sim: trellis bit-width for the bulk. Default 3.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_DUMP_RANK` — HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking
+/// `HIPFIRE_RQ4_DUMP_RANK` — roughquant4-sim: set 1 to print the residual-channel saliency ranking as `RANK<tab>channel<tab>energy` and exit without quantizing. Used to pick ablation-oracle targets sampled across the diag spectrum.
 pub const ENV_HIPFIRE_RQ4_DUMP_RANK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_DUMP_RANK",
-    description: "HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking",
-    source: "crates/hipfire-quantize/src/main.rs:12261",
+    description: "roughquant4-sim: set 1 to print the residual-channel saliency ranking as `RANK<tab>channel<tab>energy` and exit without quantizing. Used to pick ablation-oracle targets sampled across the diag spectrum.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_INVERT` — HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the
+/// `HIPFIRE_RQ4_INVERT` — roughquant4-sim: set 1 to invert the selection so the VOIDED set is the top-ranked channels instead of the bottom. With a high protect_frac this separates "the metric finds outliers" from "the metric ranks the tail correctly".
 pub const ENV_HIPFIRE_RQ4_INVERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_INVERT",
-    description: "HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the",
-    source: "crates/hipfire-quantize/src/main.rs:12279",
+    description: "roughquant4-sim: set 1 to invert the selection so the VOIDED set is the top-ranked channels instead of the bottom. With a high protect_frac this separates \"the metric finds outliers\" from \"the metric ranks the tail correctly\".",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_MQ_BITS` — on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
+/// `HIPFIRE_RQ4_MQ_BITS` — roughquant4-sim: uniform bit-width for the mq bulk (4 = mq4, 5, 6 = mq6). Default 4. With protect_frac 0 this is a fair FWHT uniform-N-bit anchor on the same machinery.
 pub const ENV_HIPFIRE_RQ4_MQ_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_MQ_BITS",
-    description: "on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²",
-    source: "crates/hipfire-quantize/src/main.rs:12165",
+    description: "roughquant4-sim: uniform bit-width for the mq bulk (4 = mq4, 5, 6 = mq6). Default 4. With protect_frac 0 this is a fair FWHT uniform-N-bit anchor on the same machinery.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_OBS_DAMP` — Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
+/// `HIPFIRE_RQ4_OBS_DAMP` — roughquant4-sim: Hessian ridge for OBS saliency, as a fraction of the diagonal mean. Default 0.01. Only read when saliency is `obs`.
 pub const ENV_HIPFIRE_RQ4_OBS_DAMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_OBS_DAMP",
-    description: "Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0",
-    source: "crates/hipfire-quantize/src/main.rs:12159",
+    description: "roughquant4-sim: Hessian ridge for OBS saliency, as a fraction of the diagonal mean. Default 0.01. Only read when saliency is `obs`.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_PROTECT_FRAC` — diag(H) residual-channel energy from true residual readers
+/// `HIPFIRE_RQ4_PROTECT_FRAC` — roughquant4-sim / roughquant-real / roughquant5: fraction of residual channels kept exact, in reader COLUMNS and writer ROWS alike. Defaults 0.03 for roughquant4 and roughquant-real, 0.05 for roughquant5.
 pub const ENV_HIPFIRE_RQ4_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_FRAC",
-    description: "diag(H) residual-channel energy from true residual readers",
-    source: "crates/hipfire-quantize/src/main.rs:12735",
+    description: "roughquant4-sim / roughquant-real / roughquant5: fraction of residual channels kept exact, in reader COLUMNS and writer ROWS alike. Defaults 0.03 for roughquant4 and roughquant-real, 0.05 for roughquant5.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_PROTECT_Q8` — (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)
+/// `HIPFIRE_RQ4_PROTECT_Q8` — roughquant4-sim: set 1 to protect at 8-bit per-channel Q8 rather than bf16, so the reported bit cost is honest.
 pub const ENV_HIPFIRE_RQ4_PROTECT_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_PROTECT_Q8",
-    description: "(weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)",
-    source: "crates/hipfire-quantize/src/main.rs:12170",
+    description: "roughquant4-sim: set 1 to protect at 8-bit per-channel Q8 rather than bf16, so the reported bit cost is honest.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_Q8_EMBED` — Enabled when set to 1
+/// `HIPFIRE_RQ4_Q8_EMBED` — roughquant4-sim: set 1 to simulate Q8 on embed/lm_head for an honest mq4 comparison. Same purpose as the roughquant2 switch.
 pub const ENV_HIPFIRE_RQ4_Q8_EMBED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_Q8_EMBED",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-quantize/src/main.rs:12521",
+    description: "roughquant4-sim: set 1 to simulate Q8 on embed/lm_head for an honest mq4 comparison. Same purpose as the roughquant2 switch.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_RANDOM_SEED` — Runtime variable controlling rQ4 random seed in hipfire
+/// `HIPFIRE_RQ4_RANDOM_SEED` — Seed for the `random` saliency control, so the chance-level baseline is reproducible. Default 1234567.
 pub const ENV_HIPFIRE_RQ4_RANDOM_SEED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_RANDOM_SEED",
-    description: "Runtime variable controlling rQ4 random seed in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:12384",
+    description: "Seed for the `random` saliency control, so the chance-level baseline is reproducible. Default 1234567.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_SALIENCY` — (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)
+/// `HIPFIRE_RQ4_SALIENCY` — roughquant4-sim channel-importance metric: `diag` (E[x^2], activation energy, the default), `wnorm` (||W[:,c]||^2), `product` (||W[:,c]||^2 * E[x^2], output-error contribution), `obs`, or `random` for the chance-level control.
 pub const ENV_HIPFIRE_RQ4_SALIENCY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_SALIENCY",
-    description: "(weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution)",
-    source: "crates/hipfire-quantize/src/main.rs:12174",
+    description: "roughquant4-sim channel-importance metric: `diag` (E[x^2], activation energy, the default), `wnorm` (||W[:,c]||^2), `product` (||W[:,c]||^2 * E[x^2], output-error contribution), `obs`, or `random` for the chance-level control.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ4_VOID_ONLY` — Runtime variable controlling rQ4 void only in hipfire
+/// `HIPFIRE_RQ4_VOID_ONLY` — roughquant4-sim: comma-separated residual channel indices to ablate, overriding protect_frac and saliency selection. Isolates the marginal KLD damage of specific channels — the gold-standard per-channel importance signal to validate diag(H) against.
 pub const ENV_HIPFIRE_RQ4_VOID_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ4_VOID_ONLY",
-    description: "Runtime variable controlling rQ4 void only in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:12303",
+    description: "roughquant4-sim: comma-separated residual channel indices to ablate, overriding protect_frac and saliency selection. Isolates the marginal KLD damage of specific channels — the gold-standard per-channel importance signal to validate diag(H) against.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ_BULK_BITS` — Runtime variable controlling rq bulk bits in hipfire
+/// `HIPFIRE_RQ_BULK_BITS` — roughquant-sim: uniform bit-width for the unprotected bulk. Default 2.
 pub const ENV_HIPFIRE_RQ_BULK_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_BULK_BITS",
-    description: "Runtime variable controlling rq bulk bits in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11822",
+    description: "roughquant-sim: uniform bit-width for the unprotected bulk. Default 2.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_RQ_GROUP` — Runtime variable controlling rq group in hipfire
+/// `HIPFIRE_RQ_GROUP` — roughquant-sim: quantization group size for the bulk. Default 256.
 pub const ENV_HIPFIRE_RQ_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_GROUP",
-    description: "Runtime variable controlling rq group in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11826",
+    description: "roughquant-sim: quantization group size for the bulk. Default 256.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_RQ_HAND` — hook, which only the hand arms below carry — force the hand path
@@ -4443,11 +4457,11 @@ pub const ENV_HIPFIRE_RQ_HAND: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs:41",
 };
 
-/// `HIPFIRE_RQ_PROTECT_FRAC` — Runtime variable controlling rq protect frac in hipfire
+/// `HIPFIRE_RQ_PROTECT_FRAC` — roughquant-sim: fraction of columns kept at full precision, the rest crushed to a uniform grid and baked back to bf16. Default 0.015. Saliency is diag(H) when a Hessian exists, else the column L2 norm.
 pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_PROTECT_FRAC",
-    description: "Runtime variable controlling rq protect frac in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:11818",
+    description: "roughquant-sim: fraction of columns kept at full precision, the rest crushed to a uniform grid and baked back to bf16. Default 0.015. Saliency is diag(H) when a Hessian exists, else the column L2 norm.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_RUN_EXAMPLE_BIN` — Runtime variable controlling run example bin in hipfire
@@ -4632,11 +4646,11 @@ pub const ENV_HIPFIRE_TEST_NOLIMA_CACHE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-eval/src/datasets.rs:1571",
 };
 
-/// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
+/// `HIPFIRE_TIER_RATIO` — Fraction of tensors placed in the high tier by the tiered MQ router. `--tier-ratio` wins over this. Default 0.30.
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
-    description: "Runtime variable controlling tier ratio in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:7476",
+    description: "Fraction of tensors placed in the high tier by the tiered MQ router. `--tier-ratio` wins over this. Default 0.30.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_TINYQUANT_FAMILIES` — Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES")
@@ -5614,6 +5628,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_MINIMAX_EXPERT_MQ2L,
     ENV_HIPFIRE_MINIMAX_EXPERT_MQ3L,
     ENV_HIPFIRE_MINIMAX_EXPERT_MQ6,
+    ENV_HIPFIRE_MINIMAX_PROMOTE_MQ4,
+    ENV_HIPFIRE_MINIMAX_PROMOTE_MQ6,
     ENV_HIPFIRE_MMQ,
     ENV_HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY,
     ENV_HIPFIRE_MMQ_SCREEN,
