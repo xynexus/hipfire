@@ -69,18 +69,32 @@ This is a `--mixed-bpw` run with the promotion list printed (already emitted:
 lines of `eprintln!`. **Do this before anything else.** It is cheap and it is
 decisive in one direction.
 
-## A defect that is independent of the objective
+## A defect that is independent of the objective — MEASURED, NOT WORTH FIXING
 
-`assign_tiers` models the gain of promoting oq4 -> oq8 as `c.err_oq4` — i.e. it
-assumes oq8 has ZERO error:
+`assign_tiers` models the gain of promoting oq4 -> oq8 as `c.err_oq4`, i.e. it
+assumes oq8 has ZERO error. oq8++ is near-lossless but not lossless, so the
+honest gain is `err_oq4 - err_oq8`, and I claimed here that tensors with
+irreducible oq4 error would be over-credited.
 
-    Tier::Oq4 => (c.err_oq4, (OQ8_BPW - c.bpw_at(...)) * numel, true)
+**Measured, and the correction is numerically inert.** Added
+`oq8_sensitivity` and dumped the residual for all 113 tensors:
 
-oq8++ is near-lossless but not lossless (3.5e-4 KLD from bf16 per
-`layer_sensitivity_hessian`'s header), so the true gain is
-`err_oq4 - err_oq8`. Tensors whose oq4 error is mostly irreducible get
-over-credited. This is cheap to fix and worth fixing regardless of which
-objective wins — it is a modelling error, not an approximation.
+    oq8 promotion removes 99.57% .. 99.61% of err_oq4
+    mean 99.598%, total spread 0.040 percentage points
+
+Every candidate is scaled by ~0.996, essentially uniformly. The greedy ranks by
+a density RATIO, so a near-constant factor cannot reorder it. There is no tensor
+whose oq4 error is meaningfully irreducible at oq8 — the premise of the concern
+was wrong.
+
+So: do NOT adopt `err_oq4 - err_oq8` in the gain model. It would add a full oq8
+quantize+dequant pass per tensor, doubling the sensitivity cost, to change
+nothing. `oq8_sensitivity` is kept because the ranking dump reports the residual
+column, which is how this was settled.
+
+Worth stating as a general point, since this document exists to direct
+expensive work: the defect was real and the fix was still worthless. Those are
+independent questions.
 
 ## What the objective currently is
 
@@ -161,8 +175,7 @@ o alone -15.1%, together -28.4%).
 ## Recommendation
 
 1. **Step 0 first.** It is an hour and it can eliminate the rest.
-2. **Fix the oq8-residual gain model** regardless — it is a real defect and
-   nearly free.
+2. ~~Fix the oq8-residual gain model~~ — measured inert, see above. Skip it.
 3. Only then decide between A and B, and note the expected prize is modest:
    `docs/2308.13137.md` measures OmniQuant's advantage over AWQ collapsing from
    3.6% to 0.7% once grouping is used, and we quantize at g256. The reason to do
