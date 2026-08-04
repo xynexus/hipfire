@@ -352,11 +352,25 @@ impl CalibCollector {
                 capture_id.0, descriptor.input_width
             )));
         }
+        // A wider-than-`k` stride means the caller handed us a scratch buffer
+        // sized for its MAXIMUM row count while `n` is this call's ACTUAL row
+        // count. For `n > 1` that is silent accumulator corruption: rows 1..n-1
+        // are then read at `row * (numel / n)`, i.e. stale data from a previous,
+        // wider slice. Reject it rather than striding over it.
+        //
+        // For `n == 1` the row offset `row * row_stride` is always 0, so only
+        // the first `k` elements are ever touched and a wider buffer is
+        // harmless. Several arches (gemma3/gemma4/cohere2) legitimately pass a
+        // shared scratch tensor at `n = 1`; requiring an exact stride there
+        // would reject correct callers, so only the lower bound is enforced.
         let row_stride = input.numel() / n;
-        if row_stride < k {
+        let stride_ok = if n == 1 { row_stride >= k } else { row_stride == k };
+        if !stride_ok {
             return Err(contracts::CalibError::InvalidCapture(format!(
-                "capture {} input row stride {row_stride} is below width {k}",
-                capture_id.0
+                "capture {} input row stride {row_stride} != width {k} \
+                 (input has {} elements for {n} rows; narrow it to n*k first)",
+                capture_id.0,
+                input.numel()
             )));
         }
 
