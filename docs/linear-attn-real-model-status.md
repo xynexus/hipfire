@@ -315,6 +315,50 @@ Logit magnitudes are comparable (rms 3.11 vs 3.28), so this is a ranking
 failure rather than a scale failure. That rules out a uniform magnitude bug —
 which is what the retracted reading would have sent me looking for.
 
+## Single token already diverges
+
+`dump_logits_qwen35 --prefill 1` against a one-token numpy forward: **cos 0.79**.
+
+That is the sharpest narrowing yet. With one token there is no cross-token flow
+at all — the conv sees a single tap, the recurrence is one step
+(`S = (v*beta) (x) k`, `out = S.q`), and attention's softmax is over ONE key, so
+it reduces to `ctx = v * sigmoid(gate)` with rope and QK-norm irrelevant
+(position 0 rotates by nothing; q and k cannot affect a one-element softmax).
+
+So the defect is in per-token math, and it iterates in seconds rather than six
+minutes.
+
+Variant sweep at one token, cos against the runtime:
+
+| variant | cos |
+|---|---|
+| base | 0.7896 |
+| drop q's 1/sqrt(hd) scale | 0.8349 |
+| attention gate: Q/gate halves swapped | 0.8085 |
+| attention gate: block layout | 0.7907 |
+| attention gate: off | 0.7883 |
+| MLP: gate/up swapped | 0.7511 |
+| MLP: off entirely | 0.7532 |
+
+Nothing is decisive — the whole spread is 0.75-0.83, and the best (dropping the
+q scale) contradicts a kernel this was verified against at 1e-7. No single
+structural flip explains it, which suggests either a small error compounding
+across 24 layers, or something about this checkpoint not visible in tensor names
+and shapes.
+
+Worth noting what the MLP rows say: turning the MLP off entirely costs only
+0.036 cos. At one token, 24 SwiGLU blocks are apparently near-irrelevant to the
+output direction — which is itself odd and may be a clue rather than noise.
+
+### Next
+
+The dumper's per-layer states are untrustworthy for SEQUENCES, but its bug may
+well be sequence-related (ring buffer, state carry, decode-from-cold). At
+`n_ctx = 1` there is no ring to wrap and no state to carry. If its layer-0
+state at one token matches this implementation's, it is usable for exactly the
+narrow case that now matters — and one layer at one token is a small enough
+system to check exhaustively.
+
 ## Superseded: the old next-step
 
 Per-layer states are what localise a defect, and that source is now known-bad.
