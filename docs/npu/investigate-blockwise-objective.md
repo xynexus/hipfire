@@ -229,3 +229,58 @@ Also incomplete: `BlockAdjoints` carries no `d_down`, so down_proj (16 tensors)
 and the embed table are absent from the gamma table — 96 of 113 candidates are
 covered. down_proj's adjoint is available on the existing path
 (`down_guided_capture` takes it from `d_x`) and just needs folding in.
+
+
+## k_proj MEASURED 2026-08-04 — my reference number was wrong
+
+`k_proj = -2.6%` was never measured. I derived it as `v+k (-16.0%)` minus
+`v alone (-13.4%)`, and this document's additivity claim was verified for v and
+o, not for v and k. Measured directly (`oq4.25++ a0.45`, k_proj alone to oq8++):
+
+    baseline oq4.25++ a0.45     KLD 0.034862
+    + k_proj -> oq8++           KLD 0.034686     -0.50%
+
+So k_proj alone is worth **-0.5%, not -2.6%** — five times smaller than assumed,
+and v+k is superadditive rather than additive (13.4 + 0.5 = 13.9 against a
+measured 16.0). Any inference resting on the -2.6% figure, including the earlier
+"implied G" column, is off by that factor for k.
+
+### The gap, correctly quantified
+
+Per-weight efficiency (gain % per % of quantised params), which is what the
+greedy actually ranks on:
+
+    o_proj   gain 15.1%   share 6.90%   eff 2.19
+    v_proj   gain 13.4%   share 1.72%   eff 7.77
+    k_proj   gain  0.5%   share 1.72%   eff 0.29
+
+    truth  o/k efficiency ratio        7.48
+    H-only objective   o/k =  0.00334   off by 2238x
+    gamma-weighted     o/k =  0.1789    off by   42x
+
+**gamma closes 54x of a 2238x gap and leaves 42x.** That is the honest scoring:
+the factor is real and does most of the work, and it is still not sufficient.
+
+Note what it DOES get right: v_proj is the most efficient promotion per weight
+(7.77, more than 3x o_proj), and the gamma-weighted ranking puts v_proj at
+2..20. For a budget-constrained greedy that is the single most important call,
+and the H-only objective had it at 29..85.
+
+### Why a residual is expected, and where it probably lives
+
+The remaining error is concentrated in k_proj being over-ranked. A plausible
+mechanism, consistent with everything measured: `k_proj` feeds attention LOGITS,
+which pass through a softmax. A second-order local expansion — which is what
+`gamma * H` is, K-FAC included — assumes perturbations propagate linearly. A
+saturated softmax suppresses them NONLINEARLY, so the local gradient at the
+operating point overstates the damage that actually reaches the loss.
+
+If that is right, no refinement of a local quadratic objective fixes k_proj,
+because the effect is not in the quadratic. That would make the practical answer
+"use gamma, and accept that logit-path tensors are over-ranked", or move to a
+genuinely non-local measurement (ablate and evaluate), rather than a third
+attempt at a better local form.
+
+This is a hypothesis with a clean test: promote k_proj and measure whether the
+KLD change tracks the local prediction at small perturbations and falls away at
+large ones. Not run.
