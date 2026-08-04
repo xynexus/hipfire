@@ -829,12 +829,17 @@ pub fn load_model(
                 arch_features(hfq.arch_id).dflash,
             )?;
 
+            // `find_tensor_info`, not `tensor_data`: this only wants the quant
+            // type, and the borrowing accessor returns None for a losslessly
+            // recoded (LUT3/Huffman) table. That made the whole chain yield None
+            // for a tied embed stored compressed, SILENTLY dropping the lm_head
+            // out of the batched-kernel whitelist below rather than failing.
             let lm_qt = hfq
-                .tensor_data("lm_head.weight")
-                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
-                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
-                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
-                .map(|(info, _)| info.quant_type);
+                .find_tensor_info("lm_head.weight")
+                .or_else(|| hfq.find_tensor_info("model.language_model.lm_head.weight"))
+                .or_else(|| hfq.find_tensor_info("model.language_model.embed_tokens.weight"))
+                .or_else(|| hfq.find_tensor_info("model.embed_tokens.weight"))
+                .map(|info| info.quant_type);
             // MQ3 (qt=17) batched lm_head + WMMA prefill kernels exist on gfx11
             // only (`gemm_hfq3g256_batched_lmhead` + `is_batchable_la` admits MQ3
             // for gfx1100/1101/1102/1150/1151). On other archs, MQ3 lm_head still

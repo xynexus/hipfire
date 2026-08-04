@@ -1472,6 +1472,34 @@ impl HfqFile {
         self.tensor_data(name)
     }
 
+    /// Borrow the tensor's logical bytes, decoding only when they are stored
+    /// compressed. Use this wherever a caller would reach for [`Self::tensor_data`]
+    /// on a tensor that MIGHT be a lossless BF16 recoding (`Bf16Lut3` /
+    /// `Bf16Huff`) — most importantly the embedding table, which is the one
+    /// tensor big enough that recoding it is worth ~12% of an artifact.
+    ///
+    /// [`Self::tensor_data`] deliberately returns `None` for those (it can only
+    /// hand back the mmap'd PACKED bytes, which tagged as BF16 would be
+    /// garbage). Callers that then `.expect("<name> not found")` report a
+    /// present-but-compressed tensor as MISSING, which is a genuinely
+    /// misleading trail to follow — it reads as a broken artifact rather than
+    /// an unsupported storage coding.
+    ///
+    /// Borrowed in the common uncompressed case, so this does not cost the
+    /// embedding table's several hundred MB unless the decode is real.
+    pub fn tensor_data_cow(
+        &self,
+        name: &str,
+    ) -> Option<(&HfqTensorInfo, std::borrow::Cow<'_, [u8]>)> {
+        let idx = self.resolve_idx(name)?;
+        if self.bf16_packed[idx].is_some() {
+            let (info, bytes) = self.tensor_data_vec(name)?;
+            return Some((info, std::borrow::Cow::Owned(bytes)));
+        }
+        let (info, bytes) = self.tensor_data(name)?;
+        Some((info, std::borrow::Cow::Borrowed(bytes)))
+    }
+
     /// Read tensor data using the best available path:
     /// - Unix with pread support: pread + fadvise_dontneed (avoids page cache buildup)
     /// - Fallback: mmap slice (returns None if mmap was dropped)
@@ -2567,9 +2595,13 @@ pub fn load_weights_hfq(
     }
 
     eprintln!("  loading token_embd...");
+    // `tensor_data_cow`, not `tensor_data`: a LUT3/Huffman-recoded embed table
+    // is stored compressed, and the borrowing accessor refuses those. Reaching
+    // for it here reported the tensor as MISSING when it was merely coded.
     let embd_info = hfq
-        .tensor_data("model.embed_tokens.weight")
+        .tensor_data_cow("model.embed_tokens.weight")
         .expect("embed_tokens not found");
+    let embd_info = (embd_info.0, embd_info.1.as_ref());
     let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
         // Q4_K: upload raw, use Q4K embedding lookup at inference
         eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
@@ -2633,7 +2665,10 @@ pub fn load_weights_hfq(
         // Tied embeddings — reuse token_embd as F32 output weights for the
         // logit GEMV. Dequant by the embed's actual format (qtip3 models store
         // embed as Q8F16; the old code assumed F16 and would garble Q8 bytes).
-        let (embd_t, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
+        // Same reason as the load above: a recoded table must be decoded here,
+        // or the tied-output dequant reads packed bytes as if they were BF16.
+        let (embd_t, data) = hfq.tensor_data_cow("model.embed_tokens.weight").unwrap();
+        let data = data.as_ref();
         let n = config.vocab_size * config.dim;
         let f32_data: Vec<f32> = match embd_t.quant_type {
             3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block

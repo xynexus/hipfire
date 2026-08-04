@@ -346,7 +346,7 @@ pub const ENV_HIPFIRE_BF16_MOE_M256: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BF16_WEIGHTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_WEIGHTS",
     description: "Runtime variable controlling bf16 weights in hipfire",
-    source: "crates/hipfire-runtime/src/hfq.rs:2392",
+    source: "crates/hipfire-runtime/src/hfq.rs:2420",
 };
 
 /// `HIPFIRE_BLOB_FORCE` — Graph / capture / deterministic
@@ -452,7 +452,7 @@ pub const ENV_HIPFIRE_DAEMON_SCHED_DEBUG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_BUDGET",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-serving-core/src/load.rs:4302",
+    source: "crates/hipfire-serving-core/src/load.rs:4307",
 };
 
 /// `HIPFIRE_DDTREE_FORCE_SLOW` — HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when
@@ -508,7 +508,7 @@ pub const ENV_HIPFIRE_DDTREE_TAPE_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TOPK",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-serving-core/src/load.rs:4374",
+    source: "crates/hipfire-serving-core/src/load.rs:4379",
 };
 
 /// `HIPFIRE_DDTREE_TREE_LA` — Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected
@@ -823,7 +823,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_POST_SCALE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_PP_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_PP_BATCH",
     description: "Cache EOS token id. DeepSeek family uses \"<｜end▁of▁sentence｜>\";",
-    source: "crates/hipfire-serving-core/src/load.rs:1894",
+    source: "crates/hipfire-serving-core/src/load.rs:1899",
 };
 
 /// `HIPFIRE_DEEPSEEK4_Q8_4W` — Environment toggle value controls runtime behavior
@@ -1370,7 +1370,7 @@ pub const ENV_HIPFIRE_DRAFT_SUBPHASE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/load.rs:4126",
+    source: "crates/hipfire-serving-core/src/load.rs:4131",
 };
 
 /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` — Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today)
@@ -1559,21 +1559,21 @@ pub const ENV_HIPFIRE_EMBED_E2E_TOKENS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_GPU_FALLBACK_MODEL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_GPU_FALLBACK_MODEL",
     description: "Runtime variable controlling embed gpu fallback model in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2927",
+    source: "crates/hipfire-serving-core/src/load.rs:2932",
 };
 
 /// `HIPFIRE_EMBED_NPU_BATCH` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_EMBED_NPU_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_NPU_BATCH",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-serving-core/src/load.rs:2874",
+    source: "crates/hipfire-serving-core/src/load.rs:2879",
 };
 
 /// `HIPFIRE_EMBED_NPU_CACHE` — Runtime variable controlling embed npu cache in hipfire
 pub const ENV_HIPFIRE_EMBED_NPU_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_NPU_CACHE",
     description: "Runtime variable controlling embed npu cache in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2884",
+    source: "crates/hipfire-serving-core/src/load.rs:2889",
 };
 
 /// `HIPFIRE_EMBED_PROFILE` — Runtime variable controlling embed profile in hipfire
@@ -1608,7 +1608,7 @@ pub const ENV_HIPFIRE_EMBED_RESIDENT_FFN_CACHE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
     description: "Runtime variable controlling embed resident layer in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2867",
+    source: "crates/hipfire-serving-core/src/load.rs:2872",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT` — Parses "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT" with fallback defaults
@@ -2441,14 +2441,14 @@ pub const ENV_HIPFIRE_KV_MIGRATE_BATCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_MODE",
     description: "(the recurrent state's cumulative-error sensitivity; orthogonal to KV)",
-    source: "crates/hipfire-serving-core/src/load.rs:3503",
+    source: "crates/hipfire-serving-core/src/load.rs:3508",
 };
 
 /// `HIPFIRE_KV_PHYSICAL_CAP` — Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults
 pub const ENV_HIPFIRE_KV_PHYSICAL_CAP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_PHYSICAL_CAP",
     description: "Parses \"HIPFIRE_KV_PHYSICAL_CAP\" with fallback defaults",
-    source: "crates/hipfire-serving-core/src/load.rs:944",
+    source: "crates/hipfire-serving-core/src/load.rs:949",
 };
 
 /// `HIPFIRE_KV_POS_LOCAL` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
@@ -3415,7 +3415,7 @@ pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_LAYERS",
     description: "HIPFIRE_PP_LAYERS=\"a,b,...\" overrides uniform split. Length must equal",
-    source: "crates/hipfire-serving-core/src/load.rs:3555",
+    source: "crates/hipfire-serving-core/src/load.rs:3560",
 };
 
 /// `HIPFIRE_PP_PARITY_MODEL` — Runtime variable controlling pp parity model in hipfire
@@ -3971,7 +3971,7 @@ pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD",
     description: "conf_threshold ladder: env > 0.1 default (source's sweep-tuned default)",
-    source: "crates/hipfire-serving-core/src/load.rs:4189",
+    source: "crates/hipfire-serving-core/src/load.rs:4194",
 };
 
 /// `HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS` — Imatrix storage is small enough to capture all layers in one pass. The
