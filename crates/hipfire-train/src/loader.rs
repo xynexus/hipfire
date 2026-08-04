@@ -208,6 +208,20 @@ pub fn load_llama_layer_fp32_hfq_pfx<S: WeightSource + ?Sized>(
     layer: usize,
     dense_mlp: bool,
 ) -> Result<LlamaLayerF32, String> {
+    load_llama_layer_fp32_pfx_off(gpu, src, prefix, cfg, layer, dense_mlp, false)
+}
+
+/// As [`load_llama_layer_fp32_hfq_pfx`], with the GemmaRMSNorm unit offset.
+#[allow(clippy::too_many_arguments)]
+pub fn load_llama_layer_fp32_pfx_off<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    cfg: &LlamaConfig,
+    layer: usize,
+    dense_mlp: bool,
+    unit_offset: bool,
+) -> Result<LlamaLayerF32, String> {
     let h = cfg.hidden_size;
     let q = cfg.q_dim();
     let kv = cfg.kv_dim();
@@ -281,6 +295,10 @@ pub fn load_llama_layer_fp32_hfq_pfx<S: WeightSource + ?Sized>(
         false => None,
     };
 
+    if unit_offset {
+        apply_unit_offset(gpu, &input_layernorm)?;
+        apply_unit_offset(gpu, &post_attention_layernorm)?;
+    }
     Ok(LlamaLayerF32 {
         input_layernorm,
         q_norm,
@@ -494,6 +512,34 @@ impl WeightSource for DequantHfq<'_> {
     }
 }
 
+/// Does this model use GemmaRMSNorm — `rmsnorm(x) * (1 + w)` — for its block
+/// and final norms?
+///
+/// Qwen3.5/3.6 do. The weights are stored as deviations from 1, which is why
+/// they centre near 0 (layer-0 `input_layernorm` means +0.24) where a plain
+/// RMSNorm weight would centre near 1. Applying them plainly is silent: shapes
+/// match, everything stays differentiable, and the model merely gets quietly
+/// worse. Measured against the runtime's own prefill logits at one token, the
+/// difference is cos 0.7896 plain vs 0.9994 with the offset.
+///
+/// It does NOT apply to `q_norm`, `k_norm` or `linear_attn.norm` — those are
+/// stored as ordinary weights (linear_attn.norm centres near +0.96), and
+/// offsetting them too drops the same measurement back to 0.7840.
+pub fn uses_unit_offset_norm(model_type: &str) -> bool {
+    model_type.starts_with("qwen3_5") || model_type.starts_with("qwen3_next")
+}
+
+/// Add the GemmaRMSNorm unit offset to a loaded norm weight, in place.
+fn apply_unit_offset(gpu: &mut Gpu, t: &GpuTensor) -> Result<(), String> {
+    let mut v = gpu.download_f32(t).map_err(|e| format!("{e}"))?;
+    for x in v.iter_mut() {
+        *x += 1.0;
+    }
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_ne_bytes()).collect();
+    gpu.memcpy_htod_auto(&t.buf, &bytes)
+        .map_err(|e| format!("unit-offset upload: {e}"))
+}
+
 /// Load `embed_tokens` as fp32 from any weight source.
 pub fn load_embed_f32<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
@@ -516,8 +562,13 @@ pub fn load_final_norm_f32<S: WeightSource + ?Sized>(
     src: &S,
     prefix: &str,
     h: usize,
+    unit_offset: bool,
 ) -> Result<GpuTensor, String> {
-    upload_tensor(gpu, src, &format!("{prefix}norm.weight"), &[h])
+    let t = upload_tensor(gpu, src, &format!("{prefix}norm.weight"), &[h])?;
+    if unit_offset {
+        apply_unit_offset(gpu, &t)?;
+    }
+    Ok(t)
 }
 
 /// Is layer `l` linear-attention rather than self-attention? qwen3.5/3.6 are
@@ -542,6 +593,7 @@ pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
     prefix: &str,
     layer: usize,
     h: usize,
+    unit_offset: bool,
 ) -> Result<LinearAttnLayerF32, String> {
     let p = format!("{prefix}layers.{layer}.linear_attn");
     let (_, a_log) = src.fetch_f32(&format!("{p}.A_log"))?;
@@ -587,14 +639,21 @@ pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
     let (_, dt_bias) = src.fetch_f32(&format!("{p}.dt_bias"))?;
 
     let lp = format!("{prefix}layers.{layer}");
+    // `norm` (the gated per-head one) is NOT offset — see uses_unit_offset_norm.
+    let input_layernorm = upload_tensor(gpu, src, &format!("{lp}.input_layernorm.weight"), &[h])?;
+    let post_attention_layernorm = upload_tensor(
+        gpu,
+        src,
+        &format!("{lp}.post_attention_layernorm.weight"),
+        &[h],
+    )?;
+    if unit_offset {
+        apply_unit_offset(gpu, &input_layernorm)?;
+        apply_unit_offset(gpu, &post_attention_layernorm)?;
+    }
     Ok(LinearAttnLayerF32 {
-        input_layernorm: upload_tensor(gpu, src, &format!("{lp}.input_layernorm.weight"), &[h])?,
-        post_attention_layernorm: upload_tensor(
-            gpu,
-            src,
-            &format!("{lp}.post_attention_layernorm.weight"),
-            &[h],
-        )?,
+        input_layernorm,
+        post_attention_layernorm,
         in_proj_qkv: upload_tensor(
             gpu,
             src,

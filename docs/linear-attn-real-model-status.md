@@ -1,11 +1,58 @@
-# linear_attn on a real model: what works and what does not
+# linear_attn on a real model — FIXED
 
-**Status: the assembly runs at 35B scale and is NOT yet numerically correct.**
+**The defect was GemmaRMSNorm.** Qwen3.5/3.6 store their block and final norm
+weights as deviations from 1, so the norm is `rmsnorm(x) * (1 + w)`. This
+implementation applied `w` plainly.
 
-Earlier commits in this session said the hybrid assembly was "validated on a
-real model". That was too strong, and this note is the correction. What was
-validated was PLUMBING — layer dispatch, loaders, streaming, shapes. Running a
-real model over real text shows the forward does not reproduce the model.
+| | mean loss, real text |
+|---|---|
+| before | 13.34 (uniform is 12.42) |
+| **after** | **4.03** |
+
+At one token, against the runtime's own prefill logits: cos 0.7896 -> **0.9994**.
+
+It applies to `input_layernorm`, `post_attention_layernorm` and the final norm,
+and NOT to `q_norm`, `k_norm` or `linear_attn.norm` — offsetting those too drops
+the same measurement back to 0.7840. The weights say the same thing:
+layer-0 `input_layernorm` centres at +0.24 where a plain weight would centre at
+1, while `linear_attn.norm` centres at +0.96.
+
+## Why it took so long
+
+The failure was silent in every way a failure can be. Shapes match. Everything
+stays differentiable, so all five gradchecks passed throughout. Every individual
+stage matched its kernel to ~1e-7, because each stage WAS right — the norm
+weights feeding them were wrong. Three independent implementations agreed with
+each other, because all three were written from the same misreading.
+
+Two earlier detours are worth keeping as cautions, both recorded in the git
+history:
+
+- **The AWQ fold.** Tuned by loss on synthetic tokens, where every variant sits
+  near uniform and the spread is noise. Retracted.
+- **"The branches are four times too weak."** Derived from the hidden-state
+  dumper's per-layer rms one commit after establishing that the dumper is
+  broken. Retracted.
+
+Both share a shape: a number was trusted without checking what produced it. The
+thing that finally worked was insisting on an oracle whose correctness was
+independently demonstrated — `hipfire chat` generating coherent text from the
+same artifact — and then reducing to the smallest case that still failed (one
+token, where rope and QK-norm are provably irrelevant).
+
+The `1 + w` variant had in fact been measured 6 commits earlier and set aside,
+because no unit offset appears in `rmsnorm.hip` and the runtime ships working
+inference. That reasoning was sound but the conclusion was wrong: hipfire
+applies the offset somewhere other than that kernel. Where is worth finding, and
+is now the only open question about this norm.
+
+## What is verified now
+
+- One token vs runtime prefill logits: cos 0.9994.
+- Real text through the streamed walk: mean loss 4.03 on the bf16 source and
+  4.03 on the oq8 artifact.
+- The random-init fixture still lands at ln(vocab), as it must.
+- All five gradchecks and the stacked-MoE byte check still pass.
 
 ## The measurement
 

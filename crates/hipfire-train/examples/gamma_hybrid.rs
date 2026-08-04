@@ -46,7 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(f) => serde_json::from_str(f.metadata_json())?,
         None => serde_json::from_str(&std::fs::read_to_string(path.join("config.json"))?)?,
     };
-    let raw = raw.get("config").cloned().unwrap_or(raw);
+    let raw_full = raw.get("config").cloned().unwrap_or(raw.clone());
+    let raw = raw_full.clone();
     // Qwen3.5-VL wraps the decoder config; the geometry lives in text_config.
     let raw = raw.get("text_config").cloned().unwrap_or(raw);
     // A pure-MoE config carries no dense `intermediate_size`. LlamaConfig
@@ -102,7 +103,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let embed = hipfire_train::loader::load_embed_f32(&mut gpu, src, prefix, cfg.vocab_size, h)?;
-    let final_norm = hipfire_train::loader::load_final_norm_f32(&mut gpu, src, prefix, h)?;
+    // Qwen3.5/3.6 store block and final norm weights as deviations from 1.
+    let unit_offset =
+        hipfire_train::loader::uses_unit_offset_norm(raw_full["model_type"].as_str().unwrap_or(""));
+    eprintln!(
+        "norm convention: {}",
+        if unit_offset {
+            "GemmaRMSNorm (1 + w)"
+        } else {
+            "plain w"
+        }
+    );
+    let final_norm =
+        hipfire_train::loader::load_final_norm_f32(&mut gpu, src, prefix, h, unit_offset)?;
 
     // Real tokens when we can get them. An .hfq embeds its tokenizer, and a
     // real model over real text should land at a language-model loss (~2-4),
@@ -194,6 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_experts,
         top_k,
         &mut acc,
+        unit_offset,
     )?;
 
     // Oracle export, matching dump_qwen35_hidden_states' HFHIDDEN format.
@@ -265,12 +279,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mean = loss / seq as f32;
     let expect = (cfg.vocab_size as f32).ln();
-    let ok_loss = mean.is_finite() && (mean - expect).abs() < 2.0;
+    // A random-init fixture lands at ln(vocab); a real trained model lands far
+    // BELOW it. Both are healthy — the failure mode this guards against is a
+    // loss at or above uniform, which is what a broken forward produces.
+    let ok_loss = mean.is_finite() && mean < expect + 0.5;
     let ok_layers = by_layer.len() == kinds.len();
     let ok_finite = table.values().all(|v| v.is_finite() && *v >= 0.0);
 
     if ok_loss && ok_layers && ok_finite {
-        println!("\nPASS — hybrid stack assembled, mean loss {mean:.3} vs ln(vocab) {expect:.3}");
+        let verdict = if mean < expect - 2.0 {
+            "predicts text"
+        } else {
+            "near uniform (expected for a random-init fixture)"
+        };
+        println!("\nPASS — hybrid stack assembled, mean loss {mean:.3} vs ln(vocab) {expect:.3} — {verdict}");
         Ok(())
     } else {
         println!(

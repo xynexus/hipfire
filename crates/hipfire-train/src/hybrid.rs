@@ -26,7 +26,7 @@ use crate::la_block::{
 };
 use crate::loader::{
     free_linear_attn_layer_fp32, free_llama_layer_fp32, free_moe_layer_fp32, layer_is_linear_attn,
-    layer_is_moe, load_dense_mlp_fp32, load_linear_attn_layer_fp32, load_llama_layer_fp32_hfq_pfx,
+    layer_is_moe, load_dense_mlp_fp32, load_linear_attn_layer_fp32, load_llama_layer_fp32_pfx_off,
     load_moe_layer_fp32, LinearAttnLayerF32, WeightSource,
 };
 use crate::model::GammaAccum;
@@ -162,6 +162,9 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     n_experts: usize,
     top_k: usize,
     acc: &mut GammaAccum,
+    // GemmaRMSNorm: block and final norms are `1 + w`. See
+    // `loader::uses_unit_offset_norm` — wrong here is silent, not loud.
+    unit_offset: bool,
 ) -> Result<(f32, Vec<LayerKind>, Vec<Vec<f32>>), String> {
     let (seq, h) = (dims.seq, dims.h);
     let vocab = cfg.vocab_size;
@@ -193,7 +196,19 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     for (i, &kind) in kinds.iter().enumerate() {
         layer_inputs.push(gpu.download_f32(&x).map_err(e)?);
         let x_out = run_layer_forward(
-            gpu, src, prefix, cfg, dims, &lora, &x, i, kind, n_experts, top_k, pos_host,
+            gpu,
+            src,
+            prefix,
+            cfg,
+            dims,
+            &lora,
+            &x,
+            i,
+            kind,
+            n_experts,
+            top_k,
+            pos_host,
+            unit_offset,
         )?;
         gpu.free_tensor(x).map_err(e)?;
         x = x_out;
@@ -242,8 +257,21 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     for i in (0..n_layers).rev() {
         let x_in = gpu.upload_f32(&layer_inputs[i], &[seq * h]).map_err(e)?;
         let d_in = run_layer_backward(
-            gpu, src, prefix, cfg, dims, &lora, &x_in, &d_x, i, kinds[i], n_experts, top_k,
-            pos_host, acc,
+            gpu,
+            src,
+            prefix,
+            cfg,
+            dims,
+            &lora,
+            &x_in,
+            &d_x,
+            i,
+            kinds[i],
+            n_experts,
+            top_k,
+            pos_host,
+            acc,
+            unit_offset,
         )?;
         gpu.free_tensor(x_in).map_err(e)?;
         gpu.free_tensor(d_x).map_err(e)?;
@@ -272,12 +300,13 @@ fn run_layer_forward<S: WeightSource + ?Sized>(
     n_experts: usize,
     top_k: usize,
     pos_host: &[f32],
+    unit_offset: bool,
 ) -> Result<GpuTensor, String> {
     let (seq, h) = (dims.seq, dims.h);
     let e = |r: hipfire_rdna::HipError| format!("{r}");
 
     if kind.is_linear_attn() {
-        let l = load_linear_attn_layer_fp32(gpu, src, prefix, i, h)?;
+        let l = load_linear_attn_layer_fp32(gpu, src, prefix, i, h, unit_offset)?;
         let d = la_dims(&l, seq, h, dims.eps);
         let acts = la_block_forward(gpu, x, &la_weights(&l), &d).map_err(e)?;
         let x_out = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
@@ -313,7 +342,7 @@ fn run_layer_forward<S: WeightSource + ?Sized>(
     }
 
     // Full-attention layer, dense or routed — the existing block handles both.
-    let lw = load_llama_layer_fp32_hfq_pfx(gpu, src, prefix, cfg, i, !kind.is_moe())?;
+    let lw = load_llama_layer_fp32_pfx_off(gpu, src, prefix, cfg, i, !kind.is_moe(), unit_offset)?;
     let bw = crate::model::block_of(&lw);
     let out = if kind.is_moe() {
         let (ml, inter) = load_moe_layer_fp32(gpu, src, prefix, i, h, n_experts)?;
@@ -370,12 +399,13 @@ fn run_layer_backward<S: WeightSource + ?Sized>(
     top_k: usize,
     pos_host: &[f32],
     acc: &mut GammaAccum,
+    unit_offset: bool,
 ) -> Result<GpuTensor, String> {
     let (seq, h) = (dims.seq, dims.h);
     let e = |r: hipfire_rdna::HipError| format!("{r}");
 
     if kind.is_linear_attn() {
-        let l = load_linear_attn_layer_fp32(gpu, src, prefix, i, h)?;
+        let l = load_linear_attn_layer_fp32(gpu, src, prefix, i, h, unit_offset)?;
         let d = la_dims(&l, seq, h, dims.eps);
         let w = la_weights(&l);
         let acts = la_block_forward(gpu, x_in, &w, &d).map_err(e)?;
@@ -417,7 +447,7 @@ fn run_layer_backward<S: WeightSource + ?Sized>(
         return Ok(d_in);
     }
 
-    let lw = load_llama_layer_fp32_hfq_pfx(gpu, src, prefix, cfg, i, !kind.is_moe())?;
+    let lw = load_llama_layer_fp32_pfx_off(gpu, src, prefix, cfg, i, !kind.is_moe(), unit_offset)?;
     let bw = crate::model::block_of(&lw);
     let (qd, kvd) = (dims.q_dim(), dims.kv_dim());
     let d_in = if kind.is_moe() {
