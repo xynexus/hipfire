@@ -145,3 +145,55 @@ it, weighted by the router's gate value. Whether that is captured by accumulatin
 the adjoint over routed tokens, or needs the gate weight folded in explicitly, is
 not obvious from the dense derivation and should be checked against a measured
 per-expert promotion before trusting it.
+
+
+## Part B progress 2026-08-04 — MLP half done, block assembly is the next unit
+
+Landed (hipfire `de033b4fe`): `ops/moe.rs` with routed-MoE forward and backward,
+gradchecked at 4.178e-4 worst relative error against central differences, with
+one expert receiving zero tokens so the empty-expert path is exercised. Plus
+`accumulate_gamma_moe`, normalising by ROUTED tokens rather than sequence
+length.
+
+That was the novel part — the derivation. What remains is assembly, and there is
+one design choice worth settling before starting rather than discovering
+halfway.
+
+### The block cannot be composed around the dense one
+
+The obvious shortcut does not work. Zeroing the dense block's MLP weights makes
+`x_out = x_mid` in the forward, but in the BACKWARD it also makes the dense
+path's `d_xn2` zero, so the MoE's contribution to `d_xn2` never reaches
+`rmsnorm_backward` and the attention half receives a wrong gradient. The MLP is
+not a separable addend on the backward; it feeds the norm2 path.
+
+### Two viable routes, and the trade
+
+**(a) Refactor `block.rs` into attention/MLP halves.** Add
+`block_forward_upto_xn2` and `block_backward_from_dxn2(d_x_out, d_xn2)`, and
+have both the dense and MoE blocks call them. Clean, no duplication, and
+`gradcheck_block` guards the dense path against regression.
+
+**(b) A separate `block_moe.rs` duplicating the ~120-line attention sequence.**
+Touches nothing already tested; risk is confined to new code, gradchecked
+independently. Costs ~240 lines of duplicated forward+backward that will drift.
+
+**(a) is the better end state** — the duplication in (b) is exactly the kind
+that silently diverges when someone fixes a rope or GQA detail in one copy. The
+argument for (b) is only that the dense path is load-bearing and already
+gradchecked, so leaving it untouched has value. Given `gradcheck_block` exists
+and would catch a bad extraction immediately, that argument is weak: the guard
+that makes (b) safe is the same guard that makes (a) safe.
+
+Recommend (a), with `gradcheck_block` run before and after the extraction as the
+regression check, then `gradcheck_moe_block` added for the new path.
+
+### Then
+
+    * layer loader: recognise routed-expert tensor names
+      (`model.layers.N.mlp.experts.E.{gate,up,down}_proj`) and the router
+    * streamed walk: dispatch dense vs MoE per layer
+    * emit gamma keyed by (layer, expert) into the .calib.hfq
+
+None of that is derivation; it is wiring against pieces that now exist and are
+tested.
