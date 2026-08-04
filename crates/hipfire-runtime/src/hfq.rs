@@ -892,7 +892,10 @@ pub struct HfqFile {
 /// Only [`QuantType::Bf16Lut3`] can stay resident. Huffman codes are bit-serial,
 /// so `Bf16Huff` is always expanded regardless of this flag.
 fn bf16l3_resident() -> bool {
-    std::env::var_os("HIPFIRE_BF16L3_RESIDENT").is_some_and(|v| v != "0")
+    // Present and not literally "0" — deliberately NOT `flag()`: this predates
+    // the 1/true/on/yes spelling and any other value counts as on.
+    hipfire_env::BF16L3_RESIDENT.is_set()
+        && hipfire_env::BF16L3_RESIDENT.get().as_deref() != Some("0")
 }
 
 /// Rewrite losslessly-recoded index entries to their logical view, returning the
@@ -1957,9 +1960,13 @@ fn load_f16_tensor(
     st_name: &str,
     shape: &[usize],
 ) -> HipResult<GpuTensor> {
+    // `tensor_data_cow`: a losslessly recoded (LUT3/Huffman) tensor is stored
+    // compressed and the borrowing accessor refuses it, which would report a
+    // present tensor as "not found". Borrows when stored plainly.
     let (info, data) = hfq
-        .tensor_data(st_name)
+        .tensor_data_cow(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
+    let data = data.as_ref();
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 => {
@@ -2049,9 +2056,13 @@ fn load_weight_tensor(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
+    // `tensor_data_cow`: a losslessly recoded (LUT3/Huffman) tensor is stored
+    // compressed and the borrowing accessor refuses it, which would report a
+    // present tensor as "not found". Borrows when stored plainly.
     let (info, data) = hfq
-        .tensor_data(st_name)
+        .tensor_data_cow(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
+    let data = data.as_ref();
 
     let wt_result: HipResult<WeightTensor> = match info.quant_type {
         0 => {
@@ -2373,7 +2384,7 @@ fn load_weight_tensor(
             // back to a per-token GEMV. Needs K % 16 == 0 (16-wide WMMA K
             // fragments); non-aligned linears stay on the F32 upcast path.
             // `HIPFIRE_BF16_WEIGHTS=f32` forces the old upcast (rollback).
-            let force_f32 = std::env::var("HIPFIRE_BF16_WEIGHTS").ok().as_deref() == Some("f32");
+            let force_f32 = hipfire_env::BF16_WEIGHTS.get().as_deref() == Some("f32");
             if k % 16 == 0 && !force_f32 {
                 let mut buf = gpu.upload_raw(data, &[data.len()])?;
                 buf.dtype = DType::F16;
@@ -2415,7 +2426,7 @@ fn load_weight_tensor(
             // K % 16 == 0; the rare non-aligned linear stays on the F32 upcast
             // path for correctness. `HIPFIRE_BF16_WEIGHTS=f32` forces the old
             // upcast everywhere (rollback / debugging).
-            let force_f32 = std::env::var("HIPFIRE_BF16_WEIGHTS").ok().as_deref() == Some("f32");
+            let force_f32 = hipfire_env::BF16_WEIGHTS.get().as_deref() == Some("f32");
             if k % 16 == 0 && !force_f32 {
                 let mut buf = gpu.upload_raw(data, &[data.len()])?;
                 buf.dtype = DType::BF16;

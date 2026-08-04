@@ -321,11 +321,11 @@ pub const ENV_HIPFIRE_BENCH_SKIP_PARITY: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/examples/bench_gemv_bf16l3.rs:120",
 };
 
-/// `HIPFIRE_BF16L3_RESIDENT` — Runtime variable controlling bf16l3 resident in hipfire
+/// `HIPFIRE_BF16L3_RESIDENT` — Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding them at load. Set to anything except `0`. Only `Bf16Lut3` can stay resident — Huffman codes are bit-serial and are always expanded. Requires kernels that decode the packed form natively (`gemv_bf16l3`); a gather-read table (a tied embed/lm_head) has no such path and will fail to load. Buys ~1.18x weight bandwidth only once the working set exceeds the GPU's last-level cache, and is a measured slowdown below.
 pub const ENV_HIPFIRE_BF16L3_RESIDENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16L3_RESIDENT",
-    description: "Runtime variable controlling bf16l3 resident in hipfire",
-    source: "crates/hipfire-runtime/src/hfq.rs:895",
+    description: "Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding them at load. Set to anything except `0`. Only `Bf16Lut3` can stay resident — Huffman codes are bit-serial and are always expanded. Requires kernels that decode the packed form natively (`gemv_bf16l3`); a gather-read table (a tied embed/lm_head) has no such path and will fail to load. Buys ~1.18x weight bandwidth only once the working set exceeds the GPU's last-level cache, and is a measured slowdown below.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
@@ -342,11 +342,11 @@ pub const ENV_HIPFIRE_BF16_MOE_M256: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/dispatch/overlays/gfx1151.rs:162",
 };
 
-/// `HIPFIRE_BF16_WEIGHTS` — Runtime variable controlling bf16 weights in hipfire
+/// `HIPFIRE_BF16_WEIGHTS` — Set `f32` to force F16 weights to upcast to F32 at load instead of staying native. Native F16 lets `weight_gemm` take the batched `gemm_f16_x_f32_wmma` path; the upcast falls back to a per-token GEMV. Rollback switch for that change.
 pub const ENV_HIPFIRE_BF16_WEIGHTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_WEIGHTS",
-    description: "Runtime variable controlling bf16 weights in hipfire",
-    source: "crates/hipfire-runtime/src/hfq.rs:2418",
+    description: "Set `f32` to force F16 weights to upcast to F32 at load instead of staying native. Native F16 lets `weight_gemm` take the batched `gemm_f16_x_f32_wmma` path; the upcast falls back to a per-token GEMV. Rollback switch for that change.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_BLOB_FORCE` — Graph / capture / deterministic
