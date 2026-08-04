@@ -277,7 +277,34 @@ globally, and a model without a DFlash sidecar fails to load with
 with a shadow `HOME` whose `.hipfire/config.json` sets it off rather than
 editing the real config.
 
-## Next: a trustworthy oracle
+## A trustworthy oracle exists now, and it sharpens the symptom
+
+`dump_logits_qwen35` runs the real prefill path — the one generation proved
+correct — on the deterministic prompt `0,1,2,...`, so the tokens are trivially
+reproducible. Comparing last-position logits after `0..63`:
+
+| | top-5 ids | rms |
+|---|---|---|
+| runtime | 44576, **64**, 91, 61, 93 | 3.28 |
+| this implementation | 220, **63**, 96110, 17, 271 | 3.11 |
+
+cos 0.566. The runtime continues the count — 64 after 0..63. This
+implementation's second choice is 63: the CURRENT token.
+
+That is the signature of a model whose layers barely move the residual stream.
+With tied embeddings the logits are `h . E^T`, so if `h` stays close to the
+input embedding the argmax is whatever token was just read. The measured branch
+magnitudes say exactly that: attention 0.0135 and MLP 0.0011 against a residual
+of 0.0206, where the runtime roughly triples the stream in layer 0 alone.
+
+So the question is now specific: **why are the branches four times too weak?**
+Not "which stage is wrong" but "what makes every stage's output too small". That
+is a different search, and it fits every observation so far — the near-uniform
+loss, the position-indifference of rope (a branch that contributes little cannot
+care about position), and the current-token predictions from both this
+implementation and the broken hidden-state dump.
+
+## Superseded: the old next-step
 
 Per-layer states are what localise a defect, and that source is now known-bad.
 Two options, in order of cost:

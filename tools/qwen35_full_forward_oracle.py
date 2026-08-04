@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # hipfire — see LICENSE and NOTICE in the project root.
-"""Whole-model numpy forward for Qwen3.5-0.8B, straight from bf16 safetensors.
+"""Whole-model numpy forward for Qwen3.5-0.8B, checked against the RUNTIME.
 
-The layer-0 oracle answered "is the Rust faithful to my understanding" (yes).
-This answers the next question: is the UNDERSTANDING itself enough to make a
-language model work? It implements all 24 layers independently — linear_attn
-and full attention, QK-norm, partial rope, GQA, the attention output gate —
-and scores next-token NLL.
+Independent implementation of all 24 layers — linear_attn and full attention,
+QK-norm, partial rope, GQA, the attention output gate — from bf16 safetensors.
 
-Answer as of writing: NLL 11.70 against a uniform 12.42. So no. A completely
-separate implementation of the same reading of the architecture also fails,
-which means the defect is in the reading, not in either codebase.
+The oracle is `dump_logits_qwen35`, which runs the real prefill path on the
+deterministic prompt 0,1,2,... and dumps the last position's logits. That path
+is trustworthy: generating from the same artifact through `hipfire chat`
+produces coherent text. (The per-layer hidden-state dumper is NOT trustworthy —
+see docs/linear-attn-real-model-status.md.)
 
-Slow on purpose — plain numpy, no batching, ~6 min for 64 tokens. It is a
-correctness oracle, not a benchmark.
+    cargo run --release -p hipfire-runtime --features deltanet \
+      --example dump_logits_qwen35 -- <model.hfq> ref_logits.f32 --prefill 64
+
+Result as of writing: cos 0.566. The runtime's top-2 after 0..63 includes 64 —
+it continues the count. This implementation's top-2 includes 63, the CURRENT
+token, which is what a tied-embedding model returns when the layers barely move
+the residual stream. Measured branch magnitudes agree: attention 0.0135 and MLP
+0.0011 against a residual of 0.0206, where the runtime roughly triples the
+stream in layer 0 alone.
+
+Slow on purpose — plain numpy, ~6 min for 64 tokens. A correctness oracle, not
+a benchmark.
 """
 F='/home/sadara/.claude/jobs/9a1047b0/tmp/q08b/model.safetensors-00001-of-00001.safetensors'
 fh=open(F,'rb'); n=int.from_bytes(fh.read(8),'little'); H=json.loads(fh.read(n)); B=8+n
@@ -26,7 +35,7 @@ def T(nm):
 cfg=json.load(open('/home/sadara/.claude/jobs/9a1047b0/tmp/q08b/config.json'))['text_config']
 P='model.language_model.'; eps=cfg['rms_norm_eps']
 d='/home/sadara/.claude/jobs/9a1047b0/tmp/oracle/'
-toks=np.frombuffer(open(d+'tokens.hfkldr','rb').read()[32:],dtype=np.uint32).astype(np.int64)
+toks=np.arange(64,dtype=np.int64)  # deterministic prompt 0..63, matching dump_logits_qwen35
 S=len(toks)
 silu=lambda v: v/(1+np.exp(-v))
 rms=lambda v,w: v/np.sqrt((v**2).mean(-1,keepdims=True)+eps)*w
@@ -88,5 +97,9 @@ for li,lt in enumerate(cfg['layer_types']):
     x=x+((silu(xn2@T(L+'mlp.gate_proj.weight').T)*(xn2@T(L+'mlp.up_proj.weight').T))@T(L+'mlp.down_proj.weight').T)
 hn=rms(x,T(P+'norm.weight')); lg=hn@E.T
 lp=lg-lg.max(-1,keepdims=True); ls=lp-np.log(np.exp(lp).sum(-1,keepdims=True))
-nll=-np.mean([ls[i,toks[i+1]] for i in range(S-1)]); acc=np.mean([lg[i].argmax()==toks[i+1] for i in range(S-1)])
-print(f'FULL numpy forward: next-token NLL {nll:.3f}  acc {acc:.3f}  (uniform {np.log(cfg["vocab_size"]):.2f})')
+ref=np.fromfile('/home/sadara/.claude/jobs/9a1047b0/tmp/oracle/ref_logits.f32',dtype=np.float32)
+mine=lg[-1]  # runtime dumps the LAST position's logits
+c=float((mine*ref).sum()/(np.linalg.norm(mine)*np.linalg.norm(ref)+1e-12))
+print(f'last-position logits: cos(mine, runtime) = {c:.4f}')
+print(f'  mine  top5 ids {np.argsort(-mine)[:5].tolist()}  rms {float(np.sqrt((mine**2).mean())):.4f}')
+print(f'  runtime top5 ids {np.argsort(-ref)[:5].tolist()}  rms {float(np.sqrt((ref**2).mean())):.4f}')
