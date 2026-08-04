@@ -489,15 +489,13 @@ fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
 /// The objective is mismatched too: the grid minimises UNWEIGHTED squared error
 /// inside the group, and reconstruction error has repeatedly failed to predict
 /// output quality on this model.
-pub static CLIP_DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
+pub static CLIP_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Per-tensor clip policy: `true` when this tensor should NOT be clip-searched.
 /// Controlled by `HIPFIRE_NO_CLIP_LAYERS` — a comma-separated list of suffixes,
 /// e.g. `down_proj,o_proj`. Unset keeps the historical uniform behaviour.
 pub fn clip_disabled_for(name: &str) -> bool {
-    let Ok(list) = std::env::var("HIPFIRE_NO_CLIP_LAYERS") else {
+    let Some(list) = hipfire_env::NO_CLIP_LAYERS.get() else {
         return false;
     };
     list.split(',')
@@ -2845,7 +2843,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// Which clip factor does the search actually pick, as a function of
     /// bitwidth? The grid is [1.0 .. 0.6] of amax; c=1.0 means NO clipping.
     ///

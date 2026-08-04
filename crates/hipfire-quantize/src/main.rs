@@ -46,8 +46,8 @@ pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, q
 // artifacts through the same code path the native quantizer uses.
 use hipfire_quantize::hfq_out::{
     compress_bf16_tensor, compress_bf16_tensors, insert_parameter_counts_metadata,
-    write_hfq_with_progress, Bf16Codec, Bf16CompressStats,
-    HfqStreamTensor, HfqTensor, LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
+    write_hfq_with_progress, Bf16Codec, Bf16CompressStats, HfqStreamTensor, HfqTensor,
+    LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
 };
 // Helpers exercised only by this binary's unit tests.
 #[cfg(test)]
@@ -2412,10 +2412,7 @@ fn quantize_mq2g256_lloyd_gptq(
     // identical to quantize_mq2g256_lloyd_weighted (which is the right
     // thing to use directly if you don't need the GPTQ name in the
     // pipeline log). Override via env var.
-    let damping_env: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
+    let damping_env: f32 = hipfire_env::GPTQ_DAMPING.parse_or(0.0);
     if damping_env > 0.0 {
         let has_real_imatrix = col_weights.iter().any(|&w| (w - 1.0).abs() > 1e-6);
         if !has_real_imatrix {
@@ -2657,8 +2654,12 @@ impl HfqInputFile {
             return front_json.to_string();
         };
         let (Some(off), Some(size)) = (
-            tail.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize),
-            tail.get("size").and_then(|v| v.as_u64()).map(|v| v as usize),
+            tail.get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            tail.get("size")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
         ) else {
             return front_json.to_string();
         };
@@ -4073,7 +4074,7 @@ fn quantize_hfq_source_tensor(
     // NPU-native path; this env keeps such artifacts loadable on GPU. Default
     // stays padded-Opus (NPU loader), unchanged.
     if k % 256 != 0
-        && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
+        && hipfire_env::OQ_RAGGED_Q8.is_set()
         && matches!(
             format,
             HfqInputFormat::Oq3
@@ -4472,10 +4473,8 @@ fn quantize_hfq_source_tensor(
             // int8 in the compact ~4 b/w layout (130 + 2*N_out B/group, qt=36).
             // Composes AWQ + LDLQ like the Oq4 arm.
             let m_dim = shape[0] as usize;
-            let w8_frac = outliers_per_group_for(
-                name,
-                OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01),
-            );
+            let w8_frac =
+                outliers_per_group_for(name, OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01));
             // `--ldlq`: tiered GPTQ/OBS error-feedback (Hessian) → tiered int8
             // layout. Composes AWQ exactly like the Oq4 LDLQ arm (W·s offline +
             // rebase H' = diag(1/s) H diag(1/s) + x/s sidecar).
@@ -4552,8 +4551,8 @@ fn quantize_hfq_source_tensor(
 /// offline bottleneck). `--beam` sets this env in `main`, so both the
 /// `.hfq`-requantize and direct-source paths read it here.
 fn qtip_beam_width() -> usize {
-    std::env::var("HIPFIRE_QTIP_BEAM")
-        .ok()
+    hipfire_env::QTIP_BEAM
+        .get()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&b| b > 0)
         .unwrap_or(128)
@@ -4608,8 +4607,13 @@ mod greedy_timing {
         format!(
             "rotate_H {:.1}s  cholesky {:.1}s  upload {:.1}s  gather {:.1}s  \
              encode {:.1}s  err {:.1}s  propagate {:.1}s",
-            g(&ROTATE_MS), g(&CHOL_MS), g(&UPLOAD_MS), g(&GATHER_MS),
-            g(&ENCODE_MS), g(&ERR_MS), g(&PROP_MS)
+            g(&ROTATE_MS),
+            g(&CHOL_MS),
+            g(&UPLOAD_MS),
+            g(&GATHER_MS),
+            g(&ENCODE_MS),
+            g(&ERR_MS),
+            g(&PROP_MS)
         )
     }
 }
@@ -4661,14 +4665,11 @@ fn qtip_greedy_encode_gpu(
 
     // L as f32 [k, k] row-major, uploaded once. The kernel reads L[f, c0+c].
     let mut lflat = vec![0.0f32; k * k];
-    lflat
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(f, row)| {
-            for (c, v) in row.iter_mut().enumerate() {
-                *v = l[(f, c)] as f32;
-            }
-        });
+    lflat.par_chunks_mut(k).enumerate().for_each(|(f, row)| {
+        for (c, v) in row.iter_mut().enumerate() {
+            *v = l[(f, c)] as f32;
+        }
+    });
     let t = Instant::now();
     // OWNED allocations throughout. `GpuTensor` has NO Drop impl — only
     // `OwnedTensor` returns its buffer to the pool — so allocating per tensor
@@ -4725,8 +4726,7 @@ fn qtip_greedy_encode_gpu(
         for row in 0..m {
             symbols[row * k + c0..row * k + c1]
                 .copy_from_slice(&sym_flat[row * 256..row * 256 + 256]);
-            targets[row * k + c0..row * k + c1]
-                .copy_from_slice(&block[row * 256..row * 256 + 256]);
+            targets[row * k + c0..row * k + c1].copy_from_slice(&block[row * 256..row * 256 + 256]);
         }
 
         if c1 < k {
@@ -4766,7 +4766,6 @@ fn qtip_greedy_encode_gpu(
     }
     Some((symbols, targets))
 }
-
 
 /// Reusable GPU scratch for the trellis encode. The backpointer buffer is
 /// `chunk × 256 × 256 × 2` F32 = 512 MB at the default chunk, and its contents
@@ -4898,7 +4897,7 @@ fn gpu_encode_symbols_scratch(
 /// All three need `--hessian`; without one the tensor falls back to plain.
 fn qtip_cond_mode() -> Option<hipfire_quantize::ldlq::QtipCondMode> {
     use hipfire_quantize::ldlq::QtipCondMode;
-    match std::env::var("HIPFIRE_QTIP_COND").ok()?.to_ascii_lowercase().as_str() {
+    match hipfire_env::QTIP_COND.get()?.to_ascii_lowercase().as_str() {
         "weighted" => Some(QtipCondMode::Weighted),
         "greedy" => Some(QtipCondMode::Greedy),
         "beamldlq" | "beam_ldlq" => Some(QtipCondMode::BeamLdlq),
@@ -4916,11 +4915,11 @@ fn qtip_cond_mode() -> Option<hipfire_quantize::ldlq::QtipCondMode> {
 /// The one place the 3INST decision is read. Encoder codebook, artifact tag and
 /// decode kernel all derive from this, so they cannot drift apart.
 fn qtip_use_3inst() -> bool {
-    std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
+    hipfire_env::QTIP_CODEBOOK.get().as_deref() == Some("3inst")
 }
 
 fn qtip_sim_codebook() -> Vec<f32> {
-    if std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst") {
+    if hipfire_env::QTIP_CODEBOOK.get().as_deref() == Some("3inst") {
         eprintln!("qtip3-sim: 3INST computed codebook");
         qtip::build_codebook_3inst()
     } else {
@@ -4930,7 +4929,7 @@ fn qtip_sim_codebook() -> Vec<f32> {
 }
 
 fn qtip_trellis_lm_head_enabled() -> bool {
-    std::env::var("HIPFIRE_QTIP_LM_HEAD").ok().as_deref() == Some("1")
+    hipfire_env::QTIP_LM_HEAD.flag()
 }
 
 fn pack_qtip_real_tensors(
@@ -4974,24 +4973,24 @@ fn pack_qtip_real_tensors(
     // the encoder swap alone. Set HIPFIRE_QTIP_CPU_ENCODE=1 to hold the encoder
     // fixed across arms.
     #[cfg(feature = "gpu")]
-    let force_cpu = std::env::var("HIPFIRE_QTIP_CPU_ENCODE").ok().as_deref() == Some("1");
+    let force_cpu = hipfire_env::QTIP_CPU_ENCODE.flag();
     #[cfg(feature = "gpu")]
     let mut gpu = if force_cpu {
         eprintln!("  qtip{bits} (real): CPU beam encoder forced (beam={beam})");
         None
     } else {
         match hipfire_rdna::Gpu::init() {
-        Ok(g) => {
-            eprintln!(
-                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi)",
-                g.arch,
-            );
-            Some(g)
-        }
-        Err(_) => {
-            eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
-            None
-        }
+            Ok(g) => {
+                eprintln!(
+                    "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi)",
+                    g.arch,
+                );
+                Some(g)
+            }
+            Err(_) => {
+                eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
+                None
+            }
         }
     };
     #[cfg(not(feature = "gpu"))]
@@ -5113,18 +5112,18 @@ fn pack_qtip_real_tensors(
             Vec::new()
         } else {
             match gpu.as_mut() {
-            Some(g) => match gpu_encode_symbols(g, &rotated, ng, bits) {
-                Ok(s) => s,
-                Err(e) => {
-                    // Never fail the quantize on a GPU hiccup — the CPU beam is the
-                    // reference and always works (AGENTS.md: CPU-only functionality).
-                    eprintln!(
+                Some(g) => match gpu_encode_symbols(g, &rotated, ng, bits) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Never fail the quantize on a GPU hiccup — the CPU beam is the
+                        // reference and always works (AGENTS.md: CPU-only functionality).
+                        eprintln!(
                         "  qtip{bits}: GPU encode failed ({e}) — falling back to CPU beam for this tensor"
                     );
-                    cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
-                }
-            },
-            None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
+                        cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                    }
+                },
+                None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
             }
         };
         #[cfg(not(feature = "gpu"))]
@@ -5164,26 +5163,24 @@ fn pack_qtip_real_tensors(
                 let enc_scratch: std::cell::RefCell<Option<QtipEncodeScratch>> =
                     std::cell::RefCell::new(None);
                 #[cfg(feature = "gpu")]
-                let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> =
-                    if mode == hipfire_quantize::ldlq::QtipCondMode::Greedy
-                        && gpu_cell.borrow().is_some()
-                    {
-                        Some(Box::new(|flat: &[f32], groups: usize| {
-                            let mut guard = gpu_cell.borrow_mut();
-                            let mut sc = enc_scratch.borrow_mut();
-                            match guard.as_mut() {
-                                Some(g) => {
-                                    gpu_encode_symbols_scratch(g, flat, groups, bits, &mut sc)
-                                        .unwrap_or_else(|_| {
-                                            cpu_encode_symbols(flat, groups, qtip_cb, beam, bits)
-                                        })
-                                }
-                                None => cpu_encode_symbols(flat, groups, qtip_cb, beam, bits),
-                            }
-                        }))
-                    } else {
-                        None
-                    };
+                let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> = if mode
+                    == hipfire_quantize::ldlq::QtipCondMode::Greedy
+                    && gpu_cell.borrow().is_some()
+                {
+                    Some(Box::new(|flat: &[f32], groups: usize| {
+                        let mut guard = gpu_cell.borrow_mut();
+                        let mut sc = enc_scratch.borrow_mut();
+                        match guard.as_mut() {
+                            Some(g) => gpu_encode_symbols_scratch(g, flat, groups, bits, &mut sc)
+                                .unwrap_or_else(|_| {
+                                    cpu_encode_symbols(flat, groups, qtip_cb, beam, bits)
+                                }),
+                            None => cpu_encode_symbols(flat, groups, qtip_cb, beam, bits),
+                        }
+                    }))
+                } else {
+                    None
+                };
                 #[cfg(not(feature = "gpu"))]
                 let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> = None;
                 // Greedy with a GPU present takes the device-resident path: the
@@ -5210,8 +5207,7 @@ fn pack_qtip_real_tensors(
                         let mut sc = enc_scratch.borrow_mut();
                         let g = guard.as_mut().expect("checked above");
                         qtip_greedy_encode_gpu(
-                            g, &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, bits,
-                            &mut sc,
+                            g, &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, bits, &mut sc,
                         )
                     }
                     #[cfg(not(feature = "gpu"))]
@@ -5220,7 +5216,17 @@ fn pack_qtip_real_tensors(
                     }
                 } else {
                     hipfire_quantize::ldlq::qtip_conditioned_encode(
-                        &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, beam, bits, mode,
+                        &rotated,
+                        m,
+                        k,
+                        &h,
+                        qtip_s1,
+                        qtip_s2,
+                        damp,
+                        qtip_cb,
+                        beam,
+                        bits,
+                        mode,
                         gpu_block.as_deref(),
                     )
                 };
@@ -5256,10 +5262,9 @@ fn pack_qtip_real_tensors(
                 #[cfg(feature = "gpu")]
                 {
                     match gpu.as_mut() {
-                        Some(g) => gpu_encode_symbols(g, &rotated, ng, bits)
-                            .unwrap_or_else(|_| {
-                                cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
-                            }),
+                        Some(g) => gpu_encode_symbols(g, &rotated, ng, bits).unwrap_or_else(|_| {
+                            cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                        }),
                         None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
                     }
                 }
@@ -5376,7 +5381,10 @@ fn pack_qtip_real_tensors(
     if let Some(mode) = cond_mode {
         eprintln!("  qtip{bits} (real): {mode:?} conditioning applied to {n_cond} tensors");
         #[cfg(feature = "gpu")]
-        eprintln!("  qtip{bits} (real): greedy breakdown — {}", greedy_timing::report());
+        eprintln!(
+            "  qtip{bits} (real): greedy breakdown — {}",
+            greedy_timing::report()
+        );
         if n_cond == 0 && n_packed > 0 {
             // Refuse to ship an artifact that silently ignored the conditioning it
             // was asked for. Byte-identical to the unconditioned build, it would
@@ -5470,10 +5478,10 @@ fn run_hfq_source_pipeline(
                         &ones
                     }
                 };
-                let err = hipfire_quantize::mixed_precision::oq4_sensitivity(
-                    &f32d, m, k, &im, &s1, &s2,
-                );
+                let err =
+                    hipfire_quantize::mixed_precision::oq4_sensitivity(&f32d, m, k, &im, &s1, &s2);
                 cands.push(TierCandidate {
+                    base_bpw: Some(oq_floor_bpw_for(&t.name)),
                     name: t.name.clone(),
                     numel: m * k,
                     err_oq2: err, // unused at floor=Oq4; the oq2 step never fires
@@ -5672,10 +5680,7 @@ fn run_hfq_source_pipeline(
             &qtip_cb,
             &qtip_s1,
             &qtip_s2,
-            std::env::var("HIPFIRE_LOWRANK_R")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            hipfire_env::LOWRANK_R.parse_or(0),
             bits,
             qtip_beam_width(),
             qtip_trellis_lm_head_enabled(),
@@ -6045,12 +6050,11 @@ fn minimax_layer_index(name: &str) -> Option<usize> {
 }
 
 /// True if layer `l` falls in the comma-separated range list held in env `var`
-/// (e.g. "12-45,50,55-60"; inclusive ranges or bare singles). Unset/empty →
+/// (e.g. "12-45,50,55-60"; inclusive ranges or bare singles). Unset/empty ->
 /// false. Drives per-layer mixed-precision expert promotion for MiniMax.
-fn minimax_layer_in_env_set(var: &str, l: usize) -> bool {
-    let spec = match std::env::var(var) {
-        Ok(v) => v,
-        Err(_) => return false,
+fn minimax_layer_in_env_set(var: hipfire_env::EnvVar, l: usize) -> bool {
+    let Some(spec) = var.get() else {
+        return false;
     };
     for tok in spec.split(',') {
         let tok = tok.trim();
@@ -6368,8 +6372,28 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
 /// The container already supports this: OqPlusCompact stores `N_out` implicitly
 /// in the block length (`130 + 2·N_out`), derived per tensor on read, so a
 /// per-layer budget needs no format change.
+/// Bits-per-weight this tensor actually costs at the oq4 floor.
+///
+/// Plain oq4 is 4.0625 (130 B/256-group). An `oq<BITS>++` base additionally
+/// stores `N_out` W8 overlays per group in a `130 + 2*N_out` byte block, so it
+/// costs `4.0625 + N_out/16` — and `N_out` is per tensor when
+/// `HIPFIRE_OUTLIERS_BY_LAYER` is in play. Returns the plain rate when this is
+/// not an OQ+ run (`OQPLUS_W8_FRAC` unset).
+///
+/// The mixed-precision allocator needs this: charging the plain rate for an
+/// oq4.25++ base understates realized b/w by 0.1875 AND hands that difference
+/// back as budget, promoting more tensors than the target actually allows.
+fn oq_floor_bpw_for(name: &str) -> f64 {
+    let Some(&default_frac) = OQPLUS_W8_FRAC.get() else {
+        return hipfire_quantize::mixed_precision::OQ4_BPW;
+    };
+    let frac = outliers_per_group_for(name, default_frac);
+    let outliers = ((frac * 256.0).round() as usize).clamp(1, 255);
+    4.0625 + outliers as f64 / 16.0
+}
+
 fn outliers_per_group_for(name: &str, default_frac: f32) -> f32 {
-    let Ok(spec) = std::env::var("HIPFIRE_OUTLIERS_BY_LAYER") else {
+    let Some(spec) = hipfire_env::OUTLIERS_BY_LAYER.get() else {
         return default_frac;
     };
     let mut fallback = default_frac;
@@ -6396,7 +6420,7 @@ fn awq_eligible(name: &str) -> bool {
     // are excluded — produces an F1-equivalent quant for comparison
     // bench against the same binary's F2 quant. Default (env unset):
     // the full F2 whitelist applies.
-    let f1_only = std::env::var("HIPFIRE_AWQ_F1_ONLY").ok().as_deref() == Some("1");
+    let f1_only = hipfire_env::AWQ_F1_ONLY.flag();
     let f1_match =
     // Full-attention input projections (HF naming + fused variants).
     name.ends_with("q_proj.weight")
@@ -6882,8 +6906,8 @@ fn main() {
         .position(|a| a == "--threads")
         .and_then(|i| args.get(i + 1).and_then(|s| s.parse::<usize>().ok()))
         .or_else(|| {
-            std::env::var("HIPFIRE_QUANT_THREADS")
-                .ok()
+            hipfire_env::QUANT_THREADS
+                .get()
                 .and_then(|s| s.parse().ok())
         })
         .unwrap_or(default_threads);
@@ -7200,8 +7224,7 @@ fn main() {
         // block carries no marker, so sharing one code would let a 3INST artifact
         // dequantize to noise under a 1MAD kernel with every structural check
         // passing. Real qtip4 stays 1MAD — no distinct code exists for it.
-        let cb = if !use_qtip4_real
-            && std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
+        let cb = if !use_qtip4_real && hipfire_env::QTIP_CODEBOOK.get().as_deref() == Some("3inst")
         {
             eprintln!("qtip: 3INST computed codebook selected");
             qtip::build_codebook_3inst()
@@ -7223,7 +7246,7 @@ fn main() {
         || use_roughquant_real
         || use_roughquant5
     {
-        std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
+        hipfire_env::QTIP_HESSIAN.get().and_then(|p| {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
                 Ok(s) => {
                     eprintln!(
@@ -7351,8 +7374,8 @@ fn main() {
     let use_mq4_routed_lloyd_mq3_kmap = format == "mq4-routed-lloyd-mq3-kmap"
         || format == "mq4-routed-lloyd-mq3"
         || format == "mq4-routed-lloyd-mq3-exp";
-    let allow_mq3_lloyd_for_mixed = args.iter().any(|a| a == "--allow-mq3-lloyd")
-        || std::env::var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+    let allow_mq3_lloyd_for_mixed =
+        args.iter().any(|a| a == "--allow-mq3-lloyd") || hipfire_env::ALLOW_MQ3_LLOYD.flag();
     if use_mq4_routed_lloyd_mq3_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
             "note: --format mq4-routed-lloyd-mq3-kmap requires --allow-mq3-lloyd or\n\
@@ -7430,7 +7453,7 @@ fn main() {
         || format == "all-mq2-gptq";
     if use_mq4_routed_lloyd_mq2_gptq_all
         && imatrix_path.is_none()
-        && std::env::var("HIPFIRE_ALLOW_UNIT_IMATRIX").ok().as_deref() != Some("1")
+        && hipfire_env::ALLOW_UNIT_IMATRIX.get().as_deref() != Some("1")
     {
         eprintln!("error: --format mq4-routed-lloyd-mq2-gptq-all requires --imatrix <PATH>");
         eprintln!(
@@ -7472,11 +7495,7 @@ fn main() {
         .iter()
         .position(|a| a == "--tier-ratio")
         .and_then(|i| args.get(i + 1).and_then(|s| s.parse().ok()))
-        .or_else(|| {
-            std::env::var("HIPFIRE_TIER_RATIO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
+        .or_else(|| hipfire_env::TIER_RATIO.get().and_then(|s| s.parse().ok()))
         .unwrap_or(0.30);
     if use_mq4_routed_lloyd_mq_tiered {
         if imatrix_path.is_none() {
@@ -7868,8 +7887,7 @@ fn main() {
     // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
     // mojibake on all 4 coherence-gate prompts). Refuse by default until
     // Path D Lloyd-Max non-uniform codebooks land (PRD §5.2).
-    let allow_mq2 = args.iter().any(|a| a == "--allow-mq2")
-        || std::env::var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
+    let allow_mq2 = args.iter().any(|a| a == "--allow-mq2") || hipfire_env::ALLOW_MQ2.flag();
     if use_mq2g256 && !allow_mq2 {
         eprintln!(
             "error: --format mq2 is reserved — empirical quality verdict is collapse on every model\n\
@@ -7888,8 +7906,8 @@ fn main() {
     // lloyd_max_findings_20260501.md) but still text-collapse — 9B ppl=2,163
     // vs 9B MQ4 ppl=10. Research-only: same opt-in gate so users don't
     // accidentally ship a 2-bpw model that won't produce coherent output.
-    let allow_mq3_lloyd = args.iter().any(|a| a == "--allow-mq3-lloyd")
-        || std::env::var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+    let allow_mq3_lloyd =
+        args.iter().any(|a| a == "--allow-mq3-lloyd") || hipfire_env::ALLOW_MQ3_LLOYD.flag();
     if use_lloyd_mq3g256 && !allow_mq3_lloyd {
         eprintln!(
             "note: --format lloyd-mq3 is research — Lloyd-Max 8-entry codebook +\n\
@@ -7903,8 +7921,8 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
-        || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
+    let allow_mq2_lloyd =
+        args.iter().any(|a| a == "--allow-mq2-lloyd") || hipfire_env::ALLOW_MQ2_LLOYD.flag();
     if (use_lloyd_mq2g256
         || use_mq4_routed_lloyd_mq2_exp
         || use_mq4_routed_lloyd_mq2_native
@@ -7938,8 +7956,8 @@ fn main() {
     // 9B projection is ppl 8.0–9.3 (vs uniform MQ4 ppl 10.34, MQ6 ppl 9.36).
     // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
     // numbers land.
-    let allow_mq4_lloyd = args.iter().any(|a| a == "--allow-mq4-lloyd")
-        || std::env::var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
+    let allow_mq4_lloyd =
+        args.iter().any(|a| a == "--allow-mq4-lloyd") || hipfire_env::ALLOW_MQ4_LLOYD.flag();
     if use_lloyd_mq4g256 && !allow_mq4_lloyd {
         eprintln!(
             "note: --format lloyd-mq4 is research — Lloyd-Max 16-entry codebook +\n\
@@ -8538,6 +8556,8 @@ fn main() {
                         numel: m * k,
                         err_oq2: oq2_sensitivity(&w, m, k, &imat, &s1, &s2),
                         err_oq4: oq4_sensitivity(&w, m, k, &imat, &s1, &s2),
+                        // Plain-tier sweep: the base carries no W8 overlays.
+                        base_bpw: None,
                     });
                 }
             }
@@ -9803,12 +9823,9 @@ fn main() {
                 // Expert format by --format: mq2-lloyd (MQ2G256Lloyd, hipx sub-4-bit
                 // target — has deepseek4 indexed-MoE kernels), mq6 (oracle check /
                 // HIPFIRE_MINIMAX_EXPERT_MQ6), else mq4 (MQ4G256, validated baseline).
-                let mm_mq6 =
-                    use_mq6g256 || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
-                let mm_mq2l =
-                    use_lloyd_mq2g256 || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
-                let mm_mq3l =
-                    use_lloyd_mq3g256 || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
+                let mm_mq6 = use_mq6g256 || hipfire_env::MINIMAX_EXPERT_MQ6.is_set();
+                let mm_mq2l = use_lloyd_mq2g256 || hipfire_env::MINIMAX_EXPERT_MQ2L.is_set();
+                let mm_mq3l = use_lloyd_mq3g256 || hipfire_env::MINIMAX_EXPERT_MQ3L.is_set();
                 // Per-layer mixed-precision promotion. HIPFIRE_MINIMAX_PROMOTE_MQ4 /
                 // _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
                 // forced UP to MQ4 / MQ6 regardless of the base --format. The forward
@@ -9816,10 +9833,10 @@ fn main() {
                 // carries an MQ2-Lloyd base with MQ4 on the quant-sensitive middle layers.
                 let mm_layer = minimax_layer_index(name);
                 let promote_mq6 = mm_layer.map_or(false, |l| {
-                    minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ6", l)
+                    minimax_layer_in_env_set(hipfire_env::MINIMAX_PROMOTE_MQ6, l)
                 });
                 let promote_mq4 = mm_layer.map_or(false, |l| {
-                    minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ4", l)
+                    minimax_layer_in_env_set(hipfire_env::MINIMAX_PROMOTE_MQ4, l)
                 });
                 // Per-projection promotion: the down proj (w2) sees ~24x the
                 // activation magnitude of gate/up (the SwiGLU intermediate), so its
@@ -9827,7 +9844,7 @@ fn main() {
                 // {mq6,mq4,mq3-lloyd} promotes ONLY w2, keeping w1/w3 at the base.
                 // The forward dispatches down on its own dtype, so they can differ.
                 let down_fmt = if name.ends_with(".w2.weight") {
-                    std::env::var("HIPFIRE_MINIMAX_DOWN_FORMAT").ok()
+                    hipfire_env::MINIMAX_DOWN_FORMAT.get()
                 } else {
                     None
                 };
@@ -10122,7 +10139,7 @@ fn main() {
             // `HIPFIRE_NO_EXPERT_AWQ=1` suppresses per-expert AWQ smoothing (the
             // experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the
             // expert-AWQ quality delta; does not affect dense tensors.
-            let no_expert_awq = std::env::var("HIPFIRE_NO_EXPERT_AWQ").ok().as_deref() == Some("1");
+            let no_expert_awq = hipfire_env::NO_EXPERT_AWQ.flag();
             let nested: Vec<Vec<HfqTensor>> = (0..n_experts)
                 .into_par_iter()
                 .map(|x| {
@@ -10184,9 +10201,7 @@ fn main() {
                         });
                         oq_sidecar_scales = OQ4_AWQ_SIDECAR.with(|cell| cell.borrow_mut().take());
                         (q, qt, gs)
-                    } else if stacked_oq_format.is_some()
-                        && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
-                    {
+                    } else if stacked_oq_format.is_some() && hipfire_env::OQ_RAGGED_Q8.is_set() {
                         // Keep OQ expert pairs loadable when a tiny/ragged
                         // fixture has K that is not a 256-group multiple (for
                         // example Qwen3.5-MoE down_proj K=128). The generic 2D
@@ -10326,9 +10341,7 @@ fn main() {
                 } else {
                     "OQ4-EXP"
                 }
-            } else if stacked_oq_format.is_some()
-                && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
-            {
+            } else if stacked_oq_format.is_some() && hipfire_env::OQ_RAGGED_Q8.is_set() {
                 "Q8-RAGGED-OQ"
             } else if expert_lloyd_mq3_native {
                 "MQ3G256L"
@@ -10573,7 +10586,7 @@ fn main() {
                 } else if (use_oq4 || use_opus_mixed || use_oq8 || use_oq8_plus)
                     && (name.ends_with("mlp.gate.weight")
                         || name.ends_with("mlp.shared_expert_gate.weight"))
-                    && std::env::var("HIPFIRE_OQ8_ROUTER").ok().as_deref() == Some("1")
+                    && hipfire_env::OQ8_ROUTER.flag()
                     && meta.shape.len() == 2
                     && (meta.shape[1] as usize) % 256 == 0
                 {
@@ -11129,12 +11142,11 @@ fn main() {
                                 };
                             let data: &[f32] = awq_scaled.as_deref().unwrap_or(&f32_data);
                             // HIPFIRE_LLOYD_K3=1 → ternary "MQ1.58" (3-level codebook, reuses kernel).
-                            let q =
-                                if std::env::var("HIPFIRE_LLOYD_K3").ok().as_deref() == Some("1") {
-                                    quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
-                                } else {
-                                    quantize_mq2g256_lloyd(data, &signs1, &signs2)
-                                };
+                            let q = if hipfire_env::LLOYD_K3.flag() {
+                                quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
+                            } else {
+                                quantize_mq2g256_lloyd(data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                         } else {
                             // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
@@ -11684,17 +11696,14 @@ fn main() {
         // enables per-channel scaling by spectral activation energy (from the
         // calib Hessian) before the trellis, math-invariant. α=0.5 is the paper
         // default; unset = no BBT.
-        let bbt_alpha: Option<f32> = std::env::var("HIPFIRE_QTIP_BBT_ALPHA")
-            .ok()
+        let bbt_alpha: Option<f32> = hipfire_env::QTIP_BBT_ALPHA
+            .get()
             .and_then(|v| v.parse().ok())
             .filter(|&a: &f32| a > 0.0);
         // HIPFIRE_LOWRANK_R=r adds a rank-r correction of the quant error back
         // into the emitted weight (LQER/CALDERA low-rank residual probe). This
         // sims the quality of W4 + a 2-WMMA UᵥVᵥ correction; rank=0 = off.
-        let lowrank_r: usize = std::env::var("HIPFIRE_LOWRANK_R")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let lowrank_r: usize = hipfire_env::LOWRANK_R.parse_or(0);
         let (mut n_bbt, mut n_lowrank) = (0usize, 0usize);
         for t in hfq_tensors.iter_mut() {
             if !(matches!(t.quant_type, QuantType::BF16)
@@ -11815,18 +11824,9 @@ fn main() {
     // back into bf16. Saliency = diag(H) when the tensor has a Hessian, else the
     // column L2 norm of W. Mirrors the qtip-sim post-pass above.
     if use_roughquant_sim {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.015);
-        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ_BULK_BITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
-        let group: usize = std::env::var("HIPFIRE_RQ_GROUP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256);
+        let protect_frac: f64 = hipfire_env::RQ_PROTECT_FRAC.parse_or(0.015);
+        let bulk_bits: u32 = hipfire_env::RQ_BULK_BITS.parse_or(2);
+        let group: usize = hipfire_env::RQ_GROUP.parse_or(256);
         eprintln!(
             "  roughquant-sim: protect_frac={protect_frac} bulk_bits={bulk_bits} group={group}"
         );
@@ -11886,18 +11886,9 @@ fn main() {
     // bulk, inverse-rotate back, bake into bf16. Tensors lacking a Hessian (or
     // whose eigensolve fails) are left as the staged bf16.
     if use_roughquant2_sim {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ2_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.015);
-        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ2_BULK_BITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
-        let damp: f64 = std::env::var("HIPFIRE_RQ2_DAMP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.01);
+        let protect_frac: f64 = hipfire_env::RQ2_PROTECT_FRAC.parse_or(0.015);
+        let bulk_bits: u32 = hipfire_env::RQ2_BULK_BITS.parse_or(3);
+        let damp: f64 = hipfire_env::RQ2_DAMP.parse_or(0.01);
         eprintln!(
             "  roughquant2-sim: PCA rotation, protect_frac={protect_frac} bulk_bits={bulk_bits} damp={damp}"
         );
@@ -11908,7 +11899,7 @@ fn main() {
         // k!=1024 (o_proj/out_proj=2048, down_proj=3584) read internal activations
         // and keep their own per-weight rotation (the runtime-rotation tier).
         // Tests whether forcing the foldable shared rotation preserves the win.
-        let share_resid = std::env::var("HIPFIRE_RQ2_SHARE_RESID").ok().as_deref() == Some("1");
+        let share_resid = hipfire_env::RQ2_SHARE_RESID.flag();
         let r_global: Option<Vec<f32>> = if share_resid {
             let kk = 1024usize;
             let mut csum = vec![0.0f32; kk * kk];
@@ -12012,7 +12003,7 @@ fn main() {
         // Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1,
         // simulate Q8 (8-bit per-256-group uniform, no protection) on those tensors
         // so the comparison is honest.
-        if std::env::var("HIPFIRE_RQ2_Q8_EMBED").ok().as_deref() == Some("1") {
+        if hipfire_env::RQ2_Q8_EMBED.flag() {
             let mut n_e = 0usize;
             for t in hfq_tensors.iter_mut() {
                 if matches!(t.quant_type, QuantType::BF16)
@@ -12045,14 +12036,8 @@ fn main() {
     // un-permute back. A permutation folds for free (reindex), so this is the
     // foldable analog of Phase 2 — minus the channel-mixing decorrelation.
     if use_roughquant3_sim {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ3_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.03);
-        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ3_BULK_BITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+        let protect_frac: f64 = hipfire_env::RQ3_PROTECT_FRAC.parse_or(0.03);
+        let bulk_bits: u32 = hipfire_env::RQ3_BULK_BITS.parse_or(3);
         eprintln!(
             "  roughquant3-sim: permutation+protection, protect_frac={protect_frac} bulk_bits={bulk_bits}"
         );
@@ -12111,7 +12096,7 @@ fn main() {
         }
         eprintln!("  roughquant3-sim: diag(H)-saliency on {n_hess} tensors, L2-proxy on {n_proxy}");
         // Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A).
-        if std::env::var("HIPFIRE_RQ3_Q8_EMBED").ok().as_deref() == Some("1") {
+        if hipfire_env::RQ3_Q8_EMBED.flag() {
             let mut n_e = 0usize;
             for t in hfq_tensors.iter_mut() {
                 if matches!(t.quant_type, QuantType::BF16)
@@ -12142,37 +12127,25 @@ fn main() {
     // top set exact in true residual-reader COLUMNS and residual-writer ROWS.
     // Non-residual inputs use per-weight diag(H) column protection.
     if use_roughquant4_sim {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.03);
-        let bulk_bits: u32 = std::env::var("HIPFIRE_RQ4_BULK_BITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+        let protect_frac: f64 = hipfire_env::RQ4_PROTECT_FRAC.parse_or(0.03);
+        let bulk_bits: u32 = hipfire_env::RQ4_BULK_BITS.parse_or(3);
         // Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set
         // protect_frac=0 for the plain-mq4 baseline); else QTIP-{bulk_bits}.
-        let bulk_kind = std::env::var("HIPFIRE_RQ4_BULK").ok().unwrap_or_default();
+        let bulk_kind = hipfire_env::RQ4_BULK.get().unwrap_or_default();
         let bulk_mq4 = bulk_kind == "mq4";
         let bulk_void = bulk_kind == "void";
         // OBS saliency Hessian ridge (fraction of diag mean), for SALIENCY=obs.
-        let damp: f64 = std::env::var("HIPFIRE_RQ4_OBS_DAMP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.01);
+        let damp: f64 = hipfire_env::RQ4_OBS_DAMP.parse_or(0.01);
         // Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0
         // + this gives a fair FWHT uniform-N-bit anchor on the same machinery.
-        let mq_bits: u32 = std::env::var("HIPFIRE_RQ4_MQ_BITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+        let mq_bits: u32 = hipfire_env::RQ4_MQ_BITS.parse_or(4);
         // Protect at 8-bit (per-channel Q8) instead of bf16 — honest bit-cost.
-        let protect_q8 = std::env::var("HIPFIRE_RQ4_PROTECT_Q8").ok().as_deref() == Some("1");
+        let protect_q8 = hipfire_env::RQ4_PROTECT_Q8.flag();
         // Saliency metric for which channels to protect (user steer: don't rely
         // on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖²
         // (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution).
-        let saliency_metric = std::env::var("HIPFIRE_RQ4_SALIENCY")
-            .ok()
+        let saliency_metric = hipfire_env::RQ4_SALIENCY
+            .get()
             .unwrap_or_else(|| "diag".into());
         let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or_else(|| {
             eprintln!(
@@ -12243,10 +12216,7 @@ fn main() {
         // (energy/product) is no better than chance at finding the important
         // channels — not that importance is worthless. Reproducible via the seed.
         if saliency_metric == "random" {
-            let seed: u64 = std::env::var("HIPFIRE_RQ4_RANDOM_SEED")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1234567);
+            let seed: u64 = hipfire_env::RQ4_RANDOM_SEED.parse_or(1234567);
             for (i, e) in resid_energy.iter_mut().enumerate() {
                 let mut z = seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -12258,7 +12228,7 @@ fn main() {
         // HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking
         // (descending) as `RANK<tab>channel<tab>energy` and exit. Cheap (no quant);
         // used to pick ablation-oracle targets sampled across the diag spectrum.
-        if std::env::var("HIPFIRE_RQ4_DUMP_RANK").ok().as_deref() == Some("1") {
+        if hipfire_env::RQ4_DUMP_RANK.flag() {
             let mut idx: Vec<usize> = (0..dmodel).collect();
             idx.sort_unstable_by(|&a, &b| {
                 resid_energy[b]
@@ -12276,7 +12246,7 @@ fn main() {
         // by the chosen metric; INVERT flips it so the voided set is the TOP. If
         // void-bottom (our metric) hurts LESS than void-random and void-top hurts
         // MOST, the metric ranks the tail correctly (not just the outliers).
-        let invert_select = std::env::var("HIPFIRE_RQ4_INVERT").ok().as_deref() == Some("1");
+        let invert_select = hipfire_env::RQ4_INVERT.flag();
         // Top residual channels (shared across readers' cols and writers' rows).
         let n_prot_resid = ((protect_frac * dmodel as f64).round() as usize).min(dmodel);
         let protected_resid: Vec<usize> = {
@@ -12299,30 +12269,29 @@ fn main() {
         // isolates the marginal KLD damage of ablating those specific channels —
         // the gold-standard per-channel importance signal to validate diag against.
         // Overrides protect_frac/saliency selection for the residual set.
-        let (protected_resid, n_prot_resid) =
-            if let Ok(spec) = std::env::var("HIPFIRE_RQ4_VOID_ONLY") {
-                let void_set: std::collections::HashSet<usize> = spec
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<usize>().ok())
-                    .filter(|&c| c < dmodel)
-                    .collect();
-                let keep: Vec<usize> = (0..dmodel).filter(|c| !void_set.contains(c)).collect();
-                eprintln!(
-                    "  roughquant4-sim: ABLATION ORACLE — voiding {} residual channels {:?}, \
+        let (protected_resid, n_prot_resid) = if let Some(spec) = hipfire_env::RQ4_VOID_ONLY.get() {
+            let void_set: std::collections::HashSet<usize> = spec
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter(|&c| c < dmodel)
+                .collect();
+            let keep: Vec<usize> = (0..dmodel).filter(|c| !void_set.contains(c)).collect();
+            eprintln!(
+                "  roughquant4-sim: ABLATION ORACLE — voiding {} residual channels {:?}, \
                  protecting the other {}",
-                    void_set.len(),
-                    {
-                        let mut v: Vec<usize> = void_set.iter().copied().collect();
-                        v.sort_unstable();
-                        v
-                    },
-                    keep.len()
-                );
-                let n = keep.len();
-                (keep, n)
-            } else {
-                (protected_resid, n_prot_resid)
-            };
+                void_set.len(),
+                {
+                    let mut v: Vec<usize> = void_set.iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                },
+                keep.len()
+            );
+            let n = keep.len();
+            (keep, n)
+        } else {
+            (protected_resid, n_prot_resid)
+        };
         eprintln!(
             "  roughquant4-sim: channel-consistent, protect_frac={protect_frac} bulk={}; \
              {n_prot_resid}/{dmodel} residual channels protected (read cols + write rows)",
@@ -12381,10 +12350,7 @@ fn main() {
                         } else {
                             None
                         };
-                    let rng_seed: u64 = std::env::var("HIPFIRE_RQ4_RANDOM_SEED")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1234567);
+                    let rng_seed: u64 = hipfire_env::RQ4_RANDOM_SEED.parse_or(1234567);
                     let sal: Vec<f64> = (0..k)
                         .map(|c| {
                             let d = diag.as_ref().map(|d| d[c]).unwrap_or(1.0);
@@ -12518,7 +12484,7 @@ fn main() {
             t.data = f32_slice_to_bf16_bytes(&wf);
         }
         eprintln!("  roughquant4-sim: {n_w} residual writers (row-protected), {n_r} other tensors");
-        if std::env::var("HIPFIRE_RQ4_Q8_EMBED").ok().as_deref() == Some("1") {
+        if hipfire_env::RQ4_Q8_EMBED.flag() {
             let mut n_e = 0usize;
             for t in hfq_tensors.iter_mut() {
                 if matches!(t.quant_type, QuantType::BF16)
@@ -12554,10 +12520,7 @@ fn main() {
     // indices live in metadata["roughquant_sidecar"]; values in `<name>.rqcorr`
     // BF16 tensors. Absent sidecar ⇒ plain mq4 (backward-compatible loader).
     if use_roughquant_real {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.03);
+        let protect_frac: f64 = hipfire_env::RQ4_PROTECT_FRAC.parse_or(0.03);
         let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or(1024);
         // Aggregate per-residual-channel diag(H) energy from true residual readers.
         let mut resid_energy = vec![0.0f64; dmodel];
@@ -12732,10 +12695,7 @@ fn main() {
     // lm_head cols). Bijective ⇒ model output unchanged. Verify: permuted-vs-original
     // KLD ≈ 0 on the working forward path.
     if use_roughquant5 {
-        let protect_frac: f64 = std::env::var("HIPFIRE_RQ4_PROTECT_FRAC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.05);
+        let protect_frac: f64 = hipfire_env::RQ4_PROTECT_FRAC.parse_or(0.05);
         let dmodel = roughquant4_infer_dmodel(&hfq_tensors).unwrap_or(1024);
         // diag(H) residual-channel energy from true residual readers.
         let mut resid_energy = vec![0.0f64; dmodel];
@@ -12910,10 +12870,7 @@ fn main() {
             &qtip_cb,
             &qtip_s1,
             &qtip_s2,
-            std::env::var("HIPFIRE_LOWRANK_R")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            hipfire_env::LOWRANK_R.parse_or(0),
             qtip_bits,
             qtip_beam_width(),
             qtip_trellis_lm_head_enabled(),
@@ -14622,8 +14579,9 @@ mod hfq_block_diag {
     #[test]
     #[ignore]
     fn hfq_dump_metadata() {
-        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
-            .unwrap_or_else(|_| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
+        let path_str = hipfire_env::QUANT_DIAG_PATH
+            .get()
+            .unwrap_or_else(|| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
         let path = Path::new(&path_str);
         let json = parse_hfq_metadata(path).expect("parse");
         // Print just keys at top level + any "source" / "path" / "input" hints.
@@ -14903,8 +14861,9 @@ mod hfq_block_diag {
     #[test]
     #[ignore]
     fn hfq_dist_sample() {
-        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
-            .unwrap_or_else(|_| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
+        let path_str = hipfire_env::QUANT_DIAG_PATH
+            .get()
+            .unwrap_or_else(|| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
         let path = Path::new(&path_str);
         let (mmap, tensors) = parse_hfq(path).expect("parse hfq");
 
@@ -15000,8 +14959,9 @@ mod hfq_block_diag {
     #[test]
     #[ignore]
     fn hfq_inventory() {
-        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
-            .unwrap_or_else(|_| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
+        let path_str = hipfire_env::QUANT_DIAG_PATH
+            .get()
+            .unwrap_or_else(|| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
         let path = Path::new(&path_str);
         eprintln!("opening {path:?}");
         let (_mmap, tensors) = parse_hfq(path).expect("parse hfq");
@@ -15041,8 +15001,9 @@ mod hfq_block_diag {
     #[test]
     #[ignore]
     fn hfq_block_range_diag() {
-        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
-            .unwrap_or_else(|_| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
+        let path_str = hipfire_env::QUANT_DIAG_PATH
+            .get()
+            .unwrap_or_else(|| "/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
         let path = Path::new(&path_str);
         eprintln!("opening {path:?}");
         let (mmap, tensors) = parse_hfq(path).expect("parse hfq");
@@ -15633,7 +15594,10 @@ mod tests {
         // normalizing to "oq3+" and failing the HFQ-source dispatch outright.
         assert_eq!(HfqInputFormat::from_flag("oq3"), Some(HfqInputFormat::Oq3));
         assert_eq!(HfqInputFormat::from_flag("oq3+"), Some(HfqInputFormat::Oq3));
-        assert_eq!(HfqInputFormat::from_flag("oq3++"), Some(HfqInputFormat::Oq3));
+        assert_eq!(
+            HfqInputFormat::from_flag("oq3++"),
+            Some(HfqInputFormat::Oq3)
+        );
         assert_eq!(HfqInputFormat::from_flag("op4"), None);
         assert_eq!(HfqInputFormat::from_flag("op4+"), None);
         assert_eq!(
