@@ -19,6 +19,15 @@
 //!     every run, so its output never stabilized — there was no working
 //!     content gate). The `.rs` output is also piped through `rustfmt` so it
 //!     stops fighting `cargo fmt`.
+//!
+//! **The output is a pure function of the tracked sources.** It deliberately
+//! does NOT read descriptions back out of `docs/env-vars.md`: that file is
+//! gitignored, so it exists in a worktree that has run the generator before and
+//! never in a fresh clone. Preferring its text made the `.rs` differ between a
+//! warm worktree and CI — the gate then failed in CI while passing locally on
+//! the same commit, for 16 vars whose description came from the markdown rather
+//! than from source. Any input to this generator must be tracked, or the
+//! content gate is not reproducible.
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -251,8 +260,6 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
         raw_lines.insert(rel, lines);
     }
 
-    let existing = collect_existing_descs(root);
-
     let mut docs: Vec<EnvDoc> = Vec::new();
     for name in &order {
         let usage_list = &usages[name];
@@ -262,7 +269,6 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
             let line = &lines[usage.line_idx];
             let cands = extract_comment_descriptions(usage.line_idx, lines);
             let desc = infer_default(
-                existing.get(name).map(String::as_str),
                 name,
                 &cands,
                 line,
@@ -641,27 +647,7 @@ fn infer_name_from_var(var: &str, source: &str) -> String {
 /// Existing descriptions parsed from the committed Markdown table, so curated
 /// wording is preserved across regenerations. Pipe-escapes are collapsed so the
 /// round-trip is idempotent (the Python re-escaped `|` every run).
-fn collect_existing_descs(root: &Path) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let doc = root.join("docs/env-vars.md");
-    let Ok(text) = std::fs::read_to_string(&doc) else {
-        return out;
-    };
-    let row = Regex::new(r"^\| `([A-Z0-9_]+)` \| (.*?) \|").unwrap();
-    let esc_pipe = Regex::new(r"\\+\|").unwrap();
-    for line in text.lines() {
-        if let Some(caps) = row.captures(line) {
-            let name = caps[1].to_string();
-            let desc = esc_pipe.replace_all(caps[2].trim(), "|").to_string();
-            out.insert(name, desc);
-        }
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
 fn infer_default(
-    existing_desc: Option<&str>,
     var: &str,
     cands: &[String],
     line: &str,
@@ -669,12 +655,6 @@ fn infer_default(
     line_idx: usize,
     usage_source: &str,
 ) -> String {
-    if let Some(d) = existing_desc {
-        if is_helpful_description(d) {
-            return normalize_description(d);
-        }
-    }
-
     let mut ranked: Vec<(usize, &String)> = cands
         .iter()
         .filter(|c| is_helpful_description(c))
