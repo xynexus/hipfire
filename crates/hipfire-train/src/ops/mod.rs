@@ -12,6 +12,7 @@ pub mod distill;
 pub mod gated_scan;
 pub mod linear;
 pub mod lora;
+pub mod moe;
 pub mod pflash_score;
 pub mod rmsnorm;
 pub mod rope;

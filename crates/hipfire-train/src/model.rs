@@ -967,6 +967,44 @@ pub fn accumulate_gamma(
     }
 }
 
+/// Fold one MoE layer's per-expert adjoints into the accumulator.
+///
+/// Keys match the HFQ tensor naming a routed MoE artifact uses, so the table
+/// joins to weights exactly as the dense one does.
+///
+/// **Normalised by ROUTED tokens, not by sequence length.** An expert only sees
+/// the tokens the router sent it, so dividing by `seq` would report a rarely
+/// routed expert as insensitive when that is a routing fact, not a sensitivity
+/// fact — and the allocator would then under-promote precisely the experts that
+/// are sharp on the few tokens they serve. An expert that received nothing
+/// contributes nothing rather than a zero, so it does not drag its own mean
+/// down across calibration sequences.
+pub fn accumulate_gamma_moe(
+    acc: &mut GammaAccum,
+    layer: usize,
+    adj: &crate::ops::moe::MoeAdjoints,
+    h: usize,
+    n_experts: usize,
+) {
+    for e in 0..n_experts {
+        let d = &adj.d_expert_out[e];
+        let rows = d.len() / h.max(1);
+        if rows == 0 {
+            continue;
+        }
+        let mut tot = 0.0f64;
+        for r in 0..rows {
+            let row = &d[r * h..(r + 1) * h];
+            let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            tot += ss / h as f64;
+        }
+        // The routed-expert down_proj is where the expert's error leaves for the
+        // residual stream, matching where the dense path takes d_down.
+        let name = format!("model.layers.{layer}.mlp.experts.{e}.down_proj");
+        *acc.sum.entry(name).or_insert(0.0) += tot / rows as f64;
+    }
+}
+
 /// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.
 pub fn flatten_lora_grads(grads: &[BlockLoraGrad]) -> Vec<&GpuTensor> {
     let mut v = Vec::with_capacity(grads.len() * 4);
