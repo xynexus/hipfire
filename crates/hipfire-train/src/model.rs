@@ -807,7 +807,7 @@ pub fn model_gamma_streamed(
 ) -> Result<f32, String> {
     use crate::loader::{
         detect_prefix, free_llama_layer_fp32, free_moe_layer_fp32, layer_is_moe,
-        load_llama_layer_fp32_hfq_pfx, load_moe_layer_fp32_hfq,
+        load_llama_layer_fp32_hfq_pfx, load_moe_layer_fp32,
     };
     let prefix = detect_prefix(hfq);
     let (seq, h) = (dims.seq, dims.h);
@@ -891,7 +891,7 @@ pub fn model_gamma_streamed(
         let x_in = gpu.upload_f32(&layer_inputs[i], &[seq * h]).map_err(e)?;
 
         let d_in = if moe {
-            let (ml, inter) = load_moe_layer_fp32_hfq(gpu, hfq, prefix, i, h, n_experts)?;
+            let (ml, inter) = load_moe_layer_fp32(gpu, hfq, prefix, i, h, n_experts)?;
             let mw = moe_weights_of(&ml);
             let md = crate::ops::moe::MoeDims {
                 seq,
