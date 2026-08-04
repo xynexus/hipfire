@@ -195,11 +195,11 @@ pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-server/src/routes/sdapi.rs:4432",
 };
 
-/// `HF_TOKEN` — Runtime variable controlling hf token in hipfire
+/// `HF_TOKEN` — Selects behavior from recognized values
 pub const ENV_HF_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HF_TOKEN",
-    description: "Runtime variable controlling hf token in hipfire",
-    source: "crates/hipfire-cli/src/commands/induct.rs:198",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-hub/src/lib.rs:126",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire

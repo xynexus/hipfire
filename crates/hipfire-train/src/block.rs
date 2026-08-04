@@ -106,6 +106,40 @@ pub fn block_forward(
     pos_host: &[f32],
     layer_idx: usize,
 ) -> HipResult<(GpuTensor, BlockActivations)> {
+    block_forward_inner(gpu, x, w, lora, dims, pos_host, layer_idx, true)
+}
+
+/// Forward through ATTENTION ONLY, stopping after `norm2`.
+///
+/// Returns `x_out = x_mid` (no MLP added) and activations whose `xn2` is the
+/// MLP's input. A routed-MoE block runs its own MLP on that `xn2` and adds the
+/// result to `acts.x_mid` itself; pair with [`block_backward_from_dxn2`].
+///
+/// `acts.gate` / `up` / `act` are 1-element placeholders on this path — nothing
+/// reads them, and the matching backward skips the dense MLP entirely.
+pub fn block_forward_attn_only(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    dims: &BlockDims,
+    pos_host: &[f32],
+    layer_idx: usize,
+) -> HipResult<(GpuTensor, BlockActivations)> {
+    block_forward_inner(gpu, x, w, lora, dims, pos_host, layer_idx, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_forward_inner(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    dims: &BlockDims,
+    pos_host: &[f32],
+    layer_idx: usize,
+    dense_mlp: bool,
+) -> HipResult<(GpuTensor, BlockActivations)> {
     let (seq, h, inter) = (dims.seq, dims.h, dims.inter);
     let (qd, kvd, r) = (dims.q_dim(), dims.kv_dim(), dims.lora_rank);
 
@@ -222,22 +256,34 @@ pub fn block_forward(
     let xn2 = gpu.zeros(&[seq * h], DType::F32)?;
     let rinv2 = gpu.zeros(&[seq], DType::F32)?;
     rmsnorm_forward(gpu, &x_mid, w.norm2, &xn2, &rinv2, seq, h, dims.eps)?;
-    let gate = gpu.zeros(&[seq * inter], DType::F32)?;
-    linear_forward(gpu, &xn2, w.wgate, &gate, seq, h, inter)?;
-    let up = gpu.zeros(&[seq * inter], DType::F32)?;
-    linear_forward(gpu, &xn2, w.wup, &up, seq, h, inter)?;
-    let act = gpu.zeros(&[seq * inter], DType::F32)?;
-    swiglu_forward(gpu, &gate, &up, &act, seq * inter)?;
-    let mlp = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_forward(gpu, &act, w.wdown, &mlp, seq, inter, h)?;
+    let n_mlp = if dense_mlp { seq * inter } else { 1 };
+    let gate = gpu.zeros(&[n_mlp], DType::F32)?;
+    let up = gpu.zeros(&[n_mlp], DType::F32)?;
+    let act = gpu.zeros(&[n_mlp], DType::F32)?;
     let x_out = gpu.zeros(&[seq * h], DType::F32)?;
-    gpu.add_f32(&x_mid, &mlp, &x_out)?;
+    let mlp = if dense_mlp {
+        linear_forward(gpu, &xn2, w.wgate, &gate, seq, h, inter)?;
+        linear_forward(gpu, &xn2, w.wup, &up, seq, h, inter)?;
+        swiglu_forward(gpu, &gate, &up, &act, seq * inter)?;
+        let mlp = gpu.zeros(&[seq * h], DType::F32)?;
+        linear_forward(gpu, &act, w.wdown, &mlp, seq, inter, h)?;
+        gpu.add_f32(&x_mid, &mlp, &x_out)?;
+        Some(mlp)
+    } else {
+        // Attention only: the caller supplies the MLP. x_out is the residual so
+        // far, and it adds its own MLP output to `acts.x_mid`.
+        gpu.memcpy_dtod_auto(&x_out.buf, &x_mid.buf, seq * h * 4)?;
+        None
+    };
 
     // Return forward scratch the backward never reads (pre-rope q/k, lora
     // pre-scale, attn/mlp pre-residual) to the pool — GpuTensor has no Drop, so
     // without this each block_forward leaks ~5 MB and many-step training OOMs.
-    for t in [loraq_s, q, k, lorav_s, attn, mlp] {
+    for t in [loraq_s, q, k, lorav_s, attn] {
         gpu.free_tensor(t)?;
+    }
+    if let Some(m) = mlp {
+        gpu.free_tensor(m)?;
     }
 
     Ok((
@@ -337,7 +383,7 @@ pub fn block_backward(
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad)> {
     let (d_x, lora_g, _, _) =
-        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, false)?;
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, false, None)?;
     Ok((d_x, lora_g))
 }
 
@@ -352,7 +398,7 @@ pub fn block_backward_full(
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad, BlockWeightGrad)> {
     let (d_x, lora_g, wg, _) =
-        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, true, false)?;
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, true, false, None)?;
     Ok((d_x, lora_g, wg.expect("want_w=true ⇒ Some")))
 }
 
@@ -368,7 +414,91 @@ pub fn block_backward_capture(
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad, BlockAdjoints)> {
     let (d_x, lora_g, _, adj) =
-        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, true)?;
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, true, None)?;
+    Ok((d_x, lora_g, adj.expect("want_capture=true ⇒ Some")))
+}
+
+/// One routed-MoE transformer block: the dense block's attention, with the
+/// SwiGLU MLP replaced by a router and `top_k` experts.
+///
+/// Built on [`block_forward_attn_only`] rather than a second copy of the
+/// attention sequence, so a fix to rope/GQA/norm reaches both block kinds. The
+/// composition is just the residual identity `x_out = x_mid + moe(xn2)`.
+pub fn moe_block_forward(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    moe_w: &crate::ops::moe::MoeWeights,
+    lora: &BlockLora,
+    dims: &BlockDims,
+    moe_dims: &crate::ops::moe::MoeDims,
+    pos_host: &[f32],
+    layer_idx: usize,
+) -> HipResult<(GpuTensor, BlockActivations, crate::ops::moe::MoeActivations)> {
+    let (x_mid_only, acts) = block_forward_attn_only(gpu, x, w, lora, dims, pos_host, layer_idx)?;
+    let (moe_out, moe_acts) = crate::ops::moe::moe_forward(gpu, &acts.xn2, moe_w, moe_dims)?;
+    let x_out = gpu.zeros(&[dims.seq * dims.h], DType::F32)?;
+    gpu.add_f32(&acts.x_mid, &moe_out, &x_out)?;
+    gpu.free_tensor(moe_out)?;
+    gpu.free_tensor(x_mid_only)?;
+    Ok((x_out, acts, moe_acts))
+}
+
+/// Backward for [`moe_block_forward`], capturing both the attention-side
+/// adjoints and the per-expert ones.
+///
+/// `x_out = x_mid + moe(xn2)` gives `d_moe_out = d_x_out` directly, and
+/// `moe_backward` returns the gradient w.r.t. its own input — which IS `d_xn2`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_block_backward_capture(
+    gpu: &mut Gpu,
+    d_x_out: &GpuTensor,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    moe_w: &crate::ops::moe::MoeWeights,
+    lora: &BlockLora,
+    acts: &BlockActivations,
+    moe_acts: &crate::ops::moe::MoeActivations,
+    dims: &BlockDims,
+    moe_dims: &crate::ops::moe::MoeDims,
+) -> HipResult<(GpuTensor, BlockAdjoints, crate::ops::moe::MoeAdjoints)> {
+    let (d_xn2, moe_adj) = crate::ops::moe::moe_backward(gpu, d_x_out, moe_w, moe_acts, moe_dims)?;
+    let (d_x, _lora_g, adj) =
+        block_backward_from_dxn2(gpu, d_x_out, &d_xn2, x, w, lora, acts, dims)?;
+    gpu.free_tensor(d_xn2)?;
+    Ok((d_x, adj, moe_adj))
+}
+
+/// Backward for a block whose MLP was run by the CALLER, taking that MLP's
+/// input gradient as `d_xn2`.
+///
+/// Pairs with [`block_forward_attn_only`]. The dense MLP chain is skipped
+/// entirely; `d_xn2` is fed straight to `norm2`'s backward and on into the
+/// attention half, which is why it must be the real gradient and not a
+/// placeholder — see the note in `block_backward_inner`.
+#[allow(clippy::too_many_arguments)]
+pub fn block_backward_from_dxn2(
+    gpu: &mut Gpu,
+    d_x_out: &GpuTensor,
+    d_xn2: &GpuTensor,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    acts: &BlockActivations,
+    dims: &BlockDims,
+) -> HipResult<(GpuTensor, BlockLoraGrad, BlockAdjoints)> {
+    let (d_x, lora_g, _, adj) = block_backward_inner(
+        gpu,
+        d_x_out,
+        x,
+        w,
+        lora,
+        acts,
+        dims,
+        false,
+        true,
+        Some(d_xn2),
+    )?;
     Ok((d_x, lora_g, adj.expect("want_capture=true ⇒ Some")))
 }
 
@@ -383,6 +513,7 @@ fn block_backward_inner(
     dims: &BlockDims,
     want_w: bool,
     want_capture: bool,
+    d_xn2_ext: Option<&GpuTensor>,
 ) -> HipResult<(
     GpuTensor,
     BlockLoraGrad,
@@ -396,29 +527,47 @@ fn block_backward_inner(
 
     // ── MLP branch ──────────────────────────────────────────────────────────
     // x_out = x_mid + mlp  ⇒ d_mlp = d_x_out, and d_x_mid starts = d_x_out.
-    let d_act = gpu.zeros(&[seq * inter], DType::F32)?;
-    linear_backward_x(gpu, d_x_out, w.wdown, &d_act, seq, inter, h, false)?;
-    let d_gate = gpu.zeros(&[seq * inter], DType::F32)?;
-    let d_up = gpu.zeros(&[seq * inter], DType::F32)?;
-    swiglu_backward(
-        gpu,
-        &d_act,
-        &acts.gate,
-        &acts.up,
-        &d_gate,
-        &d_up,
-        seq * inter,
-    )?;
-    let d_xn2 = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, seq, h, inter, false)?;
-    linear_backward_x(gpu, &d_up, w.wup, &d_xn2, seq, h, inter, true)?;
+    //
+    // With `d_xn2_ext` the caller ran its own MLP (a routed MoE) and already
+    // has d_xn2 — the dense chain is skipped and its value used directly. Note
+    // the MLP is NOT a separable addend: d_xn2 feeds rmsnorm_backward below and
+    // thence the attention half, so passing zero here would silently corrupt
+    // the attention gradient rather than merely omit the MLP.
+    let (d_xn2, d_act, d_gate, d_up) = match d_xn2_ext {
+        Some(_) => (
+            gpu.zeros(&[1], DType::F32)?,
+            gpu.zeros(&[1], DType::F32)?,
+            gpu.zeros(&[1], DType::F32)?,
+            gpu.zeros(&[1], DType::F32)?,
+        ),
+        None => {
+            let d_act = gpu.zeros(&[seq * inter], DType::F32)?;
+            linear_backward_x(gpu, d_x_out, w.wdown, &d_act, seq, inter, h, false)?;
+            let d_gate = gpu.zeros(&[seq * inter], DType::F32)?;
+            let d_up = gpu.zeros(&[seq * inter], DType::F32)?;
+            swiglu_backward(
+                gpu,
+                &d_act,
+                &acts.gate,
+                &acts.up,
+                &d_gate,
+                &d_up,
+                seq * inter,
+            )?;
+            let d_xn2 = gpu.zeros(&[seq * h], DType::F32)?;
+            linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, seq, h, inter, false)?;
+            linear_backward_x(gpu, &d_up, w.wup, &d_xn2, seq, h, inter, true)?;
+            (d_xn2, d_act, d_gate, d_up)
+        }
+    };
+    let d_xn2_use = d_xn2_ext.unwrap_or(&d_xn2);
     // norm2 backward → adds into d_x_mid; dnorm2 is the trainable weight grad
     let d_x_mid = gpu.zeros(&[seq * h], DType::F32)?;
     gpu.memcpy_dtod_auto(&d_x_mid.buf, &d_x_out.buf, seq * h * 4)?; // residual
     let d_xmid_norm = gpu.zeros(&[seq * h], DType::F32)?;
     rmsnorm_backward(
         gpu,
-        &d_xn2,
+        d_xn2_use,
         &acts.x_mid,
         w.norm2,
         &acts.rinv2,
