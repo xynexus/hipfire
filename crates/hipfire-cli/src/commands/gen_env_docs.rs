@@ -268,14 +268,7 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
             let lines = &raw_lines[source_path(&usage.source)];
             let line = &lines[usage.line_idx];
             let cands = extract_comment_descriptions(usage.line_idx, lines);
-            let desc = infer_default(
-                name,
-                &cands,
-                line,
-                lines,
-                usage.line_idx,
-                &usage.source,
-            );
+            let desc = infer_default(name, &cands, line, lines, usage.line_idx, &usage.source);
             // Match gen-env-docs.py: adopt the first usage, then re-adopt on
             // every *helpful* usage — so a var documented in multiple files is
             // attributed to the last helpful usage in scan (git ls-files) order.

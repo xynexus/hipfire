@@ -3537,7 +3537,12 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
                     // same buffers the fused kernel writes; downstream silu_mul
                     // is unchanged.
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+                    gpu.quantize_act_oq8_batched(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                     for (w, y) in [
                         (&layer.w_gate, &pbs.gate_ffn_batch),
                         (&layer.w_up, &pbs.up_batch),
@@ -5508,7 +5513,12 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if fa_ffn_is_oq8 {
                     // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+                    gpu.quantize_act_oq8_batched(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                     for (w, y) in [
                         (&layer.w_gate, &pbs.gate_ffn_batch),
                         (&layer.w_up, &pbs.up_batch),
