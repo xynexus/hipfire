@@ -818,9 +818,24 @@ Each of these produced a confident wrong result that survived at least one check
 
     There are 16, hard, and the broadcast B vector takes one — so 15 weight
     streams is the ceiling for this design, extrapolating to ~33 GB/s. **This
-    design cannot reach 54.7 by adding cores.** The fused design's 54.7 must
-    come from different data movement (memtile reuse rather than one shim stream
-    per core), not from more of what this probe does.
+    design cannot reach 54.7 by adding cores.**
+
+    **And flm-refe-log.md already documents why, so this is not an open
+    question.** Its "array topology: horizontal broadcast, vertical weight feed"
+    section maps DMA0's source on every tile and finds columns 0-1 pulling EAST,
+    columns 6-7 pulling WEST, middle columns pulling SOUTH from the memtile —
+    i.e. data enters at the middle columns and propagates HORIZONTALLY outward
+    through the stream switches, so *"one memtile read serves several columns
+    instead of every core pulling separately"*. That log already calls it "a
+    real bandwidth-economy design ... a large part of how FLM sustains 86% of
+    fabric on decode".
+
+    That is precisely the axis this probe does not have. One shim stream per
+    core (or per pair) makes shim channels the budget; horizontal propagation
+    makes them almost irrelevant, because a stream is amortised across a row of
+    columns. So ~33 GB/s is a property of the NAIVE topology, not of the fabric,
+    and the route to 54.7 is the horizontal-broadcast topology already
+    characterised in that log — not more shim streams.
 
     Getting 16 cores working took three fixes, each of which failed in a
     different way and is worth recording:
