@@ -54,6 +54,51 @@ carries the cross-channel correlation the attention output induces.
 assessed until the ranking is fixed — a greedy fill given a mis-ordered list will
 look broken no matter how good it is.
 
+## Option A BUILT AND MEASURED 2026-08-04 — it does not fix the ranking
+
+`oq4_output_sensitivity` implements the full `tr(dW H dW^T)` and is wired into
+`--mixed-bpw` (hipfire; full-Hessian on 112 of 113 tensors, the embed table
+falling back to the diagonal). It was cheaper to build than this document
+estimated: `dW` comes back in the ORIGINAL basis for free, because
+`quantize_oq4g256` rotates and `dequant_oq4g256` rotates back, so the raw
+captured `H` is the right operand and the O(k^3) congruence priced below is
+simply not needed.
+
+Then it changed almost nothing:
+
+    113 tensors; 38 changed rank vs the diagonal; MAX MOVE 3 PLACES
+
+    tensor type   diagonal      full Hessian
+    k_proj         2 ..  34      2 ..  33
+    v_proj        29 ..  85     29 ..  85
+    o_proj        79 .. 113     79 .. 113     <- still bottom third
+
+**o_proj does not move at all.** The off-diagonal terms were the hypothesis and
+they are not the answer.
+
+### Why, and what it eliminates
+
+This document already named the risk without weighting it properly:
+
+> Fidelity ceiling: still a linearization of ONE layer's output error. It
+> ignores error propagation through the rest of the network, which is the thing
+> that has repeatedly surprised us.
+
+That ceiling is the whole problem, not a caveat on it. `tr(dW H dW^T)` — diagonal
+or full — answers "how much does THIS layer's output move". o_proj's importance
+is not that its own output moves a lot; it is that its error enters the residual
+stream and is carried through every subsequent layer. No layer-local statistic
+can see that, so refining the layer-local statistic was never going to work.
+
+The cross-channel correlation was a plausible mechanism and it is now
+empirically ruled out, at the cost of one afternoon and no quantize runs.
+
+**Option A is dead. The remaining candidate is B** (block-wise / end-to-end
+output error), which is the only option here that measures propagation. Note
+this is also what `docs/2308.13137.md` argues for, and its reasoning survives
+this result intact — OmniQuant optimizes the BLOCK output, not a per-tensor
+proxy, precisely because per-tensor proxies cannot see downstream effects.
+
 ## Step 0 (original plan, retained for context)
 
 Dump the current ranking and see where `v_proj` / `o_proj` actually land.
