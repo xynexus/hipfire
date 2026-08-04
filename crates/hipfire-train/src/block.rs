@@ -47,6 +47,24 @@ impl BlockDims {
 /// Frozen base weights for one block (HF row-major `[out, in]`).
 pub struct BlockWeights<'a> {
     pub norm1: &'a GpuTensor,
+    /// Per-head RMSNorm on q and k, applied after the projection and BEFORE
+    /// rope — the qwen3 family's QK-norm. `None` for llama-shaped models that
+    /// do not have it. Both are present or neither: a checkpoint with one is
+    /// malformed, and treating a missing one as identity would quietly change
+    /// the attention scores.
+    pub q_norm: Option<&'a GpuTensor>,
+    pub k_norm: Option<&'a GpuTensor>,
+    /// qwen3.5 `attn_output_gate`: `wq` emits `2*q_dim` with Q and a gate
+    /// INTERLEAVED per head — `[Q_h0, G_h0, Q_h1, G_h1, ...]` — and the gate
+    /// multiplies the attention output before `o_proj`
+    /// (`sigmoid_mul_f32(fa_attn_out, fa_gate)` in the runtime).
+    ///
+    /// LoRA on q_proj is NOT applied on a gated layer: the adapter's `B` is
+    /// `[q_dim, r]` while the base projection emits `2*q_dim`, so there is no
+    /// single correct place to add it without deciding whether the adapter also
+    /// steers the gate. The forward checks that `bq` is all-zero and errors
+    /// otherwise rather than silently dropping a trained adapter.
+    pub attn_out_gate: bool,
     pub wq: &'a GpuTensor,
     pub wk: &'a GpuTensor,
     pub wv: &'a GpuTensor,
@@ -80,6 +98,15 @@ pub struct BlockLoraGrad {
 pub struct BlockActivations {
     pub xn1: GpuTensor,
     pub rinv1: GpuTensor,
+    /// Pre-QK-norm q and k with their row inverse-norms. Kept only when
+    /// `q_norm`/`k_norm` are set, since the backward needs the norm's input.
+    pub q_pre: Option<GpuTensor>,
+    pub k_pre: Option<GpuTensor>,
+    pub rinv_q: Option<GpuTensor>,
+    pub rinv_k: Option<GpuTensor>,
+    /// Pre-sigmoid attention gate `[seq, q_dim]`, and the context it scaled.
+    pub attn_gate: Option<GpuTensor>,
+    pub ctx_pre_gate: Option<GpuTensor>,
     pub hq: GpuTensor,
     pub hv: GpuTensor,
     pub q_r: GpuTensor,
@@ -150,22 +177,55 @@ fn block_forward_inner(
     // q = lora_q(xn1), k = lin(xn1), v = lora_v(xn1)
     let hq = gpu.zeros(&[seq * r], DType::F32)?;
     let loraq_s = gpu.zeros(&[seq * qd], DType::F32)?;
-    let q = gpu.zeros(&[seq * qd], DType::F32)?;
-    lora_forward(
-        gpu,
-        &xn1,
-        w.wq,
-        lora.aq,
-        lora.bq,
-        &hq,
-        &loraq_s,
-        &q,
-        seq,
-        h,
-        qd,
-        r,
-        dims.lora_scale,
-    )?;
+    let (q, attn_gate) = if w.attn_out_gate {
+        // Refuse rather than silently ignore a trained q adapter — see the
+        // note on BlockWeights::attn_out_gate.
+        if gpu.download_f32(lora.bq)?.iter().any(|&v| v != 0.0) {
+            return Err(hipfire_rdna::HipError::unsupported(
+                "block: LoRA on q_proj with attn_out_gate (bq is nonzero)",
+            ));
+        }
+        let qfull = gpu.zeros(&[seq * 2 * qd], DType::F32)?;
+        linear_forward(gpu, &xn1, w.wq, &qfull, seq, h, 2 * qd)?;
+        // Deinterleave [Q_h0, G_h0, Q_h1, G_h1, ...] on the host: it is
+        // seq*2*q_dim floats beside a GEMM of seq*h*2*q_dim MACs, and the GPU
+        // helper is shaped for decode rows, not a whole sequence.
+        let f = gpu.download_f32(&qfull)?;
+        gpu.free_tensor(qfull)?;
+        let (mut qh, mut gh) = (vec![0.0f32; seq * qd], vec![0.0f32; seq * qd]);
+        let hd = dims.head_dim;
+        for t in 0..seq {
+            for head in 0..dims.n_heads {
+                for j in 0..hd {
+                    let src = t * 2 * qd + head * 2 * hd + j;
+                    qh[t * qd + head * hd + j] = f[src];
+                    gh[t * qd + head * hd + j] = f[src + hd];
+                }
+            }
+        }
+        (
+            gpu.upload_f32(&qh, &[seq * qd])?,
+            Some(gpu.upload_f32(&gh, &[seq * qd])?),
+        )
+    } else {
+        let q = gpu.zeros(&[seq * qd], DType::F32)?;
+        lora_forward(
+            gpu,
+            &xn1,
+            w.wq,
+            lora.aq,
+            lora.bq,
+            &hq,
+            &loraq_s,
+            &q,
+            seq,
+            h,
+            qd,
+            r,
+            dims.lora_scale,
+        )?;
+        (q, None)
+    };
     let k = gpu.zeros(&[seq * kvd], DType::F32)?;
     linear_forward(gpu, &xn1, w.wk, &k, seq, h, kvd)?;
     let hv = gpu.zeros(&[seq * r], DType::F32)?;
@@ -186,6 +246,45 @@ fn block_forward_inner(
         r,
         dims.lora_scale,
     )?;
+
+    // QK-norm (qwen3): per-head rmsnorm over head_dim, before rope. Rows are
+    // seq*n_heads because q is [seq, n_heads*head_dim] row-major, so each head
+    // is one contiguous row.
+    let (q, k, q_pre, k_pre, rinv_q, rinv_k) = match (w.q_norm, w.k_norm) {
+        (Some(qn), Some(kn)) => {
+            let qh = gpu.zeros(&[seq * qd], DType::F32)?;
+            let rq = gpu.zeros(&[seq * dims.n_heads], DType::F32)?;
+            rmsnorm_forward(
+                gpu,
+                &q,
+                qn,
+                &qh,
+                &rq,
+                seq * dims.n_heads,
+                dims.head_dim,
+                dims.eps,
+            )?;
+            let kh = gpu.zeros(&[seq * kvd], DType::F32)?;
+            let rk = gpu.zeros(&[seq * dims.n_kv], DType::F32)?;
+            rmsnorm_forward(
+                gpu,
+                &k,
+                kn,
+                &kh,
+                &rk,
+                seq * dims.n_kv,
+                dims.head_dim,
+                dims.eps,
+            )?;
+            (qh, kh, Some(q), Some(k), Some(rq), Some(rk))
+        }
+        (None, None) => (q, k, None, None, None, None),
+        _ => {
+            return Err(hipfire_rdna::HipError::unsupported(
+                "block: q_norm and k_norm must both be set or both be absent",
+            ))
+        }
+    };
 
     // rope(q), rope(k)
     let pos = gpu.upload_f32(pos_host, &[seq])?;
@@ -246,6 +345,17 @@ fn block_forward_inner(
         dims.attn_scale(),
     )?;
 
+    // attn_output_gate: ctx *= sigmoid(gate), before o_proj.
+    let ctx_pre_gate = match &attn_gate {
+        Some(g) => {
+            let keep = gpu.zeros(&[seq * qd], DType::F32)?;
+            gpu.memcpy_dtod_auto(&keep.buf, &ctx.buf, seq * qd * 4)?;
+            gpu.sigmoid_mul_f32(&ctx, g)?;
+            Some(keep)
+        }
+        None => None,
+    };
+
     // o_proj + residual
     let attn = gpu.zeros(&[seq * h], DType::F32)?;
     linear_forward(gpu, &ctx, w.wo, &attn, seq, qd, h)?;
@@ -291,6 +401,12 @@ fn block_forward_inner(
         BlockActivations {
             xn1,
             rinv1,
+            q_pre,
+            k_pre,
+            rinv_q,
+            rinv_k,
+            attn_gate,
+            ctx_pre_gate,
             hq,
             hv,
             q_r,
@@ -330,6 +446,12 @@ pub fn free_block_acts(gpu: &mut Gpu, b: BlockActivations) -> HipResult<()> {
     let BlockActivations {
         xn1,
         rinv1,
+        q_pre,
+        k_pre,
+        rinv_q,
+        rinv_k,
+        attn_gate,
+        ctx_pre_gate,
         hq,
         hv,
         q_r,
@@ -348,6 +470,12 @@ pub fn free_block_acts(gpu: &mut Gpu, b: BlockActivations) -> HipResult<()> {
     for t in [
         xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
     ] {
+        gpu.free_tensor(t)?;
+    }
+    for t in [q_pre, k_pre, rinv_q, rinv_k, attn_gate, ctx_pre_gate]
+        .into_iter()
+        .flatten()
+    {
         gpu.free_tensor(t)?;
     }
     Ok(())
@@ -582,6 +710,27 @@ fn block_backward_inner(
     // x_mid = x + attn ⇒ d_attn = d_x_mid, d_x starts = d_x_mid.
     let d_ctx = gpu.zeros(&[seq * qd], DType::F32)?;
     linear_backward_x(gpu, &d_x_mid, w.wo, &d_ctx, seq, qd, h, false)?;
+
+    // attn_output_gate backward. ctx_gated = ctx * sigmoid(g), so the adjoint
+    // splits: gqa sees d_ctx * sigmoid(g), and the gate collects
+    // d_ctx * ctx * sigmoid'(g). Done on the host beside the deinterleave the
+    // forward already does there.
+    let d_gate_host = match (&acts.attn_gate, &acts.ctx_pre_gate) {
+        (Some(g), Some(ctx_pre)) => {
+            let (gh, ch) = (gpu.download_f32(g)?, gpu.download_f32(ctx_pre)?);
+            let mut dc = gpu.download_f32(&d_ctx)?;
+            let mut dg = vec![0.0f32; seq * qd];
+            for i in 0..seq * qd {
+                let sg = 1.0 / (1.0 + (-gh[i]).exp());
+                dg[i] = dc[i] * ch[i] * sg * (1.0 - sg);
+                dc[i] *= sg;
+            }
+            let bytes: Vec<u8> = dc.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            gpu.memcpy_htod_auto(&d_ctx.buf, &bytes)?;
+            Some(dg)
+        }
+        _ => None,
+    };
     let d_q_r = gpu.zeros(&[seq * qd], DType::F32)?;
     let d_k_r = gpu.zeros(&[seq * kvd], DType::F32)?;
     let d_v = gpu.zeros(&[seq * kvd], DType::F32)?;
@@ -625,6 +774,45 @@ fn block_backward_inner(
         dims.rope_base,
     )?;
 
+    // QK-norm backward: rope's input was the NORMED q/k, so its adjoint has to
+    // pass back through the per-head rmsnorm before reaching the projections.
+    // Skipping this leaves d_x wrong by the norm's Jacobian — a scale-ish error
+    // that looks plausible and trains badly.
+    let (d_q, d_k) = match (w.q_norm, w.k_norm, &acts.q_pre, &acts.k_pre) {
+        (Some(qn), Some(kn), Some(q_pre), Some(k_pre)) => {
+            let dwq = gpu.zeros(&[dims.head_dim], DType::F32)?;
+            let d_q_pre = gpu.zeros(&[seq * qd], DType::F32)?;
+            rmsnorm_backward(
+                gpu,
+                &d_q,
+                q_pre,
+                qn,
+                acts.rinv_q.as_ref().expect("rinv_q with q_norm"),
+                &d_q_pre,
+                &dwq,
+                seq * dims.n_heads,
+                dims.head_dim,
+            )?;
+            let d_k_pre = gpu.zeros(&[seq * kvd], DType::F32)?;
+            rmsnorm_backward(
+                gpu,
+                &d_k,
+                k_pre,
+                kn,
+                acts.rinv_k.as_ref().expect("rinv_k with k_norm"),
+                &d_k_pre,
+                &dwq,
+                seq * dims.n_kv,
+                dims.head_dim,
+            )?;
+            gpu.free_tensor(dwq)?;
+            gpu.free_tensor(d_q)?;
+            gpu.free_tensor(d_k)?;
+            (d_q_pre, d_k_pre)
+        }
+        _ => (d_q, d_k),
+    };
+
     // q/k/v projection backward → accumulate into d_xn1, produce LoRA grads
     let d_xn1 = gpu.zeros(&[seq * h], DType::F32)?;
     let daq = gpu.zeros(&[r * h], DType::F32)?;
@@ -633,26 +821,46 @@ fn block_backward_inner(
     let dbv = gpu.zeros(&[kvd * r], DType::F32)?;
     let dyl_q = gpu.zeros(&[seq * qd], DType::F32)?;
     let dh_q = gpu.zeros(&[seq * r], DType::F32)?;
-    lora_backward(
-        gpu,
-        &d_q,
-        &acts.xn1,
-        w.wq,
-        lora.aq,
-        lora.bq,
-        &acts.hq,
-        &dyl_q,
-        &dh_q,
-        &daq,
-        &dbq,
-        &d_xn1,
-        seq,
-        h,
-        qd,
-        r,
-        dims.lora_scale,
-        true,
-    )?;
+    if let Some(dg) = &d_gate_host {
+        // Re-interleave [dQ_h0, dG_h0, dQ_h1, ...] to match wq's output layout.
+        // daq/dbq stay zero: LoRA is refused on a gated layer in the forward.
+        let dqh = gpu.download_f32(&d_q)?;
+        let hd = dims.head_dim;
+        let mut full = vec![0.0f32; seq * 2 * qd];
+        for t in 0..seq {
+            for head in 0..dims.n_heads {
+                for j in 0..hd {
+                    let dst = t * 2 * qd + head * 2 * hd + j;
+                    full[dst] = dqh[t * qd + head * hd + j];
+                    full[dst + hd] = dg[t * qd + head * hd + j];
+                }
+            }
+        }
+        let d_full = gpu.upload_f32(&full, &[seq * 2 * qd])?;
+        linear_backward_x(gpu, &d_full, w.wq, &d_xn1, seq, h, 2 * qd, true)?;
+        gpu.free_tensor(d_full)?;
+    } else {
+        lora_backward(
+            gpu,
+            &d_q,
+            &acts.xn1,
+            w.wq,
+            lora.aq,
+            lora.bq,
+            &acts.hq,
+            &dyl_q,
+            &dh_q,
+            &daq,
+            &dbq,
+            &d_xn1,
+            seq,
+            h,
+            qd,
+            r,
+            dims.lora_scale,
+            true,
+        )?;
+    }
     linear_backward_x(gpu, &d_k, w.wk, &d_xn1, seq, h, kvd, true)?;
     let dyl_v = gpu.zeros(&[seq * kvd], DType::F32)?;
     let dh_v = gpu.zeros(&[seq * r], DType::F32)?;

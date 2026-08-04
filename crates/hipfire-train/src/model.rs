@@ -36,6 +36,9 @@ impl LayerWeights {
     fn as_block(&self) -> BlockWeights<'_> {
         BlockWeights {
             norm1: &self.norm1,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             wq: &self.wq,
             wk: &self.wk,
             wv: &self.wv,
@@ -57,7 +60,7 @@ pub struct LayerLora {
 }
 
 impl LayerLora {
-    fn as_block(&self) -> BlockLora<'_> {
+    pub fn as_block(&self) -> BlockLora<'_> {
         BlockLora {
             aq: &self.aq,
             bq: &self.bq,
@@ -282,6 +285,12 @@ pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
         let BlockActivations {
             xn1,
             rinv1,
+            q_pre,
+            k_pre,
+            rinv_q,
+            rinv_k,
+            attn_gate,
+            ctx_pre_gate,
             hq,
             hv,
             q_r,
@@ -300,6 +309,12 @@ pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
         for t in [
             xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
         ] {
+            gpu.free_tensor(t)?;
+        }
+        for t in [q_pre, k_pre, rinv_q, rinv_k, attn_gate, ctx_pre_gate]
+            .into_iter()
+            .flatten()
+        {
             gpu.free_tensor(t)?;
         }
     }
@@ -977,9 +992,12 @@ pub fn model_gamma_streamed(
 
 /// `BlockWeights` borrowed from a streamed `LlamaLayerF32`, so the streamed walk
 /// needs no owned `LayerWeights` copy of a layer it is about to drop.
-fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
+pub fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
     BlockWeights {
         norm1: &l.input_layernorm,
+        q_norm: l.q_norm.as_ref(),
+        k_norm: l.k_norm.as_ref(),
+        attn_out_gate: l.attn_out_gate,
         wq: &l.q_proj,
         wk: &l.k_proj,
         wv: &l.v_proj,
@@ -993,7 +1011,7 @@ fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
 
 /// `MoeWeights` borrowed from a streamed layer, so nothing is copied for a
 /// layer that is about to be dropped.
-fn moe_weights_of(l: &crate::loader::MoeLayerF32) -> crate::ops::moe::MoeWeights<'_> {
+pub fn moe_weights_of(l: &crate::loader::MoeLayerF32) -> crate::ops::moe::MoeWeights<'_> {
     crate::ops::moe::MoeWeights {
         router: &l.router,
         experts: l

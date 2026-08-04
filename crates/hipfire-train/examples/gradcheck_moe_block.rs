@@ -79,6 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let norm1 = gpu.upload_f32(&ones(H), &[H])?;
     let norm2 = gpu.upload_f32(&ones(H), &[H])?;
     let wq = gpu.upload_f32(&rnd(qd * H, &mut s), &[qd * H])?;
+    // Doubled q_proj for the qwen3.5 attn_output_gate pass: [Q_h, G_h] per head.
+    let wq2 = gpu.upload_f32(&rnd(2 * qd * H, &mut s), &[2 * qd * H])?;
+    let qnw = gpu.upload_f32(&rnd(HD, &mut s), &[HD])?;
+    let knw = gpu.upload_f32(&rnd(HD, &mut s), &[HD])?;
     let wk = gpu.upload_f32(&rnd(kvd * H, &mut s), &[kvd * H])?;
     let wv = gpu.upload_f32(&rnd(kvd * H, &mut s), &[kvd * H])?;
     let wo = gpu.upload_f32(&rnd(H * qd, &mut s), &[H * qd])?;
@@ -88,6 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wd = gpu.upload_f32(&rnd(H * INTER, &mut s), &[H * INTER])?;
     let w = BlockWeights {
         norm1: &norm1,
+        q_norm: None,
+        k_norm: None,
+        attn_out_gate: false,
         wq: &wq,
         wk: &wk,
         wv: &wv,
@@ -96,6 +103,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wgate: &wg,
         wup: &wu,
         wdown: &wd,
+    };
+    // qwen3.5 full-attention shape: QK-norm AND a gated, doubled q_proj. Both
+    // are off the llama path, and the gate's own adjoint reaches x only through
+    // wq — never through the LoRA params — so d_x is the only check that sees
+    // it at all.
+    let w_qwen = BlockWeights {
+        q_norm: Some(&qnw),
+        k_norm: Some(&knw),
+        attn_out_gate: true,
+        wq: &wq2,
+        ..w
     };
 
     // Zero LoRA (B = 0) so the block sits exactly at the base weights.
@@ -142,86 +160,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: None,
     };
 
-    let pos: Vec<f32> = (0..SEQ).map(|i| i as f32).collect();
+    for (label, w) in [
+        ("llama attention", &w),
+        ("qwen3.5 gated + qk-norm", &w_qwen),
+    ] {
+        let pos: Vec<f32> = (0..SEQ).map(|i| i as f32).collect();
 
-    let x = gpu.upload_f32(&x_host, &[SEQ * H])?;
-    let (out, acts, macts) =
-        moe_block_forward(&mut gpu, &x, &w, &moe_w, &lora, &dims, &md, &pos, 0)?;
-    let routing = macts.idx.clone();
-    let d_out = gpu.upload_f32(&seed, &[SEQ * H])?;
-    let (d_x, adj, moe_adj) = moe_block_backward_capture(
-        &mut gpu, &d_out, &x, &w, &moe_w, &lora, &acts, &macts, &dims, &md,
-    )?;
-    let d_x_host = gpu.download_f32(&d_x)?;
-    free_block_acts(&mut gpu, acts)?;
-    free_moe_acts(&mut gpu, macts)?;
-    gpu.free_tensor(out)?;
+        let x = gpu.upload_f32(&x_host, &[SEQ * H])?;
+        let (out, acts, macts) =
+            moe_block_forward(&mut gpu, &x, w, &moe_w, &lora, &dims, &md, &pos, 0)?;
+        let routing = macts.idx.clone();
+        let d_out = gpu.upload_f32(&seed, &[SEQ * H])?;
+        let (d_x, adj, moe_adj) = moe_block_backward_capture(
+            &mut gpu, &d_out, &x, w, &moe_w, &lora, &acts, &macts, &dims, &md,
+        )?;
+        let d_x_host = gpu.download_f32(&d_x)?;
+        free_block_acts(&mut gpu, acts)?;
+        free_moe_acts(&mut gpu, macts)?;
+        gpu.free_tensor(out)?;
 
-    let served: Vec<usize> = (0..NE).map(|e| moe_adj.d_expert_out[e].len() / H).collect();
-    println!("MoE block gradcheck: seq={SEQ} h={H} experts={NE} top_k={TOPK}");
-    println!("  rows per expert: {served:?}");
-    println!(
-        "  attention adjoints captured: d_q {} d_attn {}",
-        adj.d_q.len(),
-        adj.d_attn.len()
-    );
+        let served: Vec<usize> = (0..NE).map(|e| moe_adj.d_expert_out[e].len() / H).collect();
+        println!("MoE block gradcheck: seq={SEQ} h={H} experts={NE} top_k={TOPK}");
+        println!("  rows per expert: {served:?}");
+        println!(
+            "  attention adjoints captured: d_q {} d_attn {}",
+            adj.d_q.len(),
+            adj.d_attn.len()
+        );
 
-    // eps balances truncation (too large) against f32 cancellation in the loss
-    // difference (too small). Swept once: 1.084e-2 at 1e-3 (cancellation),
-    // 3.078e-3 at 1e-2, 2.299e-2 at 3e-2 (truncation). Fixed at the measured
-    // optimum — a knob here would be scanned into the product env-var docs,
-    // which is not what a gradcheck step size is.
-    let eps: f32 = 1e-2;
-    let (mut worst, mut worst_i, mut flips, mut checked) = (0.0f32, 0usize, 0usize, 0usize);
-    for i in (0..SEQ * H).step_by(5) {
-        let probe = |delta: f32,
-                     gpu: &mut Gpu|
-         -> Result<(f64, bool), Box<dyn std::error::Error>> {
-            let mut xp = x_host.clone();
-            xp[i] += delta;
-            let xt = gpu.upload_f32(&xp, &[SEQ * H])?;
-            let (o, a, ma) = moe_block_forward(gpu, &xt, &w, &moe_w, &lora, &dims, &md, &pos, 0)?;
-            let flipped = ma.idx != routing;
-            let l: f64 = gpu
-                .download_f32(&o)?
-                .iter()
-                .zip(seed.iter())
-                .map(|(p, q)| (*p as f64) * (*q as f64))
-                .sum();
-            free_block_acts(gpu, a)?;
-            free_moe_acts(gpu, ma)?;
-            gpu.free_tensor(o)?;
-            gpu.free_tensor(xt)?;
-            Ok((l, flipped))
-        };
-        let (lp, f1) = probe(eps, &mut gpu)?;
-        let (lm, f2) = probe(-eps, &mut gpu)?;
-        if f1 || f2 {
-            flips += 1;
-            continue;
+        // eps balances truncation (too large) against f32 cancellation in the loss
+        // difference (too small). Swept once: 1.084e-2 at 1e-3 (cancellation),
+        // 3.078e-3 at 1e-2, 2.299e-2 at 3e-2 (truncation). Fixed at the measured
+        // optimum — a knob here would be scanned into the product env-var docs,
+        // which is not what a gradcheck step size is.
+        let eps: f32 = 1e-2;
+        let (mut worst, mut worst_i, mut flips, mut checked) = (0.0f32, 0usize, 0usize, 0usize);
+        for i in (0..SEQ * H).step_by(5) {
+            let probe =
+                |delta: f32, gpu: &mut Gpu| -> Result<(f64, bool), Box<dyn std::error::Error>> {
+                    let mut xp = x_host.clone();
+                    xp[i] += delta;
+                    let xt = gpu.upload_f32(&xp, &[SEQ * H])?;
+                    let (o, a, ma) =
+                        moe_block_forward(gpu, &xt, w, &moe_w, &lora, &dims, &md, &pos, 0)?;
+                    let flipped = ma.idx != routing;
+                    let l: f64 = gpu
+                        .download_f32(&o)?
+                        .iter()
+                        .zip(seed.iter())
+                        .map(|(p, q)| (*p as f64) * (*q as f64))
+                        .sum();
+                    free_block_acts(gpu, a)?;
+                    free_moe_acts(gpu, ma)?;
+                    gpu.free_tensor(o)?;
+                    gpu.free_tensor(xt)?;
+                    Ok((l, flipped))
+                };
+            let (lp, f1) = probe(eps, &mut gpu)?;
+            let (lm, f2) = probe(-eps, &mut gpu)?;
+            if f1 || f2 {
+                flips += 1;
+                continue;
+            }
+            let num = ((lp - lm) / (2.0 * eps as f64)) as f32;
+            let ana = d_x_host[i];
+            let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-4);
+            if rel > worst {
+                worst = rel;
+                worst_i = i;
+            }
+            checked += 1;
         }
-        let num = ((lp - lm) / (2.0 * eps as f64)) as f32;
-        let ana = d_x_host[i];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-4);
-        if rel > worst {
-            worst = rel;
-            worst_i = i;
-        }
-        checked += 1;
-    }
 
-    println!("  checked {checked} coords, {flips} skipped (routing flip)");
-    println!("  worst relative error {worst:.3e} at coord {worst_i}");
-    // 1e-2 is a real bound, not an accommodation: measured 3.078e-3 at the
-    // default eps. The step was swept — 1.084e-2 at 1e-3 (f32 cancellation in
-    // the loss difference) and 2.299e-2 at 3e-2 (truncation), a U-shape whose
-    // minimum is the signature of a CORRECT derivative. A wrong backward shows
-    // a floor that does not improve with eps.
-    if worst < 1e-2 && checked > 0 {
-        println!("\nPASS — attention and MoE halves compose");
-        Ok(())
-    } else {
-        println!("\nFAIL");
-        std::process::exit(1)
+        println!("  checked {checked} coords, {flips} skipped (routing flip)");
+        println!("  worst relative error {worst:.3e} at coord {worst_i}");
+        // 1e-2 is a real bound, not an accommodation: measured 3.078e-3 at the
+        // default eps. The step was swept — 1.084e-2 at 1e-3 (f32 cancellation in
+        // the loss difference) and 2.299e-2 at 3e-2 (truncation), a U-shape whose
+        // minimum is the signature of a CORRECT derivative. A wrong backward shows
+        // a floor that does not improve with eps.
+        if worst >= 1e-2 || checked == 0 {
+            println!("\nFAIL [{label}]");
+            std::process::exit(1)
+        }
+        println!("  PASS [{label}]");
     }
+    println!("\nPASS — attention and MoE halves compose");
+    Ok(())
 }

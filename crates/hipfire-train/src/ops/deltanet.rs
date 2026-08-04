@@ -324,17 +324,45 @@ pub struct LinearAttnWeights<'a> {
     pub out_proj: &'a [f32],
 }
 
-/// Full `linear_attn` forward: `x [seq, h]` → `out [seq, h]`.
-pub fn linear_attn_forward(
-    x: &[f32],
-    w: &LinearAttnWeights,
+/// The non-projection half of the layer: conv1d, the activations, the
+/// recurrence and the gated norm.
+///
+/// Split out so the GPU path and the host path share ONE implementation of the
+/// math. The projections are big dense GEMMs that must run on device — at 35B
+/// they are ~3 GMAC per layer per sequence and a host matvec would take
+/// minutes — while the recurrence is inherently sequential and tiny. Anything
+/// that duplicated the core to move the GEMMs would put the gradchecked math
+/// on a path nothing checks.
+pub struct LinearAttnCore<'a> {
+    pub conv1d: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm: &'a [f32],
+}
+
+impl<'a> LinearAttnWeights<'a> {
+    fn core(&self) -> LinearAttnCore<'a> {
+        LinearAttnCore {
+            conv1d: self.conv1d,
+            a_log: self.a_log,
+            dt_bias: self.dt_bias,
+            norm: self.norm,
+        }
+    }
+}
+
+/// Core forward: projection OUTPUTS in, `normed [seq, n_heads*hd_v]` out.
+pub fn linear_attn_core_forward(
+    qkv: &[f32],
+    a_raw: &[f32],
+    b_raw: &[f32],
+    z: &[f32],
+    w: &LinearAttnCore,
     d: &LinearAttnDims,
 ) -> (Vec<f32>, LinearAttnActs) {
-    let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
+    let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
     let qkv_dim = nh * (hk + hk + hv);
-
-    let qkv = matvec_seq(x, w.in_proj_qkv, seq, h, qkv_dim);
-    let qkv_pre = conv1d_causal(&qkv, w.conv1d, seq, qkv_dim, d.conv_k);
+    let qkv_pre = conv1d_causal(qkv, w.conv1d, seq, qkv_dim, d.conv_k);
 
     // Split [Q | K | V] after silu.
     let (mut q, mut k, mut v) = (
@@ -353,8 +381,6 @@ pub fn linear_attn_forward(
         }
     }
 
-    let a_raw = matvec_seq(x, w.in_proj_a, seq, h, nh);
-    let b_raw = matvec_seq(x, w.in_proj_b, seq, h, nh);
     let mut gate = vec![0.0f32; seq * nh];
     let mut beta = vec![0.0f32; seq * nh];
     for t in 0..seq {
@@ -368,8 +394,6 @@ pub fn linear_attn_forward(
 
     let (dn_out, dn) = deltanet_forward(&q, &k, &v, &gate, &beta, seq, nh, hk, hv);
 
-    // rmsnorm(dn_out) per head, gated by silu(z), then out_proj.
-    let z = matvec_seq(x, w.in_proj_z, seq, h, nh * hv);
     let mut normed = vec![0.0f32; seq * nh * hv];
     for t in 0..seq {
         for hh in 0..nh {
@@ -381,24 +405,137 @@ pub fn linear_attn_forward(
             }
         }
     }
-    let out = matvec_seq(&normed, w.out_proj, seq, nh * hv, h);
 
     (
-        out,
+        normed,
         LinearAttnActs {
             qkv_pre,
             q,
             k,
             v,
-            a_raw,
-            b_raw,
+            a_raw: a_raw.to_vec(),
+            b_raw: b_raw.to_vec(),
             beta,
             gate,
             dn_out,
-            z,
+            z: z.to_vec(),
             dn,
         },
     )
+}
+
+/// Core backward: adjoint at `normed` in, adjoints at the projection OUTPUTS
+/// out. Everything the caller needs to finish through its own GEMMs.
+pub struct LinearAttnCoreGrads {
+    pub d_qkv: Vec<f32>,
+    pub d_a_raw: Vec<f32>,
+    pub d_b_raw: Vec<f32>,
+    pub d_z: Vec<f32>,
+    pub d_dt_bias: Vec<f32>,
+    pub d_a_log: Vec<f32>,
+}
+
+pub fn linear_attn_core_backward(
+    d_normed: &[f32],
+    w: &LinearAttnCore,
+    a: &LinearAttnActs,
+    d: &LinearAttnDims,
+) -> LinearAttnCoreGrads {
+    let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
+    let qkv_dim = nh * (hk + hk + hv);
+
+    // normed = rmsnorm(dn) * norm_w * silu(z)
+    let mut d_dn = vec![0.0f32; seq * nh * hv];
+    let mut d_z = vec![0.0f32; seq * nh * hv];
+    for t in 0..seq {
+        for hh in 0..nh {
+            let o = (t * nh + hh) * hv;
+            let ss: f32 = (0..hv).map(|i| a.dn_out[o + i] * a.dn_out[o + i]).sum();
+            let ms = ss / hv as f32 + d.eps;
+            let inv = 1.0 / ms.sqrt();
+            // g_i is the gradient w.r.t. the NORMALISED value; the rmsnorm
+            // Jacobian then couples the head.
+            let mut gi = vec![0.0f32; hv];
+            let mut dot = 0.0f32;
+            for i in 0..hv {
+                let sz = silu(a.z[o + i]);
+                gi[i] = d_normed[o + i] * w.norm[i] * sz;
+                d_z[o + i] =
+                    d_normed[o + i] * w.norm[i] * a.dn_out[o + i] * inv * dsilu(a.z[o + i]);
+                dot += gi[i] * a.dn_out[o + i];
+            }
+            for i in 0..hv {
+                d_dn[o + i] = inv * (gi[i] - a.dn_out[o + i] * dot * inv * inv / hv as f32);
+            }
+        }
+    }
+
+    let (dq, dk, dv, dgate, dbeta) =
+        deltanet_backward(&d_dn, &a.q, &a.k, &a.v, &a.beta, &a.dn, seq, nh, hk, hv);
+
+    let mut d_a_raw = vec![0.0f32; seq * nh];
+    let mut d_b_raw = vec![0.0f32; seq * nh];
+    let mut d_dt_bias = vec![0.0f32; nh];
+    let mut d_a_log = vec![0.0f32; nh];
+    for t in 0..seq {
+        for hh in 0..nh {
+            let i = t * nh + hh;
+            let sp_in = a.a_raw[i] + w.dt_bias[hh];
+            // dt_bias enters sp_in exactly as a_raw does, so it collects the
+            // same adjoint summed over time.
+            d_a_raw[i] = dgate[i] * -(w.a_log[hh].exp()) * sigmoid(sp_in);
+            d_dt_bias[hh] += d_a_raw[i];
+            // gate = softplus * -exp(a_log), so d(gate)/d(a_log) = gate itself.
+            d_a_log[hh] += dgate[i] * a.gate[i];
+            let s = sigmoid(a.b_raw[i]);
+            d_b_raw[i] = dbeta[i] * s * (1.0 - s);
+        }
+    }
+
+    // Re-join q/k/v adjoints through silu into the conv output.
+    let mut d_qkv_pre = vec![0.0f32; seq * qkv_dim];
+    for t in 0..seq {
+        let base = t * qkv_dim;
+        for i in 0..nh * hk {
+            d_qkv_pre[base + i] = dq[t * nh * hk + i] * dsilu(a.qkv_pre[base + i]);
+            d_qkv_pre[base + nh * hk + i] =
+                dk[t * nh * hk + i] * dsilu(a.qkv_pre[base + nh * hk + i]);
+        }
+        for i in 0..nh * hv {
+            d_qkv_pre[base + 2 * nh * hk + i] =
+                dv[t * nh * hv + i] * dsilu(a.qkv_pre[base + 2 * nh * hk + i]);
+        }
+    }
+    let mut d_qkv = vec![0.0f32; seq * qkv_dim];
+    conv1d_causal_bwd(&d_qkv_pre, w.conv1d, &mut d_qkv, seq, qkv_dim, d.conv_k);
+
+    LinearAttnCoreGrads {
+        d_qkv,
+        d_a_raw,
+        d_b_raw,
+        d_z,
+        d_dt_bias,
+        d_a_log,
+    }
+}
+
+/// Full `linear_attn` forward: `x [seq, h]` → `out [seq, h]`.
+pub fn linear_attn_forward(
+    x: &[f32],
+    w: &LinearAttnWeights,
+    d: &LinearAttnDims,
+) -> (Vec<f32>, LinearAttnActs) {
+    let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
+    let qkv_dim = nh * (hk + hk + hv);
+
+    let qkv = matvec_seq(x, w.in_proj_qkv, seq, h, qkv_dim);
+    let a_raw = matvec_seq(x, w.in_proj_a, seq, h, nh);
+    let b_raw = matvec_seq(x, w.in_proj_b, seq, h, nh);
+    let z = matvec_seq(x, w.in_proj_z, seq, h, nh * hv);
+
+    let (normed, acts) = linear_attn_core_forward(&qkv, &a_raw, &b_raw, &z, &w.core(), d);
+    let out = matvec_seq(&normed, w.out_proj, seq, nh * hv, h);
+    (out, acts)
 }
 
 /// Gradients out of [`linear_attn_backward`].
@@ -429,84 +566,20 @@ pub fn linear_attn_backward(
     let qkv_dim = nh * (hk + hk + hv);
     let mut dx = vec![0.0f32; seq * h];
 
-    // out = Wo · normed
     let mut d_normed = vec![0.0f32; seq * nh * hv];
     matvec_seq_bwd(d_out, w.out_proj, &mut d_normed, seq, nh * hv, h);
 
-    // normed = rmsnorm(dn) * norm_w * silu(z)
-    let mut d_dn = vec![0.0f32; seq * nh * hv];
-    let mut d_z = vec![0.0f32; seq * nh * hv];
-    for t in 0..seq {
-        for hh in 0..nh {
-            let o = (t * nh + hh) * hv;
-            let ss: f32 = (0..hv).map(|i| a.dn_out[o + i] * a.dn_out[o + i]).sum();
-            let ms = ss / hv as f32 + d.eps;
-            let inv = 1.0 / ms.sqrt();
-            // g_i = d_normed_i * norm_w_i * silu(z_i) is the gradient w.r.t.
-            // the NORMALISED value; the rmsnorm Jacobian then couples the head.
-            let mut gi = vec![0.0f32; hv];
-            let mut dot = 0.0f32;
-            for i in 0..hv {
-                let sz = silu(a.z[o + i]);
-                gi[i] = d_normed[o + i] * w.norm[i] * sz;
-                d_z[o + i] =
-                    d_normed[o + i] * w.norm[i] * a.dn_out[o + i] * inv * dsilu(a.z[o + i]);
-                dot += gi[i] * a.dn_out[o + i];
-            }
-            for i in 0..hv {
-                d_dn[o + i] = inv * (gi[i] - a.dn_out[o + i] * dot * inv * inv / hv as f32);
-            }
-        }
-    }
-    matvec_seq_bwd(&d_z, w.in_proj_z, &mut dx, seq, h, nh * hv);
+    let g = linear_attn_core_backward(&d_normed, &w.core(), a, d);
 
-    let (dq, dk, dv, dgate, dbeta) =
-        deltanet_backward(&d_dn, &a.q, &a.k, &a.v, &a.beta, &a.dn, seq, nh, hk, hv);
+    matvec_seq_bwd(&g.d_z, w.in_proj_z, &mut dx, seq, h, nh * hv);
+    matvec_seq_bwd(&g.d_a_raw, w.in_proj_a, &mut dx, seq, h, nh);
+    matvec_seq_bwd(&g.d_b_raw, w.in_proj_b, &mut dx, seq, h, nh);
+    matvec_seq_bwd(&g.d_qkv, w.in_proj_qkv, &mut dx, seq, h, qkv_dim);
 
-    // gate = softplus(a_raw + dt_bias) * -exp(A_log);  beta = sigmoid(b_raw)
-    let mut d_a_raw = vec![0.0f32; seq * nh];
-    let mut d_b_raw = vec![0.0f32; seq * nh];
-    let mut d_dt_bias = vec![0.0f32; nh];
-    let mut d_a_log = vec![0.0f32; nh];
-    for t in 0..seq {
-        for hh in 0..nh {
-            let i = t * nh + hh;
-            let sp_in = a.a_raw[i] + w.dt_bias[hh];
-            // dt_bias enters sp_in exactly as a_raw does, so it collects the
-            // same adjoint summed over time.
-            d_a_raw[i] = dgate[i] * -(w.a_log[hh].exp()) * sigmoid(sp_in);
-            d_dt_bias[hh] += d_a_raw[i];
-            // gate = softplus * -exp(a_log), so d(gate)/d(a_log) = gate itself.
-            d_a_log[hh] += dgate[i] * a.gate[i];
-            let s = sigmoid(a.b_raw[i]);
-            d_b_raw[i] = dbeta[i] * s * (1.0 - s);
-        }
-    }
-    matvec_seq_bwd(&d_a_raw, w.in_proj_a, &mut dx, seq, h, nh);
-    matvec_seq_bwd(&d_b_raw, w.in_proj_b, &mut dx, seq, h, nh);
-
-    // Re-join q/k/v adjoints through silu into the conv output.
-    let mut d_qkv_pre = vec![0.0f32; seq * qkv_dim];
-    for t in 0..seq {
-        let base = t * qkv_dim;
-        for i in 0..nh * hk {
-            d_qkv_pre[base + i] = dq[t * nh * hk + i] * dsilu(a.qkv_pre[base + i]);
-            d_qkv_pre[base + nh * hk + i] =
-                dk[t * nh * hk + i] * dsilu(a.qkv_pre[base + nh * hk + i]);
-        }
-        for i in 0..nh * hv {
-            d_qkv_pre[base + 2 * nh * hk + i] =
-                dv[t * nh * hv + i] * dsilu(a.qkv_pre[base + 2 * nh * hk + i]);
-        }
-    }
-    let mut d_qkv = vec![0.0f32; seq * qkv_dim];
-    conv1d_causal_bwd(&d_qkv_pre, w.conv1d, &mut d_qkv, seq, qkv_dim, d.conv_k);
-    matvec_seq_bwd(&d_qkv, w.in_proj_qkv, &mut dx, seq, h, qkv_dim);
-
-    let _ = x;
+    let _ = (x, qkv_dim);
     LinearAttnGrads {
         d_x: dx,
-        d_dt_bias,
-        d_a_log,
+        d_dt_bias: g.d_dt_bias,
+        d_a_log: g.d_a_log,
     }
 }

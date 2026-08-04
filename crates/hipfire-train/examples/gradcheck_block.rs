@@ -98,8 +98,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wgate = up(&mut gpu, &rnd(INTER * H, 9, 7, 0.05, -0.15))?;
     let wup = up(&mut gpu, &rnd(INTER * H, 11, 5, 0.05, -0.15))?;
     let wdown = up(&mut gpu, &rnd(H * INTER, 13, 7, 0.05, -0.15))?;
-    let w = BlockWeights {
+    // QK-norm weights, deliberately NOT all-ones: at 1.0 a per-head rmsnorm is
+    // still a real normalisation, but a wrong per-element weight in the
+    // backward would cancel and pass.
+    let qnw = up(&mut gpu, &rnd(HD, 3, 7, 0.2, 0.9))?;
+    let knw = up(&mut gpu, &rnd(HD, 5, 3, 0.2, 0.9))?;
+    let w_plain = BlockWeights {
         norm1: &norm1,
+        q_norm: None,
+        k_norm: None,
+        attn_out_gate: false,
         wq: &wq,
         wk: &wk,
         wv: &wv,
@@ -108,6 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wgate: &wgate,
         wup: &wup,
         wdown: &wdown,
+    };
+    let w_qk = BlockWeights {
+        q_norm: Some(&qnw),
+        k_norm: Some(&knw),
+        ..w_plain
     };
 
     // LoRA params (random, trainable).
@@ -122,72 +135,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let x = up(&mut gpu, &xh)?;
 
-    // Analytic
-    let lora = BlockLora {
-        aq: &aq,
-        bq: &bq,
-        av: &av,
-        bv: &bv,
-    };
-    let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &dims(), &pos, 0)?;
-    let d_x_out = up(&mut gpu, &gh)?;
-    let (_dx, grads) = block_backward(&mut gpu, &d_x_out, &x, &w, &lora, &acts, &dims())?;
-    let daq = gpu.download_f32(&grads.daq)?;
-    let dbq = gpu.download_f32(&grads.dbq)?;
-    let dav = gpu.download_f32(&grads.dav)?;
-    let dbv = gpu.download_f32(&grads.dbv)?;
+    // Run twice: QK-norm sits between wq and rope, so a wrong QK-norm backward
+    // shows up in dAq/dBq while dAv/dBv (which never cross it) stay clean.
+    for (label, w) in [("no qk-norm", &w_plain), ("qk-norm", &w_qk)] {
+        // Analytic
+        let lora = BlockLora {
+            aq: &aq,
+            bq: &bq,
+            av: &av,
+            bv: &bv,
+        };
+        let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &dims(), &pos, 0)?;
+        let d_x_out = up(&mut gpu, &gh)?;
+        let (_dx, grads) = block_backward(&mut gpu, &d_x_out, &x, &w, &lora, &acts, &dims())?;
+        let daq = gpu.download_f32(&grads.daq)?;
+        let dbq = gpu.download_f32(&grads.dbq)?;
+        let dav = gpu.download_f32(&grads.dav)?;
+        let dbv = gpu.download_f32(&grads.dbv)?;
 
-    let eps = 1e-3f32;
-    // which: 0=aq,1=bq,2=av,3=bv
-    let check = |gpu: &mut Gpu, host: &[f32], which: u8, ana: &[f32]| -> HipResult<f32> {
-        let mut e = 0.0f32;
-        for i in 0..host.len() {
-            let mut hp = host.to_vec();
-            hp[i] += eps;
-            let mut hm = host.to_vec();
-            hm[i] -= eps;
-            let pd = gpu.upload_f32(&hp, &[host.len()])?;
-            let md = gpu.upload_f32(&hm, &[host.len()])?;
-            let (lp, lm) = match which {
-                0 => (
-                    loss(gpu, &x, &w, &pd, &bq, &av, &bv, &gh, &pos)?,
-                    loss(gpu, &x, &w, &md, &bq, &av, &bv, &gh, &pos)?,
-                ),
-                1 => (
-                    loss(gpu, &x, &w, &aq, &pd, &av, &bv, &gh, &pos)?,
-                    loss(gpu, &x, &w, &aq, &md, &av, &bv, &gh, &pos)?,
-                ),
-                2 => (
-                    loss(gpu, &x, &w, &aq, &bq, &pd, &bv, &gh, &pos)?,
-                    loss(gpu, &x, &w, &aq, &bq, &md, &bv, &gh, &pos)?,
-                ),
-                _ => (
-                    loss(gpu, &x, &w, &aq, &bq, &av, &pd, &gh, &pos)?,
-                    loss(gpu, &x, &w, &aq, &bq, &av, &md, &gh, &pos)?,
-                ),
-            };
-            e = e.max(((lp - lm) / (2.0 * eps) - ana[i]).abs());
+        let eps = 1e-3f32;
+        // which: 0=aq,1=bq,2=av,3=bv
+        let check = |gpu: &mut Gpu, host: &[f32], which: u8, ana: &[f32]| -> HipResult<f32> {
+            let mut e = 0.0f32;
+            for i in 0..host.len() {
+                let mut hp = host.to_vec();
+                hp[i] += eps;
+                let mut hm = host.to_vec();
+                hm[i] -= eps;
+                let pd = gpu.upload_f32(&hp, &[host.len()])?;
+                let md = gpu.upload_f32(&hm, &[host.len()])?;
+                let (lp, lm) = match which {
+                    0 => (
+                        loss(gpu, &x, &w, &pd, &bq, &av, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &md, &bq, &av, &bv, &gh, &pos)?,
+                    ),
+                    1 => (
+                        loss(gpu, &x, &w, &aq, &pd, &av, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &md, &av, &bv, &gh, &pos)?,
+                    ),
+                    2 => (
+                        loss(gpu, &x, &w, &aq, &bq, &pd, &bv, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &bq, &md, &bv, &gh, &pos)?,
+                    ),
+                    _ => (
+                        loss(gpu, &x, &w, &aq, &bq, &av, &pd, &gh, &pos)?,
+                        loss(gpu, &x, &w, &aq, &bq, &av, &md, &gh, &pos)?,
+                    ),
+                };
+                e = e.max(((lp - lm) / (2.0 * eps) - ana[i]).abs());
+            }
+            Ok(e)
+        };
+
+        let eaq = check(&mut gpu, &aqh, 0, &daq)?;
+        let ebq = check(&mut gpu, &bqh, 1, &dbq)?;
+        let eav = check(&mut gpu, &avh, 2, &dav)?;
+        let ebv = check(&mut gpu, &bvh, 3, &dbv)?;
+
+        println!("[{label}] dAq {eaq:.2e} dBq {ebq:.2e} dAv {eav:.2e} dBv {ebv:.2e}");
+        let tol = 2e-2f32;
+        if eaq >= tol || ebq >= tol || eav >= tol || ebv >= tol {
+            return Err(format!(
+                "gradcheck FAIL [{label}]: dAq {eaq:.2e}, dBq {ebq:.2e}, dAv {eav:.2e}, dBv {ebv:.2e}"
+            )
+            .into());
         }
-        Ok(e)
-    };
-
-    let eaq = check(&mut gpu, &aqh, 0, &daq)?;
-    let ebq = check(&mut gpu, &bqh, 1, &dbq)?;
-    let eav = check(&mut gpu, &avh, 2, &dav)?;
-    let ebv = check(&mut gpu, &bvh, 3, &dbv)?;
-
-    println!("block dAq max|analytic-numeric| = {eaq:.2e}");
-    println!("block dBq max|analytic-numeric| = {ebq:.2e}");
-    println!("block dAv max|analytic-numeric| = {eav:.2e}");
-    println!("block dBv max|analytic-numeric| = {ebv:.2e}");
-    let tol = 2e-2f32;
-    if eaq < tol && ebq < tol && eav < tol && ebv < tol {
-        println!("\nGRADCHECK PASS — full block LoRA backward matches finite differences.");
-        Ok(())
-    } else {
-        Err(
-            format!("gradcheck FAIL: dAq {eaq:.2e}, dBq {ebq:.2e}, dAv {eav:.2e}, dBv {ebv:.2e}")
-                .into(),
-        )
     }
+    println!("\nGRADCHECK PASS — full block LoRA backward matches finite differences.");
+    Ok(())
 }

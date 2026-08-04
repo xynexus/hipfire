@@ -16,7 +16,15 @@ use std::path::Path;
 /// Per-layer frozen weights (HF row-major `[out, in]`, ready for
 /// `gemm_f32_train` with `trans_b=true`).
 pub struct LlamaLayerF32 {
-    pub input_layernorm: GpuTensor,          // [hidden]
+    pub input_layernorm: GpuTensor, // [hidden]
+    /// qwen3-style QK-norm, `[head_dim]`. `None` on llama-shaped models.
+    pub q_norm: Option<GpuTensor>,
+    pub k_norm: Option<GpuTensor>,
+    /// True when `q_proj` emits `2*q_dim` (qwen3.5 `attn_output_gate`).
+    /// DERIVED from the tensor's own shape, never from config: the runtime
+    /// does the same (`infer_attn_output_gate_from_hfq`), because some routed
+    /// Qwen3 artifacts set the config flag while storing plain Q.
+    pub attn_out_gate: bool,
     pub q_proj: GpuTensor,                   // [q_dim, hidden]
     pub k_proj: GpuTensor,                   // [kv_dim, hidden]
     pub v_proj: GpuTensor,                   // [kv_dim, hidden]
@@ -65,6 +73,9 @@ pub fn load_llama_fp32(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
@@ -134,6 +145,9 @@ pub fn load_llama_fp32_hfq(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
@@ -186,9 +200,9 @@ pub fn load_llama_layer_fp32_hfq(
 /// experts — so `dense_mlp = false` substitutes 1-element placeholders. Nothing
 /// reads them: `block_forward_attn_only` and `block_backward_from_dxn2` skip the
 /// dense MLP entirely.
-pub fn load_llama_layer_fp32_hfq_pfx(
+pub fn load_llama_layer_fp32_hfq_pfx<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
-    hfq: &HfqFile,
+    src: &S,
     prefix: &str,
     cfg: &LlamaConfig,
     layer: usize,
@@ -202,24 +216,41 @@ pub fn load_llama_layer_fp32_hfq_pfx(
     // Sequential rather than a closure: a `|..| load_tensor_f32_hfq(gpu, ..)`
     // closure holds `&mut gpu` for its whole life, which blocks the placeholder
     // allocations below.
-    let input_layernorm =
-        load_tensor_f32_hfq(gpu, hfq, &format!("{p}.input_layernorm.weight"), &[h])?;
-    let q_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?;
-    let k_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?;
-    let v_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?;
-    let o_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?;
-    let post_attention_layernorm = load_tensor_f32_hfq(
+    let input_layernorm = upload_tensor(gpu, src, &format!("{p}.input_layernorm.weight"), &[h])?;
+    let q_rows = src
+        .shape_of(&format!("{p}.self_attn.q_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no q_proj"))?[0];
+    let attn_out_gate = match q_rows {
+        r if r == q => false,
+        r if r == 2 * q => true,
+        r => {
+            return Err(format!(
+                "layer {layer}: q_proj rows {r} are neither q_dim {q} nor 2*q_dim {}",
+                2 * q
+            ))
+        }
+    };
+    let q_proj = upload_tensor(
         gpu,
-        hfq,
+        src,
+        &format!("{p}.self_attn.q_proj.weight"),
+        &[q_rows, h],
+    )?;
+    let k_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?;
+    let v_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?;
+    let o_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?;
+    let post_attention_layernorm = upload_tensor(
+        gpu,
+        src,
         &format!("{p}.post_attention_layernorm.weight"),
         &[h],
     )?;
 
     let (gate_proj, up_proj, down_proj) = if dense_mlp {
         (
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
         )
     } else {
         let z = |g: &mut Gpu| {
@@ -229,8 +260,32 @@ pub fn load_llama_layer_fp32_hfq_pfx(
         (z(gpu)?, z(gpu)?, z(gpu)?)
     };
 
+    // qwen3-style QK-norm, per HEAD_DIM not per hidden. Absent on llama.
+    let hd = cfg.head_dim;
+    let q_norm = match src.has(&format!("{p}.self_attn.q_norm.weight")) {
+        true => Some(upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.self_attn.q_norm.weight"),
+            &[hd],
+        )?),
+        false => None,
+    };
+    let k_norm = match src.has(&format!("{p}.self_attn.k_norm.weight")) {
+        true => Some(upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.self_attn.k_norm.weight"),
+            &[hd],
+        )?),
+        false => None,
+    };
+
     Ok(LlamaLayerF32 {
         input_layernorm,
+        q_norm,
+        k_norm,
+        attn_out_gate,
         q_proj,
         k_proj,
         v_proj,
@@ -316,6 +371,176 @@ fn upload_tensor<S: WeightSource + ?Sized>(
     }
     gpu.upload_f32(&f32s, want_shape)
         .map_err(|e| format!("upload {name}: {e}"))
+}
+
+/// One `linear_attn` layer's fp32 weights.
+///
+/// The four small tensors stay on the host — see `la_block::
+/// LinearAttnBlockWeights`, whose core consumes them as slices.
+pub struct LinearAttnLayerF32 {
+    pub input_layernorm: GpuTensor,
+    pub post_attention_layernorm: GpuTensor,
+    pub in_proj_qkv: GpuTensor,
+    pub in_proj_a: GpuTensor,
+    pub in_proj_b: GpuTensor,
+    pub in_proj_z: GpuTensor,
+    pub out_proj: GpuTensor,
+    pub conv1d: Vec<f32>,
+    pub a_log: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub n_heads: usize,
+    pub hd_k: usize,
+    pub hd_v: usize,
+    pub conv_k: usize,
+}
+
+/// Load `embed_tokens` as fp32 from any weight source.
+pub fn load_embed_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    vocab: usize,
+    h: usize,
+) -> Result<GpuTensor, String> {
+    upload_tensor(
+        gpu,
+        src,
+        &format!("{prefix}embed_tokens.weight"),
+        &[vocab, h],
+    )
+}
+
+/// Load the final RMSNorm weight as fp32 from any weight source.
+pub fn load_final_norm_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    h: usize,
+) -> Result<GpuTensor, String> {
+    upload_tensor(gpu, src, &format!("{prefix}norm.weight"), &[h])
+}
+
+/// Is layer `l` linear-attention rather than self-attention? qwen3.5/3.6 are
+/// HYBRID — the 35B is 30 linear_attn layers to 10 full-attention — so this is
+/// probed per layer, never inferred from the model.
+pub fn layer_is_linear_attn<S: WeightSource + ?Sized>(src: &S, prefix: &str, layer: usize) -> bool {
+    src.has(&format!(
+        "{prefix}layers.{layer}.linear_attn.in_proj_qkv.weight"
+    ))
+}
+
+/// Load one `linear_attn` layer.
+///
+/// Every head dimension is DERIVED from the tensors, not from config, and then
+/// cross-checked: `hd_v` comes from `in_proj_z` and must equal `norm`'s length,
+/// and `hd_k` falls out of `in_proj_qkv`'s `[Q|K|V]` width. A config that
+/// disagreed with the checkpoint would otherwise reshape the recurrence
+/// silently.
+pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    layer: usize,
+    h: usize,
+) -> Result<LinearAttnLayerF32, String> {
+    let p = format!("{prefix}layers.{layer}.linear_attn");
+    let (_, a_log) = src.fetch_f32(&format!("{p}.A_log"))?;
+    let n_heads = a_log.len();
+    if n_heads == 0 {
+        return Err(format!("layer {layer}: empty A_log"));
+    }
+    let (_, norm) = src.fetch_f32(&format!("{p}.norm.weight"))?;
+    let hd_v = norm.len();
+
+    let z_shape = src
+        .shape_of(&format!("{p}.in_proj_z.weight"))
+        .ok_or_else(|| format!("layer {layer}: no in_proj_z"))?;
+    if z_shape[0] != n_heads * hd_v {
+        return Err(format!(
+            "layer {layer}: in_proj_z out {} != n_heads {n_heads} * hd_v {hd_v}",
+            z_shape[0]
+        ));
+    }
+    let qkv_shape = src
+        .shape_of(&format!("{p}.in_proj_qkv.weight"))
+        .ok_or_else(|| format!("layer {layer}: no in_proj_qkv"))?;
+    let per_head = qkv_shape[0] / n_heads;
+    if per_head * n_heads != qkv_shape[0] || per_head < hd_v || (per_head - hd_v) % 2 != 0 {
+        return Err(format!(
+            "layer {layer}: in_proj_qkv out {} is not n_heads*(2*hd_k + hd_v) with hd_v {hd_v}",
+            qkv_shape[0]
+        ));
+    }
+    let hd_k = (per_head - hd_v) / 2;
+
+    let conv_shape = src
+        .shape_of(&format!("{p}.conv1d.weight"))
+        .ok_or_else(|| format!("layer {layer}: no conv1d"))?;
+    if conv_shape[0] != qkv_shape[0] {
+        return Err(format!(
+            "layer {layer}: conv1d channels {} != qkv width {}",
+            conv_shape[0], qkv_shape[0]
+        ));
+    }
+    let conv_k = *conv_shape.last().unwrap();
+    let (_, conv1d) = src.fetch_f32(&format!("{p}.conv1d.weight"))?;
+    let (_, dt_bias) = src.fetch_f32(&format!("{p}.dt_bias"))?;
+
+    let lp = format!("{prefix}layers.{layer}");
+    Ok(LinearAttnLayerF32 {
+        input_layernorm: upload_tensor(gpu, src, &format!("{lp}.input_layernorm.weight"), &[h])?,
+        post_attention_layernorm: upload_tensor(
+            gpu,
+            src,
+            &format!("{lp}.post_attention_layernorm.weight"),
+            &[h],
+        )?,
+        in_proj_qkv: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.in_proj_qkv.weight"),
+            &[qkv_shape[0], h],
+        )?,
+        in_proj_a: upload_tensor(gpu, src, &format!("{p}.in_proj_a.weight"), &[n_heads, h])?,
+        in_proj_b: upload_tensor(gpu, src, &format!("{p}.in_proj_b.weight"), &[n_heads, h])?,
+        in_proj_z: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.in_proj_z.weight"),
+            &[n_heads * hd_v, h],
+        )?,
+        out_proj: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.out_proj.weight"),
+            &[h, n_heads * hd_v],
+        )?,
+        conv1d,
+        a_log,
+        dt_bias,
+        norm,
+        n_heads,
+        hd_k,
+        hd_v,
+        conv_k,
+    })
+}
+
+pub fn free_linear_attn_layer_fp32(gpu: &mut Gpu, l: LinearAttnLayerF32) -> Result<(), String> {
+    for t in [
+        l.input_layernorm,
+        l.post_attention_layernorm,
+        l.in_proj_qkv,
+        l.in_proj_a,
+        l.in_proj_b,
+        l.in_proj_z,
+        l.out_proj,
+    ] {
+        gpu.free_tensor(t)
+            .map_err(|e| format!("free linear_attn tensor: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Is layer `l` routed? Detected from the artifact rather than the config,
@@ -521,6 +746,10 @@ pub fn free_llama_layer_fp32(gpu: &mut Gpu, l: LlamaLayerF32) -> Result<(), Stri
         gpu.free_tensor(t)
             .map_err(|e| format!("free layer tensor: {e}"))?;
     }
+    for t in [l.q_norm, l.k_norm].into_iter().flatten() {
+        gpu.free_tensor(t)
+            .map_err(|e| format!("free qk-norm tensor: {e}"))?;
+    }
     Ok(())
 }
 
@@ -725,6 +954,9 @@ pub fn load_llama_from_hfq(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
