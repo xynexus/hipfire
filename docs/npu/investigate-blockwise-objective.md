@@ -284,3 +284,49 @@ attempt at a better local form.
 This is a hypothesis with a clean test: promote k_proj and measure whether the
 KLD change tracks the local prediction at small perturbations and falls away at
 large ones. Not run.
+
+
+## END-TO-END RESULT 2026-08-04 — gamma makes auto allocation work
+
+The ranking analysis above is a proxy. The artifact is the question, so gamma was
+wired into `--mixed-bpw` (`HIPFIRE_MIXED_BPW_GAMMA`) and run at 4.578 b/w — the
+hand-picked configuration's exact budget, making it a clean A/B:
+
+    configuration            b/w      PPL       KLD       note
+    q4nx (FLM, the bar)   5.0000  17.1949  0.034954
+    auto, H-only            ~4.88        —  0.030071   loses badly
+    auto, gamma-weighted   4.5735  17.1018  0.025734   40 of 113 promoted
+    hand-picked v+o        4.5780  17.1157  0.025025
+
+**Against the previous auto: 14.4% better KLD at 0.30 b/w FEWER.** Against
+hand-picking: within 2.8% on KLD at marginally fewer bits, and BETTER on PPL
+(17.1018 vs 17.1157).
+
+So the allocator now clears the bar on its own — 8.5% fewer bits than q4nx while
+beating it on both metrics — without anyone choosing tensors by hand. That was
+the point of the exercise: hand-picking does not scale to the 35B MoE.
+
+### Why this beat what the ranking predicted
+
+The rank spans said gamma still over-ranks k_proj relative to o_proj by ~42x,
+which looked like it would misallocate. It did not matter much in practice, and
+the reason is worth keeping:
+
+* The greedy spends a BUDGET. What decides quality is mostly which tensors get
+  promoted FIRST, and gamma gets the most efficient promotion (v_proj, 7.77
+  gain-per-%-params, over 3x o_proj) right at the top.
+* k_proj is cheap — 1.72% of quantised params. Over-ranking a small tensor
+  wastes little budget. The H-only objective's failure was different in kind: it
+  put o_proj, 6.9% of params and the largest single win, where it was never
+  reached at all.
+
+A ranking metric can therefore look badly wrong on span comparisons and still
+allocate well, because the greedy is forgiving about the order of cheap items
+and unforgiving about missing expensive ones.
+
+### Standing position
+
+Ship gamma as the `--mixed-bpw` objective. The remaining 42x k_proj residual is
+real, is probably the softmax-saturation effect described above, and is now a
+refinement rather than a blocker — the allocator already produces an artifact
+that beats the bar and matches hand-picking.
