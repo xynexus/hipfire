@@ -285,19 +285,6 @@ pub fn qtip_ldlq_dequant_bits(
     Some(out)
 }
 
-/// Opus W4A4 (oq4) LDLQ: Hessian error-feedback **symmetric int4** weight quant,
-/// emitting the SAME packed `[f16 scale][128 signed nibbles]` per-256-group layout
-/// as `codecs::quantize_oq4g256` (130 B/group, row-major), but with the GPTQ/OBS
-/// error feedback the plain RTN codec lacks.
-///
-/// Same machinery as `qtip_ldlq_dequant_bits`: FWHT-rotate H + W into the
-/// incoherent domain (oq4 stores PRE-rotated weights, so the packed output stays
-/// in the rotated domain — no un-rotate), `L` with `LLᵀ=(H_rot+λI)⁻¹`, then for
-/// each 256-column block in order, per row: clip-search scale + round the
-/// OBS-adjusted residual to signed int4, pack, and propagate `(w−ŵ)/L[c,c]` to
-/// all later columns. The inner per-group quant is oq4's symmetric round (the only
-/// substitution vs the QTIP trellis encode). `None` on Cholesky breakdown →
-/// caller falls back to plain `quantize_oq4g256`.
 #[cfg(feature = "gpu")]
 thread_local! {
     /// Lazily-initialised device for the Cholesky, one per thread that asks.
@@ -338,6 +325,19 @@ fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     inv_cholesky_lower_rotated_fast(h, k, damp)
 }
 
+/// Opus W4A4 (oq4) LDLQ: Hessian error-feedback **symmetric int4** weight quant,
+/// emitting the SAME packed `[f16 scale][128 signed nibbles]` per-256-group layout
+/// as `codecs::quantize_oq4g256` (130 B/group, row-major), but with the GPTQ/OBS
+/// error feedback the plain RTN codec lacks.
+///
+/// Same machinery as `qtip_ldlq_dequant_bits`: FWHT-rotate H + W into the
+/// incoherent domain (oq4 stores PRE-rotated weights, so the packed output stays
+/// in the rotated domain — no un-rotate), `L` with `LLᵀ=(H_rot+λI)⁻¹`, then for
+/// each 256-column block in order, per row: clip-search scale + round the
+/// OBS-adjusted residual to signed int4, pack, and propagate `(w−ŵ)/L[c,c]` to
+/// all later columns. The inner per-group quant is oq4's symmetric round (the only
+/// substitution vs the QTIP trellis encode). `None` on Cholesky breakdown →
+/// caller falls back to plain `quantize_oq4g256`.
 pub fn oq4_ldlq_pack(
     weights_f32: &[f32],
     m: usize,
