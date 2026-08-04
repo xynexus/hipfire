@@ -763,10 +763,15 @@ Each of these produced a confident wrong result that survived at least one check
     (`n_cores = 1` is a local, not a parameter), so it is not comparable to
     54.7 GB/s, which is a whole-device figure. Raising `n_cores` does not work:
     at 4 it fails placement with `no ShimNOCTile has sufficient DMA capacity for
-    0 input/1 output channels`, at 8 with `no available compute tiles`. The
-    blocker is shim DMA channel allocation, so a real answer needs a
-    purpose-built multi-core GEMV that distributes weight streaming across shim
-    tiles — design work, not a flag.
+    0 input/1 output channels near centroid column 0`, at 8 with `no available
+    compute tiles`.
+
+    Read that error against the platform constants above — `shim budget 16 in /
+    16 out, 8 shim tiles x 2 each way, HARD`. The device HAS the channels; the
+    example asks for them all `near centroid column 0`. So the blocker is
+    placement LOCALITY, not device DMA capacity, and a multi-core GEMV is within
+    budget provided it spreads its shim endpoints across columns. That is a
+    smaller problem than "needs a new design".
 
     Two further gaps to be aware of before trusting any number from this path:
     `kernels.mv` documents `np.int16` inputs ONLY, so it cannot express the
@@ -777,11 +782,13 @@ Each of these produced a confident wrong result that survived at least one check
     reuses weights across the batch, so it is compute/dispatch-bound by
     construction and low weight-BW there is expected, not a finding.
 
-    Worth one note as a hypothesis and not a claim: 5.45 GB/s x 10 cores is
-    54.5, suspiciously close to the 54.7 figure. If that number was derived from
-    roughly ten cores' worth of shim DMA rather than an aggregate device
-    ceiling, the projection may be self-consistent — but that should be checked
-    against wherever 54.7 came from, not assumed from one coincidence.
+    On the 5.45 x 10 = 54.5 coincidence: checked, and it does NOT hold up as an
+    explanation. 54.7 is listed among the measured platform constants next to a
+    shim budget of 16 channels each way, not 10, so the arithmetic does not line
+    up with any structural count — 16 x 5.45 would be ~87. Treat the near-match
+    as coincidence until someone reproduces where 54.7 was measured. Recording
+    it because a plausible-looking coincidence is exactly the kind of thing that
+    gets adopted as a fact on the second retelling.
   - Prefill is UNEXAMINED. Everything here is decode. Prefill is compute-bound
     and batched — a different regime where the format argument above does not
     apply, and where FLM may still have something to teach.
