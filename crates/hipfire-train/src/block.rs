@@ -319,6 +319,12 @@ pub struct BlockAdjoints {
     pub d_attn: Vec<f32>,
     pub d_gate: Vec<f32>,
     pub d_up: Vec<f32>,
+    /// down_proj's output adjoint `[seq,h]`. NOT produced by the backward — it
+    /// is the block's incoming `d_x`, because down_proj's output IS the block
+    /// output pre-residual. Filled by the caller that owns `d_x` (see
+    /// `model_guided_adjoints`); left empty by `block_backward_capture` itself,
+    /// which never sees it.
+    pub d_down: Vec<f32>,
 }
 
 pub fn block_backward(
@@ -575,6 +581,8 @@ fn block_backward_inner(
     // GuidedQuant: capture the six output adjoints (still alive) to host before free.
     let adjoints = if want_capture {
         Some(BlockAdjoints {
+            // Filled by the caller that owns d_x; the backward never sees it.
+            d_down: Vec::new(),
             d_q: gpu.download_f32(&d_q)?,
             d_k: gpu.download_f32(&d_k)?,
             d_v: gpu.download_f32(&d_v)?,

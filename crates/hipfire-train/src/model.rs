@@ -547,7 +547,12 @@ pub fn model_guided_adjoints(
     let mut d_x = d_x_last;
     for i in (0..model.layers.len()).rev() {
         let (lw, ll) = &model.layers[i];
-        let (d_in, _lora_g, a) = block_backward_capture(
+        // down_proj's output adjoint is the block's INCOMING d_x — its output is
+        // the block output pre-residual — so it has to be read before the
+        // backward consumes it. This is the same fact `down_guided_capture`
+        // relies on; without it down_proj is absent from the adjoint set.
+        let d_down = gpu.download_f32(&d_x)?;
+        let (d_in, _lora_g, mut a) = block_backward_capture(
             gpu,
             &d_x,
             &acts.layer_inputs[i],
@@ -556,6 +561,7 @@ pub fn model_guided_adjoints(
             &acts.layer_acts[i],
             &model.dims,
         )?;
+        a.d_down = d_down;
         adj.push(a);
         d_x = d_in;
     }
@@ -746,6 +752,7 @@ pub fn model_gamma_backward(
             (format!("{p}.self_attn.o_proj"), &a.d_attn, h),
             (format!("{p}.mlp.gate_proj"), &a.d_gate, inter),
             (format!("{p}.mlp.up_proj"), &a.d_up, inter),
+            (format!("{p}.mlp.down_proj"), &a.d_down, h),
         ] {
             if width == 0 || d.len() < seq * width {
                 continue;
