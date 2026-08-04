@@ -192,7 +192,7 @@ pub fn qtip_ldlq_dequant_bits(
     // Rotate the Hessian, then L with L·Lᵀ = (H_rot + λI)⁻¹.
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     // Rotate the weights into the same domain.
     let nb = k / 256;
@@ -298,6 +298,46 @@ pub fn qtip_ldlq_dequant_bits(
 /// all later columns. The inner per-group quant is oq4's symmetric round (the only
 /// substitution vs the QTIP trellis encode). `None` on Cholesky breakdown →
 /// caller falls back to plain `quantize_oq4g256`.
+#[cfg(feature = "gpu")]
+thread_local! {
+    /// Lazily-initialised device for the Cholesky, one per thread that asks.
+    /// A thread_local rather than a global because `Gpu` is neither Send nor
+    /// Sync; the tensor loop that reaches here is sequential, so one handle is
+    /// created and reused for the whole model.
+    static CHOL_GPU: std::cell::RefCell<Option<hipfire_rdna::Gpu>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `inv_cholesky_lower_rotated_fast`, or its GPU sibling when
+/// `HIPFIRE_GPU_CHOLESKY=1` is set and a device is available.
+///
+/// Opt-in rather than default: the device factorizations run in f32, and the
+/// agreement with the f64 reference degrades as the Hessian gets worse
+/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2). Whether
+/// that matters is a KLD question, not a norm question, so it ships behind a
+/// flag until measured on a real artifact.
+fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+    #[cfg(feature = "gpu")]
+    {
+        if std::env::var("HIPFIRE_GPU_CHOLESKY").as_deref() == Ok("1") {
+            let out = CHOL_GPU.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = hipfire_rdna::Gpu::init().ok();
+                }
+                slot.as_mut()
+                    .and_then(|g| inv_cholesky_lower_rotated_gpu(g, h, k, damp))
+            });
+            if out.is_some() {
+                return out;
+            }
+            // Device missing or the factorization broke down — fall through to
+            // the CPU path rather than failing the quantize.
+        }
+    }
+    inv_cholesky_lower_rotated_fast(h, k, damp)
+}
+
 pub fn oq4_ldlq_pack(
     weights_f32: &[f32],
     m: usize,
@@ -314,7 +354,7 @@ pub fn oq4_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
@@ -437,7 +477,7 @@ pub fn oq3_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -557,7 +597,7 @@ pub fn oq2_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -668,7 +708,7 @@ pub fn oq8_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -782,7 +822,7 @@ pub fn oqplus_tiered_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -913,7 +953,7 @@ pub fn oqplus_compact_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -1188,6 +1228,48 @@ mod chol_tests {
             println!(
                 "  k={k}  faer {:.3}s ({:.1} GF/s)   gpu {:.3}s ({:.1} GF/s)   speedup {:.2}x",
                 cpu, f / cpu / 1e9, gpu_s, f / gpu_s / 1e9, cpu / gpu_s
+            );
+        }
+    }
+
+    /// The GPU inverse-Cholesky must agree with the CPU reference. Tolerance is
+    /// f32-scale because the two factorizations run in f32 on the device; the
+    /// inverse between them stays f64, since compounding device precision through
+    /// an inverse is where it would actually bite.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_inv_cholesky_matches_the_cpu_reference() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        for (k, ridge, damp) in [(256usize, 1e-1, 1e-2), (512, 1e-2, 1e-3)] {
+            let h = ill_conditioned(k, ridge);
+            let cpu = inv_cholesky_lower_rotated_fast(&h, k, damp).expect("cpu");
+            let got = super::inv_cholesky_lower_rotated_gpu(&mut gpu, &h, k, damp).expect("gpu");
+
+            // Lower-triangular by construction — the whole point of the second
+            // factorization. C^-T also satisfies L·Lᵀ = A⁻¹ but is UPPER.
+            let mut upper = 0.0f64;
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    upper = upper.max(got[(i, j)].abs());
+                }
+            }
+            assert_eq!(upper, 0.0, "gpu result is not lower-triangular (k={k})");
+
+            let scale = (0..k).map(|i| cpu[(i, i)].abs()).fold(0.0f64, f64::max);
+            let mut worst = 0.0f64;
+            for i in 0..k {
+                for j in 0..=i {
+                    worst = worst.max((cpu[(i, j)] - got[(i, j)]).abs());
+                }
+            }
+            println!("  k={k} ridge={ridge}: worst |dL| rel = {:.3e}", worst / scale);
+            assert!(
+                worst / scale < 5e-3,
+                "gpu inv-cholesky differs by rel {:.3e} (k={k})",
+                worst / scale
             );
         }
     }
@@ -1654,7 +1736,7 @@ pub fn qtip_conditioned_encode(
         return Some((symbols, rotated.to_vec()));
     }
 
-    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
     drop(h);
     let nb = k / 256;
     let mut residual: Vec<f64> = rotated.iter().map(|&w| w as f64).collect();
@@ -1844,4 +1926,103 @@ pub fn llt_lower_right_looking_gpu(
     let out = gpu.download_f32(&dev).ok()?;
     gpu.reclaim_pending();
     Some(out.iter().map(|&v| v as f64).collect())
+}
+
+/// GPU-backed `inv_cholesky_lower_rotated`: both factorizations run on the
+/// device, the inverse is formed from the raw factor.
+///
+/// The blocker on wiring [`llt_lower_right_looking_gpu`] in was that the routine
+/// is factor -> invert -> factor and faer's `inverse()` needs its own `Llt`
+/// object, which a raw device-produced factor cannot supply. So the inverse is
+/// built directly instead: with `H+λI = C·Cᵀ` (C lower),
+///
+///     (H+λI)⁻¹ = C⁻ᵀ·C⁻¹
+///
+/// via a lower-triangular inverse then one symmetric product — the same O(k³/3)
+/// each that faer's `inverse()` costs, with no `Llt` required. That leaves the
+/// two Cholesky factorizations (2/3 of the work) on the GPU.
+///
+/// Returns `None` on non-positive-definite input at every damping multiplier,
+/// matching the CPU versions exactly so callers behave identically.
+#[cfg(feature = "gpu")]
+pub fn inv_cholesky_lower_rotated_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    h: &[f64],
+    k: usize,
+    damp: f64,
+) -> Option<Mat<f64>> {
+    let base = damp.max(1e-12);
+    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+        let lambda = base * mult;
+        let mut hd = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                hd[i * k + j] = h[i * k + j] + if i == j { lambda } else { 0.0 };
+            }
+        }
+        let Some(c) = llt_lower_right_looking_gpu(gpu, &hd, k) else {
+            continue;
+        };
+        // C⁻¹ by forward substitution, column by column. Lower triangular, so
+        // this is O(k³/3) and stays in f64 — the factor came back in f32 from the
+        // device, and compounding that through an inverse is where precision
+        // would actually bite.
+        // COLUMN-MAJOR and PARALLEL. Each column of C⁻¹ is an independent forward
+        // substitution, and writing column-major keeps that column contiguous.
+        // The first version of this was a naive row-major single-threaded triple
+        // loop: ~1.8e11 scalar ops on one core at k=8192, which made the whole
+        // quantize 34x SLOWER than the CPU path it was meant to accelerate
+        // (19026s vs 564s) even though the GPU factorizations themselves were
+        // fine. Replacing faer's multithreaded inverse with hand-rolled loops is
+        // where the time went, not the device.
+        use rayon::prelude::*;
+        if (0..k).any(|i| c[i * k + i].abs() < 1e-30) {
+            continue;
+        }
+        let mut cinv_cm = vec![0.0f64; k * k]; // cinv_cm[col*k + row] = C⁻¹[row][col]
+        cinv_cm
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(col, out)| {
+                out[col] = 1.0 / c[col * k + col];
+                for row in (col + 1)..k {
+                    let mut acc = 0.0;
+                    for t in col..row {
+                        acc += c[row * k + t] * out[t];
+                    }
+                    out[row] = -acc / c[row * k + row];
+                }
+            });
+        // hinv[i][j] = Σ_t C⁻¹[t][i]·C⁻¹[t][j] — with column-major storage both
+        // operands are contiguous, so this is a dot product per (i, j).
+        let mut hinv = vec![0.0f64; k * k];
+        hinv.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+            let ci = &cinv_cm[i * k..i * k + k];
+            for j in 0..=i {
+                let cj = &cinv_cm[j * k..j * k + k];
+                let start = i.max(j);
+                let mut acc = 0.0;
+                for t in start..k {
+                    acc += ci[t] * cj[t];
+                }
+                row[j] = acc;
+            }
+        });
+        for i in 0..k {
+            for j in (i + 1)..k {
+                hinv[i * k + j] = hinv[j * k + i];
+            }
+        }
+        let Some(l) = llt_lower_right_looking_gpu(gpu, &hinv, k) else {
+            continue;
+        };
+        return Some(Mat::<f64>::from_fn(k, k, |i, j| {
+            if j <= i {
+                l[i * k + j]
+            } else {
+                0.0
+            }
+        }));
+    }
+    None
 }

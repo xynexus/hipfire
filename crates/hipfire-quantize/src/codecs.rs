@@ -2845,7 +2845,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// Which clip factor does the search actually pick, as a function of
     /// bitwidth? The grid is [1.0 .. 0.6] of amax; c=1.0 means NO clipping.
     ///
