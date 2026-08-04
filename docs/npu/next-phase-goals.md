@@ -798,22 +798,44 @@ Each of these produced a confident wrong result that survived at least one check
     and it was measured on the fused design across **32 cores**, against this
     probe's 8.
 
-    Fit the scaling instead. Over 1 -> 8 cores the exponent is 0.727
-    (4.41 -> 20.00 GB/s), which extrapolates to:
+    Fit the scaling instead. Over 1 -> 8 cores the exponent is 0.730
+    (4.41 -> 20.13 GB/s), extrapolating to 33.4 GB/s at 16 and 55.4 at 32 —
+    which lands on the measured 54.7 and looks like clean corroboration.
 
-        16 cores   33.1 GB/s
-        32 cores   54.8 GB/s      vs 54.7 measured
+    **It is not, and the 16-core run is what showed why.** 16 cores now works
+    (`--cores 16 --cores-per-stream 2`, verified against numpy) and is SLOWER
+    than 8:
 
-    Landing within 0.2% of an independently measured number, from a different
-    design on the same fabric, is meaningful corroboration — the sublinear curve
-    is the real shape of this DMA fabric, and the fused design sits exactly
-    where that curve predicts at its core count.
+        cores  weight streams   GB/s
+            4               4   14.30
+            8               8   20.13
+           16               8   13.96
 
-    Treat the extrapolation as support, not proof: it is two doublings past the
-    last measured point and the curve could flatten further. The way to close it
-    is a 16-core run, which needs more than raising `n_cores` — 16 failed
-    verification here, since one shim endpoint pair per core exhausts the 8 shim
-    tiles and cores must start sharing columns.
+    Adding cores while holding streams fixed LOSES 31%. Bandwidth here tracks
+    the number of host->array shim streams, not the number of cores — sharing a
+    stream via a memtile `split` adds overhead and no bandwidth. So the curve
+    above is a curve in STREAMS, and the extrapolation to "32" needs 32 streams.
+
+    There are 16, hard, and the broadcast B vector takes one — so 15 weight
+    streams is the ceiling for this design, extrapolating to ~33 GB/s. **This
+    design cannot reach 54.7 by adding cores.** The fused design's 54.7 must
+    come from different data movement (memtile reuse rather than one shim stream
+    per core), not from more of what this probe does.
+
+    Getting 16 cores working took three fixes, each of which failed in a
+    different way and is worth recording:
+      * round-robin `Tile(col=i % 8)` — necessary but not sufficient; the limit
+        is a channel COUNT, not a column choice.
+      * `ObjectFifo.split(offsets=...)` to put 2 cores on one stream, taking
+        host->array from 17 (over budget) to 9.
+      * strided `TensorAccessPattern` C taps — `split` gives each core the c-th
+        m-row slice of EVERY tile, so a core's rows are strided, not contiguous.
+        Leaving C contiguous returned 1536/2048 wrong outputs.
+
+    Two process notes: fills are per-stream and drains are per-core, so they
+    cannot be zipped (zipping silently truncated and hung the kernel); and they
+    must stay interleaved rather than run as two passes — separating them cost
+    20.1 -> 13.6 GB/s at 8 cores.
 
     Also note this is the stock int16 `kernels.mv`, not an `oq4++` tile shape.
     It bounds this path rather than proving oq4++ directly — but since it lands
