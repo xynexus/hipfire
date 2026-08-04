@@ -3320,10 +3320,12 @@ fn resolve_model_path(input: &str) -> String {
             let name = parts[1];
 
             // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
-            let home = std::env::var("HOME").unwrap_or_default();
-            let cache_dir = PathBuf::from(format!(
-                "{home}/.cache/huggingface/hub/models--{org}--{name}"
-            ));
+            let home = hipfire_env::home_dir().unwrap_or_default();
+            // Join rather than format: `home` is a PathBuf, and string-building
+            // a path breaks on any home directory that is not plain UTF-8.
+            let cache_dir = home
+                .join(".cache/huggingface/hub")
+                .join(format!("models--{org}--{name}"));
 
             if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
                 eprintln!("Resolved {input} -> {}", snapshot.display());

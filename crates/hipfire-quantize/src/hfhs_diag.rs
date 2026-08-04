@@ -217,11 +217,11 @@ mod tests {
         assert!(!m.contains_key("blk.0.ffn_gate"));
     }
 
-    /// Opt-in: HFHS_REAL=/path/to/qwen3.5-0.8b.hessian.bin cargo test ... -- --nocapture
+    /// Opt-in: HIPFIRE_HIPFIRE_HFHS_REAL=/path/to/qwen3.5-0.8b.hessian.bin cargo test ... -- --nocapture
     #[test]
     fn real_file_smoke() {
-        let Ok(path) = std::env::var("HFHS_REAL") else {
-            eprintln!("skip real_file_smoke (set HFHS_REAL=<.hessian.bin>)");
+        let Some(path) = hipfire_env::HFHS_REAL.get() else {
+            eprintln!("skip real_file_smoke (set HIPFIRE_HFHS_REAL=<.hessian.bin>)");
             return;
         };
         let m = read_diagonals(Path::new(&path)).unwrap();

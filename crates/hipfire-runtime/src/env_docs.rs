@@ -167,13 +167,6 @@ pub const ENV_GPU_POLL_INTERVAL: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-cli/src/commands/lock.rs:126",
 };
 
-/// `HFHS_REAL` — Runtime variable controlling hfhs real in hipfire
-pub const ENV_HFHS_REAL: EnvVarDoc = EnvVarDoc {
-    name: "HFHS_REAL",
-    description: "Runtime variable controlling hfhs real in hipfire",
-    source: "crates/hipfire-quantize/src/hfhs_diag.rs:223",
-};
-
 /// `HFQ_TEST_N_ITER` — Parses "HFQ_TEST_N_ITER" with fallback defaults
 pub const ENV_HFQ_TEST_N_ITER: EnvVarDoc = EnvVarDoc {
     name: "HFQ_TEST_N_ITER",
@@ -2092,6 +2085,13 @@ pub const ENV_HIPFIRE_HETERO_DIFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HETERO_DIFF",
     description: "above (#352's GPU greedy-accept path doesn't materialize it),",
     source: "crates/hipfire-arch-qwen35/src/mtp_spec.rs:3022",
+};
+
+/// `HIPFIRE_HFHS_REAL` — Path to a real `.hessian.bin` for the `hfhs_diag` opt-in smoke test. Unset skips that test rather than failing it. Renamed from the bare `HFHS_REAL` so it fits the HIPFIRE_ prefix the table requires.
+pub const ENV_HIPFIRE_HFHS_REAL: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_HFHS_REAL",
+    description: "Path to a real `.hessian.bin` for the `hfhs_diag` opt-in smoke test. Unset skips that test rather than failing it. Renamed from the bare `HFHS_REAL` so it fits the HIPFIRE_ prefix the table requires.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_HFQ4G128_MMQ` — Environment toggle value controls runtime behavior
@@ -5345,7 +5345,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_FP32_STATE,
     ENV_GPU_LOCK_TIMEOUT,
     ENV_GPU_POLL_INTERVAL,
-    ENV_HFHS_REAL,
     ENV_HFQ_TEST_N_ITER,
     ENV_HFQ_TEST_SCALE_LOG10,
     ENV_HFQ_TEST_ZP_MAX,
@@ -5620,6 +5619,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_GRAPH_PREFILL,
     ENV_HIPFIRE_HAVE_2_GPU,
     ENV_HIPFIRE_HETERO_DIFF,
+    ENV_HIPFIRE_HFHS_REAL,
     ENV_HIPFIRE_HFQ4G128_MMQ,
     ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151,
     ENV_HIPFIRE_HFQ4_GATE_UP_FAST,

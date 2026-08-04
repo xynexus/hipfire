@@ -30,6 +30,7 @@ cd "$ROOT"
 ENFORCED=(
     hipfire-env
     hipfire-model
+    hipfire-quantize
 )
 
 status=0

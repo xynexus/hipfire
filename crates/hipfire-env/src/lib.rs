@@ -107,6 +107,22 @@ impl EnvVar {
     }
 }
 
+/// The user's home directory, or `None` when `HOME` is unset or empty.
+///
+/// `HOME` is not a hipfire variable, so it is deliberately NOT in [`env_vars!`]
+/// — that table is `HIPFIRE_`-prefixed by invariant (see the test below), and a
+/// standard POSIX variable has no business in `hipfire help env`. But
+/// `clippy.toml` denies `std::env::var` workspace-wide, so a crate cannot opt
+/// into enforcement while reading `HOME` directly. This is the sanctioned
+/// reader: one more `allow` in the one file that is allowed to have them,
+/// rather than an exception scattered across call sites.
+#[allow(clippy::disallowed_methods)]
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Declare env vars once; expand into constants **and** the [`ALL`] table.
 ///
 /// The two expansions are the point: a read site that names the constant and a
@@ -438,6 +454,12 @@ env_vars! {
     MINIMAX_PROMOTE_MQ6 = "HIPFIRE_MINIMAX_PROMOTE_MQ6", Developer,
         "Comma-separated MiniMax layer ranges forced UP to MQ6. Same form and \
          mechanism as `HIPFIRE_MINIMAX_PROMOTE_MQ4`.";
+
+    // ── Diagnostics fixtures (hipfire-quantize) ─────────────────────────────
+    HFHS_REAL = "HIPFIRE_HFHS_REAL", Developer,
+        "Path to a real `.hessian.bin` for the `hfhs_diag` opt-in smoke test. \
+         Unset skips that test rather than failing it. Renamed from the bare \
+         `HFHS_REAL` so it fits the HIPFIRE_ prefix the table requires.";
 
     // ── Lossless BF16 recodings (hipfire-runtime) ───────────────────────────
     BF16L3_RESIDENT = "HIPFIRE_BF16L3_RESIDENT", Developer,
