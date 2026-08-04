@@ -4019,6 +4019,32 @@ pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
 /// `kernels/src/gemm_bf16_tiled_wmma.hip`.
 pub const GEMM_BF16_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
+/// LDS-staged, double-buffered, register-super-tiled bf16 GEMM (gfx1103 wave32) —
+/// the DiT throughput kernel. Bit-exact to `gemm_bf16_tiled_wmma` but LDS-staged
+/// (BM64×BN128 block tile, 8 waves, BK=64 double-buffered). K%64==0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_lds.hip`.
+pub const GEMM_BF16_TILED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_lds.hip");
+/// EXPERIMENT: LDS bf16 GEMM + `extra` throwaway VALU FMAs/WMMA, to measure the
+/// DiT GEMM's free-ALU headroom (the QTIP/correction budget). Not production.
+/// See `kernels/src/bench_bf16_lds_freealu.hip`.
+pub const BENCH_BF16_LDS_FREEALU_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_lds_freealu.hip");
+/// DIAGNOSTIC-ONLY compute-headroom probe: the register-tiled 4x4 bf16 GEMM plus
+/// N side FMAs per K-step, to measure how much unrelated VALU work the
+/// (compute-bound, ~10%-of-peak) DiT GEMM absorbs for free — i.e. the budget a
+/// codebook/trellis weight decode (QTIP, LO-BCQ) or correction branch has to fit
+/// inside. Not routed into any model path. See
+/// `kernels/src/bench_bf16_alu_headroom.hip`.
+pub const BENCH_BF16_ALU_HEADROOM_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_alu_headroom.hip");
+/// Software-pipelined (prefetched) variants of `gemm_bf16_tiled_wmma` — same math
+/// and WMMA order, so bit-exact, but the next K-step's fragments are loaded before
+/// the current step's WMMAs so global-load latency overlaps the matrix core.
+/// Chases the ~15% stall the free-ALU probe exposed (plan §12c). K % 32 == 0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_pf.hip`.
+pub const GEMM_BF16_TILED_WMMA_PF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_pf.hip");
 
 /// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
 /// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked
@@ -4105,6 +4131,15 @@ pub const GEMM_W3A4_I32_WMMA_LDS_SRC: &str =
 /// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
+pub const GEMM_OQ4_GROUPED_WMMA_BF16OUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_bf16out.hip");
+/// LDS-staged, double-buffered, register-super-tiled optimization of
+/// `gemm_oq4_grouped_wmma` (same bit-exact per-group f32 accumulation). Provides
+/// both `gemm_oq4_grouped_wmma_lds` (f32 out) and `gemm_oq4_grouped_wmma_lds_bf16out`
+/// (bf16 out). gfx1103 wave32, BM64×BN128 block tile. K%64==0, group%64==0.
+/// See `kernels/src/gemm_oq4_grouped_wmma_lds.hip`.
+pub const GEMM_OQ4_GROUPED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_lds.hip");
 
 /// OQ4+ batched PREFILL: W4A16 grouped GEMM (4-bit-resident weight dequantized
 /// to f16 inline, f16×f16 WMMA against full-precision f16 activations). The
@@ -4175,6 +4210,11 @@ pub const GEMM_OQ4_RESIDUAL_MMQ_SRC: &str =
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
 pub const QUANTIZE_ACT_OQ4_SRC: &str = include_str!("../../../kernels/src/quantize_act_oq4.hip");
+/// Clip-search variant of `quantize_act_oq4` (Stream B activation "+"): per-group
+/// MSE-optimal clip ratio instead of plain absmax. Same output format. Gated by
+/// `HIPFIRE_OQ4_ACT_CLIP=1`. See `kernels/src/quantize_act_oq4_clip.hip`.
+pub const QUANTIZE_ACT_OQ4_CLIP_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_oq4_clip.hip");
 
 /// Opus Quant W8A8 core: grouped signed-INT8 × signed-INT8 GEMM with per-group
 /// scale rescale (v_wmma_i32_16x16x16_iu8). The int8 generalization of

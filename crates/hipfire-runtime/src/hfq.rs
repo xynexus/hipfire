@@ -1698,15 +1698,18 @@ impl HfqFile {
     }
 }
 
-/// `base_offset` is the byte offset of the HFQM container within the host file: 0
-/// for a standalone `.hfq`, non-zero for one embedded after a base container.
-/// `metadata_offset` and `data_offset` arrive already rebased by it; v2's
-/// per-tensor offsets are stored container-relative and are rebased here.
+/// Parse the metadata+index block of one HFQM container.
+///
+/// `base` is the container's start within the file — nonzero for a container
+/// embedded in another file (a bundled LoRA or MTP head). `metadata_offset` and
+/// `data_offset` arrive already rebased by it; `base` is needed here because a
+/// v2 index stores each tensor's offset relative to the container, so it has to
+/// be rebased the same way. `base` is 0 for a standalone file.
 fn parse_hfqm_meta_index(
     meta_index: &[u8],
     metadata_offset: usize,
     data_offset: usize,
-    base_offset: usize,
+    base: usize,
     n_tensors: usize,
     file_len: usize,
     version: u32,
@@ -1784,27 +1787,26 @@ fn parse_hfqm_meta_index(
             let offset_div32 =
                 u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
-            // v2 stores each tensor's offset relative to the CONTAINER start, so it
-            // must be rebased for an embedded container the same way the header's
-            // metadata/data offsets already were by the caller. v1 needs no rebase:
-            // it accumulates from `data_offset`, which arrives absolute. Missing this
-            // made every embedded v2 read (bundled LoRA, sidecar bundles) return
-            // payload bytes from `base_offset` bytes too early — metadata parsed
-            // fine, tensor data came back as garbage.
+            // Stored relative to the container, so rebase like the header
+            // offsets. Without this an embedded container reads every tensor
+            // `base` bytes early — out of the host file's own data — returning
+            // plausible-looking garbage instead of failing.
+            //
+            // Alignment is a property of the container's own layout, so it is
+            // checked before rebasing: `base` is where the host file happened to
+            // end and is under no obligation to be 32-byte aligned.
             let relative = offset_div32
                 .checked_mul(HFQM_V2_OFFSET_ALIGN)
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
                 })?;
-            // Alignment is a property of the container-relative offset; `base_offset`
-            // itself carries no alignment guarantee, so check before rebasing.
             if relative % HFQM_V2_OFFSET_ALIGN != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("HFQM tensor {name} offset {relative} is not 32-byte aligned"),
                 ));
             }
-            relative.checked_add(base_offset).ok_or_else(|| {
+            relative.checked_add(base).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
             })?
         } else {

@@ -13,6 +13,28 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+/// Activation group size for the batched W4A4 prefill path (`HIPFIRE_OQ4_ACT_GROUP`,
+/// default 256 = the Oq4G256 weight codec's group, i.e. production unchanged).
+///
+/// A finer activation group means a tighter absmax per scale, so fewer values in
+/// each group are crushed by an outlier — the cheapest quality knob on the
+/// activation side that needs no new math. Legal sizes are constrained from three
+/// directions: the LDS GEMM flushes on a BK=64 K-strip boundary, the wave32
+/// quantizer needs `group/32` even, and it must divide the weight group. That
+/// leaves 64 / 128 / 256 on wave32; a wave64 quantizer (`group/64` even) would
+/// start at 128, so **128 and 256 are the only sizes portable across both wave
+/// widths**. Anything below 256 goes through `gemm_oq4_grouped_wmma_lds_gx`.
+pub fn oq4_act_group() -> usize {
+    match std::env::var("HIPFIRE_OQ4_ACT_GROUP") {
+        Ok(v) => {
+            let g: usize = v.parse().expect("HIPFIRE_OQ4_ACT_GROUP must be an integer");
+            assert!(g == 64 || g == 128 || g == 256, "HIPFIRE_OQ4_ACT_GROUP must be 64, 128 or 256");
+            g
+        }
+        Err(_) => 256,
+    }
+}
+
 impl Gpu {
     /// Ensure reusable plain-basis DFLASH activation staging for `n` rows.
     /// Capacity only grows; sequential projections safely reuse it on the same
@@ -247,21 +269,31 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Multiple of 64, not 32: both quantizer kernels give each of the 32 lanes
+        // a contiguous run of `group/32` elements and nibble-pack it in PAIRS, so
+        // an odd run (group = 32, 96, …) makes a lane read its neighbour's first
+        // element and drop its own last one — silent corruption, not a crash.
+        // (A wave64 port would need group % 128 == 0 for the same reason.)
         assert_eq!(
-            group % 32,
+            group % 64,
             0,
-            "quantize_act_oq4: group must be a multiple of 32"
+            "quantize_act_oq4: group must be a multiple of 64 (group/32 must be even to nibble-pack)"
         );
         assert_eq!(
             k % group,
             0,
             "quantize_act_oq4: K must be a multiple of group"
         );
-        self.ensure_kernel(
-            "quantize_act_oq4",
-            kernels::QUANTIZE_ACT_OQ4_SRC,
-            "quantize_act_oq4",
-        )?;
+        // Stream B lever: HIPFIRE_OQ4_ACT_CLIP=1 swaps in the per-group clip-search
+        // activation quantizer (MSE-optimal clip vs plain absmax). Same output
+        // format, so callers/GEMM are unchanged; default = plain absmax.
+        let (entry, src): (&str, &str) =
+            if std::env::var("HIPFIRE_OQ4_ACT_CLIP").as_deref() == Ok("1") {
+                ("quantize_act_oq4_clip", kernels::QUANTIZE_ACT_OQ4_CLIP_SRC)
+            } else {
+                ("quantize_act_oq4", kernels::QUANTIZE_ACT_OQ4_SRC)
+            };
+        self.ensure_kernel(entry, src, entry)?;
         let xp = x_f32.buf.as_ptr();
         let xqp = xq_i4.buf.as_ptr();
         let xsp = xs.buf.as_ptr();
@@ -278,7 +310,7 @@ impl Gpu {
         ];
         let grid_g = (k / group) as u32;
         let grid_b = batch_size as u32;
-        let func = &self.functions["quantize_act_oq4"];
+        let func = &self.functions[entry];
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -648,8 +680,10 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 256;
+        let group_x = oq4_act_group().min(k);
         self.ensure_oq4_scratch_batched(n, k, m)?;
         let ng = k / GROUP;
+        let ngx = k / group_x;
         let xq = GpuTensor {
             buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * (k / 2)],
@@ -657,12 +691,130 @@ impl Gpu {
         };
         let xs = GpuTensor {
             buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ngx],
+            dtype: DType::F32,
+        };
+        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, group_x)?;
+        let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
+        if group_x != GROUP {
+            // Finer activation group than the weight codec's 256 — the decoupled
+            // kernel. Needs the LDS tiling (BK-boundary flush), so only for n>=128.
+            if n >= 128 {
+                return self
+                    .gemm_oq4_grouped_wmma_lds_gx(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP, group_x);
+            }
+            panic!("HIPFIRE_OQ4_ACT_GROUP != 256 needs the LDS path (n>=128), got n={n}");
+        }
+        // For prefill-sized batches, the LDS-staged kernel is bit-identical to the
+        // zero-LDS original but ~1.8× faster (beats W4A8-MMQ; see the A3 gate in
+        // docs/plans/2026-07-30-oq4-w4a4-near-lossless.md §9). It needs K%64==0
+        // (group=256 guarantees it) and a full BN=128 N-tile to be worth it, so the
+        // original stays for decode/small batches. Bit-exact ⇒ no correctness risk.
+        if n >= 128 {
+            self.gemm_oq4_grouped_wmma_lds(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        } else {
+            self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        }
+    }
+
+    /// Batched W8A8 (Opus oq8) GEMM for prefill: int8-quantize the FWHT-rotated
+    /// activation `x_rot` [N×K] once into the shared batched scratch, then the
+    /// grouped int8 WMMA GEMM into `y` [N×M]. The oq8 counterpart of
+    /// [`Self::gemm_oq4_grouped_act_batched`]; `group` is fixed at 256 (oq8
+    /// codec). Same rotate-then-quantize-then-GEMM sequence that
+    /// `weight_gemm`'s `DType::Oq8G256` arm already uses, hoisted here so the
+    /// arch prefill sites can reach it without per-call scratch alloc/free.
+    pub fn gemm_oq8_grouped_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.quantize_act_oq8_batched(x_rot, m, k, n)?;
+        self.gemm_oq8_grouped_prequant(w_combined, y, m, k, n)
+    }
+
+    /// Quantize the rotated activation into the shared oq8 batched scratch.
+    /// Split out from [`Self::gemm_oq8_grouped_act_batched`] so a multi-projection
+    /// site (qkvza, gate+up) can quantize ONCE and then issue one
+    /// [`Self::gemm_oq8_grouped_prequant`] per projection — the oq8 analogue of
+    /// what the fused oq4 kernels do internally.
+    pub fn quantize_act_oq8_batched(
+        &mut self,
+        x_rot: &GpuTensor,
+        m_max: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq8_scratch_batched(n, k, m_max)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, GROUP)?;
-        let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
-        self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        self.quantize_act_oq8(x_rot, &xq, &xs, n, k, GROUP)
+    }
+
+    /// One grouped int8-WMMA GEMM against the activation already quantized into
+    /// the oq8 scratch by [`Self::quantize_act_oq8_batched`]. The caller must have
+    /// quantized with the SAME `n`/`k` — the scratch is only grown, never shrunk,
+    /// so a later call with a larger `m` cannot invalidate the quantized data.
+    pub fn gemm_oq8_grouped_prequant(
+        &mut self,
+        w_combined: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        let ws = w_combined.sub_offset(m * k, m * ng * 4);
+        self.gemm_oq8_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+    }
+
+    /// Batched W8A8 oq8 GEMM with residual add: `residual[N×M] += W·x_rot`.
+    /// GEMMs into the persistent batched f32 scratch then one elementwise add —
+    /// there is no fused oq8 residual kernel, mirroring the oq4 arm.
+    pub fn gemm_oq8_grouped_residual_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq8_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq8_grouped_act_batched(w_combined, x_rot, &tmp, m, k, n)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
     }
 
     /// Batched W4A4 oq4 GEMM with residual add: `residual[N×M] += W·x_rot`.
@@ -685,6 +837,31 @@ impl Gpu {
             dtype: DType::F32,
         };
         self.gemm_oq4_grouped_act_batched(w_combined, x_rot, &tmp, m, k, n)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
+    }
+
+    /// W4A16 (act16) residual variant of [`Self::gemm_oq4_grouped_residual_act_batched`]:
+    /// `residual[N×M] += W·x_rot` with the int4 weight dequantized to f16 against the
+    /// full-precision (f16) activation — no activation quantization. Used only by the
+    /// A4 KLD harness to build a same-batched-path W4A16 baseline for o_proj/down;
+    /// production keeps the W4A4 residual path. `group` is fixed at 256 (oq4 codec).
+    pub fn gemm_oq4_grouped_residual_f16_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq4_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq4_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq4_grouped_f16_wmma(w_combined, x_rot, &tmp, m, k, n, 256)?;
         let res_n = residual.sub_offset(0, n * m);
         self.add_inplace_f32(&res_n, &tmp)
     }

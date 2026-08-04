@@ -1758,16 +1758,23 @@ fn fused_dense_decode_accepts_only_fp32_uncompacted_state_signatures() {
             .unwrap_err();
     assert!(err.contains("compacted KV offset"));
 
-    let mut quantized_kv = fp32;
-    quantized_kv.kv_quantized = true;
-    quantized_kv.kv_quant_q8 = true;
-    let err = validate_qwen35_fused_dense_decode_session_signatures(
-        &config,
-        &[quantized_kv, quantized_kv],
-        2,
-    )
-    .unwrap_err();
-    assert!(err.contains("quantized KV state"));
+    // Plain Q8 KV (Q8_0, inline per-block scale) is fused, not rejected: the
+    // per-layer KV write + attention branch on `kv_q8`. Admitted alongside FP32.
+    let mut q8_kv = fp32;
+    q8_kv.kv_quantized = true;
+    q8_kv.kv_quant_q8 = true;
+    validate_qwen35_fused_dense_decode_session_signatures(&config, &[q8_kv, q8_kv], 2)
+        .expect("plain Q8 KV dense decode state should be admitted");
+
+    // Asym/FWHT KV (any quantized-but-not-plain-Q8 state) stays on
+    // serial_reference and is refused by the fused-prefix contract.
+    let mut asym_kv = fp32;
+    asym_kv.kv_quantized = true;
+    asym_kv.kv_quant_asym2 = true;
+    let err =
+        validate_qwen35_fused_dense_decode_session_signatures(&config, &[asym_kv, asym_kv], 2)
+            .unwrap_err();
+    assert!(err.contains("unsupported KV quantization"));
 
     let mut q8_dn = fp32;
     q8_dn.dn_quant = qwen35::StateQuant::Q8;

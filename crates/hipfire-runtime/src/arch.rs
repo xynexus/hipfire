@@ -1190,29 +1190,28 @@ fn decode_loop_inner(
     let mut forced_tokens: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
     while generated < ctx.max_tokens {
-        // Honour a caller's abort before spending another decode step. This is the
-        // cancellation point for every backend that runs the generic loop, which is
-        // the gemma3 family and all factory/registered ones — they never reach
-        // `emit_filter_action`, so checking only there let aborts be ignored
-        // entirely. Once per token is the right granularity: it is the same
-        // boundary EOS and stop-sequences are honoured at, so nothing is left
-        // half-done.
+        // Two cancellation wires converge here, at the top of the loop — the
+        // KV-safe chokepoint: every committed token's K/V has already been
+        // written by `decode_step` in the prior iteration, and the pending
+        // `next` sample is not yet written, so breaking drops only that unwritten
+        // sample and leaves the cache and `pos` exactly as a natural stop would.
+        // Ordered BEFORE the forced/grammar pick so a popped forced token or a
+        // constrained pick is not consumed and then discarded.
+        //
+        // (1) In-band abort (M3): a reader thread accepts an abort frame while
+        // this executor is busy and records it, id-scoped, in `cancel`. This is
+        // the cancellation point for every backend that runs the generic loop —
+        // the gemma3 family and all factory/registered ones never reach
+        // `emit_filter_action`, so checking only there let aborts be ignored.
         if crate::cancel::is_cancelled(ctx.id) {
             stop = StopReason::Aborted;
             break;
         }
-        // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). Checked at the
-        // top of the loop, which is the KV-safe chokepoint: every committed
-        // token's K/V has already been written by `decode_step` in the prior
-        // iteration, and the pending `next` sample is not yet written. Breaking
-        // here drops only that unwritten sample, leaving the cache and `pos`
-        // exactly as a natural `max_tokens` stop would — so the next request
-        // resumes on a consistent context. Treated as a natural stop
-        // (generated < max_tokens → "stop" finish_reason).
-        //
-        // Ordered BEFORE the forced/grammar pick below: popping a forced token
-        // and then breaking would consume it from the queue and discard it,
-        // and a constrained pick would spend GPU work on a token we drop.
+        // (2) Cooperative cancel (#205): a SIGUSR1 handler — which, being a
+        // signal handler, can only touch an AtomicBool, not the `cancel` Mutex —
+        // sets GENERATION_CANCEL. The adapter raises it on a client disconnect so
+        // an abandoned generation stops without killing the worker. Treated as a
+        // natural stop (generated < max_tokens → "stop" finish_reason).
         if crate::take_generation_cancel() {
             stop = StopReason::MaxTokens;
             break;

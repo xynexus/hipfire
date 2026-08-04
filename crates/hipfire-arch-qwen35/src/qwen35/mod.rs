@@ -1259,6 +1259,33 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         )
         && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() != Ok("0");
 
+    // Opus W8A8 (Oq8G256): batched prefill via `gemm_oq8_grouped_act_batched`
+    // (quantize_act_oq8 + gemm_oq8_grouped_wmma) at every LA/FA site —
+    // qkvza, wo, gate+up, w_down — wired in forward_prefill_chunk alongside this
+    // gate, so admitting the dtype never routes oq8 to an unhandled path. Same
+    // wave32-WMMA arch set as oq4; there is no scalar fallback.
+    //
+    // Before this, `is_batchable_la` had no Oq8G256 arm at all, so EVERY oq8
+    // model silently dropped to the per-token decode loop for prefill — measured
+    // at 86 tok/s vs 1046 for oq4 on the 0.8b (12x). That was an admission gap,
+    // not a property of 8-bit weights (plan §13j).
+    //
+    // Opt out with HIPFIRE_OQ8_BATCHED_PREFILL=0 (falls back to per-token).
+    let oq8_with_wmma = matches!(dt, DType::Oq8G256)
+        && matches!(
+            arch,
+            "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+                | "gfx1200"
+                | "gfx1201"
+        )
+        && std::env::var("HIPFIRE_OQ8_BATCHED_PREFILL").as_deref() != Ok("0");
+
     // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
     // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
@@ -1308,6 +1335,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || oq4_with_wmma
+        || oq8_with_wmma
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {

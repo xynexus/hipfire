@@ -584,6 +584,16 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_oq4_scratch()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            // HIPFIRE_OQ4_ACT4=1 (verification harness): consume the rotated
+            // activation as TRUE int4 (quantize_act_oq4 → iu4·iu4 gemm at B=1)
+            // instead of the default W4A16 gemv. Lets `hipfire chat` exercise the
+            // full-model int4-ACTIVATION path per-token, end to end, so int4-act
+            // coherence/accumulation can be compared directly against W4A16
+            // (env unset). Not a serving default — the roofline (memory-capped
+            // ~1.6× prefill-only) does not justify int4-act at B=1 decode.
+            if std::env::var("HIPFIRE_OQ4_ACT4").as_deref() == Ok("1") {
+                return gpu.gemm_oq4_grouped_act_batched(&w.buf, &xr, y, w.m, w.k, 1);
+            }
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
             gpu.gemv_oq4_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)

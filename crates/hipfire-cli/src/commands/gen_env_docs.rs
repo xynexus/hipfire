@@ -8,9 +8,10 @@
 //!
 //! This is the Rust-native replacement for the former `scripts/gen-env-docs.py`
 //! + `scripts/check-env-docs.py`. With `--check` it regenerates to memory and
-//! diffs against the committed files (plus verifies that every `HIPFIRE_*` var
+//! diffs against what is on disk (plus verifies that every `HIPFIRE_*` var
 //! named in the top-level docs is covered), exiting non-zero on drift — the
-//! freshness gate `tests/no-gpu-ci.sh` runs.
+//! freshness gate `tests/no-gpu-ci.sh` runs. Only `env_docs.rs` is tracked; the
+//! Markdown is gitignored, so its absence is not drift. See `check_file`.
 //!
 //! Two deliberate improvements over the Python it replaces:
 //!   * `source:` fields are **repo-relative**, not absolute machine paths.
@@ -18,6 +19,15 @@
 //!     every run, so its output never stabilized — there was no working
 //!     content gate). The `.rs` output is also piped through `rustfmt` so it
 //!     stops fighting `cargo fmt`.
+//!
+//! **The output is a pure function of the tracked sources.** It deliberately
+//! does NOT read descriptions back out of `docs/env-vars.md`: that file is
+//! gitignored, so it exists in a worktree that has run the generator before and
+//! never in a fresh clone. Preferring its text made the `.rs` differ between a
+//! warm worktree and CI — the gate then failed in CI while passing locally on
+//! the same commit, for 16 vars whose description came from the markdown rather
+//! than from source. Any input to this generator must be tracked, or the
+//! content gate is not reproducible.
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -98,15 +108,12 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
 
     if args.check {
         let mut stale = Vec::new();
-        // `docs/env-vars.md` is gitignored (185af67ab: it conflicted on every
-        // rebase) and regenerated on demand, so a clean checkout legitimately does
-        // not have it — CI included. Only enforce freshness when it is actually
-        // present; a stale copy is still worth reporting. The tracked registry
-        // module is always checked.
-        if doc_path.exists() {
-            check_file(&doc_path, markdown.as_bytes(), &mut stale);
-        }
-        check_file(&rust_path, rust.as_bytes(), &mut stale);
+        // The Markdown is generated and gitignored, so a clean checkout simply
+        // does not have it. Requiring it made this gate unsatisfiable anywhere
+        // but a tree where someone had already run the writer. Drift detection
+        // rides on the tracked `env_docs.rs` instead.
+        check_file(&doc_path, markdown.as_bytes(), false, &mut stale);
+        check_file(&rust_path, rust.as_bytes(), true, &mut stale);
         let missing = coverage_gaps(&root, &markdown);
 
         if !stale.is_empty() || !missing.is_empty() {
@@ -253,8 +260,6 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
         raw_lines.insert(rel, lines);
     }
 
-    let existing = collect_existing_descs(root);
-
     let mut docs: Vec<EnvDoc> = Vec::new();
     for name in &order {
         let usage_list = &usages[name];
@@ -263,15 +268,7 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
             let lines = &raw_lines[source_path(&usage.source)];
             let line = &lines[usage.line_idx];
             let cands = extract_comment_descriptions(usage.line_idx, lines);
-            let desc = infer_default(
-                existing.get(name).map(String::as_str),
-                name,
-                &cands,
-                line,
-                lines,
-                usage.line_idx,
-                &usage.source,
-            );
+            let desc = infer_default(name, &cands, line, lines, usage.line_idx, &usage.source);
             // Match gen-env-docs.py: adopt the first usage, then re-adopt on
             // every *helpful* usage — so a var documented in multiple files is
             // attributed to the last helpful usage in scan (git ls-files) order.
@@ -643,27 +640,7 @@ fn infer_name_from_var(var: &str, source: &str) -> String {
 /// Existing descriptions parsed from the committed Markdown table, so curated
 /// wording is preserved across regenerations. Pipe-escapes are collapsed so the
 /// round-trip is idempotent (the Python re-escaped `|` every run).
-fn collect_existing_descs(root: &Path) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let doc = root.join("docs/env-vars.md");
-    let Ok(text) = std::fs::read_to_string(&doc) else {
-        return out;
-    };
-    let row = Regex::new(r"^\| `([A-Z0-9_]+)` \| (.*?) \|").unwrap();
-    let esc_pipe = Regex::new(r"\\+\|").unwrap();
-    for line in text.lines() {
-        if let Some(caps) = row.captures(line) {
-            let name = caps[1].to_string();
-            let desc = esc_pipe.replace_all(caps[2].trim(), "|").to_string();
-            out.insert(name, desc);
-        }
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
 fn infer_default(
-    existing_desc: Option<&str>,
     var: &str,
     cands: &[String],
     line: &str,
@@ -671,12 +648,6 @@ fn infer_default(
     line_idx: usize,
     usage_source: &str,
 ) -> String {
-    if let Some(d) = existing_desc {
-        if is_helpful_description(d) {
-            return normalize_description(d);
-        }
-    }
-
     let mut ranked: Vec<(usize, &String)> = cands
         .iter()
         .filter(|c| is_helpful_description(c))
@@ -800,12 +771,18 @@ fn rustfmt(src: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-fn check_file(path: &Path, expected: &[u8], stale: &mut Vec<String>) {
-    let matches = std::fs::read(path)
-        .map(|got| got == expected)
-        .unwrap_or(false);
-    if !matches {
-        stale.push(path.display().to_string());
+/// Record `path` as stale unless it matches freshly generated `expected`.
+///
+/// `required` separates the two outputs. `env_docs.rs` is tracked, so a missing
+/// file is real drift. `docs/env-vars.md` is generated and gitignored, so its
+/// absence is the normal state of a clean checkout — but if it is present it
+/// still has to match, or a stale local copy would quietly mislead whoever read
+/// it. Only `NotFound` is forgiven; an unreadable file is still a failure.
+fn check_file(path: &Path, expected: &[u8], required: bool, stale: &mut Vec<String>) {
+    match std::fs::read(path) {
+        Ok(got) if got == expected => {}
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => stale.push(path.display().to_string()),
     }
 }
 
@@ -831,4 +808,36 @@ fn coverage_gaps(root: &Path, markdown: &str) -> Vec<(String, String)> {
         }
     }
     missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_file;
+
+    /// A missing optional file is not drift, but a missing required one is —
+    /// the distinction the `--check` gate rests on. Present-and-different stays
+    /// stale either way.
+    #[test]
+    fn absent_optional_output_is_not_drift() {
+        let dir = std::env::temp_dir().join(format!("hipfire-env-docs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let absent = dir.join("absent.md");
+        let present = dir.join("present.md");
+        std::fs::write(&present, b"stale").expect("write the scratch file");
+
+        let mut stale = Vec::new();
+        check_file(&absent, b"fresh", false, &mut stale);
+        assert!(stale.is_empty(), "an absent generated file is not drift");
+
+        check_file(&absent, b"fresh", true, &mut stale);
+        assert_eq!(stale.len(), 1, "an absent tracked file is drift");
+
+        check_file(&present, b"fresh", false, &mut stale);
+        assert_eq!(stale.len(), 2, "a present file must still match");
+
+        check_file(&present, b"stale", false, &mut stale);
+        assert_eq!(stale.len(), 2, "a matching file is never drift");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

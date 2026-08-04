@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 pub mod boundary;
 pub mod contracts;
+pub mod layer_stream;
 pub mod expert_capture;
 pub mod residual_probe;
 pub mod schedule;

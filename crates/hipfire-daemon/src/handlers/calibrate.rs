@@ -156,6 +156,242 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     }
 }
 
+/// Translate a `calibrate` JSON request into the exact CLI argument vector the
+/// daemon-free path parses, so `CalibrateCommand::parse` — and therefore every
+/// downstream option, geometry, and fingerprint — is byte-identical to the CLI.
+/// Only `model`, `corpus`, and `output` are required; everything else falls back
+/// to the same parser defaults the CLI uses.
+fn calibrate_args_from_msg(msg: &serde_json::Value) -> Result<Vec<String>, String> {
+    let mut a: Vec<String> = Vec::new();
+    for (flag, key) in [("--model", "model"), ("--corpus", "corpus"), ("--output", "output")] {
+        let v = msg
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("calibrate: missing '{key}'"))?;
+        a.push(flag.to_string());
+        a.push(v.to_string());
+    }
+    // Numeric passthroughs, one CLI flag each.
+    for (flag, key) in [
+        ("--sequences", "sequences"),
+        ("--context", "context"),
+        ("--sampling-seed", "sampling_seed"),
+        ("--max-rows", "max_rows"),
+        ("--min-expert-activations", "min_expert_activations"),
+        ("--expert-capture-target", "expert_capture_target"),
+        ("--expert-capture-tile-rows", "expert_capture_tile_rows"),
+        ("--kldref-topk", "kldref_topk"),
+        ("--kldref-rows", "kldref_rows"),
+        ("--layer-prefetch-bytes", "layer_prefetch_bytes"),
+        ("--pause-after-layers", "pause_after_layers"),
+        ("--residual-probe-rows", "residual_probe_rows"),
+    ] {
+        if let Some(n) = msg.get(key).and_then(|v| v.as_u64()) {
+            a.push(flag.to_string());
+            a.push(n.to_string());
+        }
+    }
+    if let Some(x) = msg.get("required_expert_fraction").and_then(|v| v.as_f64()) {
+        a.push("--required-expert-fraction".to_string());
+        a.push(x.to_string());
+    }
+    // `auto` or an integer.
+    for (flag, key) in [("--sequence-batch", "sequence_batch"), ("--time-tile", "time_tile")] {
+        if let Some(s) = msg.get(key).and_then(|v| v.as_str()) {
+            a.push(flag.to_string());
+            a.push(s.to_string());
+        } else if let Some(n) = msg.get(key).and_then(|v| v.as_u64()) {
+            a.push(flag.to_string());
+            a.push(n.to_string());
+        }
+    }
+    // String passthroughs.
+    for (flag, key) in [
+        ("--expert-coverage-policy", "expert_coverage_policy"),
+        ("--boundary-dir", "boundary_dir"),
+        ("--residual-probe-output", "residual_probe_output"),
+    ] {
+        if let Some(s) = msg.get(key).and_then(|v| v.as_str()) {
+            a.push(flag.to_string());
+            a.push(s.to_string());
+        }
+    }
+    // Boolean toggles: mapped to the parser's paired flags only when present, so
+    // an omitted field keeps the parser default (kldref on, resume on).
+    if let Some(k) = msg.get("kldref").and_then(|v| v.as_bool()) {
+        a.push(if k { "--kldref" } else { "--no-kldref" }.to_string());
+    }
+    if let Some(r) = msg.get("resume").and_then(|v| v.as_bool()) {
+        a.push(if r { "--resume" } else { "--no-resume" }.to_string());
+    }
+    if msg.get("boundary_ram").and_then(|v| v.as_bool()).unwrap_or(false) {
+        a.push("--boundary-ram".to_string());
+    }
+    Ok(a)
+}
+
+pub(crate) fn calibrate(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
+    use hipfire_runtime::calibration::layer_stream::{
+        CalibrateCommand, CalibrationStep, DaemonCalibration, DaemonCalibrationStart,
+    };
+
+    let run_id = msg
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // CONTINUE the resident session iff its run_id matches; else START fresh
+    // (parse the request into the same CalibrateCommand the CLI parses, then
+    // `begin`, which runs planning + the embedding pass on this first turn).
+    let continue_run = !run_id.is_empty()
+        && daemon_state
+            .calibrate_session
+            .as_ref()
+            .map(|s| s.run_id == run_id)
+            .unwrap_or(false);
+    if !continue_run {
+        daemon_state.calibrate_session = None; // drop any stale session, free VRAM
+        let args = match calibrate_args_from_msg(msg) {
+            Ok(a) => a,
+            Err(e) => {
+                daemon_state.out.error(e);
+                return;
+            }
+        };
+        let command = match CalibrateCommand::parse(&args) {
+            Ok(c) => c,
+            Err(e) => {
+                daemon_state.out.error(format!("calibrate: {e}"));
+                return;
+            }
+        };
+        daemon_state.out.emit(serde_json::json!({
+            "type": "calibrate_start",
+            "run_id": run_id,
+            "output": command_output(&args),
+        }));
+        // No `acquire_gpu_lock` here: the daemon already holds the single
+        // process-lifetime GPU lease (unlike the daemon-free CLI, which self-locks).
+        match DaemonCalibration::begin(&command, &mut daemon_state.gpu) {
+            Ok(DaemonCalibrationStart::Complete(result)) => {
+                // A prior completed artifact was recovered before any layer work.
+                daemon_state.out.emit(serde_json::json!({
+                    "type": "calibrate_done",
+                    "run_id": run_id,
+                    "status": "complete",
+                    "artifact": result.artifact_path,
+                    "family": result.model.family,
+                    "layers": result.model.num_layers,
+                    "hessian_tensors": result.artifact.n_hessian,
+                    "imatrix_tensors": result.artifact.n_imatrix,
+                    "max_consistency": result.artifact.max_consistency,
+                    "recovered": true,
+                    "done": true,
+                }));
+                return;
+            }
+            Ok(DaemonCalibrationStart::Session(session)) => {
+                daemon_state.calibrate_session = Some(CalibrateDaemonSession {
+                    run_id: run_id.clone(),
+                    session,
+                });
+            }
+            Err(e) => {
+                daemon_state.out.error(format!("calibrate: {e}"));
+                return;
+            }
+        }
+    }
+
+    // Run ONE layer — the calibration quantum, one GPU turn — on the resident
+    // session, then either park it (Advanced) or finalize it (LayersComplete /
+    // Paused). Split the &mut borrow of the session apart from &mut gpu.
+    let step = {
+        let sess = daemon_state
+            .calibrate_session
+            .as_mut()
+            .expect("session present after start/return");
+        sess.session.step(&mut daemon_state.gpu)
+    };
+    match step {
+        Ok(CalibrationStep::Advanced) => {
+            let sess = daemon_state
+                .calibrate_session
+                .as_ref()
+                .expect("advanced implies present");
+            daemon_state.out.emit(serde_json::json!({
+                "type": "calibrate_progress",
+                "run_id": sess.run_id,
+                "completed_layers": sess.session.completed_layers(),
+                "total_layers": sess.session.num_layers(),
+                "family": sess.session.family(),
+                "done": false,
+            }));
+        }
+        Ok(CalibrationStep::Paused) => {
+            // A `--pause-after-layers` boundary: consume the session, drop the
+            // parked state, and report a resumable pause (terminal for this run_id).
+            let sess = daemon_state
+                .calibrate_session
+                .take()
+                .expect("paused implies present");
+            let CalibrateDaemonSession { run_id, session } = sess;
+            let output = session.output().to_path_buf();
+            let paused = session.into_paused();
+            daemon_state.out.emit(serde_json::json!({
+                "type": "calibrate_paused",
+                "run_id": run_id,
+                "status": "paused",
+                "artifact": serde_json::Value::Null,
+                "intended_artifact": output,
+                "family": paused.model.family,
+                "layers": paused.model.num_layers,
+                "completed_layers": paused.boundary_checkpoint.completed_layers,
+                "resume_required": true,
+                "done": true,
+            }));
+        }
+        Ok(CalibrationStep::LayersComplete) => {
+            // All layers committed: consume the session and run the KLD
+            // finalizer + artifact assembly, then emit the terminal event.
+            let sess = daemon_state
+                .calibrate_session
+                .take()
+                .expect("complete implies present");
+            let CalibrateDaemonSession { run_id, session } = sess;
+            match session.finish(&mut daemon_state.gpu) {
+                Ok(result) => daemon_state.out.emit(serde_json::json!({
+                    "type": "calibrate_done",
+                    "run_id": run_id,
+                    "status": "complete",
+                    "artifact": result.artifact_path,
+                    "family": result.model.family,
+                    "layers": result.model.num_layers,
+                    "hessian_tensors": result.artifact.n_hessian,
+                    "imatrix_tensors": result.artifact.n_imatrix,
+                    "max_consistency": result.artifact.max_consistency,
+                    "kldref_positions": result.kldref_positions,
+                    "done": true,
+                })),
+                Err(e) => daemon_state.out.error(format!("calibrate: {e}")),
+            }
+        }
+        Err(e) => {
+            daemon_state.calibrate_session = None;
+            daemon_state.out.error(format!("calibrate: {e}"));
+        }
+    }
+}
+
+/// The `--output` value from an already-built arg vector, for the start frame.
+fn command_output(args: &[String]) -> Option<&str> {
+    args.iter()
+        .position(|a| a == "--output")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
 pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
     let corpus = msg.get("corpus").and_then(|v| v.as_str()).map(String::from);

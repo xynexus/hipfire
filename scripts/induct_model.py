@@ -907,8 +907,20 @@ def main() -> None:
         parser.error("--sampling-seed must be nonnegative")
 
     target = resolve_hf_snapshot(args.target)
-    draft = resolve_hf_snapshot(args.dflash_source) if args.dflash_source is not None else None
-    preflight = preflight_sources(target, draft)
+    if "dflash" in selected and args.dflash_source is not None:
+        draft = resolve_hf_snapshot(args.dflash_source)
+        preflight = preflight_sources(target, draft)
+    else:
+        # The DFlash draft (and its target/draft compatibility contract) is
+        # irrelevant when the dflash stage is not selected, or when no source was
+        # given. Skip resolving and preflighting it so target-only and
+        # triattn-only inductions work for models that have no matching DFlash
+        # draft. `draft` is only referenced by the (unselected) dflash command,
+        # so aliasing it to target keeps unconditional command construction safe
+        # (a bare None would be formatted into the argv). The None-aware
+        # `preflight_sources` from master subsumes `preflight_target_only`.
+        draft = target
+        preflight = preflight_sources(target, None)
     artifact_root = args.artifact_root.expanduser().resolve()
     model_dir = args.model_dir.expanduser().resolve()
     if args.dflash_formats and draft is None:
