@@ -130,11 +130,31 @@ a win rather than a trade.
 `cargo run --release -p hipfire-runtime --example bench_lmhead_dtype`, at the
 real 128256 x 2048 shape, 30 iterations on gfx1151:
 
-| path | per call | achieved | tok/s if head-bound |
-|---|---|---|---|
-| **BF16 via `gemv_bf16_f32`** | **3.18 ms** | 165.5 GB/s | **315.0** |
-| F32 via `gemv_f32` | 5.28 ms | 199.2 GB/s | 189.6 |
-| BF16 via `gemm_bf16_x_bf16_wmma(batch=1)` | 14.97 ms | 35.1 GB/s | 66.8 |
+| path | per call | achieved | tok/s if head-bound | argmax vs F32 | worst diff |
+|---|---|---|---|---|---|
+| **BF16 via `gemv_bf16_f32`** | **3.20 ms** | 164.1 GB/s | **312.3** | OK | 1.16e-3 |
+| F32 via `gemv_f32` | 5.22 ms | 201.3 GB/s | 191.6 | reference | — |
+| BF16 via `gemm_bf16_x_bf16_wmma(batch=1)` | 14.89 ms | 35.3 GB/s | 67.2 | OK | 1.16e-3 |
+
+Both BF16 paths land at the same 1.16e-3 worst deviation against the F32
+reference on a 0.284 magnitude — that is bf16 mantissa rounding, identical for
+the two, and the decoded token is unchanged.
+
+**The correctness column is not decoration.** The first run of this benchmark
+recommended `gemv_bf16_f32` on speed alone, and it was producing garbage: worst
+|diff| 5.8e8 and a different argmax. The cause was a caller error, not a kernel
+bug — `gemm_bf16_x_bf16_wmma` asserts an **F32** activation and stages it to
+bf16 internally, while `gemv_bf16_f32` wants a **BF16** activation already (its
+`x` is `const unsigned short*`). Passing the F32 buffer reads float bytes as
+bf16 pairs. The two contracts differ, and mixing them yields wrong numbers
+rather than an error. Timing was unchanged between the broken and fixed runs
+(3.199 vs 3.202 ms), so the bad run was not fast by skipping work — speed alone
+would never have exposed it.
+
+That contract is also the one real cost of wiring this in: runtime activations
+are F32, so the path needs an x -> bf16 staging step. It is 2048 elements
+against a 128256 x 2048 weight read, and the WMMA path already does exactly
+this internally.
 
 Two conclusions, and the first corrects this document's own earlier advice.
 

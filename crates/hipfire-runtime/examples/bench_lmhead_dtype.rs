@@ -63,9 +63,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut w_bf16 = gpu.upload_raw(&f32_to_bf16_bytes(&w), &[vocab, hidden])?;
     w_bf16.dtype = DType::BF16;
     let x_f32 = gpu.upload_f32(&x, &[hidden])?;
-    // Activations stay F32: gemm_bf16_x_bf16_wmma stages them to BF16 itself,
-    // and asserts F32 on the way in — same as the real weight_gemv call site.
+    // Two different activation contracts, and mixing them up yields garbage
+    // rather than an error: gemm_bf16_x_bf16_wmma asserts F32 in and stages to
+    // BF16 itself, while gemv_bf16_f32 wants BF16 already (its x is
+    // `const unsigned short*`). Feeding it the F32 buffer reads float bytes as
+    // bf16 pairs — worst |diff| 5.8e8 against a magnitude of 0.284.
+    let mut x_bf16 = gpu.upload_raw(&f32_to_bf16_bytes(&x), &[hidden])?;
+    x_bf16.dtype = DType::BF16;
     let y = gpu.zeros(&[vocab], DType::F32)?;
+
+    // Correctness BEFORE speed: a faster kernel that disagrees is worthless,
+    // and the whole recommendation here is "switch the lm_head to this path".
+    // bf16 has ~8 mantissa bits, so exact equality is not the bar; what matters
+    // is that the ARGMAX (the decoded token) and the top of the distribution
+    // agree with the f32 reference.
+    gpu.gemv_f32(&w_f32, &x_f32, &y)?;
+    let ref_y = gpu.download_f32(&y)?;
+    gpu.gemv_bf16_f32(&w_bf16, &x_bf16, &y, vocab, hidden)?;
+    let bf_y = gpu.download_f32(&y)?;
+    gpu.gemm_bf16_x_bf16_wmma(&w_bf16, &x_f32, &y, vocab, hidden, 1)?;
+    let wm_y = gpu.download_f32(&y)?;
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let mag = ref_y.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let a_ref = argmax(&ref_y);
+    for (label, v) in [("gemv_bf16_f32", &bf_y), ("gemm_wmma", &wm_y)] {
+        let worst = ref_y
+            .iter()
+            .zip(v.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let am = argmax(v);
+        println!(
+            "  {:<22} argmax {} vs f32 {} {}  worst |diff| {:.3e} (rel {:.2e}, mag {:.3})",
+            label,
+            am,
+            a_ref,
+            if am == a_ref { "OK" } else { "MISMATCH" },
+            worst,
+            worst / mag.max(1e-9),
+            mag
+        );
+    }
+    println!();
 
     // Straight-line timing: no closures, so no GpuTensor clones.
     for _ in 0..3 {
@@ -95,12 +140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the dispatch family run_auto consults, which is what forces the WMMA
     // special case above.
     for _ in 0..3 {
-        gpu.gemv_bf16_f32(&w_bf16, &x_f32, &y, vocab, hidden)?;
+        gpu.gemv_bf16_f32(&w_bf16, &x_bf16, &y, vocab, hidden)?;
     }
     gpu.hip.device_synchronize()?;
     let t = Instant::now();
     for _ in 0..iters {
-        gpu.gemv_bf16_f32(&w_bf16, &x_f32, &y, vocab, hidden)?;
+        gpu.gemv_bf16_f32(&w_bf16, &x_bf16, &y, vocab, hidden)?;
     }
     gpu.hip.device_synchronize()?;
     let t_bf16_gemv = t.elapsed().as_secs_f64() / iters as f64;
