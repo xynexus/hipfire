@@ -120,6 +120,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "plain w"
         }
     );
+    // An untied head must be loaded; scoring through the embedding when the
+    // artifact ships a separate lm_head compares against an unrelated matrix.
+    let lm_head =
+        hipfire_train::loader::load_lm_head_f32(&mut gpu, src, prefix, cfg.vocab_size, h)?;
+    eprintln!(
+        "head: {}",
+        match &lm_head {
+            Some(_) => "UNTIED lm_head.weight",
+            None => "tied (the head IS the embedding)",
+        }
+    );
     let final_norm =
         hipfire_train::loader::load_final_norm_f32(&mut gpu, src, prefix, h, unit_offset)?;
 
@@ -210,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg,
         &dims,
         &embed,
-        None, // tie_word_embeddings: the head IS the embedding
+        lm_head.as_ref(),
         &final_norm,
         &tokens,
         &pos,

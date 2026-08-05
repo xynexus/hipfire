@@ -315,6 +315,39 @@ projection is exact — `out_dim` 8192 worst 3.8e-6 against magnitude 26.8, 4096
 worst 2.9e-6, the two 32-wide ones ~1e-6. So the GEMM path is not
 dimension-sensitive and is eliminated.
 
+## SOLVED: the harness scored the 35B through the wrong head
+
+The 35B ships an **untied `lm_head.weight`**. `gamma_hybrid` hardcoded
+`None, // tie_word_embeddings: the head IS the embedding` and scored every
+model through its embedding matrix.
+
+The 35B's `lm_head` correlates with its own embedding at **0.025** — they are
+unrelated matrices. That number is the answer: every "orthogonal at one token"
+measurement in this document, cos 0.0144 / -0.0382 / -0.0655, was the walk's
+layer output projected through the wrong matrix. The layer math was never
+wrong.
+
+With `load_lm_head_f32` loading the untied head when the artifact has one:
+
+| testbed | before | after |
+|---|---|---|
+| Qwen3.5-0.8B, 1 layer (tied) | +1.0000 | +0.999993 |
+| qwen3_5_moe-tiny, 1 layer (tied) | +1.0000 | +0.999978 |
+| GQA fixture n_k=1<n_v=2 (tied) | +1.0000 | +0.999982 |
+| **35B, 1 layer (UNTIED)** | **-0.0382** | **+0.999990** |
+
+‖mine‖ 883.60 against ‖ref‖ 884.18.
+
+Why every control passed and only the 35B failed: the 0.8B and both tiny
+fixtures tie their heads, so for them "the head IS the embedding" was true and
+the hardcoded `None` was correct. The 35B is the only artifact in reach with an
+untied head, and the assumption was written as a comment asserting a fact
+rather than as a lookup.
+
+Note also that the name needs trying with AND without the model prefix — the
+35B stores `model.language_model.embed_tokens.weight` but a bare
+`lm_head.weight`.
+
 ## RETRACTED: GQA is not the defect
 
 The section below concluded, by elimination, that `n_k < n_v` was the defect,

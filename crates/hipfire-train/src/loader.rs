@@ -566,6 +566,36 @@ pub fn load_embed_f32<S: WeightSource + ?Sized>(
     )
 }
 
+/// Load an UNTIED output head, if the artifact has one.
+///
+/// Returns `None` when the model ties the head to the embedding, which is the
+/// common case for small Qwen3.5 models and for both tiny fixtures. Getting
+/// this wrong is silent and catastrophic: a model with an untied head that is
+/// scored through its embedding produces logits from an unrelated matrix, so
+/// the output is orthogonal to the truth rather than merely inaccurate. The
+/// 35B's `lm_head` correlates with its own embedding at 0.025.
+///
+/// The name is tried both with and without the model prefix because artifacts
+/// disagree: the 35B stores `model.language_model.embed_tokens.weight` but a
+/// bare `lm_head.weight`.
+pub fn load_lm_head_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    vocab: usize,
+    h: usize,
+) -> Result<Option<GpuTensor>, String> {
+    for name in [
+        format!("{prefix}lm_head.weight"),
+        "lm_head.weight".to_string(),
+    ] {
+        if src.has(&name) {
+            return Ok(Some(upload_tensor(gpu, src, &name, &[vocab, h])?));
+        }
+    }
+    Ok(None)
+}
+
 /// Load the final RMSNorm weight as fp32 from any weight source.
 pub fn load_final_norm_f32<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
