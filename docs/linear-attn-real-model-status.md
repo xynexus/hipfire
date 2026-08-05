@@ -315,8 +315,38 @@ projection is exact — `out_dim` 8192 worst 3.8e-6 against magnitude 26.8, 4096
 worst 2.9e-6, the two 32-wide ones ~1e-6. So the GEMM path is not
 dimension-sensitive and is eliminated.
 
-**So linear_attn is eliminated as the 35B defect.** Projections, conv, the
-norms, the activations, the repeat, and the recurrence are all the inference
+## The defect is GQA linear attention, and nothing else
+
+Two controls settle it. The 1-layer testbed methodology had only ever been
+validated at FOUR layers on the 0.8B, so the harness itself was unproven at the
+size everything was being measured at. Running it at one layer:
+
+| testbed | layer 0 | n_k / n_v | cos | ‖mine‖ | ‖ref‖ |
+|---|---|---|---|---|---|
+| Qwen3.5-0.8B, 1 layer | linear_attn + dense | 16 / 16 | **+1.0000** | 1296.98 | 1297.17 |
+| Qwen3.5-0.8B, 4 layers | linear_attn + dense | 16 / 16 | +1.0000 | 1159.65 | 1159.64 |
+| qwen3_5_moe-tiny, 1 layer | linear_attn + **MoE** | 2 / 2 | **+1.0000** | 58.67 | 58.68 |
+| qwen3_5_moe-tiny, 4 layers | linear_attn + MoE | 2 / 2 | +0.9990 | 58.54 | 58.52 |
+| **35B, 1 layer** | linear_attn + MoE | **16 / 32** | **-0.0382** | 689.11 | 884.18 |
+
+The first row proves the harness is sound at one layer, so the 35B failure is
+real. The third proves a full MoE layer — router, 8 experts, shared branch,
+top-2 — reproduces exactly through the same harness, so the MoE is not the
+defect.
+
+What is left is the one structural feature neither passing testbed has:
+**n_k < n_v**. Both controls run n_k == n_v, the 35B is the only GQA linear-attn
+model in reach, and it is the only failure. Every earlier component check ran
+GQA geometry through MY OWN call, with my own k_dim/v_dim and my own repeat —
+which is why they all passed. The runtime's own k_dim agrees
+(`linear_num_key_heads * linear_key_head_dim`, prefill_batch.rs:2058), so the
+split offsets are not it; what remains untested is the PLACEMENT of the repeat
+within the runtime's pipeline relative to mine.
+
+(Superseded in scope by the section above: linear_attn's COMPONENTS are each
+the inference path's at 35B dimensions, but the GQA repeat's placement in the
+pipeline is an integration question no component check reaches.) Projections,
+conv, the norms, the activations, and the recurrence are all the inference
 path's, at the inference path's dimensions. Since the embedding and the head
 were already exact at 35B scale, what remains inside the layer is the MoE
 branch and the residual/norm plumbing around it — and the MoE has only ever
