@@ -1316,6 +1316,23 @@ pub fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
     Ok(())
 }
 
+/// Model-level gate for the fused **dense** prefill-session batch body.
+///
+/// This is the same weights contract the fused kernel enforces internally,
+/// hoisted to backend-selection time so an ineligible model routes to
+/// `SerialReference` instead of reaching the kernel. Mirrors
+/// [`validate_qwen35_fused_grouped_moe_prefill_model_capability`] above and
+/// `validate_qwen35_fused_dense_decode_model_capability` on the decode side,
+/// which already consults the same contract.
+pub fn validate_qwen35_fused_dense_prefill_model_capability(m: &LoadedModel) -> Result<(), String> {
+    let weights = m
+        .q35_weights
+        .as_ref()
+        .ok_or_else(|| "qwen35 fused dense prefill requires qwen35 weights".to_string())?;
+    qwen35::validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
+        .map_err(|e| format!("qwen35 fused dense prefill unsupported weights: {e}"))
+}
+
 /// Make the requested worker the active one, parking whatever was active first
 /// — the single-resident-slot worker swap.
 pub fn activate_model_worker(

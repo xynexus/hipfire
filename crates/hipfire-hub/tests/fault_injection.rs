@@ -226,6 +226,7 @@ async fn wrong_bytes_are_rejected_and_nothing_is_committed() {
         path: "model.safetensors".into(),
         size: 64 * 1024,
         sha256: Some(promised.clone()),
+        git_oid: None,
     };
     let err = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store)
         .await
@@ -253,6 +254,7 @@ async fn truncated_body_fails_and_is_not_committed() {
         path: "model.safetensors".into(),
         size: 256 * 1024,
         sha256: Some(sha.clone()),
+        git_oid: None,
     };
     let err = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store)
         .await
@@ -278,6 +280,7 @@ async fn dropped_connection_resumes_and_verifies() {
         path: "model.safetensors".into(),
         size: body.len() as u64,
         sha256: Some(sha.clone()),
+        git_oid: None,
     };
 
     // First attempt drops partway and must keep the partial for resume.
@@ -316,6 +319,7 @@ async fn corrupt_partial_is_not_spliced_into_a_valid_file() {
         path: "model.safetensors".into(),
         size: 256 * 1024,
         sha256: Some(sha.clone()),
+        git_oid: None,
     };
     let err = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store)
         .await
@@ -344,6 +348,7 @@ async fn origin_ignoring_range_restarts_instead_of_appending() {
         path: "model.safetensors".into(),
         size: body.len() as u64,
         sha256: Some(sha.clone()),
+        git_oid: None,
     };
     let blob = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store)
         .await
@@ -364,6 +369,7 @@ fn preflight_refuses_when_the_fetch_cannot_fit() {
         path: "model.safetensors".into(),
         size: u64::MAX / 4,
         sha256: None,
+        git_oid: None,
     };
     let err = hipfire_hub::preflight(&[huge], fx.store.dir(), 0)
         .expect_err("an impossible fetch must be refused up front");
@@ -387,4 +393,76 @@ fn stale_parts_are_swept_without_touching_blobs() {
         "sweeping removed a committed blob"
     );
     assert!(!blobs.join(".model.safetensors.0.part").exists());
+}
+
+
+/// A partial left by a process that has died must be picked up, not discarded.
+///
+/// This is the gap the suite had: every other case here exercises a transport
+/// fault *within one run*, so a bug in what survives across runs went
+/// unnoticed. PID-scoping the partial gave concurrency safety and silently
+/// removed the ability to resume after an interruption — a killed 7 GB fetch
+/// left 0.18 GB that the next run could neither see nor use, and would have
+/// swept as litter.
+#[test]
+fn a_dead_runs_partial_is_adopted_rather_than_discarded() {
+    let fx = fixture("orphan");
+    let blobs = fx.store.dir().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+
+    // A partial tagged with a pid that is not running. Named the way the
+    // previous run would have named it.
+    let orphan = blobs.join(".model.safetensors.999999.part");
+    std::fs::write(&orphan, vec![7u8; 8192]).unwrap();
+
+    let adopted = fx.store.adopt_orphan_parts().expect("adopt");
+    assert_eq!(adopted, 8192, "the interrupted run's progress was not recovered");
+
+    let mine = fx.store.part_path("model.safetensors");
+    assert!(mine.exists(), "the partial was not claimed by this run");
+    assert_eq!(std::fs::read(&mine).unwrap().len(), 8192);
+    assert!(!orphan.exists(), "the orphan was left behind as well as copied");
+}
+
+/// A partial belonging to a *live* process must be left strictly alone, or the
+/// concurrency safety that pid-scoping exists for is gone.
+#[test]
+fn a_live_runs_partial_is_never_stolen() {
+    let fx = fixture("livepart");
+    let blobs = fx.store.dir().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+
+    // This process is alive by definition, and is not us only in the sense
+    // that the name is built by hand — using our own pid proves the guard
+    // covers the self case too.
+    let live = blobs.join(format!(".other.safetensors.{}.part", std::process::id()));
+    std::fs::write(&live, vec![3u8; 4096]).unwrap();
+
+    let adopted = fx.store.adopt_orphan_parts().expect("adopt");
+    assert_eq!(adopted, 0, "a live process's partial was taken");
+    assert!(live.exists(), "a live process's partial was removed");
+
+    let freed = fx.store.sweep_stale_parts().expect("sweep");
+    assert_eq!(freed, 0, "a live process's partial was swept");
+    assert!(live.exists());
+}
+
+/// Adoption must not lose ground: if this run already got further than the
+/// orphan did, keep the better one.
+#[test]
+fn adoption_keeps_whichever_partial_got_further() {
+    let fx = fixture("further");
+    let blobs = fx.store.dir().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+
+    let mine = fx.store.part_path("model.safetensors");
+    std::fs::write(&mine, vec![1u8; 9000]).unwrap();
+    std::fs::write(blobs.join(".model.safetensors.999999.part"), vec![2u8; 1000]).unwrap();
+
+    fx.store.adopt_orphan_parts().expect("adopt");
+    assert_eq!(
+        std::fs::metadata(&mine).unwrap().len(),
+        9000,
+        "a shorter orphan overwrote this run's longer partial"
+    );
 }

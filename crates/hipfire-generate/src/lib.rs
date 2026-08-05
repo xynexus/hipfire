@@ -1383,12 +1383,22 @@ pub fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
 pub fn select_qwen35_prefill_batch_backend(
     plan: GenerateBatchPrefillPlan,
     requested: Option<&str>,
+    fused_dense_supported: Result<(), String>,
     fused_grouped_moe_supported: Result<(), String>,
 ) -> Result<Qwen35PrefillBatchBackend, String> {
     match requested.unwrap_or("auto") {
         "auto" | "" => match plan {
             GenerateBatchPrefillPlan::FusedDenseQwen35Candidate => {
-                Ok(Qwen35PrefillBatchBackend::FusedDense)
+                // Same shape as the grouped-MoE arm below: a model the fused
+                // dense body can't compute (AWQ pre-scaled weights, unsupported
+                // dtype) routes to serial rather than reaching the kernel and
+                // failing — or, before the awq_scale guard, silently computing
+                // the wrong thing.
+                if fused_dense_supported.is_ok() {
+                    Ok(Qwen35PrefillBatchBackend::FusedDense)
+                } else {
+                    Ok(Qwen35PrefillBatchBackend::SerialReference)
+                }
             }
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate => {
                 if fused_grouped_moe_supported.is_ok() {
@@ -1402,6 +1412,7 @@ pub fn select_qwen35_prefill_batch_backend(
         "serial" | "serial_reference" => Ok(Qwen35PrefillBatchBackend::SerialReference),
         "fused" | "fused_dense" => {
             if plan == GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
+                fused_dense_supported?;
                 Ok(Qwen35PrefillBatchBackend::FusedDense)
             } else if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
                 fused_grouped_moe_supported?;
@@ -2454,6 +2465,7 @@ mod tests {
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
                 None,
+                Ok(()),
                 Ok(())
             )
             .unwrap(),
@@ -2463,6 +2475,7 @@ mod tests {
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
                 None,
+                Ok(()),
                 Err("capability missing".to_string())
             )
             .unwrap(),
@@ -2472,6 +2485,7 @@ mod tests {
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
                 Some("fused"),
+                Ok(()),
                 Ok(())
             )
             .unwrap(),
@@ -2480,10 +2494,36 @@ mod tests {
         assert!(select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::SerialExact,
             Some("fused_grouped_moe"),
+            Ok(()),
             Ok(())
         )
         .unwrap_err()
         .contains("grouped-MoE eligible"));
+    }
+
+    /// A dense-plan model the fused body cannot compute (AWQ pre-scaled weights,
+    /// unsupported dtype) must route to serial under `auto` and fail loudly when
+    /// fused is requested explicitly — never reach the kernel.
+    #[test]
+    fn qwen35_prefill_dense_falls_back_when_fused_dense_unsupported() {
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+                None,
+                Err("awq_scale sidecar".to_string()),
+                Ok(())
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::SerialReference
+        );
+        assert!(select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+            Some("fused"),
+            Err("awq_scale sidecar".to_string()),
+            Ok(())
+        )
+        .unwrap_err()
+        .contains("awq_scale sidecar"));
     }
 
     #[test]

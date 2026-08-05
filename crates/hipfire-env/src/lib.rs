@@ -123,6 +123,31 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// `HF_HUB_CACHE` — HuggingFace's hub cache directory, or `None` when unset or
+/// empty.
+///
+/// Same reasoning as [`home_dir`]: a HuggingFace variable is not a hipfire
+/// variable, so it does not belong in [`env_vars!`] (`HIPFIRE_`-prefixed by
+/// invariant) or in `hipfire help env`. But `clippy.toml` denies `std::env::var`
+/// workspace-wide, so a crate that resolves an HF cache path cannot opt into
+/// enforcement without a sanctioned reader. Precedence between this and
+/// [`hf_home`] is the caller's policy, not this crate's.
+#[allow(clippy::disallowed_methods)]
+pub fn hf_hub_cache() -> Option<std::path::PathBuf> {
+    std::env::var_os("HF_HUB_CACHE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// `HF_HOME` — HuggingFace's home directory, or `None` when unset or empty.
+/// The hub cache lives in its `hub/` subdirectory. See [`hf_hub_cache`].
+#[allow(clippy::disallowed_methods)]
+pub fn hf_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HF_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Declare env vars once; expand into constants **and** the [`ALL`] table.
 ///
 /// The two expansions are the point: a read site that names the constant and a

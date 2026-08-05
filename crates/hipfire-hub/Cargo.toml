@@ -14,6 +14,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 futures-util = "0.3"
 sha2 = "0.10"
+# Non-LFS files carry a git blob SHA-1 as their `oid`; without this they could
+# only be length-checked.
+sha1 = "0.10"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 libc = "0.2"

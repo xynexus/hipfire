@@ -96,18 +96,26 @@ impl From<reqwest::Error> for Error {
 pub struct RepoFile {
     pub path: String,
     pub size: u64,
-    /// LFS oid — a SHA-256 of the content. `None` for small non-LFS files,
-    /// which the hub does not give a content hash for.
+    /// LFS oid — a SHA-256 of the content. `None` for a small non-LFS file.
     pub sha256: Option<String>,
+    /// Git blob SHA-1, present for every file the tree API lists.
+    ///
+    /// For a non-LFS file this is the only content hash the hub offers, and it
+    /// is a real one: `sha1("blob <len>\0" + content)`. Verified against all 13
+    /// non-LFS files of amd/chatglm3-6b-onnx-ryzenai-npu, 13 matches, 0
+    /// mismatches. Treating those files as merely length-checkable left
+    /// integrity on the table.
+    pub git_oid: Option<String>,
 }
 
 impl RepoFile {
-    /// Whether this file can be proven correct, or only checked by length.
+    /// Whether the file can be proven correct at all.
     ///
-    /// Callers must report which of the two applied rather than implying a
-    /// stronger guarantee than was actually made.
+    /// Callers must report *which* hash applied rather than implying a stronger
+    /// guarantee than was made: SHA-256 over the content, or the weaker git
+    /// blob SHA-1.
     pub fn is_content_addressed(&self) -> bool {
-        self.sha256.is_some()
+        self.sha256.is_some() || self.git_oid.is_some()
     }
 }
 
@@ -159,10 +167,16 @@ pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
             .and_then(|l| l.get("oid"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let git_oid = e
+            .get("oid")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() == 40)
+            .map(|s| s.to_string());
         out.push(RepoFile {
             path: path.to_string(),
             size,
             sha256,
+            git_oid,
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -228,6 +242,24 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
+/// Git blob hash of a file already on disk: `sha1("blob <len>\0" + content)`.
+pub async fn git_blob_sha1_file(path: &Path) -> Result<String> {
+    use sha1::Digest as _;
+    let len = tokio::fs::metadata(path).await?.len();
+    let mut h = sha1::Sha1::new();
+    h.update(format!("blob {len}\0").as_bytes());
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -265,8 +297,8 @@ pub async fn fetch_file_from(
 ) -> Result<PathBuf> {
     // A content-addressed blob we already hold is already proven; there is
     // nothing to gain by fetching it again.
-    if let Some(sha) = &file.sha256 {
-        let blob = store.blob_path(sha);
+    if let Some(name) = file.sha256.as_deref().or(file.git_oid.as_deref()) {
+        let blob = store.blob_path(name);
         if blob.exists() {
             return Ok(blob);
         }
@@ -385,6 +417,31 @@ pub async fn fetch_file_from(
                 got,
             });
         }
+    } else if let Some(want) = &file.git_oid {
+        // No LFS digest, but the tree API's `oid` is a git blob hash and is
+        // verifiable. Length alone would accept a same-size wrong file.
+        use sha1::Digest as _;
+        let mut g = sha1::Sha1::new();
+        g.update(format!("blob {written}\0").as_bytes());
+        let mut rd = tokio::fs::File::open(&part).await?;
+        let mut buf = vec![0u8; 8 << 20];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut rd, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            g.update(&buf[..n]);
+        }
+        drop(rd);
+        let got_git = hex(&g.finalize());
+        if &got_git != want {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got: got_git,
+            });
+        }
     } else if file.size != 0 && written != file.size {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(Error::Fatal(format!(
@@ -393,7 +450,16 @@ pub async fn fetch_file_from(
         )));
     }
 
-    let final_path = store.blob_path(want.as_deref().unwrap_or(&got));
+    // Name the blob the way the HF cache does: the LFS sha256 when there is
+    // one, otherwise the git blob sha1 that serves as the etag. Naming a
+    // non-LFS blob by its content sha256 instead makes it invisible to every
+    // lookup that starts from the tree API, which is how this was found.
+    let blob_name = want
+        .as_deref()
+        .or(file.git_oid.as_deref())
+        .unwrap_or(&got)
+        .to_string();
+    let final_path = store.blob_path(&blob_name);
     if let Some(p) = final_path.parent() {
         tokio::fs::create_dir_all(p).await?;
     }
