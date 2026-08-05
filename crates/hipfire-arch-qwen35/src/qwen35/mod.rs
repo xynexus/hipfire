@@ -1984,6 +1984,24 @@ pub fn prefill_batch_pbs_eligible(
     // channel-tested. The scatter workspace supports at most 1024 experts.
     let moe_topk_ok =
         moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
+    // Why the batched prefill was declined. Without this the only outward sign
+    // is a per-token kernel histogram — measured 1279 dispatches/token on
+    // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
+    // eight conditions, so the histogram cannot say which one.
+    //
+    // Note the MoE-specific shape: a model with DeltaNetMoe/FullAttnMoe layers
+    // fails the `all(DeltaNet|FullAttn)` arm by construction, so for any MoE
+    // model batched prefill REQUIRES dn_state.quant == Q8.
+    if hipfire_rdna::kernel_trace::enabled() {
+        let all_dense_la = weights
+            .layers
+            .iter()
+            .all(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_)));
+        eprintln!(
+            "[kernel-trace] pbs_eligible inputs: force_fallback={force_fallback} n={n}              dn_quant={:?} all_layers_dense_la={all_dense_la} moe_topk_ok={moe_topk_ok}              (K={}, E={}) router_logits={moe_router_logits_present} arch={arch}",
+            dn_state.quant, config.num_experts_per_tok, config.num_experts
+        );
+    }
     !force_fallback
         && n >= MIN_BATCH
         && matches!(dn_state.quant, StateQuant::Q8 | StateQuant::FP32)

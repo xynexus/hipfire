@@ -802,6 +802,24 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         // a second dtoh sync per MoE layer.
         let mut path2_m_total: usize = 0;
         let path2_shape = moe_grouped_path2_shape(n, k_top, n_exp);
+        // Same reasoning as the FA gate: when the grouped path is declined the
+        // only outward sign is a GEMV-dominated histogram — measured 1279
+        // dispatches/token on Qwen3.6-35B-A3B, with MoE routing at one dispatch
+        // per token per layer. Name the reason instead.
+        if !path2_eligible && hipfire_rdna::kernel_trace::enabled() {
+            eprintln!(
+                "[kernel-trace] MoE grouped GEMM declined: expert_gate_up={:?} arch={}                  use_path2={} mixed={} experts_empty={} buckets={} n={} k_top={} n_exp={}",
+                dtypes.expert_gate_up,
+                gpu.arch,
+                use_path2,
+                dtypes.routed_profile.is_mixed(),
+                ffn.experts.is_empty(),
+                routed_expert_buckets.is_some(),
+                n,
+                k_top,
+                n_exp
+            );
+        }
         if routed_expert_buckets.is_some() && !path2_eligible {
             return Err(HipError::new(
                 0,
