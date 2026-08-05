@@ -1679,6 +1679,24 @@ impl HfqFile {
         &self.tensors
     }
 
+    /// The lossless recoding a tensor is STORED as, if any: `(quant_type,
+    /// packed byte length)`.
+    ///
+    /// `tensors()` reports the LOGICAL view — `expand_bf16_index` rewrites a
+    /// recoded entry's dtype and length at open, so a BF16L3-compressed tensor
+    /// reads as plain `BF16` there. That is right for anyone consuming values
+    /// and wrong for anyone asking what is on disk, which is what this answers.
+    /// `None` means the tensor is stored exactly as `tensors()` describes it.
+    ///
+    /// Indices match `tensors()`.
+    pub fn stored_recoding(&self, idx: usize) -> Option<(u8, usize)> {
+        self.bf16_packed
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|(qt, _off, size)| (qt, size))
+    }
+
     /// Whether this file supports the `O_DIRECT` GPU slab loader. True for a
     /// real file-backed HFQM; false for a safetensors-backed in-memory file
     /// (`from_safetensors`), whose bytes are spread across shards with no
