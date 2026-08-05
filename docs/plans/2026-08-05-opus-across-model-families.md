@@ -215,6 +215,26 @@ Sequence, cheapest-first:
    oracle's reference is the right one. The next step is per-op instrumentation
    — dump each op's output under both modes and diff — not more reading.
 
+   **The batched-LA admission gate is eliminated too, by hash this time.**
+   `is_batchable_la`'s `oq8_with_wmma` matches `Oq8G256` and not
+   `OqCompactG256`, so compact sits permanently in the state that
+   `HIPFIRE_OQ8_BATCHED_PREFILL=0` puts oq8 into — which made it the obvious
+   suspect. It is not: expanded with that flag set produces the EXACT default
+   expanded logit_hash (`0x9fec73050da8e72e`), so flipping the gate off changes
+   nothing for this probe and cannot be what compact does differently. (The
+   earlier wall-time observation said the same thing; this confirms it on the
+   quantity that actually matters.)
+
+   Running list of what is EXCLUDED, so nobody re-walks it: the GEMM kernels
+   (synthetic and real blocks, every (M, K) class), the per-group scales, the
+   host expander, the real block bytes, the FWHT rotation
+   (`rotate_x_mq_batched_for` branches on `awq_scale` only, never on dtype),
+   activation quantization (same function, same input, both paths), the
+   `is_batchable_la` gate, any single-op or single-projection story (all eight
+   classes diverge alone), and the `prefill_chunk` fallthrough (the guard never
+   fires). What survives is small and dtype-keyed; per-op instrumentation on the
+   LA layers is where to spend the next effort.
+
    **The GEMM is now eliminated with REAL data.** The synthetic oracle rested on
    two assumptions that had never been executed: that its local mirror of
    `oqplus_compact_to_oq8_combined` matches the real expander, and that real
