@@ -1,9 +1,32 @@
-# Wiring the BF16L3 lm_head — what is done, what is left
+# Wiring the BF16L3 lm_head — DONE
 
-`gemv_bf16l3_xf32` is committed and verified (1.917 ms against
-`gemv_bf16_xf32`'s 3.241 at 128256 x 2048, worst |diff| 2.570e-7, argmax
-identical). Nothing dispatches to it yet. This is the remaining plumbing, with
-the parts already established.
+**Landed.** This file was written as a plan; everything under "Left to do" is
+now implemented and measured. Kept because the "Established" notes below are
+still the quickest orientation, and because the `K % 256` constraint and the
+verification caveat still apply to anyone touching this.
+
+Result, on an artifact with quantized layers and a LUT3 embedding
+(`oq4` + `--bf16-codec lut3`), head 379.84 MB packed against 525.47 MB logical:
+
+| | pp512 | tg128 |
+|---|---|---|
+| `HIPFIRE_BF16L3_RESIDENT` off | 97.43 | 90.74 |
+| **on — packed head** | **111.17** | **102.53** |
+| | +14.1% | **+13.0%** |
+
+Generation byte-identical between the two.
+
+Cumulative over the whole chain on this path — F32 tied head -> BF16 tied head
+-> BF16L3 packed head — **76.07 -> 102.53 tg128, +34.8%**, output unchanged at
+every step. llama3.2:1b per-token traffic 1545.5 -> 871.1 MB, i.e. 2.00x FLM's
+772.3 MB down to **1.13x**.
+
+`gemv_bf16l3_xf32` itself: 1.917 ms against `gemv_bf16_xf32`'s 3.241 at
+128256 x 2048, worst |diff| 2.570e-7, argmax identical.
+
+**Still opt-in.** `HIPFIRE_BF16L3_RESIDENT` is unset by default, so the +13%
+needs the env var. Whether it should default on for artifacts whose head is
+LUT3 is an open decision.
 
 ## Established
 
@@ -26,20 +49,33 @@ while the embedding table is expanded for lookup — which is what the
 `HIPFIRE_BF16L3_RESIDENT` doc means by "a gather-read table ... will fail to
 load". That caveat constrains the EMBEDDING, not the head.
 
-## Left to do
+## What it took (all landed)
 
-1. **`DType::Bf16L3`** in `hipfire-gpu-types`. There is no variant today. Byte
-   length is not a simple stride, so anything computing sizes from the dtype
-   needs checking.
-2. **Dispatch entry**, mirroring the `GemvBf16` work exactly: `KernelKey`
-   variant, `(Bf16L3, Plain)` in `for_gemv`, a `launch` arm calling
-   `gemv_bf16l3_xf32`, and the dtype in `register_plain`. `dtype_arch_predicate`
-   and `dtype_rotation_plan` both need a case.
-3. **Loader branch.** In the tied-head `else` of `load_weights_hfq`, alongside
-   the existing `quant_type == 16` case: when `quant_type == 49`, upload `data`
-   as-is and set `gpu_dtype: DType::Bf16L3`. The bf16 case is the template.
-4. **Preflight.** `gemv_dtype_supported` must accept it, and the
-   `preflight_dtype_contract` test list needs the variant.
+1. **`DType::Bf16L3`.** Cascaded to exactly two exhaustive matches, both of
+   which deserved the decision rather than a mechanical fill-in: `DType::size()`
+   — BF16L3 is planar with a VARIABLE escape plane, so it has no per-element
+   stride and is byte-level like `Raw`; anything computing `n * size()` for it
+   is wrong — and `dtype_arch_predicate`, where it is `Always`.
+   `dtype_rotation_plan` needed nothing: its `_ => RotationPlan::None` is
+   correct here.
+2. **Dispatch entry**, mirroring `GemvBf16`: `KernelKey::GemvBf16L3`,
+   `(Bf16L3, Plain)` in `for_gemv`, a `launch` arm, and the dtype in
+   `register_plain`.
+3. **Three loader sites, not one** — each found by it panicking, which is the
+   good failure mode:
+   * the tied-head branch, which also guards `K % 256 == 0` and decodes
+     explicitly when it does not hold;
+   * `token_embd`, which must DECODE — the gather reads one arbitrary row and
+     the escape plane is only addressable by walking a block. This is what
+     `HIPFIRE_BF16L3_RESIDENT`'s "a gather-read table will fail to load" means,
+     and it constrains only the gather;
+   * `load_f16_tensor` and `load_weight_tensor`, because residency is global:
+     norms and layer weights stay packed too. Layer weights are decoded
+     deliberately — `gemv_bf16l3_xf32` is batch-1 and there is no BF16L3 GEMM,
+     so a packed layer weight would work at decode and break at prefill.
+
+The head is the only tensor that stays packed, because it is the only pure-GEMV
+consumer of a large matrix.
 
 ## Constraint worth checking first
 
