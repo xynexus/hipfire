@@ -55,15 +55,50 @@ right. The 602 measured the real batched path; the 37.40 measured a decode loop.
   GPU-measured through `hipfire bench`'s decode path, which is what that path
   legitimately measures. Unaffected.
 
-## What is now open again
+## ANSWERED: production prefill IS fully batched
 
-**Production prefill has never been measured on this host.** Whether the daemon
-batches prefill is unknown, in either direction.
+Measured 2026-08-06 with `HIPFIRE_KERNEL_TRACE=1` (added for exactly this) on a
+real `generate` request, so the path is
+`SimpleAr::prefill` → `llama::prefill_forward`:
 
-To measure it, drive a real `generate` request through the JSON-lines protocol
-(see the `run-model` skill) so the path is
-`SimpleAr::prefill` → `llama::prefill_forward`, and profile that. Do not use
-`hipfire bench` for any prefill claim until its handler is fixed.
+    [kernel-trace] llama prefill_forward (211 tokens): 693 dispatches across 11 kernels
+            211   30.4%  embedding_bf16
+            112   16.2%  gemm_oq4_residual_mmq
+            112   16.2%  quantize_q8_1_mmq_ds4
+            112   16.2%  rotate_x_mq_awq
+             33    4.8%  rmsnorm_f32_gfx1151
+             32    4.6%  add_inplace_f32
+             32    4.6%  kv_cache_write_q8_0_batched
+             16    2.3%  attention_causal_batched
+             16    2.3%  rope_batched_f32
+             16    2.3%  silu_mul_f32
+              1    0.1%  gemv_bf16_xf32
+
+**693 dispatches for 211 tokens — 3.3 per token, against the warm-pass's 371.**
+
+Every count is the batched shape:
+
+* `gemm_oq4_residual_mmq` **112** = 7 projections x 16 layers. One GEMM per
+  projection for the WHOLE prompt, not per position. A GEMM kernel, not a GEMV.
+* `attention_causal_batched` **16**, `rope_batched_f32` **16** — once per layer.
+* `kv_cache_write_q8_0_batched` **32** — batched, two per layer.
+* `gemv_bf16_xf32` **1** — the lm_head runs at the last position only. The
+  "skip lm_head for non-final positions" win is already implemented.
+* `embedding_bf16` **211** — one per token, which is correct: a gather reads one
+  row per token by definition.
+
+So the daemon's prefill does not have the problem. The `examples/infer_hfq`
+profile in `decoder-layer-npu-scope.md` — 85008 `gemv_oq4_grouped` dispatches,
+no `gemm_*` — describes that example, not this path, exactly as its own caveat
+warned.
+
+### What this means for the prefill-vs-FLM gap
+
+The "hipfire prefill 80.8 t/s against FLM's ~2750" comparison in
+`decoder-layer-npu-scope.md` needs re-deriving before it is used to justify NPU
+work: if its hipfire number came from `bench_prefill`, it is a decode rate
+wearing a prefill label, and the real gap is unknown. Timing a traced `generate`
+is the way to get an honest figure.
 
 ## Instrument fix
 
