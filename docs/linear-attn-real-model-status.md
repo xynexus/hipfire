@@ -77,6 +77,49 @@ Rust, which uses hipfire's rope kernel directly and scores 3.52 on real text;
 it does mean the numpy oracle is only trustworthy at short lengths until the
 rest is found.
 
+## The 35B is wrong at ONE token, and nothing found yet explains it
+
+| model | seq 1 | seq 4 |
+|---|---|---|
+| Qwen3.5-0.8B | 0.9996 | 0.9998 |
+| **Qwen3.6-35B-A3B** | **0.0038** | **-0.1854** |
+
+Orthogonal, not merely degraded. At seq 1 there is no cross-token flow and the
+MoE is fully exercised, so this is per-token math specific to this model.
+
+Ruled out for the 35B specifically:
+
+- **Tokenization** — its embedded tokenizer emits the same ids as the 0.8B's
+  for the same text, and the comparison above uses the `arange` prompt anyway.
+- **Config/tensor agreement** — 16 heads, 2 KV heads, head_dim 256, n_rot 64,
+  q_proj 8192 = 2*4096 so the output gate is detected; 32 value / 16 key linear
+  heads with qkv 2*16*128 + 32*128 = 8192 exactly.
+- **The repeat-interleave convention** — `repeat_interleave_qk.hip` documents
+  `dst[(kh*ratio + r)] = src[kh]`, so value head j reads key head j/ratio, which
+  is what this implements.
+- **The expert AWQ fold** — disabling it for expert tensors moves cos from
+  0.0038 to -0.0906. Both are noise around zero; it is not the cause.
+
+One anomaly found and not yet explained: `experts.0.down_proj` dequantizes to
+raw rms 0.151 where `gate_up_proj` is 0.0073 and the shared expert's own
+`down_proj` is 0.0118 — 13-20x its siblings. Its AWQ sidecar spans 0.083 to
+44.6 (mean 9.86), against 0.32-5.5 for gate_up and 0.55-2.4 for the shared
+expert. A 500x dynamic range on one tensor's scales is unusual enough to note
+even though removing the fold did not fix anything.
+
+### Next: build the missing fixture
+
+Exactly one structural feature is exercised by the 35B and by nothing that
+works: **fewer key heads than value heads** in linear attention. The 0.8B is
+16/16 and both tiny fixtures are 2/2. The gradcheck covers n_k < n_v
+synthetically, which proves internal consistency, not correctness — the same
+gap that hid GemmaRMSNorm for a dozen commits.
+
+The fix is to stop relying on the 35B as the only witness: synthesize a tiny
+fixture with n_k < n_v (halve `linear_num_key_heads` and narrow `in_proj_qkv`
+and `conv1d` to match), and compare it against the runtime at seq 1. Seconds
+per iteration instead of twenty minutes, and a definitive answer either way.
+
 ## The dense hybrid is correct — 0.9999 against the runtime
 
 Sweeping sequence length against `dump_logits_qwen35` settles the last doubts
