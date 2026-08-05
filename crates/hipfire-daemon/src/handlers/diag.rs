@@ -175,6 +175,9 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
     let _ = daemon_state.gpu.hip.device_synchronize();
     // Scope the kernel trace to the timed region, so the histogram describes
     // this bench and not model load. Off unless HIPFIRE_KERNEL_TRACE is set.
+    // Captured before the timed region so the report below can name the arch
+    // without re-borrowing `m`.
+    let m_arch_id_for_report = m.arch_id;
     hipfire_rdna::kernel_trace::reset();
     let t0 = Instant::now();
     let run_ok = if is_qwen35_family_arch_id(m.arch_id) {
@@ -360,10 +363,28 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
         } else {
             0.0
         };
-        // Which kernels actually ran. This handler's arch-0/1 arm is a
-        // per-token decode warm-pass, not prefill, and reporting `pp512 t/s`
-        // from it cost a full misdirected investigation — the histogram makes
-        // that visible in the output instead of in the source.
+        // Say so when this was a warm-pass, not prefill.
+        //
+        // Only the qwen3.5/3.6 arm above runs the real batched prefill
+        // (`qwen35::forward_prefill_batch`). Every other arm — LLaMA/Qwen3,
+        // Qwen2, DeepSeek V4, MiniMax-M2, LFM2.5-MoE — is a per-token
+        // decode/warm-pass loop, correctly described in its own comment and
+        // then reported to the user as `pp512 t/s`.
+        //
+        // That mislabel cost a full misdirected investigation: pp512 ~= tg128
+        // and a flat ms/token curve were both read as evidence about prefill
+        // batching, and two documents were written and retracted before anyone
+        // read this handler. The label is the bug; naming it is the fix that
+        // does not require rewriting five arch arms.
+        if !is_qwen35_family_arch_id(m_arch_id_for_report) {
+            eprintln!(
+                "[bench_prefill] NOTE: arch_id={m_arch_id_for_report} runs a per-token WARM-PASS here, not the production prefill path."
+            );
+            eprintln!(
+                "[bench_prefill]       The tok/s below is a DECODE rate. For real prefill throughput, trace a `generate` request with HIPFIRE_KERNEL_TRACE=1."
+            );
+        }
+        // Which kernels actually ran, so the claim above is checkable.
         if let Some(rep) = hipfire_rdna::kernel_trace::report("bench_prefill") {
             eprint!("{rep}");
         }
