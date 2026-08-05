@@ -4,7 +4,12 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage: benchmarks/calib/zaya-ragged-slice-parity.sh \
-  --model FILE --output-dir DIR --artifact-stem MODEL_NAME [options]
+  --model DIR --output-dir DIR --artifact-stem MODEL_NAME [options]
+
+--model is a Hugging Face SNAPSHOT DIRECTORY (one holding config.json) or a
+cache root (one holding snapshots/). Streamed calibration reads the raw
+checkpoint, not a packed container, so an .hfq artifact is NOT a valid source
+however convenient it looks sitting next to one.
 
 Run one ZAYA streamed calibration job at two slice widths over a RAGGED corpus
 and compare the two artifacts. Catches capture bugs that only appear when a
@@ -80,7 +85,21 @@ done
 [[ -n $MODEL ]] || { printf 'error: --model is required\n' >&2; exit 2; }
 [[ -n $OUTPUT_DIR ]] || { printf 'error: --output-dir is required\n' >&2; exit 2; }
 [[ -n $ARTIFACT_STEM ]] || { printf 'error: --artifact-stem is required\n' >&2; exit 2; }
-[[ -f $MODEL ]] || { printf 'error: model not found: %s\n' "$MODEL" >&2; exit 2; }
+# Mirror resolve_hf_snapshot() so a wrong source fails here in milliseconds
+# instead of after the run has taken the GPU lock and started loading.
+if [[ ! -d $MODEL ]]; then
+    if [[ $MODEL == *.hfq ]]; then
+        printf 'error: --model must be a Hugging Face snapshot directory, not an .hfq: %s\n' \
+            "$MODEL" >&2
+    else
+        printf 'error: model directory not found: %s\n' "$MODEL" >&2
+    fi
+    exit 2
+fi
+if [[ ! -f $MODEL/config.json && ! -d $MODEL/snapshots ]]; then
+    printf 'error: %s is neither a Hugging Face snapshot nor a cache root\n' "$MODEL" >&2
+    exit 2
+fi
 [[ -x $COEXISTENCE ]] || { printf 'error: executable not found: %s\n' "$COEXISTENCE" >&2; exit 2; }
 for command in jq sha256sum; do
     command -v "$command" >/dev/null || { printf 'error: %s is required\n' "$command" >&2; exit 2; }
@@ -209,7 +228,19 @@ if [[ $EXPERT_MISMATCHES != 0 ]]; then
         "$(date --iso-8601=seconds)" "$EXPERT_MISMATCHES" | tee -a "$LOG"
 fi
 
-MODEL_SHA256=$(sha256sum "$MODEL" | awk '{print $1}')
+# The model is a directory, so hash what identifies the weights rather than the
+# weights themselves: the safetensors index names every shard and its offsets.
+# config.json is the fallback for a checkpoint stored as a single shard.
+MODEL_FINGERPRINT_FILE=$(
+    find "$MODEL" -maxdepth 3 \( -name 'model.safetensors.index.json' -o -name 'config.json' \) \
+        -print 2>/dev/null | sort | head -1
+)
+if [[ -n $MODEL_FINGERPRINT_FILE ]]; then
+    MODEL_SHA256=$(sha256sum "$MODEL_FINGERPRINT_FILE" | awk '{print $1}')
+else
+    MODEL_FINGERPRINT_FILE=
+    MODEL_SHA256=
+fi
 CORPUS_SHA256=$(sha256sum "$CORPUS" | awk '{print $1}')
 REFERENCE_SHA256=$(sha256sum "$REFERENCE_CALIB" | awk '{print $1}')
 CANDIDATE_SHA256=$(sha256sum "$CANDIDATE_CALIB" | awk '{print $1}')
@@ -231,6 +262,7 @@ jq -n \
     --arg generated_at "$(date --iso-8601=seconds)" \
     --arg model "$MODEL" \
     --arg model_sha256 "$MODEL_SHA256" \
+    --arg model_fingerprint "$MODEL_FINGERPRINT_FILE" \
     --arg corpus "$CORPUS" \
     --arg corpus_sha256 "$CORPUS_SHA256" \
     --argjson corpus_generated "$GENERATED_CORPUS" \
@@ -256,7 +288,11 @@ jq -n \
         generated_at: $generated_at,
         mechanism: "layer_streamed_slice_width_1_vs_n_over_ragged_corpus",
         inputs: {
-            model: {path: $model, sha256: $model_sha256},
+            model: {
+                path: $model,
+                fingerprint_file: (if $model_fingerprint == "" then null else $model_fingerprint end),
+                sha256: (if $model_sha256 == "" then null else $model_sha256 end)
+            },
             corpus: {path: $corpus, sha256: $corpus_sha256, generated: $corpus_generated}
         },
         geometry: {
