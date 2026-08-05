@@ -149,6 +149,37 @@ So the oq4++ decode, its AWQ sidecars and the LDLQ feedback are all handled
 correctly. Combined with the earlier results, every quantisation this
 implementation reads is now verified on a real model.
 
+### The routed experts are not the cause, and the residual stream is pathological
+
+Ablating the routed experts entirely on the 35B (shared branch only) moves cos
+from 0.0038 to -0.0025 — no change, both noise. The output is already corrupt
+before the routed contribution, so the defect is upstream of them.
+
+Per-layer residual rms at seq 1 tells a clearer story. Layer INPUTS, so index i
+is the output of layer i-1:
+
+```
+35B   0.009 0.029 0.035 0.056 0.047 0.050 0.056 0.286 0.171 0.154 0.153 0.935
+      0.941 0.947 0.947 0.952 0.954 0.953 0.953 0.955 0.954 0.953 0.952 0.952
+      0.951 0.948 0.947 0.948 0.941 0.936 0.933 0.929 0.098 0.093 0.117 0.144 ...
+0.8B  0.023 0.038 0.051 0.057 0.089 0.088 0.088 0.384 0.211 0.208 0.204 0.223
+      0.105 0.086 0.087 0.551 0.108 0.111 0.117 0.140 0.136 0.140 0.154 0.193
+```
+
+The 0.8B spikes at layers 7 and 15 — both full-attention layers — and comes
+back down, so spikes there are normal and not in themselves a defect.
+
+The 35B is different in a way that looks mechanical rather than numerical: after
+layer 11 (also a full-attention layer) the stream pins at ~0.95 and stays within
+1% for TWENTY layers, then collapses to 0.098 after layer 31 (another attention
+layer). A residual stream that stops responding to twenty consecutive layers is
+not a subtle scaling error — every subsequent contribution is negligible against
+whatever layer 11 wrote.
+
+Layer 11 is the place to look next, and specifically what makes an attention
+layer at 16 heads / 2 KV heads (8:1 GQA, against the 0.8B's 4:1) write something
+the following layers cannot move.
+
 ### What is left
 
 With oq4++ cleared, the untested combination narrows to **MoE together with
