@@ -195,6 +195,13 @@ pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-server/src/routes/sdapi.rs:4432",
 };
 
+/// `HF_HUB_CACHE` — Runtime variable controlling hf hub cache in hipfire
+pub const ENV_HF_HUB_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HF_HUB_CACHE",
+    description: "Runtime variable controlling hf hub cache in hipfire",
+    source: "crates/hipfire-env/src/lib.rs:137",
+};
+
 /// `HF_TOKEN` — Selects behavior from recognized values
 pub const ENV_HF_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HF_TOKEN",
@@ -5369,6 +5376,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HFQ_TEST_SCALE_LOG10,
     ENV_HFQ_TEST_ZP_MAX,
     ENV_HF_HOME,
+    ENV_HF_HUB_CACHE,
     ENV_HF_TOKEN,
     ENV_HIPFIRE_ADAPTIVE_B_DOWN,
     ENV_HIPFIRE_ADAPTIVE_B_UNSAFE,
