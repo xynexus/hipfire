@@ -226,6 +226,53 @@ embedding — still produce an orthogonal result over 40 layers. With the layers
 gone, the head is provably right. So the wrongness is in the layer math itself
 and is not confined to one component, one layer type, or the norm convention.
 
+## A 1-layer 35B testbed, and what it shows
+
+`export_truncated_model` writes the first N layers of an `.hfq` as bf16
+safetensors — dequantised and AWQ-folded by this crate's loader, so both sides
+of a comparison read IDENTICAL weights. Validated on the 0.8B cut to 4 layers:
+cos 1.0001.
+
+Applied to the 35B at ONE layer: **cos 0.0144**. Same weights, same token, one
+linear_attn+MoE layer, and the outputs are orthogonal. Quantisation, the AWQ
+fold and the decode path are all eliminated in a single measurement — the defect
+is in the layer math at 35B dimensions. The testbed is 2.6 GB and runs in
+seconds against ~20 minutes for the full model.
+
+Internals, against the 0.8B at the same point:
+
+| quantity | 35B | 0.8B |
+|---|---|---|
+| q, k (post L2-norm) | 0.0078, 0.0884 | 0.0078, 0.0884 |
+| v | **0.4198** | 0.0507 |
+| z (in_proj_z output) | **2.2883** | 0.2301 |
+| dn_out | 0.0059 | 0.00086 |
+| normed (gated-norm out) | 0.0247 | 0.0709 |
+
+q and k match exactly, which is expected — both are L2-normalised, so the norm
+erases any input scale difference. v and z do not: they are 8-10x the 0.8B's.
+And despite z being 10x LARGER, `normed` comes out 3x SMALLER, which means
+`silu(z)` is collapsing — z must carry large negative outliers.
+
+Three single-change variants each improve it by an order of magnitude, and none
+comes close to fixing it:
+
+| variant | cos |
+|---|---|
+| base | 0.0144 |
+| MoE MLP ablated | 0.0226 |
+| GQA repeat as `hh % nk` instead of `hh / rep` | 0.2052 |
+| gated norm using `sigmoid(z)` instead of `silu(z)` | 0.2306 |
+| norm unit offset disabled (full model) | 0.1179 |
+
+None is adopted. `silu` is confirmed against `gated_norm.hip` at 1e-7 and
+`hh / rep` against `repeat_interleave_qk.hip`'s documented
+`dst[kh*ratio + r] = src[kh]`; both are also exact on the 0.8B and the tiny
+fixtures. Several unrelated changes each buying 10x, none reaching 1, is the
+signature of a systematic error upstream of all of them that these variants
+partially mask — most likely whatever makes z carry those outliers. Adopting any
+one would be the AWQ mistake again, on better-looking numbers.
+
 ## Stopping the bisect
 
 This is the stated stopping point from the previous round: if ablating the MLP
