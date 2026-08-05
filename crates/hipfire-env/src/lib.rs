@@ -278,6 +278,22 @@ env_vars! {
          Set 1 to opt in while the compact-resident path is validated; the \
          default stays on the expanded path.";
 
+    OQ_COMPACT_RESIDENT_ONLY_K = "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K", Developer,
+        "Diagnostic bisection filter for HIPFIRE_OQ_COMPACT_RESIDENT. Comma-separated \
+         list of K (input-dim) values; when set, ONLY tensors whose K appears in the \
+         list stay compact-resident and every other OqPlusCompact tensor takes the \
+         expanded path. Exists to localize the compact-vs-expanded logit divergence \
+         to a projection class by bisecting over shapes — the load-time hook sees \
+         (qt, data, m, k) but not the tensor name, so K is the available handle. \
+         Empty or unset means no filter.";
+
+    OQ_COMPACT_RESIDENT_ONLY_M = "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M", Developer,
+        "Companion to HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: a comma-separated list of \
+         M (output-dim) values. Both filters must admit a tensor for it to stay \
+         compact-resident, so setting both narrows to a single (M, K) projection \
+         class — the finest grain available at a load hook that sees the shape but \
+         never the tensor name. Empty or unset means no filter.";
+
     LLOYD_K3 = "HIPFIRE_LLOYD_K3", Developer,
         "Set 1 to encode MQ2-Lloyd with a ternary 3-level codebook (\"MQ1.58\") \
          instead of 4 levels. Reuses the same kernel and block layout.";

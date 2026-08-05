@@ -183,6 +183,68 @@ Sequence, cheapest-first:
    reassuring, not proof, and an unexplained numeric difference in the premier
    quant's residency path is exactly the kind of thing that surfaces later as a
    quality regression nobody can bisect.
+   Two controls make the bisection trustworthy rather than suggestive:
+   `ONLY_K=999`, matching no tensor, reproduces the expanded logit_hash
+   EXACTLY — so compact residency applied to nothing is byte-identical, and the
+   filter is doing what it claims; and `ONLY_K=1024,2048,3584` equals plain
+   compact-all, confirming those three values cover every compact tensor with
+   none unaccounted for.
+
+   Narrowed further with a companion `..._ONLY_M`, which pins a single (M, K)
+   projection class — the finest grain a load hook that never sees tensor names
+   can reach. **Every class diverges on its own**, all eight of them:
+   16x1024, 512x1024, 1024x2048, 1024x3584, 2048x1024, 3584x1024, 4096x1024,
+   6144x1024. A single 16-row tensor left compact is enough to move the logits.
+
+   That kills the last "one bad op" story. Any compact tensor, any shape, any
+   position perturbs the result — while the kernel is bit-identical at those
+   exact shapes. So the cause is tied to the dtype itself rather than to a shape,
+   an op, or a projection: something dispatch- or metadata-level that differs for
+   `OqCompactG256` regardless of which tensor carries it. Note the expanded
+   buffer is the COMBINED layout (weights + appended f32 scale plane) while the
+   compact buffer is blocks only, so any code deriving a quantity from the weight
+   buffer's size rather than from M/K would differ for every compact tensor
+   uniformly — that is the shape of hypothesis the evidence now points at, and
+   the first thing per-op instrumentation should check.
+
+   Static analysis is now exhausted, with these paths eliminated: prefill_batch
+   is symmetric (oq8 and compact both go `*_act_batched` -> quantize ->
+   their GEMM); the decode files carry no dtype-specific handling at all, so
+   decode is pure generic dispatch; and `gemm_oq8_grouped_prequant` bottoms out
+   in the same `gemm_oq8_grouped_wmma` the oracle compares against, so the
+   oracle's reference is the right one. The next step is per-op instrumentation
+   — dump each op's output under both modes and diff — not more reading.
+
+   **Separately found, and more serious than the divergence:
+   `prefill_chunk.rs` has NO compact support at all** — zero `OqCompactG256`
+   against 22 `Oq8G256`. Traced through the `wo` chain, a compact tensor there:
+
+   1. makes `wo_is_mq` false, because `OqCompactG256` is missing from the FWHT
+      rotation-admission list, so it is handed the **unrotated** activation
+      batch — the omission whose comment in that same file records the result
+      for oq8 as garbage, PPL 3.5e6; and
+   2. matches no `wo_is_*` arm, so it falls to the terminal `else`, which runs
+      `KernelKey::GemmHfq4G256Residual` over the compact bytes.
+
+   So it is decoded as HFQ4 with an unrotated input: **silently wrong, not an
+   error.** Qwen3.5-0.8B dense does not appear to route through this file, which
+   is why the smoke and `ar-hash` still produce sane output — but any model that
+   does would be quietly corrupt under the opt-in flag. Nothing is broken for
+   users today (the flag defaults off); this is a trap armed for whoever turns
+   it on next.
+
+   Two ways to close it, and they are not alternatives — do the guard first:
+
+   - **Guard (one edit, do now).** `run_residual_gemm_key` / `run_gemm_key`
+     already take `w_dtype`, and every fallthrough in the file goes through
+     them. Rejecting `OqCompactG256` there when the key is not a compact key
+     converts silent corruption into a loud error everywhere at once.
+   - **Wire it (the real fix).** ~8 LA/FA sites, each needing
+     `OqCompactG256` added to the rotation list plus a compact arm calling
+     `gemm_oq_compact_act_batched` / `gemm_oq_compact_residual_act_batched`.
+     The routed-expert `gemv_oq8g256_moe_*_indexed_batched` arms additionally
+     have no compact kernel at all, so those need kernel work, not wiring.
+
 2. **The shared loader** (`oq8_arch`) covers every family routed through it, so
    it is the highest-leverage single site — but only once each consumer of
    `DType::OqCompactG256` exists for those families' paths.

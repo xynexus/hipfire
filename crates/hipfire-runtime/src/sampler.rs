@@ -713,6 +713,24 @@ fn simple_rand() -> f32 {
 mod tests {
     use super::*;
 
+    /// `SAMPLER_STATE` is a process-global `AtomicU32`, and cargo runs this
+    /// crate's tests in parallel threads. Any two tests that seed it and then
+    /// assert on what comes out therefore race: one thread's
+    /// `reset_cpu_sampler_rng` can land between the other's reset and its draw,
+    /// so the second draw continues a stream the first never seeded.
+    ///
+    /// This is not hypothetical — it failed in CI as `left: 95, right: 52` from
+    /// two identically-seeded `sample_top_k_top_p` calls, while passing locally,
+    /// which is exactly the shape a scheduling race takes.
+    ///
+    /// Every test that depends on the global RNG takes this lock. Poisoning is
+    /// ignored on purpose: if one such test already failed, the others should
+    /// still report their own result rather than all panic on the mutex.
+    fn lock_sampler_rng() -> std::sync::MutexGuard<'static, ()> {
+        static RNG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        RNG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn sample_cpu_applies_presence_and_frequency_penalties() {
         let mut logits = vec![0.0_f32, 4.0, 3.5, 3.0];
@@ -746,6 +764,7 @@ mod tests {
 
     #[test]
     fn top_k_64_is_seeded_and_excludes_the_tail() {
+        let _rng = lock_sampler_rng();
         let logits: Vec<f32> = (0..96).map(|index| index as f32 * 0.03125).collect();
         reset_cpu_sampler_rng(0x1357_9bdf);
         let first = sample_top_k_top_p(&logits, 1.0, 64, 0.95);
@@ -791,6 +810,7 @@ mod tests {
 
     #[test]
     fn cpu_sampler_rng_reset_is_deterministic() {
+        let _rng = lock_sampler_rng();
         reset_cpu_sampler_rng(123);
         let first = simple_rand();
         reset_cpu_sampler_rng(123);
