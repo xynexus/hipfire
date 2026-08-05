@@ -180,6 +180,42 @@ two-stage path reachable as a side effect.
 The NPU case prefers fewer bytes independently — a 56.5 GB/s fabric does not
 care that a GEMV kernel is nicer.
 
+## Landed: `gemv_bf16_xf32`
+
+`kernels/src/gemv_bf16_xf32.hip` + `weight_gemv` routing (commit
+`feat(gemv): add gemv_bf16_xf32 and route BF16 weights through it`).
+
+| path | time | worst diff vs f32 ref (same bf16 W) |
+|---|---|---|
+| **`gemv_bf16_xf32` (x=f32)** | **3.24 ms** | **6.7e-8** |
+| `gemv_bf16_f32` (x=bf16) | 3.20 ms | 4.5e-4 |
+| `gemm_wmma` (x staged to bf16) | 14.6 ms | 4.5e-4 |
+| `gemv_f32` (W widened) | 5.22 ms | reference |
+
+6.7e-8 is f32 accumulation noise, so this is numerically the widened-F32 path
+at half the bytes and 1.61x its speed. The 1.1% it gives up against the
+bf16-activation variant buys back a 6800x accuracy difference.
+
+### Gate status — the 8 failures are NOT from this change
+
+`tests/tiny-affected-gate.sh --require-coverage` reports 8 drifted cells. They
+are pre-existing. Reverting only the `weight_gemv` routing, rebuilding, and
+re-running the same cells reproduces them **to six decimals**:
+
+| cell | with change | routing reverted |
+|---|---|---|
+| `qwen2/kld:hfq4` | 0.001790 | 0.001790 |
+| `qwen3_5_moe/kld:q8f16` | 0.179210 | 0.179210 |
+| `qwen3_5_moe/kld:mq6` | 0.215099 | 0.215099 |
+| `qwen3_5_moe/kld:mq4` | 0.215099 | 0.215099 |
+
+Bit-identical means the BF16 path is not exercised by these fixtures at all —
+their linear weights are quantized, so nothing reaches the branch. This is the
+stale-gfx1151-baseline issue already on the open-decisions list, and
+`minimax/kld:mq4` drifting by exactly 0.000000 is the known vacuous cell.
+
+The coherence battery reported no hard errors.
+
 ## Ordering
 
 1. **Wire `gemv_bf16_f32` into the dispatch family, THEN stop expanding to F32.**
