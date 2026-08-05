@@ -87,26 +87,19 @@ fallback. The real risk is an incomplete audit in step 3.
 **Goal.** Organic traffic reaches the fused path, so the multi-row win is
 actually delivered.
 
-**Expect less than 2.2x.** That figure came from `Qwen3.5-0.8B--mq4`, whose tied
-lm_head is BF16. Profiling during phase 1 found the gain tracks lm_head dtype,
-not model or quant:
+**Expect ~2.2x on current artifacts.** Multi-row gain tracks the tied lm_head
+dtype. Measured on gfx1103 with a controlled pair built from one HF source,
+identical 186-tensor MQ4G256 body, differing only in `--embed-precision`:
 
-| model | tied lm_head | multi-row gain |
-|---|---|---|
-| `Qwen3.5-0.8B--mq4` | BF16 509 MB | 2.2x |
-| `qwen3.5-0.8b-mq4+` | Q8F16 270 MB | 1.03x |
-| `qwen3.5-9b-mq4` | MQ4G256 540 MB | 1.54x |
+| tied lm_head | 1x4 | 4x1 | gain |
+|---|---|---|---|
+| BF16 (the `source` default) | 2707 ms | 1229 ms | **2.20x** |
+| Q8 (`--embed-precision q8`, deprecated) | 2004 ms | 1925 ms | 1.04x |
 
-The two 0.8B rows are a controlled A/B — identical 186-tensor MQ4G256 body and
-arch, differing only in lm_head dtype. The Q8 lm_head arm does not amortize
-across rows. Most production quants ship a quantized lm_head, so the realistic
-default-on win is nearer 1.5x than 2.2x. Size the decision on that.
-
-**The change** is in `select_qwen35_decode_batch_backend`
-(`crates/hipfire-generate/src/lib.rs`): `""`/`"auto"` currently returns
-`SerialReference` unconditionally. It should select `FusedDenseLayerChunked`
-for dense qwen3.5 when a capability gate passes, and fall back otherwise —
-mirroring the prefill arm PR #215 added.
+Q8 is faster single-row (270 MB vs 509 MB) but does not amortize; BF16 is slower
+single-row and scales. Since `--embed-precision` defaults to `source`, current
+artifacts land on the 2.2x row. A separate quantized `lm_head.weight` is a
+different case: `qwen3.5-9b-mq4` (MQ4G256 lm_head) measures 1.54x.
 
 **Steps.**
 
@@ -210,31 +203,18 @@ seam.
 
 ---
 
-## Phase 6 — Batch the Q8 lm_head arm (new, from phase 1 profiling)
+## Not doing: batching the Q8 lm_head arm
 
-**Goal.** Make `gemm_q8_0_batched_chunked` amortize across rows, so a quantized
-lm_head stops capping multi-row decode.
+Considered and dropped. Phase 1 profiling found the Q8 lm_head arm does not
+amortize across rows (1.04x vs BF16's 2.20x), which looked like a lever until
+the format's status was checked: `--embed-precision` defaults to `source`, and
+Q8 is the historical opt-in table that also carries "the largest per-tensor KLD
+cost in an otherwise low-bit model" (hipfire-quantize/src/main.rs). Making a
+discouraged format batch better is not worth the work.
 
-Found while profiling phase 1, not planned. It is the single biggest lever on
-what phase 2 actually delivers: with a Q8 lm_head the multi-row gain collapses
-to ~1.03x, and tied-embedding models put lm_head at a large fraction of decode
-bytes. BF16 lm_head amortizes fine, so the batching is achievable — one arm
-already does it.
-
-**Steps.**
-
-1. Confirm the container's `Q8F16` maps to the `DType::Q8_0` match arm at
-   runtime. The whole finding rests on that and it is currently an assumption.
-2. Isolate: microbenchmark `gemm_q8_0_batched_chunked` at N=1 vs N=4 against the
-   BF16 arm at the same shapes. Confirm the row-scaling gap in the kernel rather
-   than inferring it from end-to-end decode.
-3. Then optimise, or route the tied-lm_head case to an arm that batches.
-
-**Risk.** Unknown until step 2 — the chunking may be structural. Worth knowing
-either way, because it bounds phase 2's payoff.
-
-**Ordering.** Independent of phases 3-5. Doing it before or alongside phase 2
-changes how phase 2 should be sized, so at minimum finish step 2 first.
+The live question it leaves is the MQ4 `lm_head.weight` case — `qwen3.5-9b-mq4`
+measures 1.54x — which is a supported configuration. Chase that if sub-2.2x
+scaling on quantized-lm_head models matters.
 
 ## Sequencing
 
