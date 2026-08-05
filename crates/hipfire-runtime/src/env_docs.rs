@@ -3243,6 +3243,13 @@ pub const ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
+/// `HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M` — Companion to HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: a comma-separated list of M (output-dim) values. Both filters must admit a tensor for it to stay compact-resident, so setting both narrows to a single (M, K) projection class — the finest grain available at a load hook that sees the shape but never the tensor name. Empty or unset means no filter.
+pub const ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M",
+    description: "Companion to HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: a comma-separated list of M (output-dim) values. Both filters must admit a tensor for it to stay compact-resident, so setting both narrows to a single (M, K) projection class — the finest grain available at a load hook that sees the shape but never the tensor name. Empty or unset means no filter.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_OQ_RAGGED_Q8` — Set (to any value) to emit Opus tensors whose K is not a multiple of 256 as Q8 rather than zero-padding them to a 256 group. The GPU serving loaders assert `K % 256 == 0`, so padded ragged Opus tensors load only on the NPU-native path; this keeps such artifacts GPU-loadable. Default stays padded-Opus.
 pub const ENV_HIPFIRE_OQ_RAGGED_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ_RAGGED_Q8",
@@ -5832,6 +5839,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_OQ8_ROUTER,
     ENV_HIPFIRE_OQ_COMPACT_RESIDENT,
     ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K,
+    ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M,
     ENV_HIPFIRE_OQ_RAGGED_Q8,
     ENV_HIPFIRE_OUTLIERS_BY_LAYER,
     ENV_HIPFIRE_PACK_IDENTITY,
