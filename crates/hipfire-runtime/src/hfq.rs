@@ -898,12 +898,27 @@ fn bf16l3_resident() -> bool {
         && hipfire_env::BF16L3_RESIDENT.get().as_deref() != Some("0")
 }
 
+/// `HIPFIRE_BF16L3_RESIDENT=0` — an explicit opt-OUT, which now has to be
+/// distinguishable from "unset" because residency is on by default for heads.
+fn bf16l3_resident_disabled() -> bool {
+    hipfire_env::BF16L3_RESIDENT.get().as_deref() == Some("0")
+}
+
+/// A tensor consumed by the output projection (and, when tied, the embedding
+/// gather). Matches `hipfire_quantize::hfq_out::is_gather_shaped`, which is what
+/// steers these to LUT3 in the first place — the two must agree or a tensor gets
+/// packed by one and not recognised by the other.
+fn is_head_tensor(name: &str) -> bool {
+    name.contains("lm_head") || name.contains("embed_tokens")
+}
+
 /// Rewrite losslessly-recoded index entries to their logical view, returning the
 /// physical extents. Which types are recodings, what they expand to, and how long
 /// the expansion is all come from `hipfire_quant_format::storage` — the one place
 /// that knowledge lives, so a new codec cannot be invisible here.
 fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, usize)>> {
     let resident = bf16l3_resident();
+    let opted_out = bf16l3_resident_disabled();
     tensors
         .iter_mut()
         .map(|t| {
@@ -912,7 +927,27 @@ fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, us
                 return None;
             }
             // Residency opts a GPU-decodable coding out of expansion.
-            if resident && stored == QuantType::Bf16Lut3 {
+            //
+            // A LUT3 HEAD stays packed by DEFAULT. It is the only large tensor
+            // that is a pure GEMV consumer, so it is the only one with a kernel
+            // that reads the packed form — `gemv_bf16l3_xf32`, measured at
+            // 1.917 ms against plain bf16's 3.241 at 128256 x 2048, taking
+            // tg128 from 90.74 to 102.53 with byte-identical output.
+            //
+            // Deliberately NOT extended to every Bf16Lut3 tensor. Layer weights
+            // must serve prefill too, `gemv_bf16l3_xf32` is batch-1, and there
+            // is no BF16L3 GEMM — so they would be decoded at load anyway, for
+            // no benefit and a second decode path to keep correct. The env var
+            // still forces that global behaviour when set.
+            //
+            // When the model ties its head, this same entry also backs the
+            // embedding gather. That is fine: the gather decodes it explicitly
+            // at `token_embd` load, because a lookup reads one arbitrary row and
+            // the escape plane is only addressable by walking a block.
+            //
+            // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
+            let head_default = !opted_out && is_head_tensor(&t.name);
+            if (resident || head_default) && stored == QuantType::Bf16Lut3 {
                 return None;
             }
             let physical = (t.quant_type, t.data_offset, t.data_size);
