@@ -238,7 +238,20 @@ pub struct LinearAttnActs {
 pub struct LinearAttnDims {
     pub seq: usize,
     pub h: usize,
+    /// VALUE heads — what `A_log`/`dt_bias` are sized by, and what the
+    /// recurrence runs.
     pub n_heads: usize,
+    /// KEY heads. Qwen3.5 allows fewer of these than value heads (the 35B has
+    /// 16 against 32), in which case q and k are L2-normalised over
+    /// `n_k_heads` heads and then repeat-interleaved up to `n_heads`, exactly
+    /// as `qwen35/lowered.rs` does with `repeat_interleave_qk_f32`.
+    ///
+    /// This is NOT cosmetic. Folding it into one head count keeps every tensor
+    /// the same SIZE — 16x128 and 32x64 are both 2048 — so nothing about the
+    /// shapes complains; only the per-head normalisation, the `1/sqrt(hd_k)`
+    /// scale and the k/v head pairing come out wrong. `0` means "same as
+    /// n_heads".
+    pub n_k_heads: usize,
     pub hd_k: usize,
     pub hd_v: usize,
     pub conv_k: usize,
@@ -329,6 +342,17 @@ pub struct LinearAttnWeights<'a> {
     pub out_proj: &'a [f32],
 }
 
+impl LinearAttnDims {
+    /// Key-head count, resolving the `0 = same as n_heads` default.
+    pub fn nk(&self) -> usize {
+        if self.n_k_heads == 0 {
+            self.n_heads
+        } else {
+            self.n_k_heads
+        }
+    }
+}
+
 /// The non-projection half of the layer: conv1d, the activations, the
 /// recurrence and the gated norm.
 ///
@@ -366,46 +390,65 @@ pub fn linear_attn_core_forward(
     d: &LinearAttnDims,
 ) -> (Vec<f32>, LinearAttnActs) {
     let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (hk + hk + hv);
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
     let qkv_pre = conv1d_causal(qkv, w.conv1d, seq, qkv_dim, d.conv_k);
 
-    // Split [Q | K | V] after silu.
-    let (mut q, mut k, mut v) = (
-        vec![0.0f32; seq * nh * hk],
-        vec![0.0f32; seq * nh * hk],
+    // Channel layout is [Q | K | V] where Q and K are nk*hd_k wide and V is
+    // nh*hd_v. With nk < nh the key side is NARROWER than the value side —
+    // 2048 against 4096 on the 35B — and each key head serves nh/nk value
+    // heads whole. Splitting the key head instead keeps every total width
+    // identical, so nothing but the numbers complains.
+    let nk = d.nk();
+    let kw = nk * hk;
+    let (mut qn, mut kn, mut v) = (
+        vec![0.0f32; seq * kw],
+        vec![0.0f32; seq * kw],
         vec![0.0f32; seq * nh * hv],
     );
     for t in 0..seq {
         let base = t * qkv_dim;
-        for i in 0..nh * hk {
-            q[t * nh * hk + i] = silu(qkv_pre[base + i]);
-            k[t * nh * hk + i] = silu(qkv_pre[base + nh * hk + i]);
+        for i in 0..kw {
+            qn[t * kw + i] = silu(qkv_pre[base + i]);
+            kn[t * kw + i] = silu(qkv_pre[base + kw + i]);
         }
         for i in 0..nh * hv {
-            v[t * nh * hv + i] = silu(qkv_pre[base + 2 * nh * hk + i]);
+            v[t * nh * hv + i] = silu(qkv_pre[base + 2 * kw + i]);
         }
     }
 
-    // Per-head L2 norm on q and k, plus q's 1/sqrt(hd) scale — the
-    // `fused_qk_l2_norm_scale_f32` stage that sits between the conv split and
-    // the recurrence. Omitting it leaves the delta-rule state unbounded: on a
-    // real model at seq 64 the state grows until the backward overflows, and
-    // the loss sits at ln(vocab). A short random fixture never shows it.
-    let (q_raw, k_raw) = (q.clone(), k.clone());
+    // L2-norm per KEY head, q additionally scaled by 1/sqrt(hd_k).
+    let (q_raw, k_raw) = (qn.clone(), kn.clone());
     let q_scale = 1.0 / (hk as f32).sqrt();
     for t in 0..seq {
-        for hh in 0..nh {
-            let o = t * nh * hk + hh * hk;
-            let qs: f32 = (0..hk).map(|i| q[o + i] * q[o + i]).sum();
-            let ks: f32 = (0..hk).map(|i| k[o + i] * k[o + i]).sum();
+        for hh in 0..nk {
+            let o = t * kw + hh * hk;
+            let qs: f32 = (0..hk).map(|i| qn[o + i] * qn[o + i]).sum();
+            let ks: f32 = (0..hk).map(|i| kn[o + i] * kn[o + i]).sum();
             let qg = 1.0 / (qs + d.eps).sqrt();
             let kg = 1.0 / (ks + d.eps).sqrt();
             for i in 0..hk {
-                q[o + i] *= qg * q_scale;
-                k[o + i] *= kg;
+                qn[o + i] *= qg * q_scale;
+                kn[o + i] *= kg;
             }
         }
     }
+
+    // repeat_interleave_qk: value head j reads key head j/(nh/nk), whole.
+    let (q, k) = if nk == nh {
+        (qn, kn)
+    } else {
+        let rep = nh / nk;
+        let (mut qe, mut ke) = (vec![0.0f32; seq * nh * hk], vec![0.0f32; seq * nh * hk]);
+        for t in 0..seq {
+            for hh in 0..nh {
+                let src = t * kw + (hh / rep) * hk;
+                let dst = t * nh * hk + hh * hk;
+                qe[dst..dst + hk].copy_from_slice(&qn[src..src + hk]);
+                ke[dst..dst + hk].copy_from_slice(&kn[src..src + hk]);
+            }
+        }
+        (qe, ke)
+    };
 
     let mut gate = vec![0.0f32; seq * nh];
     let mut beta = vec![0.0f32; seq * nh];
@@ -415,7 +458,6 @@ pub fn linear_attn_core_forward(
             // Numerically stable softplus. The naive ln(1+exp(x)) overflows
             // to inf for x > ~88 in f32, and then gate = -inf makes
             // d_a_log += dgate * gate evaluate 0 * -inf = NaN in the backward.
-            // A small random fixture never reaches that; real dt_bias does.
             let x = a_raw[i] + w.dt_bias[hh];
             let sp = x.max(0.0) + (1.0 + (-x.abs()).exp()).ln();
             gate[i] = sp * -(w.a_log[hh].exp());
@@ -475,7 +517,7 @@ pub fn linear_attn_core_backward(
     d: &LinearAttnDims,
 ) -> LinearAttnCoreGrads {
     let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (hk + hk + hv);
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
 
     // normed = rmsnorm(dn) * norm_w * silu(z)
     let mut d_dn = vec![0.0f32; seq * nh * hv];
@@ -508,12 +550,36 @@ pub fn linear_attn_core_backward(
 
     // L2-norm backward. y = c*x*g with g = (sum(x^2)+eps)^-1/2, so
     // dx = c*g*(dy - x * g^2 * <dy, x>). c is 1/sqrt(hd) for q, 1 for k.
-    let mut dq = vec![0.0f32; seq * nh * hk];
-    let mut dk = vec![0.0f32; seq * nh * hk];
+    // Fold the repeat first: a key head that served `rep` value heads collects
+    // the sum of their adjoints. Dropping this silently scales the key-side
+    // gradient by 1/rep.
+    let nk = d.nk();
+    let kw = nk * hk;
+    let (dq_k, dk_k) = if nk == nh {
+        (dq_n, dk_n)
+    } else {
+        let rep = nh / nk;
+        let (mut qa, mut ka) = (vec![0.0f32; seq * kw], vec![0.0f32; seq * kw]);
+        for t in 0..seq {
+            for hh in 0..nh {
+                let src = t * nh * hk + hh * hk;
+                let dst = t * kw + (hh / rep) * hk;
+                for i in 0..hk {
+                    qa[dst + i] += dq_n[src + i];
+                    ka[dst + i] += dk_n[src + i];
+                }
+            }
+        }
+        (qa, ka)
+    };
+    let (dq_n, dk_n) = (dq_k, dk_k);
+
+    let mut dq = vec![0.0f32; seq * kw];
+    let mut dk = vec![0.0f32; seq * kw];
     let q_scale = 1.0 / (hk as f32).sqrt();
     for t in 0..seq {
-        for hh in 0..nh {
-            let o = t * nh * hk + hh * hk;
+        for hh in 0..nk {
+            let o = t * kw + hh * hk;
             for (src, dst, xr, c) in [
                 (&dq_n, &mut dq, &a.q_raw, q_scale),
                 (&dk_n, &mut dk, &a.k_raw, 1.0),
@@ -551,14 +617,13 @@ pub fn linear_attn_core_backward(
     let mut d_qkv_pre = vec![0.0f32; seq * qkv_dim];
     for t in 0..seq {
         let base = t * qkv_dim;
-        for i in 0..nh * hk {
-            d_qkv_pre[base + i] = dq[t * nh * hk + i] * dsilu(a.qkv_pre[base + i]);
-            d_qkv_pre[base + nh * hk + i] =
-                dk[t * nh * hk + i] * dsilu(a.qkv_pre[base + nh * hk + i]);
+        for i in 0..kw {
+            d_qkv_pre[base + i] = dq[t * kw + i] * dsilu(a.qkv_pre[base + i]);
+            d_qkv_pre[base + kw + i] = dk[t * kw + i] * dsilu(a.qkv_pre[base + kw + i]);
         }
         for i in 0..nh * hv {
-            d_qkv_pre[base + 2 * nh * hk + i] =
-                dv[t * nh * hv + i] * dsilu(a.qkv_pre[base + 2 * nh * hk + i]);
+            d_qkv_pre[base + 2 * kw + i] =
+                dv[t * nh * hv + i] * dsilu(a.qkv_pre[base + 2 * kw + i]);
         }
     }
     let mut d_qkv = vec![0.0f32; seq * qkv_dim];
@@ -581,7 +646,7 @@ pub fn linear_attn_forward(
     d: &LinearAttnDims,
 ) -> (Vec<f32>, LinearAttnActs) {
     let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (hk + hk + hv);
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
 
     let qkv = matvec_seq(x, w.in_proj_qkv, seq, h, qkv_dim);
     let a_raw = matvec_seq(x, w.in_proj_a, seq, h, nh);
@@ -618,7 +683,7 @@ pub fn linear_attn_backward(
     d: &LinearAttnDims,
 ) -> LinearAttnGrads {
     let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (hk + hk + hv);
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
     let mut dx = vec![0.0f32; seq * h];
 
     let mut d_normed = vec![0.0f32; seq * nh * hv];

@@ -414,7 +414,10 @@ pub struct LinearAttnLayerF32 {
     pub a_log: Vec<f32>,
     pub dt_bias: Vec<f32>,
     pub norm: Vec<f32>,
+    /// Value heads (`A_log`'s length).
     pub n_heads: usize,
+    /// Key heads — may be fewer; see `LinearAttnDims::n_k_heads`.
+    pub n_k_heads: usize,
     pub hd_k: usize,
     pub hd_v: usize,
     pub conv_k: usize,
@@ -623,14 +626,27 @@ pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
     let qkv_shape = src
         .shape_of(&format!("{p}.in_proj_qkv.weight"))
         .ok_or_else(|| format!("layer {layer}: no in_proj_qkv"))?;
-    let per_head = qkv_shape[0] / n_heads;
-    if per_head * n_heads != qkv_shape[0] || per_head < hd_v || (per_head - hd_v) % 2 != 0 {
+    // qkv = 2*(n_k*hd_k) + n_v*hd_v. Qwen3.5 allows n_k < n_v (the 35B is
+    // 16 key against 32 value heads), and hd_k is the KEY head width, which
+    // equals hd_v on every artifact seen so far. Solving for n_k rather than
+    // assuming n_k == n_v matters: 16x128 and 32x64 have identical total
+    // width, so the wrong split is shape-silent.
+    let hd_k = hd_v;
+    let kq_total = qkv_shape[0]
+        .checked_sub(n_heads * hd_v)
+        .ok_or_else(|| format!("layer {layer}: in_proj_qkv {} < v width", qkv_shape[0]))?;
+    if kq_total % (2 * hd_k) != 0 {
         return Err(format!(
-            "layer {layer}: in_proj_qkv out {} is not n_heads*(2*hd_k + hd_v) with hd_v {hd_v}",
+            "layer {layer}: in_proj_qkv {} leaves {kq_total} for q+k, not a multiple of 2*{hd_k}",
             qkv_shape[0]
         ));
     }
-    let hd_k = (per_head - hd_v) / 2;
+    let n_k_heads = kq_total / (2 * hd_k);
+    if n_k_heads == 0 || n_heads % n_k_heads != 0 {
+        return Err(format!(
+            "layer {layer}: {n_k_heads} key heads does not divide {n_heads} value heads"
+        ));
+    }
 
     let conv_shape = src
         .shape_of(&format!("{p}.conv1d.weight"))
@@ -686,6 +702,7 @@ pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
         dt_bias,
         norm,
         n_heads,
+        n_k_heads,
         hd_k,
         hd_v,
         conv_k,

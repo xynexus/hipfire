@@ -42,14 +42,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seq: 5,
         h: 16,
         n_heads: 2,
+        n_k_heads: 0,
         hd_k: 5,
         hd_v: 3,
         conv_k: 4,
         eps: 1e-6,
     };
     let (seq, h, nh) = (d.seq, d.h, d.n_heads);
-    let qkv_dim = nh * (2 * d.hd_k + d.hd_v);
+    let qkv_dim = 2 * d.nk() * d.hd_k + nh * d.hd_v;
     let vd = nh * d.hd_v;
+    let kw = d.nk() * d.hd_k;
     let md = MoeDims {
         seq,
         h,
@@ -73,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // beta paths are otherwise too small a share of d_x to test anything.
     let wa = up(&mut gpu, &rnd(nh * h, &mut s, 1.5));
     let wb = up(&mut gpu, &rnd(nh * h, &mut s, 1.5));
+    let _ = kw;
     let wz = up(&mut gpu, &rnd(vd * h, &mut s, 0.3));
     let wo = up(&mut gpu, &rnd(h * vd, &mut s, 0.3));
     let conv1d = rnd(qkv_dim * d.conv_k, &mut s, 0.5);

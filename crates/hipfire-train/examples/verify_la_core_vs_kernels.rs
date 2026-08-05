@@ -54,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seq: 5,
         h: 64,
         n_heads: 2,
+        n_k_heads: 0,
         hd_k: 128,
         hd_v: 128,
         conv_k: 4,

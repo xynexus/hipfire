@@ -76,6 +76,7 @@ fn la_dims(l: &LinearAttnLayerF32, seq: usize, h: usize, eps: f32) -> LinearAttn
         seq,
         h,
         n_heads: l.n_heads,
+        n_k_heads: l.n_k_heads,
         hd_k: l.hd_k,
         hd_v: l.hd_v,
         conv_k: l.conv_k,
