@@ -216,6 +216,22 @@ stale-gfx1151-baseline issue already on the open-decisions list, and
 
 The coherence battery reported no hard errors.
 
+Re-run after the dispatch-family registration: the same 8 cells, same numbers.
+So the registration is behaviourally inert for these fixtures too, as expected —
+nothing in them dispatches BF16.
+
+### Models that DO exercise the path
+
+`zaya1-8b-parity.bf16` generates 1 token and stops. That predates the change:
+the same prompt on the pre-change build (`gemm_bf16_x_bf16_wmma`) does the same,
+22.48 vs 20.25 tok/s. It is a parity fixture, not a chat model. Worth recording
+because "a full-bf16 model emits one token" is exactly the shape a regression
+here would take, and the only way to tell was to run the old code.
+
+`Llama-3.2-1B-Instruct--bf16` is the working end-to-end check: byte-identical
+generation across all three arrangements (WMMA special case, gemv_bf16_xf32
+special case, gemv_bf16_xf32 via the family) at 24.65 / 24.68 tok/s.
+
 ## Ordering
 
 1. **Wire `gemv_bf16_f32` into the dispatch family, THEN stop expanding to F32.**
