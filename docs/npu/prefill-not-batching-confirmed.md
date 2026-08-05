@@ -21,6 +21,21 @@ per-token rate — FLM's own ratio is ~45x (2750 t/s prefill against 60.1 decode
 hipfire gets 1.03-1.07x, which is what per-position evaluation predicts and
 nothing else does.
 
+## Stronger: cost per token is FLAT in prompt length
+
+The ratio above says prefill costs what decode costs. Sweeping prompt length
+says there is no amortisation at all:
+
+| prompt | prefill | ms/token |
+|---|---|---|
+| 64 | 634.2 ms | 9.91 |
+| 128 | 1278.7 ms | 9.99 |
+| 512 | 5289.6 ms | **10.33** |
+
+Flat across 8x. A batched prefill reads each weight once for the whole prompt,
+so ms/token must fall roughly as 1/N until the GEMM saturates; instead it is
+constant, and mildly WORSE at 512. The weights are being re-read per token.
+
 ## What this rules out
 
 **Not quant-specific.** bf16 and oq4++ show the same ratio, so it is not the
@@ -32,6 +47,14 @@ driven.
 1.92 ms path (`tied-lmhead-f32-expansion.md` in hipfire). Real, and already
 banked, but it cannot explain a 1.03x ratio: the head is one dispatch per
 position either way.
+
+**Not a missing batched kernel.** `weight_gemm`'s generic arm loops per-token
+GEMV and `warn_generic_once`s when it does. A pp512 run emits no such warning,
+so the batched kernels are selected.
+
+**Not upstream chunking.** `SimpleAr::prefill` is handed the whole
+`prompt_tokens` slice (`generate_arch.rs:1403`), and `prefill_forward` sets
+`batch = tokens.len()`, so `weight_gemm` really is called with batch_size=512.
 
 **Not `prefill_forward` being unbatched by construction.** It is documented as
 the `attention_causal_batched` path and a same-build A/B preferred it over the
@@ -55,8 +78,21 @@ the last axis" assumes prefill is batched before it is offloaded.
 
 ## Next
 
-Profile the daemon directly (rocprofv3 through the JSON-lines protocol, see the
-`run-model` skill) to see which kernels a served pp512 actually dispatches, and
-whether `prefill_forward`'s batching is defeated upstream — by chunking, by the
-session/round driver, or by a fallback inside it. The 602-vs-37 gap between the
-recorded A/B and this measurement is the sharpest lead.
+The gap is now narrow and strange: the call site is batched, the batch size is
+the full prompt, the batched kernels are selected, and yet per-token cost is
+flat. That leaves the batched GEMM kernels themselves performing like N GEMVs at
+these shapes, or `hipfire bench` not reaching `SimpleAr::prefill` at all.
+
+Two checks, in order:
+
+1. Confirm the bench actually routes through `SimpleAr::prefill` for this model
+   — a `dbg!`/log at that call site during a pp512 run settles it in one run and
+   costs nothing. If it does not, everything above describes a path the
+   measurement never took.
+2. If it does, time `gemm_oq4_grouped_act_batched` directly at the prefill shape
+   against 512 `gemv_oq4_grouped` calls. `examples/bench_lmhead_dtype.rs` is the
+   template — it already does exactly this shape of A/B with a correctness
+   column.
+
+The 602-vs-37 gap between the recorded gfx1103 A/B and this measurement stays
+the sharpest external lead.
