@@ -245,16 +245,20 @@ Sequence, cheapest-first:
    scales, rotation, activation quantization, the expander and the real block
    bytes are all now excluded; whatever moves the logits is outside the GEMM.
 
-   That example also surfaced something the earlier note got wrong. The tensors
-   are named `linear_attn.in_proj_a` / `in_proj_qkv` / `in_proj_z` / `out_proj`,
-   so this model **does** carry linear-attention layers — the very layers
-   `prefill_chunk.rs` serves. The claim below that Qwen3.5-0.8B "does not appear
-   to route through that file" is therefore unsafe. Yet the compact fallthrough
-   guard does NOT fire under either the smoke or `ar-hash`, which means the LA
-   path is reaching neither `run_plain_gemm_key` nor `run_residual_gemm_key`
-   with a compact weight. Explaining that — which arm the LA layers actually
-   take for a compact tensor — is now the most promising single question, and it
-   is where per-op instrumentation should start.
+   That example prompted a retraction that then had to be retracted itself,
+   which is worth recording as a caution. The tensors are named
+   `linear_attn.in_proj_a` / `in_proj_qkv` / `in_proj_z` / `out_proj`, so this
+   model **does** carry linear-attention layers — the layers `prefill_chunk.rs`
+   serves — and on that basis the earlier claim that Qwen3.5-0.8B "does not
+   appear to route through that file" was withdrawn as unsafe.
+
+   A one-shot entry trace then settled it directly: **`forward_prefill_chunk` is
+   never entered at all**, in either mode, for this probe. The original claim was
+   right; the retraction inferred a code path from tensor names, which does not
+   follow. This also explains the guard's silence — the file simply never runs
+   here, rather than the LA layers slipping past the guard. The `prefill_chunk`
+   corruption below stays real and stays guarded, but it is latent for models and
+   paths that DO enter that file, not for this one.
 
    **Separately found, and more serious than the divergence:
    `prefill_chunk.rs` has NO compact support at all** — zero `OqCompactG256`
