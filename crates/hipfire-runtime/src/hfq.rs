@@ -964,10 +964,15 @@ fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, us
 
 /// Decode a recoded payload back to its logical bytes.
 ///
+/// Public because arch loaders outside this crate need it: residency leaves
+/// `Bf16Lut3` packed, and any loader that then reads the tensor must decode
+/// rather than assume plain bf16. Returns `None` if `stored_qt` is not a
+/// lossless recoding.
+///
 /// Huffman decode is bit-serial (~600 MB/s/core), so a full artifact would take
 /// minutes on one thread; it is spread across cores using the format's chunk
 /// table. Byte-aligned codings ignore the thread count.
-fn decode_bf16_packed(stored_qt: u8, packed: &[u8], n: usize) -> Option<Vec<u8>> {
+pub fn decode_bf16_packed(stored_qt: u8, packed: &[u8], n: usize) -> Option<Vec<u8>> {
     let stored = QuantType::from_code(stored_qt)?;
     storage::expand(stored, packed, n, decode_threads()).map(|b| b.into_owned())
 }

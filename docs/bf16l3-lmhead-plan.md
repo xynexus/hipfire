@@ -31,10 +31,30 @@ loader was taught to decode a packed embed for the gather, so qwen35, qwen2 and
 dots-ocr all panicked with `expected F16/F32/BF16 for embed_tokens.weight, got
 qt=49`.
 
-**Prerequisite for the default:** teach every arch loader the same
-decode-for-gather arm the LLaMA path has. The predicate is already present as
-`is_head_tensor`. Until then the flag stays opt-in, and enabling it on a
-non-LLaMA arch fails to load rather than degrading.
+**Prerequisite for the default:** teach every arch loader to decode a packed
+tensor. The predicate is already present as `is_head_tensor`; the work is the
+per-arch decode arms.
+
+That tail is longer than it looks. Measured by forcing
+`HIPFIRE_BF16L3_RESIDENT=1` and running the gate, which is stricter than the
+head-only default and so bounds the work:
+
+| state | gate failures |
+|---|---|
+| residency off (baseline) | 8 |
+| forced on, before any arch fix | 58 |
+| forced on, after teaching qwen35 | **43** |
+
+One arch bought 15 cells. The remainder are spread across `gemma4`
+("unsupported embedding quant type 49"), `zaya` ("zaya gpu: unsupported
+quant_type 49") and others, each with its own embedding loader and its own
+panic string — there is no shared seam to fix once. `hipfire-runtime::hfq::
+decode_bf16_packed` is now `pub` so each arch can use the same decoder, which is
+the only part that is shared.
+
+Until every arch is taught, the flag stays opt-in. Enabling it on an untaught
+arch fails to load rather than degrading, which is the right failure but not one
+to inflict by default.
 
 ### Reach
 

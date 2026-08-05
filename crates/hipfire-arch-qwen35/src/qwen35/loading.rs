@@ -699,6 +699,25 @@ fn hfq_plain_tensor_as_f32(info: &HfqTensorInfo, data: &[u8], name: &str) -> Vec
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         16 => bf16_bytes_to_f32(data),
+        // A lossless recoding left packed — Bf16Lut3 under
+        // HIPFIRE_BF16L3_RESIDENT, or Bf16Huff. Decode instead of panicking.
+        //
+        // Residency is global: it is enabled to keep a LUT3 lm_head packed for
+        // `gemv_bf16l3_xf32`, but every other bf16 tensor stays packed too, and
+        // this loader sees them. Without this arm the whole arch fails to load
+        // with `got qt=49` — which is exactly what took tiny-quant-gate from 8
+        // failures to 58 when the residency default was first attempted.
+        49 | 50 => {
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = hipfire_runtime::hfq::decode_bf16_packed(info.quant_type, data, n)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "failed to decode recoded tensor {name} (qt={})",
+                        info.quant_type
+                    )
+                });
+            bf16_bytes_to_f32(&logical)
+        }
         _ => panic!(
             "expected F16/F32/BF16 for {name}, got qt={}",
             info.quant_type
