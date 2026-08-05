@@ -898,16 +898,13 @@ fn bf16l3_resident() -> bool {
         && hipfire_env::BF16L3_RESIDENT.get().as_deref() != Some("0")
 }
 
-/// `HIPFIRE_BF16L3_RESIDENT=0` — an explicit opt-OUT, which now has to be
-/// distinguishable from "unset" because residency is on by default for heads.
-fn bf16l3_resident_disabled() -> bool {
-    hipfire_env::BF16L3_RESIDENT.get().as_deref() == Some("0")
-}
-
 /// A tensor consumed by the output projection (and, when tied, the embedding
 /// gather). Matches `hipfire_quantize::hfq_out::is_gather_shaped`, which is what
-/// steers these to LUT3 in the first place — the two must agree or a tensor gets
-/// packed by one and not recognised by the other.
+/// steers these to LUT3 in the first place.
+///
+/// Unused until every arch loader can decode a packed embed — see the note in
+/// `expand_bf16_index`. Kept because it is the predicate the default will use.
+#[allow(dead_code)]
 fn is_head_tensor(name: &str) -> bool {
     name.contains("lm_head") || name.contains("embed_tokens")
 }
@@ -918,7 +915,6 @@ fn is_head_tensor(name: &str) -> bool {
 /// that knowledge lives, so a new codec cannot be invisible here.
 fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, usize)>> {
     let resident = bf16l3_resident();
-    let opted_out = bf16l3_resident_disabled();
     tensors
         .iter_mut()
         .map(|t| {
@@ -946,8 +942,15 @@ fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, us
             // the escape plane is only addressable by walking a block.
             //
             // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
-            let head_default = !opted_out && is_head_tensor(&t.name);
-            if (resident || head_default) && stored == QuantType::Bf16Lut3 {
+            // NOTE: defaulting this on for head-shaped tensors was tried and
+            // reverted. `expand_bf16_index` is arch-agnostic, but the loaders
+            // are not: only the LLaMA path was taught to decode a packed embed.
+            // qwen35, qwen2 and dots-ocr each panic with
+            // `expected F16/F32/BF16 for embed_tokens.weight, got qt=49`, and
+            // the tiny-quant gate went from 8 failures to 58. Teaching every
+            // arch loader is the prerequisite; see
+            // `docs/bf16l3-lmhead-plan.md`.
+            if resident && stored == QuantType::Bf16Lut3 {
                 return None;
             }
             let physical = (t.quant_type, t.data_offset, t.data_size);
