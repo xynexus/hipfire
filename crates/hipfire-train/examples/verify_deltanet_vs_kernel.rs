@@ -41,7 +41,14 @@ fn lcg(s: &mut u64) -> f32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init()?;
     const HD: usize = 128; // the kernel's compile-time width
-    let (seq, nh) = (6usize, 2usize);
+                           // Head count from argv: the 35B runs 32 value heads, and every earlier run
+                           // of this file used 2 — which exercises neither the kernel's head-block
+                           // grid nor its state stride at the real size.
+    let a: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    let (seq, nh) = (*a.first().unwrap_or(&6), *a.get(1).unwrap_or(&2));
 
     let mut s = 0x0de17a_u64;
     let rnd = |n: usize, s: &mut u64, k: f32| (0..n).map(|_| k * lcg(s)).collect::<Vec<f32>>();

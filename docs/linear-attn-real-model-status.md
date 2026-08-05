@@ -287,10 +287,44 @@ kernel-verified conventions turned out to be right for a reason I had not
 identified at the time: the measurement itself could not see the thing it
 appeared to be measuring.
 
+**Every linear_attn stage is now verified at the REAL 35B geometry**, not the
+toy 2-head one every earlier run of these files used. `verify_la_core_vs_kernels`
+and `verify_deltanet_vs_kernel` both take the geometry from argv now:
+
+| stage | 2 heads | 32v/16k heads, h=2048 | 32v/32k |
+|---|---|---|---|
+| conv1d + SiLU + split | 1.6e-7 | 2.0e-7 | 2.0e-7 |
+| l2norm(q)/sqrt(hd), l2norm(k) | 1.7e-7 | 2.5e-7 | 3.1e-7 |
+| alpha / beta | 1.1e-7 | 1.8e-7 | 2.0e-7 |
+| gated norm | 1.3e-7 | 1.9e-7 | 2.5e-7 |
+
+and the recurrence, at the real head count and out to seq 64:
+
+| seq x heads | 6x2 | 6x32 | 16x32 | 64x32 |
+|---|---|---|---|---|
+| rel vs `gated_delta_net_f32` | 5.0e-7 | 6.5e-7 | 9.9e-7 | 2.0e-6 |
+
+The GQA repeat convention is confirmed by reading
+`repeat_interleave_qk_batched.hip` directly: `dst[b, kh*ratio+r, d] =
+src[b, kh, d]`, which is what the host core does. (Note the l2norm check *uses*
+that convention to gather post-repeat values back, so it corroborates rather
+than independently proves it — the kernel source is the proof.)
+
 Also verified at 35B dimensions, against a host matmul inside the walk: every
 projection is exact — `out_dim` 8192 worst 3.8e-6 against magnitude 26.8, 4096
 worst 2.9e-6, the two 32-wide ones ~1e-6. So the GEMM path is not
 dimension-sensitive and is eliminated.
+
+**So linear_attn is eliminated as the 35B defect.** Projections, conv, the
+norms, the activations, the repeat, and the recurrence are all the inference
+path's, at the inference path's dimensions. Since the embedding and the head
+were already exact at 35B scale, what remains inside the layer is the MoE
+branch and the residual/norm plumbing around it — and the MoE has only ever
+been checked for LOADING (`verify_moe_per_expert`, bit-exact) and for FORWARD
+math on a tiny fixture at seq 1. The 35B routes top-k over its full expert
+count at h=2048; that forward has never been cross-checked against the
+kernels at that scale, which is now the same gap this tick just closed for
+linear_attn.
 
 The original three variants, for the record (all at seq 1, so all suspect):
 

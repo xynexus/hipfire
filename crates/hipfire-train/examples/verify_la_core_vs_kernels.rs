@@ -50,19 +50,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init()?;
     // head_dim 128 for both k and v: the real geometry, and the width the
     // recurrence kernel is compiled for.
+    // Configurable so the REAL geometries can be checked, not just a toy one.
+    // The 35B is 32 value heads against 16 key heads; every earlier run of this
+    // file used 2/2, which exercises neither the head count nor the repeat.
+    let a: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|x| x.parse().ok())
+        .collect();
     let d = LinearAttnDims {
-        seq: 5,
-        h: 64,
-        n_heads: 2,
-        n_k_heads: 0,
+        seq: *a.first().unwrap_or(&5),
+        h: *a.get(3).unwrap_or(&64),
+        n_heads: *a.get(1).unwrap_or(&2),
+        n_k_heads: *a.get(2).unwrap_or(&0),
         hd_k: 128,
         hd_v: 128,
         conv_k: 4,
         eps: 1e-6,
     };
     let (seq, nh, hk, hv) = (d.seq, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (2 * hk + hv);
-    let (k_dim, v_dim) = (nh * hk, nh * hv);
+    let nk = d.nk();
+    let qkv_dim = 2 * nk * hk + nh * hv;
+    let (k_dim, v_dim) = (nk * hk, nh * hv);
+    println!(
+        "  geometry: seq={seq} v_heads={nh} k_heads={nk} hd={hk} h={} qkv={qkv_dim}",
+        d.h
+    );
 
     let mut s = 0xc0ffee_u64;
     let rnd = |n: usize, s: &mut u64, k: f32| (0..n).map(|_| k * lcg(s)).collect::<Vec<f32>>();
@@ -124,20 +136,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stage between the conv split and the recurrence. Omitting it
         // entirely still gradchecks and still runs; it shows up only as an
         // unbounded state on a real model at real sequence length.
-        let qt = gpu.upload_f32(&acts.q_raw, &[seq * nh * hk])?;
-        let kt = gpu.upload_f32(&acts.k_raw, &[seq * nh * hk])?;
+        let qt = gpu.upload_f32(&acts.q_raw, &[seq * nk * hk])?;
+        let kt = gpu.upload_f32(&acts.k_raw, &[seq * nk * hk])?;
         gpu.fused_qk_l2_norm_scale_f32_batched(
             &qt,
             &kt,
-            nh,
+            nk,
             hk,
             1.0 / (hk as f32).sqrt(),
             d.eps,
             seq,
         )?;
         let (gq, gk) = (gpu.download_f32(&qt)?, gpu.download_f32(&kt)?);
-        let (aq, rq) = worst(&acts.q, &gq);
-        let (ak, rk) = worst(&acts.k, &gk);
+        // acts.q/k are POST-repeat (nh heads). The repeat is
+        // dst[kh*ratio + r] = src[kh], so key head kh lands at value head
+        // kh*ratio — gather those back out rather than slicing the front,
+        // which would only be right when nk == nh.
+        let rep = nh / nk;
+        let gather = |v: &[f32]| -> Vec<f32> {
+            let mut o = Vec::with_capacity(seq * nk * hk);
+            for t in 0..seq {
+                for kh in 0..nk {
+                    let src = t * nh * hk + (kh * rep) * hk;
+                    o.extend_from_slice(&v[src..src + hk]);
+                }
+            }
+            o
+        };
+        let (aq, rq) = worst(&gather(&acts.q), &gq);
+        let (ak, rk) = worst(&gather(&acts.k), &gk);
         println!("  l2norm(q)*1/sqrt(hd): worst {aq:.3e} (rel {rq:.3e})");
         println!("  l2norm(k):            worst {ak:.3e} (rel {rk:.3e})");
         ok &= rq < 1e-5 && rk < 1e-5;
