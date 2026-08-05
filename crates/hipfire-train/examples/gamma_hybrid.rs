@@ -122,8 +122,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // An untied head must be loaded; scoring through the embedding when the
     // artifact ships a separate lm_head compares against an unrelated matrix.
-    let lm_head =
-        hipfire_train::loader::load_lm_head_f32(&mut gpu, src, prefix, cfg.vocab_size, h)?;
+    let lm_head = hipfire_train::loader::load_lm_head_f32(
+        &mut gpu,
+        src,
+        prefix,
+        cfg.vocab_size,
+        h,
+        cfg.tie_word_embeddings,
+    )?;
     eprintln!(
         "head: {}",
         match &lm_head {

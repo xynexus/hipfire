@@ -566,34 +566,45 @@ pub fn load_embed_f32<S: WeightSource + ?Sized>(
     )
 }
 
-/// Load an UNTIED output head, if the artifact has one.
+/// Load an UNTIED output head, if the model has one.
 ///
-/// Returns `None` when the model ties the head to the embedding, which is the
-/// common case for small Qwen3.5 models and for both tiny fixtures. Getting
-/// this wrong is silent and catastrophic: a model with an untied head that is
-/// scored through its embedding produces logits from an unrelated matrix, so
-/// the output is orthogonal to the truth rather than merely inaccurate. The
-/// 35B's `lm_head` correlates with its own embedding at 0.025.
+/// Returns `None` only when the model genuinely ties its head to the
+/// embedding. Getting this wrong is silent and catastrophic: a model with an
+/// untied head scored through its embedding produces logits from an unrelated
+/// matrix, so the output is orthogonal to the truth rather than merely
+/// inaccurate. The 35B's `lm_head` correlates with its own embedding at 0.025,
+/// and a hardcoded "the head IS the embedding" in `gamma_hybrid` is what made
+/// that model look like it had a layer-math defect.
 ///
-/// The name is tried both with and without the model prefix because artifacts
-/// disagree: the 35B stores `model.language_model.embed_tokens.weight` but a
-/// bare `lm_head.weight`.
+/// `tie_word_embeddings` from the config is authoritative. When it says untied
+/// the head MUST be found, so a missing tensor is an error rather than a quiet
+/// fall back to the embedding — quiet is precisely the failure this function
+/// exists to prevent. The name is tried with and without the model prefix
+/// because artifacts disagree: the 35B stores
+/// `model.language_model.embed_tokens.weight` but a bare `lm_head.weight`.
 pub fn load_lm_head_f32<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
     src: &S,
     prefix: &str,
     vocab: usize,
     h: usize,
+    tie_word_embeddings: bool,
 ) -> Result<Option<GpuTensor>, String> {
-    for name in [
+    let names = [
         format!("{prefix}lm_head.weight"),
         "lm_head.weight".to_string(),
-    ] {
-        if src.has(&name) {
-            return Ok(Some(upload_tensor(gpu, src, &name, &[vocab, h])?));
-        }
+    ];
+    if let Some(name) = names.iter().find(|n| src.has(n)) {
+        return Ok(Some(upload_tensor(gpu, src, name, &[vocab, h])?));
     }
-    Ok(None)
+    if tie_word_embeddings {
+        Ok(None)
+    } else {
+        Err(format!(
+            "config says tie_word_embeddings=false but no lm_head found (tried {names:?}); \
+             refusing to silently score through the embedding"
+        ))
+    }
 }
 
 /// Load the final RMSNorm weight as fp32 from any weight source.
