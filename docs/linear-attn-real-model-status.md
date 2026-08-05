@@ -169,16 +169,27 @@ is the output of layer i-1:
 The 0.8B spikes at layers 7 and 15 — both full-attention layers — and comes
 back down, so spikes there are normal and not in themselves a defect.
 
-The 35B is different in a way that looks mechanical rather than numerical: after
-layer 11 (also a full-attention layer) the stream pins at ~0.95 and stays within
-1% for TWENTY layers, then collapses to 0.098 after layer 31 (another attention
-layer). A residual stream that stops responding to twenty consecutive layers is
-not a subtle scaling error — every subsequent contribution is negligible against
-whatever layer 11 wrote.
+The 35B pins at ~0.95 from layer 11 to 31 and then collapses — which I first
+read as mechanical. **That reading was wrong.** Decomposing the energy:
 
-Layer 11 is the place to look next, and specifically what makes an attention
-layer at 16 heads / 2 KV heads (8:1 GQA, against the 0.8B's 4:1) write something
-the following layers cannot move.
+| model | layer | rms | max abs | dim | share of energy in that dim |
+|---|---|---|---|---|---|
+| 35B | 11 | 0.935 | 34.2 | 1108 | **0.65** |
+| 35B | 20 | 0.954 | 34.4 | 1108 | 0.63 |
+| 35B | 31 | 0.929 | 33.3 | 1108 | 0.63 |
+| 0.8B | 7 | 0.384 | 3.9 | 119 | 0.10 |
+
+A single dimension carrying 65% of the residual energy is the well-known
+massive-activation / attention-sink phenomenon, and it explains the flat rms
+completely: once dim 1108 reaches 34, every later layer's contribution is small
+against it, so the norm stops moving. The 0.8B shows a milder version of the
+same thing.
+
+So the per-layer rms profile is NOT evidence of where the bug is, and layer 11
+is not implicated by it. What the profile does show is that the magnitude of
+that one dimension dominates everything downstream of it — the final norm and
+the tied lm_head see mostly dim 1108 — so if its value is wrong, the logits are
+orthogonal no matter what else is right.
 
 ### What is left
 
