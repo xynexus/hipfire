@@ -4333,6 +4333,7 @@ pub const KVARN_BUILD_KCACHE_SRC: &str =
 pub const GEMV_F16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f32.hip");
 pub const GEMV_F16_F16_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f16.hip");
 pub const GEMV_BF16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_f32.hip");
+pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
 /// Per-row symmetric Q4 GEMV — the coarse candidate-scorer for the two-stage
 /// lm_head shortlist. See kernels/src/gemv_q4sym_f32.hip.
 pub const GEMV_Q4SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q4sym_f32.hip");

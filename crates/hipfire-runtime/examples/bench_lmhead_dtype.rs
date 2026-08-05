@@ -58,7 +58,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
         .collect();
 
-    let w_f32 = gpu.upload_f32(&w, &[vocab, hidden])?;
+    // The runtime's F32 head is a BF16 weight UPCONVERTED, so the honest
+    // reference rounds w to bf16 first and then widens. Comparing against the
+    // original f32 w would charge the bf16 path for weight rounding that is not
+    // an error — the stored weight IS bf16, so that rounding is ground truth.
+    let w_rt: Vec<f32> = f32_to_bf16_bytes(&w)
+        .chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+        .collect();
+    let w_f32 = gpu.upload_f32(&w_rt, &[vocab, hidden])?;
     // upload_raw types the tensor as DType::Raw; the WMMA path asserts BF16.
     let mut w_bf16 = gpu.upload_raw(&f32_to_bf16_bytes(&w), &[vocab, hidden])?;
     w_bf16.dtype = DType::BF16;
@@ -81,6 +89,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ref_y = gpu.download_f32(&y)?;
     gpu.gemv_bf16_f32(&w_bf16, &x_bf16, &y, vocab, hidden)?;
     let bf_y = gpu.download_f32(&y)?;
+    gpu.gemv_bf16_xf32(&w_bf16, &x_f32, &y, vocab, hidden)?;
+    let mx_y = gpu.download_f32(&y)?;
     gpu.gemm_bf16_x_bf16_wmma(&w_bf16, &x_f32, &y, vocab, hidden, 1)?;
     let wm_y = gpu.download_f32(&y)?;
 
@@ -93,7 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mag = ref_y.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let a_ref = argmax(&ref_y);
-    for (label, v) in [("gemv_bf16_f32", &bf_y), ("gemm_wmma", &wm_y)] {
+    for (label, v) in [
+        ("gemv_bf16_xf32 (x=f32)", &mx_y),
+        ("gemv_bf16_f32 (x=bf16)", &bf_y),
+        ("gemm_wmma (x staged)", &wm_y),
+    ] {
         let worst = ref_y
             .iter()
             .zip(v.iter())
@@ -110,6 +124,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mag
         );
     }
+    // Isolate ACTIVATION rounding: same bf16 weight both sides, f32 x vs bf16 x.
+    // This is the quality question — does staging x to bf16 cost anything the
+    // F32 path keeps?
+    let n_diff = ref_y
+        .iter()
+        .zip(bf_y.iter())
+        .filter(|(a, b)| (*a - *b).abs() > 0.0)
+        .count();
+    let rms = (ref_y
+        .iter()
+        .zip(bf_y.iter())
+        .map(|(a, b)| ((a - b) as f32).powi(2) as f64)
+        .sum::<f64>()
+        / ref_y.len() as f64)
+        .sqrt();
+    println!(
+        "  activation rounding (bf16 W both sides): {} / {} logits differ, rms {:.3e}, mag {:.3}",
+        n_diff,
+        ref_y.len(),
+        rms,
+        mag
+    );
     println!();
 
     // Straight-line timing: no closures, so no GpuTensor clones.
@@ -140,6 +176,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the dispatch family run_auto consults, which is what forces the WMMA
     // special case above.
     for _ in 0..3 {
+        gpu.gemv_bf16_xf32(&w_bf16, &x_f32, &y, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t = Instant::now();
+    for _ in 0..iters {
+        gpu.gemv_bf16_xf32(&w_bf16, &x_f32, &y, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t_mixed = t.elapsed().as_secs_f64() / iters as f64;
+
+    for _ in 0..3 {
         gpu.gemv_bf16_f32(&w_bf16, &x_bf16, &y, vocab, hidden)?;
     }
     gpu.hip.device_synchronize()?;
@@ -151,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_bf16_gemv = t.elapsed().as_secs_f64() / iters as f64;
 
     for (label, per, bytes) in [
+        ("BF16 gemv_bf16_xf32", t_mixed, vocab * hidden * 2),
         ("BF16 gemv_bf16_f32", t_bf16_gemv, vocab * hidden * 2),
         ("F32 gemv_f32", t_f32, vocab * hidden * 4),
         ("BF16 gemm_wmma(batch=1)", t_bf16, vocab * hidden * 2),
@@ -175,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stating it alone would recommend keeping an expansion that a wired-in
     // BF16 gemv beats on both bytes and time.
     let best = [
+        ("BF16 gemv_bf16_xf32", t_mixed),
         ("BF16 gemv_bf16_f32", t_bf16_gemv),
         ("F32 gemv_f32", t_f32),
         ("BF16 gemm_wmma", t_bf16),

@@ -429,9 +429,26 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
-        // BF16 weights use WMMA GEMM directly (dispatch family has no BF16 GEMV entry).
+        // BF16 weights go through `gemv_bf16_xf32` — bf16 weight, F32
+        // activation, f32 accumulate.
+        //
+        // BF16 previously had no GEMV entry and fell back to a batch-1 WMMA
+        // GEMM, which is built for batched work and collapses at one row:
+        // 15.1 ms against 3.1 ms at 128256 x 2048 on gfx1151, 4.8x.
+        //
+        // The other bf16 GEMVs in the tree (`gemv_bf16_f32` and friends) want
+        // the ACTIVATION in bf16 too, which would round it. That is a real and
+        // avoidable loss — the weight is genuinely bf16 so widening it recovers
+        // nothing, but x arrives at full precision, and staging it down costs
+        // rel rms 3.4e-4 / worst rel 1.6e-3 here. `gemv_bf16_xf32` reads x as
+        // f32 directly at no bandwidth cost: x is k elements against an m x k
+        // weight read.
+        //
+        // See `docs/tied-lmhead-f32-expansion.md` and
+        // `examples/bench_lmhead_dtype.rs`.
         if w.gpu_dtype == DType::BF16 {
-            return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
+            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+            return gpu.gemv_bf16_xf32(&w.buf, x, y, w.m, w.k);
         }
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
