@@ -270,8 +270,29 @@ fixture at seq 64). The rule that keeps proving itself: **before comparing two
 measurements, confirm they were produced by the same code at the same time.**
 Stale numbers in a doc are not evidence.
 
-Three single-change variants each improve it by an order of magnitude, and none
-comes close to fixing it:
+**Those seq-1 variant results were artifacts.** At sequence length 1 the
+recurrence collapses to `out = (v * beta) * (k . q)`, and `k . q` is SYMMETRIC —
+so seq 1 cannot distinguish q from k at all. Confirmed directly: swapping the Q
+and K blocks in the channel split gives cos identical to base to four decimals.
+Re-run at seq 4, where q and k are distinguishable, the "improvements" vanish:
+
+| variant | seq 1 | seq 4 |
+|---|---|---|
+| base | 0.0144 | -0.0655 |
+| GQA repeat as `hh % nk` | 0.2052 | +0.0216 |
+| `[K\|Q\|V]` split | 0.0144 (blind) | -0.0748 |
+
+Declining to adopt the seq-1 winners on the grounds that they contradicted
+kernel-verified conventions turned out to be right for a reason I had not
+identified at the time: the measurement itself could not see the thing it
+appeared to be measuring.
+
+Also verified at 35B dimensions, against a host matmul inside the walk: every
+projection is exact — `out_dim` 8192 worst 3.8e-6 against magnitude 26.8, 4096
+worst 2.9e-6, the two 32-wide ones ~1e-6. So the GEMM path is not
+dimension-sensitive and is eliminated.
+
+The original three variants, for the record (all at seq 1, so all suspect):
 
 | variant | cos |
 |---|---|
