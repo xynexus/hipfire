@@ -763,6 +763,30 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        // Opus W8A8 lm_head — see `dense_session_prefill_gemm_full_precision`.
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_oq8_grouped_act_batched(
+                    &weights.output.buf,
+                    &rot,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
             // AWQ-aware — see `dense_session_prefill_gemm_full_precision`.
@@ -1104,14 +1128,39 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
     // by the scale, so an AWQ sidecar on one would still compute `(W·s)·x` —
     // silently, since the dtype is otherwise accepted. Keep routing those to
     // serial. Widen this only alongside the arm that applies the scale.
-    if weight.awq_scale.is_some() && weight.gpu_dtype != DType::MQ4G256 {
+    // The arms that pre-rotate through `rotate_x_mq_batched_for` apply the scale
+    // (it dispatches the `x /= awq_scale` + FWHT kernel when the sidecar is
+    // present); every other arm would compute `(W·s)·x`. Keep this list in step
+    // with the `_for` call sites below — adding a rotated arm without adding it
+    // here silently routes an AWQ model to serial, which is how the Opus arms
+    // were caught during bring-up.
+    if weight.awq_scale.is_some() && !matches!(weight.gpu_dtype, DType::MQ4G256 | DType::Oq8G256) {
         return Some(
-            "AWQ pre-scaled weights: the fused body applies awq_scale only on the MQ4G256 arm",
+            "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256)",
         );
     }
+    // Oq4G256 (oq4/oq4+/oq4++) is deliberately NOT admitted yet: wiring it to
+    // `gemm_oq4_grouped_act_batched` compiled and ran, but failed fused-vs-serial
+    // parity at b8 on qwen3.5-0.8b--oq4++ (3 of 8 sessions produced a different
+    // first token — near-tie flips, so it reads numerical rather than gross,
+    // most likely an activation-precision difference between that kernel and the
+    // serial oq4 path). Parity is the bar, so it stays on serial until that is
+    // understood.
+    //
+    // Oq8G256 is the whole Opus family on this path: Opus executes as W8A8, and
+    // 4-bit forms (oq4.25++ = OqPlusCompact on disk) are expanded to dense int8
+    // at load — `oq_gpu_dtype_for_quant_type` maps OqPlusG256/OqPlusCompact/
+    // Oq8G256 all to `DType::Oq8G256`. So admitting this one dtype is what puts
+    // the premier quant on the fused path.
     if !matches!(
         weight.gpu_dtype,
-        DType::F32 | DType::F16 | DType::BF16 | DType::Raw | DType::Q8_0 | DType::MQ4G256
+        DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::Raw
+            | DType::Q8_0
+            | DType::MQ4G256
+            | DType::Oq8G256
     ) {
         return Some("unsupported weight dtype");
     }
@@ -4599,6 +4648,18 @@ fn dense_session_prefill_gemm_full_precision(
             gemm_raw_x_f32_auto(gpu, &weight.buf, x, y, weight.m, weight.k, n)
         }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
+        // Opus W8A8: same FWHT-256 pre-rotation as MQ, then the batched
+        // quantize-act + grouped int8 WMMA. Mirrors the serial recipe documented
+        // on `weight_gemv` (rotate -> quantize_act_oq8 -> gemm_oq8_grouped_wmma);
+        // `gemm_oq8_grouped_act_batched` does the last two and owns its scratch.
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result =
+                gpu.gemm_oq8_grouped_act_batched(&weight.buf, &rot, y, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
+        }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
             // AWQ-aware. When `weight` ships an `awq_scale` sidecar its stored
@@ -4658,6 +4719,20 @@ fn dense_session_prefill_gemm_full_precision_residual(
             gpu.gemm_q8_0_batched_chunked(&weight.buf, x, &out, weight.m, weight.k, n)?;
             let accum = y_residual.sub_offset(0, n * weight.m);
             gpu.add_inplace_f32(&accum, &out)
+        }
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq8_grouped_residual_act_batched(
+                &weight.buf,
+                &rot,
+                y_residual,
+                weight.m,
+                weight.k,
+                n,
+            );
+            let _ = gpu.free_tensor(rot);
+            result
         }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
