@@ -398,6 +398,33 @@ state variant, not to flip the default. Flipping it would trade a measured
 prefill win against a documented quality decision whose reasoning is not
 reconstructed here.
 
+### The prize cannot be sized without building the fix
+
+An attempt to measure what batched MoE prefill is worth — by lowering
+`HIPFIRE_DN_STATE_FP32_BELOW` so `default_state_quant` returns Q8, unlocking the
+path — did not work, and should not be retried. The run reported
+`dn_quant=FP32` unchanged, 327465 dispatches unchanged, pp256 51.20 unchanged.
+
+`hipfire-env` states why: *"Quantized (Q8/Q4) DeltaNet state is refused by
+policy — lowering this errors out rather than degrading quality."* The policy is
+enforced in code, not merely defaulted. That is the system working.
+
+So the size of the win is **unknown and unmeasurable** short of implementing the
+FP32 batched-prefill variant. What is known:
+
+* the 35B currently issues **1279 dispatches/token** in prefill against the 1B's
+  **128**, and the 1B's batched path is what makes that difference;
+* every other condition in `prefill_batch_pbs_eligible` passes.
+
+Whoever picks this up should expect to build first and measure second, which is
+unusual and worth stating plainly rather than discovering.
+
+**Worth noting how this failure was caught.** The `pbs_eligible inputs` line
+showed `dn_quant=FP32` in a run that was supposed to force Q8. Without it the
+timing would have read as "batched MoE prefill gives no win" — a confident,
+wrong, and expensive conclusion. The diagnostic that cost an hour to add has now
+prevented one bad conclusion and produced four correct ones.
+
 ### Summary of where the NPU premises landed
 
 | premise | status |
