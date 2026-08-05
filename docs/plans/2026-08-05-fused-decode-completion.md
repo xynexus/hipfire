@@ -82,57 +82,44 @@ fallback. The real risk is an incomplete audit in step 3.
 
 ---
 
-## Phase 2 — Default fused decode on
+## Phase 2 — Default fused decode on — ALREADY DONE, no work required
 
-**Goal.** Organic traffic reaches the fused path, so the multi-row win is
-actually delivered.
+**This phase was written on a false premise and is closed unbuilt.**
 
-**Expect less than 2.2x.** That figure came from `Qwen3.5-0.8B--mq4`, whose tied
-lm_head is BF16. Profiling during phase 1 found the gain tracks lm_head dtype,
-not model or quant:
+The premise was that `select_qwen35_decode_batch_backend` maps `auto` to
+`SerialReference` unconditionally, so no organic traffic reached the fused path.
+That function does return `SerialReference` for `auto` — but its caller
+immediately overrides it. `qwen35_decode.rs:377-384` selects
+`FusedDenseLayerChunked` whenever the request is `auto`, the arch is dense,
+`session_count >= 2`, and both `validate_qwen35_fused_dense_decode_model_capability`
+and `validate_qwen35_fused_dense_decode_resident_sessions` pass. That has been
+there since `08617fbc8` (2026-06-20). The premise came from reading one function
+without its caller.
 
-| model | tied lm_head | multi-row gain |
-|---|---|---|
-| `Qwen3.5-0.8B--mq4` | BF16 509 MB | 2.2x |
-| `qwen3.5-0.8b-mq4+` | Q8F16 270 MB | 1.03x |
-| `qwen3.5-9b-mq4` | MQ4G256 540 MB | 1.54x |
+Measured with nothing set (`HIPFIRE_QWEN35_DECODE_BATCH` absent, so `auto`), four
+concurrent sessions in lockstep on gfx1103:
 
-The two 0.8B rows are a controlled A/B — identical 186-tensor MQ4G256 body and
-arch, differing only in lm_head dtype. The Q8 lm_head arm does not amortize
-across rows. Most production quants ship a quantized lm_head, so the realistic
-default-on win is nearer 1.5x than 2.2x. Size the decision on that.
+    backend = fused_dense_layer_chunked   chunk = 4x1   decode_ms = 1247
 
-**The change** is in `select_qwen35_decode_batch_backend`
-(`crates/hipfire-generate/src/lib.rs`): `""`/`"auto"` currently returns
-`SerialReference` unconditionally. It should select `FusedDenseLayerChunked`
-for dense qwen3.5 when a capability gate passes, and fall back otherwise —
-mirroring the prefill arm PR #215 added.
+against 1229 ms for an explicit `fused_dense` request — the same path. Organic
+concurrent traffic has been getting fused multi-row decode all along.
 
-**Steps.**
+Every step this phase proposed already exists:
 
-1. Give decode the same shape prefill now has: consult
-   `validate_qwen35_fused_dense_decode_model_capability` from `auto`, not only
-   from an explicit request. The capability fn already exists and already
-   consults the weights contract.
-2. Decide the envelope deliberately. `batch_runner::batch_envelope_ok` already
-   excludes DFlash, PP>1 and hierarchical KV from continuous batching; decode
-   needs an equivalent, and the KV-mode gate (`fp32`/`q8` only, asym/KVarN
-   fall back) already exists in the capability fn. Write the envelope down
-   rather than inheriting it by accident.
-3. Keep `HIPFIRE_QWEN35_DECODE_BATCH=serial` working as the kill switch, and
-   say so in the env doc.
+| proposed | where it already is |
+|---|---|
+| consult the capability gate from `auto` | `qwen35_decode.rs:377-384` |
+| deliberate envelope (PP / DFlash / eviction) | `validate_qwen35_decode_batch_runtime_surface`, `:352` |
+| hierarchical KV forced to serial | `:405` |
+| `=serial` kill switch | already works |
 
-**Validation.** Two-session and four-session parity against serial at temp 0,
-byte-identical. Then a throughput number on organic HTTP traffic — the existing
-`multirow_bench.py` harness measures exactly this. Coherence across the
-qwen3.5 size matrix before flipping, since this changes the default path for
-every dense qwen3.5 request.
-
-**Risk.** Highest in this plan — it changes what production does. Phase 1 first
-is what makes it safe: with AWQ applied rather than rejected, nothing silently
-drops to serial and the fused path is the same path everywhere.
-
----
+**Measurement trap worth recording.** A first check of `auto` reported
+`backend=serial_reference` and appeared to confirm the false premise. That is a
+telemetry artifact: `last_backend` reflects the final decode step, and when
+sessions finish at different lengths the tail steps run one row, which correctly
+takes the serial path. Give every session an identical prompt so they stay in
+lockstep, or the last-cycle telemetry will describe a one-row step rather than
+the batch.
 
 ## Phase 3 — Route `resolve_model_path` through `hipfire-hub`
 
@@ -181,60 +168,78 @@ commit.
 
 ---
 
-## Phase 5 — A second arch for continuous batching
+## Phase 5 — A second arch for continuous batching — BLOCKED, needs re-scope
 
-**Goal.** Prove the generic seam. Everything above is qwen3.5-only.
+**Investigated 2026-08-05. The phase cannot run as written, at either end.**
 
-`docs/plans/2026-07-18-continuous-scheduler-headline.md` sets the test:
-"first non-qwen35 target is deepseek4... If a seam can't be implemented for
-deepseek4 without touching the generic layer, the seam is wrong — fix the
-abstraction, not deepseek4." That is unproven today. lfm2 has only
-`run_generate_batch_prefill_serial_lfm2` and no fused batch decode.
+### There is no seam to test
 
-**Steps.**
+The plan's test was "if a seam can't be implemented for deepseek4 without
+touching the generic layer, the seam is wrong". That test presumes a seam. What
+actually exists:
 
-1. Implement `BatchableSession` for deepseek4 and drive it through the existing
-   runner. Change nothing generic at first — treat any forced change to the
-   generic layer as a finding about the seam.
-2. Port fused batch prefill, then decode.
-3. Record what the seam could not express. That record is the deliverable even
-   if the port stalls.
+- **`ContinuousBatching`** (`hipfire-arch-api`) is declaration-only — its sole
+  method is `max_batch_sessions() -> usize`. Declaring it tells the *server* a
+  request may be routed to the batch runner. It carries no execution.
+- **`BatchableSession`** (`batch_runner.rs:250`) has exactly one impl,
+  `DummySession`, in a `#[cfg(test)]` module. No production arch implements it.
+  Its only method is `batch_key()`.
+- **The daemon dispatches by arch `if`/`else`**, not through a trait:
+  `if is_qwen35_family_arch_id(..) { qwen35 } else if ARCH_ID_LFM2_MOE { lfm2 }
+  else { "supports qwen35/qwen35-moe and lfm2-moe only" }`
+  (`handlers/batch.rs`), for prefill; decode has only
+  `run_generate_batch_decode_step_qwen35`.
 
-**Validation.** The same parity ladder used for qwen3.5: fused == serial at
-temp 0, then throughput.
+So adding any arch today means adding a third arm to that chain — touching the
+generic layer *by construction*, because there is no generic layer to leave
+alone. The seam is not wrong; it is absent.
 
-**Risk.** Largest scope here, and the only phase whose output may be "the
-abstraction is wrong" rather than a landed feature. That is a legitimate
-result — it is the reason to do it before more arches accumulate on the current
-seam.
+Note also the population: exactly **one** arch (qwen35) has true fused
+multi-session execution. lfm2moe's batch prefill is serial per-session and it has
+no batch decode. An abstraction drawn from a single implementation is unproven
+regardless of how it is written.
 
----
+### deepseek4 is not ready to be that second arch
 
-## Phase 6 — Batch the Q8 lm_head arm (new, from phase 1 profiling)
+Its batched forwards are single-session and incomplete:
 
-**Goal.** Make `gemm_q8_0_batched_chunked` amortize across rows, so a quantized
-lm_head stops capping multi-row decode.
+- `forward_prefill_batch` takes one `state`, one `tokens`, one `start_pos` — one
+  session — and its body is a per-token `decode_step` loop, commented "Per-token
+  fallback until forward_prefill_batch_chunk is end-to-end".
+- `forward_prefill_batch_chunk` is "Phase B2 work in progress... Currently a
+  partial wiring".
 
-Found while profiling phase 1, not planned. It is the single biggest lever on
-what phase 2 actually delivers: with a Q8 lm_head the multi-row gain collapses
-to ~1.03x, and tied-embedding models put lm_head at a large fraction of decode
-bytes. BF16 lm_head amortizes fine, so the batching is achievable — one arm
-already does it.
+Multi-session batching needs block-diagonal attention over N separate KV/MLA
+states. deepseek4 does not yet have batched execution for *one* session.
 
-**Steps.**
+### Re-scope: two independent pieces of work
 
-1. Confirm the container's `Q8F16` maps to the `DType::Q8_0` match arm at
-   runtime. The whole finding rests on that and it is currently an assumption.
-2. Isolate: microbenchmark `gemm_q8_0_batched_chunked` at N=1 vs N=4 against the
-   BF16 arm at the same shapes. Confirm the row-scaling gap in the kernel rather
-   than inferring it from end-to-end decode.
-3. Then optimise, or route the tied-lm_head case to an arm that batches.
+**5a — Build the seam, proven against what exists.** Replace the daemon's arch
+`if`/`else` with a trait the batch prefill/decode handlers dispatch through, and
+implement it for qwen35 (fused) and lfm2moe (serial). Tractable now, and it makes
+the abstraction concrete before a second arch has to fit it. Weak evidence on its
+own — one real impl plus one degenerate one — but it converts "no seam" into "a
+seam with a known-thin proof".
 
-**Risk.** Unknown until step 2 — the chunking may be structural. Worth knowing
-either way, because it bounds phase 2's payoff.
+**5b — Finish deepseek4's batched forward.** A kernel project (its own Phase B2),
+independent of any batching seam, and a prerequisite for deepseek4 participating
+at all.
 
-**Ordering.** Independent of phases 3-5. Doing it before or alongside phase 2
-changes how phase 2 should be sized, so at minimum finish step 2 first.
+They can proceed in either order; 5a does not depend on 5b. Doing 5a first means
+5b's author has something to implement against instead of a third `else if`.
+
+## Not doing: batching the Q8 lm_head arm
+
+Considered and dropped. Phase 1 profiling found the Q8 lm_head arm does not
+amortize across rows (1.04x vs BF16's 2.20x), which looked like a lever until
+the format's status was checked: `--embed-precision` defaults to `source`, and
+Q8 is the historical opt-in table that also carries "the largest per-tensor KLD
+cost in an otherwise low-bit model" (hipfire-quantize/src/main.rs). Making a
+discouraged format batch better is not worth the work.
+
+The live question it leaves is the MQ4 `lm_head.weight` case — `qwen3.5-9b-mq4`
+measures 1.54x — which is a supported configuration. Chase that if sub-2.2x
+scaling on quantized-lm_head models matters.
 
 ## Sequencing
 
