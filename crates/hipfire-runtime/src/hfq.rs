@@ -2596,6 +2596,38 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        49 | 50 => {
+            // A lossless recoding left packed — BF16L3 under residency, or
+            // Huffman. Decode to plain bf16 rather than keep it packed.
+            //
+            // Only a GEMV consumer can read the packed form: `gemv_bf16l3_xf32`
+            // is batch-1, and there is no BF16L3 GEMM, so a layer weight kept
+            // packed would work at decode and break at prefill. The lm_head is
+            // different — it is GEMV-only — and stays packed via its own branch
+            // in `load_weights_hfq`, which runs before this.
+            //
+            // HIPFIRE_BF16L3_RESIDENT is global, so enabling it to pack the head
+            // also leaves every layer weight packed on an all-bf16 model. Before
+            // this arm that panicked here with `unsupported quant_type 49`.
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = decode_bf16_packed(info.quant_type, data, n).unwrap_or_else(|| {
+                panic!(
+                    "failed to decode recoded weight {st_name} (quant_type={})",
+                    info.quant_type
+                )
+            });
+            let mut buf = gpu.upload_raw(&logical, &[m, k])?;
+            buf.dtype = DType::BF16;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!(
             "unsupported quant_type {} for weight {st_name}",
             info.quant_type
