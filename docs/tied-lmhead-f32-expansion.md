@@ -251,6 +251,13 @@ embedding GATHER is untouched (`token_embd` is its own buffer).
 Per-token traffic on llama3.2:1b goes from 1545.5 MB to 1020.1 MB — **2.00x
 FLM's 772.3 MB down to 1.32x**.
 
+**Superseded by the packed head.** `gemv_bf16l3_xf32` plus a BF16L3-stored
+embedding takes it further: tg128 90.74 -> **102.53**, head 525.3 -> 379.8 MB,
+per-token 1020.1 -> 871.1 MB, i.e. **1.13x FLM**. See
+`bf16l3-lmhead-plan.md`. The bf16 step below is still the one that applies by
+default, since the packed head needs `HIPFIRE_BF16L3_RESIDENT` and an artifact
+built with `--bf16-codec lut3`.
+
 ### Which models this reaches
 
 Scanning all 43 registered artifacts for a BF16 `embed_tokens` with no
