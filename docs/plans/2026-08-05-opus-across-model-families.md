@@ -183,6 +183,21 @@ Sequence, cheapest-first:
    reassuring, not proof, and an unexplained numeric difference in the premier
    quant's residency path is exactly the kind of thing that surfaces later as a
    quality regression nobody can bisect.
+   Two controls make the bisection trustworthy rather than suggestive:
+   `ONLY_K=999`, matching no tensor, reproduces the expanded logit_hash
+   EXACTLY — so compact residency applied to nothing is byte-identical, and the
+   filter is doing what it claims; and `ONLY_K=1024,2048,3584` equals plain
+   compact-all, confirming those three values cover every compact tensor with
+   none unaccounted for.
+
+   Static analysis is now exhausted, with these paths eliminated: prefill_batch
+   is symmetric (oq8 and compact both go `*_act_batched` -> quantize ->
+   their GEMM); the decode files carry no dtype-specific handling at all, so
+   decode is pure generic dispatch; and `gemm_oq8_grouped_prequant` bottoms out
+   in the same `gemm_oq8_grouped_wmma` the oracle compares against, so the
+   oracle's reference is the right one. The next step is per-op instrumentation
+   — dump each op's output under both modes and diff — not more reading.
+
    **Separately found, and more serious than the divergence:
    `prefill_chunk.rs` has NO compact support at all** — zero `OqCompactG256`
    against 22 `Oq8G256`. Traced through the `wo` chain, a compact tensor there:
