@@ -322,10 +322,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ok_finite = table.values().all(|v| v.is_finite() && *v >= 0.0);
 
     if ok_loss && ok_layers && ok_finite {
-        let verdict = if mean < expect - 2.0 {
-            "predicts text"
-        } else {
-            "near uniform (expected for a random-init fixture)"
+        // Never claim "predicts text" off synthetic tokens: the run already
+        // warned that the loss is not meaningful there, and a verdict that
+        // contradicts its own preamble is worse than no verdict. On 0,1,2,...
+        // a low loss says the stack is coherent, not that it models language.
+        let verdict = match (synthetic, mean < expect - 2.0) {
+            (true, true) => "well below uniform — but tokens are SYNTHETIC, so this shows a coherent stack, NOT a language-model loss",
+            (true, false) => "near uniform (synthetic tokens; expected for a random-init fixture)",
+            (false, true) => "predicts text",
+            (false, false) => "near uniform (expected for a random-init fixture)",
         };
         println!("\nPASS — hybrid stack assembled, mean loss {mean:.3} vs ln(vocab) {expect:.3} — {verdict}");
         Ok(())
