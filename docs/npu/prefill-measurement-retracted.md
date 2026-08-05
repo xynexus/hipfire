@@ -114,12 +114,34 @@ rate falls with length — 2400 at 403 tokens, 1294.6 at 1339 — because attent
 is O(n^2), so a like-for-like comparison needs FLM's length. And 2400 t/s is one
 host, one artifact (`Llama-3.2-1B-Instruct--oq4++`, gfx1151).
 
-**Consequence for the NPU plan.** The premise that prefill is 34x behind does not
-survive. Whatever case exists for a prefill NPU offload has to be rebuilt on
-measured numbers, at a matched prompt length, with the path shown. The
-`decoder-layer-npu-scope.md` table should not be used until its hipfire column
-is re-derived — every row in it is suspect for the same reason, including the
-35B's 36.4 t/s.
+**Consequence for the NPU plan — narrower than first written.** An earlier
+revision of this section said every row of the scope table was suspect
+"including the 35B's 36.4 t/s". That was an overcorrection. `bench_prefill`
+dispatches per arch, and only some arms are warm-passes:
+
+| arch | `bench_prefill` arm | prefill figure |
+|---|---|---|
+| qwen3.5/3.6 family (incl. **35B-A3B**) | `qwen35::forward_prefill_batch` | **real prefill** |
+| LLaMA / Qwen3 (arch 0/1) | per-token `decode_step` | warm-pass — not prefill |
+| Qwen2 | per-token `forward_step` | warm-pass |
+| DeepSeek V4, MiniMax-M2, LFM2.5-MoE | per-token `decode_step` | warm-pass |
+
+So the two rows of the scope table land differently:
+
+* **llama-1B prefill 80.8 t/s is not a prefill number.** Measured properly it is
+  ~2400 t/s, and the gap to FLM's ~2750 is ~13%, not 34x.
+* **35B-A3B prefill 36.4 t/s IS a prefill number** — the qwen35 arm runs the
+  batched path. Against FLM's ~290 that is a genuine ~8x gap.
+
+**The MoE case for a prefill NPU offload therefore survives, and it is the case
+the scope doc actually makes** — "a prefill-only offload for the MoE is the
+smallest change that flips the last axis", noting the MoE is `prefill = "full"`
+in `model-support.toml` where llama is only `partial`. What does not survive is
+the llama row, and any argument resting on it.
+
+Still worth re-deriving the 35B figure with the trace, to confirm the batched
+path is what runs and to get a rate at a stated prompt length. But the premise
+is not refuted there.
 
 ## Instrument fix
 
