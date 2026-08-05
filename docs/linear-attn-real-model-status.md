@@ -239,20 +239,36 @@ fold and the decode path are all eliminated in a single measurement — the defe
 is in the layer math at 35B dimensions. The testbed is 2.6 GB and runs in
 seconds against ~20 minutes for the full model.
 
-Internals, against the 0.8B at the same point:
+### RETRACTED: "v and z are 8-10x the 0.8B's"
+
+That comparison was invalid. The 0.8B figures came from
+`tools/qwen35_layer0_oracle.py`'s stage dump, which was recorded BEFORE the
+GemmaRMSNorm fix and therefore used a plain `w` norm instead of `1 + w` — a
+factor of 3.8 on `xn1` and everything downstream of it. Comparing a pre-fix
+number against a post-fix one produced a difference that is an artifact of the
+fix, not a property of the model.
+
+Recomputed with the same convention on both:
 
 | quantity | 35B | 0.8B |
 |---|---|---|
-| q, k (post L2-norm) | 0.0078, 0.0884 | 0.0078, 0.0884 |
-| v | **0.4198** | 0.0507 |
-| z (in_proj_z output) | **2.2883** | 0.2301 |
-| dn_out | 0.0059 | 0.00086 |
-| normed (gated-norm out) | 0.0247 | 0.0709 |
+| xn1 | 1.0478 | 1.2287 |
+| z rms | 2.2882 | 0.8781 |
+| z min / max | -14.60 / +4.86 | -5.21 / +3.11 |
+| fraction of z negative | 0.75 | 0.60 |
+| **silu(z) rms** | **0.8941** | 0.4848 |
 
-q and k match exactly, which is expected — both are L2-normalised, so the norm
-erases any input scale difference. v and z do not: they are 8-10x the 0.8B's.
-And despite z being 10x LARGER, `normed` comes out 3x SMALLER, which means
-`silu(z)` is collapsing — z must carry large negative outliers.
+`silu(z)` is 1.8x LARGER for the 35B, not collapsing. The z ratio is 2.6x
+against a 2x wider hidden — unremarkable. So the 35B's linear_attn internals
+look normal relative to the 0.8B's, and the "z carries large negative outliers
+that kill the gate" lead is dead.
+
+This is the fifth time this session a conclusion has come from a number whose
+provenance was not checked (after the AWQ fold on synthetic tokens, the branch
+magnitudes from the broken dumper, the flat-rms "pathology", and the random-init
+fixture at seq 64). The rule that keeps proving itself: **before comparing two
+measurements, confirm they were produced by the same code at the same time.**
+Stale numbers in a doc are not evidence.
 
 Three single-change variants each improve it by an order of magnitude, and none
 comes close to fixing it:
