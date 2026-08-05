@@ -1086,11 +1086,25 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
 // (F32/F16/BF16/Raw) plus plain Q8_0 and MQ4G256 (quantized dense models). MQ6G256
 // and other quant formats have no batched non-residual kernel yet, so models using
 // them fall back to serial_reference via the contract. (Name kept to avoid churn.)
-fn dense_prefill_weight_full_precision_supported(weight: &WeightTensor) -> bool {
-    matches!(
+/// Why `weight` cannot go through the fused dense body, or `None` if it can.
+fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'static str> {
+    // AWQ-calibrated artifacts ("+" quants, e.g. mq4+) store weights PRE-SCALED
+    // as `W·s` and require the forward path to apply `x /= s` upstream of the
+    // linear, completing `(W·s)·(x/s) = W·x` — see `WeightTensor::awq_scale`.
+    // This fused body never applies it, so it would compute `(W·s)·x`: wrong by
+    // a per-channel factor, and silently, because the dtype is otherwise
+    // accepted. Route those to serial until the fused body folds the scale in.
+    // Mirrors the `awq_scale.is_none()` guards already in `moe_decode.rs`.
+    if weight.awq_scale.is_some() {
+        return Some("AWQ pre-scaled weights: the fused body does not apply the awq_scale sidecar");
+    }
+    if !matches!(
         weight.gpu_dtype,
         DType::F32 | DType::F16 | DType::BF16 | DType::Raw | DType::Q8_0 | DType::MQ4G256
-    )
+    ) {
+        return Some("unsupported weight dtype");
+    }
+    None
 }
 
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
@@ -1109,38 +1123,44 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
             weights.embd_format,
         ));
     }
-    if !dense_prefill_weight_full_precision_supported(&weights.output) {
+    if let Some(reason) = dense_prefill_weight_unsupported_reason(&weights.output) {
         return Err(format!(
-            "dense session fused prefix does not support lm_head dtype {:?} yet",
+            "dense session fused prefix does not support lm_head ({reason}; dtype {:?})",
             weights.output.gpu_dtype,
         ));
     }
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        let supported = match layer {
-            LayerWeights::DeltaNet(layer) => {
-                dense_prefill_weight_full_precision_supported(&layer.wqkv)
-                    && dense_prefill_weight_full_precision_supported(&layer.wz)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_alpha)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_beta)
-                    && dense_prefill_weight_full_precision_supported(&layer.wo)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
+        let unsupported = match layer {
+            LayerWeights::DeltaNet(layer) => [
+                &layer.wqkv,
+                &layer.wz,
+                &layer.w_alpha,
+                &layer.w_beta,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .into_iter()
+            .find_map(dense_prefill_weight_unsupported_reason),
+            LayerWeights::FullAttn(layer) => [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .into_iter()
+            .find_map(dense_prefill_weight_unsupported_reason),
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
+                Some("MoE layer weights; the dense fused prefix is dense-only")
             }
-            LayerWeights::FullAttn(layer) => {
-                dense_prefill_weight_full_precision_supported(&layer.wq)
-                    && dense_prefill_weight_full_precision_supported(&layer.wk)
-                    && dense_prefill_weight_full_precision_supported(&layer.wv)
-                    && dense_prefill_weight_full_precision_supported(&layer.wo)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
-            }
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         };
-        if !supported {
+        if let Some(reason) = unsupported {
             return Err(format!(
-                "dense session fused prefix layer {layer_idx} has unsupported dense/MoE weight dtypes; first target is dense full-precision weights"
+                "dense session fused prefix layer {layer_idx} has unsupported weights ({reason})"
             ));
         }
     }
