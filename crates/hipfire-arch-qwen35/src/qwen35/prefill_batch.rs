@@ -765,9 +765,16 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
         ),
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
-            let rotated = gpu
-                .rotate_x_mq_batched(&normed_rows, &rot, weights.output.k, row_count)
-                .and_then(|()| {
+            // AWQ-aware — see `dense_session_prefill_gemm_full_precision`.
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
                     gpu.gemm_hfq4g256(
                         &weights.output.buf,
                         &rot,
@@ -1088,15 +1095,19 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
 // them fall back to serial_reference via the contract. (Name kept to avoid churn.)
 /// Why `weight` cannot go through the fused dense body, or `None` if it can.
 fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'static str> {
-    // AWQ-calibrated artifacts ("+" quants, e.g. mq4+) store weights PRE-SCALED
-    // as `W·s` and require the forward path to apply `x /= s` upstream of the
-    // linear, completing `(W·s)·(x/s) = W·x` — see `WeightTensor::awq_scale`.
-    // This fused body never applies it, so it would compute `(W·s)·x`: wrong by
-    // a per-channel factor, and silently, because the dtype is otherwise
-    // accepted. Route those to serial until the fused body folds the scale in.
-    // Mirrors the `awq_scale.is_none()` guards already in `moe_decode.rs`.
-    if weight.awq_scale.is_some() {
-        return Some("AWQ pre-scaled weights: the fused body does not apply the awq_scale sidecar");
+    // AWQ-calibrated artifacts ("+" quants) store weights PRE-SCALED as `W·s`
+    // and require the forward path to apply `x /= s` upstream of the linear,
+    // completing `(W·s)·(x/s) = W·x` — see `WeightTensor::awq_scale`. Applying
+    // it is per-dtype work, not a blanket property of this body: MQ4G256 gets
+    // it from the FWHT pre-rotation, which now dispatches through
+    // `rotate_x_mq_batched_for` at every dense site. No other dense arm divides
+    // by the scale, so an AWQ sidecar on one would still compute `(W·s)·x` —
+    // silently, since the dtype is otherwise accepted. Keep routing those to
+    // serial. Widen this only alongside the arm that applies the scale.
+    if weight.awq_scale.is_some() && weight.gpu_dtype != DType::MQ4G256 {
+        return Some(
+            "AWQ pre-scaled weights: the fused body applies awq_scale only on the MQ4G256 arm",
+        );
     }
     if !matches!(
         weight.gpu_dtype,
@@ -4590,7 +4601,12 @@ fn dense_session_prefill_gemm_full_precision(
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
-            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            // AWQ-aware. When `weight` ships an `awq_scale` sidecar its stored
+            // bytes are pre-scaled `W·s`, so the activation must be divided by
+            // `s` before the FWHT to complete `(W·s)·(x/s) = W·x`. `_for`
+            // dispatches that kernel and is byte-identical to the plain rotate
+            // when there is no sidecar.
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
             let result = gpu.gemm_hfq4g256(&weight.buf, &rot, y, weight.m, weight.k, n);
             let _ = gpu.free_tensor(rot);
             result
@@ -4645,7 +4661,8 @@ fn dense_session_prefill_gemm_full_precision_residual(
         }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
-            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            // AWQ-aware — see `dense_session_prefill_gemm_full_precision`.
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
             let result =
                 gpu.gemm_hfq4g256_residual(&weight.buf, &rot, y_residual, weight.m, weight.k, n);
             let _ = gpu.free_tensor(rot);
