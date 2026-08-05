@@ -2010,6 +2010,13 @@ pub const ENV_HIPFIRE_GFX942_RMSNORM_SPLIT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/feature_flags.rs:250",
 };
 
+/// `HIPFIRE_GH_ORACLE_DIR` — Oracle export, matching dump_qwen35_hidden_states' HFHIDDEN format
+pub const ENV_HIPFIRE_GH_ORACLE_DIR: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GH_ORACLE_DIR",
+    description: "Oracle export, matching dump_qwen35_hidden_states' HFHIDDEN format",
+    source: "crates/hipfire-train/examples/gamma_hybrid.rs:245",
+};
+
 /// `HIPFIRE_GPTQ_DAMPING` — Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 (the default) the pass is a no-op and output is byte-identical to plain `quantize_mq2g256_lloyd_weighted`.
 pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPTQ_DAMPING",
@@ -2546,7 +2553,7 @@ pub const ENV_HIPFIRE_LFM2_GRAPH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS",
     description: "Runtime variable controlling llama calib layers per pass in hipfire",
-    source: "crates/hipfire-runtime/src/llama_calibration.rs:44",
+    source: "crates/hipfire-runtime/src/llama_calibration.rs:42",
 };
 
 /// `HIPFIRE_LLOYD_FORCE_BASELINE` — Runtime variable controlling lloyd force baseline in hipfire
@@ -3142,14 +3149,14 @@ pub const ENV_HIPFIRE_NPU_VERIFY_UNIT_SCALES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_ACT4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_ACT4",
     description: "HIPFIRE_OQ4_ACT4=1 (verification harness): consume the rotated",
-    source: "crates/hipfire-runtime/src/weights.rs:594",
+    source: "crates/hipfire-runtime/src/weights.rs:590",
 };
 
 /// `HIPFIRE_OQ4_ACT_CLIP` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_OQ4_ACT_CLIP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_ACT_CLIP",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-runtime/examples/perplexity_batched.rs:98",
+    source: "crates/hipfire-runtime/examples/perplexity_batched.rs:103",
 };
 
 /// `HIPFIRE_OQ4_ACT_GROUP` — Selects behavior from recognized values
@@ -3170,7 +3177,7 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
     description: "Interprets \"HIPFIRE_OQ4_PREFILL_ACT_BITS\" from environment to select behavior",
-    source: "crates/hipfire-runtime/src/weights.rs:1392",
+    source: "crates/hipfire-runtime/src/weights.rs:1388",
 };
 
 /// `HIPFIRE_OQ4_PREFILL_ACT_BITS_DOWN` — Runtime variable controlling oQ4 prefill act bits down in hipfire
@@ -3205,7 +3212,7 @@ pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS_QKV: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_TRACE",
     description: "Runtime variable controlling oQ4 trace in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:677",
+    source: "crates/hipfire-runtime/src/weights.rs:673",
 };
 
 /// `HIPFIRE_OQ8_BATCHED_PREFILL` — Environment toggle value controls runtime behavior
@@ -3275,7 +3282,7 @@ pub const ENV_HIPFIRE_PARO_FUSED_PACK2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSE_RMSNORM",
     description: "time per call. Net loss on every site. Default OFF; explicit opt-in for",
-    source: "crates/hipfire-runtime/src/weights.rs:790",
+    source: "crates/hipfire-runtime/src/weights.rs:786",
 };
 
 /// `HIPFIRE_PARO_GATE_UP_FUSED` — Runtime variable controlling paro gate up fused in hipfire
@@ -3331,7 +3338,7 @@ pub const ENV_HIPFIRE_PARO_PACK4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_PREROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PREROTATE",
     description: "Runtime variable controlling paro prerotate in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1321",
+    source: "crates/hipfire-runtime/src/weights.rs:1317",
 };
 
 /// `HIPFIRE_PARO_SHARED_PAIRS` — Runtime variable controlling paro shared pairs in hipfire
@@ -3345,7 +3352,7 @@ pub const ENV_HIPFIRE_PARO_SHARED_PAIRS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SWIGLU_FUSED",
     description: "Runtime variable controlling paro swiglu fused in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1334",
+    source: "crates/hipfire-runtime/src/weights.rs:1330",
 };
 
 /// `HIPFIRE_PERF_BASELINE` — Runtime variable controlling perf baseline in hipfire
@@ -4306,7 +4313,7 @@ pub const ENV_HIPFIRE_RECOVER_NOISE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_REF_DIAG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_REF_DIAG",
     description: "token, next to ours. A block/position misalignment shows",
-    source: "crates/hipfire-runtime/examples/perplexity_batched.rs:208",
+    source: "crates/hipfire-runtime/examples/perplexity_batched.rs:232",
 };
 
 /// `HIPFIRE_REPLAY_GRAPH` — Enabled when set to 1
@@ -5635,6 +5642,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_GFX942_GEMV_V3,
     ENV_HIPFIRE_GFX942_MFMA_PREFILL,
     ENV_HIPFIRE_GFX942_RMSNORM_SPLIT,
+    ENV_HIPFIRE_GH_ORACLE_DIR,
     ENV_HIPFIRE_GPTQ_DAMPING,
     ENV_HIPFIRE_GPU_CHOLESKY,
     ENV_HIPFIRE_GPU_SLAB_LOAD,

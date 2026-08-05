@@ -4333,6 +4333,7 @@ pub const KVARN_BUILD_KCACHE_SRC: &str =
 pub const GEMV_F16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f32.hip");
 pub const GEMV_F16_F16_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f16.hip");
 pub const GEMV_BF16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_f32.hip");
+pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
 /// Per-row symmetric Q4 GEMV — the coarse candidate-scorer for the two-stage
 /// lm_head shortlist. See kernels/src/gemv_q4sym_f32.hip.
 pub const GEMV_Q4SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q4sym_f32.hip");
@@ -4353,6 +4354,7 @@ pub const LMHEAD_COARSE_COMPACT_SRC: &str =
     include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
 pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
+pub const GEMV_BF16L3_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3_xf32.hip");
 
 /// Expand a BF16H (Huffman-coded exponent) payload to plain BF16 on device.
 ///

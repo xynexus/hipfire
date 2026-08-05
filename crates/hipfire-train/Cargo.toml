@@ -9,6 +9,12 @@ description = "hipfire training path: un-fused fp32 forward + hand-written backw
 # is deliberately decoupled from the fused inference hot path: it owns its own
 # un-fused fp32 forward so every op has a clean, differentiable backward.
 
+[features]
+# Cross-check the host delta-rule against the inference kernel. Off by default:
+# the kernel is gfx-specific and hard-wired to head_dim 128, so it is a
+# verification tool, not something the training path should depend on.
+deltanet = ["hipfire-rdna/deltanet"]
+
 [dependencies]
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-runtime = { path = "../hipfire-runtime" }
@@ -36,3 +42,11 @@ path = "examples/train_load_supra50m.rs"
 [[example]]
 name = "dspark_labels"
 path = "examples/dspark_labels.rs"
+
+[[example]]
+name = "verify_deltanet_vs_kernel"
+required-features = ["deltanet"]
+
+[[example]]
+name = "verify_la_core_vs_kernels"
+required-features = ["deltanet"]

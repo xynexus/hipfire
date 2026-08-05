@@ -320,6 +320,22 @@ fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect()),
+        // Lossless recoding left packed by HIPFIRE_BF16L3_RESIDENT. Residency is
+        // global, so enabling it for a LUT3 lm_head leaves every bf16 tensor
+        // packed — including the ones this dequant sees.
+        49 => {
+            // `dequant_qt` has no element count, but BF16L3's own header records
+            // one — `n_elems` at offset 4. Huffman (50) carries no equivalent
+            // here and still errors, which is correct: it is never resident.
+            let n = hipfire_primitives::bf16_lut3::n_elems(bytes)
+                .ok_or_else(|| "zaya gpu: BF16L3 payload has no header".to_string())?;
+            let logical = hipfire_runtime::hfq::decode_bf16_packed(49, bytes, n)
+                .ok_or_else(|| "zaya gpu: failed to decode BF16L3".to_string())?;
+            Ok(logical
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect())
+        }
         other => Err(format!("zaya gpu: unsupported quant_type {other}")),
     }
 }

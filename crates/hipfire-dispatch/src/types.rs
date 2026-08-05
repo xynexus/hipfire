@@ -111,8 +111,8 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
         // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
         // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
         // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
@@ -131,8 +131,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -183,6 +183,13 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
 pub enum KernelKey {
     // GEMV plain
     GemvF32,
+    /// BF16 weight x F32 activation. See `gemv_bf16_xf32.hip`: bf16 has no
+    /// same-precision-activation entry on purpose — rounding x costs
+    /// rel rms 3.4e-4 and buys nothing, x being K elements against M x K.
+    GemvBf16,
+    /// BF16L3 weight x F32 activation. Lossless packed bf16 — see
+    /// `gemv_bf16l3_xf32.hip`. Requires K % 256 == 0.
+    GemvBf16L3,
     GemvF16,
     GemvQ8_0,
     GemvQ4K,
@@ -558,6 +565,8 @@ impl KernelKey {
         use GemvVariant::*;
         match (dtype, variant) {
             (F32, Plain) => Ok(Self::GemvF32),
+            (BF16, Plain) => Ok(Self::GemvBf16),
+            (Bf16L3, Plain) => Ok(Self::GemvBf16L3),
             (F16, Plain) => Ok(Self::GemvF16),
             (Q8_0, Plain) => Ok(Self::GemvQ8_0),
             (Q4K, Plain) => Ok(Self::GemvQ4K),
@@ -688,7 +697,11 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            // Bf16L3 decodes with shifts, byte loads and a wave prefix sum —
+            // no ISA-specific intrinsics, so it runs anywhere BF16 does.
+            F32 | F16 | BF16 | Bf16L3 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => {
+                ArchPredicate::Always
+            }
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)

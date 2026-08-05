@@ -18,6 +18,10 @@ pub enum DType {
     F32,
     F16,
     BF16,
+    /// BF16L3: lossless 3-bit-LUT exponent coding, ~11.6 bits/element, decoded
+    /// in-kernel so the ratio applies to bandwidth. Byte length is NOT a stride
+    /// — see `hipfire_primitives::bf16_lut3` for the plane layout.
+    Bf16L3,
     Q4K,       // 144 bytes per 256 elements
     Q6K,       // 210 bytes per 256 elements
     Q8_0,      // 34 bytes per 32 elements
@@ -126,6 +130,11 @@ impl DType {
             | DType::DflashOq4MixedPlain
             | DType::W8A8Ref
             | DType::Oq8G256
+            // BF16L3's payload is planar with a variable escape plane, so
+            // there is no per-element stride at all — byte-level, like Raw.
+            // Anything computing a length as `n * size()` is wrong for it and
+            // must use the format's own layout.
+            | DType::Bf16L3
             | DType::Raw => 1, // byte-level
         }
     }

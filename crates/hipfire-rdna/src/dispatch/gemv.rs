@@ -4853,6 +4853,24 @@ impl Gpu {
 
     /// Per-row symmetric Q4 GEMV (coarse lm_head scorer): `w4` [M, K/2] bytes +
     /// `scale` [M], `x` [K] f32 → `y` [M] f32. Grid capped + strided over rows.
+    /// BF16 weight x **F32** activation -> F32. The bf16 analogue of
+    /// `gemv_f16_xf32_residual`.
+    ///
+    /// Prefer this over [`Self::gemv_bf16_f32`] whenever the activation is
+    /// already f32, which in the decode path it always is: staging x down to
+    /// bf16 costs rel rms 3.4e-4 (worst rel 1.6e-3) at 128256 x 2048 and buys
+    /// nothing, since x is K elements against an M x K weight read.
+    pub fn gemv_bf16_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.launch_gemv_generic("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, w, x, y, m, k)
+    }
+
     pub fn gemv_q4sym_f32(
         &mut self,
         w4: &GpuTensor,
@@ -5093,6 +5111,36 @@ impl Gpu {
         assert_eq!(k % 256, 0, "gemv_bf16l3 requires K % 256 == 0, got K={k}");
         self.launch_gemv_generic("gemv_bf16l3", kernels::GEMV_BF16L3_SRC, w, x, y, m, k)
     }
+    /// BF16L3 weight x **F32** activation -> F32. Mixed-precision
+    /// [`Self::gemv_bf16l3`].
+    ///
+    /// Prefer this for an lm_head: `gemv_bf16l3` rounds both the activation and
+    /// the logits to bf16, and neither is necessary — x is K elements against
+    /// an M x K weight read, so reading it as f32 costs no bandwidth.
+    pub fn gemv_bf16l3_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_bf16l3_xf32 requires K % 256 == 0, got K={k}"
+        );
+        self.launch_gemv_generic(
+            "gemv_bf16l3_xf32",
+            kernels::GEMV_BF16L3_XF32_SRC,
+            w,
+            x,
+            y,
+            m,
+            k,
+        )
+    }
+
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(
         &mut self,

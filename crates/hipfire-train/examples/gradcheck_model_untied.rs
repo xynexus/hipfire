@@ -38,6 +38,7 @@ fn dims() -> BlockDims {
         head_dim: HD,
         inter: INTER,
         rope_base: 10000.0,
+        rotary_dim: 0,
         eps: 1e-6,
         lora_scale: 1.0,
         lora_rank: R,

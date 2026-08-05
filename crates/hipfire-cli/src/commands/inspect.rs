@@ -83,6 +83,13 @@ fn resolve(arg: &str, loaded: &LoadedConfig) -> anyhow::Result<PathBuf> {
 
 /// Decode a quant-type byte to its canonical variant name, or a marker for an
 /// unknown/reserved id.
+/// Codes that are lossless BF16 recodings rather than value quantisations.
+/// A tensor still carrying one of these at inspect time was left packed
+/// (residency) rather than expanded at open.
+fn is_lossless_recoding_code(code: u8) -> bool {
+    QuantType::from_code(code).is_some_and(|qt| qt.is_lossless_recoding())
+}
+
 fn quant_name(code: u8) -> String {
     match QuantType::from_code(code) {
         Some(qt) => format!("{qt:?}"),
@@ -301,11 +308,97 @@ fn print_human(
     }
     println!("total: {total_tensors} tensors  {}", fmt_bytes(total_bytes));
 
+    // Lossless storage codecs.
+    //
+    // The histogram above is the LOGICAL view: `expand_bf16_index` rewrites a
+    // recoded entry's dtype and length at open, so a BF16L3-compressed tensor
+    // shows as plain `BF16` with its expanded size. Without this section the
+    // only way to tell a compressed artifact from an uncompressed one is to
+    // compare the file size against the total — which is exactly how it was
+    // missed while working on the BF16L3 lm_head.
+    let mut codecs: std::collections::BTreeMap<u8, (usize, u64, u64)> = Default::default();
+    for (i, t) in hfq.tensors().iter().enumerate() {
+        // Two ways a tensor is compressed on disk, and reporting only the first
+        // hides the biggest one.
+        //
+        //  1. Expanded at open. `expand_bf16_index` rewrote the entry to its
+        //     logical view and `stored_recoding` remembers the physical extent.
+        //  2. Left PACKED. A LUT3 head is resident by default, so its entry is
+        //     never rewritten — `stored_recoding` is None and `quant_type` is
+        //     still the codec. Its `data_size` is already the packed length.
+        //
+        // Case 2 is exactly the 379.74 MB embedding on a stock artifact, so
+        // omitting it reported "saved 55.73 KB" against a real 145 MB.
+        let (stored_qt, packed_len, logical_len) = match hfq.stored_recoding(i) {
+            Some((qt, packed)) => (qt, packed as u64, t.data_size as u64),
+            None if is_lossless_recoding_code(t.quant_type) => {
+                let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                (t.quant_type, t.data_size as u64, n * 2)
+            }
+            None => continue,
+        };
+        let e = codecs.entry(stored_qt).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += packed_len;
+        e.2 += logical_len;
+    }
+    if !codecs.is_empty() {
+        println!("\nlossless storage (compressed on disk, expanded or decoded in-kernel):");
+        let (mut tot_p, mut tot_l) = (0u64, 0u64);
+        for (qt, (n, packed, logical)) in &codecs {
+            println!(
+                "  {:<12}  {:>6} tensors  {:>10} on disk  from {:>10}  {:.3}x",
+                quant_name(*qt),
+                n,
+                fmt_bytes(*packed),
+                fmt_bytes(*logical),
+                *logical as f64 / (*packed).max(1) as f64,
+            );
+            tot_p += packed;
+            tot_l += logical;
+        }
+        if codecs.len() > 1 {
+            println!(
+                "  {:<12}  {:>6} tensors  {:>10} on disk  from {:>10}  {:.3}x",
+                "combined",
+                codecs.values().map(|v| v.0).sum::<usize>(),
+                fmt_bytes(tot_p),
+                fmt_bytes(tot_l),
+                tot_l as f64 / tot_p.max(1) as f64,
+            );
+        }
+        println!(
+            "  saved {} against the logical size",
+            fmt_bytes(tot_l - tot_p)
+        );
+    }
+
     if list_tensors {
         println!("\ntensors:");
-        for t in hfq.tensors() {
+        for (i, t) in hfq.tensors().iter().enumerate() {
+            // Annotate the stored codec: the dtype column is the logical view,
+            // so without this a compressed tensor is indistinguishable here.
+            let stored = match hfq.stored_recoding(i) {
+                Some((qt, packed)) => format!(
+                    "  [stored {} {}, {:.3}x]",
+                    quant_name(qt),
+                    fmt_bytes(packed as u64),
+                    t.data_size as f64 / (packed as f64).max(1.0)
+                ),
+                // Left packed rather than expanded — the dtype column already
+                // names the codec, so say so and give the ratio it is saving.
+                None if is_lossless_recoding_code(t.quant_type) => {
+                    let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                    format!(
+                        "  [packed in place, from {}, {:.3}x]",
+                        fmt_bytes(n * 2),
+                        (n * 2) as f64 / (t.data_size as f64).max(1.0)
+                    )
+                }
+                None => String::new(),
+            };
             println!(
-                "  {:60} {:<14} shape={:?} g={} {}",
+                "  {:60} {:<14} shape={:?} g={} {}{stored}",
                 t.name,
                 quant_name(t.quant_type),
                 t.shape,
@@ -349,7 +442,20 @@ fn print_json(
     let tensors: Vec<Value> = hfq
         .tensors()
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
+            // `quant_type` / `data_size` are the LOGICAL view. When the tensor
+            // is stored under a lossless recoding these report what it expands
+            // to, not what is on disk, so emit the stored form alongside rather
+            // than leaving a consumer to infer it from file size.
+            let (stored_type, stored_code, stored_size) = match hfq.stored_recoding(i) {
+                Some((qt, packed)) => (
+                    Value::from(quant_name(qt)),
+                    Value::from(qt),
+                    Value::from(packed),
+                ),
+                None => (Value::Null, Value::Null, Value::Null),
+            };
             json!({
                 "name": t.name,
                 "quant_code": t.quant_type,
@@ -357,6 +463,9 @@ fn print_json(
                 "shape": t.shape,
                 "group_size": t.group_size,
                 "data_size": t.data_size,
+                "stored_quant_type": stored_type,
+                "stored_quant_code": stored_code,
+                "stored_data_size": stored_size,
             })
         })
         .collect();

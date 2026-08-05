@@ -509,13 +509,7 @@ env_vars! {
 
     // ── Lossless BF16 recodings (hipfire-runtime) ───────────────────────────
     BF16L3_RESIDENT = "HIPFIRE_BF16L3_RESIDENT", Developer,
-        "Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding \
-         them at load. Set to anything except `0`. Only `Bf16Lut3` can stay \
-         resident — Huffman codes are bit-serial and are always expanded. \
-         Requires kernels that decode the packed form natively (`gemv_bf16l3`); \
-         a gather-read table (a tied embed/lm_head) has no such path and will \
-         fail to load. Buys ~1.18x weight bandwidth only once the working set \
-         exceeds the GPU's last-level cache, and is a measured slowdown below.";
+        "Extend LUT3 residency to EVERY Bf16Lut3 tensor. A LUT3 lm_head is already resident by DEFAULT — it is the only large pure-GEMV consumer, served by `gemv_bf16l3_xf32`, worth tg128 90.05 -> 101.45 with byte-identical output. Set to `0` to opt out entirely, head included. Setting it to anything else also packs layer weights, which is rarely wanted: there is no BF16L3 GEMM, so they are decoded at load anyway. Huffman is never resident (bit-serial). Gather reads decode explicitly — a lookup takes one arbitrary row and BF16L3's escape plane needs a block walk.";
 
     BF16_WEIGHTS = "HIPFIRE_BF16_WEIGHTS", Developer,
         "Set `f32` to force F16 weights to upcast to F32 at load instead of \

@@ -1,0 +1,325 @@
+# The tied lm_head is expanded to F32, and why lut3 can't fix it yet
+
+Two findings, one cause.
+
+## 1. Why the two-stage BF16 gate is false
+
+`lmhead_project` (`runtime/src/llama.rs:66`) gates the two-stage shortlist on
+`w.gpu_dtype == DType::BF16`. For a **tied-embedding** model it is never BF16.
+
+Both tied-head load paths dequantise the embedding to **F32** and upload 4 bytes
+per element:
+
+| path | site |
+|---|---|
+| HFQ | `runtime/src/hfq.rs:2689-2727` — `quant_type 16` → `f32::from_bits(u16 << 16)`, `gpu_dtype: DType::F32` |
+| PARO/source | `runtime/src/hfq.rs:3158-3199` — same, `gpu_dtype: DType::F32` |
+
+So on Llama-3.2-1B-Instruct (`tie_word_embeddings: true`) the head is BF16 on
+disk and **F32 in VRAM**. The gate cannot match, and the two-stage path is dead
+code for every tied model — which is exactly the class where the head is the
+largest single tensor.
+
+That is the measured flat TTFT: 59.0 / 60.2 / 56.6 ms for unset / `q4` / `q2`.
+The coarse build never runs because the branch is never taken.
+
+### Verified, both halves
+
+The claim needs two things to be true, and both are directly observed rather
+than inferred:
+
+* **The artifact takes the tied branch.** `hipfire inspect --tensors` on
+  `Llama-3.2-1B-Instruct--oq4++.hfq` matches `lm_head` **zero** times. The only
+  head-shaped tensors are `model.embed_tokens.weight` (BF16) and
+  `model.embed_tokens.coarse.weight` (CoarseQ4Row). So
+  `hfq.find_tensor("lm_head.weight").is_some()` is false and the `else` branch
+  runs.
+* **That branch uploads F32.** Both sites build a `Vec<f32>` and construct
+  `WeightTensor { gpu_dtype: DType::F32 }` — there is no conditional inside them.
+
+Two measurement routes that do NOT work on this box, recorded so they are not
+retried:
+
+* **VRAM via `/sys/class/drm/card1/device/mem_info_vram_used`** stays flat at
+  ~156 MiB through a full load. gfx1151 is a UMA APU; weights do not show up as
+  discrete VRAM.
+* **`/usr/bin/time -v` on `hipfire chat`** reports 10.5 MB peak RSS. The CLI
+  hands off to a daemon it spawns, so the weights are never in the measured
+  process. Sampling the daemon's RSS instead is a race — load takes seconds and
+  a shell poll loop finishes in milliseconds.
+
+## 2. What it costs
+
+`128256 x 2048` head, per token:
+
+| head form | bytes | vs F32 |
+|---|---|---|
+| **F32 — today, tied models** | **1050.7 MB** | 1.00x |
+| BF16 (as stored on disk) | 525.3 MB | 2.00x better |
+| BF16L3 lossless (1.38x) | 380.7 MB | 2.76x better |
+| coarse Q4 shortlist (lossy tail) | 131.3 MB | 8.00x better |
+
+Whole-model per-token traffic against FLM's measured 772.3 MB for the same model:
+
+| configuration | MB/token | vs FLM |
+|---|---|---|
+| **hipfire today (F32 tied head)** | **1545.5** | **2.00x** |
+| head kept BF16 | 1020.1 | 1.32x |
+| head as BF16L3 | 875.5 | 1.13x |
+| two-stage coarse Q4 | 626.1 | 0.81x |
+
+The earlier claim that hipfire streams 1020 MB/token was optimistic: it assumed
+the head stayed BF16. It expands. **hipfire currently moves exactly twice FLM's
+bytes per token on llama3.2:1b**, and the single largest cause is a dequant at
+load, not a format choice.
+
+## 3. Why bf16lut3 is the right idea and still blocked
+
+BF16L3 (`primitives/src/bf16_lut3.rs`) is **exactly lossless** — every `u16`
+reproduced bit-for-bit including NaN payloads — at ~11.6 bits/element, 1.38x
+measured, and it is decoded *in the kernel*, so the ratio applies to bandwidth
+rather than only to file size. For an exact lm_head that is strictly better than
+BF16: same numerics, fewer bytes. There is no accuracy argument against it.
+
+It cannot be used on a tied head today. From `HIPFIRE_BF16L3_RESIDENT`'s own
+documentation:
+
+> Requires kernels that decode the packed form natively (`gemv_bf16l3`); **a
+> gather-read table (a tied embed/lm_head) has no such path and will fail to
+> load.**
+
+The tied tensor serves two consumers with different access patterns: the
+embedding **gather** (one random row per token) and the logit **GEMV** (every
+row). BF16L3 is block-addressable — which is why `hfq_out.rs:167` deliberately
+steers gather-shaped tensors to LUT3 over the better-compressing Huffman — but
+no gather kernel decodes it, so the tied case fails.
+
+Note also that `HIPFIRE_BF16L3_RESIDENT` buys ~1.18x bandwidth **only** once the
+working set exceeds last-level cache, and is a measured slowdown below that. On
+a bandwidth-bound NPU that is a win; on a GPU with a 1B model it may not be.
+
+## Why F32 may have been deliberate — read before "just keep it BF16"
+
+Step 1 below looks free. It may not be, and the reason is a kernel-dispatch
+detail rather than anything about numerics.
+
+`weight_gemv` handles a BF16 weight with an explicit special case
+(`weights.rs`, inside `weight_gemv`):
+
+    // BF16 weights use WMMA GEMM directly (dispatch family has no BF16 GEMV entry).
+    if w.gpu_dtype == DType::BF16 {
+        return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
+    }
+
+So a BF16 head works, but it is served by a **batch-1 WMMA GEMM**, not by a
+GEMV. F32 and F16 heads instead reach dedicated residual GEMV paths. Expanding
+the tied head to F32 buys the better decode kernel at twice the bytes, and on a
+GPU whose working set fits in cache that can be the right trade — which is the
+same regime where `HIPFIRE_BF16L3_RESIDENT` is documented as "a measured
+slowdown".
+
+Note that BF16 GEMV kernels do exist in the tree — `gemv_bf16_f32.hip`,
+`gemv_bf16_vec8.hip`, and a gather variant `gemv_bf16_gather_f32.hip`, plus
+`gemv_bf16l3.hip` for the packed form. They are simply not wired into the
+dispatch family that `run_auto` consults. That is what makes the comment true
+today, and it is also the smallest change that would make step 1 unambiguously
+a win rather than a trade.
+
+### Measured — and the answer is neither of the two obvious options
+
+`cargo run --release -p hipfire-runtime --example bench_lmhead_dtype`, at the
+real 128256 x 2048 shape, 30 iterations on gfx1151:
+
+| path | per call | achieved | tok/s if head-bound | argmax vs F32 | worst diff |
+|---|---|---|---|---|---|
+| **BF16 via `gemv_bf16_f32`** | **3.20 ms** | 164.1 GB/s | **312.3** | OK | 1.16e-3 |
+| F32 via `gemv_f32` | 5.22 ms | 201.3 GB/s | 191.6 | reference | — |
+| BF16 via `gemm_bf16_x_bf16_wmma(batch=1)` | 14.89 ms | 35.3 GB/s | 67.2 | OK | 1.16e-3 |
+
+Both BF16 paths land at the same 1.16e-3 worst deviation against the F32
+reference on a 0.284 magnitude — that is bf16 mantissa rounding, identical for
+the two, and the decoded token is unchanged.
+
+**The correctness column is not decoration.** The first run of this benchmark
+recommended `gemv_bf16_f32` on speed alone, and it was producing garbage: worst
+|diff| 5.8e8 and a different argmax. The cause was a caller error, not a kernel
+bug — `gemm_bf16_x_bf16_wmma` asserts an **F32** activation and stages it to
+bf16 internally, while `gemv_bf16_f32` wants a **BF16** activation already (its
+`x` is `const unsigned short*`). Passing the F32 buffer reads float bytes as
+bf16 pairs. The two contracts differ, and mixing them yields wrong numbers
+rather than an error. Timing was unchanged between the broken and fixed runs
+(3.199 vs 3.202 ms), so the bad run was not fast by skipping work — speed alone
+would never have exposed it.
+
+That contract is also the one real cost of wiring this in: runtime activations
+are F32, so the path needs an x -> bf16 staging step. It is 2048 elements
+against a 128256 x 2048 weight read, and the WMMA path already does exactly
+this internally.
+
+Two conclusions, and the first corrects this document's own earlier advice.
+
+**The F32 expansion is right, given the dispatch family as it stands.** Against
+the BF16 path `weight_gemv` actually takes, F32 is **2.95x faster**. "Just keep
+the head BF16" would have been a near-3x decode regression at the head, not a
+free halving. A batch-1 WMMA GEMM sustains only 35.1 GB/s — it is built for
+batched work and collapses at one row.
+
+**But the best option is already in the tree and unused.** `gemv_bf16_f32` beats
+the F32 GEMV by **1.66x** *while reading half the bytes*. Note it does so at a
+LOWER achieved bandwidth (165.5 vs 199.2 GB/s): the F32 kernel saturates memory
+better, and still loses on wall time because it has twice as much to move. Bytes
+beat efficiency here.
+
+The kernel exists (`kernels/src/gemv_bf16_f32.hip`), the binding exists
+(`dispatch/gemv.rs:4843`), and neither is in the dispatch family `run_auto`
+consults — which is exactly why `weight_gemv` needs its WMMA special case, and
+why the loader expands to F32 to avoid it. Wiring it in is the fix: 1.66x faster
+decode at half the per-token head traffic, no accuracy change, and it makes the
+two-stage path reachable as a side effect.
+
+The NPU case prefers fewer bytes independently — a 56.5 GB/s fabric does not
+care that a GEMV kernel is nicer.
+
+## Landed: `gemv_bf16_xf32`
+
+`kernels/src/gemv_bf16_xf32.hip` + `weight_gemv` routing (commit
+`feat(gemv): add gemv_bf16_xf32 and route BF16 weights through it`).
+
+| path | time | worst diff vs f32 ref (same bf16 W) |
+|---|---|---|
+| **`gemv_bf16_xf32` (x=f32)** | **3.24 ms** | **6.7e-8** |
+| `gemv_bf16_f32` (x=bf16) | 3.20 ms | 4.5e-4 |
+| `gemm_wmma` (x staged to bf16) | 14.6 ms | 4.5e-4 |
+| `gemv_f32` (W widened) | 5.22 ms | reference |
+
+6.7e-8 is f32 accumulation noise, so this is numerically the widened-F32 path
+at half the bytes and 1.61x its speed. The 1.1% it gives up against the
+bf16-activation variant buys back a 6800x accuracy difference.
+
+### Gate status — the 8 failures are NOT from this change
+
+`tests/tiny-affected-gate.sh --require-coverage` reports 8 drifted cells. They
+are pre-existing. Reverting only the `weight_gemv` routing, rebuilding, and
+re-running the same cells reproduces them **to six decimals**:
+
+| cell | with change | routing reverted |
+|---|---|---|
+| `qwen2/kld:hfq4` | 0.001790 | 0.001790 |
+| `qwen3_5_moe/kld:q8f16` | 0.179210 | 0.179210 |
+| `qwen3_5_moe/kld:mq6` | 0.215099 | 0.215099 |
+| `qwen3_5_moe/kld:mq4` | 0.215099 | 0.215099 |
+
+Bit-identical means the BF16 path is not exercised by these fixtures at all —
+their linear weights are quantized, so nothing reaches the branch. This is the
+stale-gfx1151-baseline issue already on the open-decisions list, and
+`minimax/kld:mq4` drifting by exactly 0.000000 is the known vacuous cell.
+
+The coherence battery reported no hard errors.
+
+Re-run after the dispatch-family registration: the same 8 cells, same numbers.
+So the registration is behaviourally inert for these fixtures too, as expected —
+nothing in them dispatches BF16.
+
+### Models that DO exercise the path
+
+`zaya1-8b-parity.bf16` generates 1 token and stops. That predates the change:
+the same prompt on the pre-change build (`gemm_bf16_x_bf16_wmma`) does the same,
+22.48 vs 20.25 tok/s. It is a parity fixture, not a chat model. Worth recording
+because "a full-bf16 model emits one token" is exactly the shape a regression
+here would take, and the only way to tell was to run the old code.
+
+`Llama-3.2-1B-Instruct--bf16` is the working end-to-end check: byte-identical
+generation across all three arrangements (WMMA special case, gemv_bf16_xf32
+special case, gemv_bf16_xf32 via the family) at 24.65 / 24.68 tok/s.
+
+## Landed: the tied head stays BF16
+
+`hfq.rs` uploads a BF16 embedding as bf16 instead of widening it. Measured on
+`Llama-3.2-1B-Instruct--oq4++`:
+
+| metric | F32 head | BF16 head | change |
+|---|---|---|---|
+| tg128 | 76.07 t/s | **89.95 t/s** | **+18.2%** |
+| pp512 | 80.83 t/s | **96.67 t/s** | **+19.6%** |
+| ttft | 55.7 ms | 54.8 ms | -1.6% |
+| resident head | 1050.7 MB | 525.3 MB | half |
+
+Generation is byte-identical, as `gemv_bf16_xf32`'s 6.7e-8 agreement predicts.
+Only BF16 embeddings change; Q8F16 / F16 / F32 still decode to f32, and the
+embedding GATHER is untouched (`token_embd` is its own buffer).
+
+Per-token traffic on llama3.2:1b goes from 1545.5 MB to 1020.1 MB — **2.00x
+FLM's 772.3 MB down to 1.32x**.
+
+**Superseded by the packed head.** `gemv_bf16l3_xf32` plus a BF16L3-stored
+embedding takes it further: tg128 90.74 -> **102.53**, head 525.3 -> 379.8 MB,
+per-token 1020.1 -> 871.1 MB, i.e. **1.13x FLM**. See
+`bf16l3-lmhead-plan.md`. The bf16 step below is still the one that applies by
+default, since the packed head needs `HIPFIRE_BF16L3_RESIDENT` and an artifact
+built with `--bf16-codec lut3`.
+
+### Which models this reaches
+
+Scanning all 43 registered artifacts for a BF16 `embed_tokens` with no
+`lm_head.weight` — the exact condition the branch tests — **9 qualify**:
+
+    Llama-3.2-1B-Instruct--oq4++          Llama-3.2-1B-Instruct--mq4
+    Llama-3.2-1B-Instruct-nc--oq4++       Llama-3.2-1B-Instruct-nc--mq4
+    Llama-3.2-1B-Instruct-nc--oq4++.gfx1151
+    Llama-3.2-1B-Instruct-lut3--oq4++     zaya1-8b-parity.bf16
+    Krea-2-Turbo.dit.oq4.25               Krea-2-Turbo.source
+
+`Llama-3.2-1B-Instruct-nc--oq4++` independently reaches tg128 **89.97** /
+pp512 **96.73**, matching the measured variant's 89.95 / 96.67 — so the gain is
+a property of the dtype path, not of one artifact.
+
+The rest of the registry is untouched by construction: `Q8F16` embeddings (the
+majority — the EmbeddingGemma and L32 families, Gemma-4-31B) and `F16` ones
+(`L32-f16src--*`, `Llama-3.2-1B-Instruct-e16`) still decode to f32, because
+their stored form is not one the GEMV path takes directly. Nothing here has an
+untied `lm_head.weight`, so that branch is unexercised locally.
+
+Two caveats worth stating rather than implying. The Krea-2-Turbo entries are
+diffusion artifacts and likely load through `hipfire-diffusion`, not this
+function, so counting them as beneficiaries is optimistic. And
+`zaya1-8b-parity.bf16` emits one token and stops both before and after — a
+parity fixture, not a working chat model.
+
+### The measurement trap that hid this for a whole cycle
+
+The first attempt at this change measured **76.09 t/s against 76.07** — a
+perfect null — and was reverted as unproven. The change was fine; the
+measurement was not.
+
+**`hipfire chat` and `hipfire bench` are served by a separate `hipfire-daemon`
+binary.** So:
+
+    cargo build -p hipfire-runtime      # library only — daemon unchanged
+    cargo build --bin hipfire           # CLI only    — daemon unchanged
+    cargo build --bin hipfire-daemon    # what actually matters
+
+Binary timestamps are the tell: `hipfire` at 19:36 against `hipfire-daemon` at
+19:24 while "the change did nothing". Rebuilding the daemon turned the same edit
+from +0.03% into +18.2%.
+
+Two things make this hard to notice. A diagnostic `eprintln!` added to the
+edited branch does not appear — but neither does anything else new, so it reads
+as "branch not taken" rather than "stale binary", which is the wrong diagnosis
+and sends you looking at the code. And `hipfire status` reports `offline` /
+`no serve.pid` even with a live daemon, because the CLI daemon's singleton is a
+flock on `~/.hipfire/daemon.pid`, a different file from the HTTP server's
+`serve.pid`. That pidfile also holds a stale line after the writer dies, so the
+PID it names may not exist.
+
+**Rule: for anything reached through `chat`/`bench`, build the workspace or the
+daemon explicitly, and confirm a diagnostic fires before trusting a number.**
+
+## Ordering
+
+1. **Wire `gemv_bf16_f32` into the dispatch family, THEN stop expanding to F32.**
+   Measured 1.66x faster than the F32 GEMV at half the bytes. Doing the second
+   half without the first is a 2.95x regression — see the measurement above.
+2. **Then BF16L3**, which needs a gather-read decode path so the tied tensor can
+   stay packed for both consumers — 1.32x -> 1.13x, still lossless.
+3. **Two-stage** is a decode/argmax fast path only; eval and scoring must keep
+   the exact head, so 1 and 2 are what those paths get.

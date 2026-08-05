@@ -16,7 +16,15 @@ use std::path::Path;
 /// Per-layer frozen weights (HF row-major `[out, in]`, ready for
 /// `gemm_f32_train` with `trans_b=true`).
 pub struct LlamaLayerF32 {
-    pub input_layernorm: GpuTensor,          // [hidden]
+    pub input_layernorm: GpuTensor, // [hidden]
+    /// qwen3-style QK-norm, `[head_dim]`. `None` on llama-shaped models.
+    pub q_norm: Option<GpuTensor>,
+    pub k_norm: Option<GpuTensor>,
+    /// True when `q_proj` emits `2*q_dim` (qwen3.5 `attn_output_gate`).
+    /// DERIVED from the tensor's own shape, never from config: the runtime
+    /// does the same (`infer_attn_output_gate_from_hfq`), because some routed
+    /// Qwen3 artifacts set the config flag while storing plain Q.
+    pub attn_out_gate: bool,
     pub q_proj: GpuTensor,                   // [q_dim, hidden]
     pub k_proj: GpuTensor,                   // [kv_dim, hidden]
     pub v_proj: GpuTensor,                   // [kv_dim, hidden]
@@ -65,6 +73,9 @@ pub fn load_llama_fp32(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
@@ -134,6 +145,9 @@ pub fn load_llama_fp32_hfq(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
@@ -186,13 +200,27 @@ pub fn load_llama_layer_fp32_hfq(
 /// experts — so `dense_mlp = false` substitutes 1-element placeholders. Nothing
 /// reads them: `block_forward_attn_only` and `block_backward_from_dxn2` skip the
 /// dense MLP entirely.
-pub fn load_llama_layer_fp32_hfq_pfx(
+pub fn load_llama_layer_fp32_hfq_pfx<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
-    hfq: &HfqFile,
+    src: &S,
     prefix: &str,
     cfg: &LlamaConfig,
     layer: usize,
     dense_mlp: bool,
+) -> Result<LlamaLayerF32, String> {
+    load_llama_layer_fp32_pfx_off(gpu, src, prefix, cfg, layer, dense_mlp, false)
+}
+
+/// As [`load_llama_layer_fp32_hfq_pfx`], with the GemmaRMSNorm unit offset.
+#[allow(clippy::too_many_arguments)]
+pub fn load_llama_layer_fp32_pfx_off<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    cfg: &LlamaConfig,
+    layer: usize,
+    dense_mlp: bool,
+    unit_offset: bool,
 ) -> Result<LlamaLayerF32, String> {
     let h = cfg.hidden_size;
     let q = cfg.q_dim();
@@ -202,24 +230,41 @@ pub fn load_llama_layer_fp32_hfq_pfx(
     // Sequential rather than a closure: a `|..| load_tensor_f32_hfq(gpu, ..)`
     // closure holds `&mut gpu` for its whole life, which blocks the placeholder
     // allocations below.
-    let input_layernorm =
-        load_tensor_f32_hfq(gpu, hfq, &format!("{p}.input_layernorm.weight"), &[h])?;
-    let q_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?;
-    let k_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?;
-    let v_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?;
-    let o_proj = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?;
-    let post_attention_layernorm = load_tensor_f32_hfq(
+    let input_layernorm = upload_tensor(gpu, src, &format!("{p}.input_layernorm.weight"), &[h])?;
+    let q_rows = src
+        .shape_of(&format!("{p}.self_attn.q_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no q_proj"))?[0];
+    let attn_out_gate = match q_rows {
+        r if r == q => false,
+        r if r == 2 * q => true,
+        r => {
+            return Err(format!(
+                "layer {layer}: q_proj rows {r} are neither q_dim {q} nor 2*q_dim {}",
+                2 * q
+            ))
+        }
+    };
+    let q_proj = upload_tensor(
         gpu,
-        hfq,
+        src,
+        &format!("{p}.self_attn.q_proj.weight"),
+        &[q_rows, h],
+    )?;
+    let k_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?;
+    let v_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?;
+    let o_proj = upload_tensor(gpu, src, &format!("{p}.self_attn.o_proj.weight"), &[h, q])?;
+    let post_attention_layernorm = upload_tensor(
+        gpu,
+        src,
         &format!("{p}.post_attention_layernorm.weight"),
         &[h],
     )?;
 
     let (gate_proj, up_proj, down_proj) = if dense_mlp {
         (
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.gate_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.up_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
         )
     } else {
         let z = |g: &mut Gpu| {
@@ -229,8 +274,43 @@ pub fn load_llama_layer_fp32_hfq_pfx(
         (z(gpu)?, z(gpu)?, z(gpu)?)
     };
 
+    // qwen3-style QK-norm, per HEAD_DIM not per hidden. Absent on llama.
+    let hd = cfg.head_dim;
+    let q_norm = match src.has(&format!("{p}.self_attn.q_norm.weight")) {
+        true => Some(upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.self_attn.q_norm.weight"),
+            &[hd],
+        )?),
+        false => None,
+    };
+    let k_norm = match src.has(&format!("{p}.self_attn.k_norm.weight")) {
+        true => Some(upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.self_attn.k_norm.weight"),
+            &[hd],
+        )?),
+        false => None,
+    };
+
+    if unit_offset {
+        apply_unit_offset(gpu, &input_layernorm)?;
+        apply_unit_offset(gpu, &post_attention_layernorm)?;
+        // q_norm/k_norm take the offset too — qwen35/loading.rs:4571 loads them
+        // with the same `load_norm_weight` as the block norms. A one-token
+        // measurement CANNOT see this (softmax over a single key ignores q and
+        // k entirely), which is why it needed the runtime's loader to settle.
+        for t in [q_norm.as_ref(), k_norm.as_ref()].into_iter().flatten() {
+            apply_unit_offset(gpu, t)?;
+        }
+    }
     Ok(LlamaLayerF32 {
         input_layernorm,
+        q_norm,
+        k_norm,
+        attn_out_gate,
         q_proj,
         k_proj,
         v_proj,
@@ -247,25 +327,464 @@ pub struct MoeLayerF32 {
     pub router: GpuTensor,
     /// Per expert, in expert order: (gate, up, down).
     pub experts: Vec<(GpuTensor, GpuTensor, GpuTensor)>,
+    /// The always-on shared branch, when the architecture has one.
+    pub shared: Option<SharedLayerF32>,
+}
+
+/// One layer's shared-expert weights. `scalar_gate` is `[1, h]` and is NOT the
+/// SwiGLU gate — see `ops::moe::SharedExpert`.
+pub struct SharedLayerF32 {
+    pub scalar_gate: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
+    pub inter: usize,
+}
+
+/// A name→fp32 weight source, so the MoE loaders work against either an `.hfq`
+/// artifact or a raw safetensors directory.
+///
+/// This exists because the stacked/fused expert layout could otherwise only be
+/// tested by inspection: the 35B target is `.hfq`, but the only fixture that
+/// has that layout (`qwen3_5_moe-tiny`) is safetensors, and
+/// `import safetensors` implements 'zaya' alone. One trait means the fixture
+/// exercises the SAME slicing code the artifact will, rather than a parallel
+/// copy that can drift.
+pub trait WeightSource {
+    fn shape_of(&self, name: &str) -> Option<Vec<usize>>;
+    fn fetch_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String>;
+    fn has(&self, name: &str) -> bool {
+        self.shape_of(name).is_some()
+    }
+}
+
+impl WeightSource for HfqFile {
+    fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.find_tensor_info(name)
+            .map(|i| i.shape.iter().map(|&d| d as usize).collect())
+    }
+    fn fetch_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        fetch_f32_hfq(self, name)
+    }
+}
+
+impl WeightSource for SafetensorsSource {
+    fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.tensor_data(name).map(|(i, _)| i.shape.clone())
+    }
+    fn fetch_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        let (info, bytes) = self
+            .tensor_data(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        let f32s = bytes_to_f32(&info.dtype, bytes).map_err(|e| format!("tensor {name}: {e}"))?;
+        Ok((info.shape.clone(), f32s))
+    }
+}
+
+/// Fetch, validate shape, upload.
+fn upload_tensor<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    name: &str,
+    want_shape: &[usize],
+) -> Result<GpuTensor, String> {
+    let (shape, f32s) = src.fetch_f32(name)?;
+    if shape != want_shape {
+        return Err(format!(
+            "tensor {name}: shape {shape:?} != expected {want_shape:?}"
+        ));
+    }
+    gpu.upload_f32(&f32s, want_shape)
+        .map_err(|e| format!("upload {name}: {e}"))
+}
+
+/// One `linear_attn` layer's fp32 weights.
+///
+/// The four small tensors stay on the host — see `la_block::
+/// LinearAttnBlockWeights`, whose core consumes them as slices.
+pub struct LinearAttnLayerF32 {
+    pub input_layernorm: GpuTensor,
+    pub post_attention_layernorm: GpuTensor,
+    pub in_proj_qkv: GpuTensor,
+    pub in_proj_a: GpuTensor,
+    pub in_proj_b: GpuTensor,
+    pub in_proj_z: GpuTensor,
+    pub out_proj: GpuTensor,
+    pub conv1d: Vec<f32>,
+    pub a_log: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm: Vec<f32>,
+    /// Value heads (`A_log`'s length).
+    pub n_heads: usize,
+    /// Key heads — may be fewer; see `LinearAttnDims::n_k_heads`.
+    pub n_k_heads: usize,
+    pub hd_k: usize,
+    pub hd_v: usize,
+    pub conv_k: usize,
+}
+
+/// Load a dense MLP's `(gate, up, down)` for one layer, with `inter` taken
+/// from the tensor rather than config — a hybrid's linear_attn layers can
+/// carry a different MLP width than its attention layers.
+pub fn load_dense_mlp_fp32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    layer: usize,
+    h: usize,
+) -> Result<(GpuTensor, GpuTensor, GpuTensor, usize), String> {
+    let p = format!("{prefix}layers.{layer}.mlp");
+    let inter = src
+        .shape_of(&format!("{p}.gate_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no mlp.gate_proj"))?[0];
+    Ok((
+        upload_tensor(gpu, src, &format!("{p}.gate_proj.weight"), &[inter, h])?,
+        upload_tensor(gpu, src, &format!("{p}.up_proj.weight"), &[inter, h])?,
+        upload_tensor(gpu, src, &format!("{p}.down_proj.weight"), &[h, inter])?,
+        inter,
+    ))
+}
+
+/// A [`WeightSource`] that DEQUANTIZES on read.
+///
+/// `HfqFile`'s own impl deliberately refuses quantized tensors: training on
+/// dequantized weights is a different thing from training on the source, and
+/// that guard should stay. This wrapper is the explicit opt-in, and it exists
+/// for one job — running the hybrid assembly against a REAL model when no
+/// unquantized hybrid is on disk.
+///
+/// **Gamma captured through this is not production gamma.** It measures the
+/// quantized model's sensitivities, not the source's, which is the wrong input
+/// for deciding where to spend bits. It is a validation tool.
+pub struct DequantHfq<'a>(pub &'a HfqFile);
+
+impl WeightSource for DequantHfq<'_> {
+    fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.0.shape_of(name)
+    }
+    fn fetch_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        let (info, bytes) = self
+            .0
+            .tensor_data_cow(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+        let n: usize = shape.iter().product();
+        let mut w = match info.quant_type {
+            1 | 2 | 16 => {
+                let dt = match info.quant_type {
+                    1 => "F16",
+                    2 => "F32",
+                    _ => "BF16",
+                };
+                bytes_to_f32(dt, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?
+            }
+            3 => hipfire_runtime::quant::dequant_q8f16(bytes.as_ref(), n),
+            34 => hipfire_runtime::quant::dequant_oq4g256(bytes.as_ref(), n),
+            35 => hipfire_runtime::quant::dequant_oq8g256(bytes.as_ref(), n),
+            other => {
+                return Err(format!(
+                    "tensor {name}: quant_type {other} has no host dequantizer here; \
+                     Oq4G256 (34), Oq8G256 (35) and Q8F16 (3) are wired"
+                ))
+            }
+        };
+        if w.len() != n {
+            return Err(format!("tensor {name}: decoded {} != {n}", w.len()));
+        }
+
+        // AWQ fold. The artifact stores W*s and the runtime computes
+        // (W*s)*(x/s) — see hfq.rs::load_awq_scale. This forward takes plain x,
+        // so the scale has to come back out of the WEIGHT, per input column.
+        // Getting the axis wrong here is silent: the shapes still line up.
+        if shape.len() == 2 {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
+            let sidecar = format!("{stem}.awq_scale.weight");
+            if let Some((si, sb)) = self.0.tensor_data_cow(&sidecar) {
+                let k = shape[1];
+                let sdt = match si.quant_type {
+                    1 => "F16",
+                    2 => "F32",
+                    16 => "BF16",
+                    o => return Err(format!("{sidecar}: unexpected quant_type {o}")),
+                };
+                let sc = bytes_to_f32(sdt, sb.as_ref()).map_err(|e| format!("{sidecar}: {e}"))?;
+                if sc.len() != k {
+                    return Err(format!("{sidecar}: len {} != K {k}", sc.len()));
+                }
+                for r in 0..shape[0] {
+                    for c in 0..k {
+                        w[r * k + c] /= sc[c];
+                    }
+                }
+            }
+        }
+        Ok((shape, w))
+    }
+}
+
+/// Does this model use GemmaRMSNorm — `rmsnorm(x) * (1 + w)` — for its block
+/// and final norms?
+///
+/// Qwen3.5/3.6 do. The weights are stored as deviations from 1, which is why
+/// they centre near 0 (layer-0 `input_layernorm` means +0.24) where a plain
+/// RMSNorm weight would centre near 1. Applying them plainly is silent: shapes
+/// match, everything stays differentiable, and the model merely gets quietly
+/// worse. Measured against the runtime's own prefill logits at one token, the
+/// difference is cos 0.7896 plain vs 0.9994 with the offset.
+///
+/// It also covers `q_norm`/`k_norm` (`qwen35/loading.rs:4571`), but NOT
+/// `linear_attn.norm`, which the runtime loads via plain `load_any_as_f32`
+/// (`loading.rs:4475`) and whose weights centre near +0.96 rather than 0.
+pub fn uses_unit_offset_norm(model_type: &str) -> bool {
+    model_type.starts_with("qwen3_5") || model_type.starts_with("qwen3_next")
+}
+
+/// Add the GemmaRMSNorm unit offset to a loaded norm weight, in place.
+fn apply_unit_offset(gpu: &mut Gpu, t: &GpuTensor) -> Result<(), String> {
+    let mut v = gpu.download_f32(t).map_err(|e| format!("{e}"))?;
+    for x in v.iter_mut() {
+        *x += 1.0;
+    }
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_ne_bytes()).collect();
+    gpu.memcpy_htod_auto(&t.buf, &bytes)
+        .map_err(|e| format!("unit-offset upload: {e}"))
+}
+
+/// Load `embed_tokens` as fp32 from any weight source.
+pub fn load_embed_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    vocab: usize,
+    h: usize,
+) -> Result<GpuTensor, String> {
+    upload_tensor(
+        gpu,
+        src,
+        &format!("{prefix}embed_tokens.weight"),
+        &[vocab, h],
+    )
+}
+
+/// Load an UNTIED output head, if the model has one.
+///
+/// Returns `None` only when the model genuinely ties its head to the
+/// embedding. Getting this wrong is silent and catastrophic: a model with an
+/// untied head scored through its embedding produces logits from an unrelated
+/// matrix, so the output is orthogonal to the truth rather than merely
+/// inaccurate. The 35B's `lm_head` correlates with its own embedding at 0.025,
+/// and a hardcoded "the head IS the embedding" in `gamma_hybrid` is what made
+/// that model look like it had a layer-math defect.
+///
+/// `tie_word_embeddings` from the config is authoritative. When it says untied
+/// the head MUST be found, so a missing tensor is an error rather than a quiet
+/// fall back to the embedding — quiet is precisely the failure this function
+/// exists to prevent. The name is tried with and without the model prefix
+/// because artifacts disagree: the 35B stores
+/// `model.language_model.embed_tokens.weight` but a bare `lm_head.weight`.
+pub fn load_lm_head_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    vocab: usize,
+    h: usize,
+    tie_word_embeddings: bool,
+) -> Result<Option<GpuTensor>, String> {
+    let names = [
+        format!("{prefix}lm_head.weight"),
+        "lm_head.weight".to_string(),
+    ];
+    if let Some(name) = names.iter().find(|n| src.has(n)) {
+        return Ok(Some(upload_tensor(gpu, src, name, &[vocab, h])?));
+    }
+    if tie_word_embeddings {
+        Ok(None)
+    } else {
+        Err(format!(
+            "config says tie_word_embeddings=false but no lm_head found (tried {names:?}); \
+             refusing to silently score through the embedding"
+        ))
+    }
+}
+
+/// Load the final RMSNorm weight as fp32 from any weight source.
+pub fn load_final_norm_f32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    h: usize,
+    unit_offset: bool,
+) -> Result<GpuTensor, String> {
+    let t = upload_tensor(gpu, src, &format!("{prefix}norm.weight"), &[h])?;
+    if unit_offset {
+        apply_unit_offset(gpu, &t)?;
+    }
+    Ok(t)
+}
+
+/// Is layer `l` linear-attention rather than self-attention? qwen3.5/3.6 are
+/// HYBRID — the 35B is 30 linear_attn layers to 10 full-attention — so this is
+/// probed per layer, never inferred from the model.
+pub fn layer_is_linear_attn<S: WeightSource + ?Sized>(src: &S, prefix: &str, layer: usize) -> bool {
+    src.has(&format!(
+        "{prefix}layers.{layer}.linear_attn.in_proj_qkv.weight"
+    ))
+}
+
+/// Load one `linear_attn` layer.
+///
+/// Every head dimension is DERIVED from the tensors, not from config, and then
+/// cross-checked: `hd_v` comes from `in_proj_z` and must equal `norm`'s length,
+/// and `hd_k` falls out of `in_proj_qkv`'s `[Q|K|V]` width. A config that
+/// disagreed with the checkpoint would otherwise reshape the recurrence
+/// silently.
+pub fn load_linear_attn_layer_fp32<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    prefix: &str,
+    layer: usize,
+    h: usize,
+    unit_offset: bool,
+) -> Result<LinearAttnLayerF32, String> {
+    let p = format!("{prefix}layers.{layer}.linear_attn");
+    let (_, a_log) = src.fetch_f32(&format!("{p}.A_log"))?;
+    let n_heads = a_log.len();
+    if n_heads == 0 {
+        return Err(format!("layer {layer}: empty A_log"));
+    }
+    let (_, norm) = src.fetch_f32(&format!("{p}.norm.weight"))?;
+    let hd_v = norm.len();
+
+    let z_shape = src
+        .shape_of(&format!("{p}.in_proj_z.weight"))
+        .ok_or_else(|| format!("layer {layer}: no in_proj_z"))?;
+    if z_shape[0] != n_heads * hd_v {
+        return Err(format!(
+            "layer {layer}: in_proj_z out {} != n_heads {n_heads} * hd_v {hd_v}",
+            z_shape[0]
+        ));
+    }
+    let qkv_shape = src
+        .shape_of(&format!("{p}.in_proj_qkv.weight"))
+        .ok_or_else(|| format!("layer {layer}: no in_proj_qkv"))?;
+    // qkv = 2*(n_k*hd_k) + n_v*hd_v. Qwen3.5 allows n_k < n_v (the 35B is
+    // 16 key against 32 value heads), and hd_k is the KEY head width, which
+    // equals hd_v on every artifact seen so far. Solving for n_k rather than
+    // assuming n_k == n_v matters: 16x128 and 32x64 have identical total
+    // width, so the wrong split is shape-silent.
+    let hd_k = hd_v;
+    let kq_total = qkv_shape[0]
+        .checked_sub(n_heads * hd_v)
+        .ok_or_else(|| format!("layer {layer}: in_proj_qkv {} < v width", qkv_shape[0]))?;
+    if kq_total % (2 * hd_k) != 0 {
+        return Err(format!(
+            "layer {layer}: in_proj_qkv {} leaves {kq_total} for q+k, not a multiple of 2*{hd_k}",
+            qkv_shape[0]
+        ));
+    }
+    let n_k_heads = kq_total / (2 * hd_k);
+    if n_k_heads == 0 || n_heads % n_k_heads != 0 {
+        return Err(format!(
+            "layer {layer}: {n_k_heads} key heads does not divide {n_heads} value heads"
+        ));
+    }
+
+    let conv_shape = src
+        .shape_of(&format!("{p}.conv1d.weight"))
+        .ok_or_else(|| format!("layer {layer}: no conv1d"))?;
+    if conv_shape[0] != qkv_shape[0] {
+        return Err(format!(
+            "layer {layer}: conv1d channels {} != qkv width {}",
+            conv_shape[0], qkv_shape[0]
+        ));
+    }
+    let conv_k = *conv_shape.last().unwrap();
+    let (_, conv1d) = src.fetch_f32(&format!("{p}.conv1d.weight"))?;
+    let (_, dt_bias) = src.fetch_f32(&format!("{p}.dt_bias"))?;
+
+    let lp = format!("{prefix}layers.{layer}");
+    // `norm` (the gated per-head one) is NOT offset — see uses_unit_offset_norm.
+    let input_layernorm = upload_tensor(gpu, src, &format!("{lp}.input_layernorm.weight"), &[h])?;
+    let post_attention_layernorm = upload_tensor(
+        gpu,
+        src,
+        &format!("{lp}.post_attention_layernorm.weight"),
+        &[h],
+    )?;
+    if unit_offset {
+        apply_unit_offset(gpu, &input_layernorm)?;
+        apply_unit_offset(gpu, &post_attention_layernorm)?;
+    }
+    Ok(LinearAttnLayerF32 {
+        input_layernorm,
+        post_attention_layernorm,
+        in_proj_qkv: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.in_proj_qkv.weight"),
+            &[qkv_shape[0], h],
+        )?,
+        in_proj_a: upload_tensor(gpu, src, &format!("{p}.in_proj_a.weight"), &[n_heads, h])?,
+        in_proj_b: upload_tensor(gpu, src, &format!("{p}.in_proj_b.weight"), &[n_heads, h])?,
+        in_proj_z: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.in_proj_z.weight"),
+            &[n_heads * hd_v, h],
+        )?,
+        out_proj: upload_tensor(
+            gpu,
+            src,
+            &format!("{p}.out_proj.weight"),
+            &[h, n_heads * hd_v],
+        )?,
+        conv1d,
+        a_log,
+        dt_bias,
+        norm,
+        n_heads,
+        n_k_heads,
+        hd_k,
+        hd_v,
+        conv_k,
+    })
+}
+
+pub fn free_linear_attn_layer_fp32(gpu: &mut Gpu, l: LinearAttnLayerF32) -> Result<(), String> {
+    for t in [
+        l.input_layernorm,
+        l.post_attention_layernorm,
+        l.in_proj_qkv,
+        l.in_proj_a,
+        l.in_proj_b,
+        l.in_proj_z,
+        l.out_proj,
+    ] {
+        gpu.free_tensor(t)
+            .map_err(|e| format!("free linear_attn tensor: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Is layer `l` routed? Detected from the artifact rather than the config,
 /// because hybrid models exist — BLS-Mini-Code-1.0 has a DENSE layer 0 and
 /// routed layers 1..49, so a per-model flag would be wrong for it.
-pub fn layer_is_moe(hfq: &HfqFile, prefix: &str, layer: usize) -> bool {
-    hfq.find_tensor_info(&format!(
-        "{prefix}layers.{layer}.mlp.experts.0.down_proj.weight"
-    ))
-    .is_some()
+pub fn layer_is_moe<S: WeightSource + ?Sized>(src: &S, prefix: &str, layer: usize) -> bool {
+    let p = format!("{prefix}layers.{layer}.mlp.experts");
+    // Two on-disk shapes: per-expert tensors (BLS, Mixtral) and the stacked
+    // form qwen3.5/3.6 uses, where all experts live in one 3-D tensor.
+    src.has(&format!("{p}.0.down_proj.weight"))
+        || src.has(&format!("{p}.down_proj"))
+        || src.has(&format!("{p}.down_proj.weight"))
 }
 
 /// Tensor-name prefix an artifact uses: `model.` or `model.language_model.`
 /// (the multimodal wrapper). Probed once rather than guessed.
-pub fn detect_prefix(hfq: &HfqFile) -> &'static str {
-    if hfq
-        .find_tensor_info("model.language_model.layers.0.self_attn.q_proj.weight")
-        .is_some()
-    {
+pub fn detect_prefix<S: WeightSource + ?Sized>(src: &S) -> &'static str {
+    // Probe input_layernorm, not self_attn: a hybrid can have linear_attn at
+    // layer 0 and no self_attn there at all, which made the old probe report
+    // the wrong prefix for exactly the models this crate now targets.
+    if src.has("model.language_model.layers.0.input_layernorm.weight") {
         "model.language_model."
     } else {
         "model."
@@ -278,31 +797,197 @@ pub fn detect_prefix(hfq: &HfqFile) -> &'static str {
 /// `intermediate_size` in config (BLS: 768 per expert against a 3072 dense
 /// layer 0), so it is taken from the expert tensor's own shape rather than the
 /// config.
-pub fn load_moe_layer_fp32_hfq(
+pub fn load_moe_layer_fp32<S: WeightSource + ?Sized>(
     gpu: &mut Gpu,
-    hfq: &HfqFile,
+    src: &S,
     prefix: &str,
     layer: usize,
     h: usize,
     n_experts: usize,
 ) -> Result<(MoeLayerF32, usize), String> {
     let p = format!("{prefix}layers.{layer}.mlp");
-    let router = load_tensor_f32_hfq(gpu, hfq, &format!("{p}.gate.weight"), &[n_experts, h])?;
-    let probe = hfq
-        .find_tensor_info(&format!("{p}.experts.0.gate_proj.weight"))
-        .ok_or_else(|| format!("layer {layer}: no experts.0.gate_proj"))?;
-    let inter = probe.shape[0] as usize;
+    let router = upload_tensor(gpu, src, &format!("{p}.gate.weight"), &[n_experts, h])?;
 
+    // Three layouts in the wild, all seen on real artifacts:
+    //   experts.N.gate_proj + up_proj      per-expert, unfused (BLS, Mixtral)
+    //   experts.N.gate_up_proj  [2*I, H]   per-expert, FUSED   (what
+    //                                      hipfire-quantize emits for MoE)
+    //   experts.gate_up_proj    [E, 2I, H] stacked + fused     (HF export)
+    let (experts, inter) = if src.has(&format!("{p}.experts.0.gate_proj.weight")) {
+        load_experts_per_tensor(gpu, src, &p, layer, h, n_experts)?
+    } else if src.has(&format!("{p}.experts.0.gate_up_proj.weight")) {
+        load_experts_per_expert_fused(gpu, src, &p, layer, h, n_experts)?
+    } else {
+        load_experts_stacked(gpu, src, &p, layer, h, n_experts)?
+    };
+
+    // Shared branch is optional: qwen3.5/3.6 has one, BLS does not.
+    let sp = format!("{p}.shared_expert");
+    let shared = match src.shape_of(&format!("{sp}.down_proj.weight")) {
+        None => None,
+        Some(shape) => {
+            // [h, shared_inter] — the shared intermediate is its own size and
+            // need not match the routed experts'.
+            let si = shape[1];
+            Some(SharedLayerF32 {
+                scalar_gate: upload_tensor(
+                    gpu,
+                    src,
+                    &format!("{p}.shared_expert_gate.weight"),
+                    &[1, h],
+                )?,
+                gate: upload_tensor(gpu, src, &format!("{sp}.gate_proj.weight"), &[si, h])?,
+                up: upload_tensor(gpu, src, &format!("{sp}.up_proj.weight"), &[si, h])?,
+                down: upload_tensor(gpu, src, &format!("{sp}.down_proj.weight"), &[h, si])?,
+                inter: si,
+            })
+        }
+    };
+
+    Ok((
+        MoeLayerF32 {
+            router,
+            experts,
+            shared,
+        },
+        inter,
+    ))
+}
+
+type ExpertTriples = Vec<(GpuTensor, GpuTensor, GpuTensor)>;
+
+/// BLS/Mixtral shape: one tensor per expert per projection.
+fn load_experts_per_tensor<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
+    let inter = src
+        .shape_of(&format!("{p}.experts.0.gate_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no experts.0.gate_proj"))?[0];
     let mut experts = Vec::with_capacity(n_experts);
     for e in 0..n_experts {
         let ep = format!("{p}.experts.{e}");
         experts.push((
-            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.gate_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.up_proj.weight"), &[inter, h])?,
-            load_tensor_f32_hfq(gpu, hfq, &format!("{ep}.down_proj.weight"), &[h, inter])?,
+            upload_tensor(gpu, src, &format!("{ep}.gate_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{ep}.up_proj.weight"), &[inter, h])?,
+            upload_tensor(gpu, src, &format!("{ep}.down_proj.weight"), &[h, inter])?,
         ));
     }
-    Ok((MoeLayerF32 { router, experts }, inter))
+    Ok((experts, inter))
+}
+
+/// Per-expert but FUSED: `experts.N.gate_up_proj.weight` is `[2*inter, h]`.
+///
+/// This is what `hipfire-quantize` emits for a routed MoE — it splits the
+/// stacked HF tensor per expert but leaves gate and up fused, deferring the
+/// halving to the runtime. Same `(gate || up)` order as the stacked form
+/// (`qwen35/layout.rs`, and `moe_gate_up_unscatter_k8.hip` reads rows
+/// `0..mi` as gate).
+fn load_experts_per_expert_fused<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
+    let gu0 = src
+        .shape_of(&format!("{p}.experts.0.gate_up_proj.weight"))
+        .ok_or_else(|| format!("layer {layer}: no experts.0.gate_up_proj"))?;
+    if gu0.len() != 2 || gu0[1] != h || gu0[0] % 2 != 0 {
+        return Err(format!(
+            "layer {layer}: experts.0.gate_up_proj shape {gu0:?} is not [2*inter, {h}]"
+        ));
+    }
+    let inter = gu0[0] / 2;
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let ep = format!("{p}.experts.{e}");
+        let (shape, gu) = src.fetch_f32(&format!("{ep}.gate_up_proj.weight"))?;
+        if shape != vec![2 * inter, h] {
+            return Err(format!(
+                "layer {layer} expert {e}: gate_up shape {shape:?} != [{}, {h}]",
+                2 * inter
+            ));
+        }
+        experts.push((
+            gpu.upload_f32(&gu[..inter * h], &[inter, h])
+                .map_err(|r| format!("upload expert {e} gate: {r}"))?,
+            gpu.upload_f32(&gu[inter * h..], &[inter, h])
+                .map_err(|r| format!("upload expert {e} up: {r}"))?,
+            upload_tensor(gpu, src, &format!("{ep}.down_proj.weight"), &[h, inter])?,
+        ));
+    }
+    Ok((experts, inter))
+}
+
+/// qwen3.5/3.6 shape: all experts stacked into one 3-D tensor, with gate and up
+/// fused into `gate_up_proj`.
+///
+/// `gate_up_proj` is `[n_experts, 2*inter, h]` and the layout comment in
+/// `qwen35/layout.rs` pins the fusion as `(gate || up)` — gate is the FIRST
+/// `inter` rows, not interleaved. `inter` is derived from that tensor rather
+/// than from config, and `down_proj` is then required to agree, so a
+/// transposed or interleaved variant fails loudly here instead of training
+/// silently on scrambled weights.
+fn load_experts_stacked<S: WeightSource + ?Sized>(
+    gpu: &mut Gpu,
+    src: &S,
+    p: &str,
+    layer: usize,
+    h: usize,
+    n_experts: usize,
+) -> Result<(ExpertTriples, usize), String> {
+    let gu_name = [
+        format!("{p}.experts.gate_up_proj"),
+        format!("{p}.experts.gate_up_proj.weight"),
+    ]
+    .into_iter()
+    .find(|n| src.has(n))
+    .ok_or_else(|| format!("layer {layer}: no per-expert or stacked gate_up_proj"))?;
+    let dn_name = gu_name.replace("gate_up_proj", "down_proj");
+
+    let (gu_shape, gu) = src.fetch_f32(&gu_name)?;
+    let (dn_shape, dn) = src.fetch_f32(&dn_name)?;
+    if gu_shape.len() != 3 || gu_shape[0] != n_experts || gu_shape[2] != h {
+        return Err(format!(
+            "layer {layer}: {gu_name} shape {gu_shape:?} is not [{n_experts}, 2*inter, {h}]"
+        ));
+    }
+    if gu_shape[1] % 2 != 0 {
+        return Err(format!(
+            "layer {layer}: fused gate_up rows {} are odd, so it is not (gate || up)",
+            gu_shape[1]
+        ));
+    }
+    let inter = gu_shape[1] / 2;
+    if dn_shape != vec![n_experts, h, inter] {
+        return Err(format!(
+            "layer {layer}: {dn_name} shape {dn_shape:?} != [{n_experts}, {h}, {inter}]"
+        ));
+    }
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let base = e * 2 * inter * h;
+        let g = &gu[base..base + inter * h];
+        let u = &gu[base + inter * h..base + 2 * inter * h];
+        let d = &dn[e * h * inter..(e + 1) * h * inter];
+        experts.push((
+            gpu.upload_f32(g, &[inter, h])
+                .map_err(|e| format!("upload expert gate: {e}"))?,
+            gpu.upload_f32(u, &[inter, h])
+                .map_err(|e| format!("upload expert up: {e}"))?,
+            gpu.upload_f32(d, &[h, inter])
+                .map_err(|e| format!("upload expert down: {e}"))?,
+        ));
+    }
+    Ok((experts, inter))
 }
 
 /// Free one streamed MoE layer.
@@ -313,6 +998,12 @@ pub fn free_moe_layer_fp32(gpu: &mut Gpu, l: MoeLayerF32) -> Result<(), String> 
         for t in [g, u, d] {
             gpu.free_tensor(t)
                 .map_err(|e| format!("free expert tensor: {e}"))?;
+        }
+    }
+    if let Some(sh) = l.shared {
+        for t in [sh.scalar_gate, sh.gate, sh.up, sh.down] {
+            gpu.free_tensor(t)
+                .map_err(|e| format!("free shared expert tensor: {e}"))?;
         }
     }
     Ok(())
@@ -334,6 +1025,10 @@ pub fn free_llama_layer_fp32(gpu: &mut Gpu, l: LlamaLayerF32) -> Result<(), Stri
         gpu.free_tensor(t)
             .map_err(|e| format!("free layer tensor: {e}"))?;
     }
+    for t in [l.q_norm, l.k_norm].into_iter().flatten() {
+        gpu.free_tensor(t)
+            .map_err(|e| format!("free qk-norm tensor: {e}"))?;
+    }
     Ok(())
 }
 
@@ -342,6 +1037,31 @@ pub fn free_llama_layer_fp32(gpu: &mut Gpu, l: LlamaLayerF32) -> Result<(), Stri
 /// Uses `tensor_data_cow`, not `tensor_data`: `--bf16-codec` defaults to `huff`,
 /// so a bf16 artifact's tensors may be losslessly recoded, and the borrowing
 /// accessor returns None for those — reporting a present tensor as missing.
+/// Decode one hfq tensor to fp32 on the host, returning its shape alongside.
+///
+/// Split out from [`load_tensor_f32_hfq`] because the stacked MoE tensors have
+/// to be sliced per expert (and the fused `gate_up` halved) before upload, and
+/// doing that through the upload path would mean decoding the whole stack once
+/// per expert.
+fn fetch_f32_hfq(hfq: &HfqFile, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let (info, bytes) = hfq
+        .tensor_data_cow(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+    let dtype = match info.quant_type {
+        1 => "F16",
+        2 => "F32",
+        16 => "BF16",
+        other => {
+            return Err(format!(
+                "tensor {name}: quant_type {other} is not an unquantized float;                  the fp32 training base needs an f16/f32/bf16 artifact"
+            ))
+        }
+    };
+    let f32s = bytes_to_f32(dtype, bytes.as_ref()).map_err(|e| format!("tensor {name}: {e}"))?;
+    Ok((shape, f32s))
+}
+
 fn load_tensor_f32_hfq(
     gpu: &mut Gpu,
     hfq: &HfqFile,
@@ -513,6 +1233,9 @@ pub fn load_llama_from_hfq(
         let p = format!("model.layers.{i}");
         layers.push(LlamaLayerF32 {
             input_layernorm: load(gpu, &format!("{p}.input_layernorm.weight"), &[h])?,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             q_proj: load(gpu, &format!("{p}.self_attn.q_proj.weight"), &[q, h])?,
             k_proj: load(gpu, &format!("{p}.self_attn.k_proj.weight"), &[kv, h])?,
             v_proj: load(gpu, &format!("{p}.self_attn.v_proj.weight"), &[kv, h])?,
