@@ -34,6 +34,47 @@ current NPU buffers receive no observable 32 MiB capacity benefit, no
 shared-region amplification, and no interference from a GPU workload occupying
 the reported MALL capacity.
 
+## Where 56.5 GB/s comes from — clocks and widths
+
+The roof is not a round number and not 8x anything, so it is worth decomposing.
+The driver exposes no clock (`xrt-smi examine -r all` reports only
+`Total Columns: 8`), so the AIE clock below is inferred — but three independently
+measured numbers agree on it, which is stronger than a datasheet lookup.
+
+**Step 1 — the single stream fixes the clock.** One compute-tile receive stream
+sustains *exactly* 14.4 GB/s while active. At 1.8 GHz that is
+
+    14.4e9 / 1.8e9 = 8.00 bytes/cycle
+
+a 64-bit shim ingress per column, exactly. No other plausible clock gives a
+whole number: 1.6 GHz -> 9.00 B/cyc, 1.7 -> 8.47, 1.75 -> 8.23.
+
+**Step 2 — the roof is 32 B/cycle, not 64.** Eight columns at 8 B/cyc could
+consume 64 B/cycle = 115.2 GB/s. Measured saturation is 56.5 GB/s:
+
+    56.5e9 / 1.8e9 = 31.4 bytes/cycle  (98% of 32)
+
+So the NPU's port into the SoC data fabric is **32 bytes/cycle**, half what the
+column array can absorb. The roof is 3.92x a single stream — *four* streams'
+worth, not eight.
+
+**Step 3 — the duty cycle confirms it independently.** If eight columns demand
+64 B/cyc and the fabric supplies 32, each column should be busy 32/64 = **50%**
+of the time. This document measured per-column receive busy time falling to
+**49%** — arrived at from timing, not from this arithmetic. That the two agree
+is the real evidence that the limit is a 32 B/cycle port and not, say, DMA
+issue overhead or tile contention.
+
+**Step 4 — cross-check against DRAM.** LPDDR5X at 256-bit and 8000 MT/s gives
+256 GB/s system-wide. The NPU's 56.5 GB/s is 22% of that, so the roof is a
+port-width limit rather than a DRAM limit — consistent with the contention
+results above, where CPU DRAM pressure drops the NPU to 43.0 GB/s and a GPU
+stream to 18.2 GB/s. A DRAM-bound NPU would not sit at 22% while idle.
+
+Summary: **8 columns x 8 B/cycle of demand against a 32 B/cycle fabric port at
+~1.8 GHz.** Adding columns past four buys nothing; the fix for a
+bandwidth-bound NPU workload is fewer bytes, not more columns.
+
 ## Measurement hierarchy
 
 It is important not to call every byte movement “memory bandwidth.” Four
