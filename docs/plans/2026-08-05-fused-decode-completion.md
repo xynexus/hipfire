@@ -225,6 +225,53 @@ seam with a known-thin proof".
 independent of any batching seam, and a prerequisite for deepseek4 participating
 at all.
 
+### 5b investigation (2026-08-05): it is not merely unfinished, it is silently wrong
+
+The in-code status comment on `forward_prefill_batch_chunked` (dated 2026-05-18)
+says pure-SWA layers work "end-to-end including the MoE FFN" and that mixed
+layers "still bail at the indexer chain". Both halves are stale.
+
+Reproducer — tiny deepseek4 fixture, `--emit-fixture deepseek4 --seed 42`,
+quantized `q8f16`, 2 layers, `compress_ratios = [0, 0]` (so **pure-SWA**, the
+path the comment claims works), 8 routed experts + 1 shared, top-2:
+
+    profile_prefill_deepseek4 ds4.hfq --prefill 16 --warmup 0 --no-profile
+    -> PREFILL_CHECK argmax=0 logit_sum=NaN logit_max=-inf
+
+The same artifact through the per-token path is finite:
+
+    tiny_quant_probe ar-hash --arch deepseek4 --model ds4.hfq --len 16
+    -> logit_hash: 0x26a2dc1bd19c368e   (finite, stable)
+
+So this is a path bug, not a property of the fixture's weights. It does not bail
+or error — it returns `Ok` and emits NaN, which is why the documented per-token
+fallback never triggers: the fallback fires on `Err`, and there is no `Err`.
+
+Localised with the existing `HIPFIRE_DEEPSEEK4_DUMP_STATE` hooks. Every upstream
+stage is finite — embedding, HC stream init, `q_lora`, `kv_joint`, tail RoPE, the
+whole attention block, `hc_attn_mix`, FFN-side `mhc_pre`. The first non-finite
+buffer is `10_l0_ffn_out`, and it is total rather than sporadic: 4096 NaN =
+16 tokens x 256 hidden, i.e. every real output element, with the rest of the
+buffer untouched zeros.
+
+Narrowed one level further with `HIPFIRE_DEEPSEEK4_MOE=0`, which returns from
+`ffn_batched` right after the shared expert:
+
+    HIPFIRE_DEEPSEEK4_MOE=0 -> logit_sum=7.0162 logit_max=0.898018, zero NaN
+
+**The NaN is entirely in the routed-expert MoE half of `ffn_batched`.** The
+shared-expert half is clean.
+
+Note the attention/indexer chain — which the stale comment blames — was never
+reached by this fixture (`compress_ratios = [0, 0]`) and is therefore still
+untested, not exonerated. A fixture with `compress_ratio > 0` is needed to
+exercise it.
+
+Next step is to instrument inside the routed-MoE section (router GEMV, top-k,
+expert gather, grouped GEMM) the same way. Until this is fixed, "finish the
+batched forward" understates the work: the existing path produces wrong numbers
+silently, so it needs a correctness fix before any completion work.
+
 They can proceed in either order; 5a does not depend on 5b. Doing 5a first means
 5b's author has something to implement against instead of a third `else if`.
 
