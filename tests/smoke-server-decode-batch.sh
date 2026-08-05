@@ -70,7 +70,9 @@ if request_count < 2:
     raise RuntimeError("HIPFIRE_DECODE_BATCH_REQUESTS must be >= 2")
 dense_fused_mode = expected_decode_backend == "fused_dense_layer_chunked"
 kv_cache = "fp32" if dense_fused_mode else "q8"
-native_multirow_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW", "").lower() in {"1", "true", "yes", "on"}
+# Multi-row native decode is ON by default; only the kill-switch values disable
+# it (mirrors qwen35_decode_dense_native_multirow_enabled).
+native_multirow_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW", "").strip().lower() not in {"0", "off", "false", "no"}
 
 
 def pick_port() -> int:
