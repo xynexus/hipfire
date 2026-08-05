@@ -187,6 +187,9 @@ pub enum KernelKey {
     /// same-precision-activation entry on purpose — rounding x costs
     /// rel rms 3.4e-4 and buys nothing, x being K elements against M x K.
     GemvBf16,
+    /// BF16L3 weight x F32 activation. Lossless packed bf16 — see
+    /// `gemv_bf16l3_xf32.hip`. Requires K % 256 == 0.
+    GemvBf16L3,
     GemvF16,
     GemvQ8_0,
     GemvQ4K,
@@ -563,6 +566,7 @@ impl KernelKey {
         match (dtype, variant) {
             (F32, Plain) => Ok(Self::GemvF32),
             (BF16, Plain) => Ok(Self::GemvBf16),
+            (Bf16L3, Plain) => Ok(Self::GemvBf16L3),
             (F16, Plain) => Ok(Self::GemvF16),
             (Q8_0, Plain) => Ok(Self::GemvQ8_0),
             (Q4K, Plain) => Ok(Self::GemvQ4K),
@@ -693,7 +697,11 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            // Bf16L3 decodes with shifts, byte loads and a wave prefix sum —
+            // no ISA-specific intrinsics, so it runs anywhere BF16 does.
+            F32 | F16 | BF16 | Bf16L3 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => {
+                ArchPredicate::Always
+            }
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)

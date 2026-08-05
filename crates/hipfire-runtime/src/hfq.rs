@@ -2025,6 +2025,28 @@ fn load_f16_tensor(
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect()
         }
+        49 | 50 => {
+            // A lossless recoding that residency (BF16L3) or the codec itself
+            // (Huffman) left packed. Decode rather than panic: this is reached
+            // for norms and other small tensors, which have no packed-consumer
+            // kernel and whose decode cost is negligible.
+            //
+            // HIPFIRE_BF16L3_RESIDENT is global, so turning it on to keep the
+            // lm_head packed also leaves every other bf16 tensor packed — norms
+            // included. Before this arm that panicked with
+            // `got quant_type=49` on model.norm.weight.
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = decode_bf16_packed(info.quant_type, data, n).unwrap_or_else(|| {
+                panic!(
+                    "failed to decode recoded tensor {st_name} (quant_type={})",
+                    info.quant_type
+                )
+            });
+            logical
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
         _ => panic!(
             "expected F16/F32/BF16 tensor for {st_name}, got quant_type={}",
             info.quant_type
@@ -2673,6 +2695,30 @@ pub fn load_weights_hfq(
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::Q8_0,
         )
+    } else if embd_info.0.quant_type == 49 {
+        // BF16L3 that residency kept packed. The GATHER cannot use it: a lookup
+        // reads one arbitrary row, and BF16L3's escape plane is only addressable
+        // by walking a block, so there is no gather kernel for it. Decode here.
+        //
+        // This is what HIPFIRE_BF16L3_RESIDENT's "a gather-read table ... will
+        // fail to load" refers to; before this arm it panicked in
+        // `load_f16_tensor` with `got quant_type=49`.
+        //
+        // The tied lm_head is a separate buffer and DOES stay packed — it is a
+        // pure GEMV consumer, which `gemv_bf16l3_xf32` serves. So residency buys
+        // the head's bandwidth without the gather losing its random access.
+        let n = embd_info.0.shape.iter().map(|&d| d as usize).product();
+        let logical = decode_bf16_packed(49, embd_info.1, n)
+            .ok_or_else(|| HipError::new(0, "token_embd: BF16L3 decode failed"))?;
+        eprintln!(
+            "    (bf16l3 -> bf16 for gather, {} MB packed -> {} MB)",
+            embd_info.1.len() / 1_000_000,
+            logical.len() / 1_000_000
+        );
+        (
+            gpu.upload_raw(&logical, &[logical.len()])?,
+            EmbeddingFormat::BF16,
+        )
     } else if embd_info.0.quant_type == 16 {
         // Native bf16 table: upload raw 2 B/elem; gather converts to f32 inline
         // (no F32 promotion). Keeps the largest tensor at half the memory.
@@ -2704,6 +2750,7 @@ pub fn load_weights_hfq(
     let output_norm = load_f16_tensor(hfq, gpu, "model.norm.weight", &[config.dim])?;
 
     eprintln!("  loading output...");
+    let mut return_packed_head: Option<WeightTensor> = None;
     let output = if hfq.find_tensor("lm_head.weight").is_some() {
         load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
     } else {
@@ -2733,7 +2780,51 @@ pub fn load_weights_hfq(
         // their stored form not being one the GEMV path takes directly. The
         // embedding GATHER is untouched: `token_embd` is its own buffer, loaded
         // above.
-        if embd_t.quant_type == 16 {
+        // BF16L3 stays PACKED when residency kept it so, and dispatches to
+        // `gemv_bf16l3_xf32`: 1.917 ms against the plain-bf16 GEMV's 3.241 at
+        // 128256 x 2048, reading 376.3 MB instead of 525.3. Lossless, and
+        // verified at 2.570e-7 worst deviation with an identical argmax.
+        //
+        // Only reachable with HIPFIRE_BF16L3_RESIDENT set; without it
+        // `expand_bf16_index` has already rewritten this entry to logical BF16
+        // and decoded the bytes, so the arm below handles it.
+        //
+        // The kernel requires K % 256 == 0. Rather than assume a well-behaved
+        // hidden size, decode explicitly when it does not hold — the bytes in
+        // `data` are packed, so falling through to the f32 arm would read them
+        // as raw bf16 and garble every logit.
+        if embd_t.quant_type == 49 {
+            if config.dim % 256 == 0 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::Bf16L3;
+                return_packed_head = Some(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::Bf16L3,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                });
+            } else {
+                let logical = decode_bf16_packed(embd_t.quant_type, data, n)
+                    .ok_or_else(|| HipError::new(0, "tied lm_head: BF16L3 decode failed"))?;
+                let mut buf = gpu.upload_raw(&logical, &[config.vocab_size, config.dim])?;
+                buf.dtype = DType::BF16;
+                return_packed_head = Some(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::BF16,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                });
+            }
+        }
+        if let Some(w) = return_packed_head.take() {
+            w
+        } else if embd_t.quant_type == 16 {
             let mut buf = gpu.upload_raw(data, &[config.vocab_size, config.dim])?;
             buf.dtype = DType::BF16;
             WeightTensor {
