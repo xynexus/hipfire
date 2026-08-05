@@ -215,6 +215,78 @@ Sequence, cheapest-first:
    oracle's reference is the right one. The next step is per-op instrumentation
    — dump each op's output under both modes and diff — not more reading.
 
+   **MECHANISM FOUND: the two modes take different ROUTES, not different math.**
+   Once-guarded traces in the two GEMV dispatch arms show, on the same probe:
+
+   - expanded — `GemvOq8G256Prerotated` **never fires at all**; the oq8 weights
+     are served by a batched/fused path instead.
+   - compact — `GemvOqCompactG256Prerotated` **does** fire; the compact weights
+     fall back to the generic per-op GEMV dispatch.
+
+   So `OqCompactG256` is not admitted to whatever fast path `Oq8G256` takes, and
+   drops to per-op GEMV. That single fact explains every observation at once, and
+   explains why so much elimination found nothing: the kernels really are
+   bit-identical, because the difference was never in the math. It is
+   dtype-keyed and shape-independent, so every (M, K) class diverges on its own
+   — leaving ANY tensor compact reroutes it. It is present at the first token.
+   And both routes are individually valid, so the tokens still match while the
+   logits do not.
+
+   **ROOT CAUSE, with the kernels named.** Tracing every oq8 dispatch entry
+   point shows the two modes run disjoint kernel sets on the same probe:
+
+   | mode | kernels actually invoked |
+   |---|---|
+   | expanded | `fused_qkvza_oq8_gemv`, `fused_gate_up_oq8_gemv`, `gemv_oq8_grouped` |
+   | compact  | `gemm_oq_compact_grouped_wmma` only |
+
+   `OqCompactG256` has no fused equivalents, so where oq8 computes Q/K/V/Z/A in
+   ONE fused kernel and gate+up in another, compact issues separate unfused
+   GEMMs. Identical semantics, different accumulation and rounding — precisely a
+   small logit delta with unchanged argmax. It is also why compact costs ~31%:
+   unfused means more launches and more activation traffic, so the divergence
+   and the slowdown are the SAME gap, and closing it fixes both.
+
+   One sting for the parity oracles: the expanded path uses `gemv_oq8_grouped`,
+   NOT `gemm_oq8_grouped_wmma`. Both oracles compare compact against
+   `gemm_oq8_grouped_wmma` — a kernel the model never invokes for these ops. They
+   are still valid as decode-correctness checks, but they were never testing the
+   comparison that the in-model divergence actually turns on. Any future oracle
+   should assert against the kernel the arch code really dispatches.
+
+   The fix is therefore not "find the rejecting admission" but "give compact the
+   fused arms": compact variants of `fused_qkvza_oq8_*` and `fused_gate_up_oq8_*`
+   (plus `gemv_oq8_grouped`), or an expand-on-use at those sites. Until then the
+   flag stays opt-in — the difference is now understood and benign-looking, but
+   it is a real numerical change, not noise.
+
+   Next: find the admission that rejects `OqCompactG256` and sends it to the
+   serial path. `dense_prefill_weight_unsupported_reason` accepts the dtype, so
+   the rejection is elsewhere — and closing it is what makes the flag
+   defaultable AND recovers the ~31% latency, since per-op GEMV is also the
+   slower route. Note the compact GEMM arms in `prefill_batch.rs` are evidently
+   not being reached on this probe despite existing.
+
+   **The batched-LA admission gate is eliminated too, by hash this time.**
+   `is_batchable_la`'s `oq8_with_wmma` matches `Oq8G256` and not
+   `OqCompactG256`, so compact sits permanently in the state that
+   `HIPFIRE_OQ8_BATCHED_PREFILL=0` puts oq8 into — which made it the obvious
+   suspect. It is not: expanded with that flag set produces the EXACT default
+   expanded logit_hash (`0x9fec73050da8e72e`), so flipping the gate off changes
+   nothing for this probe and cannot be what compact does differently. (The
+   earlier wall-time observation said the same thing; this confirms it on the
+   quantity that actually matters.)
+
+   Running list of what is EXCLUDED, so nobody re-walks it: the GEMM kernels
+   (synthetic and real blocks, every (M, K) class), the per-group scales, the
+   host expander, the real block bytes, the FWHT rotation
+   (`rotate_x_mq_batched_for` branches on `awq_scale` only, never on dtype),
+   activation quantization (same function, same input, both paths), the
+   `is_batchable_la` gate, any single-op or single-projection story (all eight
+   classes diverge alone), and the `prefill_chunk` fallthrough (the guard never
+   fires). What survives is small and dtype-keyed; per-op instrumentation on the
+   LA layers is where to spend the next effort.
+
    **The GEMM is now eliminated with REAL data.** The synthetic oracle rested on
    two assumptions that had never been executed: that its local mirror of
    `oqplus_compact_to_oq8_combined` matches the real expander, and that real
@@ -225,16 +297,20 @@ Sequence, cheapest-first:
    scales, rotation, activation quantization, the expander and the real block
    bytes are all now excluded; whatever moves the logits is outside the GEMM.
 
-   That example also surfaced something the earlier note got wrong. The tensors
-   are named `linear_attn.in_proj_a` / `in_proj_qkv` / `in_proj_z` / `out_proj`,
-   so this model **does** carry linear-attention layers — the very layers
-   `prefill_chunk.rs` serves. The claim below that Qwen3.5-0.8B "does not appear
-   to route through that file" is therefore unsafe. Yet the compact fallthrough
-   guard does NOT fire under either the smoke or `ar-hash`, which means the LA
-   path is reaching neither `run_plain_gemm_key` nor `run_residual_gemm_key`
-   with a compact weight. Explaining that — which arm the LA layers actually
-   take for a compact tensor — is now the most promising single question, and it
-   is where per-op instrumentation should start.
+   That example prompted a retraction that then had to be retracted itself,
+   which is worth recording as a caution. The tensors are named
+   `linear_attn.in_proj_a` / `in_proj_qkv` / `in_proj_z` / `out_proj`, so this
+   model **does** carry linear-attention layers — the layers `prefill_chunk.rs`
+   serves — and on that basis the earlier claim that Qwen3.5-0.8B "does not
+   appear to route through that file" was withdrawn as unsafe.
+
+   A one-shot entry trace then settled it directly: **`forward_prefill_chunk` is
+   never entered at all**, in either mode, for this probe. The original claim was
+   right; the retraction inferred a code path from tensor names, which does not
+   follow. This also explains the guard's silence — the file simply never runs
+   here, rather than the LA layers slipping past the guard. The `prefill_chunk`
+   corruption below stays real and stays guarded, but it is latent for models and
+   paths that DO enter that file, not for this one.
 
    **Separately found, and more serious than the divergence:
    `prefill_chunk.rs` has NO compact support at all** — zero `OqCompactG256`
