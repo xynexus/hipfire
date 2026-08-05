@@ -232,6 +232,18 @@ Sequence, cheapest-first:
    And both routes are individually valid, so the tokens still match while the
    logits do not.
 
+   **Method note, worth more than the finding.** This was found by counting
+   which kernels actually ran, and only after a long elimination hunt that kept
+   coming up empty — the GEMM, the scales, the expander, the rotation, the
+   activation quantization, the admission gates, every (M, K) class. All of it
+   was correct and none of it mattered, because the difference was never in the
+   math: it was in which kernels got dispatched at all. PR #227 generalizes
+   exactly this into `HIPFIRE_KERNEL_TRACE`, a histogram at `Gpu::ensure_kernel`
+   (the universal dispatch chokepoint), and reaches the same conclusion from an
+   independent direction — that a measurement can name a path it never took.
+   Reach for that trace FIRST on any "same inputs, different outputs" question;
+   it would have answered this one in minutes.
+
    **ROOT CAUSE, with the kernels named.** Tracing every oq8 dispatch entry
    point shows the two modes run disjoint kernel sets on the same probe:
 
