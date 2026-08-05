@@ -173,6 +173,9 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
     // trailing device_synchronize so we capture actual GPU
     // completion (kernel launches are async by default).
     let _ = daemon_state.gpu.hip.device_synchronize();
+    // Scope the kernel trace to the timed region, so the histogram describes
+    // this bench and not model load. Off unless HIPFIRE_KERNEL_TRACE is set.
+    hipfire_rdna::kernel_trace::reset();
     let t0 = Instant::now();
     let run_ok = if is_qwen35_family_arch_id(m.arch_id) {
         let config = m.q35_config.as_ref().unwrap();
@@ -357,6 +360,13 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
         } else {
             0.0
         };
+        // Which kernels actually ran. This handler's arch-0/1 arm is a
+        // per-token decode warm-pass, not prefill, and reporting `pp512 t/s`
+        // from it cost a full misdirected investigation — the histogram makes
+        // that visible in the output instead of in the source.
+        if let Some(rep) = hipfire_rdna::kernel_trace::report("bench_prefill") {
+            eprint!("{rep}");
+        }
         let _ = writeln!(
             daemon_state.out.sink,
             r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
