@@ -266,6 +266,21 @@ Sequence, cheapest-first:
    comparison that the in-model divergence actually turns on. Any future oracle
    should assert against the kernel the arch code really dispatches.
 
+   **The difference is NOT cosmetic — correcting an earlier reading here.** On
+   Qwen3.5-0.8B all 128 free-run tokens matched, which made it look benign. On a
+   random-weight tiny fixture, whose logits are near-tied, the SAME difference
+   flips argmax and the token hashes diverge too. So token equality is a
+   property of a confident model, not an invariant of the path: on genuinely
+   uncertain predictions this changes the output. Treat it as a real numerical
+   regression against the expanded path, not a rounding curiosity.
+
+   `tests/opus-compact-gate.sh` pins this down — tiny `qwen3_5` fixture at
+   `oq4.25` (N_out=3), both modes, per-mode committed baselines. It deliberately
+   does NOT assert the two modes agree, because they do not and the reason is
+   understood; it instead catches drift in either mode, and prints a loud notice
+   if they ever converge, since convergence means the fused arms landed and the
+   baselines want re-recording.
+
    The fix is therefore not "find the rejecting admission" but "give compact the
    fused arms": compact variants of `fused_qkvza_oq8_*` and `fused_gate_up_oq8_*`
    (plus `gemv_oq8_grouped`), or an expand-on-use at those sites. Until then the

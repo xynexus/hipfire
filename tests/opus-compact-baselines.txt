@@ -1,0 +1,3 @@
+# gpu family format mode logit_hash token_hash
+gfx1103 qwen3_5 oq4.25 expanded 0xf7e80c02e19b1035 0xf203904405baf8ac
+gfx1103 qwen3_5 oq4.25 compact 0x20cf44884b61c338 0x489f81a467af2d33
