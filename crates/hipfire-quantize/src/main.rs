@@ -3301,19 +3301,12 @@ fn resolve_hf_cache_root(path: &Path) -> Option<PathBuf> {
 /// shared mount via `HF_HOME` would re-download a model it already had.
 fn hf_cache_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let mut push_env = |var: &str, suffix: Option<&str>| {
-        if let Ok(dir) = std::env::var(var) {
-            if !dir.trim().is_empty() {
-                let base = PathBuf::from(dir);
-                roots.push(match suffix {
-                    Some(s) => base.join(s),
-                    None => base,
-                });
-            }
-        }
-    };
-    push_env("HF_HUB_CACHE", None);
-    push_env("HF_HOME", Some("hub"));
+    if let Some(dir) = hipfire_env::hf_hub_cache() {
+        roots.push(dir);
+    }
+    if let Some(dir) = hipfire_env::hf_home() {
+        roots.push(dir.join("hub"));
+    }
     if let Some(home) = hipfire_env::home_dir() {
         roots.push(home.join(".cache/huggingface/hub"));
     }
