@@ -107,7 +107,47 @@ raw rms 0.151 where `gate_up_proj` is 0.0073 and the shared expert's own
 expert. A 500x dynamic range on one tensor's scales is unusual enough to note
 even though removing the fold did not fix anything.
 
-### Next: build the missing fixture
+### The missing fixture was built — and n_k < n_v is NOT the cause
+
+Synthesised from `qwen3_5_moe-tiny` by halving `linear_num_key_heads` (2 -> 1)
+and narrowing `in_proj_qkv` and `conv1d` to match (768 -> 512 rows), then
+quantised to bf16 and compared at seq 1:
+
+| fixture | seq 1 |
+|---|---|
+| qwen3_5_moe-tiny (n_k == n_v) | 1.0000 |
+| synthesised n_k < n_v | **0.9915** |
+
+So the GQA linear-attention path carries a small real discrepancy worth fixing
+— 0.9915 where its sibling is exact — but nothing like the 35B's 0.0038. It is
+not the cause.
+
+Also cleared for the 35B this round:
+
+- **The artifact is good.** `hipfire chat` on
+  `Qwen3.6-35B-A3B--oq4++.hfq` answers "The capital of France is Paris" with a
+  coherent reasoning trace. The file and the engine are fine; this
+  implementation is what is wrong.
+- **The embedding.** BF16, rms ~0.009 per row, loads correctly.
+- **The final norm.** Mean +1.6279, and the unit offset applied gives 2.63 —
+  exactly what the runtime's own history says is correct ("1.63 instead of the
+  correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce").
+
+### What is left
+
+Everything structural now has a witness except the 35B's SCALE and its exact
+quantisation: 40 layers at h=2048, 256 experts at top-8, and `oq4++`
+specifically (Hessian/LDLQ error feedback plus aggressive AWQ — one expert
+sidecar spans 0.083 to 44.6). The 0.8B validated `oq8++` and a plain `oq4` this
+session, but not `oq4++`, and no small model on disk carries it.
+
+The next cheap probe is a numpy recomputation of the 35B's layer 0 from its own
+dequantised weights, compared against the Rust walk's layer-0 output. That does
+not prove correctness — both use the same dequantiser — but it separates "the
+Rust disagrees with its own weights" from "the weights are already wrong", and
+the second would point squarely at the oq4++ decode.
+
+## The dense hybrid is correct
 
 Exactly one structural feature is exercised by the 35B and by nothing that
 works: **fewer key heads than value heads** in linear attention. The 0.8B is
