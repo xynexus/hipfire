@@ -125,16 +125,46 @@ dispatch family that `run_auto` consults. That is what makes the comment true
 today, and it is also the smallest change that would make step 1 unambiguously
 a win rather than a trade.
 
-**So this is a decision, not a cleanup**, and it wants a measurement rather than
-an opinion: batch-1 WMMA GEMM over BF16 versus residual GEMV over F32, at
-128256 x 2048, on this hardware. Whichever wins, the NPU case still prefers
-fewer bytes — a 56.5 GB/s fabric does not care that a GEMV kernel is nicer.
+### Measured — and the answer is neither of the two obvious options
+
+`cargo run --release -p hipfire-runtime --example bench_lmhead_dtype`, at the
+real 128256 x 2048 shape, 30 iterations on gfx1151:
+
+| path | per call | achieved | tok/s if head-bound |
+|---|---|---|---|
+| **BF16 via `gemv_bf16_f32`** | **3.18 ms** | 165.5 GB/s | **315.0** |
+| F32 via `gemv_f32` | 5.28 ms | 199.2 GB/s | 189.6 |
+| BF16 via `gemm_bf16_x_bf16_wmma(batch=1)` | 14.97 ms | 35.1 GB/s | 66.8 |
+
+Two conclusions, and the first corrects this document's own earlier advice.
+
+**The F32 expansion is right, given the dispatch family as it stands.** Against
+the BF16 path `weight_gemv` actually takes, F32 is **2.95x faster**. "Just keep
+the head BF16" would have been a near-3x decode regression at the head, not a
+free halving. A batch-1 WMMA GEMM sustains only 35.1 GB/s — it is built for
+batched work and collapses at one row.
+
+**But the best option is already in the tree and unused.** `gemv_bf16_f32` beats
+the F32 GEMV by **1.66x** *while reading half the bytes*. Note it does so at a
+LOWER achieved bandwidth (165.5 vs 199.2 GB/s): the F32 kernel saturates memory
+better, and still loses on wall time because it has twice as much to move. Bytes
+beat efficiency here.
+
+The kernel exists (`kernels/src/gemv_bf16_f32.hip`), the binding exists
+(`dispatch/gemv.rs:4843`), and neither is in the dispatch family `run_auto`
+consults — which is exactly why `weight_gemv` needs its WMMA special case, and
+why the loader expands to F32 to avoid it. Wiring it in is the fix: 1.66x faster
+decode at half the per-token head traffic, no accuracy change, and it makes the
+two-stage path reachable as a side effect.
+
+The NPU case prefers fewer bytes independently — a 56.5 GB/s fabric does not
+care that a GEMV kernel is nicer.
 
 ## Ordering
 
-1. **Stop expanding to F32.** Keeping the tied head BF16 halves head traffic
-   with no format work, no accuracy change, and it makes the existing two-stage
-   path reachable for the first time. This is the whole 2.00x -> 1.32x step.
+1. **Wire `gemv_bf16_f32` into the dispatch family, THEN stop expanding to F32.**
+   Measured 1.66x faster than the F32 GEMV at half the bytes. Doing the second
+   half without the first is a 2.95x regression — see the measurement above.
 2. **Then BF16L3**, which needs a gather-read decode path so the tied tensor can
    stay packed for both consumers — 1.32x -> 1.13x, still lossless.
 3. **Two-stage** is a decode/argmax fast path only; eval and scoring must keep
