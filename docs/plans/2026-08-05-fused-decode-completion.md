@@ -267,10 +267,49 @@ reached by this fixture (`compress_ratios = [0, 0]`) and is therefore still
 untested, not exonerated. A fixture with `compress_ratio > 0` is needed to
 exercise it.
 
-Next step is to instrument inside the routed-MoE section (router GEMV, top-k,
-expert gather, grouped GEMM) the same way. Until this is fixed, "finish the
-batched forward" understates the work: the existing path produces wrong numbers
-silently, so it needs a correctness fix before any completion work.
+### Root cause: the prefill MoE hard-assumes MQ2-Lloyd experts and never checks
+
+Instrumenting inside the routed-MoE section (dumps `12`-`15`, added alongside the
+existing hooks) narrows it to one call:
+
+| stage | result |
+|---|---|
+| `12_l0_moe_scores_raw` (router GEMV) | finite, +/-0.7413 |
+| `13_l0_moe_scores_softplus` | finite, 0.6242..1.019 |
+| `14_l0_moe_topk_weights` (routing/top-k) | finite, 0..1.168 |
+| `15_l0_ffn_out_after_moe` | **4096 NaN** |
+
+So routing is healthy; `moe_family().run_bias_aware_prefill` is what destroys the
+(finite) shared-expert output already sitting in `ffn_out`. Both of its arms fail
+identically — scalar K4 at B=16 and grouped GEMM at B=128 and B=256 all NaN — so
+it is not path selection.
+
+The cause is in that function's own doc comment: "Run a batched/prefill deepseek4
+MoE step (**k=6, MQ2-Lloyd**)". The path is written for MQ2-Lloyd routed experts.
+`MoeBiasAwarePrefillParams` carries `expert_gate_up_ptrs` / `expert_down_ptrs` as
+raw device pointers and **no dtype field at all**, so there is no dtype
+negotiation and no check. Handed `Q8F16` experts it reinterprets the bytes as
+MQ2-Lloyd and produces NaN — while returning `Ok`, which is why the documented
+per-token fallback never fires: the fallback keys on `Err`.
+
+This is the same bug class as the `awq_scale` defect fixed in PR #216 — accept
+and miscompute, rather than reject and fall back.
+
+### The fix, in two tiers
+
+**Tier 1 (small, correct now):** give `MoeBiasAwarePrefillParams` an expert dtype,
+populate it from `layer.expert_gate_up_blob`, and reject anything that is not
+MQ2-Lloyd. That turns silent NaN into an `Err`, which makes the *existing*
+per-token fallback fire — the machinery is already there and is currently dead
+because nothing ever errors. Note this touches `hipfire-dispatch::families::moe`,
+shared with the qwen35 MoE prefill arm, so it wants review.
+
+**Tier 2 (kernel work):** support Q8F16 (and the other expert dtypes the
+quantizer emits) on the prefill MoE path, so deepseek4 batched prefill actually
+runs rather than falling back.
+
+Tier 1 should land first regardless: until it does, any deepseek4 model whose
+experts are not MQ2-Lloyd silently produces NaN through batched prefill.
 
 They can proceed in either order; 5a does not depend on 5b. Doing 5a first means
 5b's author has something to implement against instead of a third `else if`.
