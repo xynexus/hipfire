@@ -393,6 +393,63 @@ impl Gpu {
         }
     }
 
+    /// Compact-resident twin of [`Self::gemm_oq8_grouped_residual_act_batched`]:
+    /// `residual[N x M] += W_compact . x_rot`. GEMMs into the persistent batched
+    /// f32 scratch then one elementwise add — there is no fused compact residual
+    /// kernel, mirroring the oq8 and oq4 arms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_residual_act_batched(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq8_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq_compact_act_batched(w_blocks, x_rot, &tmp, m, k, n, block_stride)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
+    }
+
+    /// Compact-resident twin of [`Self::gemm_oq8_grouped_act_batched`]: quantize
+    /// the rotated activation into the shared oq8 scratch, then run the compact
+    /// GEMM against it. The scratch is Gpu-owned, so callers outside this module
+    /// use this rather than assembling `x_i8`/`x_scales` themselves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_act_batched(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.quantize_act_oq8_batched(x_rot, m, k, n)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        self.gemm_oq_compact_grouped_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)
+    }
+
     /// Compact-resident Opus W8A8 GEMM: the [`Self::gemm_oq8_grouped_wmma`] core
     /// reading OqPlusCompact (qt=36) blocks DIRECTLY instead of a pre-expanded
     /// dense int8 plane, so oq4.25++ stays ~4.25 bits/weight in VRAM rather than

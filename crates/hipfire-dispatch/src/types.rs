@@ -116,7 +116,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
         // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
         // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
-        Oq4G256 | Oq8G256 => RotationPlan::FwhtG256,
+        Oq4G256 | Oq8G256 | OqCompactG256 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -132,9 +132,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256
-        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
-            GemvVariant::Prerotated
-        }
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256
+        | OqCompactG256 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -234,6 +233,9 @@ pub enum KernelKey {
     // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
     // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
     GemvOq8G256Prerotated,
+    /// Compact-resident Opus W8A8: same math as [`Self::GemvOq8G256Prerotated`]
+    /// but the weight is on-disk OqPlusCompact blocks decoded in-kernel.
+    GemvOqCompactG256Prerotated,
     // Opus Quant W4A16 decode — prerotated f32 activation × int4 grouped weight.
     // x arrives FWHT-rotated; launch dispatches the dense gemv_oq4_grouped (no
     // activation quant at B=1, mirroring the OQ8 prerotated arm).
@@ -618,6 +620,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
             Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
+            OqCompactG256 => Ok(Self::GemvOqCompactG256Prerotated),
             Oq4G256 => Ok(Self::GemvOq4G256Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
@@ -725,7 +728,9 @@ impl KernelKey {
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             // Opus Quant W4A4 / W8A8 (grouped, FWHT-rotated) — int activations +
             // int weights via iu4/iu8 grouped WMMA.
-            Oq4G256 | Oq8G256 => ArchPredicate::HasWmma,
+            // Compact-resident Opus rides the same iu8 WMMA core as Oq8G256;
+            // it only differs in how the weight bytes are decoded.
+            Oq4G256 | Oq8G256 | OqCompactG256 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
             Q8HFQ | DflashOq8Plain | DflashOq4Plain | DflashOq4MixedPlain | Raw => {
