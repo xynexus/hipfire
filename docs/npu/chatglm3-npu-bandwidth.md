@@ -21,16 +21,35 @@ and reports the achieved rate. Sweeping buffer size and worker count:
 | 16 x 2 MiB | 16 | 44.0 | 0.95x | 78% |
 | 16 x 4 MiB | 8 | 52.3 | 1.13x | 93% |
 | 16 x 8 MiB | 8 | 53.9 | 1.17x | 95% |
-| **16 x 16 MiB** | **8** | **54.9** | **1.19x** | **97%** |
+| 16 x 16 MiB | 8 | 54.9 | 1.19x | 97% |
+| 20 x 16 MiB | 5 | 50.7 | 1.10x | 90% |
+| **20 x 16 MiB** | **10** | **55.5** | **1.20x** | **98%** |
 
 Bandwidth is dominated by **transfer size, not worker count**: 8 workers at
 16 MiB beats 16 workers at 2 MiB by 25%. Per-transfer overhead is what the
 small-buffer configurations are paying.
 
-`--bufs 48` fails with `ERT_CMD_STATE_ERROR`, so this build does not carry the
-`kMaxHostBOs` 16 -> 64 raise that `dispatch_bw_probe.py`'s docstring assumes.
-Everything above is therefore within the stock 16-BO limit — the 50-buffer
-configuration FLM itself uses was not reachable here.
+### The host-BO ceiling is 20, not 64
+
+`--bufs 48` fails with `ERT_CMD_STATE_ERROR`, and the first version of this
+document blamed a missing `kMaxHostBOs` 16 -> 64 raise. That was wrong:
+`tools/aiecc/SidecarFiles.h:93` already reads `kMaxHostBOs = 64`, and the
+failure is at RUN time, not at aiecc's compile-time check.
+
+Bisected, the real boundary is sharp and sits far below either number:
+
+| bufs | result |
+|---|---|
+| 20 | works, at every worker count tried (1, 2, 4, 10) |
+| 21 | `ERT_CMD_STATE_ERROR` |
+| 22, 24, 32, 48 | `ERT_CMD_STATE_ERROR` |
+
+**20 host buffers per dispatch is the hard limit on this stack**, independent
+of worker count, and it is a runtime/driver limit rather than a compiler one.
+Raising `kMaxHostBOs` further cannot help. FLM's own 50-buffer configuration is
+not reachable here at all, so the comparison against its 46.2 GB/s is between
+different dispatch shapes — worth remembering before reading 1.20x as "we beat
+FLM's structure".
 
 ## What it implies for chatglm3
 
@@ -46,7 +65,7 @@ the file. So "every weight once per token" is the right model.
 
 | streaming rate | decode ceiling |
 |---|---|
-| 54.9 GB/s (measured peak) | **17.0 tok/s** |
+| 55.5 GB/s (measured peak) | **17.2 tok/s** |
 | 46.2 GB/s (FLM's rate) | 14.3 tok/s |
 | 33.5 GB/s (small buffers) | 10.4 tok/s |
 
