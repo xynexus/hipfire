@@ -133,19 +133,41 @@ Also cleared for the 35B this round:
   exactly what the runtime's own history says is correct ("1.63 instead of the
   correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce").
 
+### oq4++ is not the cause either
+
+Quantised the 0.8B bf16 source to **oq4++** — the 35B's exact format, full
+Hessian/LDLQ feedback and all — using `/srv/hipfire/calib/qwen3.5-0.8b.calib.hfq`
+as the Hessian, and compared at seq 1:
+
+| 0.8B format | seq 1 |
+|---|---|
+| oq8++ | 0.9996 |
+| plain oq4 | (loss 3.796, healthy) |
+| **oq4++** | **0.9998** |
+
+So the oq4++ decode, its AWQ sidecars and the LDLQ feedback are all handled
+correctly. Combined with the earlier results, every quantisation this
+implementation reads is now verified on a real model.
+
 ### What is left
 
-Everything structural now has a witness except the 35B's SCALE and its exact
-quantisation: 40 layers at h=2048, 256 experts at top-8, and `oq4++`
-specifically (Hessian/LDLQ error feedback plus aggressive AWQ — one expert
-sidecar spans 0.083 to 44.6). The 0.8B validated `oq8++` and a plain `oq4` this
-session, but not `oq4++`, and no small model on disk carries it.
+With oq4++ cleared, the untested combination narrows to **MoE together with
+4-bit quantisation**, and to raw scale — 40 layers at h=2048, 256 experts at
+top-8. Every witness so far is either dense-and-quantised (the 0.8B) or
+MoE-and-bf16 (the tiny fixtures); nothing on disk is both MoE and 4-bit except
+the 35B itself.
 
-The next cheap probe is a numpy recomputation of the 35B's layer 0 from its own
-dequantised weights, compared against the Rust walk's layer-0 output. That does
-not prove correctness — both use the same dequantiser — but it separates "the
-Rust disagrees with its own weights" from "the weights are already wrong", and
-the second would point squarely at the oq4++ decode.
+An attempt to synthesise one — padding `qwen3_5_moe-tiny`'s experts from
+`moe_intermediate` 128 to 256 so they clear the G256 group boundary — hit a
+size assertion inside the quantizer (expected 65536 per expert, got 262144).
+Worth another try with the padding done to match what the quantizer computes,
+since it would give a seconds-per-iteration witness for the last untested
+combination.
+
+The cheaper alternative, at ~20 minutes a run: ablate the routed experts in the
+35B walk (shared branch only) and see whether cos moves off zero. That splits
+"the routed-expert path is wrong at 4-bit" from "something else at this scale"
+in one measurement.
 
 ## The dense hybrid is correct
 
