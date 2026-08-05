@@ -3236,6 +3236,13 @@ pub const ENV_HIPFIRE_OQ_COMPACT_RESIDENT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
+/// `HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K` — Diagnostic bisection filter for HIPFIRE_OQ_COMPACT_RESIDENT. Comma-separated list of K (input-dim) values; when set, ONLY tensors whose K appears in the list stay compact-resident and every other OqPlusCompact tensor takes the expanded path. Exists to localize the compact-vs-expanded logit divergence to a projection class by bisecting over shapes — the load-time hook sees (qt, data, m, k) but not the tensor name, so K is the available handle. Empty or unset means no filter.
+pub const ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K",
+    description: "Diagnostic bisection filter for HIPFIRE_OQ_COMPACT_RESIDENT. Comma-separated list of K (input-dim) values; when set, ONLY tensors whose K appears in the list stay compact-resident and every other OqPlusCompact tensor takes the expanded path. Exists to localize the compact-vs-expanded logit divergence to a projection class by bisecting over shapes — the load-time hook sees (qt, data, m, k) but not the tensor name, so K is the available handle. Empty or unset means no filter.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_OQ_RAGGED_Q8` — Set (to any value) to emit Opus tensors whose K is not a multiple of 256 as Q8 rather than zero-padding them to a 256 group. The GPU serving loaders assert `K % 256 == 0`, so padded ragged Opus tensors load only on the NPU-native path; this keeps such artifacts GPU-loadable. Default stays padded-Opus.
 pub const ENV_HIPFIRE_OQ_RAGGED_Q8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ_RAGGED_Q8",
@@ -5824,6 +5831,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_OQ8_BATCHED_PREFILL,
     ENV_HIPFIRE_OQ8_ROUTER,
     ENV_HIPFIRE_OQ_COMPACT_RESIDENT,
+    ENV_HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K,
     ENV_HIPFIRE_OQ_RAGGED_Q8,
     ENV_HIPFIRE_OUTLIERS_BY_LAYER,
     ENV_HIPFIRE_PACK_IDENTITY,
