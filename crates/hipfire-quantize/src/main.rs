@@ -3293,10 +3293,57 @@ fn resolve_hf_cache_root(path: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+/// HF hub cache roots to search, most specific first — the same precedence
+/// `huggingface_hub` itself uses: `HF_HUB_CACHE`, then `$HF_HOME/hub`, then the
+/// default `~/.cache/huggingface/hub`.
+///
+/// Searching only the default was a real miss: a host that points its cache at a
+/// shared mount via `HF_HOME` would re-download a model it already had.
+fn hf_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_env = |var: &str, suffix: Option<&str>| {
+        if let Ok(dir) = std::env::var(var) {
+            if !dir.trim().is_empty() {
+                let base = PathBuf::from(dir);
+                roots.push(match suffix {
+                    Some(s) => base.join(s),
+                    None => base,
+                });
+            }
+        }
+    };
+    push_env("HF_HUB_CACHE", None);
+    push_env("HF_HOME", Some("hub"));
+    if let Some(home) = hipfire_env::home_dir() {
+        roots.push(home.join(".cache/huggingface/hub"));
+    }
+    roots
+}
+
+/// Run the HuggingFace download CLI.
+///
+/// Prefers `hf` (huggingface_hub >= 1.0) and falls back to the legacy
+/// `huggingface-cli` for older installs. Current huggingface_hub releases have
+/// REMOVED `huggingface-cli` — it exits non-zero with a deprecation notice — so
+/// calling it first silently broke `--input <org/name>` for any uncached model.
+fn run_hf_download(model_id: &str) -> std::io::Result<std::process::ExitStatus> {
+    match std::process::Command::new("hf")
+        .args(["download", model_id])
+        .status()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("huggingface-cli")
+                .args(["download", model_id])
+                .status()
+        }
+        other => other,
+    }
+}
+
 /// Resolve a model input to a local directory path.
 /// Accepts: local path, HuggingFace model ID (org/name), or HF cache path.
 /// If the input looks like a HF model ID and isn't a local path, tries to find it
-/// in the HF cache or downloads it via huggingface-cli.
+/// in any configured HF cache root, then downloads it via the HuggingFace CLI.
 fn resolve_model_path(input: &str) -> String {
     let path = Path::new(input);
 
@@ -3319,36 +3366,48 @@ fn resolve_model_path(input: &str) -> String {
             let org = parts[0];
             let name = parts[1];
 
-            // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
-            let home = hipfire_env::home_dir().unwrap_or_default();
-            // Join rather than format: `home` is a PathBuf, and string-building
-            // a path breaks on any home directory that is not plain UTF-8.
-            let cache_dir = home
-                .join(".cache/huggingface/hub")
-                .join(format!("models--{org}--{name}"));
+            // Check every configured cache root:
+            // <root>/models--{org}--{name}/snapshots/*/
+            // Join rather than format: the roots are PathBufs, and
+            // string-building a path breaks on any non-UTF-8 component.
+            let repo_dir = format!("models--{org}--{name}");
+            let cache_dirs: Vec<PathBuf> = hf_cache_roots()
+                .into_iter()
+                .map(|root| root.join(&repo_dir))
+                .collect();
 
-            if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
-                eprintln!("Resolved {input} -> {}", snapshot.display());
-                return snapshot.to_string_lossy().to_string();
+            for cache_dir in &cache_dirs {
+                if let Some(snapshot) = resolve_hf_cache_root(cache_dir) {
+                    eprintln!("Resolved {input} -> {}", snapshot.display());
+                    return snapshot.to_string_lossy().to_string();
+                }
             }
 
-            // Not in cache — try to download
-            eprintln!("Model {input} not found locally. Downloading via huggingface-cli...");
-            let status = std::process::Command::new("huggingface-cli")
-                .args(["download", input])
-                .status();
-
-            match status {
+            // Not in any cache root — try to download.
+            eprintln!("Model {input} not found locally. Downloading via the HuggingFace CLI...");
+            match run_hf_download(input) {
                 Ok(s) if s.success() => {
-                    // Retry cache lookup after download
-                    if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
-                        eprintln!("Downloaded {input} -> {}", snapshot.display());
-                        return snapshot.to_string_lossy().to_string();
+                    // Retry the lookup: the download may land in whichever root
+                    // the CLI's own env resolution picked.
+                    for cache_dir in &cache_dirs {
+                        if let Some(snapshot) = resolve_hf_cache_root(cache_dir) {
+                            eprintln!("Downloaded {input} -> {}", snapshot.display());
+                            return snapshot.to_string_lossy().to_string();
+                        }
                     }
+                    eprintln!(
+                        "Download reported success but no snapshot with config.json appeared under: {}",
+                        cache_dirs
+                            .iter()
+                            .map(|d| d.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
-                Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
+                Ok(s) => eprintln!("HuggingFace download failed with status {s}"),
                 Err(e) => eprintln!(
-                    "Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"
+                    "Failed to run the HuggingFace CLI (`hf`, or legacy `huggingface-cli`): {e}. \
+                     Install with: pip install -U huggingface_hub"
                 ),
             }
         }
