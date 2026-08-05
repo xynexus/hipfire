@@ -317,3 +317,46 @@ just the fallback line.
 **What is solid regardless:** two runs, one variable, 4.7% apart. The 1B result
 does not generalise, and no NPU decision should be made on the assumption that
 it does.
+
+## Why kvarn4 does not beat q8 here, despite moving fewer bytes
+
+Theory says a 4-bit K cache should decode faster than Q8. Measured on
+`Qwen3.5-0.8B--mq4`, it does not — at any context length tried:
+
+| context | kv | prefill | decode |
+|---|---|---|---|
+| 512 | kvarn4 | 598.30 | 101.85 |
+| 512 | q8 | 6307.60 | 103.40 |
+| **8192** | **kvarn4** | **284.85** | **99.40** |
+| **8192** | **q8** | **1983.75** | **102.60** |
+
+Decode is 3.2% SLOWER with kvarn4 at 8192, and prefill is **7x** slower.
+
+The reason is that **KV is not the bottleneck on a hybrid-attention model**.
+Qwen3.5 interleaves linear attention with full attention every 4th layer, so
+only ~1 layer in 4 holds a KV cache at all. At 8192 context with ~7 FA layers,
+2 KV heads and head_dim 128:
+
+| | KV at 8192 ctx |
+|---|---|
+| q8 | ~29 MB |
+| kvarn4 (K at 4 bit) | ~16 MB |
+| **model weights (mq4)** | **~500 MB** |
+
+Decode reads the full weight set every token and ~29 MB of KV. Compressing the
+KV to 16 MB removes ~13 MB from a ~530 MB per-token read — under 3%, and that
+is the ceiling, before the cost of KVarN's non-contiguous layout (4-bit block
+records plus an fp16 window) is paid back in indirection.
+
+So the measured 3.2% deficit is consistent: the saving is too small to cover the
+access overhead. **KVarN's advantage is structurally limited on hybrid models**
+— it needs a KV-heavy architecture (all-FA, many KV heads, or very long context)
+before the bytes it saves matter against the weights.
+
+Where it costs, it costs a lot: kvarn4 disqualifies batched FA prefill (see
+above), which is the 7x prefill difference, not a KV-bandwidth effect at all.
+
+**Not measured:** a dense all-FA model, where the 28-FA-layer row above puts KV
+at ~117 MB against the same ~500 MB of weights. That is the regime KVarN is
+presumably designed for, and nothing here contradicts it — this result is
+specific to hybrid attention.
