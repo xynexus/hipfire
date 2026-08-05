@@ -92,13 +92,34 @@ profile in `decoder-layer-npu-scope.md` — 85008 `gemv_oq4_grouped` dispatches,
 no `gemm_*` — describes that example, not this path, exactly as its own caveat
 warned.
 
-### What this means for the prefill-vs-FLM gap
+### MEASURED: the prefill gap is ~13%, not 34x
 
-The "hipfire prefill 80.8 t/s against FLM's ~2750" comparison in
-`decoder-layer-npu-scope.md` needs re-deriving before it is used to justify NPU
-work: if its hipfire number came from `bench_prefill`, it is a decode rate
-wearing a prefill label, and the real gap is unknown. Timing a traced `generate`
-is the way to get an honest figure.
+Timed inside the same trace, so the rate and the kernel list come from one call:
+
+| prompt | prefill | tok/s |
+|---|---|---|
+| 403 tokens | 167.9 ms | **2400.0** |
+| 1339 tokens | 1034.3 ms | 1294.6 |
+
+`decoder-layer-npu-scope.md` records **hipfire prefill 80.8 t/s** against FLM's
+**~2750**, and calls prefill "the only losing axis" — the justification for a
+prefill-only NPU offload as "the smallest change that flips the last axis".
+
+**Production prefill is ~2400 t/s at 403 tokens, 30x that 80.8.** The 80.8 has
+the signature of `bench_prefill`: a per-token decode warm-pass reported as
+`pp512 t/s`. Against FLM's ~2750 the real gap is roughly **13%**, not 34x.
+
+Two honest caveats. FLM's ~2750 is not stated at a prompt length, and hipfire's
+rate falls with length — 2400 at 403 tokens, 1294.6 at 1339 — because attention
+is O(n^2), so a like-for-like comparison needs FLM's length. And 2400 t/s is one
+host, one artifact (`Llama-3.2-1B-Instruct--oq4++`, gfx1151).
+
+**Consequence for the NPU plan.** The premise that prefill is 34x behind does not
+survive. Whatever case exists for a prefill NPU offload has to be rebuilt on
+measured numbers, at a matched prompt length, with the path shown. The
+`decoder-layer-npu-scope.md` table should not be used until its hipfire column
+is re-derived — every row in it is suspect for the same reason, including the
+35B's 36.4 t/s.
 
 ## Instrument fix
 
