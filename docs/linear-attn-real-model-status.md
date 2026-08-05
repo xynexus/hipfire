@@ -191,6 +191,35 @@ that one dimension dominates everything downstream of it — the final norm and
 the tied lm_head see mostly dim 1108 — so if its value is wrong, the logits are
 orthogonal no matter what else is right.
 
+### Ablation table: no single layer type is responsible
+
+All at seq 1 against `dump_logits_qwen35`, which the 0.8B matches at 0.9996:
+
+| configuration | cos |
+|---|---|
+| base | 0.0038 |
+| routed experts ablated (shared branch still on) | -0.0025 |
+| linear_attn layers ablated (30 of 40) | -0.0406 |
+| full-attention layers ablated (10 of 40) | -0.0953 |
+| **all layers ablated (head only)** | **argmax = the input token, logit +43.09** |
+
+The last row is a reference-free check and it passes: with tied embeddings, a
+model that computes nothing should rank the current token first, and it does.
+So embedding lookup, final norm and the tied head are all correct at this scale.
+The embedding is exact too — the walk's layer-0 input is bit-identical to
+`embed_tokens[0]`.
+
+What the other rows say is that removing ANY single layer type still leaves the
+output orthogonal. No one type is the culprit; either several are wrong, or
+something common to every layer is.
+
+What is common to every layer of this model and was never fully ablated: **the
+MoE MLP**. All 40 layers are routed, and the "routed experts ablated" row above
+left the SHARED expert running. So the next experiment is ablating the MLP
+entirely — routed and shared — leaving only the attention halves. If that
+restores agreement, the shared-expert branch is implicated, and it is the one
+MoE component whose only witness is a bf16 tiny fixture.
+
 ### What is left
 
 With oq4++ cleared, the untested combination narrows to **MoE together with
