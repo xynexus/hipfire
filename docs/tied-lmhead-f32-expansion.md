@@ -98,6 +98,38 @@ Note also that `HIPFIRE_BF16L3_RESIDENT` buys ~1.18x bandwidth **only** once the
 working set exceeds last-level cache, and is a measured slowdown below that. On
 a bandwidth-bound NPU that is a win; on a GPU with a 1B model it may not be.
 
+## Why F32 may have been deliberate — read before "just keep it BF16"
+
+Step 1 below looks free. It may not be, and the reason is a kernel-dispatch
+detail rather than anything about numerics.
+
+`weight_gemv` handles a BF16 weight with an explicit special case
+(`weights.rs`, inside `weight_gemv`):
+
+    // BF16 weights use WMMA GEMM directly (dispatch family has no BF16 GEMV entry).
+    if w.gpu_dtype == DType::BF16 {
+        return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
+    }
+
+So a BF16 head works, but it is served by a **batch-1 WMMA GEMM**, not by a
+GEMV. F32 and F16 heads instead reach dedicated residual GEMV paths. Expanding
+the tied head to F32 buys the better decode kernel at twice the bytes, and on a
+GPU whose working set fits in cache that can be the right trade — which is the
+same regime where `HIPFIRE_BF16L3_RESIDENT` is documented as "a measured
+slowdown".
+
+Note that BF16 GEMV kernels do exist in the tree — `gemv_bf16_f32.hip`,
+`gemv_bf16_vec8.hip`, and a gather variant `gemv_bf16_gather_f32.hip`, plus
+`gemv_bf16l3.hip` for the packed form. They are simply not wired into the
+dispatch family that `run_auto` consults. That is what makes the comment true
+today, and it is also the smallest change that would make step 1 unambiguously
+a win rather than a trade.
+
+**So this is a decision, not a cleanup**, and it wants a measurement rather than
+an opinion: batch-1 WMMA GEMM over BF16 versus residual GEMV over F32, at
+128256 x 2048, on this hardware. Whichever wins, the NPU case still prefers
+fewer bytes — a 56.5 GB/s fabric does not care that a GEMV kernel is nicer.
+
 ## Ordering
 
 1. **Stop expanding to F32.** Keeping the tied head BF16 halves head traffic
