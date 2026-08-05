@@ -342,9 +342,26 @@ fn load_embed_tokens(
             let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
             Ok((buf, EmbeddingFormat::F32))
         }
+        // A lossless recoding left packed by HIPFIRE_BF16L3_RESIDENT. The gather
+        // cannot read the packed form — a lookup reads one arbitrary row and
+        // BF16L3's escape plane is only addressable by walking a block — so
+        // decode to plain bf16 and take the native-bf16 gather path.
+        qt @ (49 | 50) => {
+            let n = cfg.vocab_size * cfg.hidden_size;
+            let logical =
+                hipfire_runtime::hfq::decode_bf16_packed(qt, &data, n).ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("qwen2: failed to decode recoded embedding {name}"),
+                    )
+                })?;
+            let buf = gpu.upload_raw(&logical, &[logical.len()])?;
+            Ok((buf, EmbeddingFormat::BF16))
+        }
         qt => panic!(
             "qwen2: unsupported embedding quant_type {qt}; handled: 1 (F16), 16 (BF16), \
-                     2 (F32) → F32; 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
+                     2 (F32) → F32; 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), \
+                     49/50 (packed recodings). \
                      Extend load_embed_tokens to handle this format."
         ),
     }
@@ -404,6 +421,29 @@ fn load_lm_head(
                 let f32_data = decode_direct_f32(&info, &data).map_err(|e| {
                     hip_bridge::HipError::new(0, &format!("qwen2 tied lm_head decode: {e:?}"))
                 })?;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.hidden_size])?
+            }
+            // Packed recoding for the TIED head. Decoded to f32 like the other
+            // direct sources here, not kept packed: qwen2's lm_head path uploads
+            // F32 bytes (raw f16/bf16 tagged F32 corrupts the matmul — R4 in
+            // dots-ocr-devlog §7), so the packed BF16L3 fast path does not apply
+            // to this arch without that being changed first.
+            qt @ (49 | 50) => {
+                let n = cfg.vocab_size * cfg.hidden_size;
+                let logical =
+                    hipfire_runtime::hfq::decode_bf16_packed(qt, &data, n).ok_or_else(|| {
+                        hip_bridge::HipError::new(
+                            0,
+                            "qwen2: failed to decode recoded tied embedding",
+                        )
+                    })?;
+                let f32_data: Vec<f32> = logical
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect();
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
@@ -562,6 +602,18 @@ fn load_norm_weight_raw(
                 f32::from_bits((bits as u32) << 16)
             })
             .collect(),
+        // A lossless recoding left packed by HIPFIRE_BF16L3_RESIDENT. Decode
+        // rather than panic — residency is global, so enabling it for a LUT3
+        // lm_head leaves every bf16 tensor here packed too.
+        qt @ (49 | 50) => {
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = hipfire_runtime::hfq::decode_bf16_packed(qt, &data, n)
+                .unwrap_or_else(|| panic!("qwen2: failed to decode recoded {name}"));
+            logical
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
         qt => panic!("qwen2: expected F16/F32/BF16 for norm {name}, got qt={qt}"),
     };
     // Harmonised with `hipfire-arch-dots-ocr::dots_ocr::load_norm_weight_raw`.

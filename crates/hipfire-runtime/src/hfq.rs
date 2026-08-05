@@ -891,6 +891,12 @@ pub struct HfqFile {
 ///
 /// Only [`QuantType::Bf16Lut3`] can stay resident. Huffman codes are bit-serial,
 /// so `Bf16Huff` is always expanded regardless of this flag.
+/// `HIPFIRE_BF16L3_RESIDENT=0` — an explicit opt-OUT, distinguishable from
+/// unset because residency is on by default for heads.
+fn bf16l3_resident_disabled() -> bool {
+    hipfire_env::BF16L3_RESIDENT.get().as_deref() == Some("0")
+}
+
 fn bf16l3_resident() -> bool {
     // Present and not literally "0" — deliberately NOT `flag()`: this predates
     // the 1/true/on/yes spelling and any other value counts as on.
@@ -902,9 +908,6 @@ fn bf16l3_resident() -> bool {
 /// gather). Matches `hipfire_quantize::hfq_out::is_gather_shaped`, which is what
 /// steers these to LUT3 in the first place.
 ///
-/// Unused until every arch loader can decode a packed embed — see the note in
-/// `expand_bf16_index`. Kept because it is the predicate the default will use.
-#[allow(dead_code)]
 fn is_head_tensor(name: &str) -> bool {
     name.contains("lm_head") || name.contains("embed_tokens")
 }
@@ -942,15 +945,29 @@ fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, us
             // the escape plane is only addressable by walking a block.
             //
             // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
-            // NOTE: defaulting this on for head-shaped tensors was tried and
-            // reverted. `expand_bf16_index` is arch-agnostic, but the loaders
-            // are not: only the LLaMA path was taught to decode a packed embed.
-            // qwen35, qwen2 and dots-ocr each panic with
-            // `expected F16/F32/BF16 for embed_tokens.weight, got qt=49`, and
-            // the tiny-quant gate went from 8 failures to 58. Teaching every
-            // arch loader is the prerequisite; see
-            // `docs/bf16l3-lmhead-plan.md`.
-            if resident && stored == QuantType::Bf16Lut3 {
+            // A LUT3 HEAD stays packed by DEFAULT, so `gemv_bf16l3_xf32` serves
+            // it: 1.917 ms against plain bf16's 3.241 at 128256 x 2048, worth
+            // tg128 90.05 -> 101.45 with byte-identical output.
+            //
+            // This was attempted once before and reverted: `expand_bf16_index`
+            // is arch-agnostic but the loaders were not, and the tiny-quant gate
+            // went from 8 failures to 58 with `got qt=49` panics across qwen35,
+            // gemma4, zaya, qwen2 and dots-ocr. Every one of those now decodes a
+            // packed tensor, and forcing residency globally reproduces the
+            // baseline 8 exactly — which is what makes the default safe.
+            //
+            // NOT extended to every Bf16Lut3 tensor. Layer weights must serve
+            // prefill, `gemv_bf16l3_xf32` is batch-1, and there is no BF16L3
+            // GEMM, so they are decoded at load regardless. The env var still
+            // forces that global behaviour.
+            //
+            // On a tied model this entry also backs the embedding gather, which
+            // decodes it explicitly at `token_embd` load — a lookup reads one
+            // arbitrary row and the escape plane needs a block walk.
+            //
+            // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
+            let head_default = !bf16l3_resident_disabled() && is_head_tensor(&t.name);
+            if (resident || head_default) && stored == QuantType::Bf16Lut3 {
                 return None;
             }
             let physical = (t.quant_type, t.data_offset, t.data_size);
