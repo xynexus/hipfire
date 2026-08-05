@@ -1,6 +1,46 @@
 # linear_attn on a real model — FIXED
 
-**The defect was GemmaRMSNorm.** Qwen3.5/3.6 store their block and final norm
+**Two separate defects, both resolved. Read this first; the rest of the file is
+the investigation log, in the order it happened, retractions included.**
+
+| # | defect | where | symptom | section |
+|---|---|---|---|---|
+| 1 | GemmaRMSNorm — norms are `rmsnorm(x)*(1+w)`, applied plainly | the walk's loader | loss 13.34, cos 0.7896 | immediately below |
+| 2 | untied `lm_head` scored through the embedding | the HARNESS (`gamma_hybrid`) | 35B cos ~0 at one token | *SOLVED: the harness scored the 35B through the wrong head* |
+
+Current state — every testbed reproduces the runtime's own prefill logits:
+
+| testbed | head | cos |
+|---|---|---|
+| Qwen3.5-0.8B, 1 and 4 layers | tied | 0.999993 |
+| qwen3_5_moe-tiny, 1 layer | tied | 0.999978 |
+| GQA fixture, `n_k=1 < n_v=2` | tied | 0.999982 |
+| Qwen3.6-35B-A3B, 1 layer | **untied** | 0.999990 |
+
+Defect 2 was in the measuring instrument, not the model. Everything the log
+below attributes to "the 35B's layer math" was the walk's output projected
+through the wrong matrix — the 35B's `lm_head` correlates with its own
+embedding at 0.025. The layer math was never wrong.
+
+What the hunt did leave behind, all of it real coverage that did not exist
+before: the linear_attn cross-checks now run at the model's true geometry
+(32 value / 16 key heads, h=2048) instead of a 2-head toy; the recurrence is
+checked at 32 heads out to seq 64; the MoE router is checked at 256 experts and
+top-8; and the 1-layer truncation harness is validated against a known-good
+4-layer result.
+
+The methodological lesson, since it recurred six times: **every wrong
+conclusion in this file came from an inference that was never tested
+directly.** The GQA hypothesis was eliminated-by-exhaustion and died in one
+run against a purpose-built GQA fixture. The seq-1 variant sweep measured a
+quantity structurally blind to the variable. The fix itself came from reading
+what the failing artifact actually contained rather than reasoning about what
+distinguished it. Build the direct test first; it is almost always cheaper
+than the argument.
+
+---
+
+**The first defect was GemmaRMSNorm.** Qwen3.5/3.6 store their block and final norm
 weights as deviations from 1, so the norm is `rmsnorm(x) * (1 + w)`. This
 implementation applied `w` plainly.
 
