@@ -24,9 +24,32 @@ every step. llama3.2:1b per-token traffic 1545.5 -> 871.1 MB, i.e. 2.00x FLM's
 `gemv_bf16l3_xf32` itself: 1.917 ms against `gemv_bf16_xf32`'s 3.241 at
 128256 x 2048, worst |diff| 2.570e-7, argmax identical.
 
-**Still opt-in.** `HIPFIRE_BF16L3_RESIDENT` is unset by default, so the +13%
-needs the env var. Whether it should default on for artifacts whose head is
-LUT3 is an open decision.
+**On by default.** A LUT3 head skips expansion without any env var;
+`HIPFIRE_BF16L3_RESIDENT=0` opts out. Setting the var to anything else extends
+residency to every Bf16Lut3 tensor, which is rarely wanted — there is no BF16L3
+GEMM, so layer weights are decoded at load regardless.
+
+### Reach
+
+**New artifacts get it for free.** The quantizer's default codec is `huff`, and
+`is_gather_shaped` steers gather-shaped tensors to LUT3 anyway, so a stock
+`hipfire-quantize` run with no `--bf16-codec` flag produces a `Bf16Lut3`
+embedding. Verified on a fresh `oq4` build: `model.embed_tokens.weight`
+`Bf16Lut3` 379.74 MB from 525.34 MB.
+
+**Existing artifacts mostly do not.** Only 1 of the 43 registered locally has a
+LUT3 head — `Llama-3.2-1B-Instruct-lut3--oq4++`, the one built for it
+deliberately. The rest carry Huffman or uncompressed embeddings and are
+untouched, so the change is forward-looking with a small blast radius on disk.
+
+On that one artifact:
+
+| | pp512 | tg128 |
+|---|---|---|
+| default (packed) | 110.10 | **101.45** |
+| `HIPFIRE_BF16L3_RESIDENT=0` | 96.70 | 90.05 |
+
+Output byte-identical.
 
 ## Established
 
