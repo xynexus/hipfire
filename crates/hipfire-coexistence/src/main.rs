@@ -568,6 +568,7 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
             "verify" => {
                 let states = hipfire_hub::run::verify(&root, &repo, &revision).await?;
                 let mut good = 0;
+                let mut gitok = 0;
                 let mut bad = 0;
                 let mut missing = 0;
                 let mut lenonly = 0;
@@ -575,6 +576,9 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     use hipfire_hub::run::FileState::*;
                     match s {
                         Good => good += 1,
+                        // Reported apart from a SHA-256 match: the git blob
+                        // hash is a real content check but a weaker one.
+                        GoodGitOid => gitok += 1,
                         Corrupt { want, got } => {
                             bad += 1;
                             eprintln!(
@@ -598,8 +602,8 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 eprintln!(
-                    "hub: {good} verified, {bad} corrupt, {missing} missing, \
-{lenonly} length-only (no hub digest)"
+                    "hub: {good} verified (sha256), {gitok} verified (git blob sha1), \
+{bad} corrupt, {missing} missing, {lenonly} length-only"
                 );
                 if bad > 0 || missing > 0 {
                     return Err(format!("{} file(s) need repair", bad + missing).into());
