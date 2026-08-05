@@ -80,6 +80,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     x_bf16.dtype = DType::BF16;
     let y = gpu.zeros(&[vocab], DType::F32)?;
 
+    // BF16L3: lossless 3-bit-LUT exponent coding, decoded in-kernel so the
+    // ratio applies to bandwidth. The question this answers is only "is the
+    // packed format faster at this shape" — `gemv_bf16l3` takes a BF16
+    // activation and emits BF16 logits, so it is NOT comparable on quality with
+    // the xf32 paths above, and an lm_head use would need a `gemv_bf16l3_xf32`
+    // that does not exist yet. Measure before writing it.
+    let bf16_bytes = f32_to_bf16_bytes(&w);
+    let packed = hipfire_primitives::bf16_lut3::encode(&bf16_bytes);
+    let mut w_l3 = gpu.upload_raw(&packed, &[packed.len()])?;
+    w_l3.dtype = DType::Raw;
+    let y_bf16 = gpu.alloc_tensor(&[vocab], DType::BF16)?;
+    println!(
+        "  BF16L3 packed {:.1} MB ({:.3}x smaller than bf16)",
+        packed.len() as f64 / 1e6,
+        bf16_bytes.len() as f64 / packed.len() as f64
+    );
+
     // Correctness BEFORE speed: a faster kernel that disagrees is worthless,
     // and the whole recommendation here is "switch the lm_head to this path".
     // bf16 has ~8 mantissa bits, so exact equality is not the bar; what matters
@@ -91,6 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bf_y = gpu.download_f32(&y)?;
     gpu.gemv_bf16_xf32(&w_bf16, &x_f32, &y, vocab, hidden)?;
     let mx_y = gpu.download_f32(&y)?;
+    gpu.gemv_bf16l3_xf32(&w_l3, &x_f32, &y, vocab, hidden)?;
+    let l3_y = gpu.download_f32(&y)?;
     gpu.gemm_bf16_x_bf16_wmma(&w_bf16, &x_f32, &y, vocab, hidden, 1)?;
     let wm_y = gpu.download_f32(&y)?;
 
@@ -104,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mag = ref_y.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let a_ref = argmax(&ref_y);
     for (label, v) in [
+        ("gemv_bf16l3_xf32 (x=f32)", &l3_y),
         ("gemv_bf16_xf32 (x=f32)", &mx_y),
         ("gemv_bf16_f32 (x=bf16)", &bf_y),
         ("gemm_wmma (x staged)", &wm_y),
@@ -197,7 +217,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gpu.hip.device_synchronize()?;
     let t_bf16_gemv = t.elapsed().as_secs_f64() / iters as f64;
 
+    for _ in 0..3 {
+        gpu.gemv_bf16l3_xf32(&w_l3, &x_f32, &y, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t = Instant::now();
+    for _ in 0..iters {
+        gpu.gemv_bf16l3_xf32(&w_l3, &x_f32, &y, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t_l3x = t.elapsed().as_secs_f64() / iters as f64;
+
+    for _ in 0..3 {
+        gpu.gemv_bf16l3(&w_l3, &x_bf16, &y_bf16, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t = Instant::now();
+    for _ in 0..iters {
+        gpu.gemv_bf16l3(&w_l3, &x_bf16, &y_bf16, vocab, hidden)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let t_l3 = t.elapsed().as_secs_f64() / iters as f64;
+
     for (label, per, bytes) in [
+        ("BF16L3 gemv_bf16l3_xf32", t_l3x, packed.len()),
+        ("BF16L3 gemv_bf16l3", t_l3, packed.len()),
         ("BF16 gemv_bf16_xf32", t_mixed, vocab * hidden * 2),
         ("BF16 gemv_bf16_f32", t_bf16_gemv, vocab * hidden * 2),
         ("F32 gemv_f32", t_f32, vocab * hidden * 4),
@@ -223,6 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stating it alone would recommend keeping an expansion that a wired-in
     // BF16 gemv beats on both bytes and time.
     let best = [
+        ("BF16L3 gemv_bf16l3_xf32", t_l3x),
         ("BF16 gemv_bf16_xf32", t_mixed),
         ("BF16 gemv_bf16_f32", t_bf16_gemv),
         ("F32 gemv_f32", t_f32),
