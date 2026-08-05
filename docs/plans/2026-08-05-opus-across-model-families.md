@@ -190,6 +190,23 @@ Sequence, cheapest-first:
    compact-all, confirming those three values cover every compact tensor with
    none unaccounted for.
 
+   Narrowed further with a companion `..._ONLY_M`, which pins a single (M, K)
+   projection class — the finest grain a load hook that never sees tensor names
+   can reach. **Every class diverges on its own**, all eight of them:
+   16x1024, 512x1024, 1024x2048, 1024x3584, 2048x1024, 3584x1024, 4096x1024,
+   6144x1024. A single 16-row tensor left compact is enough to move the logits.
+
+   That kills the last "one bad op" story. Any compact tensor, any shape, any
+   position perturbs the result — while the kernel is bit-identical at those
+   exact shapes. So the cause is tied to the dtype itself rather than to a shape,
+   an op, or a projection: something dispatch- or metadata-level that differs for
+   `OqCompactG256` regardless of which tensor carries it. Note the expanded
+   buffer is the COMBINED layout (weights + appended f32 scale plane) while the
+   compact buffer is blocks only, so any code deriving a quantity from the weight
+   buffer's size rather than from M/K would differ for every compact tensor
+   uniformly — that is the shape of hypothesis the evidence now points at, and
+   the first thing per-op instrumentation should check.
+
    Static analysis is now exhausted, with these paths eliminated: prefill_batch
    is symmetric (oq8 and compact both go `*_act_batched` -> quantize ->
    their GEMM); the decode files carry no dtype-specific handling at all, so

@@ -223,12 +223,12 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
 /// Returns `None` for any other code so the caller falls through to its own arms
 /// (OQ4 via `oq4_arch_load`, plain dtypes, etc.). All three resolve to
 /// `DType::Oq8G256`, dispatched by the generic iu8 GEMV/GEMM.
-/// Diagnostic bisection filter for compact residency: true unless
-/// `HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K` is set to a non-empty comma-separated
-/// list of K values that does not contain `k`. Unparseable entries are ignored
-/// rather than fatal — this is a debugging handle, not a correctness gate.
-fn compact_k_selected(k: usize) -> bool {
-    let Some(raw) = hipfire_env::OQ_COMPACT_RESIDENT_ONLY_K.get() else {
+/// One dimension filter: true unless `var` holds a non-empty comma-separated
+/// list of values that does not contain `value`. Unparseable entries are ignored
+/// rather than fatal — this is a debugging handle, not a correctness gate, and
+/// an empty or garbage list therefore means "no filter".
+fn dim_selected(var: &hipfire_env::EnvVar, value: usize) -> bool {
+    let Some(raw) = var.get() else {
         return true;
     };
     let mut any = false;
@@ -238,12 +238,21 @@ fn compact_k_selected(k: usize) -> bool {
             continue;
         }
         any = true;
-        if tok.parse::<usize>() == Ok(k) {
+        if tok.parse::<usize>() == Ok(value) {
             return true;
         }
     }
-    // An empty/garbage list means "no filter", so compact residency is unchanged.
     !any
+}
+
+/// Diagnostic bisection filter for compact residency. Both
+/// `HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K` and `..._ONLY_M` must admit the tensor,
+/// so setting both narrows to a single (M, K) projection class — which is as
+/// fine-grained as this hook can get, since it is handed the shape but never the
+/// tensor name.
+fn compact_shape_selected(m: usize, k: usize) -> bool {
+    dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_K, k)
+        && dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_M, m)
 }
 
 pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
@@ -257,14 +266,14 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // DType::OqCompactG256 is wired this becomes the default and the expansion
     // below can go — along with its two siblings in lfm2moe and minimax.
     //
-    // HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K narrows this to a chosen set of K values
-    // so the compact-vs-expanded logit divergence can be bisected down to a
-    // projection class. Purely diagnostic: unset (the normal case) keeps every
-    // OqPlusCompact tensor compact, exactly as before. K is the handle because
-    // this hook is given the shape but never the tensor name.
+    // HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K / _ONLY_M narrow this to chosen K and M
+    // values so the compact-vs-expanded logit divergence can be bisected down to
+    // a single (M, K) projection class. Purely diagnostic: unset (the normal
+    // case) keeps every OqPlusCompact tensor compact, exactly as before. The
+    // shape is the handle because this hook never sees the tensor name.
     if qt == QuantType::OqPlusCompact.code()
         && hipfire_env::OQ_COMPACT_RESIDENT.flag()
-        && compact_k_selected(k)
+        && compact_shape_selected(m, k)
     {
         return Some((data.to_vec(), DType::OqCompactG256));
     }
