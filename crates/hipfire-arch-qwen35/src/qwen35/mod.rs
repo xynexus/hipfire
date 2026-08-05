@@ -2238,6 +2238,26 @@ fn run_plain_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
+    // OqCompactG256 must never arrive here. Every dtype that is genuinely wired
+    // for batched prefill is driven by a direct `gpu.gemm_*` call at the call
+    // site (oq8 uses `gemm_oq8_grouped_*`, and a wired compact arm would use
+    // `gemm_oq_compact_*`), so a compact tensor reaching this KernelKey helper
+    // is always a fallthrough from a dtype chain with no compact arm. The
+    // fallthrough key is an HFQ4 one, which would decode the compact blocks as
+    // a different format — and the same missing arm means the rotation-
+    // admission list never rotated the activation either. Silent corruption on
+    // both counts, so refuse loudly instead.
+    // See docs/plans/2026-08-05-opus-across-model-families.md.
+    if w_dtype == DType::OqCompactG256 {
+        return Err(HipError::new(
+            0,
+            "compact-resident Opus (OqCompactG256) reached a KernelKey GEMM \
+             fallthrough with no compact arm; it would be decoded as another \
+             format on an unrotated activation. Unset HIPFIRE_OQ_COMPACT_RESIDENT \
+             for this model, or wire the compact arm at the call site.",
+        ));
+    }
+
     use hipfire_dispatch::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {
@@ -2288,6 +2308,26 @@ fn run_residual_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
+    // OqCompactG256 must never arrive here. Every dtype that is genuinely wired
+    // for batched prefill is driven by a direct `gpu.gemm_*` call at the call
+    // site (oq8 uses `gemm_oq8_grouped_*`, and a wired compact arm would use
+    // `gemm_oq_compact_*`), so a compact tensor reaching this KernelKey helper
+    // is always a fallthrough from a dtype chain with no compact arm. The
+    // fallthrough key is an HFQ4 one, which would decode the compact blocks as
+    // a different format — and the same missing arm means the rotation-
+    // admission list never rotated the activation either. Silent corruption on
+    // both counts, so refuse loudly instead.
+    // See docs/plans/2026-08-05-opus-across-model-families.md.
+    if w_dtype == DType::OqCompactG256 {
+        return Err(HipError::new(
+            0,
+            "compact-resident Opus (OqCompactG256) reached a KernelKey GEMM \
+             fallthrough with no compact arm; it would be decoded as another \
+             format on an unrotated activation. Unset HIPFIRE_OQ_COMPACT_RESIDENT \
+             for this model, or wire the compact arm at the call site.",
+        ));
+    }
+
     use hipfire_dispatch::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {

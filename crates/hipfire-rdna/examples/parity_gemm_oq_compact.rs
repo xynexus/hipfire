@@ -89,101 +89,138 @@ fn main() {
     // well above either. N_out = 0 is NOT tested: the on-disk contract requires
     // block_bytes >= 132, so a zero-overlay block is not a valid OqPlusCompact
     // block and the host oracle rejects it too.
-    for &(m, k, b) in &[(16usize, 256usize, 16usize), (48, 512, 8), (33, 768, 5)] {
+    // The last four are real Qwen3.5-0.8B--oq4.25 projection shapes at B=1. B=1
+    // is the decode case and was NOT covered before — every earlier shape used
+    // B>=5, so a bug that only shows with a single active batch row (lane
+    // clamping via safe_x, the n=1 tail) could not have been caught here.
+    for &(m, k, b) in &[
+        (16usize, 256usize, 16usize),
+        (48, 512, 8),
+        (33, 768, 5),
+        (2048, 1024, 1),
+        (1024, 3584, 1),
+        (512, 1024, 1),
+        (512, 1024, 2),
+    ] {
         for &n_out in &[1usize, 3, 7, 16] {
-            let block_stride = 130 + 2 * n_out;
-            let ng = k / GROUP;
-            let mut rnd = lcg(0x51ee_d00d ^ (m * k * b + n_out) as u32);
+            // Power-of-two scales are exact in f16 AND exact under f32 multiply, so
+            // they hide any difference in rounding or multiply order between the two
+            // paths. A real artifact's scales are arbitrary f16, so sweep both:
+            // `exact` reproduces the original coverage, `!exact` is the realistic case.
+            for &exact in &[true, false] {
+                let block_stride = 130 + 2 * n_out;
+                let ng = k / GROUP;
+                let mut rnd = lcg(0x51ee_d00d ^ (m * k * b + n_out) as u32 ^ (exact as u32) << 20);
 
-            // Build compact blocks.
-            let mut blocks = vec![0u8; m * ng * block_stride];
-            for r in 0..m {
-                for g in 0..ng {
-                    let off = (r * ng + g) * block_stride;
-                    let scale = 1.0f32 / (1 << (1 + (rnd() % 4))) as f32; // exact in f16
-                    blocks[off..off + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
-                    for i in 0..128 {
-                        blocks[off + 2 + i] = (rnd() & 0xff) as u8;
-                    }
-                    for s in 0..n_out {
-                        // Deliberately allow duplicate indices so last-wins is exercised.
-                        blocks[off + 130 + 2 * s] = (rnd() % 256) as u8;
-                        blocks[off + 130 + 2 * s + 1] = (rnd() & 0xff) as u8;
+                // Build compact blocks.
+                let mut blocks = vec![0u8; m * ng * block_stride];
+                for r in 0..m {
+                    for g in 0..ng {
+                        let off = (r * ng + g) * block_stride;
+                        // Arbitrary case: build the f16 bit pattern directly (random
+                        // 10-bit mantissa, exponent ~2^-5..2^3) so no f32->f16 rounding
+                        // is needed and the stored scale is exactly what both paths see.
+                        let bits = if exact {
+                            f32_to_f16_bits(1.0f32 / (1 << (1 + (rnd() % 4))) as f32)
+                        } else {
+                            (((10 + rnd() % 9) as u16) << 10) | (rnd() % 1024) as u16
+                        };
+                        blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+                        for i in 0..128 {
+                            blocks[off + 2 + i] = (rnd() & 0xff) as u8;
+                        }
+                        for s in 0..n_out {
+                            // Deliberately allow duplicate indices so last-wins is exercised.
+                            blocks[off + 130 + 2 * s] = (rnd() % 256) as u8;
+                            blocks[off + 130 + 2 * s + 1] = (rnd() & 0xff) as u8;
+                        }
                     }
                 }
-            }
 
-            // Activations: int8 + per-group f32 scales, shared by both paths.
-            let xq: Vec<i8> = (0..b * k)
-                .map(|_| ((rnd() % 255) as i32 - 127) as i8)
-                .collect();
-            let xs: Vec<f32> = (0..b * ng)
-                .map(|_| 1.0f32 / (1 << (1 + (rnd() % 3))) as f32)
-                .collect();
+                // Activations: int8 + per-group f32 scales, shared by both paths.
+                let xq: Vec<i8> = (0..b * k)
+                    .map(|_| ((rnd() % 255) as i32 - 127) as i8)
+                    .collect();
+                let xs: Vec<f32> = (0..b * ng)
+                    .map(|_| {
+                        if exact {
+                            1.0f32 / (1 << (1 + (rnd() % 3))) as f32
+                        } else {
+                            // Arbitrary positive f32, same order of magnitude.
+                            0.25f32 + (rnd() % 100_000) as f32 * 1.0e-5
+                        }
+                    })
+                    .collect();
 
-            let (w_dense, w_scales) = expand(&blocks, m, k, block_stride);
+                let (w_dense, w_scales) = expand(&blocks, m, k, block_stride);
 
-            let d_blocks = gpu
-                .upload_raw(&blocks, &[blocks.len()])
-                .expect("upload blocks");
-            let d_wdense = gpu
-                .upload_raw(
-                    unsafe {
-                        std::slice::from_raw_parts(w_dense.as_ptr() as *const u8, w_dense.len())
-                    },
-                    &[w_dense.len()],
+                let d_blocks = gpu
+                    .upload_raw(&blocks, &[blocks.len()])
+                    .expect("upload blocks");
+                let d_wdense = gpu
+                    .upload_raw(
+                        unsafe {
+                            std::slice::from_raw_parts(w_dense.as_ptr() as *const u8, w_dense.len())
+                        },
+                        &[w_dense.len()],
+                    )
+                    .expect("upload dense");
+                let d_wscales = gpu
+                    .upload_f32(&w_scales, &[w_scales.len()])
+                    .expect("upload wscales");
+                let d_xq = gpu
+                    .upload_raw(
+                        unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
+                        &[xq.len()],
+                    )
+                    .expect("upload xq");
+                let d_xs = gpu.upload_f32(&xs, &[xs.len()]).expect("upload xs");
+                let d_y_ref = gpu.zeros(&[b * m], DType::F32).expect("y ref");
+                let d_y_cmp = gpu.zeros(&[b * m], DType::F32).expect("y cmp");
+
+                gpu.gemm_oq8_grouped_wmma(
+                    &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, GROUP,
                 )
-                .expect("upload dense");
-            let d_wscales = gpu
-                .upload_f32(&w_scales, &[w_scales.len()])
-                .expect("upload wscales");
-            let d_xq = gpu
-                .upload_raw(
-                    unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
-                    &[xq.len()],
+                .expect("dense gemm");
+                gpu.gemm_oq_compact_grouped_wmma(
+                    &d_blocks,
+                    &d_xq,
+                    &d_xs,
+                    &d_y_cmp,
+                    m,
+                    k,
+                    b,
+                    GROUP,
+                    block_stride,
                 )
-                .expect("upload xq");
-            let d_xs = gpu.upload_f32(&xs, &[xs.len()]).expect("upload xs");
-            let d_y_ref = gpu.zeros(&[b * m], DType::F32).expect("y ref");
-            let d_y_cmp = gpu.zeros(&[b * m], DType::F32).expect("y cmp");
+                .expect("compact gemm");
 
-            gpu.gemm_oq8_grouped_wmma(
-                &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, GROUP,
-            )
-            .expect("dense gemm");
-            gpu.gemm_oq_compact_grouped_wmma(
-                &d_blocks,
-                &d_xq,
-                &d_xs,
-                &d_y_cmp,
-                m,
-                k,
-                b,
-                GROUP,
-                block_stride,
-            )
-            .expect("compact gemm");
+                let y_ref = gpu.download_f32(&d_y_ref).expect("dl ref");
+                let y_cmp = gpu.download_f32(&d_y_cmp).expect("dl cmp");
 
-            let y_ref = gpu.download_f32(&d_y_ref).expect("dl ref");
-            let y_cmp = gpu.download_f32(&d_y_cmp).expect("dl cmp");
-
-            let mut bad = 0usize;
-            let mut worst = 0.0f32;
-            for (a, c) in y_ref.iter().zip(y_cmp.iter()) {
-                if a.to_bits() != c.to_bits() {
-                    bad += 1;
-                    worst = worst.max((a - c).abs());
+                let mut bad = 0usize;
+                let mut worst = 0.0f32;
+                for (a, c) in y_ref.iter().zip(y_cmp.iter()) {
+                    if a.to_bits() != c.to_bits() {
+                        bad += 1;
+                        worst = worst.max((a - c).abs());
+                    }
                 }
-            }
-            let tag = format!("M={m} K={k} B={b} N_out={n_out}");
-            if bad == 0 {
-                println!("  ok   {tag}: bit-identical over {} outputs", y_ref.len());
-            } else {
-                fail += 1;
-                println!(
-                    "  FAIL {tag}: {bad}/{} outputs differ, worst |delta| {worst:.6e}",
-                    y_ref.len()
-                );
+                let scales = if exact {
+                    "pow2-scales"
+                } else {
+                    "arbitrary-scales"
+                };
+                let tag = format!("M={m} K={k} B={b} N_out={n_out} {scales}");
+                if bad == 0 {
+                    println!("  ok   {tag}: bit-identical over {} outputs", y_ref.len());
+                } else {
+                    fail += 1;
+                    println!(
+                        "  FAIL {tag}: {bad}/{} outputs differ, worst |delta| {worst:.6e}",
+                        y_ref.len()
+                    );
+                }
             }
         }
     }

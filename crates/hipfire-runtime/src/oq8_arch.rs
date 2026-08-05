@@ -223,6 +223,29 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
 /// Returns `None` for any other code so the caller falls through to its own arms
 /// (OQ4 via `oq4_arch_load`, plain dtypes, etc.). All three resolve to
 /// `DType::Oq8G256`, dispatched by the generic iu8 GEMV/GEMM.
+/// Diagnostic bisection filter for compact residency: true unless
+/// `HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K` is set to a non-empty comma-separated
+/// list of K values that does not contain `k`. Unparseable entries are ignored
+/// rather than fatal — this is a debugging handle, not a correctness gate.
+fn compact_k_selected(k: usize) -> bool {
+    let Some(raw) = hipfire_env::OQ_COMPACT_RESIDENT_ONLY_K.get() else {
+        return true;
+    };
+    let mut any = false;
+    for tok in raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        any = true;
+        if tok.parse::<usize>() == Ok(k) {
+            return true;
+        }
+    }
+    // An empty/garbage list means "no filter", so compact residency is unchanged.
+    !any
+}
+
 pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
     // Compact residency: hand the OqPlusCompact blocks to the device untouched
     // so oq4.25++ stays ~4.25 bits/weight instead of being unpacked to one int8
@@ -233,7 +256,16 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // Opt-in while the end-to-end path is validated; once every consumer of
     // DType::OqCompactG256 is wired this becomes the default and the expansion
     // below can go — along with its two siblings in lfm2moe and minimax.
-    if qt == QuantType::OqPlusCompact.code() && hipfire_env::OQ_COMPACT_RESIDENT.flag() {
+    //
+    // HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K narrows this to a chosen set of K values
+    // so the compact-vs-expanded logit divergence can be bisected down to a
+    // projection class. Purely diagnostic: unset (the normal case) keeps every
+    // OqPlusCompact tensor compact, exactly as before. K is the handle because
+    // this hook is given the shape but never the tensor name.
+    if qt == QuantType::OqPlusCompact.code()
+        && hipfire_env::OQ_COMPACT_RESIDENT.flag()
+        && compact_k_selected(k)
+    {
         return Some((data.to_vec(), DType::OqCompactG256));
     }
     let bytes = match qt {
