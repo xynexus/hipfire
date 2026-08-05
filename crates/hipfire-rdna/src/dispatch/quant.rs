@@ -393,6 +393,95 @@ impl Gpu {
         }
     }
 
+    /// Compact-resident Opus W8A8 GEMM: the [`Self::gemm_oq8_grouped_wmma`] core
+    /// reading OqPlusCompact (qt=36) blocks DIRECTLY instead of a pre-expanded
+    /// dense int8 plane, so oq4.25++ stays ~4.25 bits/weight in VRAM rather than
+    /// 8. Same FWHT-rotated W8A8 math and the same int8 activations from
+    /// `quantize_act_oq8`, so results are bit-identical to the expanded path
+    /// (see `examples/parity_gemm_oq_compact.rs`).
+    ///
+    /// `w_blocks` is `[M, K/group]` blocks of `block_stride` bytes, each
+    /// `[f16 scale | 128 packed int4 | N_out * (u8 idx, i8 val)]`, so
+    /// `block_stride == 130 + 2 * N_out`. There is no separate weight-scale
+    /// plane — the scale lives in the block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_grouped_wmma(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_oq_compact_grouped_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group, 256,
+            "gemm_oq_compact_grouped_wmma: the compact block encodes exactly 256 weights"
+        );
+        // Mirrors the host oracle's contract (`oqplus_compact_to_oq8_combined`):
+        // a valid OqPlusCompact block carries at least one overlay, so the
+        // minimum stride is 132, not 130.
+        assert!(
+            block_stride >= 132 && (block_stride - 130) % 2 == 0,
+            "gemm_oq_compact_grouped_wmma: block_stride {block_stride} invalid (expected 130 + 2*N_out, N_out >= 1)"
+        );
+        // The kernel holds the overlay table in registers; refuse rather than
+        // silently clip a block carrying more outliers than it can keep.
+        const MAX_OVERLAYS: usize = 32;
+        let overlays = (block_stride - 130) / 2;
+        assert!(
+            overlays <= MAX_OVERLAYS,
+            "gemm_oq_compact_grouped_wmma: {overlays} overlays exceeds the {MAX_OVERLAYS} the kernel keeps in registers"
+        );
+        self.ensure_kernel(
+            "gemm_oq_compact_grouped_wmma",
+            kernels::GEMM_OQ_COMPACT_GROUPED_WMMA_SRC,
+            "gemm_oq_compact_grouped_wmma",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut bs = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16) as u32;
+        let grid_b = batch_size.div_ceil(16) as u32;
+        let func = &self.functions["gemm_oq_compact_grouped_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Register-tiled unified Opus-Quant GEMM for W4A8 (`w_bits == 4`, packed
     /// int4 weight `[M,K/2]`) and W8A8 (`w_bits == 8`, int8 weight `[M,K]`).
     /// Dynamic-int8 activation (`X` int8 `[B,K]`, `Xs` `[B,K/group]`), iu8 WMMA,
