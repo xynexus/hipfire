@@ -24,37 +24,28 @@ every step. llama3.2:1b per-token traffic 1545.5 -> 871.1 MB, i.e. 2.00x FLM's
 `gemv_bf16l3_xf32` itself: 1.917 ms against `gemv_bf16_xf32`'s 3.241 at
 128256 x 2048, worst |diff| 2.570e-7, argmax identical.
 
-**Opt-in — a default was tried and reverted.** `HIPFIRE_BF16L3_RESIDENT` must be
-set. Defaulting it on for head-shaped tensors took the tiny-quant gate from 8
-failures to **58**: `expand_bf16_index` is arch-agnostic, but only the LLaMA
-loader was taught to decode a packed embed for the gather, so qwen35, qwen2 and
-dots-ocr all panicked with `expected F16/F32/BF16 for embed_tokens.weight, got
-qt=49`.
+**On by default.** A LUT3 head skips expansion with no env var;
+`HIPFIRE_BF16L3_RESIDENT=0` opts out. Setting the var to anything else extends
+residency to every Bf16Lut3 tensor, which is rarely wanted — there is no BF16L3
+GEMM, so layer weights decode at load regardless.
 
-**Prerequisite for the default:** teach every arch loader to decode a packed
-tensor. The predicate is already present as `is_head_tensor`; the work is the
-per-arch decode arms.
+**It took two attempts.** The first default took the tiny-quant gate from 8
+failures to **58**: `expand_bf16_index` is arch-agnostic but the loaders were
+not, and qwen35, gemma4, zaya, qwen2 and dots-ocr all panicked with `got
+qt=49`. Reverted, then fixed properly by teaching every loader to decode a
+packed tensor, measured by forcing residency globally — stricter than the
+head-only default — until it reproduced the baseline:
 
-That tail is longer than it looks. Measured by forcing
-`HIPFIRE_BF16L3_RESIDENT=1` and running the gate, which is stricter than the
-head-only default and so bounds the work:
-
-| state | gate failures |
+| after teaching | failures, residency forced on |
 |---|---|
-| residency off (baseline) | 8 |
-| forced on, before any arch fix | 58 |
-| forced on, after teaching qwen35 | **43** |
+| — | 58 |
+| qwen35 | 43 |
+| `transformer_loader` (gemma3/gemma4/cohere2) | 20 |
+| qwen2 norm + dots-ocr | 16 |
+| qwen2 embedding + tied head | **8** = baseline |
 
-One arch bought 15 cells. The remainder are spread across `gemma4`
-("unsupported embedding quant type 49"), `zaya` ("zaya gpu: unsupported
-quant_type 49") and others, each with its own embedding loader and its own
-panic string — there is no shared seam to fix once. `hipfire-runtime::hfq::
-decode_bf16_packed` is now `pub` so each arch can use the same decoder, which is
-the only part that is shared.
-
-Until every arch is taught, the flag stays opt-in. Enabling it on an untaught
-arch fails to load rather than degrading, which is the right failure but not one
-to inflict by default.
+All three states verified at 8: head-default on, residency forced, explicit
+opt-out.
 
 ### Reach
 
