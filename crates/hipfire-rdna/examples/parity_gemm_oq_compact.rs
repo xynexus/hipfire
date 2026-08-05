@@ -89,7 +89,19 @@ fn main() {
     // well above either. N_out = 0 is NOT tested: the on-disk contract requires
     // block_bytes >= 132, so a zero-overlay block is not a valid OqPlusCompact
     // block and the host oracle rejects it too.
-    for &(m, k, b) in &[(16usize, 256usize, 16usize), (48, 512, 8), (33, 768, 5)] {
+    // The last four are real Qwen3.5-0.8B--oq4.25 projection shapes at B=1. B=1
+    // is the decode case and was NOT covered before — every earlier shape used
+    // B>=5, so a bug that only shows with a single active batch row (lane
+    // clamping via safe_x, the n=1 tail) could not have been caught here.
+    for &(m, k, b) in &[
+        (16usize, 256usize, 16usize),
+        (48, 512, 8),
+        (33, 768, 5),
+        (2048, 1024, 1),
+        (1024, 3584, 1),
+        (512, 1024, 1),
+        (512, 1024, 2),
+    ] {
         for &n_out in &[1usize, 3, 7, 16] {
             // Power-of-two scales are exact in f16 AND exact under f32 multiply, so
             // they hide any difference in rounding or multiply order between the two
