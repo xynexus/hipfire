@@ -82,7 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_hfq { "hfq" } else { "safetensors" }
     );
 
-    let seq = 64usize;
+    // Third arg: sequence length. Short runs separate per-token errors from
+    // ones that accumulate with position — at seq 1 the recurrence has no
+    // history and attention's softmax is over a single key.
+    let seq: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(64);
     let h = cfg.hidden_size;
     let dims = BlockDims {
         seq,

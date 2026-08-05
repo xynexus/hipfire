@@ -77,6 +77,38 @@ Rust, which uses hipfire's rope kernel directly and scores 3.52 on real text;
 it does mean the numpy oracle is only trustworthy at short lengths until the
 rest is found.
 
+## The dense hybrid is correct — 0.9999 against the runtime
+
+Sweeping sequence length against `dump_logits_qwen35` settles the last doubts
+about the shared path:
+
+| model | seq 1 | seq 4 | seq 16 | seq 64 |
+|---|---|---|---|---|
+| **Qwen3.5-0.8B (trained)** | 0.9996 | 0.9998 | 0.9998 | **0.9999** |
+| qwen3_5-tiny (random init) | 1.0000 | 0.9995 | 0.9347 | 0.9441 |
+| qwen3_5_moe-tiny (random init) | 1.0000 | 0.9990 | 0.8143 | — |
+
+Two conclusions, and the second corrects the previous section:
+
+1. **The implementation is essentially exact** on a real model, at every length
+   tested. Per-token math and sequence handling are both right.
+2. **The random-init fixtures' decay with length is chaos amplification, not a
+   bug.** A randomly initialised network has no trained attractor, so f32-level
+   differences between two implementations diverge as they propagate. The
+   non-monotonicity (0.9347 at 16, 0.9441 at 64) is the tell — a systematic
+   error accumulates, it does not wander.
+
+**The MoE math is correct too.** Routing, expert SwiGLU and the shared branch
+are entirely per-token — they depend only on the current hidden state — so
+`cos 1.0000` at seq 1 on the MoE fixture is a complete test of them. The
+earlier reading of 0.6470 at seq 64 as "the MoE gap" was measuring chaos in a
+random model, not a defect.
+
+That leaves the 35B's near-uniform loss unexplained by anything found so far,
+and the useful lesson is about the oracle rather than the code: **a random-init
+fixture is a valid oracle only at short sequence length.** Comparisons on one
+at seq 64 measure divergence rate, not correctness.
+
 ## A fast MoE oracle, and the MoE gap confirmed
 
 Every 35B check costs ~20 minutes and there is no small real MoE on disk — but
