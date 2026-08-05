@@ -232,3 +232,36 @@ per-model dtype/KV checks, not anything model-specific.
 Before any NPU prefill offload is scoped: measure the 35B with a q8 KV cache. If
 it moves the way the 1B did, the offload is solving a problem that a KVarN
 batched-FA branch solves on hardware already present.
+
+## The 35B does NOT reproduce the 1B's KV-format win
+
+Measured `Qwen3.6-35B-A3B--mq4`, same build, `kv_cache` the only variable:
+
+| kv_cache | pp512 | tg32 | prefill_ms |
+|---|---|---|---|
+| q8 | 53.80 | 46.50 | 9515.8 |
+| kvarn4 (default) | 51.40 | 46.20 | 9964.1 |
+
+**4.7%, not the 1B's 10.5x.** The KV-format finding does not transfer to the
+model that matters.
+
+So the 35B's prefill gap against FLM (~290 t/s) is NOT the FA per-token
+fallback, and switching its KV format buys almost nothing. Whatever costs the
+35B its prefill throughput is something else — plausibly the MoE expert path,
+which the 0.8B does not have, but that is a hypothesis and not a measurement.
+
+### Caveat: the mechanism is unconfirmed
+
+The `PER-TOKEN fallback` diagnostic did **not** fire in either 35B run. That is
+not evidence the gate passed. `forward_prefill_chunk` (`prefill_chunk.rs:1908`)
+contains the gate and `prefill_batch.rs:5003` calls it, so the path is reached;
+either `fa_batched_ok` was true under kvarn4 — which the gate's own logic says
+it should not be — or `kernel_trace::enabled()` was false in that daemon.
+
+Silence from a diagnostic means "instrument not proven live", not "condition not
+met". Confirming it needs one more 35B run checked for the histogram itself, not
+just the fallback line.
+
+**What is solid regardless:** two runs, one variable, 4.7% apart. The 1B result
+does not generalise, and no NPU decision should be made on the assumption that
+it does.
