@@ -250,10 +250,62 @@ fallback, and switching its KV format buys almost nothing. Whatever costs the
 35B its prefill throughput is something else — plausibly the MoE expert path,
 which the 0.8B does not have, but that is a hypothesis and not a measurement.
 
-### Caveat: the mechanism is unconfirmed
+### MEASURED: the 35B prefill is per-token MoE, not the FA fallback
 
-The `PER-TOKEN fallback` diagnostic did **not** fire in either 35B run. That is
-not evidence the gate passed. `forward_prefill_chunk` (`prefill_chunk.rs:1908`)
+Full histogram, `Qwen3.6-35B-A3B--mq4`, 256-token prefill, kvarn4 default:
+
+    [kernel-trace] bench_prefill: 327465 dispatches across 36 kernels
+          51200   15.6%  mq_rotate_x
+          45825   14.0%  gemv_q8_0
+          24832    7.6%  rmsnorm_f32_gfx1151
+          18432    5.6%  gemv_hfq4g256
+          16384    5.0%  fused_silu_mul_mq_rotate
+          10240    3.1%  moe_down_combine_k8_batched
+          10240    3.1%  moe_topk_renorm_k8
+          10240    3.1%  softmax_f32
+           9984    3.0%  gemv_hfq6g256
+           9216    2.8%  gemm_gate_up_q8_0_wmma
+           7680    2.3%  gated_delta_net_f32   (and 5 more LA kernels at 7680)
+           6144    1.9%  gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
+           6144    1.9%  gemv_hfq4g256_moe_gate_up_k8_indexed
+
+**1279 dispatches per token**, against the 1B's 128. Exactly one GEMM appears.
+
+The counts factor cleanly against the model's 40 layers and 256 tokens:
+
+* `10240 = 256 x 40` — MoE routing (`moe_topk_renorm_k8`, `softmax_f32`,
+  `moe_down_combine_k8_batched`) runs **once per token per layer**.
+* `gemv_hfq4g256_moe_gate_up_k8_indexed` / `..._moe_down_...` at 6144 — the
+  expert GEMMs are **GEMV**, indexed per token.
+* `7680 = 256 x 30` — the linear-attention kernels (`gated_delta_net_f32`,
+  `conv1d_silu_split_f32`, `fused_qk_l2_norm_scale_f32`, ...) over the 30 LA
+  layers. A delta-rule recurrence is sequential in position by construction, so
+  per-token here is expected and not a defect.
+
+**So the 35B's prefill cost is the MoE expert path running per token.** That is
+consistent with a known project fact: no MoE model had ever taken the batched
+prefill path, which needs per-expert AWQ scales.
+
+The FA fallback is not involved — which also explains why switching the KV
+format moved only 4.7%.
+
+### The work this points at
+
+Batched MoE prefill, on the GPU. Not an NPU offload: the dispatch count says the
+expert path is issuing one GEMV per token per layer where a batched grouped GEMM
+would issue one per layer. The MoE grouped kernels already exist
+(`gemm_hfq4g256_moe_grouped_wmma_k2` and siblings) — they are simply not on this
+path.
+
+### Superseded caveat: the diagnostic silence
+
+The `PER-TOKEN fallback` diagnostic did not fire in either 35B run, and it was
+unclear whether the instrument was live. It was: the run above emits a full
+histogram from the same `HIPFIRE_KERNEL_TRACE` mechanism. So the silence does
+mean `fa_batched_ok` was true — the 35B's FA layers take the batched path even
+under kvarn4, which is why the KV format barely moved it.
+
+The original wording, kept because the reasoning was right at the time: `forward_prefill_chunk` (`prefill_chunk.rs:1908`)
 contains the gate and `prefill_batch.rs:5003` calls it, so the path is reached;
 either `fa_batched_ok` was true under kvarn4 — which the gate's own logic says
 it should not be — or `kernel_trace::enabled()` was false in that daemon.
