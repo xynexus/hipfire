@@ -58,13 +58,15 @@ fn main() {
         w.dtype = DType::BF16;
         let x = gpu.upload_f32(&f32v(5, b * k), &[b, k]).unwrap();
         let y_ref = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
-        gpu.gemm_bf16_tiled_wmma(&w, &x, &y_ref, m, k, b, 4, 4).unwrap();
+        gpu.gemm_bf16_tiled_wmma(&w, &x, &y_ref, m, k, b, 4, 4)
+            .unwrap();
         gpu.device_synchronize().unwrap();
         let yr = gpu.download_f32(&y_ref).unwrap();
         let mut all = true;
         for (entry, mb, nb) in VARIANTS {
             let y = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
-            gpu.gemm_bf16_tiled_wmma_pf(entry, &w, &x, &y, m, k, b, mb, nb).unwrap();
+            gpu.gemm_bf16_tiled_wmma_pf(entry, &w, &x, &y, m, k, b, mb, nb)
+                .unwrap();
             gpu.device_synchronize().unwrap();
             let yv = gpu.download_f32(&y).unwrap();
             let mut mx = 0.0f32;
@@ -73,7 +75,10 @@ fn main() {
             }
             let ok = mx == 0.0;
             all &= ok;
-            println!("parity {entry:<24} max_abs={mx:.6} [{}]", if ok { "BIT-EXACT" } else { "DIFF!" });
+            println!(
+                "parity {entry:<24} max_abs={mx:.6} [{}]",
+                if ok { "BIT-EXACT" } else { "DIFF!" }
+            );
             gpu.free_tensor(y).ok();
         }
         gpu.free_tensor(y_ref).ok();
@@ -115,7 +120,10 @@ fn main() {
     }
     gpu.device_synchronize().unwrap();
 
-    println!("bf16 DiT GEMM prefetch sweep  arch={}  M={m} K={k} N={n}  peak=16.6 TFLOP/s", gpu.arch);
+    println!(
+        "bf16 DiT GEMM prefetch sweep  arch={}  M={m} K={k} N={n}  peak=16.6 TFLOP/s",
+        gpu.arch
+    );
     let gflop = 2.0 * m as f64 * k as f64 * n as f64 / 1e9;
     let base = med!(gpu.gemm_bf16_tiled_wmma(&w, &x, &y, m, k, n, 4, 4).unwrap());
     println!(
@@ -151,7 +159,10 @@ fn main() {
     // ---- the winning variant across ALL DiT shapes (a win on one shape is not
     // enough: the LDS kernel won on 3 shapes and regressed GQA) ----
     println!("\n--- pf_4x4_x across all Krea-2 DiT shapes (N={n}) ---");
-    println!("{:<30} {:>10} {:>10} {:>8}", "shape", "tiled ms", "pf_x ms", "speedup");
+    println!(
+        "{:<30} {:>10} {:>10} {:>8}",
+        "shape", "tiled ms", "pf_x ms", "speedup"
+    );
     for (label, sm, sk) in [
         ("attn q/o/gate M6144 K6144", 6144usize, 6144usize),
         ("attn kv (GQA)  M1536 K6144", 1536, 6144),
@@ -162,7 +173,9 @@ fn main() {
         sw.dtype = DType::BF16;
         let sx = gpu.upload_f32(&f32v(9, n * sk), &[n, sk]).unwrap();
         let sy = gpu.alloc_tensor(&[n * sm], DType::F32).unwrap();
-        let tb = med!(gpu.gemm_bf16_tiled_wmma(&sw, &sx, &sy, sm, sk, n, 4, 4).unwrap());
+        let tb = med!(gpu
+            .gemm_bf16_tiled_wmma(&sw, &sx, &sy, sm, sk, n, 4, 4)
+            .unwrap());
         let tp = med!(gpu
             .gemm_bf16_tiled_wmma_pf("gemm_bf16_pf_4x4_x", &sw, &sx, &sy, sm, sk, n, 4, 4)
             .unwrap());

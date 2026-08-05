@@ -140,9 +140,7 @@ impl Store {
             let mine = self.part_path_flat(rel);
             // If this run already has a partial for the same file, keep whichever
             // got further rather than clobbering progress either way.
-            let keep_existing = std::fs::metadata(&mine)
-                .map(|m| m.len())
-                .unwrap_or(0)
+            let keep_existing = std::fs::metadata(&mine).map(|m| m.len()).unwrap_or(0)
                 >= e.metadata().map(|m| m.len()).unwrap_or(0);
             if keep_existing {
                 let _ = std::fs::remove_file(e.path());

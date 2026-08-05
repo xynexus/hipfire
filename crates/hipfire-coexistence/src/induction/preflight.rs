@@ -63,7 +63,9 @@ pub fn resolve_snapshot(path: &Path) -> Result<PathBuf, String> {
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|candidate| candidate.join("config.json").is_file())
             .filter_map(|candidate| {
-                let mtime = std::fs::metadata(&candidate).and_then(|m| m.modified()).ok()?;
+                let mtime = std::fs::metadata(&candidate)
+                    .and_then(|m| m.modified())
+                    .ok()?;
                 Some((mtime, candidate))
             })
             .collect();
@@ -102,12 +104,20 @@ pub fn safetensors_index(model: &Path) -> Result<Vec<SafetensorTensor>, String> 
                 continue;
             }
             let entry = value.as_object().ok_or_else(|| {
-                format!("invalid safetensors index entry {name:?} in {}", shard.display())
+                format!(
+                    "invalid safetensors index entry {name:?} in {}",
+                    shard.display()
+                )
             })?;
             let shape: Vec<u64> = entry
                 .get("shape")
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| format!("invalid safetensors index entry {name:?} in {}", shard.display()))?
+                .ok_or_else(|| {
+                    format!(
+                        "invalid safetensors index entry {name:?} in {}",
+                        shard.display()
+                    )
+                })?
                 .iter()
                 .map(|d| d.as_u64())
                 .collect::<Option<Vec<u64>>>()
@@ -116,15 +126,20 @@ pub fn safetensors_index(model: &Path) -> Result<Vec<SafetensorTensor>, String> 
                 .get("data_offsets")
                 .and_then(|v| v.as_array())
                 .filter(|a| a.len() == 2)
-                .ok_or_else(|| format!("invalid data_offsets for {name:?} in {}", shard.display()))?;
-            let begin = offsets[0]
-                .as_u64()
-                .ok_or_else(|| format!("invalid data_offsets for {name:?} in {}", shard.display()))?;
-            let end = offsets[1]
-                .as_u64()
-                .ok_or_else(|| format!("invalid data_offsets for {name:?} in {}", shard.display()))?;
+                .ok_or_else(|| {
+                    format!("invalid data_offsets for {name:?} in {}", shard.display())
+                })?;
+            let begin = offsets[0].as_u64().ok_or_else(|| {
+                format!("invalid data_offsets for {name:?} in {}", shard.display())
+            })?;
+            let end = offsets[1].as_u64().ok_or_else(|| {
+                format!("invalid data_offsets for {name:?} in {}", shard.display())
+            })?;
             if end < begin {
-                return Err(format!("invalid data_offsets for {name:?} in {}", shard.display()));
+                return Err(format!(
+                    "invalid data_offsets for {name:?} in {}",
+                    shard.display()
+                ));
             }
             let dtype = entry
                 .get("dtype")
@@ -169,8 +184,12 @@ fn read_safetensors_header(shard: &Path) -> Result<Value, String> {
     let mut encoded = vec![0u8; header_len as usize];
     file.read_exact(&mut encoded)
         .map_err(|_| format!("truncated safetensors header: {}", shard.display()))?;
-    serde_json::from_slice(&encoded)
-        .map_err(|e| format!("invalid safetensors header json in {}: {e}", shard.display()))
+    serde_json::from_slice(&encoded).map_err(|e| {
+        format!(
+            "invalid safetensors header json in {}: {e}",
+            shard.display()
+        )
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -244,7 +263,9 @@ pub fn oq_block_bytes(quant_format: &str) -> Result<(f64, u64), String> {
         })
         .and_then(|rest| rest.parse::<f64>().ok());
     let requested = mixed.ok_or_else(|| {
-        format!("pass-two storage admission does not know the on-disk block size for {quant_format:?}")
+        format!(
+            "pass-two storage admission does not know the on-disk block size for {quant_format:?}"
+        )
     })?;
     let overlays = ((requested - 4.0625) * 16.0).round() as i64;
     if !(1..=62).contains(&overlays) || (4.0625 + overlays as f64 / 16.0 - requested).abs() > 1e-6 {
@@ -432,7 +453,8 @@ pub fn preflight_from_index(
             .map(|(k, _)| *k)
             .collect();
         missing.sort();
-        let both: HashSet<ExpertRole> = [ExpertRole::GateUp, ExpertRole::Down].into_iter().collect();
+        let both: HashSet<ExpertRole> =
+            [ExpertRole::GateUp, ExpertRole::Down].into_iter().collect();
         let mut incomplete: Vec<(i64, i64)> = matched_roles
             .iter()
             .filter(|(_, roles)| !roles.is_empty() && **roles != both)
@@ -470,7 +492,10 @@ pub fn preflight_from_index(
     let matched_experts = matched_roles
         .values()
         .filter(|roles| {
-            **roles == [ExpertRole::GateUp, ExpertRole::Down].into_iter().collect::<HashSet<_>>()
+            **roles
+                == [ExpertRole::GateUp, ExpertRole::Down]
+                    .into_iter()
+                    .collect::<HashSet<_>>()
         })
         .count() as u64;
 
@@ -568,7 +593,11 @@ mod tests {
             (873438784, 258, false, 880262718),
         ];
         for &(numel, block, q8, expect) in cases {
-            assert_eq!(quantized_tensor_bytes(numel, block, q8), expect, "{numel},{block},{q8}");
+            assert_eq!(
+                quantized_tensor_bytes(numel, block, q8),
+                expect,
+                "{numel},{block},{q8}"
+            );
         }
     }
 
@@ -594,9 +623,15 @@ mod tests {
             routed_expert_identity("model.layers.0.mlp.experts.w2"),
             Some((0, None, ExpertRole::Down))
         );
-        assert_eq!(routed_expert_identity("model.layers.0.self_attn.q_proj.weight"), None);
+        assert_eq!(
+            routed_expert_identity("model.layers.0.self_attn.q_proj.weight"),
+            None
+        );
         assert_eq!(routed_expert_identity("model.embed_tokens.weight"), None);
-        assert_eq!(routed_expert_identity("model.layers.2.mlp.experts.5.foo.weight"), None);
+        assert_eq!(
+            routed_expert_identity("model.layers.2.mlp.experts.5.foo.weight"),
+            None
+        );
     }
 
     fn fake(name: &str, shape: &[u64]) -> SafetensorTensor {
@@ -621,12 +656,43 @@ mod tests {
             fake("model.embed_tokens.weight", &[1000, 512]),
             fake("model.layers.0.input_layernorm.weight", &[512]),
         ];
-        let calibration = json!({"metadata": {"preserve_high_precision": [{"layer": 0, "expert": 3}]}});
+        let calibration =
+            json!({"metadata": {"preserve_high_precision": [{"layer": 0, "expert": 3}]}});
         let expect: &[(&str, u64, u64, u64, u64, u64, u64, u64, u64)] = &[
             // fmt, nominal, mixed, align, artifact, required, preserve_out, preserve_nominal, delta
-            ("oq4", 1888512, 2279680, 77824, 19134720, 68738611456, 524288, 133120, 391168),
-            ("oq8", 2937088, 3197184, 77824, 20052224, 68739528960, 524288, 264192, 260096),
-            ("oq4.25++", 1937664, 2322688, 77824, 19177728, 68738654464, 524288, 139264, 385024),
+            (
+                "oq4",
+                1888512,
+                2279680,
+                77824,
+                19134720,
+                68738611456,
+                524288,
+                133120,
+                391168,
+            ),
+            (
+                "oq8",
+                2937088,
+                3197184,
+                77824,
+                20052224,
+                68739528960,
+                524288,
+                264192,
+                260096,
+            ),
+            (
+                "oq4.25++",
+                1937664,
+                2322688,
+                77824,
+                19177728,
+                68738654464,
+                524288,
+                139264,
+                385024,
+            ),
         ];
         for &(fmt, nominal, mixed, align, artifact, required, p_out, p_nom, delta) in expect {
             let pf = preflight_from_index(
@@ -642,13 +708,19 @@ mod tests {
             assert_eq!(e["nominal_payload_bytes"], nominal, "{fmt} nominal");
             assert_eq!(e["mixed_payload_bytes"], mixed, "{fmt} mixed");
             assert_eq!(e["tensor_alignment_bytes"], align, "{fmt} align");
-            assert_eq!(e["completed_artifact_estimate_bytes"], artifact, "{fmt} artifact");
+            assert_eq!(
+                e["completed_artifact_estimate_bytes"], artifact,
+                "{fmt} artifact"
+            );
             assert_eq!(e["required_free_bytes"], required, "{fmt} required");
             let p = &pf["preserve_high_precision"];
             assert_eq!(p["requested_experts"], 1);
             assert_eq!(p["matched_experts"], 1, "{fmt} matched");
             assert_eq!(p["output_bytes"], p_out, "{fmt} preserve out");
-            assert_eq!(p["nominal_quantized_bytes"], p_nom, "{fmt} preserve nominal");
+            assert_eq!(
+                p["nominal_quantized_bytes"], p_nom,
+                "{fmt} preserve nominal"
+            );
             assert_eq!(p["delta_bytes"], delta, "{fmt} preserve delta");
             assert_eq!(pf["source"]["tensors"], 5);
             assert_eq!(pf["source"]["parameters"], 2871808);
@@ -683,7 +755,10 @@ mod tests {
             assert_eq!(e["nominal_payload_bytes"], 928204928u64, "{fmt}");
             assert_eq!(e["mixed_payload_bytes"], 928204928u64, "{fmt}");
             assert_eq!(e["tensor_alignment_bytes"], 1998848u64, "{fmt}");
-            assert_eq!(e["completed_artifact_estimate_bytes"], 946980992u64, "{fmt}");
+            assert_eq!(
+                e["completed_artifact_estimate_bytes"], 946980992u64,
+                "{fmt}"
+            );
             assert_eq!(e["required_free_bytes"], 69666457728u64, "{fmt}");
         }
     }

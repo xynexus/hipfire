@@ -162,10 +162,7 @@ impl Recipe {
         for (key, value) in &self.fields {
             map.insert(key.clone(), value.clone());
         }
-        map.insert(
-            "recipe_fingerprint".into(),
-            json!(self.recipe_fingerprint),
-        );
+        map.insert("recipe_fingerprint".into(), json!(self.recipe_fingerprint));
         map
     }
 }

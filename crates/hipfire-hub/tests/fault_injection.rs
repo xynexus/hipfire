@@ -285,7 +285,10 @@ async fn dropped_connection_resumes_and_verifies() {
 
     // First attempt drops partway and must keep the partial for resume.
     let first = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store).await;
-    assert!(first.is_err(), "the dropped attempt should not have succeeded");
+    assert!(
+        first.is_err(),
+        "the dropped attempt should not have succeeded"
+    );
     let part = fx.store.part_path(&file.path);
     let carried = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     assert!(
@@ -395,7 +398,6 @@ fn stale_parts_are_swept_without_touching_blobs() {
     assert!(!blobs.join(".model.safetensors.0.part").exists());
 }
 
-
 /// A partial left by a process that has died must be picked up, not discarded.
 ///
 /// This is the gap the suite had: every other case here exercises a transport
@@ -416,12 +418,18 @@ fn a_dead_runs_partial_is_adopted_rather_than_discarded() {
     std::fs::write(&orphan, vec![7u8; 8192]).unwrap();
 
     let adopted = fx.store.adopt_orphan_parts().expect("adopt");
-    assert_eq!(adopted, 8192, "the interrupted run's progress was not recovered");
+    assert_eq!(
+        adopted, 8192,
+        "the interrupted run's progress was not recovered"
+    );
 
     let mine = fx.store.part_path("model.safetensors");
     assert!(mine.exists(), "the partial was not claimed by this run");
     assert_eq!(std::fs::read(&mine).unwrap().len(), 8192);
-    assert!(!orphan.exists(), "the orphan was left behind as well as copied");
+    assert!(
+        !orphan.exists(),
+        "the orphan was left behind as well as copied"
+    );
 }
 
 /// A partial belonging to a *live* process must be left strictly alone, or the
@@ -457,7 +465,11 @@ fn adoption_keeps_whichever_partial_got_further() {
 
     let mine = fx.store.part_path("model.safetensors");
     std::fs::write(&mine, vec![1u8; 9000]).unwrap();
-    std::fs::write(blobs.join(".model.safetensors.999999.part"), vec![2u8; 1000]).unwrap();
+    std::fs::write(
+        blobs.join(".model.safetensors.999999.part"),
+        vec![2u8; 1000],
+    )
+    .unwrap();
 
     fx.store.adopt_orphan_parts().expect("adopt");
     assert_eq!(

@@ -53,7 +53,9 @@ fn main() {
     let model_path = args
         .next()
         .expect("usage: perplexity_batched <model> <corpus> [--ctx N] [--warmup N] [--offset N] [--chunks N] [--kv-mode q8|f32] [--dump-ref f] [--kld-ref f] [--top-k N]");
-    let corpus_path = args.next().expect("usage: perplexity_batched <model> <corpus> ...");
+    let corpus_path = args
+        .next()
+        .expect("usage: perplexity_batched <model> <corpus> ...");
 
     let mut ctx_len: usize = 512;
     let mut warmup: usize = 8;
@@ -92,13 +94,18 @@ fn main() {
             h.scored_per_chunk, h.top_k, h.n_chunk, h.ref_kv_mode
         );
     }
-    assert!(ctx_len > warmup + 4, "ctx must exceed warmup by enough to score");
+    assert!(
+        ctx_len > warmup + 4,
+        "ctx must exceed warmup by enough to score"
+    );
     let act_bits =
         std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").unwrap_or_else(|_| "(default)".into());
     let clip = std::env::var("HIPFIRE_OQ4_ACT_CLIP").as_deref() == Ok("1");
     eprintln!("BATCHED prefill KLD — ACT_BITS={act_bits} clip={clip} kv={kv_mode} chunks={chunks} ctx={ctx_len}");
     if kv_mode == "f32" {
-        eprintln!("WARNING: f32 KV → per-token fallback (W4A16); use q8 for a real int4-act measurement.");
+        eprintln!(
+            "WARNING: f32 KV → per-token fallback (W4A16); use q8 for a real int4-act measurement."
+        );
     }
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
@@ -127,8 +134,7 @@ fn main() {
     // n rows (post-output-norm), so the lm-head below must NOT re-norm.
     let hidden = gpu.alloc_tensor(&[ctx_len * dim], DType::F32).unwrap();
 
-    let kld_records: Option<Vec<(f32, Vec<(u32, f32)>)>> =
-        kld_ref.as_ref().map(|p| read_kldref(p));
+    let kld_records: Option<Vec<(f32, Vec<(u32, f32)>)>> = kld_ref.as_ref().map(|p| read_kldref(p));
     let mut ref_records: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
     let mut total_nll: f64 = 0.0;
     let mut scored: usize = 0;
@@ -168,8 +174,23 @@ fn main() {
         let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
         let tp = Instant::now();
         qwen35::forward_prefill_batch_with_pbs_opts(
-            &mut gpu, &weights, &config, &window, 0, &mut kv, &mut dn, &scratch,
-            None, Some(&hidden), None, None, None, None, None, false, false,
+            &mut gpu,
+            &weights,
+            &config,
+            &window,
+            0,
+            &mut kv,
+            &mut dn,
+            &scratch,
+            None,
+            Some(&hidden),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
         )
         .expect("forward_prefill_batch");
         gpu.device_synchronize().unwrap();
@@ -195,8 +216,11 @@ fn main() {
 
             if dump_ref.is_some() {
                 let red = top_k_log_softmax(&logits, top_k);
-                let topk: Vec<(u32, f32)> =
-                    red.indices.iter().map(|&i| (i, logits[i as usize])).collect();
+                let topk: Vec<(u32, f32)> = red
+                    .indices
+                    .iter()
+                    .map(|&i| (i, logits[i as usize]))
+                    .collect();
                 ref_records.push((lz as f32, topk));
             }
             if let Some(h) = hfqm.as_ref() {
@@ -269,7 +293,11 @@ fn main() {
         done_chunks += 1;
     }
 
-    let avg_nll = if scored > 0 { total_nll / scored as f64 } else { 0.0 };
+    let avg_nll = if scored > 0 {
+        total_nll / scored as f64
+    } else {
+        0.0
+    };
     println!();
     println!("Model:    {model_path}");
     println!("Act bits: {act_bits}  clip: {clip}  kv: {kv_mode}");
@@ -286,7 +314,10 @@ fn main() {
     if (kld_records.is_some() || hfqm.is_some()) && kld_scored > 0 {
         let mean_kld = total_kld / kld_scored as f64;
         let what = match hfqm.as_ref() {
-            Some(h) => format!("ABSOLUTE vs {} ({})", h.base_model_id, h.reference_precision),
+            Some(h) => format!(
+                "ABSOLUTE vs {} ({})",
+                h.base_model_id, h.reference_precision
+            ),
             None => "act-precision penalty".to_string(),
         };
         println!(
@@ -319,7 +350,10 @@ fn main() {
     }
     if let Some(path) = dump_ref {
         write_kldref(&path, &ref_records, top_k);
-        println!("Wrote KLD reference: {path} ({} positions)", ref_records.len());
+        println!(
+            "Wrote KLD reference: {path} ({} positions)",
+            ref_records.len()
+        );
     }
 }
 
@@ -364,7 +398,11 @@ fn read_hfqm_ref(path: &str) -> HfqmRef {
     let n_chunk = usize_of("n_chunk");
     let scored_per_chunk = usize_of("scored_per_chunk");
     let top_k = usize_of("top_k");
-    let blob = |name: &str| package.blob_data(name).unwrap_or_else(|| panic!("missing {name}"));
+    let blob = |name: &str| {
+        package
+            .blob_data(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
     let u32s = |b: &[u8]| -> Vec<u32> {
         b.chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))

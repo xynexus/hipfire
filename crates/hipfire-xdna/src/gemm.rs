@@ -46,7 +46,7 @@ pub struct NpuGemm {
     // PIPE-deep ring: with resident weights the only thing stopping N dispatches being
     // in flight is A/C being overwritten under a running one, so both are ringed.
     a_buf: Vec<DeviceBuffer>, // rounds * MT*KCHUNK tiles of MR*MK int8 (broadcast to cores)
-    w_buf: DeviceBuffer, // groups * rounds * NT*KCHUNK tiles of MK*MN int4 (2/byte)
+    w_buf: DeviceBuffer,      // groups * rounds * NT*KCHUNK tiles of MK*MN int4 (2/byte)
     c_buf: Vec<DeviceBuffer>, // one dispatch writes while the host reads an earlier
                               // one back (pipelined run_packed / run_resident).
 }
@@ -93,7 +93,10 @@ impl NpuGemm {
         nb: usize,
         rounds: usize,
     ) -> Result<Self, XdnaError> {
-        assert!(rounds >= 1 && nb >= 1 && groups % nb == 0, "groups must be cols*nb");
+        assert!(
+            rounds >= 1 && nb >= 1 && groups % nb == 0,
+            "groups must be cols*nb"
+        );
         let kernel = NpuKernel::load(xclbin, insts)?;
         let asz = rounds * mt * kchunk * MR * MK;
         let mut a_buf = Vec::with_capacity(PIPE);
@@ -184,7 +187,12 @@ impl NpuGemm {
         let (bn, bk) = (self.block_n(), self.block_k());
         assert!(k % bk == 0 && n % bn == 0, "K/N must tile evenly");
         let (nks, nns) = (k / bk, n / bn);
-        let (cols, rounds, nb, sb) = (self.groups / self.nb, self.rounds, self.nb, self.slab_bytes());
+        let (cols, rounds, nb, sb) = (
+            self.groups / self.nb,
+            self.rounds,
+            self.nb,
+            self.slab_bytes(),
+        );
         let wl = self.packed_stride();
         let mut block = vec![0u8; wl];
         let mut w_sub = vec![0i8; bk * bn];
@@ -242,7 +250,10 @@ impl NpuGemm {
         // makes its C safe to read. This is what moves decode from submit-latency-bound
         // to weight-streaming-bound.
         let mut inflight: std::collections::VecDeque<(u64, usize)> = Default::default();
-        let retire = |g: &Self, q: &mut std::collections::VecDeque<(u64, usize)>, c: &mut [i32]| -> Result<(), XdnaError> {
+        let retire = |g: &Self,
+                      q: &mut std::collections::VecDeque<(u64, usize)>,
+                      c: &mut [i32]|
+         -> Result<(), XdnaError> {
             if let Some((pseq, pi)) = q.pop_front() {
                 g.kernel.wait(pseq)?;
                 g.kernel.sync_output(&g.c_buf[pi % PIPE])?;
@@ -339,7 +350,7 @@ impl NpuGemm {
         assert_eq!(c.len(), bm * n, "C shape");
 
         self.load_a_slot(a, 0); // row-major A blocks -> a_buf (kernel tensor-streams the tiling)
-                        // W -> per-group tile-major + int4 pack, then replicated per round.
+                                // W -> per-group tile-major + int4 pack, then replicated per round.
         let mut block = vec![0u8; self.packed_stride()];
         self.pack_w_slab(w_int4, &mut block);
         self.fill_w_replicated(&block);

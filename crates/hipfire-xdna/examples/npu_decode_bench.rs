@@ -29,14 +29,21 @@ fn main() {
         let i = std::fs::read(format!("{dir}/insts.bin")).expect("insts");
         let mut gemm = NpuGemm::load_rounds(&x, &i, mt, 4, kc, g, nb, rounds).expect("load");
         let (bm, bn, bk) = (gemm.block_m(), gemm.block_n(), gemm.block_k());
-        assert!(n % bn == 0 && k % bk == 0, "K/N must tile (block {bm}x{bn}x{bk})");
+        assert!(
+            n % bn == 0 && k % bk == 0,
+            "K/N must tile (block {bm}x{bn}x{bk})"
+        );
 
         let rnd = |i: usize| -> i8 {
-            let s = (i as u32).wrapping_mul(2654435761).wrapping_add(0x9e37_79b9);
+            let s = (i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(0x9e37_79b9);
             (((s >> 13) & 0xf) as i32 - 8) as i8
         };
         // One token, padded to the kernel's M block. Only row 0 is the real activation.
-        let av: Vec<i8> = (0..bm * k).map(|i| if i < k { rnd(i) } else { 0 }).collect();
+        let av: Vec<i8> = (0..bm * k)
+            .map(|i| if i < k { rnd(i) } else { 0 })
+            .collect();
         let wv: Vec<i8> = (0..k * n).map(|i| rnd(7_777_777 + i)).collect();
         let mut cv = vec![0i32; bm * n];
 
@@ -45,10 +52,13 @@ fn main() {
         let up_ms = tup.elapsed().as_secs_f64() * 1e3;
         let w_bytes = k * n / 2; // int4
 
-        gemm.run_resident(bm, k, n, &av, &weights, &mut cv).expect("run");
+        gemm.run_resident(bm, k, n, &av, &weights, &mut cv)
+            .expect("run");
         let mut bad = 0usize;
         for nn in 0..n {
-            let acc: i32 = (0..k).map(|kk| av[kk] as i32 * wv[kk * n + nn] as i32).sum();
+            let acc: i32 = (0..k)
+                .map(|kk| av[kk] as i32 * wv[kk * n + nn] as i32)
+                .sum();
             if cv[nn] != acc {
                 bad += 1;
             }
@@ -56,7 +66,8 @@ fn main() {
 
         let t = Instant::now();
         for _ in 0..iters {
-            gemm.run_resident(bm, k, n, &av, &weights, &mut cv).expect("run");
+            gemm.run_resident(bm, k, n, &av, &weights, &mut cv)
+                .expect("run");
         }
         let per = t.elapsed().as_secs_f64() / iters as f64;
         println!(
@@ -69,7 +80,11 @@ fn main() {
             "  {:.3} ms/token-linear  =>  {:.1} GB/s W stream  ({})",
             per * 1e3,
             w_bytes as f64 / per / 1e9,
-            if bad == 0 { "row 0 correct".to_string() } else { format!("{bad} MISMATCHES") }
+            if bad == 0 {
+                "row 0 correct".to_string()
+            } else {
+                format!("{bad} MISMATCHES")
+            }
         );
     }
 }

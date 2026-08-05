@@ -40,8 +40,14 @@ fn main() {
     let copy_gbps = med_gbps!(gpu.copy_d2d(&b, &a, n * 4).unwrap(), 2.0 * bytes_buf);
     let add_gbps = med_gbps!(gpu.add_inplace_f32(&a, &b).unwrap(), 3.0 * bytes_buf);
 
-    println!("achievable DRAM bandwidth  arch={}  buf=256MiB  iters={iters}", gpu.arch);
+    println!(
+        "achievable DRAM bandwidth  arch={}  buf=256MiB  iters={iters}",
+        gpu.arch
+    );
     println!("  copy_d2d (2 B/elem):         {copy_gbps:7.1} GB/s");
     println!("  add_inplace_f32 (3 B/elem):  {add_gbps:7.1} GB/s");
-    println!("  peak achieved:               {:7.1} GB/s", copy_gbps.max(add_gbps));
+    println!(
+        "  peak achieved:               {:7.1} GB/s",
+        copy_gbps.max(add_gbps)
+    );
 }

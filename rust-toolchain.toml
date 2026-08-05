@@ -1,0 +1,12 @@
+# Pin the toolchain so formatting and lints are reproducible across hosts.
+#
+# rustfmt's output changes between releases. Without a pin, two machines on
+# different stables reformat each other's code and produce churn-only diffs that
+# conflict like real changes — and CI drifts independently, since ci.yml uses
+# `dtolnay/rust-toolchain@stable` rather than a fixed version.
+#
+# Bumping this is deliberate: expect a formatting pass in the same commit, so
+# the reformat lands once rather than arriving piecemeal in unrelated PRs.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
