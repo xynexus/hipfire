@@ -232,6 +232,34 @@ Sequence, cheapest-first:
    And both routes are individually valid, so the tokens still match while the
    logits do not.
 
+   **ROOT CAUSE, with the kernels named.** Tracing every oq8 dispatch entry
+   point shows the two modes run disjoint kernel sets on the same probe:
+
+   | mode | kernels actually invoked |
+   |---|---|
+   | expanded | `fused_qkvza_oq8_gemv`, `fused_gate_up_oq8_gemv`, `gemv_oq8_grouped` |
+   | compact  | `gemm_oq_compact_grouped_wmma` only |
+
+   `OqCompactG256` has no fused equivalents, so where oq8 computes Q/K/V/Z/A in
+   ONE fused kernel and gate+up in another, compact issues separate unfused
+   GEMMs. Identical semantics, different accumulation and rounding — precisely a
+   small logit delta with unchanged argmax. It is also why compact costs ~31%:
+   unfused means more launches and more activation traffic, so the divergence
+   and the slowdown are the SAME gap, and closing it fixes both.
+
+   One sting for the parity oracles: the expanded path uses `gemv_oq8_grouped`,
+   NOT `gemm_oq8_grouped_wmma`. Both oracles compare compact against
+   `gemm_oq8_grouped_wmma` — a kernel the model never invokes for these ops. They
+   are still valid as decode-correctness checks, but they were never testing the
+   comparison that the in-model divergence actually turns on. Any future oracle
+   should assert against the kernel the arch code really dispatches.
+
+   The fix is therefore not "find the rejecting admission" but "give compact the
+   fused arms": compact variants of `fused_qkvza_oq8_*` and `fused_gate_up_oq8_*`
+   (plus `gemv_oq8_grouped`), or an expand-on-use at those sites. Until then the
+   flag stays opt-in — the difference is now understood and benign-looking, but
+   it is a real numerical change, not noise.
+
    Next: find the admission that rejects `OqCompactG256` and sends it to the
    serial path. `dense_prefill_weight_unsupported_reason` accepts the dtype, so
    the rejection is elsewhere — and closing it is what makes the flag
