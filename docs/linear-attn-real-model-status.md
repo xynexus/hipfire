@@ -22,6 +22,19 @@ below attributes to "the 35B's layer math" was the walk's output projected
 through the wrong matrix — the 35B's `lm_head` correlates with its own
 embedding at 0.025. The layer math was never wrong.
 
+**Regression fixture.** `/srv/hipfire/fixtures/qwen3_5_moe-tiny-untied` is
+`qwen3_5_moe-tiny` (already GQA, `n_k=1 < n_v=2`) plus a deliberately unrelated
+`lm_head.weight` and `tie_word_embeddings: false`. Its head correlates with its
+own embedding at **-0.0004**, so scoring through the embedding cannot give a
+right answer by luck — the counterfactual is guaranteed by construction. Built
+through the same pipeline it reproduces at **cos 0.999985**, in seconds rather
+than the ten minutes the 19 GB artifact takes. Any regression of the tied/untied
+handling shows up here first:
+
+    hipfire-quantize --input <fixture> --output bf16.hfq --format bf16
+    dump_logits_qwen35 bf16.hfq ref_4.f32 --prefill 4
+    HIPFIRE_GH_ORACLE_DIR=<dir> gamma_hybrid bf16.hfq arange 4
+
 What the hunt did leave behind, all of it real coverage that did not exist
 before: the linear_attn cross-checks now run at the model's true geometry
 (32 value / 16 key heads, h=2048) instead of a 2-head toy; the recurrence is
