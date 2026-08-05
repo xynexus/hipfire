@@ -148,3 +148,32 @@ is not refuted there.
 `bench_prefill` should either call the production prefill path for arch 0/1, or
 stop reporting `pp512 t/s` for arches where it runs a warm-pass. Tracked as the
 motivating case in `~/measurement-integrity-goal.md`.
+
+## Lead: the qwen35 batched prefill is GEMV-dominated
+
+Traced `bench_prefill` on `Qwen3.5-0.8B--mq4` (qwen35 family, so the arm runs
+the real `forward_prefill_batch`), 256 tokens — one chunk, since
+`PREFILL_MAX_BATCH = 256`:
+
+| kernel | dispatches |
+|---|---|
+| `gemv_hfq4g256_residual` | **4608** |
+| `gemm_hfq4g256_residual_mmq_full_set` | 62 |
+| `gemm_hfq4g256_residual_mmq` | 44 |
+
+32736 dispatches total across 31 kernels for 256 tokens — **128 per token**.
+
+GEMMs are dispatched, so the path is not wholly per-position. But GEMV outnumbers
+GEMM **43:1** inside a call that batches the entire prompt in one chunk. Some
+projections are taking a batched GEMM and most are not.
+
+That is worth chasing before any NPU offload: the 35B's ~8x prefill gap against
+FLM is measured on this same path, and a GEMV-dominated "batched" prefill is a
+GPU-side inefficiency, not evidence that the work belongs on the NPU. If most
+linears can be moved onto the existing GEMM kernels, the gap may close without
+new hardware.
+
+Next: identify which projections fall back and why — the LA (linear-attention)
+QKVZA/gate_up/wo/w_down set in `forward_prefill_chunk` is where the counts point.
+`HIPFIRE_KERNEL_TRACE=1` plus the per-arm dispatch counts is enough to attribute
+them without a profiler.
