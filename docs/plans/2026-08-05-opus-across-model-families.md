@@ -47,6 +47,51 @@ becoming real baselines rather than skips.
 **Do this first** — it is the only phase where a family gets Opus *at all*, and
 it is bounded by two written-down causes.
 
+### Phase 1 status (2026-08-05)
+
+**deepseek4_compressed — DONE.** `SourcePrecision` is a property of the tensor,
+declared by the arch's -spec, but the quantizer gated it on
+`use_deepseek4_source_precision`, so generic OQ builds quantized the MLA
+compressor/indexer streams anyway. Honouring the class for deepseek4 whatever the
+output format unblocks all 7 Opus cells; values track plain deepseek4 closely with
+the expected ordering intact.
+
+**Scoping finding, for whoever widens this.** `precision_class_via_ingest`
+consults EVERY arch's spec, so honouring it unconditionally reaches far past this
+blocker. Measured on gfx1103:
+
+| arch | effect of honouring SourcePrecision for all formats |
+|---|---|
+| gemma4_ple | **all 9 cells improved** — hfq4 -69%, oq8+/oq8++ -39%, rest -1.5..-9% |
+| minimax | **all 7 Opus cells regressed** — oq8 37x worse, oq4 2.7x |
+
+The gemma4 win is real and applies to magnum formats too, so this bug was never
+Opus-specific. But a higher-precision artifact scoring *worse* on minimax points
+at something there mishandling unquantized tensors rather than precision hurting.
+Get that cause before widening.
+
+**deepseek4_mtp — still blocked, and not mechanical.** Three things stack:
+`main.rs` skips `mtp.*` for non-deepseek4 formats; `arch.rs:544` has
+`mtp_layer: None ("Phase 5 work")` so the loader never wires MTP from the base
+artifact; and MTP is designed to ship as a separate `.mtp-addon.hfq` found by
+filename convention. Whether an OQ artifact should quantize MTP or keep it at
+source is a judgement about acceptance rate — `deepseek4-mtp-precise` exists
+because "the V3 paper's 60-80% acceptance benchmark assumes weights at training
+precision". Needs a decision plus loader Phase 5, not a quantizer tweak.
+
+### Inherited breakage on master (not from this work)
+
+Both verified against pristine `origin/master`, so neither should be attributed
+to Opus work that follows:
+
+- **minimax's 7 Opus cells fail** with identical numbers on master. Any full
+  `tiny-quant-gate.sh` run is red until fixed; scope with
+  `HIPFIRE_TINYQUANT_FAMILIES` to get a clean signal meanwhile.
+- **`tests/no-gpu-ci.sh` is red** — 54 ruff F821 errors in
+  `tools/qwen35_full_forward_oracle.py` (from `2f64effaa`), which has a shebang
+  and a docstring but no imports at all. Left alone: it looks like in-flight
+  work, and the fix is a guess at its author's intent.
+
 ---
 
 ## Phase 2 — Compact residency beyond qwen35 dense
