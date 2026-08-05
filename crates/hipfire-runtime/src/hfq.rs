@@ -2697,33 +2697,61 @@ pub fn load_weights_hfq(
         let (embd_t, data) = hfq.tensor_data_cow("model.embed_tokens.weight").unwrap();
         let data = data.as_ref();
         let n = config.vocab_size * config.dim;
-        let f32_data: Vec<f32> = match embd_t.quant_type {
-            3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block
-            2 => data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            16 => data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            _ => data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-        };
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-        };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
+        // A BF16 embedding is uploaded AS bf16 rather than widened.
+        //
+        // Widening recovers nothing — the stored value is already bf16, so f32
+        // is exact re-encoding — while doubling the resident head and the
+        // per-token read: 1050.7 MB against 525.3 MB at 128256 x 2048. It also
+        // costs a ~1 GB host conversion at load, skipped entirely below.
+        //
+        // It used to be the right trade regardless, because BF16 had no GEMV
+        // entry and `weight_gemv` fell back to a batch-1 WMMA GEMM: 14.6 ms
+        // against `gemv_f32`'s 5.2 ms. `gemv_bf16_xf32` and its dispatch-family
+        // registration remove that — bf16 weight against an f32 activation runs
+        // in 3.2 ms and matches the widened path to 6.7e-8, f32 accumulation
+        // noise. The widening is now pure cost.
+        //
+        // Only BF16 changes. Q8F16 / F16 / F32 embeddings still decode to f32,
+        // their stored form not being one the GEMV path takes directly. The
+        // embedding GATHER is untouched: `token_embd` is its own buffer, loaded
+        // above.
+        if embd_t.quant_type == 16 {
+            let mut buf = gpu.upload_raw(data, &[config.vocab_size, config.dim])?;
+            buf.dtype = DType::BF16;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        } else {
+            let f32_data: Vec<f32> = match embd_t.quant_type {
+                3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block
+                2 => data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+            };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
         }
     };
 

@@ -232,38 +232,53 @@ here would take, and the only way to tell was to run the old code.
 generation across all three arrangements (WMMA special case, gemv_bf16_xf32
 special case, gemv_bf16_xf32 via the family) at 24.65 / 24.68 tok/s.
 
-## Attempted and reverted: keeping the tied head BF16
+## Landed: the tied head stays BF16
 
-The loader change — upload a BF16 embedding as bf16 instead of widening — was
-written and then reverted, because it could not be shown to execute.
+`hfq.rs` uploads a BF16 embedding as bf16 instead of widening it. Measured on
+`Llama-3.2-1B-Instruct--oq4++`:
 
-`hipfire bench` on `Llama-3.2-1B-Instruct--oq4++` gave **tg128 76.09 t/s against
-76.07 before**: no change, where a 1050.7 -> 525.3 MB head at 1.61x the kernel
-speed should have been plainly visible. Rather than accept a null result, a
-diagnostic was added to both branches of the tied path. **Neither ever fired**,
-while `eprintln!("  loading output...")` two lines above them did.
+| metric | F32 head | BF16 head | change |
+|---|---|---|---|
+| tg128 | 76.07 t/s | **89.95 t/s** | **+18.2%** |
+| pp512 | 80.83 t/s | **96.67 t/s** | **+19.6%** |
+| ttft | 55.7 ms | 54.8 ms | -1.6% |
+| resident head | 1050.7 MB | 525.3 MB | half |
 
-That is not a possible state for one binary, and chasing it burned the rest of
-the session's budget:
+Generation is byte-identical, as `gemv_bf16_xf32`'s 6.7e-8 agreement predicts.
+Only BF16 embeddings change; Q8F16 / F16 / F32 still decode to f32, and the
+embedding GATHER is untouched (`token_embd` is its own buffer).
 
-* `cargo build -p hipfire-runtime` builds the LIBRARY. The `hipfire` binary
-  lives in `hipfire-cli` and needs `--bin hipfire`, so the first several
-  measurements ran against a stale binary.
-* Rebuilding the binary did not fix it either, and `hipfire stop` reports
-  `no /home/sadara/.hipfire/serve.pid` while `hipfire chat` had separately
-  refused with `FATAL: hipfire daemon already running (PID ...)`. So daemon
-  lifetime is not fully described by the pidfile, and which binary serves a
-  given `chat` is not obvious from outside.
+Per-token traffic on llama3.2:1b goes from 1545.5 MB to 1020.1 MB — **2.00x
+FLM's 772.3 MB down to 1.32x**.
 
-**Nothing here says the change is wrong** — only that this session could not
-demonstrate it running, and an unproven change to a hot load path is worse than
-no change. What it does establish is that the measurement loop for loader edits
-is unreliable in a way that silently returns "no difference", which is exactly
-the failure mode that makes a bad change look safe.
+### The measurement trap that hid this for a whole cycle
 
-Anyone picking this up: verify a diagnostic in the edited branch actually
-appears before trusting any number. The `gemv_bf16_xf32` work it depends on is
-committed and separately verified.
+The first attempt at this change measured **76.09 t/s against 76.07** — a
+perfect null — and was reverted as unproven. The change was fine; the
+measurement was not.
+
+**`hipfire chat` and `hipfire bench` are served by a separate `hipfire-daemon`
+binary.** So:
+
+    cargo build -p hipfire-runtime      # library only — daemon unchanged
+    cargo build --bin hipfire           # CLI only    — daemon unchanged
+    cargo build --bin hipfire-daemon    # what actually matters
+
+Binary timestamps are the tell: `hipfire` at 19:36 against `hipfire-daemon` at
+19:24 while "the change did nothing". Rebuilding the daemon turned the same edit
+from +0.03% into +18.2%.
+
+Two things make this hard to notice. A diagnostic `eprintln!` added to the
+edited branch does not appear — but neither does anything else new, so it reads
+as "branch not taken" rather than "stale binary", which is the wrong diagnosis
+and sends you looking at the code. And `hipfire status` reports `offline` /
+`no serve.pid` even with a live daemon, because the CLI daemon's singleton is a
+flock on `~/.hipfire/daemon.pid`, a different file from the HTTP server's
+`serve.pid`. That pidfile also holds a stale line after the writer dies, so the
+PID it names may not exist.
+
+**Rule: for anything reached through `chat`/`bench`, build the workspace or the
+daemon explicitly, and confirm a diagnostic fires before trusting a number.**
 
 ## Ordering
 
