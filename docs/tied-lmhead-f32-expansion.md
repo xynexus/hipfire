@@ -23,6 +23,31 @@ largest single tensor.
 That is the measured flat TTFT: 59.0 / 60.2 / 56.6 ms for unset / `q4` / `q2`.
 The coarse build never runs because the branch is never taken.
 
+### Verified, both halves
+
+The claim needs two things to be true, and both are directly observed rather
+than inferred:
+
+* **The artifact takes the tied branch.** `hipfire inspect --tensors` on
+  `Llama-3.2-1B-Instruct--oq4++.hfq` matches `lm_head` **zero** times. The only
+  head-shaped tensors are `model.embed_tokens.weight` (BF16) and
+  `model.embed_tokens.coarse.weight` (CoarseQ4Row). So
+  `hfq.find_tensor("lm_head.weight").is_some()` is false and the `else` branch
+  runs.
+* **That branch uploads F32.** Both sites build a `Vec<f32>` and construct
+  `WeightTensor { gpu_dtype: DType::F32 }` — there is no conditional inside them.
+
+Two measurement routes that do NOT work on this box, recorded so they are not
+retried:
+
+* **VRAM via `/sys/class/drm/card1/device/mem_info_vram_used`** stays flat at
+  ~156 MiB through a full load. gfx1151 is a UMA APU; weights do not show up as
+  discrete VRAM.
+* **`/usr/bin/time -v` on `hipfire chat`** reports 10.5 MB peak RSS. The CLI
+  hands off to a daemon it spawns, so the weights are never in the measured
+  process. Sampling the daemon's RSS instead is a race — load takes seconds and
+  a shell poll loop finishes in milliseconds.
+
 ## 2. What it costs
 
 `128256 x 2048` head, per token:
