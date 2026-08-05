@@ -215,6 +215,27 @@ Sequence, cheapest-first:
    oracle's reference is the right one. The next step is per-op instrumentation
    — dump each op's output under both modes and diff — not more reading.
 
+   **The GEMM is now eliminated with REAL data.** The synthetic oracle rested on
+   two assumptions that had never been executed: that its local mirror of
+   `oqplus_compact_to_oq8_combined` matches the real expander, and that real
+   artifact blocks resemble generated ones. `hipfire-runtime`'s
+   `parity_oq_compact_real` removes both — it reads the actual `.hfq`, takes its
+   OqPlusCompact blocks verbatim, and expands them with the REAL loader
+   function. Result: **bit-identical on all 8 (M, K) classes.** So kernels,
+   scales, rotation, activation quantization, the expander and the real block
+   bytes are all now excluded; whatever moves the logits is outside the GEMM.
+
+   That example also surfaced something the earlier note got wrong. The tensors
+   are named `linear_attn.in_proj_a` / `in_proj_qkv` / `in_proj_z` / `out_proj`,
+   so this model **does** carry linear-attention layers — the very layers
+   `prefill_chunk.rs` serves. The claim below that Qwen3.5-0.8B "does not appear
+   to route through that file" is therefore unsafe. Yet the compact fallthrough
+   guard does NOT fire under either the smoke or `ar-hash`, which means the LA
+   path is reaching neither `run_plain_gemm_key` nor `run_residual_gemm_key`
+   with a compact weight. Explaining that — which arm the LA layers actually
+   take for a compact tensor — is now the most promising single question, and it
+   is where per-op instrumentation should start.
+
    **Separately found, and more serious than the divergence:
    `prefill_chunk.rs` has NO compact support at all** — zero `OqCompactG256`
    against 22 `Oq8G256`. Traced through the `wo` chain, a compact tensor there:
