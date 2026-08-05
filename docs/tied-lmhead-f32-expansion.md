@@ -232,6 +232,39 @@ here would take, and the only way to tell was to run the old code.
 generation across all three arrangements (WMMA special case, gemv_bf16_xf32
 special case, gemv_bf16_xf32 via the family) at 24.65 / 24.68 tok/s.
 
+## Attempted and reverted: keeping the tied head BF16
+
+The loader change — upload a BF16 embedding as bf16 instead of widening — was
+written and then reverted, because it could not be shown to execute.
+
+`hipfire bench` on `Llama-3.2-1B-Instruct--oq4++` gave **tg128 76.09 t/s against
+76.07 before**: no change, where a 1050.7 -> 525.3 MB head at 1.61x the kernel
+speed should have been plainly visible. Rather than accept a null result, a
+diagnostic was added to both branches of the tied path. **Neither ever fired**,
+while `eprintln!("  loading output...")` two lines above them did.
+
+That is not a possible state for one binary, and chasing it burned the rest of
+the session's budget:
+
+* `cargo build -p hipfire-runtime` builds the LIBRARY. The `hipfire` binary
+  lives in `hipfire-cli` and needs `--bin hipfire`, so the first several
+  measurements ran against a stale binary.
+* Rebuilding the binary did not fix it either, and `hipfire stop` reports
+  `no /home/sadara/.hipfire/serve.pid` while `hipfire chat` had separately
+  refused with `FATAL: hipfire daemon already running (PID ...)`. So daemon
+  lifetime is not fully described by the pidfile, and which binary serves a
+  given `chat` is not obvious from outside.
+
+**Nothing here says the change is wrong** — only that this session could not
+demonstrate it running, and an unproven change to a hot load path is worse than
+no change. What it does establish is that the measurement loop for loader edits
+is unreliable in a way that silently returns "no difference", which is exactly
+the failure mode that makes a bad change look safe.
+
+Anyone picking this up: verify a diagnostic in the edited branch actually
+appears before trusting any number. The `gemv_bf16_xf32` work it depends on is
+committed and separately verified.
+
 ## Ordering
 
 1. **Wire `gemv_bf16_f32` into the dispatch family, THEN stop expanding to F32.**
