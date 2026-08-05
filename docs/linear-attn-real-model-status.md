@@ -17,6 +17,20 @@ Current state — every testbed reproduces the runtime's own prefill logits:
 | GQA fixture, `n_k=1 < n_v=2` | tied | 0.999982 |
 | Qwen3.6-35B-A3B, 1 layer | **untied** | 0.999990 |
 
+**End-to-end on the real artifact.** `Qwen3.6-35B-A3B--oq4++.hfq`, all 40
+layers, real tokens from the artifact's own tokenizer over `calib-1m.txt` at
+seq 64:
+
+| model | mean loss, real text | ln(vocab) |
+|---|---|---|
+| Qwen3.5-0.8B | 3.52 | 12.42 |
+| **Qwen3.6-35B-A3B (oq4++)** | **2.502** | 12.42 |
+
+The 35B lands below the 0.8B, which is the ordering a working 35B should
+produce. On the synthetic `0,1,2,...` prompt the same stack gives 5.036 — that
+number says the stack is coherent, NOT that it models language, and the harness
+now refuses to call it "predicts text".
+
 Defect 2 was in the measuring instrument, not the model. Everything the log
 below attributes to "the 35B's layer math" was the walk's output projected
 through the wrong matrix — the 35B's `lm_head` correlates with its own
