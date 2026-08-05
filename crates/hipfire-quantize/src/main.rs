@@ -10578,7 +10578,24 @@ fn main() {
         // `-spec` declares exactly those tensors as `SourcePrecision` (finer than the
         // importance-255 protected set, so attn/embed are NOT swept in); we read that
         // class arch-keyed, replacing the old `is_deepseek4_keep_f16` name-match.
-        if (use_deepseek4_source_precision
+        // deepseek4's MLA compressor/indexer streams must stay at source precision
+        // whatever the OUTPUT format — that is a property of those tensors, not of
+        // the deepseek4-* formats. Gating it on `use_deepseek4_source_precision`
+        // meant a generic OQ build quantized them anyway, which is exactly the
+        // "compressor/indexer OQ dtype routing" that blocked deepseek4_compressed
+        // from every Opus cell.
+        //
+        // Scoped to deepseek4 deliberately. `precision_class_via_ingest` consults
+        // EVERY arch's spec, so honouring it unconditionally changes far more than
+        // this blocker asked. Measured on gfx1103 when it was unconditional: all 9
+        // gemma4_ple cells IMPROVED (hfq4 -69%, oq8+/oq8++ -39%) but every minimax
+        // Opus cell REGRESSED (oq8 0.000007 -> 0.000259, 37x worse; oq4 2.7x). The
+        // gemma4 win looks worth having and the minimax regression needs a cause
+        // before anyone widens this — see
+        // docs/plans/2026-08-05-opus-across-model-families.md.
+        let honour_source_precision =
+            use_deepseek4_source_precision || arch_id == ARCH_ID_DEEPSEEK4_FLASH;
+        if (honour_source_precision
             && precision_class_via_ingest(arch_id, name)
                 == Some(hipfire_arch_api::PrecisionClass::SourcePrecision)
             || keep_f16_mtp)
