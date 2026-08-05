@@ -35,6 +35,48 @@ and reverted: it "under-scaled the MoE final norm by ~38% ... 1.63 instead of
 the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce", and the symptom it was
 masking had a different root cause entirely.
 
+## Dense path: verified. MoE path: still broken.
+
+With GemmaRMSNorm, the q/k unit offset, and the 16/32 key-value head split all
+in, the DENSE 0.8B is healthy and several long-standing questions are settled by
+measurement rather than argument:
+
+| configuration | mean loss, real text |
+|---|---|
+| bf16 source | **3.5187** |
+| oq8++ artifact (AWQ folded) | **3.5147** |
+| oq4 (quantized here from the bf16 source) | 3.7960 |
+| uniform | 12.42 |
+
+- **The AWQ fold is correct.** bf16 carries no AWQ sidecars at all and the
+  folded oq8 artifact matches it to 0.004 nats. This closes a question that was
+  answered wrongly twice earlier in the session — first tuned on synthetic
+  tokens, then re-litigated through a broken forward. With a working model it
+  takes one measurement.
+- **Oq4G256 decode is correct.** 3.796 against 3.519 is a plausible 4-bit cost,
+  not a defect.
+
+The 35B, with every one of those fixes, still sits at **12.10** against a
+uniform 12.42. The dense path is exonerated end to end, so what remains is the
+part the 0.8B does not exercise: the routed MoE — 256 experts, top-8, a shared
+expert, and the per-expert-FUSED `gate_up` layout, which is the one expert
+layout never checked against anything but its own shapes.
+
+### The numpy oracle has its own bug
+
+Its accuracy decays with sequence length — cos 0.9994 at one token, 0.9741 at
+four, 0.207 at 64 — which is characteristic of an error that grows with the rope
+angle. One cause found: it paired rope dims interleaved `(2i, 2i+1)` while
+`kernels/src/rope.hip` pairs half-split `(i, i + n_rot/2)`. Both conventions
+ship in this repo (`rope_tail_interleaved.hip` is the DeepSeek one), and the
+difference is invisible at position 0.
+
+Fixing that moved four tokens 0.9689 -> 0.9741, so it was not the whole story
+and the oracle still has a length-dependent defect. This does not implicate the
+Rust, which uses hipfire's rope kernel directly and scores 3.52 on real text;
+it does mean the numpy oracle is only trustworthy at short lengths until the
+rest is found.
+
 ## Why it took so long
 
 The failure was silent in every way a failure can be. Shapes match. Everything
