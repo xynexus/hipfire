@@ -41,50 +41,65 @@ i.e. the full BF16 525 MB matrix, every token.
 
 | configuration | per-token bytes | vs FLM's 772.3 MB |
 |---|---|---|
-| hipfire default (exact bf16 head) | **1020.1 MB** | **+32%** |
-| hipfire, `HIPFIRE_LMHEAD_TWOSTAGE=q4` | **~626.4 MB** | **-19%** |
+| hipfire as measured (F32 head) | 1545.5 MB | +100% |
+| head kept BF16 | 1020.1 MB | +32% |
+| **head BF16L3, packed — current default** | **871.1 MB** | **-13%** |
 
 The rescore adds little: top-k rows of bf16 at 4 KB each is well under 1 MB.
 
-### UNVERIFIED — the two-stage path did not activate when tested
+### RESOLVED — it was worse than this, and is now better
 
-The table above is derived from `hipfire inspect` and the env documentation. An
-attempt to confirm it on hardware did not, and the numbers should be treated as
-unconfirmed until it does.
+An earlier revision of this document flagged the figures above as unverified,
+because a throughput A/B of `HIPFIRE_LMHEAD_TWOSTAGE` showed no difference and
+a diagnostic added to the two-stage branch never fired. Both were real, and the
+cause was found:
 
-What was tried, and what it showed:
+**The tied lm_head was expanded to F32 at load.** `hfq.rs` dequantised a BF16
+embedding to f32 for the tied output projection, so the head sat in VRAM at
+1050.7 MB rather than 525.3, and `lmhead_project`'s `w.gpu_dtype == DType::BF16`
+gate could never match — which is why the two-stage path was unreachable. Two
+independent observations, not inference: the artifact matches `lm_head` zero
+times (so the tied branch runs), and that branch sets `gpu_dtype: DType::F32`
+unconditionally at both sites.
 
-* **Throughput A/B** — `hipfire bench` with and without
-  `HIPFIRE_LMHEAD_TWOSTAGE=q4`: 76.07 vs 76.15 tok/s. A 51% cut in per-token
-  traffic should not be invisible.
-* **Output A/B** — `q4:1` (top-1 shortlist) produced byte-identical text. This
-  turned out to be a WORTHLESS control: `llama.rs:60` documents the path as
-  "greedy-exact (recall@1 = 1.0 at K=32)", so identical argmax output is the
-  design, not evidence of anything.
-* **TTFT probe** — the decisive one. `lmhead_project` builds the coarse tier on
-  first use via `build_lmhead_coarse_bf16`, quantising the 525 MB bf16 head.
-  That cannot be free. Measured TTFT: **59.0 ms unset, 60.2 ms at q4, 56.6 ms at
-  q2** — flat. The coarse build is not running, so the two-stage path is **not
-  activating** on this artifact.
+So the starting point was worse than reported: **1545.5 MB per token, exactly
+2.00x FLM**, not 1020.1.
 
-The gate is `w.gpu_dtype == DType::BF16` (`llama.rs:66`). Why it is false here
-is not established. The open possibility that matters is that the runtime may
-already serve the projection from the stored `model.embed_tokens.coarse.weight`
-(CoarseQ4Row, 131.59 MB) rather than the bf16 tier — in which case the DEFAULT
-per-token figure is ~626 MB, not 1020 MB, and the "+32% vs FLM" conclusion is
-wrong in the model's favour.
+Fixed in `hipfire` across three steps, each measured with byte-identical output:
 
-Both rows below therefore rest on an unconfirmed premise. Settling it needs the
-runtime to report which tensor backs the head, which no current log emits.
+| step | head | per-token | tg128 |
+|---|---|---|---|
+| as found | F32, 1050.7 MB | 1545.5 MB | 76.07 |
+| stop widening | BF16, 525.3 MB | 1020.1 MB | 89.95 |
+| **BF16L3, packed** | **379.8 MB** | **871.1 MB** | **102.41** |
+
+That needed a kernel that did not exist — `gemv_bf16_xf32`, then
+`gemv_bf16l3_xf32` (bf16/BF16L3 weight against an f32 activation, f32
+accumulate) — plus a dispatch-family entry and decode arms in every arch loader.
+LUT3 heads are now resident by default, and the quantizer already steers
+gather-shaped tensors to LUT3, so stock artifacts get it with no flag.
+
+The two-stage lm_head shortlist is a separate, still-unused path; it is not what
+delivered this.
 
 ## Decode ceilings at 55.5 GB/s
 
 | configuration | per-token | ceiling |
 |---|---|---|
-| hipfire, two-stage lm_head | 626.4 MB | **88.6 tok/s** |
+| **hipfire now (BF16L3 head)** | 871.1 MB | **63.7 tok/s** |
 | FLM streamed set | 772.3 MB | 71.9 tok/s |
-| hipfire default | 1020.1 MB | 54.4 tok/s |
 | FLM at its own measured 46.2 GB/s | 772.3 MB | 59.8 tok/s |
+| hipfire as found (F32 head) | 1545.5 MB | 35.9 tok/s |
+
+hipfire moves 13% fewer bytes than FLM but is still behind FLM's ceiling,
+because FLM's 772.3 MB excludes tensors hipfire streams every token. The
+ordering that matters: hipfire went from 0.50x FLM's ceiling to 0.89x, on bytes
+alone.
+
+**None of this is collectible on the NPU yet.** These are GPU measurements and a
+bytes argument; hipfire's NPU decode delivers ~10 GB/s effective against the
+55.5 available, so it is dispatch-bound, not bandwidth-bound. Fewer bytes is
+necessary and not sufficient.
 
 ## What this says about the goal
 
