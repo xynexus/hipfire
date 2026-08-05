@@ -7567,7 +7567,11 @@ fn ffn_batched(
         Some(&pbs.wmma_x_scratch_f16),
     )?;
 
-    dump_buf(gpu, &format!("12_l{layer_idx}_moe_scores_raw"), &pbs.moe_scores_batch);
+    dump_buf(
+        gpu,
+        &format!("12_l{layer_idx}_moe_scores_raw"),
+        &pbs.moe_scores_batch,
+    );
 
     // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)

@@ -136,7 +136,12 @@ pub fn oq3_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
             for s in 0..8 {
                 let bo = src + 2 + s * 12;
                 let w = |o: usize| {
-                    u32::from_le_bytes([data[bo + o], data[bo + o + 1], data[bo + o + 2], data[bo + o + 3]])
+                    u32::from_le_bytes([
+                        data[bo + o],
+                        data[bo + o + 1],
+                        data[bo + o + 2],
+                        data[bo + o + 3],
+                    ])
                 };
                 let (p0, p1, p2) = (w(0), w(4), w(8));
                 for i in 0..32 {

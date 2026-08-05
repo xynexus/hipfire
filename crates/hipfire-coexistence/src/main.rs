@@ -347,7 +347,9 @@ impl ArgBag {
         let mut present = std::collections::HashSet::new();
         let mut it = args.iter();
         while let Some(a) = it.next() {
-            let key = a.strip_prefix("--").ok_or_else(|| format!("unexpected arg {a}"))?;
+            let key = a
+                .strip_prefix("--")
+                .ok_or_else(|| format!("unexpected arg {a}"))?;
             if presence.contains(&key) {
                 present.insert(key.to_string());
             } else {
@@ -359,7 +361,11 @@ impl ArgBag {
                 }
             }
         }
-        Ok(ArgBag { values, repeated, present })
+        Ok(ArgBag {
+            values,
+            repeated,
+            present,
+        })
     }
     fn get(&self, k: &str) -> Option<&str> {
         self.values.get(k).map(String::as_str)
@@ -410,13 +416,17 @@ fn induct_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let corpus = expand_user(bag.get("corpus").unwrap_or("benchmarks/calib/calib-5m.txt"));
     let cfg = InductConfig {
         target: expand_user(
-            bag.get("target").unwrap_or("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B"),
+            bag.get("target")
+                .unwrap_or("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B"),
         ),
         dflash_source: expand_user(
             bag.get("dflash-source")
                 .unwrap_or("/srv/huggingface/models--z-lab--Qwen3.5-397B-A17B-DFlash"),
         ),
-        model_name: bag.get("model-name").unwrap_or("Qwen3.5-397B-A17B").to_string(),
+        model_name: bag
+            .get("model-name")
+            .unwrap_or("Qwen3.5-397B-A17B")
+            .to_string(),
         artifact_root: expand_user(bag.get("artifact-root").unwrap_or("~/.hipfire")),
         quant_format,
         dflash_formats,
@@ -443,8 +453,14 @@ fn induct_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         stages,
         force: bag.has("force"),
         dry_run: bag.has("dry-run"),
-        hipfire: bag.get("hipfire").unwrap_or("target/release/hipfire").to_string(),
-        quantizer: bag.get("quantizer").unwrap_or("target/release/hipfire-quantize").to_string(),
+        hipfire: bag
+            .get("hipfire")
+            .unwrap_or("target/release/hipfire")
+            .to_string(),
+        quantizer: bag
+            .get("quantizer")
+            .unwrap_or("target/release/hipfire-quantize")
+            .to_string(),
         dflash_converter: bag
             .get("dflash-converter")
             .unwrap_or("target/release/dflash_convert")
@@ -500,8 +516,14 @@ fn two_pass_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
             .unwrap_or("preserve-undercovered")
             .to_string(),
         quant_args,
-        quantizer: bag.get("quantizer").unwrap_or("target/release/hipfire-quantize").to_string(),
-        hipfire: bag.get("hipfire").unwrap_or("target/release/hipfire").to_string(),
+        quantizer: bag
+            .get("quantizer")
+            .unwrap_or("target/release/hipfire-quantize")
+            .to_string(),
+        hipfire: bag
+            .get("hipfire")
+            .unwrap_or("target/release/hipfire")
+            .to_string(),
         skip_calib: bag.has("skip-calib"),
         dry_run: bag.has("dry-run"),
     };
@@ -537,7 +559,6 @@ fn lora_convert(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-
 /// `hub {fetch,verify,repair}`. Offline tooling — the runtime never links this.
 fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     let val = |k: &str| -> Option<String> {
@@ -562,7 +583,8 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     rt.block_on(async {
         match op {
             "fetch" => {
-                let n = hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref()).await?;
+                let n =
+                    hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref()).await?;
                 eprintln!("hub: {n} file(s) present and verified");
             }
             "verify" => {

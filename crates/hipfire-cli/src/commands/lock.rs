@@ -737,7 +737,10 @@ mod tests {
             hipfire_lock::probe(&path),
             Ok(hipfire_lock::LockState::Free)
         ));
-        assert!(read_holder(&path).is_some(), "record should survive the flock");
+        assert!(
+            read_holder(&path).is_some(),
+            "record should survive the flock"
+        );
         assert!(kill_holder_at(&path, false).is_ok());
         assert!(
             read_holder(&path).is_none(),

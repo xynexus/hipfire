@@ -946,6 +946,9 @@ mod overflow_regression {
 
         let out = decode(&packed, N).unwrap();
         assert_eq!(out.len(), raw.len());
-        assert!(out == raw, "round trip past the 2^32-bit boundary must be exact");
+        assert!(
+            out == raw,
+            "round trip past the 2^32-bit boundary must be exact"
+        );
     }
 }

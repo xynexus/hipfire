@@ -95,7 +95,13 @@ fn main() {
 
     // Compare two paths: pre-quant rotated-activation max_abs, nibble mismatch %,
     // and max scale rel diff.
-    let cmp = |label: &str, f1: &[f32], f2: &[f32], q1: &[u8], q2: &[u8], s1: &[f32], s2: &[f32]| {
+    let cmp = |label: &str,
+               f1: &[f32],
+               f2: &[f32],
+               q1: &[u8],
+               q2: &[u8],
+               s1: &[f32],
+               s2: &[f32]| {
         let mut mx = 0f32;
         for i in 0..f1.len() {
             mx = mx.max((f1[i] - f2[i]).abs());
@@ -116,7 +122,11 @@ fn main() {
         let mut smx = 0f32;
         for i in 0..s1.len() {
             let d = (s1[i] - s2[i]).abs();
-            let r = if s2[i].abs() > 0.0 { d / s2[i].abs() } else { d };
+            let r = if s2[i].abs() > 0.0 {
+                d / s2[i].abs()
+            } else {
+                d
+            };
             smx = smx.max(r);
         }
         println!(
@@ -126,8 +136,35 @@ fn main() {
         );
     };
 
-    println!("oq4 rotation-path parity  N={n} K={k} group={group} arch={}", gpu.arch);
-    cmp("A(fused-batched) vs B(fused-1)", &xra_f, &xrb_f, &qa, &qb, &sa, &sb);
-    cmp("A(fused-batched) vs C(standalone)", &xra_f, &xrc_f, &qa, &qc, &sa, &sc);
-    cmp("B(fused-1) vs C(standalone)", &xrb_f, &xrc_f, &qb, &qc, &sb, &sc);
+    println!(
+        "oq4 rotation-path parity  N={n} K={k} group={group} arch={}",
+        gpu.arch
+    );
+    cmp(
+        "A(fused-batched) vs B(fused-1)",
+        &xra_f,
+        &xrb_f,
+        &qa,
+        &qb,
+        &sa,
+        &sb,
+    );
+    cmp(
+        "A(fused-batched) vs C(standalone)",
+        &xra_f,
+        &xrc_f,
+        &qa,
+        &qc,
+        &sa,
+        &sc,
+    );
+    cmp(
+        "B(fused-1) vs C(standalone)",
+        &xrb_f,
+        &xrc_f,
+        &qb,
+        &qc,
+        &sb,
+        &sc,
+    );
 }

@@ -28,7 +28,10 @@ pub fn oq4_act_group() -> usize {
     match std::env::var("HIPFIRE_OQ4_ACT_GROUP") {
         Ok(v) => {
             let g: usize = v.parse().expect("HIPFIRE_OQ4_ACT_GROUP must be an integer");
-            assert!(g == 64 || g == 128 || g == 256, "HIPFIRE_OQ4_ACT_GROUP must be 64, 128 or 256");
+            assert!(
+                g == 64 || g == 128 || g == 256,
+                "HIPFIRE_OQ4_ACT_GROUP must be 64, 128 or 256"
+            );
             g
         }
         Err(_) => 256,
@@ -700,8 +703,9 @@ impl Gpu {
             // Finer activation group than the weight codec's 256 — the decoupled
             // kernel. Needs the LDS tiling (BK-boundary flush), so only for n>=128.
             if n >= 128 {
-                return self
-                    .gemm_oq4_grouped_wmma_lds_gx(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP, group_x);
+                return self.gemm_oq4_grouped_wmma_lds_gx(
+                    w_combined, &ws, &xq, &xs, y, m, k, n, GROUP, group_x,
+                );
             }
             panic!("HIPFIRE_OQ4_ACT_GROUP != 256 needs the LDS path (n>=128), got n={n}");
         }

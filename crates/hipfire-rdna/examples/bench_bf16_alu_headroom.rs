@@ -54,11 +54,15 @@ fn main() {
     // otherwise inflated by the GPU ramping up, which would fake a "more work is
     // faster" result. 30 launches of the zero-ALU kernel.
     for _ in 0..30 {
-        gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n).unwrap();
+        gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n)
+            .unwrap();
     }
     gpu.device_synchronize().unwrap();
 
-    println!("free-ALU headroom, PRODUCTION 4x4 tiled bf16 GEMM  arch={}  M={m} K={k} N={n}", gpu.arch);
+    println!(
+        "free-ALU headroom, PRODUCTION 4x4 tiled bf16 GEMM  arch={}  M={m} K={k} N={n}",
+        gpu.arch
+    );
     println!(
         "{:>10} {:>12} {:>10} {:>9}  {:>16}",
         "FMA/K-step", "FMA/WMMA", "ms", "vs 0", "free ops/weight-el"
@@ -112,13 +116,15 @@ fn main() {
     // "faster with more work" reading was a clock-ramp artifact.
     let t_ctrl = {
         for _ in 0..3 {
-            gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n).unwrap();
+            gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n)
+                .unwrap();
         }
         gpu.device_synchronize().unwrap();
         let mut ms = Vec::new();
         for _ in 0..iters {
             let t = Instant::now();
-            gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n).unwrap();
+            gpu.bench_bf16_alu_headroom("gemm_bf16_alu0", &w, &x, &y, m, k, n)
+                .unwrap();
             gpu.device_synchronize().unwrap();
             ms.push(t.elapsed().as_secs_f64() * 1e3);
         }

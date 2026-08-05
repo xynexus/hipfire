@@ -21,8 +21,13 @@ fn n_vocab_of(meta: &serde_json::Value) -> usize {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: kldref_selftest <ref.kldref.hfq> [n]");
-    let want: usize = std::env::args().nth(2).map(|v| v.parse().unwrap()).unwrap_or(8);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: kldref_selftest <ref.kldref.hfq> [n]");
+    let want: usize = std::env::args()
+        .nth(2)
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(8);
 
     let pkg = HfqPackage::open(Path::new(&path)).expect("open");
     let meta: serde_json::Value = serde_json::from_str(&pkg.metadata_json).expect("meta");
@@ -39,7 +44,10 @@ fn main() {
     );
     println!(
         "blobs: {:?}",
-        pkg.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        pkg.entries()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
     );
 
     let u32s = |n: &str| -> Vec<u32> {
@@ -98,8 +106,12 @@ fn main() {
     // Is the block array actually distinct per chunk, or did the producer stall?
     let blk = |c: usize, j: usize| &top_indices[(c * spc + j) * top_k..(c * spc + j + 1) * top_k];
     let dup01 = (0..spc).filter(|&j| blk(0, j) == blk(1, j)).count();
-    let zero1 = (0..spc).filter(|&j| blk(1, j).iter().all(|&v| v == 0)).count();
-    let zero0 = (0..spc).filter(|&j| blk(0, j).iter().all(|&v| v == 0)).count();
+    let zero1 = (0..spc)
+        .filter(|&j| blk(1, j).iter().all(|&v| v == 0))
+        .count();
+    let zero0 = (0..spc)
+        .filter(|&j| blk(0, j).iter().all(|&v| v == 0))
+        .count();
     println!(
         "chunk1 blocks identical to chunk0: {dup01}/{spc};  all-zero blocks: chunk0 {zero0}, chunk1 {zero1}"
     );
@@ -108,7 +120,9 @@ fn main() {
     let probe = 256usize.min(spc);
     let mut best = (0usize, 0usize);
     for p in (0..(tokens.len() - probe - 1)).step_by(1) {
-        let h = (0..probe).filter(|&j| blk(1, j)[0] == tokens[p + j]).count();
+        let h = (0..probe)
+            .filter(|&j| blk(1, j)[0] == tokens[p + j])
+            .count();
         if h > best.1 {
             best = (p, h);
         }
@@ -150,7 +164,10 @@ fn main() {
             "chunk {c}: top-1 agreement {:.1}% ({hit}/{spc}){}",
             100.0 * hit as f64 / spc as f64,
             if best.0 != c {
-                format!("   <-- blocks match chunk {} better ({}/{})", best.0, best.1, spc)
+                format!(
+                    "   <-- blocks match chunk {} better ({}/{})",
+                    best.0, best.1, spc
+                )
             } else {
                 String::new()
             }

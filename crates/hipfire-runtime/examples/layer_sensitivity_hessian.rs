@@ -145,8 +145,8 @@ struct Row {
     layer: usize,
     site: String,
     n: usize,
-    sse: f64,      // ‖ΔW‖²_F, isotropic
-    ref_energy: f64, // ‖W8‖²_F, for a relative figure
+    sse: f64,           // ‖ΔW‖²_F, isotropic
+    ref_energy: f64,    // ‖W8‖²_F, for a relative figure
     sse_w: Option<f64>, // imatrix-weighted, where a calib imatrix exists
     sse8: f64,
     sse8_w: f64,
@@ -165,13 +165,19 @@ fn parse_layer_site(name: &str) -> Option<(usize, String)> {
 
 fn main() {
     let mut a = std::env::args().skip(1);
-    let p4 = a.next().expect("usage: layer_sensitivity_hessian <oq4.hfq> <oq8.hfq> [calib.hfq]");
-    let p8 = a.next().expect("usage: layer_sensitivity_hessian <oq4.hfq> <oq8.hfq> [calib.hfq]");
+    let p4 = a
+        .next()
+        .expect("usage: layer_sensitivity_hessian <oq4.hfq> <oq8.hfq> [calib.hfq]");
+    let p8 = a
+        .next()
+        .expect("usage: layer_sensitivity_hessian <oq4.hfq> <oq8.hfq> [calib.hfq]");
     let pc = a.next();
 
     let h4 = HfqFile::open(Path::new(&p4)).expect("open oq4");
     let h8 = HfqFile::open(Path::new(&p8)).expect("open oq8");
-    let hc = pc.as_ref().map(|p| HfqFile::open(Path::new(p)).expect("open calib"));
+    let hc = pc
+        .as_ref()
+        .map(|p| HfqFile::open(Path::new(p)).expect("open calib"));
 
     // imatrix per weight-tensor name, where captured.
     let mut imat: BTreeMap<String, Vec<f32>> = BTreeMap::new();
@@ -230,7 +236,11 @@ fn main() {
                     let mut acc = 0f64;
                     for j in g * GROUP..(g + 1) * GROUP {
                         let sj = s_awq.as_ref().map(|s| s[j]).unwrap_or(1.0) as f64;
-                        acc += if sj.abs() > 1e-12 { d[j] as f64 / (sj * sj) } else { 0.0 };
+                        acc += if sj.abs() > 1e-12 {
+                            d[j] as f64 / (sj * sj)
+                        } else {
+                            0.0
+                        };
                     }
                     acc / GROUP as f64
                 })
@@ -326,7 +336,10 @@ fn main() {
         e.2 += r.ref_energy;
     }
     println!("\n=== per-SITE isotropic 4-bit sensitivity (‖W₈ − Q₄(W₈)‖²_F) ===");
-    println!("{:<28} {:>12} {:>9} {:>12} {:>10}", "site", "SSE", "share", "elements", "rel err");
+    println!(
+        "{:<28} {:>12} {:>9} {:>12} {:>10}",
+        "site", "SSE", "share", "elements", "rel err"
+    );
     let mut sites: Vec<_> = by_site.into_iter().collect();
     sites.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
     for (site, (sse, n, refe)) in &sites {
@@ -350,7 +363,10 @@ fn main() {
     println!("\n=== per-LAYER isotropic sensitivity, ranked ===");
     let mut layers: Vec<_> = by_layer.iter().map(|(l, v)| (*l, v.0, v.1)).collect();
     layers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    println!("{:<8} {:>12} {:>9} {:>12} {:>9}", "layer", "SSE", "share", "SSE(imat)", "share");
+    println!(
+        "{:<8} {:>12} {:>9} {:>12} {:>9}",
+        "layer", "SSE", "share", "SSE(imat)", "share"
+    );
     for (l, sse, w) in &layers {
         println!(
             "{:<8} {:>12.4e} {:>8.2}% {:>12.4e} {:>8.2}%",
@@ -358,7 +374,11 @@ fn main() {
             sse,
             100.0 * sse / total_sse,
             w,
-            if total_w > 0.0 { 100.0 * w / total_w } else { 0.0 }
+            if total_w > 0.0 {
+                100.0 * w / total_w
+            } else {
+                0.0
+            }
         );
     }
 
@@ -386,13 +406,19 @@ fn main() {
     };
     concentration(layers.iter().map(|x| x.1).collect(), total_sse, "isotropic");
     if total_w > 0.0 {
-        concentration(layers.iter().map(|x| x.2).collect(), total_w, "imatrix-weighted, down_proj");
+        concentration(
+            layers.iter().map(|x| x.2).collect(),
+            total_w,
+            "imatrix-weighted, down_proj",
+        );
     }
 
     // Does the imatrix weighting change the RANKING? If not, the isotropic
     // proxy (available for every site) can be trusted where no calib exists.
-    let mut both: Vec<(usize, f64, f64)> =
-        rows.iter().filter_map(|r| r.sse_w.map(|w| (r.layer, r.sse, w))).collect();
+    let mut both: Vec<(usize, f64, f64)> = rows
+        .iter()
+        .filter_map(|r| r.sse_w.map(|w| (r.layer, r.sse, w)))
+        .collect();
     if both.len() > 2 {
         both.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let iso_rank: Vec<usize> = both.iter().map(|x| x.0).collect();
@@ -400,7 +426,10 @@ fn main() {
         let w_rank: Vec<usize> = both.iter().map(|x| x.0).collect();
         let n = iso_rank.len() as f64;
         let pos = |v: &Vec<usize>, l: usize| v.iter().position(|&x| x == l).unwrap() as f64;
-        let d2: f64 = iso_rank.iter().map(|&l| (pos(&iso_rank, l) - pos(&w_rank, l)).powi(2)).sum();
+        let d2: f64 = iso_rank
+            .iter()
+            .map(|&l| (pos(&iso_rank, l) - pos(&w_rank, l)).powi(2))
+            .sum();
         let rho = 1.0 - 6.0 * d2 / (n * (n * n - 1.0));
         println!(
             "\n--- isotropic vs imatrix-weighted ranking (down_proj, {} layers) ---\n  Spearman ρ = {rho:.3}",
@@ -412,18 +441,35 @@ fn main() {
     // B: int4 everywhere, then promote whole tensors to int8, greedily by
     //    sensitivity-per-parameter, until the same average bit budget is spent.
     let alloc = |weighted: bool, label: &str| {
-        let sel = |r: &Row| if weighted { r.sse_w.unwrap_or(0.0) } else { r.sse };
+        let sel = |r: &Row| {
+            if weighted {
+                r.sse_w.unwrap_or(0.0)
+            } else {
+                r.sse
+            }
+        };
         let sel8 = |r: &Row| if weighted { r.sse8_w } else { r.sse8 };
-        let sel_out = |r: &Row, i: usize| if weighted { r.sse_out_w[i] } else { r.sse_out[i] };
-        let pool: Vec<&Row> =
-            rows.iter().filter(|r| !weighted || r.sse_w.is_some()).collect();
+        let sel_out = |r: &Row, i: usize| {
+            if weighted {
+                r.sse_out_w[i]
+            } else {
+                r.sse_out[i]
+            }
+        };
+        let pool: Vec<&Row> = rows
+            .iter()
+            .filter(|r| !weighted || r.sse_w.is_some())
+            .collect();
         if pool.is_empty() {
             return;
         }
         let base: f64 = pool.iter().map(|r| sel(r)).sum();
         let floor: f64 = pool.iter().map(|r| sel8(r)).sum();
         let total_params: f64 = pool.iter().map(|r| r.n as f64).sum();
-        println!("\n=== EQUAL-BIT ALLOCATION ({label}, {} tensors) ===", pool.len());
+        println!(
+            "\n=== EQUAL-BIT ALLOCATION ({label}, {} tensors) ===",
+            pool.len()
+        );
         println!("  int4 baseline error {base:.4e}   int8 floor {floor:.4e}");
         println!(
             "{:>10} {:>12} {:>26} {:>26}",

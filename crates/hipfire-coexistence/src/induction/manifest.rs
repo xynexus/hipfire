@@ -53,10 +53,18 @@ fn merge_calibration_execution(previous: Option<&Value>, current: &Value) -> Val
     let mut segments: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let empty = Vec::new();
-    let prev_segments = previous.get("segments").and_then(|v| v.as_array()).unwrap_or(&empty);
-    let cur_segments = current_obj.get("segments").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let prev_segments = previous
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let cur_segments = current_obj
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
     for segment in prev_segments.iter().chain(cur_segments) {
-        let Some(seg) = segment.as_object() else { continue };
+        let Some(seg) = segment.as_object() else {
+            continue;
+        };
         let key = format!(
             "{}|{}|{}|{}",
             seg.get("started_after_layer").unwrap_or(&Value::Null),
@@ -109,7 +117,9 @@ pub fn update_manifest(
     manifest.insert("schema".into(), json!(1));
     manifest.insert(
         "created_at".into(),
-        prev.and_then(|p| p.get("created_at")).cloned().unwrap_or_else(|| json!(utc_now())),
+        prev.and_then(|p| p.get("created_at"))
+            .cloned()
+            .unwrap_or_else(|| json!(utc_now())),
     );
     manifest.insert("updated_at".into(), json!(utc_now()));
     manifest.insert("status".into(), json!(phase));
@@ -153,7 +163,10 @@ pub fn update_manifest(
     if let Some(execution) = &update.calibration_execution {
         manifest.insert(
             "calibration_execution".into(),
-            merge_calibration_execution(prev.and_then(|p| p.get("calibration_execution")), execution),
+            merge_calibration_execution(
+                prev.and_then(|p| p.get("calibration_execution")),
+                execution,
+            ),
         );
     } else if let Some(prev_exec) = prev.and_then(|p| p.get("calibration_execution")) {
         manifest.insert("calibration_execution".into(), prev_exec.clone());
@@ -192,13 +205,34 @@ pub fn update_manifest(
     let cal = calibration_value.as_ref();
     let quant = quantized_value.as_ref();
     let candidates: [(&str, Option<Value>); 7] = [
-        ("calibration_artifact", dig(cal, &["artifact_fingerprint"]).cloned()),
-        ("calibration_engine_build", dig(cal, &["metadata", "engine_build"]).cloned()),
-        ("calibration_run", dig(cal, &["metadata", "run_fingerprint"]).cloned()),
-        ("source", dig(cal, &["metadata", "source_manifest", "fingerprint"]).cloned()),
-        ("samples", dig(cal, &["metadata", "job", "samples", "fingerprint"]).cloned()),
-        ("quantized_artifact", dig(quant, &["artifact_fingerprint"]).cloned()),
-        ("quantized_payload", dig(quant, &["metadata", "quantization_hash", "value"]).cloned()),
+        (
+            "calibration_artifact",
+            dig(cal, &["artifact_fingerprint"]).cloned(),
+        ),
+        (
+            "calibration_engine_build",
+            dig(cal, &["metadata", "engine_build"]).cloned(),
+        ),
+        (
+            "calibration_run",
+            dig(cal, &["metadata", "run_fingerprint"]).cloned(),
+        ),
+        (
+            "source",
+            dig(cal, &["metadata", "source_manifest", "fingerprint"]).cloned(),
+        ),
+        (
+            "samples",
+            dig(cal, &["metadata", "job", "samples", "fingerprint"]).cloned(),
+        ),
+        (
+            "quantized_artifact",
+            dig(quant, &["artifact_fingerprint"]).cloned(),
+        ),
+        (
+            "quantized_payload",
+            dig(quant, &["metadata", "quantization_hash", "value"]).cloned(),
+        ),
     ];
     let mut fingerprints = Map::new();
     for (key, value) in candidates {
@@ -241,7 +275,8 @@ mod tests {
             "artifact_fingerprint": "fnv64:bbb",
             "metadata": {"quantization_hash": {"value": "qhash-555"}, "calibration": {"x": 1}},
         });
-        let dir = std::env::temp_dir().join(format!("hipfire-manifest-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-manifest-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("two-pass.json");
         let manifest = update_manifest(

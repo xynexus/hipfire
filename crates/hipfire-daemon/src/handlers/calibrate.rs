@@ -163,7 +163,11 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
 /// to the same parser defaults the CLI uses.
 fn calibrate_args_from_msg(msg: &serde_json::Value) -> Result<Vec<String>, String> {
     let mut a: Vec<String> = Vec::new();
-    for (flag, key) in [("--model", "model"), ("--corpus", "corpus"), ("--output", "output")] {
+    for (flag, key) in [
+        ("--model", "model"),
+        ("--corpus", "corpus"),
+        ("--output", "output"),
+    ] {
         let v = msg
             .get(key)
             .and_then(|v| v.as_str())
@@ -196,7 +200,10 @@ fn calibrate_args_from_msg(msg: &serde_json::Value) -> Result<Vec<String>, Strin
         a.push(x.to_string());
     }
     // `auto` or an integer.
-    for (flag, key) in [("--sequence-batch", "sequence_batch"), ("--time-tile", "time_tile")] {
+    for (flag, key) in [
+        ("--sequence-batch", "sequence_batch"),
+        ("--time-tile", "time_tile"),
+    ] {
         if let Some(s) = msg.get(key).and_then(|v| v.as_str()) {
             a.push(flag.to_string());
             a.push(s.to_string());
@@ -224,7 +231,11 @@ fn calibrate_args_from_msg(msg: &serde_json::Value) -> Result<Vec<String>, Strin
     if let Some(r) = msg.get("resume").and_then(|v| v.as_bool()) {
         a.push(if r { "--resume" } else { "--no-resume" }.to_string());
     }
-    if msg.get("boundary_ram").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if msg
+        .get("boundary_ram")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         a.push("--boundary-ram".to_string());
     }
     Ok(a)

@@ -23,11 +23,6 @@ use hipfire_runtime::calibration::boundary::BoundaryBackend;
 use hipfire_runtime::calibration::contracts::{
     CalibError, CalibrationJob, CapturePolicy, CaptureRegistry,
 };
-use hipfire_runtime::calibration::schedule::MicrobatchGeometry;
-use hipfire_runtime::calibration::source::{
-    ReadLedgerSnapshot, TensorLoadPlan, TensorOwner, LAYER_PREFETCH_WORKER_CHUNK_BYTES,
-};
-use hipfire_runtime::calibration::stream::ModelInspection;
 use hipfire_runtime::calibration::layer_stream::{
     build_calibration_run_inputs, calibration_engine_build_identity, calibration_run_fingerprint,
     cleanup_cask_only_scratch, default_boundary_directory, host_memory_snapshot, kldref_row_stride,
@@ -35,6 +30,11 @@ use hipfire_runtime::calibration::layer_stream::{
     CalibrationRunOutcome, LayerStreamEngine, SourceManifestIdentity,
     CALIBRATION_PREFETCH_HOST_RESERVE_BYTES, CALIBRATION_PREFETCH_MIN_SWAP_FREE_DENOMINATOR,
 };
+use hipfire_runtime::calibration::schedule::MicrobatchGeometry;
+use hipfire_runtime::calibration::source::{
+    ReadLedgerSnapshot, TensorLoadPlan, TensorOwner, LAYER_PREFETCH_WORKER_CHUNK_BYTES,
+};
+use hipfire_runtime::calibration::stream::ModelInspection;
 use hipfire_runtime::triattn::{install_layered_tap, take_layered_tap, LayeredTriAttnCalibState};
 use std::error::Error;
 use std::fs;
@@ -256,7 +256,6 @@ fn artifact_storage_estimate(
     })
 }
 
-
 pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
         println!("{CALIBRATE_USAGE}");
@@ -298,16 +297,12 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
         adapter.capture_plan(&inspection, &job)?
     };
     let cask_metadata = if command.cask_output.is_some() {
-        Some(
-            adapter
-                .cask_metadata(&inspection, &job)?
-                .ok_or_else(|| {
-                    CalibError::InvalidSourcePlan(format!(
-                        "{} has no native CASK generator",
-                        inspection.family
-                    ))
-                })?,
-        )
+        Some(adapter.cask_metadata(&inspection, &job)?.ok_or_else(|| {
+            CalibError::InvalidSourcePlan(format!(
+                "{} has no native CASK generator",
+                inspection.family
+            ))
+        })?)
     } else {
         None
     };
@@ -315,13 +310,8 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
     let geometry = resolve_geometry(&job)?;
     let resource_estimate = adapter.resource_estimate(&inspection, &job, geometry)?;
     let engine_build = calibration_engine_build_identity()?;
-    let run_fingerprint = calibration_run_fingerprint(
-        adapter.as_ref(),
-        &inspection,
-        &tensor_plan,
-        &job,
-        geometry,
-    )?;
+    let run_fingerprint =
+        calibration_run_fingerprint(adapter.as_ref(), &inspection, &tensor_plan, &job, geometry)?;
     let mut dry_run = dry_run_report(
         &command,
         &snapshot,
@@ -430,8 +420,7 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
         Err(error) if command.cask_only => {
             // CASK-only scratch is worthless after a failed run and would only
             // make the next fresh retry trip on stale state — remove it.
-            if let Err(cleanup) =
-                cleanup_cask_only_scratch(&command.output, inspection.num_layers)
+            if let Err(cleanup) = cleanup_cask_only_scratch(&command.output, inspection.num_layers)
             {
                 return Err(CalibError::Runtime(format!(
                     "{error}; additionally failed to clean CASK-only scratch: {cleanup}"
@@ -707,7 +696,6 @@ fn calibration_storage_estimate(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,4 +786,3 @@ mod tests {
         assert_eq!(ram.capture_payload_bytes, 184);
     }
 }
-

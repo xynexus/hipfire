@@ -127,10 +127,10 @@ fn main() {
     let shapes: Vec<(usize, usize, usize)> = match (argm, argk, argn) {
         (Some(m), Some(k), Some(n)) => vec![(m, k, n)],
         _ => vec![
-            (256, 1024, 256),   // full_add fast path
-            (1024, 1024, 512),  // full_add, o_proj-shaped
-            (1000, 1024, 100),  // generic bounds-checked add
-            (17, 512, 5),       // generic, tiny/ragged
+            (256, 1024, 256),  // full_add fast path
+            (1024, 1024, 512), // full_add, o_proj-shaped
+            (1000, 1024, 100), // generic bounds-checked add
+            (17, 512, 5),      // generic, tiny/ragged
         ],
     };
     let mut all = true;

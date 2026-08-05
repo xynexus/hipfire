@@ -370,9 +370,9 @@ impl QuantType {
             Oq4Plain => Some(130),
             OpaqueBytes => Some(1),
             // QTIP trellis (f32 scale + packed symbols)
-            Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
+            Qtip3G256 => Some(100),   // 4 + 96 (256×3-bit)
             Qtip3G256I3 => Some(100), // identical layout to Qtip3G256; only the codebook differs
-            Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
+            Qtip4G256 => Some(132),   // 4 + 128 (256×4-bit)
             // Variable-length or not-yet-single-sourced here:
             //  - Q8HFQ: row-dependent
             //  - HFP4G32 / MFP4G32: per-row FP scale

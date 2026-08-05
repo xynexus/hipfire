@@ -52,8 +52,14 @@ fn main() {
     ];
     let batches = [128usize, 512usize];
 
-    println!("oq4 activation-GEMM throughput  arch={}  iters={iters}", gpu.arch);
-    println!("{:<22} {:>5} {:>12} {:>12} {:>12}   winner", "shape", "N", "act4 ms", "act8 ms", "act16 ms");
+    println!(
+        "oq4 activation-GEMM throughput  arch={}  iters={iters}",
+        gpu.arch
+    );
+    println!(
+        "{:<22} {:>5} {:>12} {:>12} {:>12}   winner",
+        "shape", "N", "act4 ms", "act8 ms", "act16 ms"
+    );
 
     for (label, m, k) in shapes {
         let ng = k / GROUP;
@@ -114,25 +120,33 @@ fn main() {
             let y_bf16 = gpu.alloc_tensor(&[n * m * 2], DType::Raw).unwrap();
 
             // baseline (unoptimized) iu4 GEMM — measured same-run for context.
-            let _t4_gemm =
-                med_ms!(gpu.gemm_oq4_grouped_wmma(&w, &ws, &xq, &xs, &y, m, k, n, GROUP).unwrap());
+            let _t4_gemm = med_ms!(gpu
+                .gemm_oq4_grouped_wmma(&w, &ws, &xq, &xs, &y, m, k, n, GROUP)
+                .unwrap());
             // LDS-staged optimized iu4 GEMM (Stream A): f32 + bf16 output.
-            let t4_lds =
-                med_ms!(gpu.gemm_oq4_grouped_wmma_lds(&w, &ws, &xq, &xs, &y, m, k, n, GROUP).unwrap());
+            let t4_lds = med_ms!(gpu
+                .gemm_oq4_grouped_wmma_lds(&w, &ws, &xq, &xs, &y, m, k, n, GROUP)
+                .unwrap());
             let t4_lds_bf16 = med_ms!(gpu
                 .gemm_oq4_grouped_wmma_lds_bf16out(&w, &ws, &xq, &xs, &y_bf16, m, k, n, GROUP)
                 .unwrap());
-            let _t4 = med_ms!(gpu.gemm_oq4_grouped_act_batched(&w, &xr, &y, m, k, n).unwrap());
-            let t8 = med_ms!(gpu.gemm_oq4_residual_mmq(&w, &xr, &y, m, k, n, false).unwrap());
-            let t16 =
-                med_ms!(gpu.gemm_oq4_grouped_f16_wmma(&w, &xr, &y, m, k, n, GROUP).unwrap());
+            let _t4 = med_ms!(gpu
+                .gemm_oq4_grouped_act_batched(&w, &xr, &y, m, k, n)
+                .unwrap());
+            let t8 = med_ms!(gpu
+                .gemm_oq4_residual_mmq(&w, &xr, &y, m, k, n, false)
+                .unwrap());
+            let t16 = med_ms!(gpu
+                .gemm_oq4_grouped_f16_wmma(&w, &xr, &y, m, k, n, GROUP)
+                .unwrap());
 
             // FAIR full-path comparison: MMQ (t8) re-quantizes the activation every
             // call (ensure_q8_1_mmq_x must_convert=true), so time the iu4-lds FULL
             // path too = quantize_act_oq4 + LDS GEMM, matching MMQ's quant+GEMM.
             let t4_lds_full = med_ms!({
                 gpu.quantize_act_oq4(&xr, &xq, &xs, n, k, GROUP).unwrap();
-                gpu.gemm_oq4_grouped_wmma_lds(&w, &ws, &xq, &xs, &y, m, k, n, GROUP).unwrap();
+                gpu.gemm_oq4_grouped_wmma_lds(&w, &ws, &xq, &xs, &y, m, k, n, GROUP)
+                    .unwrap();
             });
 
             // Winner over the "pure GEMM" iu4 variants vs MMQ vs f16 (excludes the
