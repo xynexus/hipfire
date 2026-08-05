@@ -177,3 +177,58 @@ Next: identify which projections fall back and why — the LA (linear-attention)
 QKVZA/gate_up/wo/w_down set in `forward_prefill_chunk` is where the counts point.
 `HIPFIRE_KERNEL_TRACE=1` plus the per-arm dispatch counts is enough to attribute
 them without a profiler.
+
+## ROOT CAUSE: the KV cache format, not the NPU
+
+The 43:1 GEMV dominance is a gated fallback, and the gate now says why.
+`prefill_chunk.rs` splits the batched-FA condition and reports it under
+`HIPFIRE_KERNEL_TRACE`:
+
+    FA layers take the PER-TOKEN fallback: kv_ok=false (quantized=true,
+    q8=false, asym4=false, asym3=false, asym2=false), first non-batchable
+    FA weight dtype=<none — weights all batchable>
+
+**The weights are fine. The KV cache format alone disqualifies batched FA
+prefill.** The accepted set is `q8 | asym4 | asym3 | asym2`; the shipped default
+in `~/.hipfire/config.json` is `kvarn4`, which is not in it.
+
+Same model, same build, `kv_cache` the only variable — `Qwen3.5-0.8B--mq4`,
+gfx1151:
+
+| kv_cache | pp512 | tg64 |
+|---|---|---|
+| **q8** | **6307.60 t/s** | 103.40 |
+| kvarn4 (default) | 598.30 t/s | 101.85 |
+
+**10.5x prefill. Decode unchanged within noise.**
+
+For scale: FLM does ~2750 t/s prefill on the 1B. hipfire with a q8 KV cache does
+6307 — **2.3x faster than FLM**, on the axis the NPU work exists to fix.
+
+### Why this is NOT simply "add kvarn to the gate"
+
+The obvious patch faults. `prefill_chunk.rs` carries the reason at three sites:
+
+> KVarN K = 4-bit block records + fp16 window (not a contiguous buffer), so the
+> generic batched writes below would fault.
+
+KVarN's K cache is not a contiguous buffer, and the batched KV write and fused
+attention in the FA layer body assume contiguity. The gate is a correctness
+precondition, correctly placed. The linear-attention path already carries KVarN
+branches for exactly this; the FA prefill path does not.
+
+**So the work is: give the FA prefill path a KVarN batched write + attention
+branch, mirroring the LA path's.** That is real kernel work, but it is bounded,
+it is on the GPU, and it is worth up to ~10x prefill for every model on the
+default KV format.
+
+### What this means for the NPU plan
+
+Prefill was "the only losing axis". On the 1B it is not losing at all once the
+KV format allows the batched path — it beats FLM by 2.3x. The 35B has not been
+measured this way yet and is the model that matters, but the mechanism is
+per-model dtype/KV checks, not anything model-specific.
+
+Before any NPU prefill offload is scoped: measure the 35B with a q8 KV cache. If
+it moves the way the 1B did, the offload is solving a problem that a KVarN
+batched-FA branch solves on hardware already present.
