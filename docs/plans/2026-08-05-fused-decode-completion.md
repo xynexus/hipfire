@@ -168,34 +168,65 @@ commit.
 
 ---
 
-## Phase 5 — A second arch for continuous batching
+## Phase 5 — A second arch for continuous batching — BLOCKED, needs re-scope
 
-**Goal.** Prove the generic seam. Everything above is qwen3.5-only.
+**Investigated 2026-08-05. The phase cannot run as written, at either end.**
 
-`docs/plans/2026-07-18-continuous-scheduler-headline.md` sets the test:
-"first non-qwen35 target is deepseek4... If a seam can't be implemented for
-deepseek4 without touching the generic layer, the seam is wrong — fix the
-abstraction, not deepseek4." That is unproven today. lfm2 has only
-`run_generate_batch_prefill_serial_lfm2` and no fused batch decode.
+### There is no seam to test
 
-**Steps.**
+The plan's test was "if a seam can't be implemented for deepseek4 without
+touching the generic layer, the seam is wrong". That test presumes a seam. What
+actually exists:
 
-1. Implement `BatchableSession` for deepseek4 and drive it through the existing
-   runner. Change nothing generic at first — treat any forced change to the
-   generic layer as a finding about the seam.
-2. Port fused batch prefill, then decode.
-3. Record what the seam could not express. That record is the deliverable even
-   if the port stalls.
+- **`ContinuousBatching`** (`hipfire-arch-api`) is declaration-only — its sole
+  method is `max_batch_sessions() -> usize`. Declaring it tells the *server* a
+  request may be routed to the batch runner. It carries no execution.
+- **`BatchableSession`** (`batch_runner.rs:250`) has exactly one impl,
+  `DummySession`, in a `#[cfg(test)]` module. No production arch implements it.
+  Its only method is `batch_key()`.
+- **The daemon dispatches by arch `if`/`else`**, not through a trait:
+  `if is_qwen35_family_arch_id(..) { qwen35 } else if ARCH_ID_LFM2_MOE { lfm2 }
+  else { "supports qwen35/qwen35-moe and lfm2-moe only" }`
+  (`handlers/batch.rs`), for prefill; decode has only
+  `run_generate_batch_decode_step_qwen35`.
 
-**Validation.** The same parity ladder used for qwen3.5: fused == serial at
-temp 0, then throughput.
+So adding any arch today means adding a third arm to that chain — touching the
+generic layer *by construction*, because there is no generic layer to leave
+alone. The seam is not wrong; it is absent.
 
-**Risk.** Largest scope here, and the only phase whose output may be "the
-abstraction is wrong" rather than a landed feature. That is a legitimate
-result — it is the reason to do it before more arches accumulate on the current
-seam.
+Note also the population: exactly **one** arch (qwen35) has true fused
+multi-session execution. lfm2moe's batch prefill is serial per-session and it has
+no batch decode. An abstraction drawn from a single implementation is unproven
+regardless of how it is written.
 
----
+### deepseek4 is not ready to be that second arch
+
+Its batched forwards are single-session and incomplete:
+
+- `forward_prefill_batch` takes one `state`, one `tokens`, one `start_pos` — one
+  session — and its body is a per-token `decode_step` loop, commented "Per-token
+  fallback until forward_prefill_batch_chunk is end-to-end".
+- `forward_prefill_batch_chunk` is "Phase B2 work in progress... Currently a
+  partial wiring".
+
+Multi-session batching needs block-diagonal attention over N separate KV/MLA
+states. deepseek4 does not yet have batched execution for *one* session.
+
+### Re-scope: two independent pieces of work
+
+**5a — Build the seam, proven against what exists.** Replace the daemon's arch
+`if`/`else` with a trait the batch prefill/decode handlers dispatch through, and
+implement it for qwen35 (fused) and lfm2moe (serial). Tractable now, and it makes
+the abstraction concrete before a second arch has to fit it. Weak evidence on its
+own — one real impl plus one degenerate one — but it converts "no seam" into "a
+seam with a known-thin proof".
+
+**5b — Finish deepseek4's batched forward.** A kernel project (its own Phase B2),
+independent of any batching seam, and a prerequisite for deepseek4 participating
+at all.
+
+They can proceed in either order; 5a does not depend on 5b. Doing 5a first means
+5b's author has something to implement against instead of a third `else if`.
 
 ## Not doing: batching the Q8 lm_head arm
 
