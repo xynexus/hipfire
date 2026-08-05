@@ -213,12 +213,43 @@ What the other rows say is that removing ANY single layer type still leaves the
 output orthogonal. No one type is the culprit; either several are wrong, or
 something common to every layer is.
 
-What is common to every layer of this model and was never fully ablated: **the
-MoE MLP**. All 40 layers are routed, and the "routed experts ablated" row above
-left the SHARED expert running. So the next experiment is ablating the MLP
-entirely — routed and shared — leaving only the attention halves. If that
-restores agreement, the shared-expert branch is implicated, and it is the one
-MoE component whose only witness is a bf16 tiny fixture.
+Two further ablations completed the sweep, and neither isolates it:
+
+| configuration | cos |
+|---|---|
+| whole MoE MLP ablated (routed AND shared) | 0.1077 |
+| norm unit offset disabled | 0.1179 |
+
+Nothing moves the 35B off roughly 0.1. Reading the table as a whole: with the
+MLP gone, the linear_attn and attention halves alone — fed a verified-correct
+embedding — still produce an orthogonal result over 40 layers. With the layers
+gone, the head is provably right. So the wrongness is in the layer math itself
+and is not confined to one component, one layer type, or the norm convention.
+
+## Stopping the bisect
+
+This is the stated stopping point from the previous round: if ablating the MLP
+did not isolate the defect, further 20-minute-per-hypothesis guessing is poor
+value. Ten such runs have now eliminated every cheap hypothesis without
+localising anything.
+
+What would actually settle it is a per-layer reference, and there are exactly
+two ways to get one:
+
+1. **Settle `dump_qwen35_hidden_states`' capture semantics.** Its forward is now
+   correct (it captures during prefill) but its states still disagree with a
+   verified forward for reasons documented in
+   `dump-qwen35-hidden-states-status.md`. Whoever knows what `pbs.x_batch` holds
+   at that point can resolve it in minutes.
+2. **Build a truncated-model oracle.** Cut a model to N layers, dump its logits
+   through the trusted prefill path, and compare against this walk truncated the
+   same way. Every piece is verified; it is bounded work, but it means rewriting
+   a 20 GB artifact per depth for the 35B, or doing it on the 0.8B first to
+   validate the technique.
+
+Meanwhile the dense hybrid path is complete and verified — Qwen3.5-0.8B at
+cos 0.9999 against the runtime and mean loss 3.52 on real text — so gamma
+capture on dense hybrids is available today.
 
 ### What is left
 
