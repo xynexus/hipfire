@@ -199,7 +199,7 @@ pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HF_TOKEN",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-hub/src/lib.rs:126",
+    source: "crates/hipfire-hub/src/lib.rs:134",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
