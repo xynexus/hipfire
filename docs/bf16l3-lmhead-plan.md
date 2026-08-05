@@ -24,10 +24,17 @@ every step. llama3.2:1b per-token traffic 1545.5 -> 871.1 MB, i.e. 2.00x FLM's
 `gemv_bf16l3_xf32` itself: 1.917 ms against `gemv_bf16_xf32`'s 3.241 at
 128256 x 2048, worst |diff| 2.570e-7, argmax identical.
 
-**On by default.** A LUT3 head skips expansion without any env var;
-`HIPFIRE_BF16L3_RESIDENT=0` opts out. Setting the var to anything else extends
-residency to every Bf16Lut3 tensor, which is rarely wanted — there is no BF16L3
-GEMM, so layer weights are decoded at load regardless.
+**Opt-in — a default was tried and reverted.** `HIPFIRE_BF16L3_RESIDENT` must be
+set. Defaulting it on for head-shaped tensors took the tiny-quant gate from 8
+failures to **58**: `expand_bf16_index` is arch-agnostic, but only the LLaMA
+loader was taught to decode a packed embed for the gather, so qwen35, qwen2 and
+dots-ocr all panicked with `expected F16/F32/BF16 for embed_tokens.weight, got
+qt=49`.
+
+**Prerequisite for the default:** teach every arch loader the same
+decode-for-gather arm the LLaMA path has. The predicate is already present as
+`is_head_tensor`. Until then the flag stays opt-in, and enabling it on a
+non-LLaMA arch fails to load rather than degrading.
 
 ### Reach
 

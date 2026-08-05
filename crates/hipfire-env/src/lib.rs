@@ -484,13 +484,7 @@ env_vars! {
 
     // ── Lossless BF16 recodings (hipfire-runtime) ───────────────────────────
     BF16L3_RESIDENT = "HIPFIRE_BF16L3_RESIDENT", Developer,
-        "Keep GPU-decodable LUT3 recodings packed in RAM instead of expanding \
-         them at load. Set to anything except `0`. Only `Bf16Lut3` can stay \
-         resident — Huffman codes are bit-serial and are always expanded. \
-         Requires kernels that decode the packed form natively (`gemv_bf16l3`); \
-         a gather-read table (a tied embed/lm_head) has no such path and will \
-         fail to load. Buys ~1.18x weight bandwidth only once the working set \
-         exceeds the GPU's last-level cache, and is a measured slowdown below.";
+        "Keep GPU-decodable LUT3 recodings packed instead of expanding them at load. Set to anything except `0`. Only `Bf16Lut3` can stay resident — Huffman is bit-serial and always expands. Worth tg128 90.05 -> 101.45 on a LUT3-headed LLaMA artifact, byte-identical output, via `gemv_bf16l3_xf32`. OFF by default because it is GLOBAL and only the LLaMA loader decodes a packed embed for the gather: qwen35, qwen2 and dots-ocr panic with `got qt=49`, so enabling it there fails to load. Defaulting it on for heads was tried and reverted — it took tiny-quant-gate from 8 failures to 58.";
 
     BF16_WEIGHTS = "HIPFIRE_BF16_WEIGHTS", Developer,
         "Set `f32` to force F16 weights to upcast to F32 at load instead of \
