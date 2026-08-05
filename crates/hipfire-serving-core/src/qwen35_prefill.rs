@@ -48,6 +48,7 @@ use crate::session::{
     sequence_state_arena_active_logical_position, sequence_state_arena_checkpoint_session_state,
     sequence_state_arena_fork_session_state, sequence_state_arena_is_session_resident,
     sequence_state_arena_reset_active_session, sequence_state_arena_resident_session_count,
+    validate_qwen35_fused_dense_prefill_model_capability,
     validate_qwen35_fused_grouped_moe_prefill_model_capability, Qwen35RequestSessionState,
 };
 
@@ -1782,11 +1783,13 @@ pub fn run_generate_batch_prefill_serial_qwen35(
 
     let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope.session_count);
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
+    let fused_dense_supported = validate_qwen35_fused_dense_prefill_model_capability(m);
     let fused_grouped_moe_supported =
         validate_qwen35_fused_grouped_moe_prefill_model_capability(m, envelope.session_count);
     let backend = select_qwen35_prefill_batch_backend(
         plan,
         requested_backend.as_deref(),
+        fused_dense_supported,
         fused_grouped_moe_supported,
     )?;
     let started = serde_json::json!({
