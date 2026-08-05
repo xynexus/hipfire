@@ -82,50 +82,44 @@ fallback. The real risk is an incomplete audit in step 3.
 
 ---
 
-## Phase 2 — Default fused decode on
+## Phase 2 — Default fused decode on — ALREADY DONE, no work required
 
-**Goal.** Organic traffic reaches the fused path, so the multi-row win is
-actually delivered.
+**This phase was written on a false premise and is closed unbuilt.**
 
-**Expect ~2.2x on current artifacts.** Multi-row gain tracks the tied lm_head
-dtype. Measured on gfx1103 with a controlled pair built from one HF source,
-identical 186-tensor MQ4G256 body, differing only in `--embed-precision`:
+The premise was that `select_qwen35_decode_batch_backend` maps `auto` to
+`SerialReference` unconditionally, so no organic traffic reached the fused path.
+That function does return `SerialReference` for `auto` — but its caller
+immediately overrides it. `qwen35_decode.rs:377-384` selects
+`FusedDenseLayerChunked` whenever the request is `auto`, the arch is dense,
+`session_count >= 2`, and both `validate_qwen35_fused_dense_decode_model_capability`
+and `validate_qwen35_fused_dense_decode_resident_sessions` pass. That has been
+there since `08617fbc8` (2026-06-20). The premise came from reading one function
+without its caller.
 
-| tied lm_head | 1x4 | 4x1 | gain |
-|---|---|---|---|
-| BF16 (the `source` default) | 2707 ms | 1229 ms | **2.20x** |
-| Q8 (`--embed-precision q8`, deprecated) | 2004 ms | 1925 ms | 1.04x |
+Measured with nothing set (`HIPFIRE_QWEN35_DECODE_BATCH` absent, so `auto`), four
+concurrent sessions in lockstep on gfx1103:
 
-Q8 is faster single-row (270 MB vs 509 MB) but does not amortize; BF16 is slower
-single-row and scales. Since `--embed-precision` defaults to `source`, current
-artifacts land on the 2.2x row. A separate quantized `lm_head.weight` is a
-different case: `qwen3.5-9b-mq4` (MQ4G256 lm_head) measures 1.54x.
+    backend = fused_dense_layer_chunked   chunk = 4x1   decode_ms = 1247
 
-**Steps.**
+against 1229 ms for an explicit `fused_dense` request — the same path. Organic
+concurrent traffic has been getting fused multi-row decode all along.
 
-1. Give decode the same shape prefill now has: consult
-   `validate_qwen35_fused_dense_decode_model_capability` from `auto`, not only
-   from an explicit request. The capability fn already exists and already
-   consults the weights contract.
-2. Decide the envelope deliberately. `batch_runner::batch_envelope_ok` already
-   excludes DFlash, PP>1 and hierarchical KV from continuous batching; decode
-   needs an equivalent, and the KV-mode gate (`fp32`/`q8` only, asym/KVarN
-   fall back) already exists in the capability fn. Write the envelope down
-   rather than inheriting it by accident.
-3. Keep `HIPFIRE_QWEN35_DECODE_BATCH=serial` working as the kill switch, and
-   say so in the env doc.
+Every step this phase proposed already exists:
 
-**Validation.** Two-session and four-session parity against serial at temp 0,
-byte-identical. Then a throughput number on organic HTTP traffic — the existing
-`multirow_bench.py` harness measures exactly this. Coherence across the
-qwen3.5 size matrix before flipping, since this changes the default path for
-every dense qwen3.5 request.
+| proposed | where it already is |
+|---|---|
+| consult the capability gate from `auto` | `qwen35_decode.rs:377-384` |
+| deliberate envelope (PP / DFlash / eviction) | `validate_qwen35_decode_batch_runtime_surface`, `:352` |
+| hierarchical KV forced to serial | `:405` |
+| `=serial` kill switch | already works |
 
-**Risk.** Highest in this plan — it changes what production does. Phase 1 first
-is what makes it safe: with AWQ applied rather than rejected, nothing silently
-drops to serial and the fused path is the same path everywhere.
-
----
+**Measurement trap worth recording.** A first check of `auto` reported
+`backend=serial_reference` and appeared to confirm the false premise. That is a
+telemetry artifact: `last_backend` reflects the final decode step, and when
+sessions finish at different lengths the tail steps run one row, which correctly
+takes the serial path. Give every session an identical prompt so they stay in
+lockstep, or the last-cycle telemetry will describe a one-row step rather than
+the batch.
 
 ## Phase 3 — Route `resolve_model_path` through `hipfire-hub`
 
