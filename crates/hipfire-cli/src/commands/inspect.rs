@@ -83,6 +83,13 @@ fn resolve(arg: &str, loaded: &LoadedConfig) -> anyhow::Result<PathBuf> {
 
 /// Decode a quant-type byte to its canonical variant name, or a marker for an
 /// unknown/reserved id.
+/// Codes that are lossless BF16 recodings rather than value quantisations.
+/// A tensor still carrying one of these at inspect time was left packed
+/// (residency) rather than expanded at open.
+fn is_lossless_recoding_code(code: u8) -> bool {
+    QuantType::from_code(code).is_some_and(|qt| qt.is_lossless_recoding())
+}
+
 fn quant_name(code: u8) -> String {
     match QuantType::from_code(code) {
         Some(qt) => format!("{qt:?}"),
@@ -311,12 +318,29 @@ fn print_human(
     // missed while working on the BF16L3 lm_head.
     let mut codecs: std::collections::BTreeMap<u8, (usize, u64, u64)> = Default::default();
     for (i, t) in hfq.tensors().iter().enumerate() {
-        if let Some((stored_qt, packed_len)) = hfq.stored_recoding(i) {
-            let e = codecs.entry(stored_qt).or_insert((0, 0, 0));
-            e.0 += 1;
-            e.1 += packed_len as u64;
-            e.2 += t.data_size as u64;
-        }
+        // Two ways a tensor is compressed on disk, and reporting only the first
+        // hides the biggest one.
+        //
+        //  1. Expanded at open. `expand_bf16_index` rewrote the entry to its
+        //     logical view and `stored_recoding` remembers the physical extent.
+        //  2. Left PACKED. A LUT3 head is resident by default, so its entry is
+        //     never rewritten — `stored_recoding` is None and `quant_type` is
+        //     still the codec. Its `data_size` is already the packed length.
+        //
+        // Case 2 is exactly the 379.74 MB embedding on a stock artifact, so
+        // omitting it reported "saved 55.73 KB" against a real 145 MB.
+        let (stored_qt, packed_len, logical_len) = match hfq.stored_recoding(i) {
+            Some((qt, packed)) => (qt, packed as u64, t.data_size as u64),
+            None if is_lossless_recoding_code(t.quant_type) => {
+                let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                (t.quant_type, t.data_size as u64, n * 2)
+            }
+            None => continue,
+        };
+        let e = codecs.entry(stored_qt).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += packed_len;
+        e.2 += logical_len;
     }
     if !codecs.is_empty() {
         println!("\nlossless storage (compressed on disk, expanded or decoded in-kernel):");
@@ -361,6 +385,16 @@ fn print_human(
                     fmt_bytes(packed as u64),
                     t.data_size as f64 / (packed as f64).max(1.0)
                 ),
+                // Left packed rather than expanded — the dtype column already
+                // names the codec, so say so and give the ratio it is saving.
+                None if is_lossless_recoding_code(t.quant_type) => {
+                    let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                    format!(
+                        "  [packed in place, from {}, {:.3}x]",
+                        fmt_bytes(n * 2),
+                        (n * 2) as f64 / (t.data_size as f64).max(1.0)
+                    )
+                }
                 None => String::new(),
             };
             println!(
