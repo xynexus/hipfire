@@ -360,3 +360,51 @@ above), which is the 7x prefill difference, not a KV-bandwidth effect at all.
 at ~117 MB against the same ~500 MB of weights. That is the regime KVarN is
 presumably designed for, and nothing here contradicts it — this result is
 specific to hybrid attention.
+
+## ROOT CAUSE (35B): one conjunct in `prefill_batch_pbs_eligible`
+
+Measured, not inferred. `Qwen3.6-35B-A3B--mq4` on gfx1151, 256-token prefill:
+
+    pbs_eligible inputs: force_fallback=false n=256 dn_quant=FP32
+    all_layers_dense_la=false moe_topk_ok=true (K=8, E=256)
+    router_logits=true arch=gfx1151
+
+Every condition passes but one. The gate (`mod.rs:1988`) reads:
+
+```rust
+&& matches!(dn_state.quant, StateQuant::Q8 | StateQuant::FP32)
+&& (dn_state.quant == StateQuant::Q8
+    || weights.layers.iter().all(|lw| matches!(lw, DeltaNet(_) | FullAttn(_))))
+```
+
+A MoE model has `DeltaNetMoe`/`FullAttnMoe` layers, so the all-dense arm is false
+**by construction**. Batched prefill therefore requires `dn_quant == Q8` for any
+MoE model — and `default_state_quant` returns FP32 for this config
+(`state.rs:87`: FP32 when `deltanet_state_redundancy < deltanet_state_fp32_below`).
+
+**That single conjunct is the entire ~8x prefill gap against FLM**, and it
+explains the standing note that no MoE model had ever taken the batched prefill
+path. Not a missing kernel — the grouped MoE GEMMs exist and their own
+eligibility check passes (`path2` reported eligible, declined nothing).
+
+### Why this is not "set Q8 and ship it"
+
+`state.rs` documents a deliberate never-Q8 policy, and closes with:
+
+> Reconcile by adding an FP32/FP16 tree kernel — **not** by enabling Q8 state.
+
+So the sanctioned fix is to give the batched MoE prefill path an FP32 DeltaNet
+state variant, not to flip the default. Flipping it would trade a measured
+prefill win against a documented quality decision whose reasoning is not
+reconstructed here.
+
+### Summary of where the NPU premises landed
+
+| premise | status |
+|---|---|
+| 1B decode needs the NPU | **no** — GPU 102 t/s vs a ~38 t/s NPU ceiling |
+| 1B prefill is 34x behind FLM | **no** — 6307 vs 2750, hipfire ahead (q8 KV) |
+| 35B prefill needs an NPU offload | **no** — one conjunct disables batched prefill |
+
+All three "losing axes" were software. None needed new hardware to diagnose, and
+none needs it to fix.
