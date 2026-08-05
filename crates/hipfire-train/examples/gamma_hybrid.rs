@@ -124,10 +124,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // had to answer — the fused gate/up halves, the conv tap direction, the
     // [Q|K|V] split — wrecks the loss if answered wrong, because a model with
     // scrambled weights cannot predict text.
+    // Second arg: a corpus path, or the literal `arange` to force the
+    // deterministic 0,1,2,... prompt that dump_logits_qwen35 uses — the only
+    // way to compare against it on a model that HAS a tokenizer.
     let corpus = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "benchmarks/calib/calib-1m.txt".into());
+    let force_arange = corpus == "arange";
     let real = (|| {
+        if force_arange {
+            return None;
+        }
         // An .hfq embeds its tokenizer; a restored HF directory has the file.
         let tok_path = match &hfq {
             Some(f) => {
@@ -145,11 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (ids.len() > seq).then(|| ids[..seq].to_vec())
     })();
     let synthetic = real.is_none();
-    let tokens: Vec<u32> = real.unwrap_or_else(|| {
-        (0..seq)
-            .map(|i| ((i * 37 + 11) % cfg.vocab_size) as u32)
-            .collect()
-    });
+    // The synthetic fallback is 0,1,2,... deliberately: that is exactly the
+    // prompt `dump_logits_qwen35` uses, so a fixture with no tokenizer can
+    // still be compared against the runtime token-for-token.
+    let tokens: Vec<u32> = real.unwrap_or_else(|| (0..seq as u32).collect());
     eprintln!("first ids: {:?}", &tokens[..tokens.len().min(12)]);
     eprintln!(
         "tokens: {}",
@@ -191,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sum: Default::default(),
         n: 0,
     };
-    let (loss, kinds, layer_inputs) = gamma_hybrid_streamed(
+    let (loss, kinds, layer_inputs, last_logits) = gamma_hybrid_streamed(
         &mut gpu,
         src,
         prefix,
@@ -226,7 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         std::fs::write(std::path::Path::new(&dir).join("mine_hidden.bin"), &out)?;
-        eprintln!("oracle: wrote {} layer inputs", layer_inputs.len());
+        let lb: Vec<u8> = last_logits.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        std::fs::write(std::path::Path::new(&dir).join("mine_logits.f32"), &lb)?;
+        eprintln!(
+            "oracle: wrote {} layer inputs and {} last-position logits",
+            layer_inputs.len(),
+            last_logits.len()
+        );
     }
 
     println!("hybrid stack: {} layers, seq={seq}, h={h}", kinds.len());

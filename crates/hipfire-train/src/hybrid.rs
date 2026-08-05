@@ -166,7 +166,7 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     // GemmaRMSNorm: block and final norms are `1 + w`. See
     // `loader::uses_unit_offset_norm` — wrong here is silent, not loud.
     unit_offset: bool,
-) -> Result<(f32, Vec<LayerKind>, Vec<Vec<f32>>), String> {
+) -> Result<(f32, Vec<LayerKind>, Vec<Vec<f32>>, Vec<f32>), String> {
     let (seq, h) = (dims.seq, dims.h);
     let vocab = cfg.vocab_size;
     let n_layers = cfg.num_hidden_layers;
@@ -239,6 +239,9 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     )
     .map_err(e)?;
     let loss_sum: f32 = gpu.download_f32(&loss).map_err(e)?.iter().sum();
+    // Last position's logits — the quantity `dump_logits_qwen35` dumps, so the
+    // two are directly comparable on the same tokens.
+    let last_logits: Vec<f32> = gpu.download_f32(&logits).map_err(e)?[(seq - 1) * vocab..].to_vec();
 
     let d_xf = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
     linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false).map_err(e)?;
@@ -284,7 +287,7 @@ pub fn gamma_hybrid_streamed<S: WeightSource + ?Sized>(
     }
 
     acc.n += 1;
-    Ok((loss_sum, kinds, layer_inputs))
+    Ok((loss_sum, kinds, layer_inputs, last_logits))
 }
 
 /// One layer forward. Returns the layer output; drops everything else.

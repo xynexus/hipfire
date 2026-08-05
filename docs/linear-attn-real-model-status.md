@@ -77,6 +77,36 @@ Rust, which uses hipfire's rope kernel directly and scores 3.52 on real text;
 it does mean the numpy oracle is only trustworthy at short lengths until the
 rest is found.
 
+## A fast MoE oracle, and the MoE gap confirmed
+
+Every 35B check costs ~20 minutes and there is no small real MoE on disk — but
+the tiny fixture IS a real MoE (8 experts, top-2, shared branch), and random
+init does not matter for a comparison: both sides compute the same function.
+`gamma_hybrid` now exports last-position logits, and takes `arange` as its
+corpus argument to force the deterministic `0,1,2,...` prompt that
+`dump_logits_qwen35` uses, so the two are directly comparable on any artifact.
+Runs take seconds.
+
+| fixture | cos(mine, runtime) |
+|---|---|
+| qwen3_5-tiny (DENSE) | 0.9441 |
+| qwen3_5_moe-tiny (MoE) | 0.6470 |
+
+That is the MoE gap isolated on a model that iterates fast. Two routing
+hypotheses are already dead — both score WORSE than base, so both are right as
+implemented:
+
+| variant | cos |
+|---|---|
+| base | 0.6470 |
+| top-k gates not renormalised | 0.4918 |
+| shared-expert scalar gate not applied | 0.4523 |
+
+The dense fixture at 0.944 is worth its own look: the 0.8B scores 3.52 on real
+text and matched the runtime at cos 0.9994 for one token, so 0.944 on a
+64-token random-init model suggests a smaller second effect rather than a clean
+bill of health for the dense path.
+
 ## Why it took so long
 
 The failure was silent in every way a failure can be. Shapes match. Everything
