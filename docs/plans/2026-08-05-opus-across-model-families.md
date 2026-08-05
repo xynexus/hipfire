@@ -215,6 +215,30 @@ Sequence, cheapest-first:
    oracle's reference is the right one. The next step is per-op instrumentation
    — dump each op's output under both modes and diff — not more reading.
 
+   **MECHANISM FOUND: the two modes take different ROUTES, not different math.**
+   Once-guarded traces in the two GEMV dispatch arms show, on the same probe:
+
+   - expanded — `GemvOq8G256Prerotated` **never fires at all**; the oq8 weights
+     are served by a batched/fused path instead.
+   - compact — `GemvOqCompactG256Prerotated` **does** fire; the compact weights
+     fall back to the generic per-op GEMV dispatch.
+
+   So `OqCompactG256` is not admitted to whatever fast path `Oq8G256` takes, and
+   drops to per-op GEMV. That single fact explains every observation at once, and
+   explains why so much elimination found nothing: the kernels really are
+   bit-identical, because the difference was never in the math. It is
+   dtype-keyed and shape-independent, so every (M, K) class diverges on its own
+   — leaving ANY tensor compact reroutes it. It is present at the first token.
+   And both routes are individually valid, so the tokens still match while the
+   logits do not.
+
+   Next: find the admission that rejects `OqCompactG256` and sends it to the
+   serial path. `dense_prefill_weight_unsupported_reason` accepts the dtype, so
+   the rejection is elsewhere — and closing it is what makes the flag
+   defaultable AND recovers the ~31% latency, since per-op GEMV is also the
+   slower route. Note the compact GEMM arms in `prefill_batch.rs` are evidently
+   not being reached on this probe despite existing.
+
    **The batched-LA admission gate is eliminated too, by hash this time.**
    `is_batchable_la`'s `oq8_with_wmma` matches `Oq8G256` and not
    `OqCompactG256`, so compact sits permanently in the state that
