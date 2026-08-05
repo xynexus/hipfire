@@ -224,6 +224,18 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
 /// (OQ4 via `oq4_arch_load`, plain dtypes, etc.). All three resolve to
 /// `DType::Oq8G256`, dispatched by the generic iu8 GEMV/GEMM.
 pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    // Compact residency: hand the OqPlusCompact blocks to the device untouched
+    // so oq4.25++ stays ~4.25 bits/weight instead of being unpacked to one int8
+    // per weight here. `gemm_oq_compact_grouped_wmma` decodes the nibbles and
+    // applies the sparse overlay per tile, bit-identically to this expansion
+    // (see hipfire-rdna examples/parity_gemm_oq_compact.rs).
+    //
+    // Opt-in while the end-to-end path is validated; once every consumer of
+    // DType::OqCompactG256 is wired this becomes the default and the expansion
+    // below can go — along with its two siblings in lfm2moe and minimax.
+    if qt == QuantType::OqPlusCompact.code() && hipfire_env::OQ_COMPACT_RESIDENT.flag() {
+        return Some((data.to_vec(), DType::OqCompactG256));
+    }
     let bytes = match qt {
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),

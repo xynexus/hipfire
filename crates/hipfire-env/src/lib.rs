@@ -261,6 +261,14 @@ env_vars! {
          (the default) the pass is a no-op and output is byte-identical to \
          plain `quantize_mq2g256_lloyd_weighted`.";
 
+    // ── Opus compact residency (hipfire-runtime) ────────────────────────────
+    OQ_COMPACT_RESIDENT = "HIPFIRE_OQ_COMPACT_RESIDENT", Developer,
+        "Keep OqPlusCompact (qt=36) weights compact in VRAM instead of expanding \
+         them to one int8 per weight at load. oq4.25++ is ~4.25 bits/weight on \
+         disk but 8 bits resident without this, so the format's VRAM win is lost. \
+         Set 1 to opt in while the compact-resident path is validated; the \
+         default stays on the expanded path.";
+
     LLOYD_K3 = "HIPFIRE_LLOYD_K3", Developer,
         "Set 1 to encode MQ2-Lloyd with a ternary 3-level codebook (\"MQ1.58\") \
          instead of 4 levels. Reuses the same kernel and block layout.";

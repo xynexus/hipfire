@@ -763,6 +763,31 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(&weights.output)?;
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_oq_compact_act_batched(
+                    &weights.output.buf,
+                    &rot,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                    block_stride,
+                )
+            });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
         // Opus W8A8 lm_head — see `dense_session_prefill_gemm_full_precision`.
         DType::Oq8G256 => {
             let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
@@ -1136,7 +1161,7 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
     // were caught during bring-up.
     if weight.awq_scale.is_some() && !matches!(weight.gpu_dtype, DType::MQ4G256 | DType::Oq8G256) {
         return Some(
-            "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256)",
+            "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256, OqCompactG256)",
         );
     }
     // Oq4G256 (oq4/oq4+/oq4++) is deliberately NOT admitted yet: wiring it to
@@ -1161,6 +1186,7 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
             | DType::Q8_0
             | DType::MQ4G256
             | DType::Oq8G256
+            | DType::OqCompactG256
     ) {
         return Some("unsupported weight dtype");
     }
@@ -4628,6 +4654,34 @@ pub(crate) fn gemm_raw_x_f32_residual_batched_auto(
     gpu.add_inplace_f32(&y_n, &scratch_n)
 }
 
+/// Byte stride of one OqPlusCompact block for `weight`, derived from the buffer
+/// rather than carried as metadata: the weight is `[M, K/256]` blocks of
+/// `130 + 2*N_out` bytes, so the stride falls out of the allocation size.
+fn oq_compact_block_stride(weight: &WeightTensor) -> Result<usize, hip_bridge::HipError> {
+    const GROUP: usize = 256;
+    let blocks = weight.m * (weight.k / GROUP);
+    if blocks == 0 || weight.k % GROUP != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "OqCompactG256 requires K % 256 == 0 and M*K/256 > 0 (M={} K={})",
+                weight.m, weight.k
+            ),
+        ));
+    }
+    let bytes = weight.buf.byte_size();
+    if bytes % blocks != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "OqCompactG256 buffer {bytes} B is not divisible by {blocks} blocks (M={} K={})",
+                weight.m, weight.k
+            ),
+        ));
+    }
+    Ok(bytes / blocks)
+}
+
 // Batched single-projection GEMM for the dense fused prefill. Despite the
 // `_full_precision` name (kept to avoid churning ~10 call sites), this now
 // dispatches plain Q8_0 and MQ4G256 weights too — quantized dense models route
@@ -4657,6 +4711,24 @@ fn dense_session_prefill_gemm_full_precision(
             rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
             let result =
                 gpu.gemm_oq8_grouped_act_batched(&weight.buf, &rot, y, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
+        }
+        // Compact-resident Opus: same W8A8 math, weights decoded from the
+        // on-disk blocks in-kernel instead of a pre-expanded int8 plane.
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(weight)?;
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq_compact_act_batched(
+                &weight.buf,
+                &rot,
+                y,
+                weight.m,
+                weight.k,
+                n,
+                block_stride,
+            );
             let _ = gpu.free_tensor(rot);
             result
         }
@@ -4719,6 +4791,22 @@ fn dense_session_prefill_gemm_full_precision_residual(
             gpu.gemm_q8_0_batched_chunked(&weight.buf, x, &out, weight.m, weight.k, n)?;
             let accum = y_residual.sub_offset(0, n * weight.m);
             gpu.add_inplace_f32(&accum, &out)
+        }
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(weight)?;
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq_compact_residual_act_batched(
+                &weight.buf,
+                &rot,
+                y_residual,
+                weight.m,
+                weight.k,
+                n,
+                block_stride,
+            );
+            let _ = gpu.free_tensor(rot);
+            result
         }
         DType::Oq8G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
