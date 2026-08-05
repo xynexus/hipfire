@@ -10,6 +10,7 @@ mod dispatch;
 pub mod feature_flags;
 pub mod generic_warn;
 pub mod gtt_share;
+pub mod kernel_trace;
 mod kernels;
 pub mod pool;
 pub mod profile;

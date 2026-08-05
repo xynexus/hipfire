@@ -1518,6 +1518,10 @@ impl Gpu {
 
     /// Compile and load a kernel, caching the result.
     fn ensure_kernel(&mut self, module_name: &str, source: &str, func_name: &str) -> HipResult<()> {
+        // Universal dispatch chokepoint — every launch resolves its function
+        // here, cache-hit or not. See `kernel_trace`: off by default, one
+        // relaxed atomic load when off.
+        crate::kernel_trace::record(func_name);
         if self.functions.contains_key(func_name) {
             return Ok(());
         }
