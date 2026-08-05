@@ -113,9 +113,48 @@ The expansion is not in one place. Seven production sites unpack qt=36 today:
 
 Sequence, cheapest-first:
 
-1. **Finish the qwen35 dense path** — `oq4.25++` itself (N_out=3) end to end;
-   #223 validated `oq4.5++` (N_out=7) only. Decode parity at length. Then the
-   flag can default on for that path.
+1. **Finish the qwen35 dense path.** *(N_out=3 shipped; flag still gated — see
+   the open logit divergence below.)* #223 validated only `oq4.5++` (N_out=7).
+   `Qwen3.5-0.8B--oq4.25` (N_out=3, `block_stride` 136 — the block shape the
+   premier `oq4.25++` family uses) now passes `smoke-generate-batch-prefill.sh`
+   both expanded and compact-resident, 6 fused cells each. Allocation over its
+   186 Opus tensors: 481.98 MiB expanded vs 252.11 MiB compact, **-47.7%**
+   (better than N_out=7's -44.6%, as expected — fewer overlay bytes per block).
+   Arithmetic over artifact shapes, not a measured VRAM drop.
+
+   **Decode parity at length: tokens match, logits do not.** Via
+   `tiny_quant_probe ar-hash --arch qwen3_5 --len 128 --prompt-len 4 --seed 42`:
+
+   |            | expanded             | compact              |
+   |------------|----------------------|----------------------|
+   | token_hash | `0xe08dc73ee518ae66` | `0xe08dc73ee518ae66` |
+   | logit_hash | `0x9fec73050da8e72e` | `0x83d3e5a9628116f8` |
+
+   All 128 free-running greedy tokens are identical, so the difference is small
+   — but it is real, not noise: both modes are bit-stable across repeated runs.
+   What is known so far:
+
+   - **Not the GEMM/GEMV.** `parity_gemm_oq_compact` is bit-identical 24/24. It
+     originally used only power-of-two weight *and* activation scales, which are
+     exact under any multiply order and so could not have caught a rounding or
+     ordering difference; it now also sweeps arbitrary f16 scales and still
+     passes. Both dispatch arms are structurally identical anyway — GEMV is the
+     batched GEMM at n=1 in both, with the same `quantize_act_oq8` — and the two
+     kernels' epilogues are character-for-character the same expression.
+   - **Not the expander's scale.** `oqplus_compact_to_oq8_combined` writes
+     `f16_to_f32(block f16)` into the scale plane, exactly what the compact
+     kernel reads from the block. f16→f32 is exact.
+   - **Present in the very first forward.** At `--prompt-len 1 --len 1` — one
+     token, one B=1 GEMV, no KV accumulation, no batching — the logits already
+     differ. So it is not drift over steps.
+
+   That leaves dispatch-level routing: some op taking a different (still valid)
+   kernel or fallback under `OqCompactG256` than under `Oq8G256`. Localizing it
+   needs per-op instrumentation, which is not yet written. **The flag must not
+   default on until this is explained** — token-identity at 128 steps is
+   reassuring, not proof, and an unexplained numeric difference in the premier
+   quant's residency path is exactly the kind of thing that surfaces later as a
+   quality regression nobody can bisect.
 2. **The shared loader** (`oq8_arch`) covers every family routed through it, so
    it is the highest-leverage single site — but only once each consumer of
    `DType::OqCompactG256` exists for those families' paths.
