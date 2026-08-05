@@ -445,7 +445,7 @@ pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_SCHED_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_SCHED_DEBUG",
     description: "order does NOT report what the daemon actually chose. This trace is the",
-    source: "crates/hipfire-daemon/src/main.rs:1317",
+    source: "crates/hipfire-daemon/src/main.rs:1315",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Selects behavior from recognized values

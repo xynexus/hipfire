@@ -47,27 +47,27 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     return;
                 }
                 match daemon_state.model.as_ref() {
-                    Some(m) if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 => {
-                        emit_generate_batch_prefill_ready(&mut daemon_state.out.sink, &envelope);
-                    }
-                    #[cfg(feature = "arch-lfm2moe")]
-                    Some(m) if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 => {
-                        emit_lfm2_generate_batch_prefill_ready(
-                            &mut daemon_state.out.sink,
-                            &envelope,
-                        );
-                    }
-                    Some(m) => {
-                        let reason = format!(
-                            "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
-                            m.arch_id
-                        );
-                        emit_generate_batch_prefill_unsupported(
-                            &mut daemon_state.out.sink,
-                            &envelope,
-                            &reason,
-                        );
-                    }
+                    // Arch identity and runtime envelope both come from the
+                    // executor seam; this handler holds no arch knowledge.
+                    Some(m) => match batch_executor_for(m.arch_id) {
+                        Some(ex) => match ex.probe(m) {
+                            Ok(()) => ex.emit_ready(&mut daemon_state.out.sink, &envelope),
+                            Err(reason) => emit_generate_batch_prefill_unsupported(
+                                &mut daemon_state.out.sink,
+                                &envelope,
+                                &reason,
+                            ),
+                        },
+                        None => {
+                            let reason =
+                                batch_unsupported_reason("generate_batch_prefill", m.arch_id);
+                            emit_generate_batch_prefill_unsupported(
+                                &mut daemon_state.out.sink,
+                                &envelope,
+                                &reason,
+                            );
+                        }
+                    },
                     None => {
                         emit_generate_batch_prefill_unsupported(
                             &mut daemon_state.out.sink,
@@ -99,37 +99,25 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     return;
                 }
             };
-            if is_qwen35_family_arch_id(m.arch_id) {
-                if let Err(e) = run_generate_batch_prefill_serial_qwen35(
-                    m,
-                    &mut daemon_state.gpu,
-                    &mut daemon_state.out.sink,
-                    &envelope,
-                    daemon_state.pflash_state.is_some(),
-                ) {
-                    emit_error_with_id(&mut daemon_state.out.sink, &envelope.id, e);
-                }
-            } else {
-                #[cfg(feature = "arch-lfm2moe")]
-                if m.arch_id == ARCH_ID_LFM2_MOE {
-                    if let Err(e) = run_generate_batch_prefill_serial_lfm2(
-                        m,
-                        &mut daemon_state.gpu,
+            let executor = match batch_executor_for(m.arch_id) {
+                Some(ex) => ex,
+                None => {
+                    emit_error_with_id(
                         &mut daemon_state.out.sink,
-                        &envelope,
-                    ) {
-                        emit_error_with_id(&mut daemon_state.out.sink, &envelope.id, e);
-                    }
+                        &envelope.id,
+                        batch_unsupported_reason("generate_batch_prefill", m.arch_id),
+                    );
                     return;
                 }
-                emit_error_with_id(
-                    &mut daemon_state.out.sink,
-                    &envelope.id,
-                    format!(
-                        "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
-                        m.arch_id
-                    ),
-                );
+            };
+            if let Err(e) = executor.prefill(
+                m,
+                &mut daemon_state.gpu,
+                &mut daemon_state.out.sink,
+                &envelope,
+                daemon_state.pflash_state.is_some(),
+            ) {
+                emit_error_with_id(&mut daemon_state.out.sink, &envelope.id, e);
             }
         }
         Err(e) => {
@@ -175,27 +163,9 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
                     return;
                 }
             };
-            let preflight_result = if is_qwen35_family_arch_id(m.arch_id) {
-                run_prefix_hash_preflight_qwen35(m, &mut daemon_state.out.sink, &envelope)
-            } else {
-                #[cfg(feature = "arch-lfm2moe")]
-                {
-                    if m.arch_id == ARCH_ID_LFM2_MOE {
-                        run_prefix_hash_preflight_lfm2(m, &mut daemon_state.out.sink, &envelope)
-                    } else {
-                        Err(format!(
-                            "prefix_hash_preflight currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
-                            m.arch_id
-                        ))
-                    }
-                }
-                #[cfg(not(feature = "arch-lfm2moe"))]
-                {
-                    Err(format!(
-                        "prefix_hash_preflight currently supports qwen35/qwen35-moe only (arch_id={})",
-                        m.arch_id
-                    ))
-                }
+            let preflight_result = match batch_executor_for(m.arch_id) {
+                Some(ex) => ex.prefix_hash_preflight(m, &mut daemon_state.out.sink, &envelope),
+                None => Err(batch_unsupported_reason("prefix_hash_preflight", m.arch_id)),
             };
             if let Err(e) = preflight_result {
                 emit_error_with_id(&mut daemon_state.out.sink, &envelope.id, e);
@@ -244,12 +214,22 @@ pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Valu
                     return;
                 }
             };
-            if let Err(e) = run_generate_batch_decode_step_qwen35(
-                m,
-                &mut daemon_state.gpu,
-                &mut daemon_state.out.sink,
-                &envelope,
-            ) {
+            // This path previously called the qwen35 decode unconditionally,
+            // with no arch check — safe only because the server routes eligible
+            // arches. The seam makes the guard structural.
+            let result = match batch_executor_for(m.arch_id) {
+                Some(ex) => ex.decode_step(
+                    m,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.out.sink,
+                    &envelope,
+                ),
+                None => Err(batch_unsupported_reason(
+                    "generate_batch_decode_step",
+                    m.arch_id,
+                )),
+            };
+            if let Err(e) = result {
                 emit_error_with_id(&mut daemon_state.out.sink, &envelope.id, e);
             }
         }

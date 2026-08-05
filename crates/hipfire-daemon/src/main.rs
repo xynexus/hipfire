@@ -75,13 +75,11 @@ use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
 use hipfire_daemon_protocol::{DaemonRequest, EmbeddingInputType, EmbeddingVector, RerankResult};
 #[cfg(feature = "arch-lfm2moe")]
-use hipfire_serving_core::lfm2_prefill;
+use hipfire_serving_core::batch_executor::{batch_executor_for, batch_unsupported_reason};
 use hipfire_serving_core::{
     dummy, events, generate, generate_vl, load, model, output_filter, qwen35_decode,
     qwen35_prefill, request, session,
 };
-#[cfg(feature = "arch-lfm2moe")]
-use lfm2_prefill::*;
 use load::*;
 use model::{CaskConfig, EmbeddingGemmaState, LoadedModel, RAW_OVERRIDE};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
