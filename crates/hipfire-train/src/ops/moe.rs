@@ -103,7 +103,11 @@ pub struct SharedActs {
 /// Done on the host: it is `seq * n_experts` floats once per layer, negligible
 /// beside the expert GEMMs, and keeping the selection here means the backward
 /// can walk the exact same routing without re-deriving it.
-fn route(logits: &[f32], seq: usize, n_experts: usize, top_k: usize) -> (Vec<u32>, Vec<f32>) {
+/// Softmax → top-k → renormalise over the kept set.
+///
+/// Public so `verify_moe_router` can cross-check it against the inference
+/// kernel at the real expert count; nothing else outside this module uses it.
+pub fn route(logits: &[f32], seq: usize, n_experts: usize, top_k: usize) -> (Vec<u32>, Vec<f32>) {
     let mut idx = vec![0u32; seq * top_k];
     let mut gate = vec![0.0f32; seq * top_k];
     for t in 0..seq {
