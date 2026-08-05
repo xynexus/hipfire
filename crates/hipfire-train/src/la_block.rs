@@ -90,7 +90,10 @@ pub fn la_block_forward(
     d: &LinearAttnDims,
 ) -> HipResult<LaBlockActs> {
     let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (2 * hk + hv);
+    // q/k are nk*hd_k wide, NOT nh*hd_k — see LinearAttnDims::n_k_heads. Using
+    // the value-head count here overshoots the real projection width and the
+    // GEMM walks off the end of the weight (memory fault in gemm_f32_train).
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
     let vd = nh * hv;
 
     let xn1 = gpu.zeros(&[seq * h], DType::F32)?;
@@ -152,7 +155,10 @@ pub fn la_block_backward(
     d: &LinearAttnDims,
 ) -> HipResult<(GpuTensor, LaBlockAdjoints)> {
     let (seq, h, nh, hk, hv) = (d.seq, d.h, d.n_heads, d.hd_k, d.hd_v);
-    let qkv_dim = nh * (2 * hk + hv);
+    // q/k are nk*hd_k wide, NOT nh*hd_k — see LinearAttnDims::n_k_heads. Using
+    // the value-head count here overshoots the real projection width and the
+    // GEMM walks off the end of the weight (memory fault in gemm_f32_train).
+    let qkv_dim = 2 * d.nk() * hk + nh * hv;
     let vd = nh * hv;
     let dw_dummy = gpu.zeros(&[h], DType::F32)?;
 
