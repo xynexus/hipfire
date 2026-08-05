@@ -3828,7 +3828,7 @@ pub const ENV_HIPFIRE_QUALITY_COMPARE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANTIZE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANTIZE_BIN",
     description: "Runtime variable controlling quantize bin in hipfire",
-    source: "crates/hipfire-eval/src/executor_tinyquant.rs:267",
+    source: "crates/hipfire-eval/src/executor_tinyquant.rs:271",
 };
 
 /// `HIPFIRE_QUANT_CALIB` — Runtime variable controlling quant calib in hipfire
@@ -4796,7 +4796,7 @@ pub const ENV_HIPFIRE_TINYQUANT_RECORD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TINY_QUANT_PROBE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINY_QUANT_PROBE_BIN",
     description: "Runtime variable controlling tiny quant probe bin in hipfire",
-    source: "crates/hipfire-eval/src/executor_tinyquant.rs:283",
+    source: "crates/hipfire-eval/src/executor_tinyquant.rs:287",
 };
 
 /// `HIPFIRE_TINY_SD_HFQ` — Runtime variable controlling tiny sd hfq in hipfire
