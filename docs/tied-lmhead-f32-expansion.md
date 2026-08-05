@@ -251,6 +251,33 @@ embedding GATHER is untouched (`token_embd` is its own buffer).
 Per-token traffic on llama3.2:1b goes from 1545.5 MB to 1020.1 MB — **2.00x
 FLM's 772.3 MB down to 1.32x**.
 
+### Which models this reaches
+
+Scanning all 43 registered artifacts for a BF16 `embed_tokens` with no
+`lm_head.weight` — the exact condition the branch tests — **9 qualify**:
+
+    Llama-3.2-1B-Instruct--oq4++          Llama-3.2-1B-Instruct--mq4
+    Llama-3.2-1B-Instruct-nc--oq4++       Llama-3.2-1B-Instruct-nc--mq4
+    Llama-3.2-1B-Instruct-nc--oq4++.gfx1151
+    Llama-3.2-1B-Instruct-lut3--oq4++     zaya1-8b-parity.bf16
+    Krea-2-Turbo.dit.oq4.25               Krea-2-Turbo.source
+
+`Llama-3.2-1B-Instruct-nc--oq4++` independently reaches tg128 **89.97** /
+pp512 **96.73**, matching the measured variant's 89.95 / 96.67 — so the gain is
+a property of the dtype path, not of one artifact.
+
+The rest of the registry is untouched by construction: `Q8F16` embeddings (the
+majority — the EmbeddingGemma and L32 families, Gemma-4-31B) and `F16` ones
+(`L32-f16src--*`, `Llama-3.2-1B-Instruct-e16`) still decode to f32, because
+their stored form is not one the GEMV path takes directly. Nothing here has an
+untied `lm_head.weight`, so that branch is unexercised locally.
+
+Two caveats worth stating rather than implying. The Krea-2-Turbo entries are
+diffusion artifacts and likely load through `hipfire-diffusion`, not this
+function, so counting them as beneficiaries is optimistic. And
+`zaya1-8b-parity.bf16` emits one token and stops both before and after — a
+parity fixture, not a working chat model.
+
 ### The measurement trap that hid this for a whole cycle
 
 The first attempt at this change measured **76.09 t/s against 76.07** — a
