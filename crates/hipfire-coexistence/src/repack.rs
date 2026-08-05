@@ -72,6 +72,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut output: Option<PathBuf> = None;
     let mut verify: Option<PathBuf> = None;
     let mut check_only = false;
+    let mut upgrade = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -79,6 +80,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
             "--output" => output = it.next().map(PathBuf::from),
             "--verify" => verify = it.next().map(PathBuf::from),
             "--check" => check_only = true,
+            "--upgrade" => upgrade = true,
             other => return Err(format!("repack: unexpected argument {other:?}").into()),
         }
     }
@@ -88,6 +90,10 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     // remaining evidence they are still what was written.
     if check_only {
         return check(&input);
+    }
+    if upgrade {
+        let output = output.ok_or("repack --upgrade requires --output")?;
+        return upgrade_archive(&input, &output);
     }
     // Verify compares the archive against the source without materialising it.
     // A restore-then-diff needs temp space equal to the whole model, which is
@@ -435,7 +441,11 @@ fn restore(
                     let so = t.get("stored_off").and_then(|v| v.as_u64()).ok_or("no stored_off")?;
                     let sl = t.get("stored_len").and_then(|v| v.as_u64()).ok_or("no stored_len")?;
                     let ln = t.get("len").and_then(|v| v.as_u64()).ok_or("no len")?;
-                    let codec = t.get("codec").and_then(|v| v.as_str()).unwrap_or("raw");
+                    let codec = t
+                        .get("codec")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("raw")
+                        .to_string();
                     f.seek(SeekFrom::Start(so))?;
                     let mut sb = vec![0u8; sl as usize];
                     f.read_exact(&mut sb)?;
@@ -704,5 +714,144 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     if bad > 0 {
         return Err(format!("{bad} payload(s) failed integrity check").into());
     }
+    Ok(())
+}
+
+
+/// Rewrite a v1 archive as v2, adding the checksums it was written without.
+///
+/// Payloads are copied verbatim rather than re-encoded: the bytes are already
+/// correct, and re-encoding would burn CPU to produce the same thing while
+/// widening the window in which something can go wrong. What is added is the
+/// evidence — an XXH3 over each stored payload, and one over the content it
+/// decodes to.
+///
+/// This writes a new file rather than rewriting the index in place. In-place
+/// would be far cheaper, since only the tail changes, but it leaves a window
+/// where the trailer is half-written and the archive reads as corrupt. These
+/// archives are the only copy of their models on an array with no redundancy,
+/// so the cheap path is the wrong one.
+fn upgrade_archive(src: &Path, dst: &Path) -> Result<(), Box<dyn Error>> {
+    let mut f = File::open(src)?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic == MAGIC {
+        return Err(format!("{} is already v2", src.display()).into());
+    }
+    if &magic != MAGIC_V1 {
+        return Err("not a hipfire repack archive".into());
+    }
+    let total = f.metadata()?.len();
+    f.seek(SeekFrom::Start(total - 16))?;
+    let mut b = [0u8; 16];
+    f.read_exact(&mut b)?;
+    let io = u64::from_le_bytes(b[..8].try_into()?);
+    let il = u64::from_le_bytes(b[8..].try_into()?);
+    f.seek(SeekFrom::Start(io))?;
+    let mut ib = vec![0u8; il as usize];
+    f.read_exact(&mut ib)?;
+    let index: serde_json::Value = serde_json::from_slice(&ib)?;
+    let files = index.get("files").and_then(|v| v.as_array()).ok_or("no files")?;
+
+    let mut w = std::io::BufWriter::new(File::create(dst)?);
+    w.write_all(MAGIC)?;
+    let mut pos = MAGIC.len() as u64;
+    let mut out_files: Vec<serde_json::Value> = Vec::new();
+    let (mut n_pay, mut n_dec) = (0usize, 0usize);
+
+    // Copy one payload across, hashing the stored bytes on the way.
+    let mut carry = |f: &mut File, w: &mut dyn Write, off: u64, len: u64, pos: &mut u64|
+     -> std::io::Result<(u64, u64, Vec<u8>)> {
+        f.seek(SeekFrom::Start(off))?;
+        let start = *pos;
+        let mut h = twox_hash::xxhash3_64::Hasher::new();
+        let mut left = len;
+        let mut buf = vec![0u8; CH.min(len.max(1) as usize)];
+        // Only retained when the caller needs to decode it for the content hash.
+        let mut keep = Vec::new();
+        let small = len as usize <= (1 << 30);
+        while left > 0 {
+            let n = (buf.len() as u64).min(left) as usize;
+            f.read_exact(&mut buf[..n])?;
+            std::hash::Hasher::write(&mut h, &buf[..n]);
+            if small {
+                keep.extend_from_slice(&buf[..n]);
+            }
+            w.write_all(&buf[..n])?;
+            left -= n as u64;
+            *pos += n as u64;
+        }
+        Ok((start, std::hash::Hasher::finish(&h), keep))
+    };
+
+    for fe in files {
+        let mut e = fe.clone();
+        match fe.get("kind").and_then(|v| v.as_str()) {
+            Some("raw") => {
+                let off = fe.get("off").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = fe.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                let (start, x, _) = carry(&mut f, &mut w, off, len, &mut pos)?;
+                e["off"] = start.into();
+                e["xxh3"] = x.into();
+                n_pay += 1;
+            }
+            Some("safetensors") => {
+                let hoff = fe.get("header_off").and_then(|v| v.as_u64()).unwrap_or(0);
+                let hlen = fe.get("header_len").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mut tensors = fe
+                    .get("tensors")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for t in tensors.iter_mut() {
+                    let off = t.get("stored_off").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let len = t.get("stored_len").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ln = t.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Owned: the JSON value is mutated below, so no borrow of it
+                    // may still be live.
+                    let codec = t
+                        .get("codec")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("raw")
+                        .to_string();
+                    let (start, x, bytes) = carry(&mut f, &mut w, off, len, &mut pos)?;
+                    t["stored_off"] = start.into();
+                    t["xxh3"] = x.into();
+                    // The content hash needs the decoded bytes. For a raw
+                    // payload the stored bytes are the content.
+                    if !bytes.is_empty() {
+                        let logical = if codec == "bf16h" {
+                            hipfire_primitives::bf16_huff::decode(&bytes, (ln / 2) as usize)
+                        } else {
+                            Some(bytes)
+                        };
+                        if let Some(d) = logical {
+                            t["src_xxh3"] = xxh3(&d).into();
+                            n_dec += 1;
+                        }
+                    }
+                    n_pay += 1;
+                }
+                // Header bytes are part of the payload region; carry them too.
+                let (hstart, _, _) = carry(&mut f, &mut w, hoff, hlen, &mut pos)?;
+                e["header_off"] = hstart.into();
+                e["tensors"] = serde_json::Value::Array(tensors);
+            }
+            _ => {}
+        }
+        out_files.push(e);
+    }
+
+    let new_index = serde_json::to_vec(&serde_json::json!({ "files": out_files }))?;
+    let index_off = pos;
+    w.write_all(&new_index)?;
+    w.write_all(&index_off.to_le_bytes())?;
+    w.write_all(&(new_index.len() as u64).to_le_bytes())?;
+    w.flush()?;
+
+    eprintln!(
+        "repack: upgraded {} -> v2, {n_pay} payload(s) checksummed, {n_dec} content-hashed",
+        src.file_name().unwrap_or_default().to_string_lossy()
+    );
     Ok(())
 }
