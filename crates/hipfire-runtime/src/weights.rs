@@ -199,8 +199,8 @@ fn dispatch_err_to_hip(e: hipfire_dispatch::types::DispatchError) -> hip_bridge:
 /// Pre-flight (no-GPU, no-execute) check: would `weight_gemv` accept this weight
 /// dtype, or refuse it as unsupported? Mirrors `weight_gemv`'s dispatch decision
 /// exactly, so the gate can never pass something the GEMV path then rejects:
-///   - `BF16` → dedicated `gemm_bf16_x_bf16_wmma` path.
-///   - rotation-free dtypes → the `run_auto` path needs a `for_gemv*` kernel key.
+///   - rotation-free dtypes (including `BF16`) → the `run_auto` path needs a
+///     `for_gemv*` kernel key.
 ///   - rotation-needing dtypes → either a dedicated `weight_gemv` arm (handles its
 ///     own rotation/quant) or the generic FWHT-G256 arm (the Layer-1 gate).
 ///
@@ -215,10 +215,10 @@ pub fn gemv_dtype_supported(dtype: DType, has_awq: bool) -> Result<(), hip_bridg
     };
     use DType::*;
 
-    if dtype == BF16 {
-        return Ok(());
-    }
-
+    // BF16 used to short-circuit here because it had no family key and
+    // `weight_gemv` special-cased it to a batch-1 WMMA GEMM. It now registers as
+    // `KernelKey::GemvBf16` -> `gemv_bf16_xf32`, so it goes through the same key
+    // lookup as everything else — which is what keeps this function honest.
     if !dtype_needs_rotation(dtype) {
         // run_auto path: requires a dispatch-family key for its auto variant.
         let key = match dtype_post_rotation_variant(dtype) {
@@ -429,27 +429,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
-        // BF16 weights go through `gemv_bf16_xf32` — bf16 weight, F32
-        // activation, f32 accumulate.
-        //
-        // BF16 previously had no GEMV entry and fell back to a batch-1 WMMA
-        // GEMM, which is built for batched work and collapses at one row:
-        // 15.1 ms against 3.1 ms at 128256 x 2048 on gfx1151, 4.8x.
-        //
-        // The other bf16 GEMVs in the tree (`gemv_bf16_f32` and friends) want
-        // the ACTIVATION in bf16 too, which would round it. That is a real and
-        // avoidable loss — the weight is genuinely bf16 so widening it recovers
-        // nothing, but x arrives at full precision, and staging it down costs
-        // rel rms 3.4e-4 / worst rel 1.6e-3 here. `gemv_bf16_xf32` reads x as
-        // f32 directly at no bandwidth cost: x is k elements against an m x k
-        // weight read.
-        //
-        // See `docs/tied-lmhead-f32-expansion.md` and
-        // `examples/bench_lmhead_dtype.rs`.
-        if w.gpu_dtype == DType::BF16 {
-            gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
-            return gpu.gemv_bf16_xf32(&w.buf, x, y, w.m, w.k);
-        }
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
             .map_err(dispatch_err_to_hip);
