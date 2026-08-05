@@ -46,6 +46,37 @@ i.e. the full BF16 525 MB matrix, every token.
 
 The rescore adds little: top-k rows of bf16 at 4 KB each is well under 1 MB.
 
+### UNVERIFIED — the two-stage path did not activate when tested
+
+The table above is derived from `hipfire inspect` and the env documentation. An
+attempt to confirm it on hardware did not, and the numbers should be treated as
+unconfirmed until it does.
+
+What was tried, and what it showed:
+
+* **Throughput A/B** — `hipfire bench` with and without
+  `HIPFIRE_LMHEAD_TWOSTAGE=q4`: 76.07 vs 76.15 tok/s. A 51% cut in per-token
+  traffic should not be invisible.
+* **Output A/B** — `q4:1` (top-1 shortlist) produced byte-identical text. This
+  turned out to be a WORTHLESS control: `llama.rs:60` documents the path as
+  "greedy-exact (recall@1 = 1.0 at K=32)", so identical argmax output is the
+  design, not evidence of anything.
+* **TTFT probe** — the decisive one. `lmhead_project` builds the coarse tier on
+  first use via `build_lmhead_coarse_bf16`, quantising the 525 MB bf16 head.
+  That cannot be free. Measured TTFT: **59.0 ms unset, 60.2 ms at q4, 56.6 ms at
+  q2** — flat. The coarse build is not running, so the two-stage path is **not
+  activating** on this artifact.
+
+The gate is `w.gpu_dtype == DType::BF16` (`llama.rs:66`). Why it is false here
+is not established. The open possibility that matters is that the runtime may
+already serve the projection from the stored `model.embed_tokens.coarse.weight`
+(CoarseQ4Row, 131.59 MB) rather than the bf16 tier — in which case the DEFAULT
+per-token figure is ~626 MB, not 1020 MB, and the "+32% vs FLM" conclusion is
+wrong in the model's favour.
+
+Both rows below therefore rest on an unconfirmed premise. Settling it needs the
+runtime to report which tensor backs the head, which no current log emits.
+
 ## Decode ceilings at 55.5 GB/s
 
 | configuration | per-token | ceiling |
