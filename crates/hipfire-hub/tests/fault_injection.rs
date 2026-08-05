@@ -282,7 +282,10 @@ async fn dropped_connection_resumes_and_verifies() {
 
     // First attempt drops partway and must keep the partial for resume.
     let first = fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store).await;
-    assert!(first.is_err(), "the dropped attempt should not have succeeded");
+    assert!(
+        first.is_err(),
+        "the dropped attempt should not have succeeded"
+    );
     let part = fx.store.part_path(&file.path);
     let carried = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     assert!(

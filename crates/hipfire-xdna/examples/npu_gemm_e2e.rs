@@ -27,8 +27,7 @@ fn main() {
 
         let x = std::fs::read(format!("{dir}/final.xclbin")).expect("xclbin");
         let i = std::fs::read(format!("{dir}/insts.bin")).expect("insts");
-        let mut gemm =
-            NpuGemm::load_rounds(&x, &i, mt, 4, kc, g, nb, rounds).expect("load");
+        let mut gemm = NpuGemm::load_rounds(&x, &i, mt, 4, kc, g, nb, rounds).expect("load");
         let (bm, bn, bk) = (gemm.block_m(), gemm.block_n(), gemm.block_k());
         assert!(
             m % bm == 0 && n % bn == 0 && k % bk == 0,

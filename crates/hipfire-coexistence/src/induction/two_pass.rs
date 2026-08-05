@@ -162,11 +162,23 @@ fn validate_calibration_inspection(inspection: &Value) -> Result<(), Box<dyn Err
         return Err("native pass produced an artifact without artifact_kind=calibration".into());
     }
     let ledger = metadata.and_then(|m| m.get("read_ledger"));
-    let ledger = ledger.and_then(|v| v.as_object()).ok_or("native calibration artifact has no read_ledger")?;
-    if ledger.get("missing_logical").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+    let ledger = ledger
+        .and_then(|v| v.as_object())
+        .ok_or("native calibration artifact has no read_ledger")?;
+    if ledger
+        .get("missing_logical")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
         return Err("native calibration read ledger has missing tensors".into());
     }
-    if ledger.get("duplicate_logical").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+    if ledger
+        .get("duplicate_logical")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
         return Err("native calibration read ledger has duplicate reads".into());
     }
     Ok(())
@@ -178,14 +190,24 @@ fn validate_calibration_audit(audit: &Value, inspection: &Value) -> Result<(), B
     {
         return Err("native calibration artifact did not pass the structural audit".into());
     }
-    if audit.get("errors").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+    if audit
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
         return Err("native calibration structural audit reports errors".into());
     }
     if audit.get("artifact_fingerprint") != inspection.get("artifact_fingerprint") {
-        return Err("native calibration structural audit fingerprint differs from inspection".into());
+        return Err(
+            "native calibration structural audit fingerprint differs from inspection".into(),
+        );
     }
     if audit.get("index_only").and_then(|v| v.as_bool()) != Some(true)
-        || audit.get("payload_values_checked").and_then(|v| v.as_bool()) != Some(false)
+        || audit
+            .get("payload_values_checked")
+            .and_then(|v| v.as_bool())
+            != Some(false)
     {
         return Err("native calibration structural audit has an unknown evidence scope".into());
     }
@@ -193,14 +215,20 @@ fn validate_calibration_audit(audit: &Value, inspection: &Value) -> Result<(), B
 }
 
 fn validate_quantized_inspection(inspection: &Value) -> Result<(), Box<dyn Error>> {
-    if dig(Some(inspection), &["metadata", "quantization_hash", "value"])
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_none()
+    if dig(
+        Some(inspection),
+        &["metadata", "quantization_hash", "value"],
+    )
+    .and_then(|v| v.as_str())
+    .filter(|s| !s.is_empty())
+    .is_none()
     {
         return Err("quantized artifact has no embedded quantization_hash".into());
     }
-    if dig(Some(inspection), &["metadata", "calibration"]).and_then(|v| v.as_object()).is_none() {
+    if dig(Some(inspection), &["metadata", "calibration"])
+        .and_then(|v| v.as_object())
+        .is_none()
+    {
         return Err("quantized artifact has no embedded calibration provenance".into());
     }
     Ok(())
@@ -280,16 +308,27 @@ pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Re
         &at(inspection, &[md[0], "run_fingerprint"]),
         &at(expected, &["run_fingerprint"]),
     )?;
-    require_equal("family", &at(inspection, &[md[0], "family"]), &at(expected, &["model", "family"]))?;
+    require_equal(
+        "family",
+        &at(inspection, &[md[0], "family"]),
+        &at(expected, &["model", "family"]),
+    )?;
     require_equal(
         "adapter_version",
         &at(inspection, &[md[0], "adapter_version"]),
         &at(expected, &["model", "adapter_version"]),
     )?;
-    require_equal("arch_id", &at(inspection, &[md[0], "arch_id"]), &at(expected, &["model", "arch_id"]))?;
+    require_equal(
+        "arch_id",
+        &at(inspection, &[md[0], "arch_id"]),
+        &at(expected, &["model", "arch_id"]),
+    )?;
     require_equal(
         "source fingerprint",
-        &at(inspection, &[source_manifest[0], source_manifest[1], "fingerprint"]),
+        &at(
+            inspection,
+            &[source_manifest[0], source_manifest[1], "fingerprint"],
+        ),
         &at(expected, &["source_plan", "source_fingerprint"]),
     )?;
     require_equal(
@@ -299,7 +338,10 @@ pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Re
     )?;
     require_equal(
         "source shards",
-        &at(inspection, &[source_manifest[0], source_manifest[1], "shards"]),
+        &at(
+            inspection,
+            &[source_manifest[0], source_manifest[1], "shards"],
+        ),
         &at(expected, &["source_plan", "shards"]),
     )?;
     require_equal(
@@ -314,27 +356,49 @@ pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Re
     )?;
     require_equal(
         "sample fingerprint",
-        &at(inspection, &[samples[0], samples[1], samples[2], "fingerprint"]),
+        &at(
+            inspection,
+            &[samples[0], samples[1], samples[2], "fingerprint"],
+        ),
         &at(expected, &["corpus", "sample_fingerprint"]),
     )?;
     // Computed sample stats: count of samples, and the summed per-sample token count.
-    let sample_list = dig(Some(inspection), &[samples[0], samples[1], samples[2], "samples"])
-        .and_then(|v| v.as_array());
+    let sample_list = dig(
+        Some(inspection),
+        &[samples[0], samples[1], samples[2], "samples"],
+    )
+    .and_then(|v| v.as_array());
     let sample_count = sample_list.map(|a| a.len()).unwrap_or(0);
     let sample_rows: usize = sample_list
         .map(|a| {
             a.iter()
-                .map(|s| s.get("tokens").and_then(|t| t.as_array()).map(|t| t.len()).unwrap_or(0))
+                .map(|s| {
+                    s.get("tokens")
+                        .and_then(|t| t.as_array())
+                        .map(|t| t.len())
+                        .unwrap_or(0)
+                })
                 .sum()
         })
         .unwrap_or(0);
-    require_equal("sample count", &json!(sample_count), &at(expected, &["corpus", "sequences"]))?;
+    require_equal(
+        "sample count",
+        &json!(sample_count),
+        &at(expected, &["corpus", "sequences"]),
+    )?;
     require_equal(
         "sample context",
-        &at(inspection, &[samples[0], samples[1], samples[2], "context_len"]),
+        &at(
+            inspection,
+            &[samples[0], samples[1], samples[2], "context_len"],
+        ),
         &at(expected, &["corpus", "context"]),
     )?;
-    require_equal("sample rows", &json!(sample_rows), &at(expected, &["corpus", "rows"]))?;
+    require_equal(
+        "sample rows",
+        &json!(sample_rows),
+        &at(expected, &["corpus", "rows"]),
+    )?;
 
     require_equal(
         "geometry sequence_batch",
@@ -353,53 +417,88 @@ pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Re
     )?;
     require_equal(
         "job sequence_batch",
-        &at(inspection, &[options[0], options[1], options[2], "sequence_batch"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "sequence_batch"],
+        ),
         &at(expected, &["microbatch", "sequence_batch"]),
     )?;
     require_equal(
         "job time_tile",
-        &at(inspection, &[options[0], options[1], options[2], "time_tile"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "time_tile"],
+        ),
         &at(expected, &["microbatch", "time_tile"]),
     )?;
     require_equal(
         "job max_rows",
-        &at(inspection, &[options[0], options[1], options[2], "max_rows"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "max_rows"],
+        ),
         &at(expected, &["microbatch", "max_rows"]),
     )?;
     require_equal(
         "boundary precision",
-        &at(inspection, &[options[0], options[1], options[2], "boundary_precision"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "boundary_precision"],
+        ),
         &json!("f32"),
     )?;
 
     require_equal(
         "minimum_rows",
-        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "min_rows"]),
+        &at(
+            inspection,
+            &[quota[0], quota[1], quota[2], quota[3], "min_rows"],
+        ),
         &at(expected, &["expert_capture", "minimum_rows"]),
     )?;
     require_equal(
         "target_rows",
-        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "target_rows"]),
+        &at(
+            inspection,
+            &[quota[0], quota[1], quota[2], quota[3], "target_rows"],
+        ),
         &at(expected, &["expert_capture", "target_rows"]),
     )?;
     require_equal(
         "tile_rows",
-        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "tile_rows"]),
+        &at(
+            inspection,
+            &[quota[0], quota[1], quota[2], quota[3], "tile_rows"],
+        ),
         &at(expected, &["expert_capture", "tile_rows"]),
     )?;
     require_equal(
         "sampling",
-        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "sampling"]),
+        &at(
+            inspection,
+            &[quota[0], quota[1], quota[2], quota[3], "sampling"],
+        ),
         &at(expected, &["expert_capture", "sampling"]),
     )?;
     require_equal(
         "required_fraction",
-        &at(inspection, &[options[0], options[1], options[2], "required_expert_fraction"]),
+        &at(
+            inspection,
+            &[
+                options[0],
+                options[1],
+                options[2],
+                "required_expert_fraction",
+            ],
+        ),
         &at(expected, &["expert_capture", "required_fraction"]),
     )?;
     require_equal(
         "coverage_policy",
-        &at(inspection, &[options[0], options[1], options[2], "expert_coverage_policy"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "expert_coverage_policy"],
+        ),
         &at(expected, &["expert_capture", "coverage_policy"]),
     )?;
     require_equal(
@@ -409,7 +508,10 @@ pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Re
     )?;
     require_equal(
         "KLDREF top_k",
-        &at(inspection, &[options[0], options[1], options[2], "kldref_top_k"]),
+        &at(
+            inspection,
+            &[options[0], options[1], options[2], "kldref_top_k"],
+        ),
         &at(expected, &["kldref", "top_k"]),
     )?;
     Ok(())
@@ -433,7 +535,10 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
     let quant_command = cfg.quant_command();
 
     if cfg.dry_run {
-        println!("pass 1/2: hipfire-coexistence calibrate {}", collect_args.join(" "));
+        println!(
+            "pass 1/2: hipfire-coexistence calibrate {}",
+            collect_args.join(" ")
+        );
         println!("pass 2/2: {}", quant_command.join(" "));
         println!(
             "{}",
@@ -462,7 +567,8 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
     }
 
     // Pass 1: calibration (in-process engine), unless reusing an existing artifact.
-    let calibration_command = CalibrateCommand::parse(&collect_args).map_err(|e| format!("calibrate: {e}"))?;
+    let calibration_command =
+        CalibrateCommand::parse(&collect_args).map_err(|e| format!("calibrate: {e}"))?;
 
     // Dry-plan the calibration (CPU-only, before any GPU work) to get the
     // `expected` recipe the reuse rebind checks against. Python computes this in
@@ -474,8 +580,8 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
         )
         .into());
     }
-    let expected_calibration =
-        inspect_calibration_plan(&calibration_command).map_err(|e| format!("calibrate dry-plan: {e}"))?;
+    let expected_calibration = inspect_calibration_plan(&calibration_command)
+        .map_err(|e| format!("calibrate dry-plan: {e}"))?;
 
     if !cfg.skip_calib {
         update_manifest(
@@ -511,7 +617,9 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
                             "message": error.to_string(),
                         })),
                         phase_timings: Some(super::manifest::accumulate_attempt_timing(
-                            &manifest, "calibration", elapsed,
+                            &manifest,
+                            "calibration",
+                            elapsed,
                         )),
                         ..Default::default()
                     },
@@ -541,7 +649,9 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
                     "artifact_complete": true,
                 })),
                 phase_timings: Some(super::manifest::accumulate_attempt_timing(
-                    &manifest, "calibration", elapsed,
+                    &manifest,
+                    "calibration",
+                    elapsed,
                 )),
                 ..Default::default()
             },
@@ -581,7 +691,11 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
     update_manifest(
         &cfg.manifest,
         &recipe,
-        if sufficient { "quantization_ready" } else { "quantization_refused_storage" },
+        if sufficient {
+            "quantization_ready"
+        } else {
+            "quantization_refused_storage"
+        },
         ManifestUpdate {
             calibration: Some(calibration.clone()),
             calibration_audit: Some(calibration_audit.clone()),
@@ -624,7 +738,9 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
                     "message": error.to_string(),
                 })),
                 phase_timings: Some(super::manifest::accumulate_attempt_timing(
-                    &manifest, "quantization", elapsed,
+                    &manifest,
+                    "quantization",
+                    elapsed,
                 )),
                 ..Default::default()
             },
@@ -649,7 +765,9 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
             storage_preflight: Some(storage_preflight),
             quantized: Some(quantized),
             phase_timings: Some(super::manifest::accumulate_attempt_timing(
-                &manifest, "quantization", elapsed,
+                &manifest,
+                "quantization",
+                elapsed,
             )),
             ..Default::default()
         },

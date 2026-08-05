@@ -16,7 +16,6 @@
 pub mod arch;
 pub mod bf16_loader;
 pub mod calibration;
-pub mod llama_calibration;
 pub mod cancel;
 #[cfg(feature = "deltanet")]
 pub mod cask;
@@ -40,6 +39,7 @@ pub mod kv;
 pub mod kv_hier;
 pub mod layered_kv;
 pub mod llama;
+pub mod llama_calibration;
 pub mod llama_spec;
 pub mod load_progress;
 pub mod logging;

@@ -10,7 +10,9 @@
 
 use std::path::Path;
 
-use crate::{cache::Store, fetch_file, list_files, preflight, sha256_file, Error, RepoFile, Result};
+use crate::{
+    cache::Store, fetch_file, list_files, preflight, sha256_file, Error, RepoFile, Result,
+};
 
 /// What a check found for one file.
 #[derive(Debug, PartialEq)]
@@ -63,7 +65,12 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
 }
 
 /// Fetch a revision. Existing correct blobs are skipped, not re-downloaded.
-pub async fn fetch(root: &Path, repo: &str, revision: &str, include: Option<&str>) -> Result<usize> {
+pub async fn fetch(
+    root: &Path,
+    repo: &str,
+    revision: &str,
+    include: Option<&str>,
+) -> Result<usize> {
     let mut files = list_files(repo, revision).await?;
     if let Some(pat) = include {
         files.retain(|f| glob_match(pat, &f.path));
@@ -76,7 +83,10 @@ pub async fn fetch(root: &Path, repo: &str, revision: &str, include: Option<&str
 
     let freed = store.sweep_stale_parts().unwrap_or(0);
     if freed > 0 {
-        eprintln!("hub: swept {:.2} GB of stale .part files", freed as f64 / 1e9);
+        eprintln!(
+            "hub: swept {:.2} GB of stale .part files",
+            freed as f64 / 1e9
+        );
     }
 
     let held = store.held_bytes(files.iter().filter_map(|f| f.sha256.clone()));
@@ -173,11 +183,7 @@ async fn fetch_with_retry(
     const MAX_ATTEMPTS: u32 = 200;
 
     let part = store.part_path(&f.path);
-    let progress = || {
-        std::fs::metadata(&part)
-            .map(|m| m.len())
-            .unwrap_or(0)
-    };
+    let progress = || std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
 
     let mut stalled = 0u32;
     let mut delay = std::time::Duration::from_secs(1);

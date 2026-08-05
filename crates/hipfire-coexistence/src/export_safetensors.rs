@@ -196,8 +196,9 @@ fn export_zaya(hfq: &HfqFile, out_dir: &Path, shard_size: u64) -> Result<(), Box
 /// Map a stored quant type to its safetensors dtype, refusing anything that
 /// would need dequantization.
 fn source_dtype(quant_type: u8, name: &str) -> Result<&'static str, Box<dyn Error>> {
-    let qt = QuantType::from_code(quant_type)
-        .ok_or_else(|| format!("export safetensors: tensor {name:?} has unknown quant code {quant_type}"))?;
+    let qt = QuantType::from_code(quant_type).ok_or_else(|| {
+        format!("export safetensors: tensor {name:?} has unknown quant code {quant_type}")
+    })?;
     match qt {
         QuantType::BF16 => Ok("BF16"),
         QuantType::F16 => Ok("F16"),
@@ -453,10 +454,13 @@ mod tests {
         let header: serde_json::Value = serde_json::from_slice(&blob[8..8 + hlen]).unwrap();
         let data = &blob[8 + hlen..];
 
-        for hf_name in ["model.final_norm.weight", "model.layers.0.input_norm.weight"] {
-            let e = header.get(hf_name).unwrap_or_else(|| {
-                panic!("exported header is missing {hf_name}: {header}")
-            });
+        for hf_name in [
+            "model.final_norm.weight",
+            "model.layers.0.input_norm.weight",
+        ] {
+            let e = header
+                .get(hf_name)
+                .unwrap_or_else(|| panic!("exported header is missing {hf_name}: {header}"));
             assert_eq!(e["dtype"], "BF16", "recoded tensor must present as BF16");
             let s = e["data_offsets"][0].as_u64().unwrap() as usize;
             let end = e["data_offsets"][1].as_u64().unwrap() as usize;

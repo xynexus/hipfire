@@ -48,7 +48,10 @@ pub enum Error {
         got: String,
     },
     /// Refused before writing anything.
-    Space { need: u64, have: u64 },
+    Space {
+        need: u64,
+        have: u64,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -57,10 +60,9 @@ impl std::fmt::Display for Error {
             Error::Fatal(m) => write!(f, "{m}"),
             Error::Retryable(m) => write!(f, "{m} (retryable)"),
             Error::Io(e) => write!(f, "io: {e}"),
-            Error::Digest { path, want, got } => write!(
-                f,
-                "{path}: digest mismatch — expected {want}, got {got}"
-            ),
+            Error::Digest { path, want, got } => {
+                write!(f, "{path}: digest mismatch — expected {want}, got {got}")
+            }
             Error::Space { need, have } => write!(
                 f,
                 "refusing to start: needs {:.1} GB plus margin, {:.1} GB free",

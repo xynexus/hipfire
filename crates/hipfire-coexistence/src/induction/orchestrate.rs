@@ -58,10 +58,18 @@ impl ArtifactLayout {
         }
         Ok(Self {
             model: root.join("models").join(format!("{primary_stem}.hfq")),
-            triattn: root.join("triattn").join(format!("{model_name}.triattn.hfq")),
+            triattn: root
+                .join("triattn")
+                .join(format!("{model_name}.triattn.hfq")),
             calib: root.join("calib").join(format!("{model_name}.calib.hfq")),
-            manifest: root.join("induction").join(&primary_stem).join("manifest.json"),
-            two_pass_manifest: root.join("induction").join(&primary_stem).join("two-pass.json"),
+            manifest: root
+                .join("induction")
+                .join(&primary_stem)
+                .join("manifest.json"),
+            two_pass_manifest: root
+                .join("induction")
+                .join(&primary_stem)
+                .join("two-pass.json"),
             dflash,
         })
     }
@@ -71,7 +79,10 @@ impl ArtifactLayout {
         map.insert("model".to_string(), json!(self.model.to_string_lossy()));
         map.insert("triattn".to_string(), json!(self.triattn.to_string_lossy()));
         map.insert("calib".to_string(), json!(self.calib.to_string_lossy()));
-        map.insert("manifest".to_string(), json!(self.manifest.to_string_lossy()));
+        map.insert(
+            "manifest".to_string(),
+            json!(self.manifest.to_string_lossy()),
+        );
         map.insert(
             "two_pass_manifest".to_string(),
             json!(self.two_pass_manifest.to_string_lossy()),
@@ -130,17 +141,29 @@ pub fn target_stage_complete(layout: &ArtifactLayout, recipe_fingerprint: &str) 
     let fingerprints = manifest.get("fingerprints");
     let audit = manifest.get("calibration_audit");
     let ledger_ok = ledger.and_then(|v| v.as_object()).is_some_and(|l| {
-        !l.get("missing_logical").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
-            && !l.get("duplicate_logical").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+        !l.get("missing_logical")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+            && !l
+                .get("duplicate_logical")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
     });
     let fingerprints_ok = fingerprints.and_then(|v| v.as_object()).is_some_and(|f| {
-        f.get("calibration_artifact").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
-            && f.get("quantized_artifact").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+        f.get("calibration_artifact")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+            && f.get("quantized_artifact")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
     });
     let audit_ok = audit.and_then(|v| v.as_object()).is_some_and(|a| {
         a.get("schema").and_then(|v| v.as_str()) == Some("hipfire.calibration_audit.v1")
             && a.get("valid").and_then(|v| v.as_bool()) == Some(true)
-            && !a.get("errors").and_then(|v| v.as_array()).is_some_and(|e| !e.is_empty())
+            && !a
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .is_some_and(|e| !e.is_empty())
             && a.get("artifact_fingerprint")
                 == fingerprints.and_then(|f| f.get("calibration_artifact"))
     });
@@ -158,7 +181,10 @@ fn required_outputs(stage: &str, layout: &ArtifactLayout) -> Vec<(PathBuf, &'sta
             .iter()
             .map(|(_, path)| (path.clone(), b"HFQM" as &[u8]))
             .collect(),
-        "target" => vec![(layout.calib.clone(), b"HFQM"), (layout.model.clone(), b"HFQM")],
+        "target" => vec![
+            (layout.calib.clone(), b"HFQM"),
+            (layout.model.clone(), b"HFQM"),
+        ],
         "triattn" => vec![(layout.triattn.clone(), b"TRIA")],
         _ => vec![],
     }
@@ -251,11 +277,20 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
     let target = super::preflight::resolve_snapshot(&cfg.target)?;
     let selected: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
-        cfg.stages.iter().filter(|s| seen.insert((*s).clone())).cloned().collect()
+        cfg.stages
+            .iter()
+            .filter(|s| seen.insert((*s).clone()))
+            .cloned()
+            .collect()
     };
 
     let root = python_resolve(&cfg.artifact_root);
-    let layout = ArtifactLayout::build(&root, &cfg.model_name, &cfg.quant_format, &cfg.dflash_formats)?;
+    let layout = ArtifactLayout::build(
+        &root,
+        &cfg.model_name,
+        &cfg.quant_format,
+        &cfg.dflash_formats,
+    )?;
     let recipe_fingerprint = target_recipe_fingerprint(&cfg.recipe_inputs(&layout))?;
 
     // Source preflight (compatibility contract when dflash is selected).
@@ -323,7 +358,10 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
             ],
         },
     });
-    manifest.as_object_mut().unwrap().insert("stages".into(), Value::Object(stages_state.clone()));
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .insert("stages".into(), Value::Object(stages_state.clone()));
     atomic_json(&layout.manifest, &manifest)?;
 
     for stage in &selected {
@@ -336,22 +374,39 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
             if stage == "target" {
                 fold_two_pass(&mut manifest, &layout)?;
             }
-            manifest.as_object_mut().unwrap().insert("stages".into(), Value::Object(stages_state.clone()));
-            manifest.as_object_mut().unwrap().insert("updated_at".into(), json!(utc_now()));
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("stages".into(), Value::Object(stages_state.clone()));
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("updated_at".into(), json!(utc_now()));
             atomic_json(&layout.manifest, &manifest)?;
             continue;
         }
         if stage == "triattn" && !artifact_is_valid(&layout.model, b"HFQM") {
-            return Err("TriAttention requires the completed target HFQ; run the target stage first".into());
+            return Err(
+                "TriAttention requires the completed target HFQ; run the target stage first".into(),
+            );
         }
         for (output, _) in required_outputs(stage, &layout) {
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        stages_state.insert(stage.clone(), json!({"status": "running", "started_at": utc_now()}));
-        manifest.as_object_mut().unwrap().insert("stages".into(), Value::Object(stages_state.clone()));
-        manifest.as_object_mut().unwrap().insert("updated_at".into(), json!(utc_now()));
+        stages_state.insert(
+            stage.clone(),
+            json!({"status": "running", "started_at": utc_now()}),
+        );
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("stages".into(), Value::Object(stages_state.clone()));
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("updated_at".into(), json!(utc_now()));
         atomic_json(&layout.manifest, &manifest)?;
 
         let result = run_stage(stage, cfg, &target, &layout, &recipe_fingerprint);
@@ -360,13 +415,22 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
                 stage.clone(),
                 json!({"status": "failed", "failed_at": utc_now(), "error": error.to_string()}),
             );
-            manifest.as_object_mut().unwrap().insert("stages".into(), Value::Object(stages_state.clone()));
-            manifest.as_object_mut().unwrap().insert("updated_at".into(), json!(utc_now()));
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("stages".into(), Value::Object(stages_state.clone()));
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("updated_at".into(), json!(utc_now()));
             atomic_json(&layout.manifest, &manifest)?;
             return Err(error);
         }
         if !stage_complete(stage, &layout, &recipe_fingerprint) {
-            return Err(format!("{stage} command returned success but its output artifact is invalid").into());
+            return Err(format!(
+                "{stage} command returned success but its output artifact is invalid"
+            )
+            .into());
         }
         let outputs: Vec<Value> = required_outputs(stage, &layout)
             .iter()
@@ -381,8 +445,14 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
         if stage == "target" {
             fold_two_pass(&mut manifest, &layout)?;
         }
-        manifest.as_object_mut().unwrap().insert("stages".into(), Value::Object(stages_state.clone()));
-        manifest.as_object_mut().unwrap().insert("updated_at".into(), json!(utc_now()));
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("stages".into(), Value::Object(stages_state.clone()));
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("updated_at".into(), json!(utc_now()));
         atomic_json(&layout.manifest, &manifest)?;
     }
 
@@ -394,7 +464,8 @@ pub fn run(cfg: &InductConfig) -> Result<Value, Box<dyn Error>> {
 }
 
 fn fold_two_pass(manifest: &mut Value, layout: &ArtifactLayout) -> Result<(), Box<dyn Error>> {
-    let two_pass: Value = serde_json::from_str(&std::fs::read_to_string(&layout.two_pass_manifest)?)?;
+    let two_pass: Value =
+        serde_json::from_str(&std::fs::read_to_string(&layout.two_pass_manifest)?)?;
     let obj = manifest.as_object_mut().unwrap();
     if let Some(reads) = two_pass.get("source_reads") {
         obj.insert("source_reads".into(), reads.clone());
@@ -486,11 +557,15 @@ fn run_stage(
 }
 
 fn read_config(snapshot: &Path) -> Result<Value, Box<dyn Error>> {
-    Ok(serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?)
+    Ok(serde_json::from_str(&std::fs::read_to_string(
+        snapshot.join("config.json"),
+    )?)?)
 }
 
 fn text_config(root: &Value) -> Value {
-    root.get("text_config").cloned().unwrap_or_else(|| root.clone())
+    root.get("text_config")
+        .cloned()
+        .unwrap_or_else(|| root.clone())
 }
 
 fn integer(config: &Value, key: &str) -> Result<i64, String> {
@@ -501,7 +576,11 @@ fn integer(config: &Value, key: &str) -> Result<i64, String> {
 }
 
 fn opt_integer(config: &Value, key: &str) -> Value {
-    config.get(key).and_then(|v| v.as_i64()).map(|v| json!(v)).unwrap_or(Value::Null)
+    config
+        .get(key)
+        .and_then(|v| v.as_i64())
+        .map(|v| json!(v))
+        .unwrap_or(Value::Null)
 }
 
 fn source_summary(snapshot: &Path) -> Result<Value, Box<dyn Error>> {
@@ -514,7 +593,10 @@ fn source_summary(snapshot: &Path) -> Result<Value, Box<dyn Error>> {
     if safetensors.is_empty() {
         return Err(format!("no safetensors files under {}", snapshot.display()).into());
     }
-    let bytes: u64 = safetensors.iter().filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+    let bytes: u64 = safetensors
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
     Ok(json!({
         "snapshot": snapshot.to_string_lossy(),
         "config_sha256": super::recipe::sha256_hex(&config_bytes),
@@ -540,7 +622,10 @@ pub fn preflight_target_only(target: &Path) -> Result<Value, Box<dyn Error>> {
     for field in PREFLIGHT_FIELDS {
         obj.insert(field.into(), opt_integer(&text, field));
     }
-    obj.insert("num_hidden_layers".into(), opt_integer(&text, "num_hidden_layers"));
+    obj.insert(
+        "num_hidden_layers".into(),
+        opt_integer(&text, "num_hidden_layers"),
+    );
     Ok(json!({
         "target": summary,
         "compatibility": "not-applicable (no DFlash stage)",
@@ -591,15 +676,23 @@ pub fn preflight_sources(target: &Path, draft: &Path) -> Result<Value, Box<dyn E
         .ok_or("DFlash target_layer_ids must be an integer list")?;
     let ids: Vec<i64> = target_layer_ids
         .iter()
-        .map(|v| v.as_i64().ok_or("DFlash target_layer_ids must be an integer list"))
+        .map(|v| {
+            v.as_i64()
+                .ok_or("DFlash target_layer_ids must be an integer list")
+        })
         .collect::<Result<_, _>>()?;
     if ids.iter().any(|&l| l < 0 || l >= target_layers) {
-        mismatches.push(format!("target_layer_ids outside target range 0..{}", target_layers - 1));
+        mismatches.push(format!(
+            "target_layer_ids outside target range 0..{}",
+            target_layers - 1
+        ));
     }
     let mask_token_id = integer(&json!(dflash_config), "mask_token_id")?;
     let vocab = integer(&target_text, "vocab_size")?;
     if !(0..vocab).contains(&mask_token_id) {
-        mismatches.push(format!("mask_token_id {mask_token_id} is outside the target vocabulary"));
+        mismatches.push(format!(
+            "mask_token_id {mask_token_id} is outside the target vocabulary"
+        ));
     }
     if !mismatches.is_empty() {
         return Err(format!("target/DFlash incompatibility: {}", mismatches.join("; ")).into());
@@ -619,7 +712,10 @@ pub fn preflight_sources(target: &Path, draft: &Path) -> Result<Value, Box<dyn E
         for field in PREFLIGHT_FIELDS {
             obj.insert(field.into(), json!(integer(&draft_config, field)?));
         }
-        obj.insert("num_hidden_layers".into(), json!(integer(&draft_config, "num_hidden_layers")?));
+        obj.insert(
+            "num_hidden_layers".into(),
+            json!(integer(&draft_config, "num_hidden_layers")?),
+        );
         obj.insert("num_target_layers".into(), json!(draft_target_layers));
         obj.insert("block_size".into(), json!(block_size));
         obj.insert("mask_token_id".into(), json!(mask_token_id));

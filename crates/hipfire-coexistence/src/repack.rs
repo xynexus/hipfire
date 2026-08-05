@@ -288,7 +288,11 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
     w.flush()?;
 
     let total = std::fs::metadata(out)?.len();
-    let src: u64 = paths.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
+    let src: u64 = paths
+        .iter()
+        .filter_map(|p| p.metadata().ok())
+        .map(|m| m.len())
+        .sum();
     eprintln!(
         "repack: {} files ({} shards, {} verbatim), {} BF16 tensors recoded \
          {:.2} GB -> {:.2} GB; archive {:.2} GB vs source {:.2} GB ({:.4}x)",
@@ -309,7 +313,9 @@ fn collect(root: &Path, dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     if depth > 6 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -380,10 +386,16 @@ fn restore(
     f.read_exact(&mut ib)?;
     let index: serde_json::Value = serde_json::from_slice(&ib)?;
 
-    let files = index.get("files").and_then(|v| v.as_array()).ok_or("archive index has no files")?;
+    let files = index
+        .get("files")
+        .and_then(|v| v.as_array())
+        .ok_or("archive index has no files")?;
     let mut n = 0usize;
     for fe in files {
-        let rel = fe.get("path").and_then(|v| v.as_str()).ok_or("index entry has no path")?;
+        let rel = fe
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("index entry has no path")?;
         let mut o: Sink = match (out_dir, check) {
             (Some(d), _) => {
                 let dest = d.join(rel);
@@ -408,8 +420,14 @@ fn restore(
 
         match fe.get("kind").and_then(|v| v.as_str()) {
             Some("raw") => {
-                let off = fe.get("off").and_then(|v| v.as_u64()).ok_or("raw entry has no off")?;
-                let len = fe.get("len").and_then(|v| v.as_u64()).ok_or("raw entry has no len")?;
+                let off = fe
+                    .get("off")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("raw entry has no off")?;
+                let len = fe
+                    .get("len")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("raw entry has no len")?;
                 f.seek(SeekFrom::Start(off))?;
                 let mut left = len;
                 let mut buf = vec![0u8; CH.min(len.max(1) as usize)];
@@ -421,8 +439,14 @@ fn restore(
                 }
             }
             Some("safetensors") => {
-                let hoff = fe.get("header_off").and_then(|v| v.as_u64()).ok_or("no header_off")?;
-                let hlen = fe.get("header_len").and_then(|v| v.as_u64()).ok_or("no header_len")?;
+                let hoff = fe
+                    .get("header_off")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("no header_off")?;
+                let hlen = fe
+                    .get("header_len")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("no header_len")?;
                 f.seek(SeekFrom::Start(hoff))?;
                 let mut hdr = vec![0u8; hlen as usize];
                 f.read_exact(&mut hdr)?;
@@ -430,10 +454,19 @@ fn restore(
                 o.write_all(&hdr)?;
                 // Tensors were written in offset order, so writing them back in
                 // index order reproduces the blob exactly.
-                let tensors = fe.get("tensors").and_then(|v| v.as_array()).ok_or("no tensors")?;
+                let tensors = fe
+                    .get("tensors")
+                    .and_then(|v| v.as_array())
+                    .ok_or("no tensors")?;
                 for t in tensors {
-                    let so = t.get("stored_off").and_then(|v| v.as_u64()).ok_or("no stored_off")?;
-                    let sl = t.get("stored_len").and_then(|v| v.as_u64()).ok_or("no stored_len")?;
+                    let so = t
+                        .get("stored_off")
+                        .and_then(|v| v.as_u64())
+                        .ok_or("no stored_off")?;
+                    let sl = t
+                        .get("stored_len")
+                        .and_then(|v| v.as_u64())
+                        .ok_or("no stored_len")?;
                     let ln = t.get("len").and_then(|v| v.as_u64()).ok_or("no len")?;
                     let codec = t.get("codec").and_then(|v| v.as_str()).unwrap_or("raw");
                     f.seek(SeekFrom::Start(so))?;
@@ -506,7 +539,9 @@ fn restore(
             let mut extra: Vec<(u64, String)> = Vec::new();
             let mut walk = vec![src.to_path_buf()];
             while let Some(d) = walk.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else { continue };
+                let Ok(rd) = std::fs::read_dir(&d) else {
+                    continue;
+                };
                 for e in rd.flatten() {
                     let path = e.path();
                     if path.is_dir() {
@@ -525,8 +560,7 @@ fn restore(
             if !extra.is_empty() {
                 extra.sort_by(|a, b| b.0.cmp(&a.0));
                 let bytes: u64 = extra.iter().map(|e| e.0).sum();
-                let sample: Vec<&str> =
-                    extra.iter().take(3).map(|e| e.1.as_str()).collect();
+                let sample: Vec<&str> = extra.iter().take(3).map(|e| e.1.as_str()).collect();
                 return Err(format!(
                     "verify: {} source file(s) are NOT in the archive ({:.2} GB). Deleting the source would lose them. e.g. {:?}",
                     extra.len(),
@@ -575,7 +609,6 @@ impl Write for Sink {
     }
 }
 
-
 /// XXH3-64 over a byte range of the archive, streamed.
 fn hash_range(f: &mut File, off: u64, len: u64) -> std::io::Result<u64> {
     f.seek(SeekFrom::Start(off))?;
@@ -614,16 +647,24 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     let mut ib = vec![0u8; il as usize];
     f.read_exact(&mut ib)?;
     let index: serde_json::Value = serde_json::from_slice(&ib)?;
-    let files = index.get("files").and_then(|v| v.as_array()).ok_or("no files")?;
+    let files = index
+        .get("files")
+        .and_then(|v| v.as_array())
+        .ok_or("no files")?;
 
     let (mut checked, mut unchecked, mut bad, mut bytes) = (0usize, 0usize, 0usize, 0u64);
     let mut decoded = 0usize;
 
     for fe in files {
         let path = fe.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let mut tally = |res: std::io::Result<u64>, want: Option<u64>, what: &str,
-                         checked: &mut usize, unchecked: &mut usize, bad: &mut usize,
-                         bytes: &mut u64, len: u64| match res {
+        let mut tally = |res: std::io::Result<u64>,
+                         want: Option<u64>,
+                         what: &str,
+                         checked: &mut usize,
+                         unchecked: &mut usize,
+                         bad: &mut usize,
+                         bytes: &mut u64,
+                         len: u64| match res {
             Err(e) => {
                 println!("  READ-ERROR {path} {what}: {e}");
                 *bad += 1;
@@ -645,8 +686,16 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
                 let off = fe.get("off").and_then(|v| v.as_u64()).unwrap_or(0);
                 let len = fe.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
                 let r = hash_range(&mut f, off, len);
-                tally(r, fe.get("xxh3").and_then(|v| v.as_u64()), "",
-                      &mut checked, &mut unchecked, &mut bad, &mut bytes, len);
+                tally(
+                    r,
+                    fe.get("xxh3").and_then(|v| v.as_u64()),
+                    "",
+                    &mut checked,
+                    &mut unchecked,
+                    &mut bad,
+                    &mut bytes,
+                    len,
+                );
             }
             Some("safetensors") => {
                 if let Some(ts) = fe.get("tensors").and_then(|v| v.as_array()) {
@@ -655,8 +704,16 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
                         let len = t.get("stored_len").and_then(|v| v.as_u64()).unwrap_or(0);
                         let nm = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let r = hash_range(&mut f, off, len);
-                        tally(r, t.get("xxh3").and_then(|v| v.as_u64()), nm,
-                              &mut checked, &mut unchecked, &mut bad, &mut bytes, len);
+                        tally(
+                            r,
+                            t.get("xxh3").and_then(|v| v.as_u64()),
+                            nm,
+                            &mut checked,
+                            &mut unchecked,
+                            &mut bad,
+                            &mut bytes,
+                            len,
+                        );
                         // Decode and check the content hash: proves the payload
                         // still reproduces the original bytes, not merely that
                         // it is unchanged since it was written.
