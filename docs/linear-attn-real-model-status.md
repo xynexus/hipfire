@@ -315,7 +315,36 @@ projection is exact — `out_dim` 8192 worst 3.8e-6 against magnitude 26.8, 4096
 worst 2.9e-6, the two 32-wide ones ~1e-6. So the GEMM path is not
 dimension-sensitive and is eliminated.
 
-## The defect is GQA linear attention, and nothing else
+## RETRACTED: GQA is not the defect
+
+The section below concluded, by elimination, that `n_k < n_v` was the defect,
+because it was the only structural feature neither passing control had. Tested
+directly, it is not.
+
+A GQA fixture built by slicing `qwen3_5_moe-tiny`'s layer-0 QKV projection down
+to a single key head — Q head 0, K head 0, both V heads, so `n_k=1 < n_v=2`,
+with `conv1d.weight` sliced to the same rows and `linear_num_key_heads` set to
+1 — gives **cos +1.0000**, ‖mine‖ 59.01 against ‖ref‖ 59.01. GQA linear
+attention reproduces exactly.
+
+That was an argument from elimination, and it was wrong. The list of
+"structural features the failing case has and the passing ones don't" was only
+as good as my inventory of features, and scale is not on it. Note also that
+both the GQA fixture and the 35B run repeat ratio 2, so even the ratio is
+shared.
+
+With structure now excluded — the 35B's layer-0 tensor names and shapes are
+identical to the fixture's, modulo size — what is left between a passing
+testbed and the failing one is **pure scale**: h 256 -> 2048, value heads
+2 -> 32, qkv 512 -> 8192, experts 8 -> 256, top-k 2 -> 8, intermediate
+128 -> 512, vocab 1024 -> 248320.
+
+The next step is a bisect over those, one dimension at a time, using a
+synthetic 1-layer model generated at chosen dims. Both sides read identical
+weights, so random init is fine here — it is what the two cos-1.0000 controls
+already are.
+
+## Superseded: the elimination argument for GQA
 
 Two controls settle it. The 1-layer testbed methodology had only ever been
 validated at FOUR layers on the 0.8B, so the harness itself was unproven at the
