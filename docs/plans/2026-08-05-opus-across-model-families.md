@@ -149,8 +149,36 @@ Sequence, cheapest-first:
      differ. So it is not drift over steps.
 
    That leaves dispatch-level routing: some op taking a different (still valid)
-   kernel or fallback under `OqCompactG256` than under `Oq8G256`. Localizing it
-   needs per-op instrumentation, which is not yet written. **The flag must not
+   kernel or fallback under `OqCompactG256` than under `Oq8G256`. There is a
+   concrete, verified admission gap of exactly that shape — `OqCompactG256` was
+   wired into the generic GEMV/GEMM dispatch and into
+   `dense_prefill_weight_unsupported_reason`, but NOT into qwen35's fused/
+   specialised arms, which still match `Oq8G256` alone:
+
+   - `is_batchable_la`'s `oq8_with_wmma` gate (`qwen35/mod.rs`) — the same
+     admission gate whose comment records that missing an `Oq8G256` arm once cost
+     every oq8 model 12x on prefill (86 vs 1046 tok/s).
+   - `KernelKey::FusedGateUpOq8G256` (`prefill_chunk.rs`), and the `is_oq8` /
+     `wo_is_oq8` fused-QKV and fused-wo predicates in the same file.
+   - the routed-expert `gemv_oq8g256_moe_*_indexed_batched` arms.
+
+   **This gap is real and worth closing on its own merits, but it is NOT yet
+   proven to be the cause of the logit difference.** The control says otherwise
+   so far: forcing the expanded path off batched prefill
+   (`HIPFIRE_OQ8_BATCHED_PREFILL=0`) changed its `ar-hash` wall time not at all
+   (20.15s vs 20.17s at `--len 288 --prompt-len 256`), i.e. the batched path is
+   not engaged in this probe, so the gap cannot explain a divergence the probe
+   shows. Confirming or killing it needs per-op instrumentation, not yet written.
+
+   Cost of compact residency on that same probe: **26.48s vs 20.17s, ~31%
+   slower**, which is the expected price of decoding nibbles and scanning the
+   overlay per tile rather than reading a dense int8 plane. That is the tradeoff
+   against -47.7% allocation, and it is a reason to keep the flag opt-in for
+   latency-sensitive paths even once the divergence is explained.
+
+   (Method note: `tiny_quant_probe ar-hash` requires `--prompt-len <= --len`; an
+   invalid pair exits non-zero with empty hashes, which reads as a match if the
+   exit code is not checked.) **The flag must not
    default on until this is explained** — token-identity at 128 steps is
    reassuring, not proof, and an unexplained numeric difference in the premier
    quant's residency path is exactly the kind of thing that surfaces later as a
