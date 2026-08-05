@@ -41,10 +41,18 @@ as "the kernels this system uses" is reading a hardcoded sweep, and the sweep
 does not include the default KV format. Worth either widening to the formats
 `model-support.toml` admits, or renaming what it emits so the sweep is visible.
 
-**Not verified:** whether `gpu.profile()` reports only compiled kernels or
-enumerates a static registry. If the latter, the precompile loop is
-inconsequential and this entry downgrades to cosmetic. That check is one read of
-`Gpu::profile` and was not done here — flagged rather than assumed.
+**Verified — the entry stands.** `Gpu::profile` passes
+`self.compiler.compiled_kernels()` to `profile_kernels_with_hint`, which
+iterates exactly that map (`profiler.rs:276`). `compiled_kernels()` returns
+`&self.compiled`, the **per-`Compiler` in-process map** populated by `compile()`
+— not a scan of the on-disk kernel cache. So the reported kernel list is
+precisely what this process has compiled, which for a fresh daemon is the
+hardcoded precompile loop plus whatever the loaded model touched.
+
+The consequence is concrete rather than theoretical: run `profile` on a daemon
+serving a `kvarn4` + `oq4` model and the KV kernels it actually uses are absent
+from the output unless the model itself compiled them, while `hfq4`/`hfq6`/`q8`
+at head_dim 128 and 256 appear whether or not anything uses them.
 
 ## Other hunt sites, already covered
 
