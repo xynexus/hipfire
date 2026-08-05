@@ -2205,11 +2205,17 @@ pub(crate) fn forward_prefill_chunk(
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
     let q8_wmma_arch = gpu.arch_caps.has_wmma();
     let f16_prefill_wmma = qwen35_f16_prefill_wmma_enabled(gpu);
-    let fa_batched_ok = (!kv_cache.quantized
+    // Split the two halves so a failure can be NAMED. When FA layers fall back
+    // they go per-token through `run_fa_layer_body`, and the only outward sign
+    // is a GEMV-dominated kernel histogram — measured 43:1 against GEMM on
+    // Qwen3.5-0.8B--mq4. Which of the two conditions failed is what turns that
+    // into something actionable, and it is invisible from outside.
+    let fa_kv_ok = !kv_cache.quantized
         || kv_cache.quant_q8
         || kv_cache.quant_asym4
         || kv_cache.quant_asym3
-        || kv_cache.quant_asym2)
+        || kv_cache.quant_asym2;
+    let fa_batched_ok = fa_kv_ok
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) => {
                 is_batchable_la(l.wq.gpu_dtype, fa_arch)
@@ -2230,6 +2236,26 @@ pub(crate) fn forward_prefill_chunk(
             }
             _ => true, // LA layers don't gate this check
         });
+
+    // Reported under HIPFIRE_KERNEL_TRACE so it lands beside the histogram that
+    // motivates the question, and costs nothing otherwise.
+    if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
+        let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
+            LayerWeights::FullAttn(l) => {
+                (!is_batchable_la(l.wq.gpu_dtype, fa_arch)).then(|| format!("{:?}", l.wq.gpu_dtype))
+            }
+            _ => None,
+        });
+        eprintln!(
+            "[kernel-trace] FA layers take the PER-TOKEN fallback: kv_ok={fa_kv_ok}              (quantized={}, q8={}, asym4={}, asym3={}, asym2={}), first non-batchable              FA weight dtype={}",
+            kv_cache.quantized,
+            kv_cache.quant_q8,
+            kv_cache.quant_asym4,
+            kv_cache.quant_asym3,
+            kv_cache.quant_asym2,
+            bad_dtype.as_deref().unwrap_or("<none — weights all batchable>")
+        );
+    }
     // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
     // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
     // captured value would be stale on replay — the attention kernel would
