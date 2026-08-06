@@ -35,6 +35,44 @@ compute.
 
 ---
 
+## P1 — Codebook residual overlay — **step 1 CLEARS, and it deletes the codebook**
+
+**Outcome.** `examples/opus_codebook_residual_study.rs` (Qwen3.5-0.8B, 2048
+groups × {down,o,gate,q}_proj, both arms at 136 B/group):
+
+| arm | down | o | gate | q |
+|---|---|---|---|---|
+| 16-entry Lloyd codebook | +6.12% | +6.31% | +6.25% | +5.41% |
+| **raw signed Δ in [-8,7]** | **+6.30%** | **+6.36%** | **+6.30%** | **+6.39%** |
+
+Step 1's gate is cleared: 4 approximate corrections beat 3 exact ones by ~6%
+weight SSE, with the 4-set selected against the post-codebook reconstruction as
+the plan required.
+
+**But the codebook loses to a raw 4-bit delta on every tensor**, so steps 2–4's
+codebook machinery is dead weight. The reason is in the data: the Δ pool holds
+only 17–19 distinct values, because Δ = q8 − q4 is bounded by the ±7 clamp and
+the FWHT leaves few positions far outside it. A raw i4 covers that core exactly
+and clips a rare tail; Lloyd instead spends centroids on the frequent small
+deltas and mis-serves the tail (hence q_proj's 5.41%, its pool being the widest
+at 19 values and only 91.2% exactly hit).
+
+The raw arm also matches **N=4-exact** to four decimals (e.g. down_proj 0.264185
+vs 0.264178), so 4 bits costs essentially nothing against a full i8 here.
+
+**Revised plan.** Drop step 2 (the `<name>.oqvq` sidecar) and the codebook half
+of step 4. What remains is one new qt whose overlay entry is `(u8 index, i4
+delta)` — 4 entries in the same 6 B the current 3 entries use — plus step 5's
+golden round-trip and KLD gate. This *is* the "structured 4-bit code" endgame the
+section below prefers, arrived at by measurement rather than taste, and it needs
+no per-tensor state at all.
+
+Still ungated: the 3% KLD criterion at matched bytes. Weight SSE has disagreed
+with KLD in this exact experiment before (d77fa637a), so the format work should
+wait behind that run.
+
+Original plan below.
+
 ## P1 — Codebook residual overlay
 
 **Now:** overlay entry is `(u8 index, i8 value)` = 2 B/outlier;
@@ -474,8 +512,10 @@ it will contaminate the attribution.
    where any per-channel saliency is provably constant; see E1 above. Note this
    also constrains E3 and E5: nothing that ranks positions *within* a rotated
    group can use a per-input-channel signal.
-4. **P1 + P3** as one commit, gated on P1's step-1 study, and preferring the
-   structured-bitplane code over a free codebook.
+4. **P1 + P3** as one commit — P1's step-1 study is **done and clears**, and it
+   settled the "structured code vs free codebook" question empirically: raw i4
+   Δ wins outright, so there is no codebook and no sidecar to build. Next
+   action here is the KLD run at matched bytes, not encoder work.
 5. **E3 / E5** — the platform-premise work; largest payoff, largest cost.
 6. **E2, E4** — probe-to-kill and deferred-until-the-format-stabilises respectively.
 

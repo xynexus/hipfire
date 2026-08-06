@@ -450,6 +450,16 @@ valid for new artifacts.
   weight-bandwidth-bound (small batch).
 - **gfx1151 int4 is 2.0× int8 at ISA rate** — the W4A4 premise holds; an earlier
   ~1.0× measurement was a bandwidth-bound artifact.
+- **The overlay's Δ fits in 4 bits, so trade correction PRECISION for correction
+  DENSITY.** `q8 − q4` is bounded by the ±7 clamp, and after the FWHT a tensor's
+  whole pool of promoted deltas holds only 17–19 distinct values. Spending 4 bits
+  instead of 8 on each correction buys a 4th promoted position in the same 136 B
+  block, worth ~6% weight SSE over the shipped `N_out=3` exact form — and a RAW
+  signed Δ in [-8,7] beats a 16-entry Lloyd codebook fitted to the same pool on
+  every tensor measured, so no codebook or per-tensor sidecar is warranted.
+  Reproduce with `examples/opus_codebook_residual_study.rs`. Select the promoted
+  set against the post-correction reconstruction, not the int8-upgrade gain, or
+  the format is understated. Not yet confirmed by KLD.
 - **Nothing that ranks positions inside a rotated group can use a per-channel
   saliency.** The signed Hadamard's entries all share one magnitude, so for any
   per-input-channel weighting `s`, `[R·diag(s)·Rᵀ]ᵢᵢ = mean(s)` at every
