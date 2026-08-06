@@ -23,10 +23,31 @@ use hipfire_runtime::weights::WeightTensor;
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
+/// Read a tensor's bytes, decoding any lossless bf16 recoding to plain bf16.
+///
+/// `--format bf16` applies `Bf16Huff` (qt=50) by default, and
+/// `HIPFIRE_BF16L3_RESIDENT` leaves `Bf16Lut3` (qt=49) packed, so a plain bf16
+/// artifact reaches this loader with a quant code none of the callers' match
+/// arms know. Decoding here rather than in each arm means the arms only ever
+/// see logical codes — a new caller cannot forget the case.
 fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
     let (info, data) = hfq
         .tensor_data_vec(name)
         .ok_or_else(|| format!("lfm2moe: tensor not found in HFQ: {name}"))?;
+    if matches!(info.quant_type, 49 | 50) {
+        // Element count from the shape, NOT `data_size`: a tensor that reaches
+        // here is one `expand_bf16_index` declined to expand, so its
+        // `data_size` is still the packed physical length.
+        let n: usize = info.shape.iter().map(|&d| d as usize).product();
+        let logical = hipfire_runtime::hfq::decode_bf16_packed(info.quant_type, &data, n)
+            .ok_or_else(|| {
+                format!(
+                    "lfm2moe: failed to decode recoded tensor {name} (qt={})",
+                    info.quant_type
+                )
+            })?;
+        return Ok((16, logical));
+    }
     Ok((info.quant_type, data))
 }
 

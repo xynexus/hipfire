@@ -162,10 +162,9 @@ impl EmbeddingGemmaWeights {
         cfg: &EmbeddingGemmaConfig,
         gpu: &mut Gpu,
     ) -> Result<Self, String> {
-        let (embedding_info, embedding_data) = hfq
-            .tensor_data_vec("model.embed_tokens.weight")
-            .ok_or_else(|| "embeddinggemma: model.embed_tokens.weight not found".to_string())?;
-        let host_embedding = match embedding_info.quant_type {
+        let (embedding_qt, embedding_data) =
+            read_tensor(hfq, "model.embed_tokens.weight", "host embedding")?;
+        let host_embedding = match embedding_qt {
             1 => HostEmbedding::F16(embedding_data),
             3 => HostEmbedding::Q8F16(embedding_data),
             16 => HostEmbedding::Bf16(embedding_data),
@@ -210,10 +209,9 @@ impl EmbeddingGemmaWeights {
         cfg: &EmbeddingGemmaConfig,
         gpu: &mut Gpu,
     ) -> Result<Self, String> {
-        let (embedding_info, embedding_data) = hfq
-            .tensor_data_vec("model.embed_tokens.weight")
-            .ok_or_else(|| "embeddinggemma: model.embed_tokens.weight not found".to_string())?;
-        let host_embedding = match embedding_info.quant_type {
+        let (embedding_qt, embedding_data) =
+            read_tensor(hfq, "model.embed_tokens.weight", "host embedding")?;
+        let host_embedding = match embedding_qt {
             1 => HostEmbedding::F16(embedding_data),
             16 => HostEmbedding::Bf16(embedding_data),
             quant_type => {
@@ -284,6 +282,34 @@ pub fn gemma3_config(cfg: &EmbeddingGemmaConfig) -> Gemma3Config {
     }
 }
 
+/// Read a tensor's bytes, decoding any lossless bf16 recoding to plain bf16.
+///
+/// `--format bf16` applies `Bf16Huff` (qt=50) by default, and
+/// `HIPFIRE_BF16L3_RESIDENT` leaves `Bf16Lut3` (qt=49) packed, so a plain bf16
+/// artifact reaches this loader with a quant code none of the match arms below
+/// know. Decoding here rather than in each arm means they only ever see
+/// logical codes — a new caller cannot forget the case.
+fn read_tensor(hfq: &HfqFile, name: &str, what: &str) -> Result<(u8, Vec<u8>), String> {
+    let (info, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("embeddinggemma: {what} not found: {name}"))?;
+    if matches!(info.quant_type, 49 | 50) {
+        // Element count from the shape, NOT `data_size`: a tensor that reaches
+        // here is one `expand_bf16_index` declined to expand, so its
+        // `data_size` is still the packed physical length.
+        let n: usize = info.shape.iter().map(|&d| d as usize).product();
+        let logical = hipfire_runtime::hfq::decode_bf16_packed(info.quant_type, &data, n)
+            .ok_or_else(|| {
+                format!(
+                    "embeddinggemma: failed to decode recoded tensor {name} (qt={})",
+                    info.quant_type
+                )
+            })?;
+        return Ok((16, logical));
+    }
+    Ok((info.quant_type, data))
+}
+
 /// Load a Dense head weight matrix to a host `Vec<f32>` (dequantizing f16/bf16).
 /// The head is small and correctness-critical, so it never lives on GPU.
 fn load_dense_head_f32(
@@ -292,11 +318,9 @@ fn load_dense_head_f32(
     out_features: usize,
     in_features: usize,
 ) -> Result<Vec<f32>, String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("embeddinggemma: Dense tensor not found: {name}"))?;
+    let (quant_type, data) = read_tensor(hfq, name, "Dense tensor")?;
     let expected = out_features * in_features;
-    let w: Vec<f32> = match info.quant_type {
+    let w: Vec<f32> = match quant_type {
         1 => data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
