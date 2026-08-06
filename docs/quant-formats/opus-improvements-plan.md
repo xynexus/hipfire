@@ -299,7 +299,31 @@ skip — the on-disk gain alone does not justify a format number.
 
 ---
 
-## P4 — Cross-group promotion budget
+## P4 — Cross-group promotion budget — **CLOSED (negative)**
+
+**Outcome.** Step 1 ran (`examples/opus_group_budget_study.rs`, Qwen3.5-0.8B,
+2048 groups × {down,o,gate,q}_proj) and step 2's 5% gate rejects it — not
+narrowly, and not for want of a better allocator.
+
+| arm, at equal bytes | down | o | gate | q |
+|---|---|---|---|---|
+| free offsets (3 slots/group) | +7.2% | +5.9% | +9.0% | +11.1% |
+| u32 offsets (1 slot/group) | −9.0% | −11.9% | −9.3% | −6.9% |
+
+The allocation freedom is real — it is the *address* that is not affordable. A
+`[u32; n_groups]` prefix costs 4 B against a 136 B block, which is 2 of the 3
+overlay slots; the per-group arm then loses to uniform `N_out=3` outright. The
+negative row is a Lagrangian bound, so it holds against any allocator, not just
+the study's greedy (the SSE curves are non-convex — the joint selector re-fits
+the group scale at each N — so greedy alone could not have closed this).
+
+Break-even is between 2 and 3 bytes of addressing. 2 B caps a tensor at 65535
+blocks and 1 B cannot address a block at all, so there is no cheaper index that
+both works and wins. Step 3 (variable-length blocks) is therefore not worth
+starting, and step 4's consolation prize is already shipped as
+`HIPFIRE_OUTLIERS_BY_LAYER`. Recorded in `opus-quant.md` §7.
+
+Original plan below, kept for the reasoning.
 
 **Now:** N_out is constant per tensor. `HIPFIRE_OUTLIERS_BY_LAYER` already varies
 it per tensor by name suffix (`down_proj:7,o_proj:3,default:1`) and
@@ -415,9 +439,10 @@ it will contaminate the attribution.
 1. ~~**P2**~~ — **done.** Free, exact, non-regressive, and it turned out to be the
    precondition for measuring the rest: the old selector flattened the payoff of
    every "spend more on corrections" idea past N_out=7.
-2. **P4 step 1** — a ~100-line study that either kills the most expensive item here
-   or justifies it. Promoted above E1 because P2 moved the knee it measures.
-3. **E1** — reuses a saliency signal we already compute.
+2. ~~**P4 step 1**~~ — **done, and it killed the item.** The offset prefix costs
+   more than per-group allocation is worth; see P4 above. The most expensive
+   item in this document is off the table.
+3. **E1** — reuses a saliency signal we already compute. **Now next.**
 4. **P1 + P3** as one commit, gated on P1's step-1 study, and preferring the
    structured-bitplane code over a free codebook.
 5. **E3 / E5** — the platform-premise work; largest payoff, largest cost.

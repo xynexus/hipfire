@@ -450,5 +450,18 @@ valid for new artifacts.
   weight-bandwidth-bound (small batch).
 - **gfx1151 int4 is 2.0× int8 at ISA rate** — the W4A4 premise holds; an earlier
   ~1.0× measurement was a bandwidth-bound artifact.
+- **A per-group outlier budget is dead — the address costs more than the
+  allocation is worth.** Letting each 256-group pick its own `N_out` instead of
+  a per-tensor constant does help: water-filling at the same total slot count
+  cuts weight SSE 5.9–11.1% on Qwen3.5-0.8B. But variable-length blocks are the
+  only container that realizes it, and their `[u32; n_groups]` offset prefix
+  costs 4 B/group against a 136 B block — which buys back 1 of the 3 overlay
+  slots. At equal bytes the best *possible* allocation is 6.9–11.9% **worse**
+  than uniform `N_out=3`. That figure is a Lagrangian bound, not a heuristic's
+  output, so no smarter allocator recovers it. Break-even sits between 2 and 3
+  bytes of addressing overhead, and 2 B caps a tensor at 65535 blocks while 1 B
+  cannot address a block at all. Reproduce with
+  `examples/opus_group_budget_study.rs`. The *tensor*-level version of the same
+  idea already shipped as `HIPFIRE_OUTLIERS_BY_LAYER`.
 - `hipfire lock acquire` around any non-daemon GPU binary; `calibrate`
   **self-locks**, so never wrap it in `lock run`.
