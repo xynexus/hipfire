@@ -20,8 +20,8 @@ use std::sync::Mutex;
 
 pub mod boundary;
 pub mod contracts;
-pub mod layer_stream;
 pub mod expert_capture;
+pub mod layer_stream;
 pub mod residual_probe;
 pub mod schedule;
 pub mod source;
@@ -1594,16 +1594,68 @@ pub fn logsumexp(logits: &[f32]) -> f32 {
 }
 
 /// Top-`k` (index, logit) descending — for the KLDREF reference.
+///
+/// Selection, not a sort. This is called once per scored position, so on a
+/// 248320-vocab model a 1175-chunk reference runs it 1.2M times; fully sorting
+/// the vocab to keep 256 of it cost ~4.5 billion comparisons per chunk and put
+/// the build at ~37 s/chunk, single-threaded — twelve hours for one reference.
+///
+/// Two things were expensive. The sort was O(n log n) to answer an O(n)
+/// question, and its comparator indexed back into `logits`, so every comparison
+/// took two random loads across a 1 MB array. Selecting over (logit, index)
+/// pairs keeps those loads sequential and `select_nth_unstable_by` is
+/// introselect, so only the k survivors get ordered.
+///
+/// Ties break on the index, ascending. The old `sort_unstable` left equal
+/// logits in an arbitrary order, which made the reference bytes depend on the
+/// sort's internal swaps; pinning the tiebreak makes the artifact reproducible.
 pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-    idx.truncate(k);
-    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+    let k = k.min(logits.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let cmp = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    let mut pairs: Vec<(f32, u32)> = logits.iter().copied().zip(0u32..).collect();
+    pairs.select_nth_unstable_by(k - 1, cmp);
+    pairs.truncate(k);
+    pairs.sort_unstable_by(cmp);
+    pairs.into_iter().map(|(v, i)| (i, v)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Selection must agree with the full sort it replaced, ties included, and
+    /// must not depend on how the selection algorithm happened to swap.
+    #[test]
+    fn topk_logits_matches_full_sort_and_is_tie_deterministic() {
+        fn reference(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+            let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+            // Same tiebreak the real one pins: logit desc, index asc.
+            idx.sort_by(|&a, &b| {
+                logits[b as usize]
+                    .total_cmp(&logits[a as usize])
+                    .then(a.cmp(&b))
+            });
+            idx.truncate(k.min(logits.len()));
+            idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+        }
+
+        // Deliberately tie-heavy: only 7 distinct values over 500 slots, so the
+        // k-boundary lands inside a run of equal logits every time.
+        let logits: Vec<f32> = (0..500).map(|i| ((i * 37) % 7) as f32).collect();
+        for k in [1usize, 8, 256, 500] {
+            assert_eq!(topk_logits(&logits, k), reference(&logits, k), "k={k}");
+        }
+
+        // Ordinary descending case, plus the degenerate edges.
+        let plain: Vec<f32> = vec![-1.5, 9.0, 0.0, 3.25, -7.0];
+        assert_eq!(topk_logits(&plain, 3), vec![(1, 9.0), (3, 3.25), (2, 0.0)]);
+        assert_eq!(topk_logits(&plain, 0), vec![]);
+        // k past the end clamps rather than panicking in select_nth.
+        assert_eq!(topk_logits(&plain, 99), reference(&plain, 99));
+    }
 
     #[test]
     fn compact_hessian_size_matches_diag_plus_lower_triangle() {
