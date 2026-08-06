@@ -535,7 +535,9 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
-fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
+/// Rank group positions by int8-upgrade gain; the first `n_out` are the overlay.
+/// `pub` so budget studies can score allocations without re-deriving the metric.
+pub fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
     let inv = 1.0 / scale.max(1e-12);
     let gain = |index: usize| -> f32 {
         let value = group[index];
@@ -556,7 +558,9 @@ fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize
     indices
 }
 
-fn mixed_overlay_error(
+/// SSE of the mixed encoding: overlay slots clamp to int8, the bulk to int4.
+/// The objective `mixed_clipsearch` minimises; `pub` for the same reason.
+pub fn mixed_overlay_error(
     group: &[f32; 256],
     scale: f32,
     indices: &[usize; 256],

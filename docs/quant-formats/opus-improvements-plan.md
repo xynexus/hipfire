@@ -200,8 +200,55 @@ Consequences worth carrying forward:
   through a selector that could not reward them.** That verdict should be treated
   as void for P1, P4 and E3, all of which are "spend more on corrections" ideas.
 
-Still open: a KLD run to convert SSE into end-to-end quality, and re-running the
-per-layer outlier sweep now that the knee has moved.
+Still open: a KLD run to convert SSE into end-to-end quality.
+
+### Per-layer outlier sweep, re-run (CPU half)
+
+`examples/opus_outlier_budget_study.rs` re-scores commit d77fa637a's "uniform
+wins" verdict against the joint selector, on real Qwen3.5-0.8B weights (2048
+G256 groups per layer type). Mean per-group SSE:
+
+| layer | share | OLD N=1→31 | NEW N=1→31 |
+|---|---:|---|---|
+| q_proj | 9.0% | .00047 → .00034 (flat by N=5) | .00047 → .00016 |
+| k_proj | 1.1% | .00035 → .00025 | .00035 → .00012 |
+| v_proj | 1.1% | .00054 → .00039 | .00054 → .00019 |
+| o_proj | 4.5% | .00026 → .00019 | .00026 → .00009 |
+| gate_proj | 28.1% | .00047 → .00034 | .00047 → .00017 |
+| up_proj | 28.1% | .00018 → .00013 | .00018 → .00006 |
+| down_proj | 28.1% | .00019 → .00014 | .00019 → .00007 |
+
+The old selector saturates by N=5 in **every** layer type — the P2 finding
+reproduced per-layer. The new one keeps paying out to N=31.
+
+**The original hypothesis was backwards.** d77fa637a spent the budget on
+`down_proj` because it is 28% of parameters and consumes SwiGLU output. But the
+allocation optimum equalises the *per-group* marginal, and the group count
+cancels out of the Lagrange condition entirely — parameter share does not enter
+the ranking, only the budget arithmetic. Per group, `down_proj` and `up_proj`
+have the LOWEST marginal value of the seven; `v_proj`, `q_proj` and `gate_proj`
+have the highest. So `down=7 rest=1` was pointed the wrong way and would lose
+under the new selector too.
+
+Greedy water-fill at a matched 4.25 b/w gives:
+
+```
+HIPFIRE_OUTLIERS_BY_LAYER=q_proj:5,k_proj:6,v_proj:9,o_proj:3,gate_proj:5,up_proj:1,down_proj:2
+```
+
+worth **2.39%** param-weighted SSE over uniform N=3. That is small, and small in
+a metric already known to disagree with KLD here. **Verdict: "uniform wins"
+survives P2 for the allocation question** — do not re-open it without a reason
+better than 2.4% SSE.
+
+What P2 *does* reopen is the neighbouring claim in the same commit: that "N=3 is
+a genuine optimum in both directions", evidenced by oq4.5++ (N=7 uniform)
+scoring worse KLD than N=3 (0.037291 vs 0.036631) **while spending more bits**.
+More bits buying worse quality is not a property of the format; it is the
+signature of a selector that could not use them. Under the joint selector N=7
+now scores 10.3% better group SSE than N=3 and keeps improving. That comparison
+is the experiment worth GPU time, and it is a different one from the sweep this
+section re-ran.
 
 ---
 
