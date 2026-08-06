@@ -23,8 +23,10 @@ fn score(gpu: &mut Gpu, path: &str, tokens: &[u32]) -> Result<Vec<Vec<f32>>, Str
         .backend
         .kld_forward()
         .expect("Cohere2 exposes KLD forward")
-        .forward_chunk_scored(gpu, tokens, 0, &mut |_, logits, _| {
-            rows.push(logits.to_vec())
+        .forward_chunk_scored(gpu, tokens, 0, &mut |w| {
+            for i in 0..w.rows() {
+                rows.push(w.row(i).to_vec());
+            }
         })?;
     loaded.backend.unload(gpu);
     Ok(rows)

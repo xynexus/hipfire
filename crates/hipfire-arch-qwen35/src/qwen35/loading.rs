@@ -3244,8 +3244,9 @@ fn forward_chunk_scored(
     config: &Qwen35Config,
     chunk: &[u32],
     scoring_start: usize,
-    mut at_scored: impl FnMut(usize, &[f32], usize),
+    mut at_scored: impl FnMut(&hipfire_runtime::kld_eval::ScoredWindow<'_>),
 ) -> HipResult<()> {
+    use hipfire_runtime::kld_eval::ScoredWindow;
     let n = chunk.len();
     // Position `p` is scored against `chunk[p + 1]`, so the final token is
     // consumed as a target and never itself scored.
@@ -3323,14 +3324,15 @@ fn forward_chunk_scored(
         let values = gpu.download_f32(&batch_logits.sub_offset(0, w * vocab))?;
         dl_s += t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
-        for j in 0..w {
-            let p = pos + j;
-            at_scored(
-                p - scoring_start,
-                &values[j * vocab..(j + 1) * vocab],
-                chunk[p + 1] as usize,
-            );
-        }
+        // Hand the whole window over at once. Per-position delivery pinned the
+        // consumer's log_z + top-K work to one core; a window lets it fan out.
+        let nexts: Vec<u32> = (0..w).map(|j| chunk[pos + j + 1]).collect();
+        at_scored(&ScoredWindow {
+            j0: pos - scoring_start,
+            logits: &values,
+            vocab,
+            nexts: &nexts,
+        });
         score_s += t.elapsed().as_secs_f64();
         pos += w;
     }
@@ -3363,16 +3365,11 @@ impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&hipfire_runtime::kld_eval::ScoredWindow<'_>),
     ) -> Result<(), String> {
-        forward_chunk_scored(
-            gpu,
-            self.weights,
-            self.config,
-            chunk,
-            scoring_start,
-            |j, lg, next| at_scored(j, lg, next),
-        )
+        forward_chunk_scored(gpu, self.weights, self.config, chunk, scoring_start, |w| {
+            at_scored(w)
+        })
         .map_err(|e| format!("qwen35 kld forward: {e:?}"))
     }
 
