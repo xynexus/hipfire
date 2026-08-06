@@ -450,6 +450,17 @@ valid for new artifacts.
   weight-bandwidth-bound (small batch).
 - **gfx1151 int4 is 2.0× int8 at ISA rate** — the W4A4 premise holds; an earlier
   ~1.0× measurement was a bandwidth-bound artifact.
+- **Intra-block low-rank residual is a bad buy, and not because the residual is
+  white.** The post-int4 residual inside a 256-group does carry structure — on
+  down_proj the leading direction holds 4.84% of the energy against a 0.39%
+  white-noise floor, 12× — and the FWHT tightens but does not flatten it. It
+  still loses: with a shared 256-dim basis and r f16 coefficients per group,
+  r=1 costs 2 B for 4.84% while a 4-bit overlay correction buys 6.3% for zero
+  bytes, and %SSE-per-byte only falls as r grows. It is also the only candidate
+  needing a new decode path. Reproduce with
+  `examples/opus_intrablock_rank_study.rs`. The tensor-level
+  `HIPFIRE_LOWRANK_R` remains the strongest 2-bit lever; that is a different
+  measurement and is not affected.
 - **The overlay's Δ fits in 4 bits, so trade correction PRECISION for correction
   DENSITY.** `q8 − q4` is bounded by the ±7 clamp, and after the FWHT a tensor's
   whole pool of promoted deltas holds only 17–19 distinct values. Spending 4 bits

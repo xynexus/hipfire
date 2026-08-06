@@ -451,7 +451,45 @@ saliency, and the gain function is a one-line reweight inside
 `mixed_overlay_indices`. Highest expected value in this track because the input
 already exists.~~
 
-### E2 — Intra-block low-rank residual
+### E2 — Intra-block low-rank residual — **CLOSED (negative)**
+
+**Probe ran** (`examples/opus_intrablock_rank_study.rs`, Qwen3.5-0.8B, 2048
+groups × 4 tensors). The prediction was "flat spectrum → close it". The spectrum
+is **near-flat but not flat**, so the prediction's stated reason is wrong and the
+item still closes — on economics, not on absence of structure. Record both,
+since this is exactly the idea that keeps coming back.
+
+Cumulative energy share of the leading `r` directions of `ΔᵀΔ`, post-FWHT
+(white-noise floor is `r/256`):
+
+| tensor | r=1 | r=4 | r=16 | r=32 |
+|---|---|---|---|---|
+| floor | .0039 | .0156 | .0625 | .1250 |
+| down_proj | .0484 | .0810 | .1685 | .2628 |
+| o_proj | .0085 | .0325 | .1167 | .2169 |
+| gate_proj | .0088 | .0333 | .1226 | .2278 |
+| q_proj | .0109 | .0406 | .1382 | .2479 |
+
+down_proj carries 12× the floor at r=1. The FWHT does tighten the spectrum
+against a no-rotation control on 3 of 4 tensors, but it does not flatten it.
+
+**Why it closes anyway.** Cheapest sane form is one 256-dim basis shared across
+a tensor's groups with `r` f16 coefficients per group — 2r B on a 136 B block.
+Best case (perfect projection, no coefficient quantization):
+
+| rank | cost/group | best case | %SSE per byte |
+|---|---|---|---|
+| r=1 | 2 B | 4.84% | 2.42 |
+| r=4 | 8 B | 8.10% | 1.01 |
+| r=32 | 64 B | 26.28% | 0.41 |
+
+P1 step 1 gets **+6.3% for zero bytes**, which dominates the r=1 row outright,
+and the per-byte column only worsens with rank — the curve never turns
+favourable, it just buys more by spending more. E2 is also the only candidate
+here that needs a new decode path: the overlay resolves inside the existing
+expander, while a shared basis adds a 256-wide matmul per group to every load.
+
+### E2 — Intra-block low-rank residual (original text)
 
 `HIPFIRE_LOWRANK_R` already does low-rank residual correction at tensor level
 (−13% at 2b). The extract's version is the same idea inside a 256-group.
@@ -517,7 +555,8 @@ it will contaminate the attribution.
    Δ wins outright, so there is no codebook and no sidecar to build. Next
    action here is the KLD run at matched bytes, not encoder work.
 5. **E3 / E5** — the platform-premise work; largest payoff, largest cost.
-6. **E2, E4** — probe-to-kill and deferred-until-the-format-stabilises respectively.
+6. ~~**E2**~~ — **probed and killed**; see E2 above. **E4** — still deferred until
+   the format stabilises.
 
 Re-run the per-layer outlier sweep (`HIPFIRE_OUTLIERS_BY_LAYER`) before 2–4: its
 current values were tuned against the pre-P2 selector.
