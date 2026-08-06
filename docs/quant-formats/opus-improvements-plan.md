@@ -375,15 +375,43 @@ as a parameter**, so E1–E5 are each a flag rather than a fork.
 
 Run in this order — each result kills or feeds the next.
 
-### E1 — Saliency-weighted upgrade gain
+### E1 — Saliency-weighted upgrade gain — **CLOSED (no-op, provable)**
 
-The extract proposes `G_i ∝ σ²_x(i)·(e4² − e8²)`. We have already measured that
+**Do not build this.** Not because the saliency is wrong, but because the
+selector it would reweight cannot see it.
+
+`mixed_overlay_indices` ranks positions INSIDE a group that
+`quantize_oqplus_compact` has already passed through `cpu_fwht_256`. The signed
+Hadamard has entries of one magnitude (`1/√256`), so for ANY per-input-channel
+saliency `s`, the rotated weighting's diagonal is
+
+```
+[R·diag(s)·Rᵀ]ᵢᵢ  =  Σⱼ Rᵢⱼ²·sⱼ  =  (1/256)·Σⱼ sⱼ  =  mean(s)
+```
+
+— the same number at every position. A per-position reweight of the gain
+therefore multiplies every candidate by one constant and cannot reorder them.
+Exact, not approximate: `hipfire-primitives` test
+`rotation_flattens_any_per_channel_saliency` measures the spread at 0 over the
+real transform. And 97% of the mass of `R·diag(s)·Rᵀ` is off-diagonal, so a
+diagonal reweight could not capture the true weighted error even if it varied.
+
+The two ways saliency CAN reach this codec are both already shipped: act before
+the rotation (per-channel scaling — the `+` AWQ/SmoothQuant pass) or account for
+the off-diagonal coupling (`++` LDLQ/OBS error feedback). "Highest expected value
+in this track because the input already exists" was wrong for the same reason
+the FWHT is worth having: it spreads structure, including the structure a
+saliency reweight would need.
+
+Original text kept below.
+
+~~The extract proposes `G_i ∝ σ²_x(i)·(e4² − e8²)`. We have already measured that
 family: plain XᵀX-weighted LDLQ ≈ no-calib on held-out data, and GuidedQuant
 (end-loss gradients) was the only robust winner. So do **not** build the σ² version.
 Build the GuidedQuant-weighted one: `calib_guided.rs` already produces the
 saliency, and the gain function is a one-line reweight inside
 `mixed_overlay_indices`. Highest expected value in this track because the input
-already exists.
+already exists.~~
 
 ### E2 — Intra-block low-rank residual
 
@@ -442,7 +470,10 @@ it will contaminate the attribution.
 2. ~~**P4 step 1**~~ — **done, and it killed the item.** The offset prefix costs
    more than per-group allocation is worth; see P4 above. The most expensive
    item in this document is off the table.
-3. **E1** — reuses a saliency signal we already compute. **Now next.**
+3. ~~**E1**~~ — **closed, no-op.** The overlay selects in the rotated domain,
+   where any per-channel saliency is provably constant; see E1 above. Note this
+   also constrains E3 and E5: nothing that ranks positions *within* a rotated
+   group can use a per-input-channel signal.
 4. **P1 + P3** as one commit, gated on P1's step-1 study, and preferring the
    structured-bitplane code over a free codebook.
 5. **E3 / E5** — the platform-premise work; largest payoff, largest cost.

@@ -450,6 +450,16 @@ valid for new artifacts.
   weight-bandwidth-bound (small batch).
 - **gfx1151 int4 is 2.0× int8 at ISA rate** — the W4A4 premise holds; an earlier
   ~1.0× measurement was a bandwidth-bound artifact.
+- **Nothing that ranks positions inside a rotated group can use a per-channel
+  saliency.** The signed Hadamard's entries all share one magnitude, so for any
+  per-input-channel weighting `s`, `[R·diag(s)·Rᵀ]ᵢᵢ = mean(s)` at every
+  position — a per-position reweight scales all candidates by one constant and
+  cannot reorder them. This is exact (`hipfire-primitives` test
+  `rotation_flattens_any_per_channel_saliency`), and 97% of the weighted-error
+  mass is off-diagonal besides. It kills the "reweight `mixed_overlay_indices`
+  by GuidedQuant saliency" idea outright. Saliency reaches this codec only
+  before the rotation (`+`, per-channel AWQ scaling) or through the off-diagonal
+  coupling (`++`, LDLQ/OBS) — both already shipped.
 - **A per-group outlier budget is dead — the address costs more than the
   allocation is worth.** Letting each 256-group pick its own `N_out` instead of
   a per-tensor constant does help: water-filling at the same total slot count
