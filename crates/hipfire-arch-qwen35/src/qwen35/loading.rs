@@ -4271,7 +4271,33 @@ pub fn load_weights(
             let (tied_info, tied_data) =
                 qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
             loaded_bytes += tied_data.len();
-            if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
+            // Bf16Lut3 head: hand the PACKED bytes to the GPU and let
+            // `gemv_bf16l3_xf32` decode in-kernel. `expand_bf16_index` already
+            // declines to expand a head tensor for exactly this reason — LUT3
+            // is the GPU-decodable coding (Huffman is not), so materializing it
+            // here throws away the whole point of storing it that way.
+            //
+            // Decoding instead produced a 1017 MB f32 head (248320x1024) whose
+            // GEMV measured 5255 us per call and 24.8% of all GPU time in a
+            // reference build — bandwidth-saturated at 192 GB/s reading values
+            // that came from bf16 to begin with. Packed it is 367 MB, and the
+            // same GEMV measures 1958 us: 2.68x against a 2.77x byte reduction,
+            // which is the whole win (effective bandwidth is unchanged).
+            //
+            // K % 256 is the kernel's group constraint; anything else falls
+            // through to the decode path below.
+            if embd_qt == 49 && config.dim.is_multiple_of(256) {
+                let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
+                WeightTensor {
+                    buf,
+                    gpu_dtype: DType::Bf16L3,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                }
+            } else if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
                 let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
                 let dtype = match embd_qt {
                     6 => DType::HFQ4G256,
