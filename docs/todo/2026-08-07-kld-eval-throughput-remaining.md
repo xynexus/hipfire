@@ -56,6 +56,46 @@ Fix, in order:
 2. Then widen `BF16L3_NT` (32–64 via LDS staging rather than registers). Weight
    traffic falls from 47 GB toward the 367 MB a single full pass would read.
 
+## Reference sizing — settled, build at 128 chunks
+
+Measured 2026-08-07, before regenerating anything. The old 1175-chunk refs were
+2.48 GB each; the current `RefArchive::encode` bit-packs tokens and
+`top_indices` at 18 bits (`ceil(log2(248320))`) and would land at ~1.93 GB, of
+which **64% is `top_log_probs` stored as raw f32**. That invited a codec, but
+the codec turns out to be unnecessary — the chunk count was the real lever.
+
+Convergence, uniform3 against a bf16 reference over 128 chunks:
+
+| chunks | running mean_kld | error vs 128 | SE |
+|---|---|---|---|
+| 1 | 0.041320 | **26.5%** | 0.007610 |
+| 8 | 0.049702 | 11.6% | 0.002691 |
+| 32 | 0.053853 | 4.2% | 0.001345 |
+| 128 | 0.056243 | — | 0.000673 |
+
+Per-chunk `mean_kld` has a 13.5% coefficient of variation, so **single-chunk
+numbers are worthless** — they are ~26% off and no comparison at n=1 means
+anything.
+
+Candidates are compared on the SAME chunks, so the relevant statistic is
+paired. Per-chunk KLDs of two candidates correlate at r = 0.78, which shrinks
+the noise 2.1× versus an independent-samples model:
+
+| resolve | unpaired | paired |
+|---|---|---|
+| 5% | 57 chunks | **16** |
+| 2% | 352 | **95** |
+| 1% | 1407 | **378** |
+
+Real config gaps are much larger than that floor: uniform3 vs down7rest1 is
+0.056243 vs 0.063887, a **13.6% difference resolvable at n ≥ 3 chunks**.
+
+**Decision: 128 chunks.** Measured 210,625,187 bytes, ~4.8 min to build, 95% CI
+halfwidth 0.000966 (1.7% of the mean). That is 9.2× smaller than a 1175-chunk
+ref and resolves everything the outlier-budget sweep compares. Go to 378 chunks
+(≈620 MB) only if 1% resolution is ever actually needed. No f16 log-probs, no
+delta coding — the format work is moot at this size.
+
 ## Caveats to settle, not just perf
 
 ### Batched body is not numerically identical to per-token
@@ -67,7 +107,31 @@ Accepted deliberately when the BUG-001 guard was lifted, and documented in
 - only 15% of positions keep the same top-256 set; top-1 argmax agrees 99.36%
 - deltas are flat across position (5.99e-2 first half vs 6.60e-2 second), so it
   is a per-position path difference, not accumulating drift
-- `mean_kld` moved 0.0409 → 0.0413
+
+The `mean_kld` 0.0409 → 0.0413 quoted in `22d0d2825`'s message as the metric's
+response to batching is **not evidence of anything** — it was an n=1 comparison,
+and a single chunk is ~26% off the converged mean (see "Reference sizing").
+
+**Measured properly 2026-08-07 and closed.** Same reference, same chunks, same
+candidate, 16 paired chunks, per-token forced via `HIPFIRE_PREFILL_BATCHED=0`:
+
+| forward | mean_kld |
+|---|---|
+| batched | 0.052349 |
+| per-token | 0.052109 |
+| difference | **+0.000240 (+0.46%)**, 95% CI [+0.13%, +0.79%] |
+
+The CI excludes zero, so batching carries a small **systematic** positive bias,
+not noise — per-chunk correlation between the two paths is 0.9993. But it is
+0.46%, against config gaps of ~13.6%, i.e. **3.1% of the signal**, and below the
+1.7% CI halfwidth of a 128-chunk reference. Every candidate takes the same path,
+so it largely cancels in comparisons.
+
+Verdict: acceptable for ranking quant configs, which is what these references
+are for. NOT safe to mix references built on different paths, and worth
+re-checking if a future format interacts with the KV tier differently. The
+underlying cause (suspected per-tile vs per-token q8 KV scales) is still
+un-root-caused, but is now bounded rather than unknown.
 
 Hypothesis, untested: q8 KV scales taken per-tile in the batched attention
 versus per-token in the fallback. Worth settling because a KLD *reference* is
