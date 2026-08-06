@@ -539,18 +539,22 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
 /// `pub` so budget studies can score allocations without re-deriving the metric.
 pub fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
     let inv = 1.0 / scale.max(1e-12);
-    let gain = |index: usize| -> f32 {
+    // Precomputed, NOT recomputed inside the comparator. A 256-element sort runs
+    // ~2000 comparisons and the old form evaluated `gain` twice per comparison —
+    // ~4000 evaluations to rank 256 values. `mixed_clipsearch` calls this once
+    // per scale candidate, so that waste was multiplied by the grid.
+    let gains: [f32; 256] = core::array::from_fn(|index| {
         let value = group[index];
         let q4 = (value * inv).round().clamp(-7.0, 7.0);
         let q8 = (value * inv).round().clamp(-127.0, 127.0);
         let error4 = value - q4 * scale;
         let error8 = value - q8 * scale;
         error4 * error4 - error8 * error8
-    };
+    });
     let mut indices: [usize; 256] = core::array::from_fn(|index| index);
     indices[..].sort_unstable_by(|&left, &right| {
-        gain(right)
-            .partial_cmp(&gain(left))
+        gains[right]
+            .partial_cmp(&gains[left])
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| left.cmp(&right))
     });

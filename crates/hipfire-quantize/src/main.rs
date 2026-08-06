@@ -3932,16 +3932,30 @@ fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String>
 /// ragged matrix would otherwise join the tail of one row to the head of the
 /// next, which does not match either the HFQ matrix contract or the runtime's
 /// `K.div_ceil(256)` group indexing.
-fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, mut pack_row: F) -> Vec<u8>
+/// Pack an Opus matrix row by row, IN PARALLEL.
+///
+/// The sibling `quantize_*g256` encoders in `codecs.rs` already rayon over their
+/// block chunks; this row loop was the one serial link, so the whole non-LDLQ
+/// Opus path ran on a single core while the LDLQ path used every core. Rows are
+/// independent — the codec carries no cross-row state — and `collect` into an
+/// ordered Vec keeps the output byte-identical to the serial form.
+///
+/// Thread-safety note: `pack_row` runs on rayon workers, so it must not touch a
+/// thread_local set by the caller. Today's closures only call pure codec
+/// functions; the AWQ sidecar is written before this is entered, and the clip
+/// override is a global `AtomicBool` precisely because a thread_local there was
+/// already caught being invisible to workers (see `codecs::CLIP_DISABLED`).
+fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, pack_row: F) -> Vec<u8>
 where
-    F: FnMut(&[f32]) -> Vec<u8>,
+    F: Fn(&[f32]) -> Vec<u8> + Sync + Send,
 {
+    use rayon::prelude::*;
     assert_eq!(weights.len(), m * k, "Opus matrix shape");
-    let mut output = Vec::new();
-    for row in weights.chunks_exact(k) {
-        output.extend_from_slice(&pack_row(row));
-    }
-    output
+    weights
+        .par_chunks_exact(k)
+        .map(&pack_row)
+        .collect::<Vec<Vec<u8>>>()
+        .concat()
 }
 
 fn pad_opus_columns(weights: &[f32], m: usize, k: usize) -> (Vec<f32>, usize) {
