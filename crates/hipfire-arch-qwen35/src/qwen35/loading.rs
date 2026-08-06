@@ -3212,10 +3212,32 @@ pub fn dump_embed_fp32(
     Ok((vocab, dim))
 }
 
-/// Run the resident model over `chunk` (per-token decode, fresh KV + DeltaNet
-/// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored
-/// position `j` in `[scoring_start, n_ctx-1)`. The single forward path that both
-/// reference build and candidate scoring funnel through.
+/// Positions per lm-head window. Staging is `rows x vocab` f32 — 256 rows at
+/// Qwen3.5's 248320 vocab is 254 MB, where the whole 2048-token chunk would be
+/// 2.0 GB in one allocation.
+const SCORED_HEAD_WINDOW: usize = 256;
+
+/// Run the resident model over `chunk` and invoke
+/// `at_scored(j, full_logits, actual_next)` for each scored position `j` in
+/// `[scoring_start, n_ctx-1)`. The single forward path that both reference build
+/// and candidate scoring funnel through.
+///
+/// Two things were per-token here, and they had to be fixed together because
+/// each one alone leaves the other dominating:
+///
+///  * The BODY ran one `forward_scratch` per position — 162 GEMM launches per
+///    token, re-reading every weight in the model each time (~1.6 GB x 2048 =
+///    3.3 TB of weight traffic per chunk). `forward_prefill_batch_with_pbs_opts`
+///    runs the whole chunk once and hands back every position's post-output-norm
+///    hidden state, measured at 58.5 -> 1660 tok/s.
+///  * The HEAD then ran one GEMV per scored position. Each GEMV streams the
+///    entire lm_head, so 2039 of them read 748 GB and took 76% of GPU time even
+///    after the packed-LUT3 win. Batched as a GEMM the head is read once per
+///    window instead of once per position.
+///
+/// `per_token_hidden_out` is written post-output-norm, so the head must NOT
+/// re-normalize. Positions below `scoring_start` never need logits and are
+/// skipped entirely.
 fn forward_chunk_scored(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -3225,7 +3247,20 @@ fn forward_chunk_scored(
     mut at_scored: impl FnMut(usize, &[f32], usize),
 ) -> HipResult<()> {
     let n = chunk.len();
-    let mut kv = kv::KvCache::new_gpu(
+    // Position `p` is scored against `chunk[p + 1]`, so the final token is
+    // consumed as a target and never itself scored.
+    let scorable = n.saturating_sub(1);
+    if scorable == 0 || scoring_start >= scorable {
+        return Ok(());
+    }
+    let vocab = config.vocab_size;
+    let dim = config.dim;
+
+    // Q8 KV, not f32. The batched prefill's F4 guard rejects an f32 KV cache
+    // outright — that tier has no batched attention kernel (`BatchEq(1)` only,
+    // MissingImpl at resolve) — so an f32 KV cache silently forces the per-token
+    // fallback and gives back the entire win above.
+    let mut kv = kv::KvCache::new_gpu_q8(
         gpu,
         config.n_layers,
         config.n_kv_heads,
@@ -3234,15 +3269,82 @@ fn forward_chunk_scored(
     )?;
     let mut dn = DeltaNetState::new(gpu, config)?;
     let scratch = Qwen35Scratch::new(gpu, config, 64)?;
-    for pos in 0..n.saturating_sub(1) {
-        forward_scratch(
-            gpu, weights, config, chunk[pos], pos, &mut kv, &mut dn, &scratch,
-        )?;
-        if pos >= scoring_start {
-            let lg = gpu.download_f32(&scratch.logits)?;
-            at_scored(pos - scoring_start, &lg, chunk[pos + 1] as usize);
-        }
+    let hidden = gpu.alloc_tensor(&[n * dim], DType::F32)?;
+
+    // HIPFIRE_KLD_PHASE_TIMING=1 splits the per-chunk cost into body / head /
+    // download / scoring. The four are on completely different resources, so a
+    // wall-clock total says nothing about which to attack next.
+    let phase_timing = std::env::var("HIPFIRE_KLD_PHASE_TIMING").as_deref() == Ok("1");
+    let t_body = std::time::Instant::now();
+
+    // Ineligible weight/KV combinations fall back to a per-token loop INSIDE
+    // this call and still populate `hidden`, so there is no separate fallback to
+    // maintain here.
+    forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        chunk,
+        0,
+        &mut kv,
+        &mut dn,
+        &scratch,
+        None,
+        Some(&hidden),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )?;
+
+    if phase_timing {
+        let _ = gpu.device_synchronize();
     }
+    let body_s = t_body.elapsed().as_secs_f64();
+    let (mut head_s, mut dl_s, mut score_s) = (0.0f64, 0.0f64, 0.0f64);
+
+    let window = SCORED_HEAD_WINDOW.min(scorable - scoring_start);
+    let batch_logits = gpu.alloc_tensor(&[window * vocab], DType::F32)?;
+    let mut pos = scoring_start;
+    while pos < scorable {
+        let w = window.min(scorable - pos);
+        let rows = hidden.sub_offset(pos * dim, w * dim);
+        let t = std::time::Instant::now();
+        hipfire_runtime::weights::weight_gemm(gpu, &weights.output, &rows, &batch_logits, w)?;
+        if phase_timing {
+            let _ = gpu.device_synchronize();
+            head_s += t.elapsed().as_secs_f64();
+        }
+        // One download per window, replacing `w` full-vocab transfers.
+        let t = std::time::Instant::now();
+        let values = gpu.download_f32(&batch_logits.sub_offset(0, w * vocab))?;
+        dl_s += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        for j in 0..w {
+            let p = pos + j;
+            at_scored(
+                p - scoring_start,
+                &values[j * vocab..(j + 1) * vocab],
+                chunk[p + 1] as usize,
+            );
+        }
+        score_s += t.elapsed().as_secs_f64();
+        pos += w;
+    }
+    if phase_timing {
+        eprintln!(
+            "  [kld-phase] body={body_s:.3}s head={head_s:.3}s download={dl_s:.3}s \
+             scoring={score_s:.3}s (n={n} scored={})",
+            scorable - scoring_start
+        );
+    }
+    let _ = gpu.free_tensor(batch_logits);
+    let _ = gpu.free_tensor(hidden);
+    kv.free_gpu(gpu);
+    dn.free_gpu(gpu);
     Ok(())
 }
 
@@ -4286,7 +4388,39 @@ pub fn load_weights(
             //
             // K % 256 is the kernel's group constraint; anything else falls
             // through to the decode path below.
-            if embd_qt == 49 && config.dim.is_multiple_of(256) {
+            //
+            // OPT-IN, and the default flipped back after measurement. Packed
+            // only pays when the head is consumed one row at a time, because
+            // `gemv_bf16l3_xf32` is the only LUT3 kernel — there is no
+            // `gemm_bf16l3`. A batched consumer (prefill, KLD scoring) reads the
+            // head ONCE per window as a GEMM instead of once per position:
+            // 2039 GEMVs x 367 MB = 748 GB, against ~367 MB plus 1.04 TFLOP for
+            // the batched form. Measured, that is 3.98 s (76% of all GPU time)
+            // versus ~0.1 s — so batching beats packing by ~15x even after the
+            // 2.68x this arm buys. Keeping it packed would force the batched
+            // logits path to decline the dtype and fall back to per-token,
+            // which is how the two optimizations cancelled.
+            //
+            // HIPFIRE_QWEN35_LUT3_HEAD=1 restores the packed head for a
+            // decode-only deployment, where every step is batch-1 and the
+            // 2.68x is the whole story.
+            // MEASURED, and the opposite of what the batching argument above
+            // predicted. Per scored position on gfx1151:
+            //
+            //   Bf16Lut3 packed, gemv_bf16l3_xf32   1.95 ms   (3.98 s / 2039)
+            //   plain BF16, gemm_bf16_x_bf16_wmma   5.05 ms   (5.17 s / 1023)
+            //
+            // `weight_gemm` genuinely batches BF16 — it is a real WMMA GEMM, not
+            // a row loop — and it is still 2.6x worse per position than the
+            // packed GEMV. Reading 367 MB per call beats reading 508 MB even
+            // once per 256-row window, because this head is bandwidth-bound at
+            // M=248320 and the GEMM gets no useful reuse out of a weight that
+            // large. So packed stays the default.
+            //
+            // HIPFIRE_QWEN35_BF16_HEAD=1 forces the plain-BF16 head back for
+            // A/B measurement.
+            let force_bf16_head = std::env::var("HIPFIRE_QWEN35_BF16_HEAD").as_deref() == Ok("1");
+            if !force_bf16_head && embd_qt == 49 && config.dim.is_multiple_of(256) {
                 let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
                 WeightTensor {
                     buf,

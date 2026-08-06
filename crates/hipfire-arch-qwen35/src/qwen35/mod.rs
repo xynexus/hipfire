@@ -1150,18 +1150,32 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32 | DType::F16
+        // BF16 was excluded on gfx1151 by the BUG-001 guard: the batched
+        // FullAttention BF16 q/k/v projection was reported to inflate `fa_q`
+        // ~9x there, so BF16 prefill was routed through the per-token
+        // `forward_scratch` loop and described as "slightly slower".
+        //
+        // That failure no longer reproduces, and "slightly" was off by a factor
+        // of 28. Re-tested on gfx1151 / qwen3.5-0.8b bf16, 2048-token chunk:
+        // prefill 58.5 -> 1646.3 tok/s, PPL 24.0318 -> 24.0551, top-1 argmax
+        // agreeing at 99.36%. Nothing resembling layer-0 garbage. The llama
+        // analogue (BUGS.md, "Batched prefill garbage for bf16/f16 llama
+        // models") was root-caused to missing BF16 projection arms rather than
+        // an attention-kernel fault and fixed; this reads as the same defect,
+        // and the guard outlived it.
+        //
+        // CAVEAT, deliberately accepted: the batched path is not numerically
+        // identical to per-token. Typical |delta logit| is ~6e-2 (max 2.4e-1)
+        // against ~4e-6 for pure reordering, and only 15% of positions keep the
+        // same top-256 set. The deltas are flat across position (5.99e-2 first
+        // half vs 6.60e-2 second), so this is a per-position path difference —
+        // most likely q8 KV scales taken per-tile in the batched attention
+        // versus per-token in the fallback — not accumulating drift. Anything
+        // that needs the two to agree bit-for-bit must pin the path explicitly.
+        | DType::BF16
     );
     if always_ok {
         return true;
-    }
-    // BUG-001 guard: the batched FullAttention BF16 q/k/v projection inflates
-    // `fa_q` ~9x on gfx1151 → garbage output (q8/asym KV enables the batched
-    // arm). F16/F32 batched are fine; only BF16 is broken on this arch. Route
-    // BF16 prefill through the per-token forward_scratch path here (correct,
-    // slightly slower) until the batched-arm projection is fixed; gfx1103 et al.
-    // keep the fast batched path. See BUGS.md / trigger a21dccf75.
-    if dt == DType::BF16 {
-        return arch != "gfx1151";
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
