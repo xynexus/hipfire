@@ -117,15 +117,20 @@ fn main() {
             let xg = gpu.upload_f32(&x, &[n * k]).unwrap();
             let ya = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             let yb = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+            let yd = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
 
             gpu.gemm_bf16_x_bf16_wmma(&wb, &xg, &ya, m, k, n).unwrap();
             gpu.gemm_bf16l3_xf32(&wl, &xg, &yb, m, k, n).unwrap();
+            gpu.gemm_bf16l3_wmma(&wl, &xg, &yd, m, k, n).unwrap();
             gpu.device_synchronize().unwrap();
             let got_a = gpu.download_f32(&ya).unwrap();
             let got_b = gpu.download_f32(&yb).unwrap();
-            // Each kernel against the reference matching ITS contract.
+            let got_d = gpu.download_f32(&yd).unwrap();
+            // Each kernel against the reference matching ITS contract. The WMMA
+            // LUT3 form stages x to bf16 exactly like the plain-BF16 WMMA path.
             let ra = maxrel(&want_bf16x, &got_a);
             let rb = maxrel(&want_f32, &got_b);
+            let rd = maxrel(&want_bf16x, &got_d);
 
             // N=1 also cross-checks the known-good GEMV.
             let mut rg = f32::NAN;
@@ -149,8 +154,8 @@ fn main() {
                 }
             };
             println!(
-                "wide={wide:<5} m={m:<5} k={k:<4} n={n:<3}  wmma {:.2e}{}  lut3-gemm {:.2e}{}  lut3-gemv {:.2e}{}",
-                ra, flag(ra), rb, flag(rb), rg, flag(rg)
+                "wide={wide:<5} m={m:<5} k={k:<4} n={n:<3}  wmma {:.2e}{}  l3-scalar {:.2e}{}  l3-wmma {:.2e}{}  l3-gemv {:.2e}{}",
+                ra, flag(ra), rb, flag(rb), rd, flag(rd), rg, flag(rg)
             );
             // The `wide` distribution spans 2^-16..2^15 INSIDE one dot product.
             // It exists to force LUT3 escapes, and LUT3 is gated on it. The
@@ -159,10 +164,10 @@ fn main() {
             // test's conditioning, not of the kernel — so it is informational
             // there. Real weight tensors are narrow-band, and every narrow case
             // agrees to <=5.6e-5.
-            if rb >= tol || (n == 1 && rg >= tol) || (!wide && ra >= tol) {
+            if rb >= tol || (n == 1 && rg >= tol) || (!wide && (ra >= tol || rd >= tol)) {
                 bad = true;
             }
-            for t in [wb, wl, xg, ya, yb] {
+            for t in [wb, wl, xg, ya, yb, yd] {
                 let _ = gpu.free_tensor(t);
             }
         }
@@ -183,10 +188,10 @@ fn main() {
         ("lm_head ", 248_320, 1024),
     ];
     println!(
-        "{:<9} {:>7} {:>5} {:>10} {:>10} {:>8}",
-        "shape", "M", "N", "bf16 ms", "lut3 ms", "lut3/bf16"
+        "{:<9} {:>7} {:>5} {:>9} {:>11} {:>7} {:>11} {:>7}",
+        "shape", "M", "N", "bf16 ms", "l3-scalar", "ratio", "l3-wmma", "ratio"
     );
-    println!("{}", "-".repeat(56));
+    println!("{}", "-".repeat(74));
     for &(label, m, k) in shapes {
         let raw = bf16_weights(m * k, 0x9E37_79B9 ^ m as u64, false);
         let packed = hipfire_primitives::bf16_lut3::encode(&raw);
@@ -216,11 +221,21 @@ fn main() {
             }
             gpu.device_synchronize().unwrap();
             let tb = t.elapsed().as_secs_f64() / reps as f64;
+            gpu.gemm_bf16l3_wmma(&wl, &xg, &ya, m, k, n).unwrap();
+            gpu.device_synchronize().unwrap();
+            let t = Instant::now();
+            for _ in 0..reps {
+                gpu.gemm_bf16l3_wmma(&wl, &xg, &ya, m, k, n).unwrap();
+            }
+            gpu.device_synchronize().unwrap();
+            let td = t.elapsed().as_secs_f64() / reps as f64;
             println!(
-                "{label} {m:>7} {n:>5} {:>10.3} {:>10.3} {:>7.2}x",
+                "{label} {m:>7} {n:>5} {:>9.3} {:>11.3} {:>6.2}x {:>11.3} {:>6.2}x",
                 ta * 1e3,
                 tb * 1e3,
-                tb / ta
+                tb / ta,
+                td * 1e3,
+                td / ta
             );
             let _ = gpu.free_tensor(xg);
             let _ = gpu.free_tensor(ya);

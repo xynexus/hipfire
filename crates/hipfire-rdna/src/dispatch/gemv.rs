@@ -5207,6 +5207,61 @@ impl Gpu {
         result
     }
 
+    /// BF16L3 weight × F32 activations → F32 via WMMA, decoding each A fragment
+    /// in-kernel. `x` is [n, k] F32 (staged to BF16 like the plain-BF16 path),
+    /// `y` is [n, m] F32.
+    ///
+    /// Same tiling and the same `wmma_f32_16x16x16_bf16` compute as
+    /// `gemm_bf16_x_bf16_wmma_gfx1151_m128` — LUT3 is treated purely as a
+    /// storage format, so this reads 1.38x fewer weight bytes for identical
+    /// math, instead of competing with WMMA using scalar FMAs the way
+    /// [`Self::gemm_bf16l3_xf32`] does.
+    pub fn gemm_bf16l3_wmma(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_wmma requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_wmma_m128",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_wmma_m128",
+        )?;
+        let wp = w.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x, n * k)?;
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = n as i32;
+        let grid_m = m.div_ceil(128) as u32;
+        let grid_b = n.div_ceil(16) as u32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_wmma", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16l3_wmma_m128",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(
         &mut self,

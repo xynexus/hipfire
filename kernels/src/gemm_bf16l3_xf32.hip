@@ -152,3 +152,136 @@ extern "C" __global__ void gemm_bf16l3_xf32(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WMMA form: decode a LUT3 block into WMMA A-fragments, keep the compute
+// identical to the plain-BF16 path.
+//
+// The scalar kernel above wins batch-1 and loses prefill 2.3-8x, and two
+// attempts to close that by restructuring memory access failed (see the header).
+// The gap is structural: the BF16 path runs 16x16x16 WMMA while this one does
+// scalar FMAs. So stop competing with it and JOIN it — treat LUT3 purely as a
+// storage format, decode a fragment, and hand it to the same intrinsic.
+//
+// Mirrors gemm_bf16_x_bf16_wmma_gfx1151_m128 exactly: 8 wave32 warps, 128 output
+// rows per block, a 16-batch X tile staged in LDS per K_BLOCK and reused by all
+// warps. The ONE change is that `a_frag` is decoded rather than loaded.
+//
+// Why the escape cursor works here: escapes are stored per block in element
+// order, so the cursor is a running count from the block's start. `kt` walks
+// 0..256 monotonically inside exactly one LUT3 block (K % 256 == 0 is asserted
+// host-side, so a row's blocks never straddle), which is precisely the order the
+// cursor needs. Resetting it at each `k_base` keeps decode and storage in step.
+//
+//   W : BF16L3 payload of [M, K]
+//   X : [B, K] BF16 row-major
+//   Y : [B, M] F32 row-major
+#define L3W_M_TILE     128
+#define L3W_N_TILE      16
+#define L3W_M_PER_WARP  16
+#define L3W_SLOTS       2
+
+typedef short __attribute__((ext_vector_type(16))) l3_b16x16_t;
+typedef float __attribute__((ext_vector_type(8)))  l3_float8_t;
+
+__launch_bounds__(256, 1)
+extern "C" __global__ void gemm_bf16l3_wmma_m128(
+    const unsigned char*  __restrict__ W,
+    const unsigned short* __restrict__ X,
+    float*                __restrict__ Y,
+    int M, int K, int B
+) {
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int lane16  = lane & 15;
+    const int row_start   = blockIdx.x * L3W_M_TILE;
+    const int batch_start = blockIdx.y * L3W_N_TILE;
+    if (row_start >= M || batch_start >= B) return;
+
+    __shared__ unsigned short lds_x[L3W_N_TILE * BF16L3_BLOCK];
+
+    // Plane bases, recomputed from n exactly as the host-side Layout does.
+    const size_t n        = (size_t)M * (size_t)K;
+    const size_t nb       = (n + BF16L3_BLOCK - 1) / BF16L3_BLOCK;
+    const size_t esc_tab  = BF16L3_HEADER;
+    const size_t lut_off  = esc_tab + bf16l3_gemm_align16(4 * nb);
+    const size_t mant_off = lut_off + bf16l3_gemm_align16(BF16L3_LUT_STRIDE * nb);
+    const size_t code_off = mant_off + BF16L3_BLOCK * nb;
+    const size_t esc_off  = code_off + BF16L3_CODE_STRIDE * nb;
+
+    const int warp_row_start = row_start + warp_id * L3W_M_PER_WARP;
+    const int my_row   = warp_row_start + lane16;
+    const int safe_row = (my_row < M) ? my_row : (M - 1);
+    const int blocks_per_row = K / BF16L3_BLOCK;
+
+    l3_float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const l3_b16x16_t zero_b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+    for (int k_base = 0; k_base < K; k_base += BF16L3_BLOCK) {
+        // Stage the X tile once per block, shared by all 8 warps.
+        const int slot_in_block = warp_id * L3W_SLOTS + (lane >> 4);
+        const int k_off = lane16 * 16;
+        const int batch_row = batch_start + slot_in_block;
+        l3_b16x16_t x_frag = zero_b;
+        if (batch_row < B && k_base + k_off < K) {
+            x_frag = *(const l3_b16x16_t*)(X + (long long)batch_row * K + k_base + k_off);
+        }
+        *(l3_b16x16_t*)(lds_x + slot_in_block * BF16L3_BLOCK + k_off) = x_frag;
+        __syncthreads();
+
+        // This lane's row-block. One LUT3 block covers exactly this k range.
+        const size_t blk = (size_t)safe_row * (size_t)blocks_per_row
+                         + (size_t)(k_base / BF16L3_BLOCK);
+        const unsigned int esc_start =
+            ((const unsigned int* __restrict__)(W + esc_tab))[blk];
+        const uint2 lv =
+            *(const uint2* __restrict__)(W + lut_off + BF16L3_LUT_STRIDE * blk);
+        const unsigned char* __restrict__ mant  = W + mant_off + BF16L3_BLOCK * blk;
+        const unsigned char* __restrict__ codes = W + code_off + BF16L3_CODE_STRIDE * blk;
+        const unsigned char* __restrict__ esc   = W + esc_off  + esc_start;
+        int cursor = 0;
+
+        for (int kt = 0; kt < BF16L3_BLOCK; kt += 16) {
+            // 16 codes live in 6 bytes: kt is a multiple of 8, so byte-aligned.
+            const unsigned char* __restrict__ cp = codes + (kt >> 3) * 3;
+            const unsigned int c0 =
+                (unsigned int)cp[0] | ((unsigned int)cp[1] << 8) | ((unsigned int)cp[2] << 16);
+            const unsigned int c1 =
+                (unsigned int)cp[3] | ((unsigned int)cp[4] << 8) | ((unsigned int)cp[5] << 16);
+
+            l3_b16x16_t a_frag;
+            #pragma unroll
+            for (int s = 0; s < 16; ++s) {
+                const unsigned int cw   = (s < 8) ? c0 : c1;
+                const unsigned int code = (cw >> (3 * (s & 7))) & 7u;
+                const unsigned int lsel = (code < 4 ? lv.x : lv.y) >> (8 * (code & 3));
+                const unsigned int e    = (code == BF16L3_ESCAPE)
+                                              ? (unsigned int)esc[cursor++]
+                                              : (lsel & 0xffu);
+                const unsigned int sm   = (unsigned int)mant[kt + s];
+                a_frag[s] = (short)(((sm & 0x80u) << 8) | (e << 7) | (sm & 0x7fu));
+            }
+
+            l3_b16x16_t b_frag = *(const l3_b16x16_t*)(lds_x + lane16 * BF16L3_BLOCK + kt);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc);
+        }
+        __syncthreads();
+    }
+
+    const int out_col = batch_start + lane16;
+    if (out_col < B) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int out_row = warp_row_start + 2 * j + (lane >> 4);
+            if (out_row < M) {
+                Y[(long long)out_col * M + out_row] = acc[j];
+            }
+        }
+    }
+}
+
+#undef L3W_M_TILE
+#undef L3W_N_TILE
+#undef L3W_M_PER_WARP
+#undef L3W_SLOTS
