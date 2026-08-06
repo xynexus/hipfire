@@ -17,12 +17,25 @@
 // BF16L3_NT columns per pass cuts the weight traffic by that factor.
 //
 // The host loops column tiles, passing `col_base`; `n_cols` is the live width of
-// the final partial tile. Accumulators are registers, so BF16L3_NT trades
-// register pressure against the amortization factor, and the amortization is
-// what matters: at NT=8 an N=256 GEMM needs 32 passes, each streaming the WHOLE
-// matrix, which measured 2.4-8.6x slower than the plain-BF16 WMMA GEMM (that one
-// reads its weights once and reuses them from LDS across all of N). Every
-// doubling of NT halves the weight traffic.
+// the final partial tile.
+//
+// WHERE THIS STANDS, and two falsified theories, so nobody re-runs them
+// (`bench_bf16l3_vs_bf16_gemm` reproduces all of it):
+//
+// Against the plain-BF16 WMMA GEMM this is 0.4-0.9x at N=1 (a WIN, up to 2.6x
+// on an lm_head) and 2.3-8x SLOWER at N=256. The crossover is below N=64.
+//
+//  * "It is weight-re-read bound." At NT=8, N=256 needs 32 passes over the whole
+//    matrix while the WMMA GEMM reads its weights once. Raising NT 8 -> 32
+//    quartered that traffic and bought ~10% at N=256, while making N=1 worse
+//    (NT accumulators are allocated even when n_cols is 1). Not the bottleneck.
+//  * "The activation loads should be contiguous." Transposing x to [K, N] so a
+//    tile's columns share a cache line made every shape 15-30% SLOWER. The
+//    [N, K] layout is coalesced ACROSS THE WAVE, which matters more.
+//
+// What is left is structural, not a constant: decode a weight tile into LDS once
+// and run the same WMMA compute the BF16 path uses, so LUT3 is purely a storage
+// format and prefill matches bf16 while reading 1.38x fewer bytes.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -113,6 +126,13 @@ extern "C" __global__ void gemm_bf16l3_xf32(
             // Decoded ONCE, spent across the column tile. This reuse is the
             // entire point of the kernel.
             const float wf = bf16l3_gemm_to_f32(wq);
+            // These loads are K floats apart per column, which looks wrong and
+            // is not: MEASURED, transposing x to [K, N] to make the tile
+            // contiguous per thread made every shape 15-30% SLOWER. This layout
+            // is coalesced ACROSS THE WAVE — adjacent lanes own k0 8 apart, so
+            // their addresses are 32 bytes apart and share lines — and that
+            // matters more than per-thread contiguity. Transposing trades it for
+            // lanes reading 8*N floats apart.
             #pragma unroll
             for (int c = 0; c < BF16L3_NT; ++c) {
                 if (c < n_cols) {

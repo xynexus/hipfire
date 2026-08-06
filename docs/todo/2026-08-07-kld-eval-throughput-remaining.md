@@ -38,6 +38,52 @@ blocking, `__shfl`, LDS bank padding — are worth not repeating.
 
 Benefits every qwen3.5 workload (serving prefill, calibration), not just eval.
 
+### 2b. LUT3 as the only in-memory bf16 form — blocked on a GEMM rewrite
+
+The idea (worth doing, not yet payable): `Bf16Huff` is always expanded at load
+even under `HIPFIRE_BF16L3_RESIDENT`, because Huffman has no in-kernel decoder,
+so a Huff-stored model gets the 1.507x on-disk win and then throws away the VRAM
+and bandwidth win. Transcoding Huff -> LUT3 during load would close that, and
+both primitives are already public (`bf16_huff::decode_par`,
+`bf16_lut3::encode`). `.hfa` ingestion feeds the same path: the container is an
+index of per-file huff-compressed payloads (NOT 7z), so random access is
+feasible without a full restore.
+
+What blocks it is prefill. `bench_bf16l3_vs_bf16_gemm` (validates against a CPU
+reference before timing — an earlier version timed two disagreeing kernels and
+printed a clean-looking table):
+
+| lut3/bf16, >1 = LUT3 slower | N=1 | N=64 | N=256 |
+|---|---|---|---|
+| dn_qkv 6144x1024 | 0.87x | 1.05x | 2.16x |
+| dn_out 1024x2048 | 0.63x | 6.34x | 8.13x |
+| ffn_gate 3584x1024 | 0.92x | 1.42x | 2.39x |
+| ffn_down 1024x3584 | 0.60x | 6.38x | 7.92x |
+| lm_head 248320x1024 | 0.39x | 1.82x | 2.28x |
+
+LUT3 wins batch-1 (up to 2.6x) and loses prefill; crossover is below N=64. Two
+theories about the prefill gap were tested and are FALSE — do not re-run them:
+
+- **Weight re-reads.** At NT=8 an N=256 GEMM makes 32 passes over the whole
+  matrix while the WMMA GEMM reads its weights once. Raising NT 8 -> 32
+  quartered that traffic, bought ~10% at N=256, and made N=1 worse (NT
+  accumulators are allocated even at n_cols=1). Kept at 32 anyway: production
+  only calls this GEMM at N=256 windows, worth 1.28x there end-to-end.
+- **Strided activation loads.** Transposing x to [K,N] so a tile's columns share
+  a cache line made every shape 15-30% SLOWER. The [N,K] layout is coalesced
+  ACROSS THE WAVE (adjacent lanes own k0 8 apart, 32 bytes), and that matters
+  more than per-thread contiguity.
+
+What is actually left is structural: decode a weight tile into LDS once and run
+the same WMMA compute the BF16 path uses, making LUT3 purely a storage format.
+Then prefill matches bf16 while reading 1.38x fewer bytes, and the transcode
+above becomes a straight win everywhere.
+
+Note the framing that makes this worth doing at all: bf16 is the
+calibration/reference path, not production serving (oq8++ is smaller, faster and
+effectively lossless), so a modest prefill loss is acceptable — but 2.3-8x is
+not modest, and it lands on the reference path this document is about.
+
 ### 2. Head GEMM — 0.770 s, 34% of the chunk
 
 `gemm_bf16l3_xf32` (`kernels/src/gemm_bf16l3_xf32.hip`), 128 launches at
