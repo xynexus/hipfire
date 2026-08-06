@@ -10,6 +10,7 @@
 // Helpers still defined in main.rs (crate root); codecs is a descendant module
 // so it can reference these private items. They will move here in a later batch.
 use crate::{cpu_fwht_256, f16_to_f32, f32_to_f16};
+use hipfire_primitives::fwht::signed_fwht;
 use hipfire_quant_format::QuantType;
 
 /// Block byte length for a fixed-geometry format — single-sourced from
@@ -610,9 +611,9 @@ pub fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f
     for b in 0..n_blocks {
         let start = b * group_size;
         let end = (start + group_size).min(n);
-        let mut group = vec![0.0f32; group_size];
+        let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
-        hipfire_primitives::fwht::signed_fwht(&mut group, signs1, signs2);
+        cpu_fwht_256(&mut group, signs1, signs2);
         let (lo, scale) = affine_clipsearch(&group, 63.0);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;
@@ -1175,9 +1176,11 @@ pub fn quantize_oqplus_compact_g(
     for b in 0..n_blocks {
         let start = b * group_size;
         let end = (start + group_size).min(n);
-        let mut group = [0.0f32; 256];
+        // Sized to the group, not a fixed 256: `signed_fwht` is the generic
+        // power-of-two form that `cpu_fwht_256` wraps.
+        let mut group = vec![0.0f32; group_size];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
-        cpu_fwht_256(&mut group, signs1, signs2);
+        signed_fwht(&mut group, signs1, signs2);
         let (scale, idx) = mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;

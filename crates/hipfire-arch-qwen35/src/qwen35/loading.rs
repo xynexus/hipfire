@@ -1125,13 +1125,13 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
-        33 | 35 | 36 => {
+        33 | 35 | 36 | 52 => {
             // OQ8-family dense tensors (OQ+ W4A8, OQ8 W8A8, and compact mixed
             // OQ) all resolve through the shared runtime helper to the combined
             // Oq8G256 device layout consumed by the iu8 GEMV/GEMM kernels. Routed
             // MoE experts keep their indexed block layout in `load_moe_expert`.
             let (bytes, gpu_dtype) = oq8_arch_load(quant_type, data, m, k)
-                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,

@@ -314,6 +314,60 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
 mod tests {
     use super::*;
 
+    /// The reason G=128 exists. K=896 (7*128) is a real shape — Qwen2-0.5B's
+    /// hidden size — and 896 % 256 == 128, so the G=256 compact format cannot
+    /// represent it at all: the group must divide K. G=128 can, and expands to
+    /// the same combined Oq8G256 layout, so nothing downstream changes.
+    #[test]
+    fn g128_covers_a_k_that_g256_cannot_divide() {
+        const K: usize = 896;
+        const M: usize = 2;
+        assert_ne!(
+            K % 256,
+            0,
+            "K=896 must NOT be divisible by 256 for this test"
+        );
+        assert_eq!(K % 128, 0, "K=896 must be divisible by 128");
+
+        let group = 128usize;
+        let n_out = 3usize;
+        let header = 2 + group / 2;
+        let block = header + 2 * n_out;
+        let ng = K / group;
+        let mut data = vec![0u8; M * ng * block];
+        for b in 0..M * ng {
+            let off = b * block;
+            data[off..off + 2].copy_from_slice(&F16_ONE.to_le_bytes());
+            // Distinct nibbles so a wrong header offset would misplace them.
+            for i in 0..group / 2 {
+                data[off + 2 + i] = 0x21;
+            }
+            for s in 0..n_out {
+                data[off + header + 2 * s] = (s * 7) as u8;
+                data[off + header + 2 * s + 1] = (100 + s) as u8;
+            }
+        }
+
+        let combined = oqplus_compact_to_oq8_combined_g(&data, M, K, group);
+        assert_eq!(combined.len(), M * K + M * ng * 4);
+        // Bulk nibbles: low then high of 0x21 sign-extended = 1, 2. Position 1 is
+        // bulk; position 0 is NOT, because overlay s=0 has index 0 and overrides
+        // it — which is the precedence the format requires.
+        assert_eq!(combined[1] as i8, 2);
+        assert_eq!(combined[2] as i8, 1);
+        // Overlays land at their in-group positions, proving the header offset is
+        // 66 here and not the G=256 value of 130.
+        assert_eq!(combined[0] as i8, 100, "position 0 is overlay s=0");
+        assert_eq!(combined[7] as i8, 101, "position 7 is overlay s=1");
+        assert_eq!(combined[14] as i8, 102, "position 14 is overlay s=2");
+        // Scales are the f16 read back as f32, one per group.
+        let so = M * K;
+        assert_eq!(
+            f32::from_le_bytes(combined[so..so + 4].try_into().unwrap()),
+            1.0
+        );
+    }
+
     // 1.0 as f16 bits, and its f32 little-endian bytes for scale asserts.
     const F16_ONE: u16 = 0x3C00;
     fn one_le() -> [u8; 4] {
