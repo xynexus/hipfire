@@ -5141,6 +5141,72 @@ impl Gpu {
         )
     }
 
+    /// BF16L3 weight × F32 activations → F32, batched over `n` columns.
+    ///
+    /// `x` is [n, k] and `y` is [n, m], both row-major per column — the layout a
+    /// per-position logits buffer already has. Bit-identical to calling
+    /// [`Self::gemv_bf16l3_xf32`] once per column, but the decode and the weight
+    /// read are shared across a tile of columns instead of repeated per column.
+    ///
+    /// The GEMV form reads the whole packed matrix per output column, which on
+    /// an lm_head is 367 MB per position. Tiling columns cuts that by the tile
+    /// width; the kernel's `BF16L3_NT` (8) sets it, and this loops the tiles.
+    pub fn gemm_bf16l3_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_xf32 requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_xf32",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_xf32",
+        )?;
+        const NT: usize = 8; // must match BF16L3_NT in the kernel
+        let wp = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = n as i32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_xf32", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let cb = col as i32;
+            let nc = cols as i32;
+            result = self.launch_kernargs(
+                "gemm_bf16l3_xf32",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 ni, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(
         &mut self,

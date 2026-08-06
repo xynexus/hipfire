@@ -1375,6 +1375,11 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
+        // Without this the packed head fell through to the per-column fallback
+        // below, which reads the whole 367 MB payload once per column — 62% of
+        // GPU time in a KLD reference build. The batched kernel shares one
+        // decode across a tile of columns.
+        DType::Bf16L3 => gpu.gemm_bf16l3_xf32(&w.buf, x, y, w.m, w.k, batch_size),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
