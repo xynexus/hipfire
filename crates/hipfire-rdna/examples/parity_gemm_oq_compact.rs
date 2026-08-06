@@ -52,22 +52,30 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 /// Host expansion, mirroring `hipfire_runtime::oq8_arch::oqplus_compact_to_oq8_combined`
 /// exactly: int4 bulk sign-extended to int8, then overlays applied in table
 /// order (last duplicate wins), scales split into a trailing f32 plane.
-fn expand(blocks: &[u8], m: usize, k: usize, block_stride: usize) -> (Vec<i8>, Vec<f32>) {
-    const GROUP: usize = 256;
+#[allow(non_snake_case)]
+fn expand(
+    blocks: &[u8],
+    m: usize,
+    k: usize,
+    block_stride: usize,
+    group: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let GROUP: usize = group;
     let ng = k / GROUP;
-    let n_out = (block_stride - 130) / 2;
+    let header = 2 + GROUP / 2;
+    let n_out = (block_stride - header) / 2;
     let mut w = vec![0i8; m * k];
     let mut ws = vec![0f32; m * ng];
     for r in 0..m {
         for g in 0..ng {
             let src = (r * ng + g) * block_stride;
             let dst = r * k + g * GROUP;
-            for i in 0..128 {
+            for i in 0..GROUP / 2 {
                 let byte = blocks[src + 2 + i];
                 w[dst + 2 * i] = (((byte & 0xf) as i8) << 4) >> 4;
                 w[dst + 2 * i + 1] = ((byte >> 4) as i8) << 4 >> 4;
             }
-            let tbl = src + 130;
+            let tbl = src + header;
             for s in 0..n_out {
                 let idx = blocks[tbl + 2 * s] as usize;
                 w[dst + idx] = blocks[tbl + 2 * s + 1] as i8;
@@ -79,7 +87,6 @@ fn expand(blocks: &[u8], m: usize, k: usize, block_stride: usize) -> (Vec<i8>, V
 }
 
 fn main() {
-    const GROUP: usize = 256;
     let mut gpu = Gpu::init().expect("gpu");
     eprintln!("GPU: {}", gpu.arch);
 
@@ -93,133 +100,143 @@ fn main() {
     // is the decode case and was NOT covered before — every earlier shape used
     // B>=5, so a bug that only shows with a single active batch row (lane
     // clamping via safe_x, the n=1 tail) could not have been caught here.
-    for &(m, k, b) in &[
-        (16usize, 256usize, 16usize),
-        (48, 512, 8),
-        (33, 768, 5),
-        (2048, 1024, 1),
-        (1024, 3584, 1),
-        (512, 1024, 1),
-        (512, 1024, 2),
-    ] {
-        for &n_out in &[1usize, 3, 7, 16] {
-            // Power-of-two scales are exact in f16 AND exact under f32 multiply, so
-            // they hide any difference in rounding or multiply order between the two
-            // paths. A real artifact's scales are arbitrary f16, so sweep both:
-            // `exact` reproduces the original coverage, `!exact` is the realistic case.
-            for &exact in &[true, false] {
-                let block_stride = 130 + 2 * n_out;
-                let ng = k / GROUP;
-                let mut rnd = lcg(0x51ee_d00d ^ (m * k * b + n_out) as u32 ^ (exact as u32) << 20);
+    // G=128 exists to fit K values that 256 cannot divide; both must decode.
+    for &GROUP in &[256usize, 128] {
+        for &(m, k, b) in &[
+            (16usize, 256usize, 16usize),
+            (48, 512, 8),
+            (33, 768, 5),
+            (2048, 1024, 1),
+            (1024, 3584, 1),
+            (512, 1024, 1),
+            (512, 1024, 2),
+        ] {
+            for &n_out in &[1usize, 3, 7, 16] {
+                // Power-of-two scales are exact in f16 AND exact under f32 multiply, so
+                // they hide any difference in rounding or multiply order between the two
+                // paths. A real artifact's scales are arbitrary f16, so sweep both:
+                // `exact` reproduces the original coverage, `!exact` is the realistic case.
+                for &exact in &[true, false] {
+                    let block_stride = 2 + GROUP / 2 + 2 * n_out;
+                    let ng = k / GROUP;
+                    let mut rnd =
+                        lcg(0x51ee_d00d ^ (m * k * b + n_out) as u32 ^ (exact as u32) << 20);
 
-                // Build compact blocks.
-                let mut blocks = vec![0u8; m * ng * block_stride];
-                for r in 0..m {
-                    for g in 0..ng {
-                        let off = (r * ng + g) * block_stride;
-                        // Arbitrary case: build the f16 bit pattern directly (random
-                        // 10-bit mantissa, exponent ~2^-5..2^3) so no f32->f16 rounding
-                        // is needed and the stored scale is exactly what both paths see.
-                        let bits = if exact {
-                            f32_to_f16_bits(1.0f32 / (1 << (1 + (rnd() % 4))) as f32)
-                        } else {
-                            (((10 + rnd() % 9) as u16) << 10) | (rnd() % 1024) as u16
-                        };
-                        blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
-                        for i in 0..128 {
-                            blocks[off + 2 + i] = (rnd() & 0xff) as u8;
-                        }
-                        for s in 0..n_out {
-                            // Deliberately allow duplicate indices so last-wins is exercised.
-                            blocks[off + 130 + 2 * s] = (rnd() % 256) as u8;
-                            blocks[off + 130 + 2 * s + 1] = (rnd() & 0xff) as u8;
+                    // Build compact blocks.
+                    let mut blocks = vec![0u8; m * ng * block_stride];
+                    for r in 0..m {
+                        for g in 0..ng {
+                            let off = (r * ng + g) * block_stride;
+                            // Arbitrary case: build the f16 bit pattern directly (random
+                            // 10-bit mantissa, exponent ~2^-5..2^3) so no f32->f16 rounding
+                            // is needed and the stored scale is exactly what both paths see.
+                            let bits = if exact {
+                                f32_to_f16_bits(1.0f32 / (1 << (1 + (rnd() % 4))) as f32)
+                            } else {
+                                (((10 + rnd() % 9) as u16) << 10) | (rnd() % 1024) as u16
+                            };
+                            blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+                            for i in 0..GROUP / 2 {
+                                blocks[off + 2 + i] = (rnd() & 0xff) as u8;
+                            }
+                            for s in 0..n_out {
+                                // Deliberately allow duplicate indices so last-wins is exercised.
+                                let hdr = 2 + GROUP / 2;
+                                blocks[off + hdr + 2 * s] = (rnd() % GROUP as u32) as u8;
+                                blocks[off + hdr + 2 * s + 1] = (rnd() & 0xff) as u8;
+                            }
                         }
                     }
-                }
 
-                // Activations: int8 + per-group f32 scales, shared by both paths.
-                let xq: Vec<i8> = (0..b * k)
-                    .map(|_| ((rnd() % 255) as i32 - 127) as i8)
-                    .collect();
-                let xs: Vec<f32> = (0..b * ng)
-                    .map(|_| {
-                        if exact {
-                            1.0f32 / (1 << (1 + (rnd() % 3))) as f32
-                        } else {
-                            // Arbitrary positive f32, same order of magnitude.
-                            0.25f32 + (rnd() % 100_000) as f32 * 1.0e-5
+                    // Activations: int8 + per-group f32 scales, shared by both paths.
+                    let xq: Vec<i8> = (0..b * k)
+                        .map(|_| ((rnd() % 255) as i32 - 127) as i8)
+                        .collect();
+                    let xs: Vec<f32> = (0..b * ng)
+                        .map(|_| {
+                            if exact {
+                                1.0f32 / (1 << (1 + (rnd() % 3))) as f32
+                            } else {
+                                // Arbitrary positive f32, same order of magnitude.
+                                0.25f32 + (rnd() % 100_000) as f32 * 1.0e-5
+                            }
+                        })
+                        .collect();
+
+                    let (w_dense, w_scales) = expand(&blocks, m, k, block_stride, GROUP);
+
+                    let d_blocks = gpu
+                        .upload_raw(&blocks, &[blocks.len()])
+                        .expect("upload blocks");
+                    let d_wdense = gpu
+                        .upload_raw(
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    w_dense.as_ptr() as *const u8,
+                                    w_dense.len(),
+                                )
+                            },
+                            &[w_dense.len()],
+                        )
+                        .expect("upload dense");
+                    let d_wscales = gpu
+                        .upload_f32(&w_scales, &[w_scales.len()])
+                        .expect("upload wscales");
+                    let d_xq = gpu
+                        .upload_raw(
+                            unsafe {
+                                std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len())
+                            },
+                            &[xq.len()],
+                        )
+                        .expect("upload xq");
+                    let d_xs = gpu.upload_f32(&xs, &[xs.len()]).expect("upload xs");
+                    let d_y_ref = gpu.zeros(&[b * m], DType::F32).expect("y ref");
+                    let d_y_cmp = gpu.zeros(&[b * m], DType::F32).expect("y cmp");
+
+                    gpu.gemm_oq8_grouped_wmma(
+                        &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, GROUP,
+                    )
+                    .expect("dense gemm");
+                    gpu.gemm_oq_compact_grouped_wmma(
+                        &d_blocks,
+                        &d_xq,
+                        &d_xs,
+                        &d_y_cmp,
+                        m,
+                        k,
+                        b,
+                        GROUP,
+                        block_stride,
+                    )
+                    .expect("compact gemm");
+
+                    let y_ref = gpu.download_f32(&d_y_ref).expect("dl ref");
+                    let y_cmp = gpu.download_f32(&d_y_cmp).expect("dl cmp");
+
+                    let mut bad = 0usize;
+                    let mut worst = 0.0f32;
+                    for (a, c) in y_ref.iter().zip(y_cmp.iter()) {
+                        if a.to_bits() != c.to_bits() {
+                            bad += 1;
+                            worst = worst.max((a - c).abs());
                         }
-                    })
-                    .collect();
-
-                let (w_dense, w_scales) = expand(&blocks, m, k, block_stride);
-
-                let d_blocks = gpu
-                    .upload_raw(&blocks, &[blocks.len()])
-                    .expect("upload blocks");
-                let d_wdense = gpu
-                    .upload_raw(
-                        unsafe {
-                            std::slice::from_raw_parts(w_dense.as_ptr() as *const u8, w_dense.len())
-                        },
-                        &[w_dense.len()],
-                    )
-                    .expect("upload dense");
-                let d_wscales = gpu
-                    .upload_f32(&w_scales, &[w_scales.len()])
-                    .expect("upload wscales");
-                let d_xq = gpu
-                    .upload_raw(
-                        unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
-                        &[xq.len()],
-                    )
-                    .expect("upload xq");
-                let d_xs = gpu.upload_f32(&xs, &[xs.len()]).expect("upload xs");
-                let d_y_ref = gpu.zeros(&[b * m], DType::F32).expect("y ref");
-                let d_y_cmp = gpu.zeros(&[b * m], DType::F32).expect("y cmp");
-
-                gpu.gemm_oq8_grouped_wmma(
-                    &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, GROUP,
-                )
-                .expect("dense gemm");
-                gpu.gemm_oq_compact_grouped_wmma(
-                    &d_blocks,
-                    &d_xq,
-                    &d_xs,
-                    &d_y_cmp,
-                    m,
-                    k,
-                    b,
-                    GROUP,
-                    block_stride,
-                )
-                .expect("compact gemm");
-
-                let y_ref = gpu.download_f32(&d_y_ref).expect("dl ref");
-                let y_cmp = gpu.download_f32(&d_y_cmp).expect("dl cmp");
-
-                let mut bad = 0usize;
-                let mut worst = 0.0f32;
-                for (a, c) in y_ref.iter().zip(y_cmp.iter()) {
-                    if a.to_bits() != c.to_bits() {
-                        bad += 1;
-                        worst = worst.max((a - c).abs());
                     }
-                }
-                let scales = if exact {
-                    "pow2-scales"
-                } else {
-                    "arbitrary-scales"
-                };
-                let tag = format!("M={m} K={k} B={b} N_out={n_out} {scales}");
-                if bad == 0 {
-                    println!("  ok   {tag}: bit-identical over {} outputs", y_ref.len());
-                } else {
-                    fail += 1;
-                    println!(
-                        "  FAIL {tag}: {bad}/{} outputs differ, worst |delta| {worst:.6e}",
-                        y_ref.len()
-                    );
+                    let scales = if exact {
+                        "pow2-scales"
+                    } else {
+                        "arbitrary-scales"
+                    };
+                    let tag = format!("G={GROUP} M={m} K={k} B={b} N_out={n_out} {scales}");
+                    if bad == 0 {
+                        println!("  ok   {tag}: bit-identical over {} outputs", y_ref.len());
+                    } else {
+                        fail += 1;
+                        println!(
+                            "  FAIL {tag}: {bad}/{} outputs differ, worst |delta| {worst:.6e}",
+                            y_ref.len()
+                        );
+                    }
                 }
             }
         }

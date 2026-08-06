@@ -535,7 +535,7 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
-fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
+fn mixed_overlay_indices(group: &[f32], scale: f32, n_out: usize) -> Vec<usize> {
     let inv = 1.0 / scale.max(1e-12);
     let gain = |index: usize| -> f32 {
         let value = group[index];
@@ -545,25 +545,20 @@ fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize
         let error8 = value - q8 * scale;
         error4 * error4 - error8 * error8
     };
-    let mut indices: [usize; 256] = core::array::from_fn(|index| index);
-    indices[..].sort_unstable_by(|&left, &right| {
+    let mut indices: Vec<usize> = (0..group.len()).collect();
+    indices.sort_unstable_by(|&left, &right| {
         gain(right)
             .partial_cmp(&gain(left))
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| left.cmp(&right))
     });
-    debug_assert!((1..=255).contains(&n_out));
+    debug_assert!((1..group.len()).contains(&n_out));
     indices
 }
 
-fn mixed_overlay_error(
-    group: &[f32; 256],
-    scale: f32,
-    indices: &[usize; 256],
-    n_out: usize,
-) -> f32 {
+fn mixed_overlay_error(group: &[f32], scale: f32, indices: &[usize], n_out: usize) -> f32 {
     let inv = 1.0 / scale.max(1e-12);
-    let mut is_w8 = [false; 256];
+    let mut is_w8 = vec![false; group.len()];
     for &index in &indices[..n_out] {
         is_w8[index] = true;
     }
@@ -579,12 +574,7 @@ fn mixed_overlay_error(
         .sum()
 }
 
-fn refit_mixed_scale(
-    group: &[f32; 256],
-    indices: &[usize; 256],
-    n_out: usize,
-    fallback: f32,
-) -> f32 {
+fn refit_mixed_scale(group: &[f32], indices: &[usize], n_out: usize, fallback: f32) -> f32 {
     const CLIP_GRID: [f32; 14] = [
         1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
     ];
@@ -602,7 +592,7 @@ fn refit_mixed_scale(
     best_scale
 }
 
-fn mixed_clipsearch(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
+fn mixed_clipsearch(group: &[f32], n_out: usize) -> (f32, Vec<usize>) {
     let initial_scale = symmetric_clipsearch(group, 7.0);
     let initial_indices = mixed_overlay_indices(group, initial_scale, n_out);
     let first_scale = refit_mixed_scale(group, &initial_indices, n_out, initial_scale);
@@ -620,9 +610,9 @@ pub fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f
     for b in 0..n_blocks {
         let start = b * group_size;
         let end = (start + group_size).min(n);
-        let mut group = [0.0f32; 256];
+        let mut group = vec![0.0f32; group_size];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
-        cpu_fwht_256(&mut group, signs1, signs2);
+        hipfire_primitives::fwht::signed_fwht(&mut group, signs1, signs2);
         let (lo, scale) = affine_clipsearch(&group, 63.0);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;
@@ -1139,9 +1129,46 @@ pub fn quantize_oqplus_compact(
     signs2: &[f32],
     w8_frac: f32,
 ) -> Vec<u8> {
-    let group_size = 256usize;
-    let n_out = ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, 255);
-    let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
+    quantize_oqplus_compact_g(f32_data, signs1, signs2, w8_frac, 256)
+}
+
+/// Group-generic `OqPlusCompact`. `group` must be a power of two and divide the
+/// FWHT length of `signs1`/`signs2`, which the CALLER supplies — G=256 uses sign
+/// seeds 42/1042, G=128 uses 43/1043 (matching `ensure_mq_signs_128`, the table
+/// the runtime rotate uploads). Passing the wrong pair silently rotates by a
+/// different transform, so the seeds are the caller's contract to get right.
+///
+/// G=128 exists for COVERAGE, not size: the group must divide K, so a model
+/// whose K is a multiple of 128 but not 256 cannot use G=256 at all. Matching
+/// G=256's quality costs ~+0.125 bits/weight — see
+/// docs/experiments/2026-08-06-oq-compact-group-size.md.
+pub fn quantize_oqplus_compact_g(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    w8_frac: f32,
+    group_size: usize,
+) -> Vec<u8> {
+    assert!(
+        group_size.is_power_of_two() && group_size >= 32,
+        "OQ+C group must be a power of two >= 32 (got {group_size})"
+    );
+    assert_eq!(
+        signs1.len(),
+        group_size,
+        "signs1 length must equal the group"
+    );
+    assert_eq!(
+        signs2.len(),
+        group_size,
+        "signs2 length must equal the group"
+    );
+    // The overlay index is a u8, so a position must fit in 0..=255; that also
+    // caps n_out itself at 255.
+    let n_out =
+        ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, group_size.min(256) - 1);
+    let header = 2 + group_size / 2; // f16 scale + packed nibbles
+    let block_bytes = header + 2 * n_out;
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1158,13 +1185,13 @@ pub fn quantize_oqplus_compact(
         output[out_off] = (scale_f16 & 0xFF) as u8;
         output[out_off + 1] = (scale_f16 >> 8) as u8;
         // Bulk int4 nibbles (every position; outlier slots get overridden on load).
-        for i in 0..128 {
+        for i in 0..group_size / 2 {
             let qlo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
             let qhi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
             output[out_off + 2 + i] = ((qlo as u8) & 0xf) | (((qhi as u8) & 0xf) << 4);
         }
         // Sparse int8 outlier overlay: (u8 index-in-group, i8 value).
-        let tbl = out_off + 130;
+        let tbl = out_off + header;
         for (s, &pos) in idx[..n_out].iter().enumerate() {
             let q8 = (group[pos] * inv).round().clamp(-127.0, 127.0) as i8;
             output[tbl + 2 * s] = pos as u8;

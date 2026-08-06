@@ -232,6 +232,19 @@ pub enum QuantType {
     /// Codec/kernel pending — the encoder can emit this; `gemv_qtip3g256`
     /// computes 1MAD on-device and must gain a 3INST path before it can serve.
     Qtip3G256I3 = 51,
+
+    /// `OqPlusCompact` at a 128-element group instead of 256: block
+    /// `[f16 scale][64 int4 nibbles][N_out × (u8 idx, i8 val)]` = `66 + 2·N_out`
+    /// bytes.
+    ///
+    /// It is NOT here to beat qt 36 on size — it does not; matching G=256's
+    /// quality costs about +0.125 bits/weight (see
+    /// docs/experiments/2026-08-06-oq-compact-group-size.md). It exists for
+    /// COVERAGE: the group must divide K, so a model whose K is a multiple of
+    /// 128 but not 256 cannot use qt 36 at all, and would otherwise fall back to
+    /// a far more expensive format. Its FWHT is the 128-length one already used
+    /// by MQ4G128 (sign seeds 43/1043, versus 42/1042 at G=256).
+    OqPlusCompactG128 = 52,
 }
 
 impl QuantType {
@@ -290,6 +303,7 @@ impl QuantType {
             34 => Oq4G256,
             35 => Oq8G256,
             36 => OqPlusCompact,
+            52 => OqPlusCompactG128,
             37 => Oq4G256ArchPacked,
             38 => Oq3G256,
             39 => Oq2G256,
@@ -383,7 +397,7 @@ impl QuantType {
             //  - Bf16Lut3 / Bf16Huff: coded-exponent length is data-dependent
             Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4MixedPlain
             | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row
-            | Bf16Lut3 | Bf16Huff => None,
+            | Bf16Lut3 | Bf16Huff | OqPlusCompactG128 => None,
         }
     }
 
@@ -489,6 +503,7 @@ mod tests {
             QuantType::MFP4G32,
             QuantType::OqPlusG256,
             QuantType::OqPlusCompact,
+            QuantType::OqPlusCompactG128,
             QuantType::Oq4MixedPlain,
             QuantType::Oq4G256ArchPacked,
             QuantType::Qtip2G256,
@@ -547,6 +562,7 @@ mod tests {
         assert_eq!(QuantType::Oq4G256.code(), 34);
         assert_eq!(QuantType::Oq8G256.code(), 35);
         assert_eq!(QuantType::OqPlusCompact.code(), 36);
+        assert_eq!(QuantType::OqPlusCompactG128.code(), 52);
         assert_eq!(QuantType::Oq4G256ArchPacked.code(), 37);
         assert_eq!(QuantType::Oq3G256.code(), 38);
         assert_eq!(QuantType::Oq2G256.code(), 39);

@@ -480,21 +480,26 @@ impl Gpu {
             0,
             "gemm_oq_compact_grouped_wmma: K must be a multiple of group"
         );
-        assert_eq!(
-            group, 256,
-            "gemm_oq_compact_grouped_wmma: the compact block encodes exactly 256 weights"
+        // 256 and 128 are the two defined compact groups. Larger groups are not
+        // representable: the overlay index is a u8, so it cannot address a
+        // position >= 256 (see
+        // docs/experiments/2026-08-06-oq-compact-group-size.md).
+        assert!(
+            group == 256 || group == 128,
+            "gemm_oq_compact_grouped_wmma: compact group must be 256 or 128 (got {group})"
         );
         // Mirrors the host oracle's contract (`oqplus_compact_to_oq8_combined`):
-        // a valid OqPlusCompact block carries at least one overlay, so the
-        // minimum stride is 132, not 130.
+        // a valid block carries at least one overlay, so the minimum stride is
+        // header + 2, where header = f16 scale + group/2 nibble bytes.
+        let header = 2 + group / 2;
         assert!(
-            block_stride >= 132 && (block_stride - 130) % 2 == 0,
-            "gemm_oq_compact_grouped_wmma: block_stride {block_stride} invalid (expected 130 + 2*N_out, N_out >= 1)"
+            block_stride >= header + 2 && (block_stride - header) % 2 == 0,
+            "gemm_oq_compact_grouped_wmma: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
         );
         // The kernel holds the overlay table in registers; refuse rather than
         // silently clip a block carrying more outliers than it can keep.
         const MAX_OVERLAYS: usize = 32;
-        let overlays = (block_stride - 130) / 2;
+        let overlays = (block_stride - header) / 2;
         assert!(
             overlays <= MAX_OVERLAYS,
             "gemm_oq_compact_grouped_wmma: {overlays} overlays exceeds the {MAX_OVERLAYS} the kernel keeps in registers"
