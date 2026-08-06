@@ -25,6 +25,11 @@ stream in layer 0 alone.
 Slow on purpose — plain numpy, ~6 min for 64 tokens. A correctness oracle, not
 a benchmark.
 """
+
+import json
+
+import numpy as np
+
 F='/home/sadara/.claude/jobs/9a1047b0/tmp/q08b/model.safetensors-00001-of-00001.safetensors'
 fh=open(F,'rb'); n=int.from_bytes(fh.read(8),'little'); H=json.loads(fh.read(n)); B=8+n
 def T(nm):
