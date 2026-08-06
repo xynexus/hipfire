@@ -165,9 +165,26 @@ impl SimpleAr for LlamaBackend {
         // is kept because it benches marginally faster: a clean same-build A/B on
         // gfx1103 / MiniCPM5-1B.bf16 gave pp512 602 t/s here vs 581 t/s for the
         // chunked path (tg128 identical).
+        // Scope a kernel trace to the real prefill, so `HIPFIRE_KERNEL_TRACE=1`
+        // on a generate request says whether this path batches. `bench_prefill`
+        // cannot answer that — its arch-0/1 arm is a decode warm-pass.
+        hipfire_rdna::kernel_trace::reset();
+        let t0 = std::time::Instant::now();
         let logits =
             llama::prefill_forward(gpu, &self.weights, &self.config, tokens, &mut self.kv_cache)
                 .map_err(|e| format!("llama prefill_forward: {e:?}"))?;
+        // Timed inside the trace so the rate and the kernel list come from the
+        // same call. `bench_prefill` reports a prefill rate from a decode
+        // warm-pass, so any prefill t/s figure needs its path shown beside it.
+        let secs = t0.elapsed().as_secs_f64();
+        if let Some(rep) = hipfire_rdna::kernel_trace::report(&format!(
+            "llama prefill_forward: {} tokens in {:.1} ms = {:.1} tok/s",
+            tokens.len(),
+            secs * 1e3,
+            tokens.len() as f64 / secs.max(1e-9)
+        )) {
+            eprint!("{rep}");
+        }
         // Land the last-position logits in `scratch.logits` for the SimpleAr seam.
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4) };

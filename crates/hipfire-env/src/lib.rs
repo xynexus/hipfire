@@ -187,6 +187,15 @@ env_vars! {
     PROMPT_HEAT_LIMIT = "HIPFIRE_PROMPT_HEAT_LIMIT", Developer,
         "Maximum tokens listed in the prompt heat dump. Default 64.";
 
+    KERNEL_TRACE = "HIPFIRE_KERNEL_TRACE", Developer,
+        "Log a per-kernel dispatch histogram. Counted in `Gpu::ensure_kernel`, \
+         the universal dispatch chokepoint, so it catches every launch; off by \
+         default at the cost of one relaxed atomic load. Also enables the \
+         gate-reason diagnostics that say WHY a batched path was declined \
+         (batched-FA, MoE grouped GEMM, prefill_batch_pbs_eligible). Exists \
+         because a measurement can name a path it never took: bench_prefill \
+         reported `pp512 t/s` from a per-token warm-pass for five arches.";
+
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP32_BELOW = "HIPFIRE_DN_STATE_FP32_BELOW", Developer,
         "DeltaNet state stays FP32 when head_dim x n_value_heads is below this \
