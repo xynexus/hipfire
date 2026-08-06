@@ -18,8 +18,11 @@
 //
 // The host loops column tiles, passing `col_base`; `n_cols` is the live width of
 // the final partial tile. Accumulators are registers, so BF16L3_NT trades
-// register pressure against the amortization factor — 8 keeps the same 32-lane
-// launch bounds as the GEMV.
+// register pressure against the amortization factor, and the amortization is
+// what matters: at NT=8 an N=256 GEMM needs 32 passes, each streaming the WHOLE
+// matrix, which measured 2.4-8.6x slower than the plain-BF16 WMMA GEMM (that one
+// reads its weights once and reuses them from LDS across all of N). Every
+// doubling of NT halves the weight traffic.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -28,7 +31,7 @@
 #define BF16L3_CODE_STRIDE  96   // 256 codes x 3 bits
 #define BF16L3_HEADER       16
 #define BF16L3_ESCAPE        7
-#define BF16L3_NT            8   // activation columns per pass
+#define BF16L3_NT           32   // activation columns per pass
 
 __device__ __forceinline__ float bf16l3_gemm_to_f32(unsigned short h) {
     return __uint_as_float(((unsigned int)h) << 16);

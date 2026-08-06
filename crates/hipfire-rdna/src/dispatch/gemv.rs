@@ -5174,7 +5174,7 @@ impl Gpu {
             kernels::GEMM_BF16L3_XF32_SRC,
             "gemm_bf16l3_xf32",
         )?;
-        const NT: usize = 8; // must match BF16L3_NT in the kernel
+        const NT: usize = 32; // must match BF16L3_NT in the kernel
         let wp = w.buf.as_ptr();
         let xp = x.buf.as_ptr();
         let yp = y.buf.as_ptr();
