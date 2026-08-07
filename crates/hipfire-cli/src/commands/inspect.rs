@@ -53,21 +53,73 @@ const SHAPE_FIELDS: &[(&str, &str)] = &[
 
 pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let path = resolve(&args.target, &loaded)?;
-    let hfq = HfqFile::open_index_only(&path)
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
+    let hfq = HfqFile::open_index_only(&path).map_err(|e| {
+        // An .hfa is an HFAR archive of a HuggingFace directory, not an HFQM
+        // container, so the raw "not an HFQM container at offset 0" leaks an
+        // internal detail and names no way forward.
+        if is_hfar_archive(&path) {
+            anyhow::anyhow!(
+                "{} is an HFAR archive, not an .hfq container. It holds a HuggingFace \
+                 source directory; restore it first with `hipfire-coexistence repack \
+                 --input {} --output <hf_dir>`.",
+                path.display(),
+                path.display(),
+            )
+        } else {
+            anyhow::anyhow!("failed to open {}: {e}", path.display())
+        }
+    })?;
 
     let meta: Value = serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| json!({}));
     let components = component_summary(&meta)?;
+    // A calibration artefact carries arch 0 in its HFQM header and the real one
+    // in `source_arch_id`; trusting the header prints "arch: 0 (llama)" for a
+    // qwen35 calib, which is not merely uninformative but wrong.
+    let arch_id = calib_source_arch_id(&meta).unwrap_or(hfq.arch_id);
     let arch_name = hipfire_archs::registry()
-        .get(ArchId(hfq.arch_id as u16))
+        .get(ArchId(arch_id as u16))
         .map(|a| a.family);
 
     if args.json {
-        print_json(&args.target, &path, &hfq, &meta, arch_name, &components);
+        print_json(
+            &args.target,
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            &components,
+        );
     } else {
-        print_human(&path, &hfq, &meta, arch_name, args.tensors, &components);
+        print_human(
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            args.tensors,
+            &components,
+        );
     }
     Ok(())
+}
+
+/// True when the file begins with an HFAR archive magic (`repack.rs`).
+fn is_hfar_archive(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && (&magic == b"HFAR0002" || &magic == b"HFAR0001")
+}
+
+/// `source_arch_id` of a calibration artefact, whose HFQM header arch is 0.
+fn calib_source_arch_id(meta: &Value) -> Option<u32> {
+    if meta_get(meta, "artifact_kind").and_then(|v| v.as_str()) != Some("calibration") {
+        return None;
+    }
+    meta_get(meta, "source_arch_id")?.as_u64().map(|v| v as u32)
 }
 
 /// Resolve an argument to a concrete path: an existing file path wins, else it
@@ -90,7 +142,16 @@ fn is_lossless_recoding_code(code: u8) -> bool {
     QuantType::from_code(code).is_some_and(|qt| qt.is_lossless_recoding())
 }
 
+/// Calibration-only HFQM quant_type, deliberately outside the `QuantType`
+/// byte-contract: exact F32 Hessian diagonal + BF16 lower strict triangle.
+/// Kept in sync with `QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32`
+/// (`hipfire_runtime::calibration`), which is private to that module.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
 fn quant_name(code: u8) -> String {
+    if code == QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 {
+        return "HessianBf16TrilDiagF32".to_string();
+    }
     match QuantType::from_code(code) {
         Some(qt) => format!("{qt:?}"),
         None => format!("qt{code}?"),
@@ -218,6 +279,7 @@ fn print_human(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
     list_tensors: bool,
     components: &[Value],
@@ -227,11 +289,29 @@ fn print_human(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     println!("artefact: {name}");
+    let calib = calib_source_arch_id(meta).is_some();
+    if calib {
+        println!("kind:     calibration (hessian + imatrix)");
+    }
     match arch_name {
-        Some(a) => println!("arch:     {} ({})", hfq.arch_id, a),
-        None => println!("arch:     {}", hfq.arch_id),
+        Some(a) if calib => println!("arch:     {arch_id} ({a}, from source_arch_id)"),
+        Some(a) => println!("arch:     {arch_id} ({a})"),
+        None => println!("arch:     {arch_id}"),
     }
     println!("format:   hfqm v{}", hfq.version);
+    if calib {
+        for (key, label) in [
+            ("n_hessian", "hessians"),
+            ("n_imatrix", "imatrix"),
+            ("n_calib_tokens", "tokens"),
+            ("source_model", "source"),
+            ("corpus", "corpus"),
+        ] {
+            if let Some(v) = meta_get(meta, key) {
+                println!("{label:9} {}", val_str(v));
+            }
+        }
+    }
 
     // Quant family / KV mode / sidecars.
     if let Some(v) = meta_get(meta, "quant_family") {
@@ -416,6 +496,7 @@ fn print_json(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
     components: &[Value],
 ) {
@@ -482,7 +563,11 @@ fn print_json(
     let out = json!({
         "target": target,
         "path": path.display().to_string(),
-        "arch_id": hfq.arch_id,
+        // For a calibration artefact this is `source_arch_id`; the raw HFQM
+        // header value (always 0 there) stays available as `header_arch_id`.
+        "arch_id": arch_id,
+        "header_arch_id": hfq.arch_id,
+        "artifact_kind": meta_get(meta, "artifact_kind").cloned().unwrap_or(Value::Null),
         "arch_name": arch_name,
         "hfqm_version": hfq.version,
         "quant_family": meta_get(meta, "quant_family"),
@@ -531,5 +616,22 @@ mod tests {
         assert_eq!(components[0]["encoding"], "hfqm-mapped-entries");
         assert_eq!(components[0]["byte_len"], 1024);
         assert_eq!(components[0]["sha256"], "abc");
+    }
+
+    #[test]
+    fn calibration_arch_comes_from_source_not_the_zero_header() {
+        // A calib artefact's HFQM header carries arch 0; trusting it printed
+        // "arch: 0 (llama)" for a qwen35 calib.
+        let calib = json!({"artifact_kind": "calibration", "source_arch_id": 5});
+        assert_eq!(calib_source_arch_id(&calib), Some(5));
+        // A model artefact must keep using its own header arch.
+        assert_eq!(calib_source_arch_id(&json!({"source_arch_id": 5})), None);
+        assert_eq!(calib_source_arch_id(&json!({})), None);
+    }
+
+    #[test]
+    fn hessian_quant_code_is_named_not_marked_unknown() {
+        assert_eq!(quant_name(130), "HessianBf16TrilDiagF32");
+        assert!(quant_name(200).ends_with('?'), "reserved codes stay marked");
     }
 }
