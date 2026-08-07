@@ -322,8 +322,16 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     // Provenance keys (caller-known) layered onto the driver's technical metadata.
+    // Index-only, so this is cheap even on a multi-GB source. Ties the calib to
+    // the exact artefact it saw — a path alone does not, once that path is
+    // rebuilt.
+    let source_fingerprint =
+        hipfire_runtime::hfq::HfqFile::open_index_only(std::path::Path::new(&model))
+            .map(|h| h.index_fingerprint())
+            .unwrap_or_else(|_| String::new());
     let mut provenance = vec![
         ("source_model", serde_json::json!(model)),
+        ("source_fingerprint", serde_json::json!(source_fingerprint)),
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
         ("source_arch_id", serde_json::json!(source_arch_id)),
