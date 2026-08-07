@@ -160,11 +160,12 @@ extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_m128(
 //
 // K_BLOCK is halved to 128 to keep the wider X tile in LDS:
 // 64 columns x 128 k x 2 B = 16 KB.
-#define NH_M_TILE     128
-#define NH_N_TILE     128
-#define NH_M_PER_WARP  16
+#define NH_MSUB         2   // M subtiles per warp
+#define NH_NSUB         8   // N subtiles per warp -> NH_MSUB*NH_NSUB accumulators
+#define NH_M_PER_WARP  (16 * NH_MSUB)
+#define NH_M_TILE      (NH_M_PER_WARP * 8)   // 8 warps
+#define NH_N_TILE      (16 * NH_NSUB)
 #define NH_K_BLOCK    128
-#define NH_NSUB         8   // NH_N_TILE / 16 accumulators per warp
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
@@ -184,14 +185,21 @@ extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
     __shared__ unsigned short lds_x[NH_N_TILE * NH_K_BLOCK];
 
     const int warp_row_start = row_start + warp_id * NH_M_PER_WARP;
-    const int my_row = warp_row_start + lane16;
-    const int safe_row = (my_row < M) ? my_row : (M - 1);
-    const unsigned short* w_row = A + (long long)safe_row * K;
-
-    float8_t acc[NH_NSUB];
+    const unsigned short* w_row[NH_MSUB];
     #pragma unroll
-    for (int j = 0; j < NH_NSUB; ++j) {
-        acc[j] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int i = 0; i < NH_MSUB; ++i) {
+        const int my_row = warp_row_start + i * 16 + lane16;
+        const int safe_row = (my_row < M) ? my_row : (M - 1);
+        w_row[i] = A + (long long)safe_row * K;
+    }
+
+    float8_t acc[NH_MSUB][NH_NSUB];
+    #pragma unroll
+    for (int i = 0; i < NH_MSUB; ++i) {
+        #pragma unroll
+        for (int j = 0; j < NH_NSUB; ++j) {
+            acc[i][j] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        }
     }
     const b16x16_t zero_b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
@@ -211,13 +219,23 @@ extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
 
         const int group_k = ((K - k_base) < NH_K_BLOCK) ? (K - k_base) : NH_K_BLOCK;
         for (int kt = 0; kt < group_k; kt += 16) {
-            // Loaded ONCE, spent across NH_NSUB output subtiles — the point.
-            b16x16_t a_frag = *(const b16x16_t*)(w_row + k_base + kt);
+            // NH_MSUB A fragments and NH_NSUB B fragments feed MSUB*NSUB WMMA
+            // ops: each A load is spent NH_NSUB times and each LDS B read
+            // NH_MSUB times. That second reuse is what MSUB buys over 1xN.
+            b16x16_t a_frag[NH_MSUB];
+            #pragma unroll
+            for (int i = 0; i < NH_MSUB; ++i) {
+                a_frag[i] = *(const b16x16_t*)(w_row[i] + k_base + kt);
+            }
             #pragma unroll
             for (int j = 0; j < NH_NSUB; ++j) {
                 b16x16_t b_frag =
                     *(const b16x16_t*)(lds_x + (j * 16 + lane16) * NH_K_BLOCK + kt);
-                acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc[j]);
+                #pragma unroll
+                for (int i = 0; i < NH_MSUB; ++i) {
+                    acc[i][j] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag[i], b_frag, acc[i][j]);
+                }
             }
         }
         __syncthreads();
@@ -228,16 +246,20 @@ extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
         const int out_col = batch_start + j * 16 + lane16;
         if (out_col < B) {
             #pragma unroll
-            for (int q = 0; q < 8; q++) {
-                int out_row = warp_row_start + 2 * q + (lane >> 4);
-                if (out_row < M) {
-                    Y[(long long)out_col * M + out_row] = acc[j][q];
+            for (int i = 0; i < NH_MSUB; ++i) {
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    int out_row = warp_row_start + i * 16 + 2 * q + (lane >> 4);
+                    if (out_row < M) {
+                        Y[(long long)out_col * M + out_row] = acc[i][j][q];
+                    }
                 }
             }
         }
     }
 }
 
+#undef NH_MSUB
 #undef NH_M_TILE
 #undef NH_N_TILE
 #undef NH_M_PER_WARP
