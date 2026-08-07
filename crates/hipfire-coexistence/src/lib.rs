@@ -6,6 +6,7 @@ pub mod calibrate;
 pub mod calibration_audit;
 pub mod calibration_compare;
 pub mod export_safetensors;
+pub mod hub_archive;
 pub mod import_safetensors;
 pub mod induction;
 pub mod repack;

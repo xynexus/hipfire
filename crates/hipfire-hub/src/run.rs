@@ -254,6 +254,60 @@ async fn fetch_with_retry(
     )))
 }
 
+/// [`fetch_with_retry`] for a streamed transfer.
+///
+/// Same rule — only consecutive *stalled* attempts count toward giving up — but
+/// progress is measured from the resume state rather than a `.part` on disk,
+/// because a streamed transfer leaves no file to measure.
+pub async fn fetch_file_streamed_with_retry(
+    repo: &str,
+    revision: &str,
+    f: &RepoFile,
+    st: &mut crate::StreamProgress,
+    sink: &mut dyn crate::ByteSink,
+) -> Result<()> {
+    const MAX_STALLED: u32 = 5;
+    const MAX_ATTEMPTS: u32 = 200;
+
+    let mut stalled = 0u32;
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let before = st.consumed();
+        match crate::fetch_file_streamed(crate::HUB, repo, revision, f, st, sink).await {
+            Ok(()) => return Ok(()),
+            Err(Error::Retryable(m)) => {
+                let after = st.consumed();
+                if after > before {
+                    stalled = 0;
+                    delay = std::time::Duration::from_secs(1);
+                } else {
+                    stalled += 1;
+                    if stalled >= MAX_STALLED {
+                        return Err(Error::Retryable(format!(
+                            "{}: {MAX_STALLED} consecutive attempts made no progress ({m})",
+                            f.path
+                        )));
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+                if attempt % 5 == 0 || after == before {
+                    eprintln!(
+                        "hub: {} at {:.2} GB — attempt {attempt} ({m})",
+                        f.path,
+                        after as f64 / 1e9
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Retryable(format!(
+        "{}: gave up after {MAX_ATTEMPTS} attempts",
+        f.path
+    )))
+}
+
 /// Minimal `*` glob, enough for `--include '*.safetensors'`.
 fn glob_match(pat: &str, s: &str) -> bool {
     let mut parts = pat.split('*');

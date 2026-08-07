@@ -271,6 +271,169 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Where a streamed transfer's bytes go instead of to a blob file.
+///
+/// This is a trait rather than a closure because the consumer carries state
+/// across chunks — the safetensors header it has not finished reading, the
+/// tensor piece it is filling — and has to be told when to throw that state
+/// away.
+pub trait ByteSink {
+    /// The next bytes, in order, from the start of the file.
+    fn chunk(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    /// Discard everything accepted for this file; the transfer restarts at 0.
+    fn reset(&mut self) -> std::io::Result<()>;
+}
+
+/// Resume state for a streamed transfer, carried across retry attempts.
+///
+/// A store-backed fetch resumes from the `.part` on disk and re-hashes its
+/// prefix. A streamed one has no `.part` — the bytes were consumed as they
+/// passed — so the digest state has to live here instead, which means resume
+/// works only within the process that started it.
+///
+/// That is the trade the single-copy archive buys. A fetch interrupted by a
+/// dropped connection still resumes byte-for-byte, which is the case that
+/// actually happens and the one a fixed attempt budget cannot survive; a fetch
+/// interrupted by the *process* dying restarts that file rather than the repo.
+pub struct StreamProgress {
+    sha: Sha256,
+    /// Retained only when the hub offers no SHA-256, so the weaker git blob
+    /// SHA-1 can still be checked. Those files are the small non-LFS ones —
+    /// configs and tokenizers — so holding them is bounded in practice.
+    side: Option<Vec<u8>>,
+    consumed: u64,
+}
+
+impl StreamProgress {
+    pub fn new(file: &RepoFile) -> Self {
+        StreamProgress {
+            sha: Sha256::new(),
+            side: file.sha256.is_none().then(Vec::new),
+            consumed: 0,
+        }
+    }
+
+    /// Source bytes accepted so far — the progress measure the retry loop
+    /// judges attempts by.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    fn accept(&mut self, chunk: &[u8]) {
+        self.sha.update(chunk);
+        if let Some(buf) = &mut self.side {
+            buf.extend_from_slice(chunk);
+        }
+        self.consumed += chunk.len() as u64;
+    }
+
+    fn restart(&mut self) {
+        self.sha = Sha256::new();
+        if let Some(buf) = &mut self.side {
+            buf.clear();
+        }
+        self.consumed = 0;
+    }
+}
+
+/// Fetch one file straight into `sink`, verified, without ever staging it on
+/// disk.
+///
+/// This is the same transfer as [`fetch_file_from`] with the blob file removed:
+/// the digest is still computed over every byte on the wire and still checked
+/// before the caller is told the file is good. What changes is *when* the caller
+/// learns that. A blob is renamed into place only after it verifies, so nothing
+/// downstream ever sees unverified bytes; a sink has already consumed them by
+/// then, so the sink — not this function — owns undoing that. `Error::Digest`
+/// is the signal to do so.
+pub async fn fetch_file_streamed(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    file: &RepoFile,
+    st: &mut StreamProgress,
+    sink: &mut dyn ByteSink,
+) -> Result<()> {
+    let url = format!("{base}/{repo}/resolve/{revision}/{}", file.path);
+
+    let mut req = auth(client()?.get(&url));
+    if st.consumed > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", st.consumed));
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(classify(status, &file.path));
+    }
+    // A server that ignores Range answers 200 with the whole body. There is no
+    // way to skip the prefix without re-deriving the sink's internal state, so
+    // take the honest option and start the file over.
+    let resuming = st.consumed > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if st.consumed > 0 && !resuming {
+        st.restart();
+        sink.reset()?;
+    } else if resuming {
+        eprintln!(
+            "hub: resuming {} at {:.2} GB",
+            file.path,
+            st.consumed as f64 / 1e9
+        );
+    }
+
+    let want = resp
+        .headers()
+        .get("x-linked-etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string())
+        .filter(|s| s.len() == 64)
+        .or_else(|| file.sha256.clone());
+
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            // Keep the progress: the next attempt ranges from here rather than
+            // starting over, which is what makes a multi-GB shard finish at all
+            // on a link that drops.
+            Err(e) => return Err(Error::Retryable(format!("{}: {e}", file.path))),
+        };
+        sink.chunk(&chunk)?;
+        st.accept(&chunk);
+    }
+
+    let got = hex(&st.sha.clone().finalize());
+    if let Some(want) = &want {
+        if &got != want {
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got,
+            });
+        }
+    } else if let Some(want) = &file.git_oid {
+        use sha1::Digest as _;
+        let body = st.side.as_deref().unwrap_or(&[]);
+        let mut g = sha1::Sha1::new();
+        g.update(format!("blob {}\0", st.consumed).as_bytes());
+        g.update(body);
+        let got_git = hex(&g.finalize());
+        if &got_git != want {
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got: got_git,
+            });
+        }
+    } else if file.size != 0 && st.consumed != file.size {
+        return Err(Error::Fatal(format!(
+            "{}: got {} bytes, expected {}",
+            file.path, st.consumed, file.size
+        )));
+    }
+    Ok(())
+}
+
 /// Download one file into the blob store, verified, and commit it atomically.
 ///
 /// The digest is computed while streaming, so a wrong file is rejected without

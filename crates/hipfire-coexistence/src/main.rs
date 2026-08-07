@@ -104,11 +104,16 @@ fn usage() {
          import safetensors --input <hf_dir> --output <model.hfq> [--arch <family>]\n\
          export safetensors --input <model.hfq> --output <hf_dir> \
          [--arch <family>] [--shard-size 5G]\n\
-         hub fetch  --repo <org/name> [--revision <sha|main>] [--include <glob>] [--dest <dir>]\n\
-         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>]\n\
-         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>]\n\
+         hub fetch  --repo <org/name> [--revision <sha|main>] [--include <glob>] \
+         [--dest <dir>] [--output <archive.hfa>] [--force] [--raw]\n\
+         \x20            default: streams into ~/.hipfire/models/models--Org--Name.hfa,\n\
+         \x20            encoding as it downloads so the raw checkpoint is never staged.\n\
+         \x20            --raw fetches a HuggingFace cache tree instead.\n\
+         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw]\n\
+         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw]\n\
          repack --input <hf_dir> --output <archive.hfa>   (lossless, no arch needed)\n\
          repack --input <archive.hfa> --output <hf_dir>   (restore, byte-identical)\n\
+         repack --input <archive.hfa> --check             (verify stored checksums)\n\
          npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
     );
 }
@@ -559,7 +564,32 @@ fn lora_convert(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The flat archive name for a repo, matching the store's directory naming so
+/// `models--Qwen--Qwen3.5-0.8B/` and `models--Qwen--Qwen3.5-0.8B.hfa` sit side
+/// by side and sort together.
+fn archive_name(repo: &str) -> String {
+    format!("models--{}.hfa", repo.replace('/', "--"))
+}
+
+/// Default root for archives: `~/.hipfire/models`, derived from `$HOME` the way
+/// every other crate in the tree locates `~/.hipfire`. Deliberately not an env
+/// var — no crate reads one for this, and `--dest` already overrides it.
+///
+/// Raw fetches keep defaulting to the HuggingFace cache root instead, since
+/// producing that layout is the whole point of them.
+fn archive_root() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".hipfire").join("models"),
+        Err(_) => PathBuf::from(".hipfire/models"),
+    }
+}
+
 /// `hub {fetch,verify,repair}`. Offline tooling — the runtime never links this.
+///
+/// `fetch` writes an `.hfa` archive by default, encoding as the bytes arrive so
+/// the raw checkpoint is never staged. `--raw` restores the older behaviour of
+/// materialising a HuggingFace cache tree, which is what you want when another
+/// tool has to read the checkpoint as files.
 fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     let val = |k: &str| -> Option<String> {
         args.iter()
@@ -569,10 +599,19 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let repo = val("--repo").ok_or("hub: --repo <org/name> is required")?;
     let revision = val("--revision").unwrap_or_else(|| "main".to_string());
-    let dest = val("--dest").unwrap_or_else(|| {
-        std::env::var("HF_HOME").unwrap_or_else(|_| "/srv/huggingface".to_string())
-    });
-    let root = PathBuf::from(dest);
+    let raw = args.iter().any(|a| a == "--raw");
+    let force = args.iter().any(|a| a == "--force");
+    let root = match val("--dest") {
+        Some(d) => PathBuf::from(d),
+        None if raw => PathBuf::from(
+            std::env::var("HF_HOME").unwrap_or_else(|_| "/srv/huggingface".to_string()),
+        ),
+        None => archive_root(),
+    };
+    let archive = match val("--output") {
+        Some(o) => PathBuf::from(o),
+        None => root.join(archive_name(&repo)),
+    };
     let include = val("--include");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -582,10 +621,52 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
 
     rt.block_on(async {
         match op {
+            "fetch" if !raw => {
+                // These archives are routinely the only copy of their model on
+                // an array with no redundancy, so overwriting one is never the
+                // silent default.
+                if archive.exists() && !force {
+                    return Err(format!(
+                        "hub: {} already exists — pass --force to replace it, \
+                         or `repack --check` it first",
+                        archive.display()
+                    )
+                    .into());
+                }
+                if let Some(p) = archive.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                let files = hipfire_hub::list_files(&repo, &revision).await?;
+                hipfire_coexistence::hub_archive::fetch_to_archive(
+                    &archive,
+                    &repo,
+                    &revision,
+                    include.as_deref(),
+                    files,
+                )
+                .await?;
+                eprintln!("hub: wrote {}", archive.display());
+            }
             "fetch" => {
                 let n =
                     hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref()).await?;
                 eprintln!("hub: {n} file(s) present and verified");
+            }
+            // An archive keeps a checksum per stored payload, not the hub's
+            // per-file digest, so verifying one is `repack --check` rather than
+            // a re-listing. Routing it here means `hub verify` answers the
+            // question for whichever form the fetch actually produced.
+            "verify" if !raw && archive.exists() => {
+                hipfire_coexistence::repack::check(&archive)?;
+            }
+            "repair" if !raw && archive.exists() => {
+                return Err(format!(
+                    "hub: {} is an archive — a damaged payload cannot be patched in place. \
+                     Re-run `hub fetch --repo {repo} --force`, or restore from it with \
+                     `repack --input <archive> --output <dir>` if it still checks out",
+                    archive.display()
+                )
+                .into());
             }
             "verify" => {
                 let states = hipfire_hub::run::verify(&root, &repo, &revision).await?;
