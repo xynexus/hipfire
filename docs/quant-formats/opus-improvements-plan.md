@@ -498,7 +498,44 @@ residual rank structure inside 256 should be flat. One cheap probe: SVD the
 per-group Δ matrix for one tensor and read the spectrum. Flat spectrum → close it,
 and record why, since this idea recurs.
 
-### E3 — Soft promotion (+1 bitplane instead of full int8)
+### E3 — Soft promotion — **CLOSED. The soft half is free; the low-base half is dead.**
+
+**Gate ran** (`examples/opus_soft_promotion_study.rs`, Qwen3.5-0.8B, 2048 groups
+× 4 tensors, every arm at the shipped 136 B/group). E3 bundles two separable
+claims and they land in opposite directions.
+
+SSE vs the shipped W4+W8 arm at equal bytes (negative = worse):
+
+| arm | n_out | down | o | gate | q |
+|---|---|---|---|---|---|
+| W4+W8 (shipped) | 3 | — | — | — | — |
+| W4+W6 | 3 | 0.00% | 0.00% | 0.00% | 0.00% |
+| W4+W5 | 3 | −0.00% | −0.00% | −0.00% | −0.00% |
+| W3+W8 | 19 | −142.7% | −142.8% | −141.7% | −142.9% |
+| W3+W5 | 23 | −122.0% | −121.8% | −120.8% | −121.8% |
+| W3+W4 | 25 | −115.5% | −114.5% | −113.4% | −114.6% |
+| W2+W5 | 43 | −1055.6% | −1030.8% | −1032.9% | −1047.4% |
+
+**The narrow overlay is free.** W6 and W5 promotions score identically to W8 —
+the promoted values simply do not need 8 bits. That corroborates P1 from a
+different direction (there the *delta* pool held 17–19 distinct values), and it
+is why P1's raw-i4 entry works: narrowing the entry costs nothing in error and
+buys a 4th promoted position.
+
+**The low base is dead.** "A W3 base with a W5 overlay is a smaller artifact
+than W4+W8 at comparable error" is false at equal bytes — it is not comparable
+error. Dropping the base to W3 frees 32 B and buys 16–22 extra promotions, and
+still loses by 114–143%; W2 loses by ~1000%. The arithmetic is unsurprising in
+hindsight: a bit of base applies to all 256 positions while a promotion applies
+to one, so 22 extra promotions cannot pay for 256 positions losing a bit. No
+W3 decode GEMV or W5 grid should be built for this reason.
+
+Caveat kept: weight SSE is a proxy, and a lower base also changes the activation
+story (W3A4 needed a learned rotation — `opus-quant.md` §7). The study bounds
+the weight side only, but the margin is far too large for the proxy to be the
+explanation.
+
+### E3 — Soft promotion (original text)
 
 Promote to W5/W6 rather than W8. Given the W3A4 result (weight bytes are the
 decode lever) this is the exploration item most aligned with the platform premise:
@@ -554,7 +591,10 @@ it will contaminate the attribution.
    settled the "structured code vs free codebook" question empirically: raw i4
    Δ wins outright, so there is no codebook and no sidecar to build. Next
    action here is the KLD run at matched bytes, not encoder work.
-5. **E3 / E5** — the platform-premise work; largest payoff, largest cost.
+5. ~~**E3**~~ — **closed.** Its soft-overlay half is free and already exploited by
+   P1; its low-base half loses by 114–143% at equal bytes. **E5** — the
+   platform-premise work; largest payoff, largest cost, and now the only
+   exploration item left standing.
 6. ~~**E2**~~ — **probed and killed**; see E2 above. **E4** — still deferred until
    the format stabilises.
 

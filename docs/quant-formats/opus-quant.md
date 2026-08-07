@@ -450,6 +450,13 @@ valid for new artifacts.
   weight-bandwidth-bound (small batch).
 - **gfx1151 int4 is 2.0× int8 at ISA rate** — the W4A4 premise holds; an earlier
   ~1.0× measurement was a bandwidth-bound artifact.
+- **Spend bytes on the BASE, not on more promotions.** A bit of base applies to
+  all 256 positions; a promotion applies to one. At a fixed 136 B/group, moving
+  the base from W4 to W3 frees 32 B and buys 16–22 extra promoted positions, and
+  still loses 114–143% weight SSE; a W2 base loses ~1000%. Conversely, narrowing
+  the *overlay* from W8 to W6 or W5 is free — those values never need 8 bits —
+  which is what makes the 4-bit-delta entry worth having. Reproduce with
+  `examples/opus_soft_promotion_study.rs`.
 - **Intra-block low-rank residual is a bad buy, and not because the residual is
   white.** The post-int4 residual inside a 256-group does carry structure — on
   down_proj the leading direction holds 4.84% of the energy against a 0.39%
