@@ -231,6 +231,16 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    POOLED_EXPERT_HESSIAN = "HIPFIRE_POOLED_EXPERT_HESSIAN", Developer,
+        "Set 1 to let a routed MoE expert's gate/up projection borrow the \
+         LAYER-POOLED Hessian under `--ldlq` when it has none of its own. \
+         Routed experts are captured imatrix-only, so `--ldlq` otherwise logs \
+         `ldlq: skip` and RTN-quantizes every one of them. Only gate/up borrow: \
+         they read the layer-shared FFN input, while `down_proj`/`w2` read that \
+         expert's own SwiGLU intermediate, whose per-expert bases measured \
+         near-orthogonal. The donor must match K exactly. See \
+         `docs/quant-formats/moe-expert-hessians.md`.";
+
     GPTQ_DAMPING = "HIPFIRE_GPTQ_DAMPING", Developer,
         "Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 \
          (the default) the pass is a no-op and output is byte-identical to \

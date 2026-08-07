@@ -90,6 +90,47 @@ H-weighted *weight* error out of sample (this table) while that reduction fails
 to become *KLD*. Nothing here contradicts that; this table ranks a mechanism,
 it does not certify a format.
 
+## Q3 — the KLD measurement: pooled `gate_up` WORKS
+
+The proxy-loss table above was explicitly not enough to justify building
+anything, so the pooled `gate_up` Hessian was implemented and measured
+end-to-end on **zaya1-8b** (16 experts, top-1, 40 MoE layers).
+
+No new capture was needed. zaya's `mlp.gate.down_proj` already accumulates a
+full Hessian over `normed` — the *same* tensor the experts consume
+(`arch-zaya/src/gpu.rs:1333` vs `:1390`), same K=2048, over every token. Under
+top-1 routing every token is routed, so that tensor **is** the layer-pooled
+`gate_up` Hessian, already sitting in every zaya calib. The change is a
+quantizer-side lookup: `HIPFIRE_POOLED_EXPERT_HESSIAN=1` lets a routed expert's
+gate/up borrow a layer-pooled donor, guarded by an exact K match and restricted
+to `POOLABLE_EXPERT_LEAVES` (never `down_proj`/`w2`).
+
+Both arms: `--format oq4++ --hessian <8k-token calib> --ldlq`, scored against a
+16-chunk bf16 reference. `mode: score` takes its tokens from the reference, so
+the arms are paired by construction.
+
+| arm | LDLQ success | missing | mean_kld |
+|---|---|---|---|
+| baseline (experts RTN) | 360 | 1280 | 0.573656 |
+| pooled `gate_up` | 1000 (+640) | 640 | **0.555906** |
+
+**Paired over 16 chunks: −3.09%, 95% CI [−5.60%, −0.59%], t = −2.42.** The CI
+excludes zero, so this is a resolved improvement, not noise. Inter-arm
+correlation is 0.977, which is why 16 chunks suffice.
+
++640 is exactly 40 layers × 16 experts of `gate_up`, and `missing` falls from
+1280 to 640 — the remaining 640 are `down_proj`, correctly still skipped.
+
+Caveats: one model, one corpus, one format, n=16. The effect is modest and the
+CI is wide (0.6–5.6%). Note also how much headroom remains — a baseline
+mean_kld of 0.574 is poor, because every routed expert was RTN; pooling
+`gate_up` recovers 3% of that, and `down_proj` (still RTN) is plausibly the
+larger remaining share.
+
+**This clears the gate set below.** The proxy-loss result did become a KLD
+result, so the per-expert `down_proj` pass is now justified rather than
+speculative.
+
 ## What to build, if anything
 
 - **`gate_up`: layer-pooled Hessian.** Q1 says pooling costs little
@@ -111,12 +152,23 @@ reduction tiles across model microbatches", and `CapturePolicy` already has a
 `HessianAndImatrix` variant. The gate is the assertion at
 `expert_capture.rs:338`, not missing machinery.
 
-**Do not start with the fused pass.** Start with the pooled `gate_up` Hessian,
-which is cheap and needs no new pipeline, and measure **KLD** — not proxy loss
-— on one MoE model. If pooled `gate_up` moves KLD, the per-expert `down_proj`
-pass is worth building. If it does not, this whole line is the `XᵀX`-doesn't-
-generalise result again and the effort belongs on GuidedQuant instead, which
-`opus-quant.md` §7 names as the only robust winner so far.
+~~Do not start with the fused pass. Start with the pooled `gate_up` Hessian and
+measure KLD.~~ **Done — see Q3. Pooled `gate_up` is measured at −3.09% KLD
+(CI excludes zero), so the gate is cleared and the per-expert `down_proj` pass
+is justified.**
+
+Remaining work, in order:
+
+1. **Generalise the pooled donor beyond zaya.** Today it relies on a donor
+   tensor that happens to consume the same activation. The principled donor is
+   the ROUTER (`mlp.gate`), which by construction sees the FFN input — already
+   listed first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.
+   Confirm K matches there and re-measure.
+2. **Per-expert `down_proj`, fused and discarded.** ~1.1 GB peak per layer,
+   or ~4.5 MB with quota-based early finalise. This is the larger remaining
+   share of the loss — 640 tensors are still RTN in the best arm above.
+3. Re-measure with more chunks: the current CI (0.6–5.6%) resolves the sign but
+   not the magnitude.
 
 ## Reproduce
 
