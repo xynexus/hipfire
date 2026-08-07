@@ -560,6 +560,40 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // Opus Quant W4A16 decode: x is FWHT-rotated f32; multiply the int4 grouped
         // weight by the full-precision activation (no act quant at B=1). Weight
         // buffer: [int4 M*K/2 | f32 scales M*ng]; the dense gemv reads both.
+        // Same body as the G256 arm at a 128-element group. The group also
+        // selects the FWHT length upstream (RotationPlan::FwhtG128), so x
+        // arrives rotated by the 128-point transform.
+        K::GemvOqCompactG128Prerotated => {
+            const GROUP: usize = 128;
+            let ng = k / GROUP;
+            let blocks = m * ng;
+            if blocks == 0 || w.buf.byte_size() % blocks != 0 {
+                return Err(DispatchError::MissingImpl { key });
+            }
+            let block_stride = w.buf.byte_size() / blocks;
+            let xq = hip!(gpu.alloc_tensor(&[k], DType::Raw))?;
+            let xs = hip!(gpu.alloc_tensor(&[ng], DType::F32))?;
+            let res = (|| {
+                hip!(gpu.quantize_act_oq8(x, &xq, &xs, 1, k, GROUP))?;
+                hip!(gpu.gemm_oq_compact_grouped_wmma(
+                    w.buf,
+                    &xq,
+                    &xs,
+                    y,
+                    m,
+                    k,
+                    1,
+                    GROUP,
+                    block_stride
+                ))
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            res
+        }
+        // Opus Quant W4A16 decode: x is FWHT-rotated f32; multiply the int4 grouped
+        // weight by the full-precision activation (no act quant at B=1). Weight
+        // buffer: [int4 M*K/2 | f32 scales M*ng]; the dense gemv reads both.
         K::GemvOq4G256Prerotated => {
             const GROUP: usize = 256;
             let ng = k / GROUP;

@@ -18,9 +18,14 @@
 //
 // On-disk block, one per (row, group) of 256 weights:
 //
-//   [ f16 scale | 128 packed signed-int4 | N_out * (u8 idx_in_group, i8 val) ]
-//     2 bytes      128 bytes               2*N_out bytes
-//   block_stride = 130 + 2*N_out          (N_out is implicit from the stride)
+//   [ f16 scale | G/2 packed signed-int4 | N_out * (u8 idx_in_group, i8 val) ]
+//     2 bytes      G/2 bytes                2*N_out bytes
+//   block_stride = (2 + G/2) + 2*N_out    (N_out is implicit from the stride)
+//
+// G is the `group` argument, so this serves OqCompactG256 (G=256, header 130)
+// and OqCompactG128 (G=128, header 66) from one body. The u8 index caps G at
+// 256; larger groups would need a wider index (see
+// docs/experiments/2026-08-06-oq-compact-group-size.md).
 //
 // Weight at group position p: low nibble of byte[2 + p/2] when p is even, high
 // nibble when odd, sign-extended from 4 bits; then any overlay entry whose idx
@@ -81,7 +86,9 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
     const int safe_x = (x_row < B) ? x_row : (B - 1);
     const int n_groups = K / group;
     const int tiles_per_group = group / 16;
-    const int overlays = (block_stride - 130) >> 1;
+    // Header = f16 scale + G/2 nibble bytes; the rest is the overlay table.
+    const int header = 2 + (group >> 1);
+    const int overlays = (block_stride - header) >> 1;
 
     const int8_t* x_prow = X + (long long)safe_x * K;
 
@@ -91,7 +98,7 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
         const uint8_t* blk =
             W + ((long long)safe_a * n_groups + g) * (long long)block_stride;
         const uint8_t* nibbles = blk + 2;
-        const uint8_t* table   = blk + 130;
+        const uint8_t* table   = blk + header;
 
         // Hoist this group's overlay table into registers once, rather than
         // re-reading it inside every one of the 16 K-tiles.

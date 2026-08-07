@@ -762,9 +762,9 @@ fn load_weight_tensor(
         // entry point so qwen2 serves OQ through the same dtype-dispatched
         // weight_gemv/weight_gemm kernels as every other simple-AR family, without
         // re-deriving the repack (the recurring gap fixed once in oq8_arch).
-        qt @ (33 | 35 | 36) => {
+        qt @ (33 | 35 | 36 | 52) => {
             let (bytes, gpu_dtype) = oq8_arch_load(qt, &data, m, k)
-                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,

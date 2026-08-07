@@ -3621,6 +3621,9 @@ struct OpusMixedSpec {
     outliers_per_group: usize,
     w8_frac: f32,
     recipe: OqCalibrationRecipe,
+    /// 256 (qt 36) or 128 (qt 52). The group must divide K, so 128 exists to fit
+    /// models whose K is a multiple of 128 but not 256 — coverage, not size.
+    group: usize,
 }
 
 fn parse_opus_mixed_format(format: &str) -> Option<OpusMixedSpec> {
@@ -3631,24 +3634,39 @@ fn parse_opus_mixed_format(format: &str) -> Option<OpusMixedSpec> {
     } else {
         (format, OqCalibrationRecipe::Plain)
     };
+    // `g128` selects the 128-element group (qt 52). The bit arithmetic differs:
+    // the header is 2 + G/2 bytes and each outlier costs 2 bytes per group, so
+    // G=256 is 4.0625 + n/16 and G=128 is 4.125 + n/8. The same number therefore
+    // names a DIFFERENT format at each group, which is why the group has to be
+    // part of the flag rather than inferred.
+    let (base, group) = match base.strip_suffix("g128") {
+        Some(stripped) => (stripped, 128usize),
+        None => (base, 256usize),
+    };
     let bits_text = base.strip_prefix("oq")?;
     if !bits_text.contains('.') {
         return None;
     }
     let requested_bits = bits_text.parse::<f32>().ok()?;
-    let outliers_exact = (requested_bits - 4.0625) * 16.0;
+    let (base_bits, per_outlier, max_outliers) = if group == 128 {
+        (4.125f32, 0.125f32, 31isize)
+    } else {
+        (4.0625f32, 0.0625f32, 62isize)
+    };
+    let outliers_exact = (requested_bits - base_bits) / per_outlier;
     let outliers_per_group = outliers_exact.round() as isize;
-    if !(1..=62).contains(&outliers_per_group)
+    if !(1..=max_outliers).contains(&outliers_per_group)
         || (outliers_exact - outliers_per_group as f32).abs() > 1e-4
     {
         return None;
     }
     let outliers_per_group = outliers_per_group as usize;
     Some(OpusMixedSpec {
-        storage_bits: 4.0625 + outliers_per_group as f32 / 16.0,
+        storage_bits: base_bits + outliers_per_group as f32 * per_outlier,
         outliers_per_group,
-        w8_frac: outliers_per_group as f32 / 256.0,
+        w8_frac: outliers_per_group as f32 / group as f32,
         recipe,
+        group,
     })
 }
 
@@ -3828,6 +3846,8 @@ enum HfqInputFormat {
     Oq6,
     Oq4,
     OqPlusCompact,
+    /// `OqPlusCompact` at a 128-element group (qt 52), for K not divisible by 256.
+    OqPlusCompactG128,
     Oq8,
     Oq8Plus,
 }
@@ -3837,9 +3857,16 @@ fn stacked_expert_oq_format(
     use_oq4: bool,
     use_oq8: bool,
     use_oq8_plus: bool,
+    // 256 or 128; ignored unless `use_opus_mixed`. Threaded through because the
+    // flag's group would otherwise be lost here and silently fall back to 256.
+    opus_group: usize,
 ) -> Option<HfqInputFormat> {
     if use_opus_mixed {
-        Some(HfqInputFormat::OqPlusCompact)
+        Some(if opus_group == 128 {
+            HfqInputFormat::OqPlusCompactG128
+        } else {
+            HfqInputFormat::OqPlusCompact
+        })
     } else if use_oq4 {
         Some(HfqInputFormat::Oq4)
     } else if use_oq8_plus {
@@ -3889,7 +3916,11 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
-            _ if parse_opus_mixed_format(flag).is_some() => Some(Self::OqPlusCompact),
+            _ => match parse_opus_mixed_format(flag) {
+                Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
+                Some(_) => Some(Self::OqPlusCompact),
+                None => None,
+            },
             "oq8" => Some(Self::Oq8),
             "oq8+" | "oq8++" => Some(Self::Oq8Plus),
             _ => None,
@@ -4138,6 +4169,7 @@ fn quantize_hfq_source_tensor(
                 | HfqInputFormat::Oq8
                 | HfqInputFormat::Oq8Plus
                 | HfqInputFormat::OqPlusCompact
+                | HfqInputFormat::OqPlusCompactG128
         )
     {
         return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
@@ -4590,6 +4622,46 @@ fn quantize_hfq_source_tensor(
                 })
             };
             (q, QuantType::OqPlusCompact, 256, "OQ+C")
+        }
+        HfqInputFormat::OqPlusCompactG128 => {
+            // Same tiered W4A8 scheme at a 128-element group (qt 52), for models
+            // whose K is a multiple of 128 but not 256 and so cannot use qt 36 at
+            // all. Coverage, not size: matching G=256's quality costs about
+            // +0.125 bits/weight (docs/experiments/2026-08-06-oq-compact-group-size.md).
+            //
+            // The 128-point FWHT uses sign seeds 43/1043 — the table
+            // `ensure_mq_signs_128` uploads for the runtime rotate. Using the
+            // G=256 pair here would rotate the weights by a transform the
+            // forward never inverts, which looks like plausible garbage rather
+            // than an error, so the signs are built locally rather than reusing
+            // the 256-length `signs1`/`signs2` in scope.
+            let signs1_128 = gen_fwht_signs(43, 128);
+            let signs2_128 = gen_fwht_signs(1043, 128);
+            let m_dim = shape[0] as usize;
+            let w8_frac =
+                outliers_per_group_for(name, OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01));
+            // `oqplus_compact_ldlq_pack` emits 256-element blocks, so tiered LDLQ
+            // has no G=128 form yet. Refuse rather than silently writing blocks
+            // of the wrong group.
+            if OQ4_LDLQ_HESSIAN.get().is_some() {
+                return Err(format!(
+                    "{name}: --ldlq is not supported at group 128 (oq*g128); \
+                     oqplus_compact_ldlq_pack emits 256-element blocks. Use a \
+                     g128 format without '++', or G=256 for this tensor."
+                )
+                .into());
+            }
+            let scaled = awq_scales_for(name).map(|scales| {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                scaled
+            });
+            let w: &[f32] = scaled.as_deref().unwrap_or(&f32_data);
+            let q = quantize_opus_rows(w, m_dim, k, |row| {
+                quantize_oqplus_compact_g(row, &signs1_128, &signs2_128, w8_frac, 128)
+            });
+            (q, QuantType::OqPlusCompactG128, 128, "OQ+C128")
         }
         HfqInputFormat::F16
         | HfqInputFormat::Bf16
@@ -7462,6 +7534,7 @@ fn main() {
             fmt,
             HfqInputFormat::Oq4
                 | HfqInputFormat::OqPlusCompact
+                | HfqInputFormat::OqPlusCompactG128
                 | HfqInputFormat::Oq8
                 | HfqInputFormat::Oq8Plus
                 | HfqInputFormat::Oq2
@@ -10267,8 +10340,13 @@ fn main() {
                 || tiered_layer_is_mq3
                 || antirez_mq3)
                 && supports_g256;
-            let stacked_oq_format =
-                stacked_expert_oq_format(use_opus_mixed, use_oq4, use_oq8, use_oq8_plus);
+            let stacked_oq_format = stacked_expert_oq_format(
+                use_opus_mixed,
+                use_oq4,
+                use_oq8,
+                use_oq8_plus,
+                opus_mixed_spec.map(|s| s.group).unwrap_or(256),
+            );
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -11482,7 +11560,11 @@ fn main() {
                             .flat_map(|value| value.to_le_bytes())
                             .collect();
                         let oq_format = if use_opus_mixed {
-                            HfqInputFormat::OqPlusCompact
+                            if opus_mixed_spec.map(|s| s.group) == Some(128) {
+                                HfqInputFormat::OqPlusCompactG128
+                            } else {
+                                HfqInputFormat::OqPlusCompact
+                            }
                         } else if use_oq4 {
                             HfqInputFormat::Oq4
                         } else if use_oq8_plus {
@@ -15613,22 +15695,31 @@ mod tests {
     #[test]
     fn stacked_expert_oq_format_includes_mixed_opus() {
         assert_eq!(
-            stacked_expert_oq_format(true, false, false, false),
+            stacked_expert_oq_format(true, false, false, false, 256),
             Some(HfqInputFormat::OqPlusCompact)
         );
+        // The group is what the flag carried, not a default: losing it here is
+        // exactly the silent fall back to 256 the parameter exists to prevent.
         assert_eq!(
-            stacked_expert_oq_format(false, true, false, false),
+            stacked_expert_oq_format(true, false, false, false, 128),
+            Some(HfqInputFormat::OqPlusCompactG128)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, true, false, false, 256),
             Some(HfqInputFormat::Oq4)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, true, false),
+            stacked_expert_oq_format(false, false, true, false, 256),
             Some(HfqInputFormat::Oq8)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, false, true),
+            stacked_expert_oq_format(false, false, false, true, 256),
             Some(HfqInputFormat::Oq8Plus)
         );
-        assert_eq!(stacked_expert_oq_format(false, false, false, false), None);
+        assert_eq!(
+            stacked_expert_oq_format(false, false, false, false, 256),
+            None
+        );
     }
 
     #[test]

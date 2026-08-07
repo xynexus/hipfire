@@ -165,8 +165,22 @@ pub fn oq3_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// bulk into int8, then overlay the sparse int8 outliers at their in-group
 /// indices → the same combined `[int8 m*k][f32 scales m*ng]` layout.
 pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    assert_eq!(k % GROUP, 0, "OQ+C requires K % 256 == 0 (got K={k})");
+    oqplus_compact_to_oq8_combined_g(data, m, k, 256)
+}
+
+/// Group-generic form of [`oqplus_compact_to_oq8_combined`]. The block header is
+/// `2 + group/2` bytes (f16 scale + packed nibbles), so G=256 gives the familiar
+/// 130 and G=128 gives 66; `N_out` is still inferred from what is left over.
+/// G=128 exists to fit models whose K is not a multiple of 256 — see
+/// docs/experiments/2026-08-06-oq-compact-group-size.md.
+pub fn oqplus_compact_to_oq8_combined_g(data: &[u8], m: usize, k: usize, group: usize) -> Vec<u8> {
+    #[allow(non_snake_case)]
+    let GROUP: usize = group;
+    assert_eq!(
+        k % GROUP,
+        0,
+        "OQ+C requires K % group == 0 (got K={k} group={GROUP})"
+    );
     let ng = k / GROUP;
     let n_groups = m * ng;
     assert!(
@@ -175,24 +189,26 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
         data.len()
     );
     let block_bytes = data.len() / n_groups;
+    // f16 scale + group/2 packed nibbles; 130 at G=256, 66 at G=128.
+    let header = 2 + GROUP / 2;
     assert!(
-        block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
-        "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+        block_bytes >= header + 2 && (block_bytes - header) % 2 == 0,
+        "OQ+C block_bytes {block_bytes} invalid (expected {header} + 2·N_out for group {GROUP})"
     );
-    let n_out = (block_bytes - 130) / 2;
+    let n_out = (block_bytes - header) / 2;
     let mut combined = vec![0u8; m * k + m * ng * 4];
     for r in 0..m {
         for g in 0..ng {
             let src = (r * ng + g) * block_bytes;
             let dst = r * k + g * GROUP;
             // int4 bulk → int8 (read as signed char downstream).
-            for i in 0..128 {
+            for i in 0..GROUP / 2 {
                 let byte = data[src + 2 + i];
                 combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
                 combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
             }
             // Overlay the sparse int8 outliers: (u8 idx, i8 val) × N_out.
-            let tbl = src + 130;
+            let tbl = src + header;
             for s in 0..n_out {
                 let idx = data[tbl + 2 * s] as usize;
                 let val = data[tbl + 2 * s + 1];
@@ -271,16 +287,23 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // a single (M, K) projection class. Purely diagnostic: unset (the normal
     // case) keeps every OqPlusCompact tensor compact, exactly as before. The
     // shape is the handle because this hook never sees the tensor name.
-    if qt == QuantType::OqPlusCompact.code()
-        && hipfire_env::OQ_COMPACT_RESIDENT.flag()
-        && compact_shape_selected(m, k)
-    {
-        return Some((data.to_vec(), DType::OqCompactG256));
+    if hipfire_env::OQ_COMPACT_RESIDENT.flag() && compact_shape_selected(m, k) {
+        if qt == QuantType::OqPlusCompact.code() {
+            return Some((data.to_vec(), DType::OqCompactG256));
+        }
+        if qt == QuantType::OqPlusCompactG128.code() {
+            return Some((data.to_vec(), DType::OqCompactG128));
+        }
     }
     let bytes = match qt {
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
         c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
+        // G=128 expands through the same path at a 128-element group; the result
+        // is the identical combined Oq8G256 layout, so only the decode differs.
+        c if c == QuantType::OqPlusCompactG128.code() => {
+            oqplus_compact_to_oq8_combined_g(data, m, k, 128)
+        }
         c if c == QuantType::Oq3G256.code() => oq3_to_oq8_combined(data, m, k),
         _ => return None,
     };
@@ -290,6 +313,60 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason G=128 exists. K=896 (7*128) is a real shape — Qwen2-0.5B's
+    /// hidden size — and 896 % 256 == 128, so the G=256 compact format cannot
+    /// represent it at all: the group must divide K. G=128 can, and expands to
+    /// the same combined Oq8G256 layout, so nothing downstream changes.
+    #[test]
+    fn g128_covers_a_k_that_g256_cannot_divide() {
+        const K: usize = 896;
+        const M: usize = 2;
+        assert_ne!(
+            K % 256,
+            0,
+            "K=896 must NOT be divisible by 256 for this test"
+        );
+        assert_eq!(K % 128, 0, "K=896 must be divisible by 128");
+
+        let group = 128usize;
+        let n_out = 3usize;
+        let header = 2 + group / 2;
+        let block = header + 2 * n_out;
+        let ng = K / group;
+        let mut data = vec![0u8; M * ng * block];
+        for b in 0..M * ng {
+            let off = b * block;
+            data[off..off + 2].copy_from_slice(&F16_ONE.to_le_bytes());
+            // Distinct nibbles so a wrong header offset would misplace them.
+            for i in 0..group / 2 {
+                data[off + 2 + i] = 0x21;
+            }
+            for s in 0..n_out {
+                data[off + header + 2 * s] = (s * 7) as u8;
+                data[off + header + 2 * s + 1] = (100 + s) as u8;
+            }
+        }
+
+        let combined = oqplus_compact_to_oq8_combined_g(&data, M, K, group);
+        assert_eq!(combined.len(), M * K + M * ng * 4);
+        // Bulk nibbles: low then high of 0x21 sign-extended = 1, 2. Position 1 is
+        // bulk; position 0 is NOT, because overlay s=0 has index 0 and overrides
+        // it — which is the precedence the format requires.
+        assert_eq!(combined[1] as i8, 2);
+        assert_eq!(combined[2] as i8, 1);
+        // Overlays land at their in-group positions, proving the header offset is
+        // 66 here and not the G=256 value of 130.
+        assert_eq!(combined[0] as i8, 100, "position 0 is overlay s=0");
+        assert_eq!(combined[7] as i8, 101, "position 7 is overlay s=1");
+        assert_eq!(combined[14] as i8, 102, "position 14 is overlay s=2");
+        // Scales are the f16 read back as f32, one per group.
+        let so = M * K;
+        assert_eq!(
+            f32::from_le_bytes(combined[so..so + 4].try_into().unwrap()),
+            1.0
+        );
+    }
 
     // 1.0 as f16 bits, and its f32 little-endian bytes for scale asserts.
     const F16_ONE: u16 = 0x3C00;
