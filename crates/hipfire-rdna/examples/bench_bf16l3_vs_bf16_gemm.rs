@@ -234,6 +234,7 @@ fn main() {
             }
             gpu.device_synchronize().unwrap();
             let tb = t.elapsed().as_secs_f64() / reps as f64;
+            let _ = tb; // scalar LUT3 timed for the record; table reports wmma/coop
             gpu.gemm_bf16l3_wmma(&wl, &xg, &ya, m, k, n).unwrap();
             gpu.device_synchronize().unwrap();
             let t = Instant::now();
