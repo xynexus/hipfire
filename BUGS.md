@@ -32,20 +32,36 @@ into full investigations here.
   mlp.gate_proj, mlp.up_proj, self_attn x4, `mlp.down_proj` absent. NOT caused
   by batched prefill: `HIPFIRE_PREFILL_BATCHED=0` reproduced the identical
   162 / 11, which is what pointed at a dtype-gated tap rather than a path.
-- Impact (historic): silent. `--ldlq` does not fail on a missing Hessian, it
-  logs `ldlq: skip <t>` and falls back to RTN, so any `oq*++` built from a
-  BF16-sourced calib quietly RTN-quantized its down_proj while reporting
-  success. down_proj is the widest FFN matrix and the one the outlier-budget
-  study found most sensitive. **Any bf16-sourced calib artefact predating
-  2026-08-07 is suspect and should be rebuilt.**
+- Impact: silent where it bites. `--ldlq` does not fail on a missing Hessian,
+  it logs `ldlq: skip <t>` and falls back to RTN, so an `oq*++` built from an
+  affected calib quietly RTN-quantizes its down_proj — the widest FFN matrix
+  and the one the outlier-budget study found most sensitive — while reporting
+  success.
+  BUT the blast radius is narrow, and an earlier revision of this entry
+  overstated it as "any bf16-sourced calib is suspect". A full audit of all 26
+  retained calib artefacts (local + `/srv/hipfire/calib`, via
+  `hipfire-coexistence artifact inspect`) found ZERO with the missing-down_proj
+  signature. The reason: a calib built from an HF **safetensors directory**
+  loads F16, and `gemv_f16_xf32` has always tapped; a calib built from a
+  **quantized** artefact keeps the `weight_gemv` wrapper tap. Only a calib
+  sourced from a **bf16 `.hfq`** hits the gap, and that workflow only started
+  being used on 2026-08-07. Check provenance with `artifact inspect` —
+  `metadata.source_model` — before assuming an artefact is affected.
 - Still open: the collector has no coverage assertion. A dense arch should
   produce one Hessian per admitted projection per layer, and a shortfall should
   fail rather than write a partial artefact — that would have caught this at
   the point of writing instead of at quantize time.
-- Related: `/srv/hipfire/calib/qwen3.5-{0.8b,2b,4b}.calib.hfq` are a SEPARATE
-  and older defect — built 2026-06-27, they carry `kinds=1` (down_proj only,
-  the mirror image of this bug). The other 12 shared calibs have 7-13 kinds and
-  look sound.
+- Related (also FIXED 2026-08-07): `qwen3.5-{0.8b,2b,4b}.calib.hfq` were a
+  SEPARATE and older defect — built 2026-06-27 from `*.q8f16ref.hfq` sources at
+  128 tokens, they carried `kinds=1`, down_proj ONLY, the mirror image of this
+  bug. All three have been rebuilt from bf16 sources at 512 tokens and now
+  carry the full 12 kinds (186/186/248 hessians), local and `/srv` copies
+  md5-identical. The root cause of THAT defect was never diagnosed — the
+  artefacts are replaced, but if a `q8f16ref` source is ever used for
+  calibration again, audit the result.
+  `/srv/hipfire/calib/FLUX.2-klein-base-4B.calib.hfq` is empty (`n_hessian`
+  absent, 0 kinds, 6 MB) and is a third, separate issue. The remaining 22
+  artefacts audit clean.
 - Scope: Calibration / quantization quality
 - Confidence: Confirmed by rebuild (an earlier revision of this entry blamed
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
