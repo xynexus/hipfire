@@ -314,7 +314,7 @@ impl Gpu {
         let ki = k as i32;
         let bi = batch_size as i32;
         let grid_m = m.div_ceil(128) as u32;
-        let grid_b = batch_size.div_ceil(64) as u32;
+        let grid_b = batch_size.div_ceil(128) as u32;
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,

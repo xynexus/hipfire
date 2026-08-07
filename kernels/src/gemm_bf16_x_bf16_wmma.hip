@@ -161,10 +161,10 @@ extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_m128(
 // K_BLOCK is halved to 128 to keep the wider X tile in LDS:
 // 64 columns x 128 k x 2 B = 16 KB.
 #define NH_M_TILE     128
-#define NH_N_TILE      64
+#define NH_N_TILE     128
 #define NH_M_PER_WARP  16
 #define NH_K_BLOCK    128
-#define NH_NSUB         4   // NH_N_TILE / 16 accumulators per warp
+#define NH_NSUB         8   // NH_N_TILE / 16 accumulators per warp
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
