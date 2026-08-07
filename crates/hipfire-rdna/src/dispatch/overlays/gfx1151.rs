@@ -273,6 +273,68 @@ impl Gpu {
         }
         result
     }
+
+    /// N-heavy variant of [`Self::gemm_bf16_x_bf16_wmma_gfx1151_m128_labeled`]:
+    /// each warp keeps 4 accumulators and computes a 16x64 output strip, so one
+    /// A fragment feeds 4 WMMA ops instead of 1.
+    ///
+    /// The m128 form gives a warp one 16x16 tile, so at a 256-column prefill
+    /// window its 16 column-blocks each re-read the whole of A. That kernel
+    /// measures 3.3 TFLOPS on gfx1151 and is 61% of a KLD reference build's GPU
+    /// time. This trades registers for A traffic, the shape the gfx1151 iu4 GEMM
+    /// tuning notes found reached ~50% of peak.
+    pub fn gemm_bf16_x_bf16_wmma_gfx1151_nheavy(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy: weights must be BF16"
+        );
+        assert!(
+            k % 16 == 0,
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy: K={k} must be divisible by 16",
+        );
+        self.ensure_kernel(
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy",
+            kernels::GEMM_BF16_X_BF16_WMMA_SRC,
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(128) as u32;
+        let grid_b = batch_size.div_ceil(64) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "gemm_bf16_x_bf16_wmma_gfx1151_nheavy",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1151 4-warp 64x64 Q8_0 gate+up GEMM for large prefill shapes.
     pub fn gemm_gate_up_q8_0_wmma_4w_gfx1151(
         &mut self,

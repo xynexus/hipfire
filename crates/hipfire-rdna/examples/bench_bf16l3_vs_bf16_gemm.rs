@@ -124,10 +124,15 @@ fn main() {
             gpu.gemm_bf16l3_wmma(&wl, &xg, &yd, m, k, n).unwrap();
             let ye = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             gpu.gemm_bf16l3_wmma_coop(&wl, &xg, &ye, m, k, n).unwrap();
+            let yf = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+            gpu.gemm_bf16_x_bf16_wmma_gfx1151_nheavy(&wb, &xg, &yf, m, k, n)
+                .unwrap();
             gpu.device_synchronize().unwrap();
             let got_e = gpu.download_f32(&ye).unwrap();
             let re = maxrel(&want_bf16x, &got_e);
+            let rf = maxrel(&want_bf16x, &gpu.download_f32(&yf).unwrap());
             let _ = gpu.free_tensor(ye);
+            let _ = gpu.free_tensor(yf);
             let got_a = gpu.download_f32(&ya).unwrap();
             let got_b = gpu.download_f32(&yb).unwrap();
             let got_d = gpu.download_f32(&yd).unwrap();
@@ -159,8 +164,8 @@ fn main() {
                 }
             };
             println!(
-                "wide={wide:<5} m={m:<5} k={k:<4} n={n:<3}  wmma {:.2e}{}  l3-scalar {:.2e}{}  l3-wmma {:.2e}{}  l3-coop {:.2e}{}  l3-gemv {:.2e}{}",
-                ra, flag(ra), rb, flag(rb), rd, flag(rd), re, flag(re), rg, flag(rg)
+                "wide={wide:<5} m={m:<5} k={k:<4} n={n:<3}  wmma {:.2e}{}  l3-scalar {:.2e}{}  l3-wmma {:.2e}{}  l3-coop {:.2e}{}  nheavy {:.2e}{}",
+                ra, flag(ra), rb, flag(rb), rd, flag(rd), re, flag(re), rf, flag(rf)
             );
             // The `wide` distribution spans 2^-16..2^15 INSIDE one dot product.
             // It exists to force LUT3 escapes, and LUT3 is gated on it. The
@@ -171,7 +176,7 @@ fn main() {
             // agrees to <=5.6e-5.
             if rb >= tol
                 || (n == 1 && rg >= tol)
-                || (!wide && (ra >= tol || rd >= tol || re >= tol))
+                || (!wide && (ra >= tol || rd >= tol || re >= tol || rf >= tol))
             {
                 bad = true;
             }
@@ -196,10 +201,10 @@ fn main() {
         ("lm_head ", 248_320, 1024),
     ];
     println!(
-        "{:<9} {:>7} {:>5} {:>9} {:>10} {:>6} {:>10} {:>6} {:>10} {:>6}",
-        "shape", "M", "N", "bf16 ms", "l3-scalar", "ratio", "l3-wmma", "ratio", "l3-coop", "ratio"
+        "{:<9} {:>7} {:>5} {:>10} {:>10} {:>7} {:>10} {:>7}",
+        "shape", "M", "N", "bf16 m128", "l3-coop", "ratio", "bf16 nheav", "ratio"
     );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(74));
     for &(label, m, k) in shapes {
         let raw = bf16_weights(m * k, 0x9E37_79B9 ^ m as u64, false);
         let packed = hipfire_primitives::bf16_lut3::encode(&raw);
@@ -237,6 +242,7 @@ fn main() {
             }
             gpu.device_synchronize().unwrap();
             let td = t.elapsed().as_secs_f64() / reps as f64;
+            let _ = td;
             gpu.gemm_bf16l3_wmma_coop(&wl, &xg, &ya, m, k, n).unwrap();
             gpu.device_synchronize().unwrap();
             let t = Instant::now();
@@ -245,15 +251,23 @@ fn main() {
             }
             gpu.device_synchronize().unwrap();
             let te = t.elapsed().as_secs_f64() / reps as f64;
+            gpu.gemm_bf16_x_bf16_wmma_gfx1151_nheavy(&wb, &xg, &ya, m, k, n)
+                .unwrap();
+            gpu.device_synchronize().unwrap();
+            let t = Instant::now();
+            for _ in 0..reps {
+                gpu.gemm_bf16_x_bf16_wmma_gfx1151_nheavy(&wb, &xg, &ya, m, k, n)
+                    .unwrap();
+            }
+            gpu.device_synchronize().unwrap();
+            let tf = t.elapsed().as_secs_f64() / reps as f64;
             println!(
-                "{label} {m:>7} {n:>5} {:>9.3} {:>10.3} {:>5.2}x {:>10.3} {:>5.2}x {:>10.3} {:>5.2}x",
+                "{label} {m:>7} {n:>5} {:>10.3} {:>10.3} {:>6.2}x {:>10.3} {:>6.2}x",
                 ta * 1e3,
-                tb * 1e3,
-                tb / ta,
-                td * 1e3,
-                td / ta,
                 te * 1e3,
-                te / ta
+                te / ta,
+                tf * 1e3,
+                tf / ta
             );
             let _ = gpu.free_tensor(xg);
             let _ = gpu.free_tensor(ya);
