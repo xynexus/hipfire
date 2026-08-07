@@ -53,6 +53,113 @@ use crate::repack::{
 /// counts as plausible.
 const MAX_HEADER: u64 = 512 << 20;
 
+/// How often to print progress. Long enough not to clutter a log, short enough
+/// that a stalled transfer becomes obvious quickly.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Below these, a rate estimate is dominated by connection setup rather than
+/// throughput, and the ETA it implies is worse than none: the first sample of a
+/// real fetch read `0.0 MB/s — eta 25h53m` about ten seconds before settling at
+/// 1.3 MB/s and 3m. An alarming number that is simply wrong costs more trust
+/// than a `--` does.
+const ETA_MIN_BYTES: u64 = 4 << 20;
+const ETA_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Periodic progress for a transfer that can run for hours.
+///
+/// Without it the run is silent between the opening line and the summary. On a
+/// 272 MB model over a slow link that was 11 minutes of nothing; on a
+/// multi-hundred-GB one it is indistinguishable from a hang, which is exactly
+/// how it was misread during bring-up.
+///
+/// Rate and ETA are computed over the whole run rather than the last interval.
+/// A link that drops and resumes then reports the throughput actually being
+/// achieved, instead of a figure that swings between zero and line speed every
+/// time a connection stalls.
+struct Progress {
+    /// Total source bytes across every file in the fetch.
+    total: u64,
+    /// Source bytes in files already committed.
+    done: u64,
+    /// Source bytes accepted for the file in flight.
+    cur: u64,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    fn new(total: u64) -> Self {
+        let now = std::time::Instant::now();
+        Progress {
+            total,
+            done: 0,
+            cur: 0,
+            started: now,
+            last: now,
+        }
+    }
+
+    fn advance(&mut self, n: usize, label: &str) {
+        self.cur += n as u64;
+        // The first line is due one interval in, so a fetch that finishes
+        // quickly — every unit test, most small repos — prints nothing extra.
+        if self.last.elapsed() < PROGRESS_EVERY {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        self.last = std::time::Instant::now();
+        let got = self.done + self.cur;
+        let rate = got as f64 / elapsed.as_secs_f64().max(1e-3);
+        let pct = if self.total > 0 {
+            got as f64 / self.total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let eta = if got >= ETA_MIN_BYTES && elapsed >= ETA_MIN_ELAPSED && rate > 0.0 && self.total > got
+        {
+            fmt_dur(((self.total - got) as f64 / rate) as u64)
+        } else {
+            "--".to_string()
+        };
+        eprintln!(
+            "hub: {} ({pct:.0}%) — {label} — {:.1} MB/s — eta {eta}",
+            fmt_pair(got, self.total),
+            rate / 1e6,
+        );
+    }
+
+    fn finish_file(&mut self) {
+        self.done += self.cur;
+        self.cur = 0;
+    }
+
+    /// The in-flight file restarted, so its bytes no longer count toward the
+    /// total transferred. Without this an ignored `Range` would inflate the
+    /// figure past 100%.
+    fn restart_file(&mut self) {
+        self.cur = 0;
+    }
+}
+
+/// Both figures share one unit, chosen from the total, so they stay directly
+/// comparable. GB is too coarse below a gigabyte — a 272 MB fetch spends most of
+/// its life reading `0.00/0.27 GB`, which shows no movement at all.
+fn fmt_pair(got: u64, total: u64) -> String {
+    if total >= 1_000_000_000 {
+        format!("{:.2}/{:.2} GB", got as f64 / 1e9, total as f64 / 1e9)
+    } else {
+        format!("{:.0}/{:.0} MB", got as f64 / 1e6, total as f64 / 1e6)
+    }
+}
+
+fn fmt_dur(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
 /// What the packer is doing with the bytes of the file currently in flight.
 enum Stage {
     /// Still reading `[u64 header_len][header JSON]`.
@@ -84,13 +191,17 @@ struct CurFile {
 pub struct StreamPacker {
     aw: ArchiveWriter,
     cur: Option<CurFile>,
+    progress: Progress,
 }
 
 impl StreamPacker {
-    pub fn create(out: &Path) -> io::Result<Self> {
+    /// `total_bytes` is the summed source size of everything to be fetched,
+    /// used only to give progress a denominator.
+    pub fn create(out: &Path, total_bytes: u64) -> io::Result<Self> {
         Ok(StreamPacker {
             aw: ArchiveWriter::create(out)?,
             cur: None,
+            progress: Progress::new(total_bytes),
         })
     }
 
@@ -117,6 +228,7 @@ impl StreamPacker {
     /// Commit the file: emit its index entry.
     pub fn finish_file(&mut self) -> Result<(), Box<dyn Error>> {
         let cur = self.cur.take().ok_or("finish_file outside a file")?;
+        self.progress.finish_file();
         match cur.stage {
             Stage::Verbatim => {
                 let (off, len, x) = self.aw.end_payload();
@@ -181,7 +293,7 @@ impl StreamPacker {
 
     /// Drive the state machine over one arriving chunk.
     fn feed(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        let Self { aw, cur } = self;
+        let Self { aw, cur, .. } = self;
         let cur = cur
             .as_mut()
             .ok_or_else(|| io::Error::other("chunk arrived outside a file"))?;
@@ -287,11 +399,17 @@ impl StreamPacker {
 
 impl ByteSink for StreamPacker {
     fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.feed(bytes)
+        self.feed(bytes)?;
+        // Disjoint field borrows: naming the file costs no allocation per chunk.
+        let Self { cur, progress, .. } = self;
+        let label = cur.as_ref().map(|c| c.rel.as_str()).unwrap_or("?");
+        progress.advance(bytes.len(), label);
+        Ok(())
     }
 
     /// Restart the in-flight file from byte zero.
     fn reset(&mut self) -> io::Result<()> {
+        self.progress.restart_file();
         let Some(cur) = self.cur.as_ref() else {
             return Ok(());
         };
@@ -342,7 +460,7 @@ pub async fn fetch_to_archive(
         out.display()
     );
 
-    let mut packer = StreamPacker::create(out)?;
+    let mut packer = StreamPacker::create(out, src_bytes)?;
     for f in &files {
         let mut st = StreamProgress::new(f);
         packer.begin_file(f)?;

@@ -1274,7 +1274,8 @@ mod tests {
     /// Drive the streaming packer over a model, in chunks that land on no
     /// convenient boundary.
     fn stream_model(out: &Path, files: &[(String, Vec<u8>)], chunk: usize) {
-        let mut packer = StreamPacker::create(out).expect("create stream archive");
+        let total: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+        let mut packer = StreamPacker::create(out, total).expect("create stream archive");
         let mut src = 0u64;
         for (name, bytes) in files {
             let rf = RepoFile {
