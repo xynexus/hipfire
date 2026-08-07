@@ -37,6 +37,33 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
+/// The arch's imatrix-only substring list, or the `HIPFIRE_CALIB_IMATRIX_ONLY`
+/// override. Every arch blocks routed experts from full `[K,K]` Hessians by
+/// default (`vec![".experts."]`), because storing one per expert was assumed
+/// prohibitive. It is not, for `down_proj`: its K is the MoE INTERMEDIATE
+/// width, which shrinks as experts multiply, so the total stays ~2.6 GB on both
+/// zaya1-8b (640 x K=2048) and qwen3.6-35b-a3b (9778 x K=512). It is `gate_up`
+/// that is expensive at K=hidden — and that one pools
+/// (`docs/quant-formats/moe-expert-hessians.md`).
+///
+/// Set to a comma-separated substring list to re-scope, or to an empty string
+/// to capture a full Hessian for every registered tensor. Each entry is matched
+/// with `contains`, so `.gate_up_proj` blocks expert gate/up while leaving
+/// expert `down_proj` (and every dense tensor) captured.
+fn effective_imatrix_only(arch_default: Vec<String>) -> Vec<String> {
+    let Some(raw) = hipfire_env::CALIB_IMATRIX_ONLY.get() else {
+        return arch_default;
+    };
+    let list: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    eprintln!("  calib: imatrix-only override active: {list:?} (was {arch_default:?})");
+    list
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HessianStorage {
     DenseF32,
@@ -1044,10 +1071,11 @@ where
 
     for (group_idx, start) in (0..num_layers).step_by(group).enumerate() {
         let end = (start + group).min(num_layers);
+        let imatrix_only = effective_imatrix_only(imatrix_only.clone());
         let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
             CalibCollector::new()
         } else {
-            CalibCollector::with_imatrix_only(imatrix_only.clone())
+            CalibCollector::with_imatrix_only(imatrix_only)
         });
         gpu.capture_names = capture_names_for(start, end);
         gpu.active_capture = Some(collector.clone());
@@ -1428,6 +1456,7 @@ pub fn arm(
     capture_names: HashMap<usize, String>,
     imatrix_only: Vec<String>,
 ) -> std::sync::Arc<CalibCollector> {
+    let imatrix_only = effective_imatrix_only(imatrix_only);
     let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
         CalibCollector::new()
     } else {

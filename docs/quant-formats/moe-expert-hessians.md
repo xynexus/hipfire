@@ -131,6 +131,57 @@ larger remaining share.
 result, so the per-expert `down_proj` pass is now justified rather than
 speculative.
 
+## Q4 — per-expert `down_proj`: NO measurable gain (negative result)
+
+Q3 ended by predicting that the per-expert `down_proj` pass was "justified
+rather than speculative". **Measurement falsified that.**
+
+Two things collapsed the cost first. The 43.6 GB storage figure is dominated by
+`gate_up` at K=hidden; **`down_proj`'s K is the MoE INTERMEDIATE width, which
+shrinks as experts multiply**, so storing every per-expert `down_proj` Hessian
+costs only ~2.6 GB on *both* zaya1-8b (640 × K=2048) and qwen3.6-35b-a3b
+(9778 × K=512). So the fused compute-then-discard pass was **never needed** —
+the expensive projection is the one that pools, and the un-poolable one is
+cheap. `HIPFIRE_CALIB_IMATRIX_ONLY=".gate_up_proj"` captures it with the
+existing collector: +607 Hessians, calib 865 MB → 3.2 GB, and capture time
+unchanged (746.8 s vs 744 s).
+
+Arm C = pooled `gate_up` + per-expert `down_proj`, same corpus, same 8192-token
+budget, same 16-chunk reference as A and B.
+
+| arm | LDLQ success | missing | mean_kld |
+|---|---|---|---|
+| A baseline (experts RTN) | 360 | 1280 | 0.573656 |
+| B pooled `gate_up` | 1000 | 640 | 0.555906 |
+| C B + per-expert `down_proj` | 1607 | 33 | 0.554680 |
+
+C's counters are exactly right: 360 dense + 640 pooled `gate_up` + 607
+per-expert `down_proj`, and the 33 missing are experts that never activated.
+
+**B → C: −0.22%, 95% CI [−2.92%, +2.47%], t = −0.16.** Nothing. The whole
+measurable gain (−3.09%, A → B) came from pooled `gate_up`; adding per-expert
+`down_proj` on top adds no resolvable improvement. A → C is −3.31% but with a
+CI spanning zero (r drops to 0.931), i.e. it is B's gain plus noise.
+
+Why, plausibly — none of these is tested:
+
+- **Sample starvation.** 8192 tokens over 16 experts is ~512 rows for K=2048,
+  n/K ≈ 0.25, and the per-expert row counts are wildly imbalanced (1 to 4262).
+  Many experts get a near-degenerate Hessian that damping collapses toward RTN.
+  Q2 measured 0.84× at n/K = 0.14 on a DENSE tensor, where rows are well mixed;
+  a starved expert is a harder case than that.
+- **Parameter share.** In zaya `gate_up` is [4096, 2048] and `down_proj` is
+  [2048, 2048], so `gate_up` is 2/3 of expert weight. B already treated the
+  larger share.
+- **The SwiGLU intermediate may simply be near-isotropic**, making `XᵀX`
+  ≈ scaled identity and LDLQ ≈ RTN regardless of sample count.
+
+The honest limit: at n=16 chunks this cannot resolve effects below ~3%. It
+does not show `down_proj` Hessians are worthless — it shows they are not worth
++2.4 GB of calib and ~200 s of quantize at this token budget on this model.
+The cheap follow-up is to re-run Arm C at a much larger token budget so the
+starved experts fill; if the effect is real it should grow.
+
 ## What to build, if anything
 
 - **`gate_up`: layer-pooled Hessian.** Q1 says pooling costs little
@@ -152,23 +203,28 @@ reduction tiles across model microbatches", and `CapturePolicy` already has a
 `HessianAndImatrix` variant. The gate is the assertion at
 `expert_capture.rs:338`, not missing machinery.
 
-~~Do not start with the fused pass. Start with the pooled `gate_up` Hessian and
-measure KLD.~~ **Done — see Q3. Pooled `gate_up` is measured at −3.09% KLD
-(CI excludes zero), so the gate is cleared and the per-expert `down_proj` pass
-is justified.**
+Settled by measurement:
 
-Remaining work, in order:
+- **Ship pooled `gate_up`** (`HIPFIRE_POOLED_EXPERT_HESSIAN=1`). −3.09% KLD,
+  CI excludes zero, costs nothing to store and needs no new capture.
+- **Do NOT enable per-expert `down_proj` by default.** −0.22% on top of pooled,
+  CI spans zero, for +2.4 GB of calib and ~200 s of quantize.
+  `HIPFIRE_CALIB_IMATRIX_ONLY` keeps it available as a research knob.
+- **The fused compute-then-discard pass is not needed and should not be
+  built.** Its whole motivation was 43.6 GB of storage, and that number was
+  `gate_up`'s; `gate_up` pools, and `down_proj` stores in ~2.6 GB.
 
-1. **Generalise the pooled donor beyond zaya.** Today it relies on a donor
-   tensor that happens to consume the same activation. The principled donor is
-   the ROUTER (`mlp.gate`), which by construction sees the FFN input — already
-   listed first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.
+Open, in rough order of value:
+
+1. **Re-run Arm C at a much larger token budget.** The per-expert `down_proj`
+   Hessians were built from ~512 rows against K=2048 with 1-to-4262 imbalance.
+   This is the one hypothesis that could overturn Q4, and it is cheap.
+2. **Generalise the pooled donor beyond zaya.** The principled donor is the
+   ROUTER (`mlp.gate`), which by construction consumes the FFN input — already
+   first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.
    Confirm K matches there and re-measure.
-2. **Per-expert `down_proj`, fused and discarded.** ~1.1 GB peak per layer,
-   or ~4.5 MB with quota-based early finalise. This is the larger remaining
-   share of the loss — 640 tensors are still RTN in the best arm above.
-3. Re-measure with more chunks: the current CI (0.6–5.6%) resolves the sign but
-   not the magnitude.
+3. More chunks: n=16 resolves the pooled effect's sign but not its magnitude
+   (0.6–5.6%), and cannot resolve anything below ~3%.
 
 ## Reproduce
 

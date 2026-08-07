@@ -231,6 +231,16 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    CALIB_IMATRIX_ONLY = "HIPFIRE_CALIB_IMATRIX_ONLY", Developer,
+        "Comma-separated substrings whose tensors capture only an imatrix \
+         (diagonal) rather than a full [K,K] Hessian, overriding the arch \
+         default of `.experts.`. Empty string captures a full Hessian for \
+         everything. `.gate_up_proj` blocks the expensive K=hidden expert \
+         gate/up (which pools instead) while capturing per-expert `down_proj`, \
+         whose K is the MoE intermediate width and so stays affordable. \
+         Raises GPU residency during capture — one [K,K] f32 per captured \
+         tensor. See `docs/quant-formats/moe-expert-hessians.md`.";
+
     POOLED_EXPERT_HESSIAN = "HIPFIRE_POOLED_EXPERT_HESSIAN", Developer,
         "Set 1 to let a routed MoE expert's gate/up projection borrow the \
          LAYER-POOLED Hessian under `--ldlq` when it has none of its own. \

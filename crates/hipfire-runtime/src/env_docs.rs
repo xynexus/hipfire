@@ -360,14 +360,21 @@ pub const ENV_HIPFIRE_BLOB_FORCE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_CALIB_F64_AUDIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_F64_AUDIT",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/src/calibration.rs:146",
+    source: "crates/hipfire-runtime/src/calibration.rs:173",
 };
 
 /// `HIPFIRE_CALIB_HESSIAN_STORAGE` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_CALIB_HESSIAN_STORAGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_HESSIAN_STORAGE",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/calibration.rs:47",
+    source: "crates/hipfire-runtime/src/calibration.rs:74",
+};
+
+/// `HIPFIRE_CALIB_IMATRIX_ONLY` — Comma-separated substrings whose tensors capture only an imatrix (diagonal) rather than a full [K,K] Hessian, overriding the arch default of `.experts.`. Empty string captures a full Hessian for everything. `.gate_up_proj` blocks the expensive K=hidden expert gate/up (which pools instead) while capturing per-expert `down_proj`, whose K is the MoE intermediate width and so stays affordable. Raises GPU residency during capture — one [K,K] f32 per captured tensor. See `docs/quant-formats/moe-expert-hessians.md`.
+pub const ENV_HIPFIRE_CALIB_IMATRIX_ONLY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_CALIB_IMATRIX_ONLY",
+    description: "Comma-separated substrings whose tensors capture only an imatrix (diagonal) rather than a full [K,K] Hessian, overriding the arch default of `.experts.`. Empty string captures a full Hessian for everything. `.gate_up_proj` blocks the expensive K=hidden expert gate/up (which pools instead) while capturing per-expert `down_proj`, whose K is the MoE intermediate width and so stays affordable. Raises GPU residency during capture — one [K,K] f32 per captured tensor. See `docs/quant-formats/moe-expert-hessians.md`.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_CALIB_PROFILE` — Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr
@@ -4041,7 +4048,7 @@ pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS",
     description: "Imatrix storage is small enough to capture all layers in one pass. The",
-    source: "crates/hipfire-runtime/src/calibration.rs:981",
+    source: "crates/hipfire-runtime/src/calibration.rs:1008",
 };
 
 /// `HIPFIRE_QWEN3_LAYER_TRACE` — Runtime variable controlling qwen3 layer trace in hipfire
@@ -5437,6 +5444,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_BLOB_FORCE,
     ENV_HIPFIRE_CALIB_F64_AUDIT,
     ENV_HIPFIRE_CALIB_HESSIAN_STORAGE,
+    ENV_HIPFIRE_CALIB_IMATRIX_ONLY,
     ENV_HIPFIRE_CALIB_PROFILE,
     ENV_HIPFIRE_CASK_OFF,
     ENV_HIPFIRE_CHATML,
