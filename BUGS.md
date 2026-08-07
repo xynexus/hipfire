@@ -4,12 +4,43 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## [Critical] Example Bug
-- Category: Architecture / Maintainability
-- Location: crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-rdna/src/dispatch/mod.rs
-- Summary: This is an example of a brief bug report
-- Suggested fix: Do nothing 
-- Scope: Architectural
+## [Critical] down_proj gets no Hessian/imatrix — the fused SwiGLU path has no capture tap
+- Category: Correctness / Calibration
+- Location: `crates/hipfire-runtime/src/weights.rs` `weight_gemv_swiglu_residual`
+  (L1255); taps live in `weight_gemv`/`weight_gemm` and in
+  `crates/hipfire-rdna/src/dispatch/fused.rs` (L2982-2985 wqkv/wz/wbeta/walpha,
+  L3076-3077 wgate/wup).
+- Summary: `weight_gemv_swiglu_residual` is the down_proj entry point and calls
+  `maybe_capture_activation` ZERO times — it dispatches straight to
+  `gemv_*_residual`, bypassing `weight_gemv`. down_proj's input is the SwiGLU
+  output produced inside that fused path, so nothing ever sees it. The fused
+  gate/up helper taps its two weights; there is no equivalent for w_down
+  anywhere.
+- Evidence: a fresh qwen3.5-0.8b calib (`collect-artifacts --max-tokens 512`)
+  yields 162 hessians / 11 kinds — linear_attn x5, mlp.gate_proj, mlp.up_proj,
+  self_attn x4 — with `mlp.down_proj` absent. That is exactly the tap list
+  above. A known-good calib from 2026-08-06 has 186 / 12 including
+  `mlp.down_proj` x24, so the coverage regressed at some point.
+  NOT caused by batched prefill: forcing the per-token path with
+  `HIPFIRE_PREFILL_BATCHED=0` reproduces the identical 162 / 11.
+- Impact: this is silent. `--ldlq` does not fail on a missing Hessian, it logs
+  `ldlq: skip <t>` and falls back to RTN, so every `oq*++` build is quietly
+  RTN-quantizing its down_proj while reporting success. down_proj is the widest
+  FFN matrix and the one the outlier-budget study found most sensitive. A prior
+  session lost a full invalid 5-config run to exactly this failure mode on a
+  partial calib.
+- Suggested fix: tap the down input inside `weight_gemv_swiglu_residual` (and
+  its batched sibling) where the SwiGLU result is materialised, mirroring the
+  gate/up taps. Then add a coverage assertion to the collector: a dense arch
+  should produce one Hessian per admitted projection per layer, and a shortfall
+  should fail rather than write a partial artefact.
+- Related: `/srv/hipfire/calib/qwen3.5-{0.8b,2b,4b}.calib.hfq` are a SEPARATE
+  and older defect — built 2026-06-27, they carry `kinds=1` (down_proj only,
+  the mirror image of this bug). The other 12 shared calibs have 7-13 kinds and
+  look sound.
+- Scope: Calibration / quantization quality
+- Confidence: High (root cause read directly from the tap sites; reproduced on
+  both forward paths)
 - Confidence: High
 
 ## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
