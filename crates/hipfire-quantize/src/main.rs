@@ -15695,22 +15695,31 @@ mod tests {
     #[test]
     fn stacked_expert_oq_format_includes_mixed_opus() {
         assert_eq!(
-            stacked_expert_oq_format(true, false, false, false),
+            stacked_expert_oq_format(true, false, false, false, 256),
             Some(HfqInputFormat::OqPlusCompact)
         );
+        // The group is what the flag carried, not a default: losing it here is
+        // exactly the silent fall back to 256 the parameter exists to prevent.
         assert_eq!(
-            stacked_expert_oq_format(false, true, false, false),
+            stacked_expert_oq_format(true, false, false, false, 128),
+            Some(HfqInputFormat::OqPlusCompactG128)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, true, false, false, 256),
             Some(HfqInputFormat::Oq4)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, true, false),
+            stacked_expert_oq_format(false, false, true, false, 256),
             Some(HfqInputFormat::Oq8)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, false, true),
+            stacked_expert_oq_format(false, false, false, true, 256),
             Some(HfqInputFormat::Oq8Plus)
         );
-        assert_eq!(stacked_expert_oq_format(false, false, false, false), None);
+        assert_eq!(
+            stacked_expert_oq_format(false, false, false, false, 256),
+            None
+        );
     }
 
     #[test]

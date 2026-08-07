@@ -101,7 +101,7 @@ fn main() {
     // B>=5, so a bug that only shows with a single active batch row (lane
     // clamping via safe_x, the n=1 tail) could not have been caught here.
     // G=128 exists to fit K values that 256 cannot divide; both must decode.
-    for &GROUP in &[256usize, 128] {
+    for &group in &[256usize, 128] {
         for &(m, k, b) in &[
             (16usize, 256usize, 16usize),
             (48, 512, 8),
@@ -117,8 +117,8 @@ fn main() {
                 // paths. A real artifact's scales are arbitrary f16, so sweep both:
                 // `exact` reproduces the original coverage, `!exact` is the realistic case.
                 for &exact in &[true, false] {
-                    let block_stride = 2 + GROUP / 2 + 2 * n_out;
-                    let ng = k / GROUP;
+                    let block_stride = 2 + group / 2 + 2 * n_out;
+                    let ng = k / group;
                     let mut rnd =
                         lcg(0x51ee_d00d ^ (m * k * b + n_out) as u32 ^ (exact as u32) << 20);
 
@@ -136,13 +136,13 @@ fn main() {
                                 (((10 + rnd() % 9) as u16) << 10) | (rnd() % 1024) as u16
                             };
                             blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
-                            for i in 0..GROUP / 2 {
+                            for i in 0..group / 2 {
                                 blocks[off + 2 + i] = (rnd() & 0xff) as u8;
                             }
                             for s in 0..n_out {
                                 // Deliberately allow duplicate indices so last-wins is exercised.
-                                let hdr = 2 + GROUP / 2;
-                                blocks[off + hdr + 2 * s] = (rnd() % GROUP as u32) as u8;
+                                let hdr = 2 + group / 2;
+                                blocks[off + hdr + 2 * s] = (rnd() % group as u32) as u8;
                                 blocks[off + hdr + 2 * s + 1] = (rnd() & 0xff) as u8;
                             }
                         }
@@ -163,7 +163,7 @@ fn main() {
                         })
                         .collect();
 
-                    let (w_dense, w_scales) = expand(&blocks, m, k, block_stride, GROUP);
+                    let (w_dense, w_scales) = expand(&blocks, m, k, block_stride, group);
 
                     let d_blocks = gpu
                         .upload_raw(&blocks, &[blocks.len()])
@@ -195,7 +195,7 @@ fn main() {
                     let d_y_cmp = gpu.zeros(&[b * m], DType::F32).expect("y cmp");
 
                     gpu.gemm_oq8_grouped_wmma(
-                        &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, GROUP,
+                        &d_wdense, &d_wscales, &d_xq, &d_xs, &d_y_ref, m, k, b, group,
                     )
                     .expect("dense gemm");
                     gpu.gemm_oq_compact_grouped_wmma(
@@ -206,7 +206,7 @@ fn main() {
                         m,
                         k,
                         b,
-                        GROUP,
+                        group,
                         block_stride,
                     )
                     .expect("compact gemm");
@@ -227,7 +227,7 @@ fn main() {
                     } else {
                         "arbitrary-scales"
                     };
-                    let tag = format!("G={GROUP} M={m} K={k} B={b} N_out={n_out} {scales}");
+                    let tag = format!("G={group} M={m} K={k} B={b} N_out={n_out} {scales}");
                     if bad == 0 {
                         println!("  ok   {tag}: bit-identical over {} outputs", y_ref.len());
                     } else {
