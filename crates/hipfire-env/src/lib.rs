@@ -231,6 +231,13 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    LDLQ_SKIP_EXPERT_LEAVES = "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", Developer,
+        "Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose \
+         tensors skip `--ldlq` even when the calibration carries a Hessian for \
+         them. Exists so ONE calibration artifact can produce both arms of a \
+         per-expert-Hessian comparison, which keeps the arms differing only in \
+         the thing under test instead of in their capture.";
+
     CALIB_IMATRIX_ONLY = "HIPFIRE_CALIB_IMATRIX_ONLY", Developer,
         "Comma-separated substrings whose tensors capture only an imatrix \
          (diagonal) rather than a full [K,K] Hessian, overriding the arch \

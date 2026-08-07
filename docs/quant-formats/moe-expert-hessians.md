@@ -182,6 +182,75 @@ does not show `down_proj` Hessians are worthless — it shows they are not worth
 The cheap follow-up is to re-run Arm C at a much larger token budget so the
 starved experts fill; if the effect is real it should grow.
 
+## Q5 — 4x the calibration budget: the budget is the real lever, and per-expert `down_proj` turns UNSTABLE
+
+Q4 blamed sample starvation (median n/K ≈ 0.22). Tested by re-running at 32768
+tokens, with both arms built from ONE calib
+(`HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES=down_proj` produces the control), so they
+differ only in the thing under test.
+
+**Was it budget or corpus diversity?** Budget, for the bulk. Row counts per
+expert scale almost exactly with the token budget, and the concentration is
+invariant across a 16x range:
+
+| tokens | p25 | p50 | p75 | p90 | rows<256 | top-10% share of rows |
+|---|---|---|---|---|---|---|
+| 2k | 45 | 119 | 194 | 273 | 88% | 28.5% |
+| 8k | 237 | 456 | 725 | 1019 | 27% | 28.3% |
+| 32k | 994 | 1874 | 2795 | 3875 | 11% | **28.4%** |
+
+A diversity-bound corpus would show the skew WORSENING as tokens are added.
+It does not — the top decile holds the same 28.4% of rows at every budget, so
+the corpus reaches experts proportionally. Diversity binds only the floor:
+`min` stays at 1 row and ~4% of experts remain under 32 rows at any English
+budget (consistent with the router profiler's CJK finding). Median n/K went
+0.22 → **0.89**.
+
+**Cost note: the capture is O(n²).** 4x the tokens cost 14.3x the time
+(747 s → 10659 s), so 32k is the practical ceiling on this path; the ~73k
+needed for median n/K ≈ 2 would be ~40 h.
+
+### The budget dominates everything else measured here
+
+Same method, same code, only 4x the calibration tokens:
+
+**pooled `gate_up` @8k → @32k: −12.92% KLD** (0.555906 → 0.484070),
+95% CI [−17.89%, −7.95%], t = −5.10.
+
+That is **4x the effect of the pooled-Hessian change itself** (−3.09%). The
+8192-token calib was simply badly under-sampled. Attribution caveat: at 32k the
+360 dense Hessians improve too, so this is the whole-model benefit of 4x calib
+tokens, not something expert-specific.
+
+### Per-expert `down_proj` at 32k: neutral on most content, catastrophic on some
+
+| arm (32k calib) | LDLQ success | missing | mean_kld |
+|---|---|---|---|
+| B32 pooled `gate_up` only | 1000 | 640 | **0.484070** |
+| C32 + per-expert `down_proj` | 1617 | 23 | 0.624441 |
+
+Aggregate reads +29%, but the inter-arm correlation **collapses to 0.17** (it
+was 0.92–0.98 everywhere else), which means instability, not a shift. Per
+chunk:
+
+- **14 of 16 chunks: ratio 0.94–1.03** (median 0.987, i.e. slightly better)
+- **2 chunks blow up 3.5x**: chunk 1 0.5366 → 1.8878, chunk 2 0.3827 → 1.4019
+
+Excluding those two: −1.82%, 95% CI [−3.75%, +0.11%]. So per-expert `down_proj`
+is worth ~1.8% *when it works* and occasionally destroys a chunk.
+
+**The blowup is NOT starvation.** 8k had MORE starved experts than 32k (41 vs
+25 under 32 rows) and produced no blowups at all. More data made it worse. That
+points at the opposite mechanism: a better-sampled Hessian makes LDLQ commit
+harder to the calibration distribution, so out-of-distribution content fails
+worse — which is precisely `opus-quant.md` §7's "plain `XᵀX` LDLQ ≈ no
+calibration on held-out data", showing up as variance rather than as a mean
+shift. A minimum-rows guard would therefore probably NOT fix it.
+
+Two follow-ups would discriminate, neither run: (a) a min-rows guard — if
+blowups persist, starvation is exonerated for good; (b) much heavier damping on
+expert `down_proj` — if blowups vanish, over-commitment is confirmed.
+
 ## What to build, if anything
 
 - **`gate_up`: layer-pooled Hessian.** Q1 says pooling costs little
@@ -205,25 +274,30 @@ reduction tiles across model microbatches", and `CapturePolicy` already has a
 
 Settled by measurement:
 
+- **Raise the calibration token budget first.** It is the largest lever found:
+  −12.92% KLD for 4x the tokens, versus −3.09% for the best Hessian-scoping
+  change. Budget it against the O(n²) capture cost.
 - **Ship pooled `gate_up`** (`HIPFIRE_POOLED_EXPERT_HESSIAN=1`). −3.09% KLD,
   CI excludes zero, costs nothing to store and needs no new capture.
-- **Do NOT enable per-expert `down_proj` by default.** −0.22% on top of pooled,
-  CI spans zero, for +2.4 GB of calib and ~200 s of quantize.
-  `HIPFIRE_CALIB_IMATRIX_ONLY` keeps it available as a research knob.
+- **Do NOT enable per-expert `down_proj`.** At 8k it bought −0.22% (CI spans
+  zero); at 32k it is ~1.8% better on 14/16 chunks and 3.5x WORSE on 2, which
+  is a net loss and a stability risk. Both knobs stay opt-in and off.
 - **The fused compute-then-discard pass is not needed and should not be
   built.** Its whole motivation was 43.6 GB of storage, and that number was
   `gate_up`'s; `gate_up` pools, and `down_proj` stores in ~2.6 GB.
 
 Open, in rough order of value:
 
-1. **Re-run Arm C at a much larger token budget.** The per-expert `down_proj`
-   Hessians were built from ~512 rows against K=2048 with 1-to-4262 imbalance.
-   This is the one hypothesis that could overturn Q4, and it is cheap.
+1. **Push the token budget further on the pooled arm**, which is where the
+   measured wins are. Needs the O(n²) capture cost addressed — chunked or
+   multi-sample capture rather than one long sequence.
 2. **Generalise the pooled donor beyond zaya.** The principled donor is the
    ROUTER (`mlp.gate`), which by construction consumes the FFN input — already
    first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.
    Confirm K matches there and re-measure.
-3. More chunks: n=16 resolves the pooled effect's sign but not its magnitude
+3. Discriminate the C32 blowup mechanism (min-rows guard vs heavier damping)
+   only if per-expert `down_proj` is ever wanted again.
+4. More chunks: n=16 resolves the pooled effect's sign but not its magnitude
    (0.6–5.6%), and cannot resolve anything below ~3%.
 
 ## Reproduce

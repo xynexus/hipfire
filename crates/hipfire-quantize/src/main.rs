@@ -375,8 +375,36 @@ fn pooled_hessian_donor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<St
         .find(|donor| idx.k_of(donor) == Some(k))
 }
 
+/// Routed-expert leaves whose tensors skip LDLQ entirely, from
+/// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES`. Lets ONE calibration artifact produce
+/// both the with- and without-per-expert-Hessian arms of a comparison, so the
+/// two differ only in the thing under test rather than in their capture.
+fn ldlq_skipped_expert_leaf(name: &str) -> bool {
+    let Some(raw) = hipfire_env::LDLQ_SKIP_EXPERT_LEAVES.get() else {
+        return false;
+    };
+    let Some((_, rest)) = name.split_once(".mlp.experts.") else {
+        return false;
+    };
+    let Some((idx, leaf)) = rest.split_once('.') else {
+        return false;
+    };
+    if idx.parse::<u32>().is_err() {
+        return false;
+    }
+    let leaf = leaf.strip_suffix(".weight").unwrap_or(leaf);
+    raw.split(',')
+        .map(str::trim)
+        .any(|s| !s.is_empty() && s == leaf)
+}
+
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if ldlq_skipped_expert_leaf(name) {
+        LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES)");
+        return None;
+    }
     let candidates = calibration_tensor_name_candidates(name);
     let direct = candidates
         .iter()
@@ -15330,6 +15358,33 @@ mod tests {
         assert!(
             pooled_donor_candidates("model.layers.7.mlp.experts.pooled.gate_up_proj").is_empty()
         );
+    }
+
+    #[test]
+    fn ldlq_expert_leaf_skip_is_scoped_to_routed_experts() {
+        // Serialised with other env-mutating tests would be ideal, but this
+        // reads one variable and restores it immediately.
+        std::env::set_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", "down_proj,w2");
+        assert!(ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
+        assert!(ldlq_skipped_expert_leaf("model.layers.3.mlp.experts.7.w2"));
+        // gate/up is the arm under comparison and must NOT be skipped.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.gate_up_proj.weight"
+        ));
+        // Dense tensors that merely end in the same leaf must not be caught —
+        // this is the whole reason it parses the expert index.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.gate.down_proj.weight"
+        ));
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.shared_expert.down_proj.weight"
+        ));
+        std::env::remove_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES");
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
     }
 
     /// Build a fake source mmap with a v2 tail blob at `offset`, plus the

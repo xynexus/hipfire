@@ -2535,6 +2535,13 @@ pub const ENV_HIPFIRE_LATENTKV_TRAIN: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-train/examples/latent_kv_recovery.rs:160",
 };
 
+/// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES` — Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose tensors skip `--ldlq` even when the calibration carries a Hessian for them. Exists so ONE calibration artifact can produce both arms of a per-expert-Hessian comparison, which keeps the arms differing only in the thing under test instead of in their capture.
+pub const ENV_HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES",
+    description: "Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose tensors skip `--ldlq` even when the calibration carries a Hessian for them. Exists so ONE calibration artifact can produce both arms of a per-expert-Hessian comparison, which keeps the arms differing only in the thing under test instead of in their capture.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_LFM2_CAPTURE_POSTMIXER` — Runtime variable controlling lfm2 capture postmixer in hipfire
 pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_CAPTURE_POSTMIXER",
@@ -5753,6 +5760,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LATENTKV_EVAL,
     ENV_HIPFIRE_LATENTKV_RANK,
     ENV_HIPFIRE_LATENTKV_TRAIN,
+    ENV_HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES,
     ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER,
     ENV_HIPFIRE_LFM2_DFLASH,
     ENV_HIPFIRE_LFM2_DFLASH_F16,
