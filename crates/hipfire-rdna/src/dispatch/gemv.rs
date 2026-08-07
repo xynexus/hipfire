@@ -5262,6 +5262,61 @@ impl Gpu {
         result
     }
 
+    /// [`Self::gemm_bf16l3_wmma`] with the decode done cooperatively by the
+    /// whole wave into an LDS A-tile, rather than each lane decoding its own
+    /// fragment.
+    ///
+    /// The per-lane form decodes every element twice (lanes 0-15 and 16-31 map
+    /// to the same rows) and walks 16 dependent cursor steps; this decodes each
+    /// element once with 8 independent steps per lane, as `gemv_bf16l3_xf32`
+    /// does. The A-tile costs 8 KB of LDS per warp, so this runs 4 warps and 64
+    /// rows per block instead of 8 and 128.
+    pub fn gemm_bf16l3_wmma_coop(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_wmma_coop requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_wmma_coop",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_wmma_coop",
+        )?;
+        let wp = w.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x, n * k)?;
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = n as i32;
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = n.div_ceil(16) as u32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_wmma_coop", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16l3_wmma_coop",
+            [grid_m, grid_b, 1],
+            [128, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(
         &mut self,

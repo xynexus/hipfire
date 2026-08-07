@@ -285,3 +285,148 @@ extern "C" __global__ void gemm_bf16l3_wmma_m128(
 #undef L3W_N_TILE
 #undef L3W_M_PER_WARP
 #undef L3W_SLOTS
+
+// ---------------------------------------------------------------------------
+// Cooperative-decode WMMA form.
+//
+// `gemm_bf16l3_wmma_m128` above has every lane decode its own 16-element A
+// fragment, and lanes 0-15 / 16-31 map to the SAME rows — so decode work is
+// 2x M*K, and each lane walks a serial cursor chain of 16 dependent steps. That
+// is why it wins small-M shapes (1.8-2.1x vs the scalar form's 8x) and loses
+// large-M ones (10x).
+//
+// Here the whole 32-lane wave decodes ONE row cooperatively, exactly as
+// gemv_bf16l3_xf32 does — lane t owns elements [8t, 8t+8), escapes resolved by a
+// wave-wide prefix sum — into an LDS A-tile that WMMA then reads. Each element
+// is decoded once, and the 8 steps per lane are independent across the wave
+// instead of 16 dependent ones.
+//
+// LDS is the binding constraint: a 16-row x 256-k A tile is 8 KB per warp, so
+// 8 warps would need 64 KB before the X tile. 4 warps -> 32 KB + 8 KB = 40 KB.
+// That halves rows per block (64, not 128) and doubles the grid, which is the
+// trade this kernel is testing.
+#define L3C_WARPS       4
+#define L3C_M_PER_WARP 16
+#define L3C_M_TILE     64   // L3C_WARPS * L3C_M_PER_WARP
+#define L3C_N_TILE     16
+
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_bf16l3_wmma_coop(
+    const unsigned char*  __restrict__ W,
+    const unsigned short* __restrict__ X,
+    float*                __restrict__ Y,
+    int M, int K, int B
+) {
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int lane16  = lane & 15;
+    const int row_start   = blockIdx.x * L3C_M_TILE;
+    const int batch_start = blockIdx.y * L3C_N_TILE;
+    if (row_start >= M || batch_start >= B) return;
+
+    __shared__ unsigned short lds_x[L3C_N_TILE * BF16L3_BLOCK];
+    __shared__ unsigned short lds_a[L3C_WARPS][L3C_M_PER_WARP * BF16L3_BLOCK];
+
+    const size_t n        = (size_t)M * (size_t)K;
+    const size_t nb       = (n + BF16L3_BLOCK - 1) / BF16L3_BLOCK;
+    const size_t esc_tab  = BF16L3_HEADER;
+    const size_t lut_off  = esc_tab + bf16l3_gemm_align16(4 * nb);
+    const size_t mant_off = lut_off + bf16l3_gemm_align16(BF16L3_LUT_STRIDE * nb);
+    const size_t code_off = mant_off + BF16L3_BLOCK * nb;
+    const size_t esc_off  = code_off + BF16L3_CODE_STRIDE * nb;
+
+    const int warp_row_start = row_start + warp_id * L3C_M_PER_WARP;
+    const int blocks_per_row = K / BF16L3_BLOCK;
+
+    l3_float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    unsigned short* __restrict__ a_tile = &lds_a[warp_id][0];
+
+    for (int k_base = 0; k_base < K; k_base += BF16L3_BLOCK) {
+        // X tile: 16 slots x 16 k-fragments, two per thread at 128 threads.
+        for (int f = tid; f < L3C_N_TILE * 16; f += 128) {
+            const int slot = f >> 4;
+            const int ko   = (f & 15) * 16;
+            const int batch_row = batch_start + slot;
+            l3_b16x16_t v = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+            if (batch_row < B && k_base + ko < K) {
+                v = *(const l3_b16x16_t*)(X + (long long)batch_row * K + k_base + ko);
+            }
+            *(l3_b16x16_t*)(lds_x + slot * BF16L3_BLOCK + ko) = v;
+        }
+
+        // Decode this warp's 16 rows, one row per wave pass.
+        for (int r = 0; r < L3C_M_PER_WARP; ++r) {
+            const int row = warp_row_start + r;
+            const int safe_row = (row < M) ? row : (M - 1);
+            const size_t blk = (size_t)safe_row * (size_t)blocks_per_row
+                             + (size_t)(k_base / BF16L3_BLOCK);
+
+            const unsigned int esc_start =
+                ((const unsigned int* __restrict__)(W + esc_tab))[blk];
+            const uint2 lv =
+                *(const uint2* __restrict__)(W + lut_off + BF16L3_LUT_STRIDE * blk);
+            const unsigned char* __restrict__ mant  = W + mant_off + BF16L3_BLOCK * blk;
+            const unsigned char* __restrict__ codes = W + code_off + BF16L3_CODE_STRIDE * blk;
+            const unsigned char* __restrict__ esc   = W + esc_off  + esc_start;
+
+            // Lane t owns elements [8t, 8t+8) — the 3 code bytes at 3t.
+            unsigned int cw = (unsigned int)codes[3 * lane]
+                            | ((unsigned int)codes[3 * lane + 1] << 8)
+                            | ((unsigned int)codes[3 * lane + 2] << 16);
+            const uint2 mv = *(const uint2* __restrict__)(mant + 8 * lane);
+
+            int local = 0;
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) local += (((cw >> (3 * s)) & 7u) == BF16L3_ESCAPE);
+            int scan = local;
+            #pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                int up = __shfl_up(scan, d);
+                if (lane >= d) scan += up;
+            }
+            int cursor = scan - local;
+
+            const unsigned int mb[2] = { mv.x, mv.y };
+            unsigned short out[8];
+            #pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                const unsigned int code = (cw >> (3 * s)) & 7u;
+                const unsigned int lsel = (code < 4 ? lv.x : lv.y) >> (8 * (code & 3));
+                const unsigned int e    = (code == BF16L3_ESCAPE)
+                                              ? (unsigned int)esc[cursor++]
+                                              : (lsel & 0xffu);
+                const unsigned int sm   = (mb[s >> 2] >> (8 * (s & 3))) & 0xffu;
+                out[s] = (unsigned short)(((sm & 0x80u) << 8) | (e << 7) | (sm & 0x7fu));
+            }
+            // 8 shorts = one 16-byte store.
+            *(uint4*)(a_tile + r * BF16L3_BLOCK + 8 * lane) = *(const uint4*)out;
+        }
+
+        __syncthreads();
+
+        for (int kt = 0; kt < BF16L3_BLOCK; kt += 16) {
+            l3_b16x16_t a_frag = *(const l3_b16x16_t*)(a_tile + lane16 * BF16L3_BLOCK + kt);
+            l3_b16x16_t b_frag = *(const l3_b16x16_t*)(lds_x + lane16 * BF16L3_BLOCK + kt);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc);
+        }
+
+        __syncthreads();
+    }
+
+    const int out_col = batch_start + lane16;
+    if (out_col < B) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int out_row = warp_row_start + 2 * j + (lane >> 4);
+            if (out_row < M) {
+                Y[(long long)out_col * M + out_row] = acc[j];
+            }
+        }
+    }
+}
+
+#undef L3C_WARPS
+#undef L3C_M_PER_WARP
+#undef L3C_M_TILE
+#undef L3C_N_TILE
