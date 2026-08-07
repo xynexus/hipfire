@@ -383,8 +383,10 @@ mod preflight_tests {
 #[inline]
 fn capture_at_weight_gemv_wrapper(dtype: DType) -> bool {
     // Full-precision GEMV routes terminate in capture-aware RDNA entrypoints:
-    // BF16 in `gemm_bf16_x_bf16_wmma_labeled`, F16 in
-    // `gemm_f16_batched_lmhead`. Keeping wrapper capture enabled for either
+    // BF16 in `gemv_bf16_xf32` (batch 1) or `gemm_bf16_x_bf16_wmma_labeled`
+    // (batched), F16 in `gemv_f16_xf32` / `gemm_f16_batched_lmhead`. The bf16
+    // batch-1 tap was missing until 2026-08-07, which cost every bf16-sourced
+    // calib its `mlp.down_proj` Hessian. Keeping wrapper capture enabled for either
     // would count each activation twice. Quantized routes have no universal
     // lower-level chokepoint and remain owned here.
     !matches!(dtype, DType::BF16 | DType::F16)

@@ -4868,6 +4868,16 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Calibration tap. BF16 is excluded from the `weight_gemv` wrapper tap
+        // (`capture_at_weight_gemv_wrapper`) on the premise that it terminates
+        // in the capture-aware `gemm_bf16_x_bf16_wmma_labeled` — true for
+        // batched GEMM, but NOT here: at batch=1 the gemv family routes
+        // `KernelKey::GemvBf16` straight to this kernel. Without this the only
+        // bf16 linear that reaches `weight_gemv` at batch 1 (w_down, via
+        // `weight_gemv_residual`'s generic tail) gets no Hessian/imatrix, so
+        // bf16-sourced calibs came out with mlp.down_proj missing entirely.
+        // `gemv_f16_xf32` has always tapped here; bf16 just never did.
+        self.maybe_capture_activation(w, x, 1, k);
         self.launch_gemv_generic("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, w, x, y, m, k)
     }
 

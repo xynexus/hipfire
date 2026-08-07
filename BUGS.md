@@ -4,44 +4,52 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## [Critical] down_proj gets no Hessian/imatrix — the fused SwiGLU path has no capture tap
+## [FIXED] down_proj gets no Hessian/imatrix on bf16 models — `gemv_bf16_xf32` never tapped
 - Category: Correctness / Calibration
-- Location: `crates/hipfire-runtime/src/weights.rs` `weight_gemv_swiglu_residual`
-  (L1255); taps live in `weight_gemv`/`weight_gemm` and in
-  `crates/hipfire-rdna/src/dispatch/fused.rs` (L2982-2985 wqkv/wz/wbeta/walpha,
-  L3076-3077 wgate/wup).
-- Summary: `weight_gemv_swiglu_residual` is the down_proj entry point and calls
-  `maybe_capture_activation` ZERO times — it dispatches straight to
-  `gemv_*_residual`, bypassing `weight_gemv`. down_proj's input is the SwiGLU
-  output produced inside that fused path, so nothing ever sees it. The fused
-  gate/up helper taps its two weights; there is no equivalent for w_down
-  anywhere.
-- Evidence: a fresh qwen3.5-0.8b calib (`collect-artifacts --max-tokens 512`)
-  yields 162 hessians / 11 kinds — linear_attn x5, mlp.gate_proj, mlp.up_proj,
-  self_attn x4 — with `mlp.down_proj` absent. That is exactly the tap list
-  above. A known-good calib from 2026-08-06 has 186 / 12 including
-  `mlp.down_proj` x24, so the coverage regressed at some point.
-  NOT caused by batched prefill: forcing the per-token path with
-  `HIPFIRE_PREFILL_BATCHED=0` reproduces the identical 162 / 11.
-- Impact: this is silent. `--ldlq` does not fail on a missing Hessian, it logs
-  `ldlq: skip <t>` and falls back to RTN, so every `oq*++` build is quietly
-  RTN-quantizing its down_proj while reporting success. down_proj is the widest
-  FFN matrix and the one the outlier-budget study found most sensitive. A prior
-  session lost a full invalid 5-config run to exactly this failure mode on a
-  partial calib.
-- Suggested fix: tap the down input inside `weight_gemv_swiglu_residual` (and
-  its batched sibling) where the SwiGLU result is materialised, mirroring the
-  gate/up taps. Then add a coverage assertion to the collector: a dense arch
-  should produce one Hessian per admitted projection per layer, and a shortfall
-  should fail rather than write a partial artefact.
+- Location: `crates/hipfire-rdna/src/dispatch/gemv.rs` `gemv_bf16_xf32`
+  (L4863); gate is `capture_at_weight_gemv_wrapper`
+  (`crates/hipfire-runtime/src/weights.rs` L384).
+- Root cause: `weight_gemv` deliberately SKIPS its tap for BF16 and F16, because
+  those "terminate in capture-aware RDNA entrypoints" and tapping both would
+  double-count. That premise held for F16 (`gemv_f16_xf32` taps at L5648) and
+  for batched BF16 (`gemm_bf16_x_bf16_wmma_labeled` taps), but NOT for BF16 at
+  batch 1: `KernelKey::GemvBf16` routes to `gemv_bf16_xf32`, which tapped
+  nowhere. So the wrapper deferred to a chokepoint that did not exist and the
+  activation was captured by neither.
+  Only down_proj showed the loss because it is the only qwen35 linear that
+  reaches `weight_gemv` at batch 1 in bf16 — via `weight_gemv_swiglu_residual`
+  -> generic `_ =>` tail -> `weight_gemv_residual` -> generic `_ =>` tail. qkv
+  and gate/up are captured by the fused kernels
+  (`dispatch/fused.rs` L2982-2985, L3076-3077); everything else goes batched.
+  Quantized weights were never affected — they keep the wrapper tap.
+- Fix (2026-08-07): one `maybe_capture_activation` in `gemv_bf16_xf32`, matching
+  what `gemv_f16_xf32` has always done. Verified: the same qwen3.5-0.8b calib
+  goes 162 hessians / 11 kinds -> 186 / 12, with `mlp.down_proj` x24 present —
+  +24 is exactly one per layer, and 186/12 matches the known-good 2026-08-06
+  artefact.
+- Evidence that led here: fresh qwen3.5-0.8b calib
+  (`collect_artifacts --max-tokens 512`) yielded 162 / 11 — linear_attn x5,
+  mlp.gate_proj, mlp.up_proj, self_attn x4, `mlp.down_proj` absent. NOT caused
+  by batched prefill: `HIPFIRE_PREFILL_BATCHED=0` reproduced the identical
+  162 / 11, which is what pointed at a dtype-gated tap rather than a path.
+- Impact (historic): silent. `--ldlq` does not fail on a missing Hessian, it
+  logs `ldlq: skip <t>` and falls back to RTN, so any `oq*++` built from a
+  BF16-sourced calib quietly RTN-quantized its down_proj while reporting
+  success. down_proj is the widest FFN matrix and the one the outlier-budget
+  study found most sensitive. **Any bf16-sourced calib artefact predating
+  2026-08-07 is suspect and should be rebuilt.**
+- Still open: the collector has no coverage assertion. A dense arch should
+  produce one Hessian per admitted projection per layer, and a shortfall should
+  fail rather than write a partial artefact — that would have caught this at
+  the point of writing instead of at quantize time.
 - Related: `/srv/hipfire/calib/qwen3.5-{0.8b,2b,4b}.calib.hfq` are a SEPARATE
   and older defect — built 2026-06-27, they carry `kinds=1` (down_proj only,
   the mirror image of this bug). The other 12 shared calibs have 7-13 kinds and
   look sound.
 - Scope: Calibration / quantization quality
-- Confidence: High (root cause read directly from the tap sites; reproduced on
-  both forward paths)
-- Confidence: High
+- Confidence: Confirmed by rebuild (an earlier revision of this entry blamed
+  `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
+  tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
 ## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
 - Category: Correctness / Tooling (hipfire-quantize)
