@@ -14,7 +14,7 @@
 //! The invariant under test is the one the whole design rests on: **a file that
 //! was not proven correct never appears at its final path.**
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -476,5 +476,207 @@ fn adoption_keeps_whichever_partial_got_further() {
         std::fs::metadata(&mine).unwrap().len(),
         9000,
         "a shorter orphan overwrote this run's longer partial"
+    );
+}
+
+// ── the streamed path ───────────────────────────────────────────────────────
+//
+// `fetch_file_streamed` gives up the property the assertions above rest on: a
+// sink has already consumed the bytes by the time the digest is known, so
+// "nothing is committed" cannot be checked at a final path. What replaces it is
+// narrower but is the thing that can actually go wrong here — the sink must end
+// up holding the body **exactly once**. Resume that re-sends a prefix would
+// duplicate; a reset that fails to fire would splice two attempts together.
+
+#[derive(Default)]
+struct Recorder {
+    got: Vec<u8>,
+    resets: usize,
+}
+
+impl hipfire_hub::ByteSink for Recorder {
+    fn chunk(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.got.extend_from_slice(b);
+        Ok(())
+    }
+    fn reset(&mut self) -> std::io::Result<()> {
+        self.got.clear();
+        self.resets += 1;
+        Ok(())
+    }
+}
+
+/// A dropped connection must resume from where it stopped, not re-send a prefix
+/// the sink has already encoded.
+#[tokio::test]
+async fn streamed_dropped_connection_resumes_without_duplicating() {
+    let body = payload(512 * 1024);
+    let sha = sha256_hex(&body);
+    let origin = serve(body.clone(), Fault::DropThenResume(100 * 1024));
+
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: body.len() as u64,
+        sha256: Some(sha),
+        git_oid: None,
+    };
+
+    let mut st = hipfire_hub::StreamProgress::new(&file);
+    let mut sink = Recorder::default();
+
+    let first = hipfire_hub::fetch_file_streamed(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await;
+    assert!(first.is_err(), "the dropped attempt should not have succeeded");
+    let carried = st.consumed();
+    assert!(
+        carried > 0,
+        "progress was discarded, so the retry would restart from zero"
+    );
+
+    hipfire_hub::fetch_file_streamed(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await
+    .expect("resume should complete and verify");
+
+    assert_eq!(sink.resets, 0, "a clean resume must not reset the sink");
+    assert_eq!(
+        sink.got.len(),
+        body.len(),
+        "sink holds {} bytes for a {} byte body — the prefix was duplicated or lost",
+        sink.got.len(),
+        body.len()
+    );
+    assert!(sink.got == body, "resumed bytes differ from the source");
+    assert!(origin.hits.load(Ordering::SeqCst) >= 2);
+}
+
+/// An origin that answers 200 to a Range request must make the sink start over.
+/// Appending the full body onto a partial is how a resume manufactures a file
+/// that is longer than the original and matches nothing.
+#[tokio::test]
+async fn streamed_origin_ignoring_range_restarts_the_sink() {
+    let body = payload(256 * 1024);
+    let sha = sha256_hex(&body);
+    let origin = serve(body.clone(), Fault::IgnoreRange);
+
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: body.len() as u64,
+        sha256: Some(sha),
+        git_oid: None,
+    };
+
+    let mut st = hipfire_hub::StreamProgress::new(&file);
+    let mut sink = Recorder::default();
+
+    // Prime a partial so the retry carries a Range header the origin will ignore.
+    let dropper = serve(body.clone(), Fault::Truncate(64 * 1024));
+    let _ = hipfire_hub::fetch_file_streamed(
+        &dropper.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await;
+    assert!(st.consumed() > 0, "no partial to resume from");
+
+    hipfire_hub::fetch_file_streamed(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await
+    .expect("a full 200 body should still verify");
+
+    assert_eq!(sink.resets, 1, "the sink should have been reset exactly once");
+    assert!(
+        sink.got == body,
+        "sink holds {} bytes for a {} byte body — the ignored Range spliced two attempts",
+        sink.got.len(),
+        body.len()
+    );
+}
+
+/// The digest check must still fire on the streamed path. It cannot prevent the
+/// sink seeing bad bytes, so it has to at least tell the caller to undo them.
+#[tokio::test]
+async fn streamed_wrong_bytes_are_reported_as_a_digest_error() {
+    let real = payload(64 * 1024);
+    let promised = sha256_hex(&payload(32 * 1024)); // digest of different content
+    let origin = serve(real, Fault::WrongBytes);
+
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: 64 * 1024,
+        sha256: Some(promised),
+        git_oid: None,
+    };
+
+    let mut st = hipfire_hub::StreamProgress::new(&file);
+    let mut sink = Recorder::default();
+    let err = hipfire_hub::fetch_file_streamed(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await
+    .expect_err("a body that does not match its digest must be refused");
+
+    assert!(
+        matches!(err, Error::Digest { .. }),
+        "expected a digest mismatch, got {err:?} — the caller keys its rollback on this"
+    );
+}
+
+/// A truncated body must not verify, however well-formed the prefix looked.
+#[tokio::test]
+async fn streamed_truncated_body_does_not_verify() {
+    let body = payload(256 * 1024);
+    let sha = sha256_hex(&body);
+    let origin = serve(body.clone(), Fault::Truncate(90 * 1024));
+
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: body.len() as u64,
+        sha256: Some(sha),
+        git_oid: None,
+    };
+
+    let mut st = hipfire_hub::StreamProgress::new(&file);
+    let mut sink = Recorder::default();
+    let r = hipfire_hub::fetch_file_streamed(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &mut st,
+        &mut sink,
+    )
+    .await;
+    assert!(r.is_err(), "a short body must not be accepted as complete");
+    assert!(
+        sink.got.len() < body.len(),
+        "the sink should hold only what arrived"
     );
 }
