@@ -3916,14 +3916,19 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
+            "oq8" => Some(Self::Oq8),
+            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
+            // MUST stay last: this arm is an unguarded wildcard, so every literal
+            // it precedes becomes unreachable and silently resolves to `None`.
+            // `8b9ee5392` inserted it above the `oq8` arms, which is what made
+            // `--format oq8/oq8+/oq8++` stop resolving at all — 9 red tiny-quant
+            // cells across the stacked-expert MoE families. rustc reported it as
+            // `unreachable_patterns`; the warning was the whole diagnosis.
             _ => match parse_opus_mixed_format(flag) {
                 Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
                 Some(_) => Some(Self::OqPlusCompact),
                 None => None,
             },
-            "oq8" => Some(Self::Oq8),
-            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
-            _ => None,
         }
     }
 }
