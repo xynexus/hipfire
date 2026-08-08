@@ -4351,13 +4351,34 @@ pub fn load_weights(
             lm_info.quant_type
         );
         loaded_bytes += lm_data.len();
-        load_weight_tensor_raw(
-            gpu,
-            lm_info.quant_type,
-            &lm_data,
-            config.vocab_size,
-            config.dim,
-        )?
+        // Bf16Lut3 (qt 49) head, same arm as the tied branch below and for the
+        // same reason: `expand_bf16_index` deliberately leaves head tensors
+        // packed because LUT3 is GPU-decodable, so `load_weight_tensor_raw`
+        // never sees an expanded tensor and rejects qt 49 outright. Without
+        // this an UNTIED model written by our own `--format bf16` (which makes
+        // LUT3 the default head coding) cannot be loaded at all — which is how
+        // Qwen3.5-35B-A3B failed to calibrate.
+        let force_bf16_head = std::env::var("HIPFIRE_QWEN35_BF16_HEAD").as_deref() == Ok("1");
+        if !force_bf16_head && lm_info.quant_type == 49 && config.dim.is_multiple_of(256) {
+            let buf = gpu.upload_raw(&lm_data, &[lm_data.len()])?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::Bf16L3,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        } else {
+            load_weight_tensor_raw(
+                gpu,
+                lm_info.quant_type,
+                &lm_data,
+                config.vocab_size,
+                config.dim,
+            )?
+        }
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
         if let Some((matched_name, mut wt)) = load_weight_tensor_from_slabs(
