@@ -914,6 +914,15 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             eps,
             rotation,
         } => {
+            // `out` is an arch-crate scratch (`x_rot`) sized from a `max(...)`
+            // over config dims, while the write length is `k` — the *next*
+            // linear's input width. The two are decided in different crates, so
+            // check them against each other before the launch: an undersized
+            // scratch here is a silent out-of-bounds device write that surfaces
+            // as a HIP 700 in some later kernel. One host-side compare per
+            // rmsnorm. See `hipfire_runtime::weights::guard_rot_capacity`.
+            out.ensure_capacity(*k, "RmsnormAutomatic out")
+                .map_err(DispatchError::Hip)?;
             if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
@@ -930,6 +939,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 gpu.rotate_quantize_x_mq8(out, *k)
                     .map_err(|e| DispatchError::Hip(e.to_string()))
             } else {
+                // The FWHT path is the only one that writes `x_plain` (the
+                // pre-rotation rmsnorm output), so guard it here rather than
+                // above — callers may pass a placeholder for the other arms.
+                x_plain
+                    .ensure_capacity(*k, "RmsnormAutomatic x_plain")
+                    .map_err(DispatchError::Hip)?;
                 let rotation_family = ROTATION.get_or_init(RotationFamily::new);
                 rotation_family
                     .run(

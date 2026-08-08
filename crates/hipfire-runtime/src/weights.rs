@@ -196,6 +196,27 @@ fn dispatch_err_to_hip(e: hipfire_dispatch::types::DispatchError) -> hip_bridge:
     }
 }
 
+/// Pre-launch capacity guard for the `rotate_x_*` / `fused_rmsnorm_rotate_*`
+/// family. Every one of them writes `k` F32 elements into a caller-supplied
+/// `x_rot` scratch, where `k` comes from the *next linear's* input width and
+/// the scratch was sized by an arch crate from a `max(...)` over config dims.
+/// Nothing else couples those two numbers, so a new writer whose `k` exceeds
+/// the sizing expression produces a silent out-of-bounds device write; the
+/// symptom is a HIP 700 or a stall at some later kernel, with no pointer back
+/// to the undersized buffer.
+///
+/// Turning that into a named error costs one host-side integer compare per
+/// rotation. Upstream `warpfront/hipfire` hit exactly this shape: `x_rot` sized
+/// `max(dim, hidden_dim)` = 2048 while a fused gated-norm rotate wrote the
+/// DeltaNet `v_dim` = 4096, 8 KiB past the end (PR #534 discussion, fixed in
+/// their #538). Our writers all sample `wq`/`wqkv`/`w_gate` (`k == dim`), so
+/// this guard is currently always satisfied — it exists to keep it that way.
+fn guard_rot_capacity(x_rot: &GpuTensor, k: usize, site: &str) -> HipResult<()> {
+    x_rot
+        .ensure_capacity(k, site)
+        .map_err(|m| hip_bridge::HipError::new(0, &m))
+}
+
 /// Pre-flight (no-GPU, no-execute) check: would `weight_gemv` accept this weight
 /// dtype, or refuse it as unsupported? Mirrors `weight_gemv`'s dispatch decision
 /// exactly, so the gate can never pass something the GEMV path then rejects:
@@ -796,6 +817,12 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
             // Math identity: the kernel computes the same rmsnorm into tmp
             // that fused_rmsnorm_rotate_for_mq's fallthrough would have, so
             // overwriting tmp here is fine.
+            guard_rot_capacity(
+                x_rot_scratch,
+                next_linear.k,
+                "fused_rmsnorm_rotate_for_paro x_rot",
+            )?;
+            guard_rot_capacity(tmp, next_linear.k, "fused_rmsnorm_rotate_for_paro tmp")?;
             gpu.fused_rmsnorm_paro4g128t_rotate(
                 &next_linear.buf,
                 x,
@@ -840,6 +867,11 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
             // For Stage A specifically, only MQ4G256 actually emits AWQ
             // sidecars from the quantizer (`--awq` flag), but routing all
             // MQ-family dtypes through the AWQ check is correct + cheap.
+            guard_rot_capacity(
+                x_rot_scratch,
+                sample_weight.k,
+                "fused_rmsnorm_rotate_for_mq x_rot",
+            )?;
             if let Some(awq) = sample_weight.awq_scale.as_ref() {
                 gpu.fused_rmsnorm_rotate_mq_awq(
                     x,
@@ -857,11 +889,17 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
         DType::MQ8G256 => {
             // MQ8 rotate+quantize produces INT8 scratch; can't fuse with rmsnorm the
             // same way. Keep the split path for now.
+            guard_rot_capacity(
+                tmp,
+                sample_weight.k,
+                "fused_rmsnorm_rotate_for_mq tmp (mq8)",
+            )?;
             gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
             gpu.rotate_quantize_x_mq8(tmp, sample_weight.k)?;
             Ok(None)
         }
         _ => {
+            guard_rot_capacity(tmp, sample_weight.k, "fused_rmsnorm_rotate_for_mq tmp")?;
             gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
             Ok(None)
         }
@@ -898,6 +936,7 @@ pub fn rotate_x_for_mq<'a>(
             // linear (callers pass o_proj / out_proj here). For Stage A
             // pre-F2 quants, awq_scale is None on these tensors so the
             // non-AWQ kernel runs — byte-identical to pre-F2 behavior.
+            guard_rot_capacity(x_rot_scratch, sample_weight.k, "rotate_x_for_mq x_rot")?;
             if let Some(awq) = sample_weight.awq_scale.as_ref() {
                 gpu.rotate_x_mq_awq(x, awq, x_rot_scratch, sample_weight.k)?;
             } else {
@@ -931,6 +970,7 @@ pub fn rotate_x_mq_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
+    guard_rot_capacity(x_rot, k, "rotate_x_mq_for x_rot")?;
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.rotate_x_mq_awq(x, awq, x_rot, k)
     } else {
@@ -951,6 +991,7 @@ pub fn rotate_x_mq_128_for(
 ) -> HipResult<()> {
     // NOTE: no AWQ branch for G128. If AWQ support for MQ4G128 is added
     // in a follow-up, mirror the AWQ branch from `rotate_x_mq_for` here.
+    guard_rot_capacity(x_rot, k, "rotate_x_mq_128_for x_rot")?;
     gpu.rotate_x_mq_128(x, x_rot, k)
 }
 

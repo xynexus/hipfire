@@ -496,8 +496,18 @@ pub struct Qwen35Scratch {
     pub repeat_buf: GpuTensor, // [repeat_window]
 
     // MagnumQuant rotation scratch: FWHT(x) shared across Q/K/V (or gate/up, etc).
-    // Sized to max(dim, hidden_dim) — one rotation per batch replaces one per GEMV.
-    pub x_rot: GpuTensor, // [max(dim, hidden_dim)]
+    // One rotation per batch replaces one per GEMV.
+    //
+    // Every writer (`fused_rmsnorm_rotate_for_mq` / `_for_paro`) samples
+    // `wq`/`wqkv`/`w_gate`, so the write length is `dim` today. `v_dim` is in
+    // the max because a DeltaNet-side fused rotate is the one plausible future
+    // writer that is wider than the residual stream, and it is what overran
+    // this exact buffer upstream (warpfront/hipfire#534 → #538: `x_rot` sized
+    // `max(dim, hidden_dim)` = 2048, gated-norm rotate wrote v_dim = 4096).
+    // Costs (v_dim - dim) * 4 B when v_dim wins — 8 KiB on 35B-A3B shapes.
+    // `guard_rot_capacity` / the `RmsnormAutomatic` guard enforce the invariant
+    // at launch; this sizing just keeps them from ever having to fire.
+    pub x_rot: GpuTensor, // [max(dim, hidden_dim, v_dim)]
 
     // Flash attention partials buffer for tile+reduce 2-kernel path.
     // Size: n_heads * max_tiles * (2 + head_dim) floats.
@@ -601,7 +611,7 @@ impl Qwen35Scratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
-            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim).max(v_dim)], DType::F32)?,
 
             // Flash attention partials: enough for max_seq with tile_size=128.
             // n_heads * max_tiles * (2 + head_dim) floats per batched query

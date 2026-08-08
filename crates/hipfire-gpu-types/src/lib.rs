@@ -294,6 +294,37 @@ impl GpuTensor {
         }
     }
 
+    /// Elements of `dtype` the underlying allocation can actually hold.
+    ///
+    /// Reads the buffer, not `shape`: scratch tensors are routinely handed to
+    /// kernels that write a length derived from a *weight* (`w.k`) rather than
+    /// from the tensor's own shape, and views built by `sub_offset` /
+    /// `DeviceBuffer::alias` carry a shape that was computed, not allocated.
+    pub fn capacity_elems(&self) -> usize {
+        self.buf.size() / self.dtype.size().max(1)
+    }
+
+    /// Guard a kernel that is about to write `need` elements into this tensor.
+    ///
+    /// Scratch sizing and kernel write-length live in different files (the
+    /// allocation is a `max(...)` over config dims; the length is whatever the
+    /// next linear's `k` happens to be), so nothing but a check like this
+    /// couples them. When they drift the failure is a silent out-of-bounds
+    /// device write, which surfaces later as a HIP 700 in an unrelated kernel.
+    ///
+    /// `what` names the buffer at the call site so the error points at the
+    /// scratch that is too small rather than at the kernel that overran it.
+    pub fn ensure_capacity(&self, need: usize, what: &str) -> Result<(), String> {
+        let have = self.capacity_elems();
+        if have < need {
+            return Err(format!(
+                "{what}: scratch holds {have} {:?} elements, kernel writes {need}",
+                self.dtype
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
@@ -305,5 +336,50 @@ impl GpuTensor {
             shape: vec![len_elems],
             dtype: self.dtype,
         }
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    /// Host-only tensor with a real byte capacity and a deliberately wrong
+    /// `shape`, to prove `capacity_elems` reads the allocation. `DeviceBuffer`
+    /// has no `Drop`, and nothing here dereferences the pointer.
+    fn fake(bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    std::ptr::dangling_mut::<std::ffi::c_void>(),
+                    bytes,
+                )
+            },
+            shape,
+            dtype,
+        }
+    }
+
+    #[test]
+    fn capacity_comes_from_the_allocation_not_the_shape() {
+        // 2048 f32 allocated, shape lies and claims 8192.
+        let t = fake(2048 * 4, vec![8192], DType::F32);
+        assert_eq!(t.capacity_elems(), 2048);
+        assert_eq!(t.numel(), 8192);
+    }
+
+    #[test]
+    fn exact_fit_is_allowed() {
+        let t = fake(2048 * 4, vec![2048], DType::F32);
+        assert!(t.ensure_capacity(2048, "x_rot").is_ok());
+    }
+
+    /// The warpfront/hipfire#534 shape: `x_rot` sized `max(dim=2048,
+    /// hidden_dim=0)` while a DeltaNet-width writer wants v_dim = 4096.
+    #[test]
+    fn overrun_is_reported_with_both_numbers() {
+        let t = fake(2048 * 4, vec![2048], DType::F32);
+        let err = t.ensure_capacity(4096, "x_rot").unwrap_err();
+        assert!(err.contains("x_rot"), "{err}");
+        assert!(err.contains("2048") && err.contains("4096"), "{err}");
     }
 }
