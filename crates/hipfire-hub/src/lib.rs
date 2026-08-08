@@ -282,6 +282,16 @@ pub trait ByteSink {
     fn chunk(&mut self, bytes: &[u8]) -> std::io::Result<()>;
     /// Discard everything accepted for this file; the transfer restarts at 0.
     fn reset(&mut self) -> std::io::Result<()>;
+    /// Report a transfer event — a resume, a retry — to whatever is rendering
+    /// this fetch.
+    ///
+    /// The default writes to stderr, which is what this module used to do
+    /// directly. A sink drawing a progress bar overrides it so the message can
+    /// be printed *around* the bar: an unsynchronised write to stderr corrupts
+    /// a live bar, and the hub has no way to suspend one it does not own.
+    fn note(&self, msg: &str) {
+        eprintln!("{msg}");
+    }
 }
 
 /// Resume state for a streamed transfer, carried across retry attempts.
@@ -373,11 +383,11 @@ pub async fn fetch_file_streamed(
         st.restart();
         sink.reset()?;
     } else if resuming {
-        eprintln!(
+        sink.note(&format!(
             "hub: resuming {} at {:.2} GB",
             file.path,
             st.consumed as f64 / 1e9
-        );
+        ));
     }
 
     let want = resp
