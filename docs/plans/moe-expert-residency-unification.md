@@ -330,11 +330,23 @@ range validation already exists in the same file — `download_i32_tensor` insid
 `gpu.active_capture`.
 
 So minimax can adopt the shared unit without touching `hipfire-dispatch`'s
-shared pipeline, and **pinned residency needs no forward change at all** — the
-same shape as lfm2moe: register, make resident at load, fill the ptr table once.
-With ~32 experts that is a legitimate configuration rather than a stepping
-stone. Do minimax first; it de-risks the deepseek4 work and is independent of
+shared pipeline. Do minimax first; it de-risks deepseek4 and is independent of
 (a) vs (b).
+
+**It must adopt `LazyLru`, not `PinAll`** — and an earlier draft of this section
+said the opposite, repeating the same error this plan already retracted once.
+minimax packs into ~2 blobs per layer today; per-module `PinAll` across ~32
+experts would be roughly 16× MORE allocations. Packing is what `PinAll` is for,
+and minimax already has it. The reason to move minimax onto the shared unit is
+per-expert admission for microbatching, which is `LazyLru`.
+
+The tell, both times: measuring a migration against `PinAll` for an arch that
+already packs. If an arch packs per layer today, the shared unit only helps it
+when residency is bounded.
+
+That means minimax DOES need a forward change after all — read the routed
+indices back, admit, patch, then dispatch — but it needs it at a seam that
+already exists, rather than a new one carved into shared code.
 
 Two complications specific to minimax, neither present in lfm2moe:
 
