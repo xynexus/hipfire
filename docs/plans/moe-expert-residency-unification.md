@@ -348,6 +348,17 @@ That means minimax DOES need a forward change after all — read the routed
 indices back, admit, patch, then dispatch — but it needs it at a seam that
 already exists, rather than a new one carved into shared code.
 
+**Prerequisite, checked:** minimax keeps ONE representative `WeightTensor` pair
+per layer whose buffer *is* the packed blob, with a comment claiming the forward
+never reads the buffer's extent. That claim holds — every use is either a bare
+`.gpu_dtype` (`forward.rs:234, 377, 520, 839, 921, 1228`) or a pass to
+`rotate_x_mq_for` / `fused_silu_mul_rotate_mq_batched_for` (`:336, :505, :819,
+:913`), which read only `awq_scale` and the dtype. The buffer pointer is never
+dereferenced. So under `LazyLru`, where no single blob exists, the representative
+can become a metadata-only view and per-expert data continues to be reached
+through the pointer table. Without that, the adoption would need a different
+shape entirely.
+
 Two complications specific to minimax, neither present in lfm2moe:
 
 - **EP sharding.** The loader packs only rank-owned experts (`owns()` /
