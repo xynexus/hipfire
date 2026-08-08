@@ -231,6 +231,15 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    CALIB_SEQ_LEN = "HIPFIRE_CALIB_SEQ_LEN", Developer,
+        "Split the calibration token stream into independent sequences of this \
+         length instead of one long sequence. Attention is O(seq²), so a single \
+         long sequence makes capture superlinear in the token budget (8192 -> \
+         32768 tokens measured 747s -> 10659s). A Hessian is a sum of per-row \
+         outer products and does not care whether rows came from one context or \
+         many, and KLD references are built at n_ctx=2048, so 2048 matches the \
+         evaluation distribution. Unset keeps the single-sequence behaviour.";
+
     LDLQ_SKIP_EXPERT_LEAVES = "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", Developer,
         "Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose \
          tensors skip `--ldlq` even when the calibration carries a Hessian for \

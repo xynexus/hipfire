@@ -251,6 +251,44 @@ Two follow-ups would discriminate, neither run: (a) a min-rows guard — if
 blowups persist, starvation is exonerated for good; (b) much heavier damping on
 expert `down_proj` — if blowups vanish, over-commitment is confirmed.
 
+## Q6 — the O(n²) capture was self-inflicted: split the sequence, get 10x
+
+Q5 found the budget to be the largest lever but the capture superlinear, which
+capped it. The cause was structural, not fundamental: the resident calibration
+ran the whole budget as ONE sequence, and attention is O(seq²).
+
+A Hessian is a sum of per-row outer products — it does not care whether the
+rows came from one context or many. And KLD references are built at
+`n_ctx=2048`, so shorter calibration sequences match the evaluation
+distribution rather than diverge from it. `HIPFIRE_CALIB_SEQ_LEN=2048` splits
+the stream into independent sequences.
+
+Same 32768 tokens, same blocklist, same everything else:
+
+| capture | wall | hessians | imatrix | experts covered |
+|---|---|---|---|---|
+| one 32768 sequence | **10746 s** | 978 | 1595 | 617 |
+| 16 x 2048 | **1065 s** | 985 | 1609 | **624** |
+
+**10.1x faster**, and it captures slightly MORE — 16 independent contexts route
+more diversely than one continuous document. Row distributions are
+statistically identical (p50 1874 vs 1880, p25 994 vs 972, top-decile share
+28.4% vs 28.6%).
+
+Quality is equivalent, and the budget win survives intact:
+
+- one-32k-sequence vs 16x2048: **−0.77%, 95% CI [−3.40%, +1.87%]** — no
+  resolved difference, which is the desired outcome.
+- pooled @8k vs pooled @32k-split: **−13.59%, 95% CI [−18.74%, −8.44%]**,
+  t = −5.17.
+
+So the −13.6% quality gain is available for 1065 s of capture instead of
+10746 s. This removes the ceiling Q5 hit: 128k tokens becomes ~70 min rather
+than ~40 h.
+
+Implemented for zaya (`arch-zaya/src/calibration.rs`); every arch's resident
+calibration has the same single-sequence shape and can adopt the same loop.
+
 ## What to build, if anything
 
 - **`gate_up`: layer-pooled Hessian.** Q1 says pooling costs little
@@ -274,9 +312,10 @@ reduction tiles across model microbatches", and `CapturePolicy` already has a
 
 Settled by measurement:
 
-- **Raise the calibration token budget first.** It is the largest lever found:
-  −12.92% KLD for 4x the tokens, versus −3.09% for the best Hessian-scoping
-  change. Budget it against the O(n²) capture cost.
+- **Raise the calibration token budget first, with `HIPFIRE_CALIB_SEQ_LEN=2048`.**
+  It is the largest lever found: −13.59% KLD for 4x the tokens, versus −3.09%
+  for the best Hessian-scoping change — and with the sequence split it costs
+  1065 s rather than 10746 s, so the old O(n²) objection is gone.
 - **Ship pooled `gate_up`** (`HIPFIRE_POOLED_EXPERT_HESSIAN=1`). −3.09% KLD,
   CI excludes zero, costs nothing to store and needs no new capture.
 - **Do NOT enable per-expert `down_proj`.** At 8k it bought −0.22% (CI spans
@@ -289,8 +328,10 @@ Settled by measurement:
 Open, in rough order of value:
 
 1. **Push the token budget further on the pooled arm**, which is where the
-   measured wins are. Needs the O(n²) capture cost addressed — chunked or
-   multi-sample capture rather than one long sequence.
+   measured wins are. Now affordable (Q6): 128k tokens is ~70 min. Unknown
+   whether the budget lever keeps paying past 32k or saturates.
+   Port `HIPFIRE_CALIB_SEQ_LEN` to the other arches' resident calibration —
+   they all share the single-sequence shape.
 2. **Generalise the pooled donor beyond zaya.** The principled donor is the
    ROUTER (`mlp.gate`), which by construction consumes the FFN input — already
    first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.

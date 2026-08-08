@@ -384,6 +384,13 @@ pub const ENV_HIPFIRE_CALIB_PROFILE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/triattn_validate.rs:60",
 };
 
+/// `HIPFIRE_CALIB_SEQ_LEN` — Split the calibration token stream into independent sequences of this length instead of one long sequence. Attention is O(seq²), so a single long sequence makes capture superlinear in the token budget (8192 -> 32768 tokens measured 747s -> 10659s). A Hessian is a sum of per-row outer products and does not care whether rows came from one context or many, and KLD references are built at n_ctx=2048, so 2048 matches the evaluation distribution. Unset keeps the single-sequence behaviour.
+pub const ENV_HIPFIRE_CALIB_SEQ_LEN: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_CALIB_SEQ_LEN",
+    description: "Split the calibration token stream into independent sequences of this length instead of one long sequence. Attention is O(seq²), so a single long sequence makes capture superlinear in the token budget (8192 -> 32768 tokens measured 747s -> 10659s). A Hessian is a sum of per-row outer products and does not care whether rows came from one context or many, and KLD references are built at n_ctx=2048, so 2048 matches the evaluation distribution. Unset keeps the single-sequence behaviour.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_CASK_OFF` — Enabled when set to 1
 pub const ENV_HIPFIRE_CASK_OFF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CASK_OFF",
@@ -5453,6 +5460,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_CALIB_HESSIAN_STORAGE,
     ENV_HIPFIRE_CALIB_IMATRIX_ONLY,
     ENV_HIPFIRE_CALIB_PROFILE,
+    ENV_HIPFIRE_CALIB_SEQ_LEN,
     ENV_HIPFIRE_CASK_OFF,
     ENV_HIPFIRE_CHATML,
     ENV_HIPFIRE_CHAT_TEMPLATE_FILE,
