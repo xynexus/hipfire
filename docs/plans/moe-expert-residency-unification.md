@@ -181,15 +181,34 @@ Fixed by ordering: `oq8` arms moved above the wildcard, with a comment pinning
 why the wildcard must stay last. Result — deepseek4, deepseek4_compressed and
 lfm2_moe fully green; whole-gate failures 14 → 7.
 
-**The fix also unmasked minimax.** Its `oq8`/`oq8+` cells were passing only
-because the quantizer was not producing OQ8 at all; with OQ8 restored, minimax
-shows its true 7 failing Opus cells — the exact numbers recorded as an inherited
-breakage in `2026-08-05-opus-across-model-families.md:82-93` (oq4 0.003531,
-oq8 0.000259). That earlier note's scoping table predicted this shape:
-honouring `SourcePrecision` across all formats regressed minimax by "oq8 37x,
-oq4 2.7x", and 0.003531/0.001294 = 2.7x. **minimax remains the one family this
-plan cannot use as an oracle**; scope with `HIPFIRE_TINYQUANT_FAMILIES` to
-exclude it until that cause is found.
+**The fix also unmasked minimax**, whose `oq8`/`oq8+` cells had been passing only
+because the quantizer was not producing OQ8 at all. With OQ8 restored it showed
+its true 7 failing Opus cells — the numbers recorded as an inherited breakage in
+`2026-08-05-opus-across-model-families.md:82-93`.
+
+**That is also fixed now.** Bisecting minimax separately (its baselines date from
+`753df2b27`, 421 commits back) named `1fa0f04dd`, which defaulted LUT3 heads to
+stay resident and taught six loaders to decode packed tensors — minimax not among
+them. It uploaded packed head bytes tagged as a logical dtype, which only a
+batch-1 GEMV can read, so it was wrong at prefill, and KLD scores through
+prefill. Confirmed by A/B: `HIPFIRE_BF16L3_RESIDENT=0` made all 7 pass on
+unmodified master. Both minimax head sites now decode, mirroring
+`transformer_loader`.
+
+**Phase 0 exit state.** `tiny-quant` passes across all 17 selected families.
+`tiny-state` is 8 failures, verified present on pristine `origin/master` with
+identical observed hashes and all in `fp16` cells (gemma3, gemma3_vl,
+gemma4_dense, gemma4_moe, gemma4_ple, qwen3_5, qwen3_5_moe, qwen3_5_vl) — the
+un-re-recorded drift `1fa0f04dd` already called "the pre-existing baseline 8".
+Every family this plan uses as an oracle is green in both gates, minimax
+included.
+
+**Carry-forward risk for this plan.** deepseek4, lfm2moe, llama, nemotron and
+embeddinggemma read tensors themselves and have no packed-decode arm either.
+They pass only because the recoding applies to plain-BF16 gather-shaped tensors
+that actually get smaller, so their fixtures never hand them a `qt=49`. Phase 2
+touches lfm2moe and Phase 3 touches deepseek4 — if either starts failing on a
+head tensor, check this before suspecting the residency work.
 
 **Phase 1 — `ResidencyPolicy::PinAll`.** Add the policy to `PagerConfig`, wire
 `PinAll` through `ensure_expert_module_resident` / `evict_lru_until`. qwen35
