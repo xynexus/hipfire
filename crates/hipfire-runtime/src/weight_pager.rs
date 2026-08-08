@@ -677,6 +677,19 @@ fn module_tensors_in_role_order(
         })?;
         out.push((role, tensor));
     }
+    // A module may spell gate_up one way or the other, never both. With both,
+    // the role ordering puts the fused tensor first and the split halves after,
+    // so the fused pointer would be silently overwritten by the gate half and
+    // the length would span only the halves — a plausible-looking region that is
+    // not the matrix anyone meant. Refuse instead.
+    let has = |want| out.iter().any(|(role, _)| *role == want);
+    if has(ModuleRole::GateUp) && (has(ModuleRole::GateUpLow) || has(ModuleRole::GateUpHigh)) {
+        return Err(WeightPagerError::InvalidModule(format!(
+            "module {} carries both a fused gate_up_proj and split w1/w3; \
+             exactly one spelling is allowed",
+            module.module_id
+        )));
+    }
     // Stable by role, then by on-disk position so a repeated role is
     // deterministic rather than dependent on the record's vector order.
     out.sort_by_key(|(role, tensor)| (*role, tensor.rel_offset));
@@ -2303,6 +2316,31 @@ mod tests {
         assert_eq!(prepared.gate_up_rel, 0);
         assert_eq!(&prepared.bytes[..len], &w1[..], "gate half must come first");
         assert_eq!(&prepared.bytes[len..2 * len], &w3[..]);
+    }
+
+    /// A module cannot spell gate_up both ways. Role ordering puts the fused
+    /// tensor first and the split halves after it, so accepting both would
+    /// overwrite the fused pointer with the gate half and give a length spanning
+    /// only the halves — a region that looks plausible and is not the matrix
+    /// anyone meant.
+    #[test]
+    fn a_module_cannot_carry_both_gate_up_spellings() {
+        let mut module = split_gate_up_module(0, 64, 128, 64, 192);
+        module.tensors.push(HfqModuleTensor {
+            name: "model.layers.0.feed_forward.experts.0.gate_up_proj.weight".to_string(),
+            quant_type: 3,
+            shape: vec![1, 128],
+            group_size: 0,
+            rel_offset: 192,
+            data_size: 128,
+        });
+        match module_resident_len(&module) {
+            Err(WeightPagerError::InvalidModule(msg)) => {
+                assert!(msg.contains("both"), "{msg}");
+                assert!(msg.contains("w1/w3"), "{msg}");
+            }
+            other => panic!("expected InvalidModule, got {other:?}"),
+        }
     }
 
     /// A module with no recognizable role is a malformed artifact, and saying so
