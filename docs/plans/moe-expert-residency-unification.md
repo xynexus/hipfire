@@ -319,6 +319,36 @@ the documented design should know it is aspirational.
 Decide (a) vs (b) before writing code. That is a hot-path structure choice, not
 a detail.
 
+### minimax does NOT need that decision — sequence it first
+
+minimax's forward is already split at the seam deepseek4 lacks:
+`gpu.deepseek4_moe_topk_bias_aware_f32` is a standalone select launch writing
+`state.topk_indices` (`forward.rs:349`), and the indexed GEMV consumes the
+pointer tables in separate calls (`:381`, `:392`). A host readback with
+range validation already exists in the same file — `download_i32_tensor` inside
+`maybe_capture_moe_gate_up_inputs` (`:71-95`), today gated behind
+`gpu.active_capture`.
+
+So minimax can adopt the shared unit without touching `hipfire-dispatch`'s
+shared pipeline, and **pinned residency needs no forward change at all** — the
+same shape as lfm2moe: register, make resident at load, fill the ptr table once.
+With ~32 experts that is a legitimate configuration rather than a stepping
+stone. Do minimax first; it de-risks the deepseek4 work and is independent of
+(a) vs (b).
+
+Two complications specific to minimax, neither present in lfm2moe:
+
+- **EP sharding.** The loader packs only rank-owned experts (`owns()` /
+  `local_of_global`), reading non-owned tensors purely to validate stride and
+  then dropping them — that is the EP memory win. A pager adoption must register
+  only owned modules and keep the non-owned pointer policy intact. This is the
+  "load-bearing correctness, not an optimization" case from Risks: a wrong
+  pointer here is silent numerical corruption, not a crash.
+- **LQER low-rank sidecars** (`gate_acc` / `up_acc` / `down_acc`) accumulate per
+  expert into separate tensors. They are independent of the expert blob and
+  should stay where they are, but the adoption has to keep pushing them for
+  owned experts only.
+
 **The role-rank half of this phase is dropped.** It existed to give `w1`/`w3`/
 `w2` deterministic ordering *within* a module so the fused pair would be
 adjacent. Phase 2a solved that at the pager, by role, independent of on-disk
