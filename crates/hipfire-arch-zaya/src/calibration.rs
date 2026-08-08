@@ -56,40 +56,26 @@ pub fn collect_calibration_artifacts(
         vec![".experts.".to_string()],
         output,
         &static_meta,
-        |gpu| {
-            // Attention is O(seq²), so ONE long calibration sequence makes the
-            // capture superlinear in the token budget: 8192 -> 32768 tokens
-            // measured 747s -> 10659s, 14.3x for 4x the tokens. Splitting the
-            // stream into independent sequences makes it linear, and the
-            // Hessian is a sum of per-row outer products, so it does not care
-            // whether the rows came from one context or many. The KLD
-            // reference is built at n_ctx=2048 anyway, so shorter calibration
-            // sequences match the evaluation distribution rather than diverge
-            // from it. Unset keeps the historical single-sequence behaviour.
-            let seq_len = hipfire_env::CALIB_SEQ_LEN
-                .parse::<usize>()
-                .filter(|n| *n >= 2)
-                .unwrap_or(tokens.len().max(2));
+        &[tokens],
+        |gpu, sequences| {
+            // Each sequence is an independent context: `gpu_forward_calib`
+            // sizes all of its state from `ids.len()`, so a fresh call IS the
+            // reset. The seam chose the split (see `calib_sequences`).
             let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-            let n_seq = tokens.len().div_ceil(seq_len);
-            for (i, chunk) in tokens.chunks(seq_len).enumerate() {
-                // A 1-token sequence has no next-token target and would only
-                // contribute a degenerate row.
-                if chunk.len() < 2 {
-                    continue;
-                }
-                if n_seq > 1 {
+            for (i, seq) in sequences.iter().enumerate() {
+                if sequences.len() > 1 {
                     eprintln!(
-                        "  calib sequence {}/{n_seq} ({} tokens)",
+                        "  calib sequence {}/{} ({} tokens)",
                         i + 1,
-                        chunk.len()
+                        sequences.len(),
+                        seq.len()
                     );
                 }
                 kldref.extend(gpu_forward_calib(
                     gpu,
                     weights,
                     config,
-                    chunk,
+                    seq,
                     opts.kldref.then_some(opts.kldref_topk),
                 )?);
             }

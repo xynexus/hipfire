@@ -4044,7 +4044,12 @@ fn collect_calibration_artifacts_sequences(
         vec![".experts.".to_string()],
         output,
         provenance,
-        |gpu| {
+        sequences,
+        // Shadows the caller's `sequences` with the seam-split view: qwen35
+        // already builds a fresh KV + DeltaNet state per sequence and restarts
+        // positions at 0, so re-splitting a long sample just yields more of the
+        // independent contexts this loop already handles correctly.
+        |gpu, sequences| {
             if is_moe {
                 reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
             }

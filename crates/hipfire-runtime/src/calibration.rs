@@ -37,6 +37,51 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
+/// Split a calibration token stream into independent sequences, per
+/// `HIPFIRE_CALIB_SEQ_LEN`. This is the chunking POLICY, owned by the shared
+/// seam so no arch can accidentally calibrate under one unbounded context.
+///
+/// Every arch's resident calibration used to consume the whole token budget as
+/// a single growing context — zaya as one long sequence, and nemotron/minimax/
+/// lfm2moe as a per-token decode loop with `pos` running to the end and state
+/// reset only once at the start. Both shapes make attention cost accumulate as
+/// O(n²) in the budget, and both calibrate under a context far longer than the
+/// one being served (KLD references are built at `n_ctx=2048`). Splitting fixes
+/// the cost and the mismatch at once: a Hessian is a sum of per-row outer
+/// products, so it does not care which context a row came from. Measured on
+/// zaya1-8b at 32768 tokens: 10746 s → 1065 s, quality unchanged
+/// (`docs/quant-formats/moe-expert-hessians.md`, Q6).
+///
+/// Unset yields a single sequence, the historical behaviour.
+///
+/// The ARCH still owns what "independent" means for it — resetting KV, SSM or
+/// recurrent state between sequences, and restarting positions at 0.
+/// Takes the arch's natural sequences — one flat stream for the corpus-driven
+/// arches, or a sample set for those that already have one — and re-splits each
+/// to at most `HIPFIRE_CALIB_SEQ_LEN`. Unset leaves them untouched.
+pub fn calib_sequences<'a>(inputs: &[&'a [u32]]) -> Vec<&'a [u32]> {
+    let seq_len = hipfire_env::CALIB_SEQ_LEN
+        .parse::<usize>()
+        .filter(|n| *n >= 2)
+        .unwrap_or(usize::MAX);
+    let n_in: usize = inputs.iter().map(|s| s.len()).sum();
+    // A 1-token sequence has no next-token target and contributes only a
+    // degenerate row, so drop a trailing remainder of one.
+    let seqs: Vec<&'a [u32]> = inputs
+        .iter()
+        .flat_map(|s| s.chunks(seq_len).filter(|c| c.len() >= 2))
+        .collect();
+    if seqs.len() > inputs.len() {
+        eprintln!(
+            "  calib: {n_in} tokens as {} independent sequences of <= {seq_len} \
+             (was {})",
+            seqs.len(),
+            inputs.len()
+        );
+    }
+    seqs
+}
+
 /// Refuse to calibrate on the frozen evaluation slice.
 ///
 /// `benchmarks/quality-baselines/slice/` is "the frozen prompt bytes used by
@@ -1459,16 +1504,22 @@ pub fn collect<F>(
     imatrix_only: Vec<String>,
     output: &std::path::Path,
     static_meta: &[(&str, serde_json::Value)],
+    sequences: &[&[u32]],
     forward: F,
 ) -> Result<CalibSummary, String>
 where
-    F: FnOnce(&mut Gpu) -> Result<CalibForward, String>,
+    F: FnOnce(&mut Gpu, &[&[u32]]) -> Result<CalibForward, String>,
 {
     let collector = arm(gpu, capture_names, imatrix_only);
 
+    // The seam owns the chunking policy, so no arch can silently calibrate
+    // under one unbounded context. The arch owns what "independent" means for
+    // it — resetting KV / SSM / recurrent state and restarting positions at 0.
+    let sequences = calib_sequences(sequences);
+
     // Run the arch forward, then ALWAYS disarm the capture before propagating
     // any error (a half-armed `gpu` would mis-capture a later forward).
-    let forward_out = forward(gpu);
+    let forward_out = forward(gpu, &sequences);
     disarm(gpu);
     let forward_out = forward_out?;
 

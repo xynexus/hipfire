@@ -11,7 +11,6 @@ hipfire-model = { path = "../hipfire-model" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
-hipfire-env = { path = "../hipfire-env" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hip-bridge = { path = "../hip-bridge" }
 serde.workspace = true

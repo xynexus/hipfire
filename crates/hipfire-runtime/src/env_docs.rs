@@ -367,14 +367,14 @@ pub const ENV_HIPFIRE_CALIB_ALLOW_EVAL_CORPUS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_CALIB_F64_AUDIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_F64_AUDIT",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/src/calibration.rs:206",
+    source: "crates/hipfire-runtime/src/calibration.rs:251",
 };
 
 /// `HIPFIRE_CALIB_HESSIAN_STORAGE` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_CALIB_HESSIAN_STORAGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_CALIB_HESSIAN_STORAGE",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/calibration.rs:107",
+    source: "crates/hipfire-runtime/src/calibration.rs:152",
 };
 
 /// `HIPFIRE_CALIB_IMATRIX_ONLY` — Comma-separated substrings whose tensors capture only an imatrix (diagonal) rather than a full [K,K] Hessian, overriding the arch default of `.experts.`. Empty string captures a full Hessian for everything. `.gate_up_proj` blocks the expensive K=hidden expert gate/up (which pools instead) while capturing per-expert `down_proj`, whose K is the MoE intermediate width and so stays affordable. Raises GPU residency during capture — one [K,K] f32 per captured tensor. See `docs/quant-formats/moe-expert-hessians.md`.
@@ -2056,7 +2056,7 @@ pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4221",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4226",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
@@ -3905,7 +3905,7 @@ pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_BF16_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_BF16_HEAD",
     description: "HIPFIRE_QWEN35_BF16_HEAD=1 forces the plain-BF16 head back for",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4419",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4424",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH` — Defaults to auto when unset
@@ -3957,7 +3957,7 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
     description:
         "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4550",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4555",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values
@@ -4069,7 +4069,7 @@ pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS",
     description: "Imatrix storage is small enough to capture all layers in one pass. The",
-    source: "crates/hipfire-runtime/src/calibration.rs:1041",
+    source: "crates/hipfire-runtime/src/calibration.rs:1086",
 };
 
 /// `HIPFIRE_QWEN3_LAYER_TRACE` — Runtime variable controlling qwen3 layer trace in hipfire
