@@ -844,6 +844,31 @@ impl Drop for AlignedHostBuffer {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// What the pager does with a registered module once it is resident.
+///
+/// The two policies share one mechanism. `ensure_expert_module_resident`
+/// already allocates ONE owning buffer per module and addresses each tensor
+/// inside it by `rel_offset` — that is packing. Whether the pager may later
+/// hand that buffer back is the only difference, so hand-rolled per-layer
+/// packing is [`PinAll`](ResidencyPolicy::PinAll): paging at 100% residency.
+///
+/// This is why an arch picks a policy instead of writing a loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidencyPolicy {
+    /// Admit on demand, evict least-recently-used against `vram_budget_bytes`.
+    /// The historical behavior and the default.
+    LazyLru,
+    /// Every module that becomes resident stays resident for the model's
+    /// lifetime. Nothing is evicted, so pointers handed to a kernel stay valid
+    /// without re-patching, and the ptr table can be written once at load.
+    ///
+    /// Deliberately fails closed: a `PinAll` pager that cannot fit the working
+    /// set returns [`WeightPagerError::PinnedBudgetExceeded`] rather than
+    /// quietly evicting. Silently degrading into an LRU nobody asked for turns
+    /// a sizing mistake into a latency mystery.
+    PinAll,
+}
+
 /// Construction-time config. Keep this small and explicit — runtime flags
 /// belong on `Qwen35Config`, not here.
 #[derive(Debug, Clone)]
@@ -856,6 +881,8 @@ pub struct PagerConfig {
     /// If true, the pager prints structured residency events to stderr.
     /// Disabled by default; useful when debugging eviction policy.
     pub trace: bool,
+    /// Whether residency is evictable. See [`ResidencyPolicy`].
+    pub policy: ResidencyPolicy,
 }
 
 impl Default for PagerConfig {
@@ -863,6 +890,20 @@ impl Default for PagerConfig {
         Self {
             vram_budget_bytes: u64::MAX,
             trace: false,
+            policy: ResidencyPolicy::LazyLru,
+        }
+    }
+}
+
+impl PagerConfig {
+    /// Pin every module for the model's lifetime, with no byte budget. The
+    /// packing configuration: one owning allocation per module, no eviction,
+    /// no per-token admission.
+    pub fn pinned() -> Self {
+        Self {
+            vram_budget_bytes: u64::MAX,
+            trace: false,
+            policy: ResidencyPolicy::PinAll,
         }
     }
 }
@@ -1353,6 +1394,10 @@ impl WeightPager {
         need_bytes: u64,
         gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
+        // Pinned residency never evicts. Refusing here rather than at each call
+        // site means no future caller can silently turn a PinAll pager back
+        // into an LRU one.
+        self.may_evict(need_bytes)?;
         // Reject up front when the requested weight is alone bigger than
         // the budget. Without this guard, `target_used` saturates to 0 and
         // the loop drains the residency map without erroring.
@@ -1500,6 +1545,28 @@ impl WeightPager {
         }
         Ok(())
     }
+
+    /// Whether this pager is allowed to evict at all. `Err` under
+    /// [`ResidencyPolicy::PinAll`], which is how pinned residency fails closed
+    /// instead of degrading into an LRU.
+    ///
+    /// Split out of `evict_lru_until` for the same reason as `would_fit`: the
+    /// decision is pure, so unit tests can exercise it without a real `Gpu`.
+    pub fn may_evict(&self, need_bytes: u64) -> Result<(), WeightPagerError> {
+        if self.config.policy == ResidencyPolicy::PinAll {
+            return Err(WeightPagerError::PinnedBudgetExceeded {
+                need_bytes,
+                in_use: self.vram_used_bytes,
+                budget: self.config.vram_budget_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// The configured residency policy.
+    pub fn policy(&self) -> ResidencyPolicy {
+        self.config.policy
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1583,15 @@ pub enum WeightPagerError {
     InvalidModule(String),
     /// Hipfire HIP error (transfer / alloc failed).
     Hip(hip_bridge::HipError),
+    /// A [`ResidencyPolicy::PinAll`] pager was asked to make room. Pinned
+    /// residency never evicts, so this is a sizing error the caller must fix
+    /// (smaller working set, larger budget, or `LazyLru`) rather than
+    /// something the pager can absorb by dropping a module.
+    PinnedBudgetExceeded {
+        need_bytes: u64,
+        in_use: u64,
+        budget: u64,
+    },
     /// Eviction couldn't free enough room — budget too small for the
     /// requested weight. User needs to raise `vram_budget_bytes` or
     /// reduce the working set somehow.
@@ -1539,6 +1615,16 @@ impl std::fmt::Display for WeightPagerError {
             ),
             Self::InvalidModule(msg) => write!(f, "invalid expert module: {msg}"),
             Self::Hip(e) => write!(f, "hip error: {e}"),
+            Self::PinnedBudgetExceeded {
+                need_bytes,
+                in_use,
+                budget,
+            } => write!(
+                f,
+                "weight pager: pinned residency cannot make room for {need_bytes} \
+                 bytes (in_use={in_use}, budget={budget}); PinAll never evicts — \
+                 raise vram_budget_bytes, shrink the working set, or use LazyLru"
+            ),
             Self::BudgetExhausted {
                 need_bytes,
                 in_use,
@@ -1824,7 +1910,7 @@ mod tests {
             &path,
             PagerConfig {
                 vram_budget_bytes: 100,
-                trace: false,
+                ..PagerConfig::default()
             },
         )
         .unwrap();
@@ -1860,6 +1946,84 @@ mod tests {
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         // Default is u64::MAX; even u64::MAX - 1 fits.
         assert!(pager.would_fit(u64::MAX - 1).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn scratch_pager(tag: &str, config: PagerConfig) -> (WeightPager, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("hipfire-pager-{tag}-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let pager = WeightPager::with_pread_transport(&path, config).unwrap();
+        (pager, path)
+    }
+
+    /// The default must stay `LazyLru`: every existing caller built
+    /// `PagerConfig` before the policy existed, and paged experts depends on
+    /// eviction actually happening.
+    #[test]
+    fn default_policy_is_lazy_lru_and_may_evict() {
+        let (pager, path) = scratch_pager("policy-default", PagerConfig::default());
+        assert_eq!(pager.policy(), ResidencyPolicy::LazyLru);
+        assert!(pager.may_evict(1024).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PinAll fails closed. The alternative — evicting anyway — turns a sizing
+    /// mistake into an intermittent latency problem with no error to search for.
+    #[test]
+    fn pinned_refuses_to_evict_with_a_named_error() {
+        let (pager, path) = scratch_pager("policy-pinned", PagerConfig::pinned());
+        assert_eq!(pager.policy(), ResidencyPolicy::PinAll);
+        match pager.may_evict(4096) {
+            Err(WeightPagerError::PinnedBudgetExceeded {
+                need_bytes,
+                in_use,
+                budget,
+            }) => {
+                assert_eq!(need_bytes, 4096);
+                assert_eq!(in_use, 0);
+                assert_eq!(budget, u64::MAX);
+            }
+            other => panic!("expected PinnedBudgetExceeded, got {other:?}"),
+        }
+        // The message must name the policy, not just the numbers — this error
+        // reaches a user who has to decide between resizing and LazyLru.
+        let msg = pager.may_evict(4096).unwrap_err().to_string();
+        assert!(msg.contains("PinAll"), "{msg}");
+        assert!(msg.contains("LazyLru"), "{msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `pinned()` is the packing configuration: pin everything, no byte cap.
+    /// A budget would reintroduce the failure mode PinAll exists to avoid.
+    #[test]
+    fn pinned_constructor_has_no_budget() {
+        let cfg = PagerConfig::pinned();
+        assert_eq!(cfg.policy, ResidencyPolicy::PinAll);
+        assert_eq!(cfg.vram_budget_bytes, u64::MAX);
+    }
+
+    /// A pinned pager with an explicit budget still refuses to evict rather
+    /// than reporting the budget error: the policy decision comes first, so the
+    /// message tells the caller what to change.
+    #[test]
+    fn pinned_policy_outranks_the_budget_error() {
+        let (pager, path) = scratch_pager(
+            "policy-pinned-budget",
+            PagerConfig {
+                vram_budget_bytes: 100,
+                policy: ResidencyPolicy::PinAll,
+                ..PagerConfig::default()
+            },
+        );
+        // 1000 > budget 100, so LazyLru would say BudgetExhausted here.
+        assert!(matches!(
+            pager.may_evict(1000),
+            Err(WeightPagerError::PinnedBudgetExceeded { .. })
+        ));
         let _ = std::fs::remove_file(&path);
     }
 }

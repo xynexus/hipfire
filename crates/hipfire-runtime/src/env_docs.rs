@@ -2631,7 +2631,7 @@ pub const ENV_HIPFIRE_LM_HEAD_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LOAD_TRANSPORT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LOAD_TRANSPORT",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/weight_pager.rs:1006",
+    source: "crates/hipfire-runtime/src/weight_pager.rs:1047",
 };
 
 /// `HIPFIRE_LOCAL` — Force local-spawn behavior and skip serve HTTP in documented workflows
@@ -3923,11 +3923,10 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_MB: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:196",
 };
 
-/// `HIPFIRE_QWEN35_EXPERT_CACHE_TRACE` — Interprets "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE" from environment to select behavior
+/// `HIPFIRE_QWEN35_EXPERT_CACHE_TRACE` — Paged experts is the whole point of this branch: admit on
 pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
-    description:
-        "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
+    description: "Paged experts is the whole point of this branch: admit on",
     source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4393",
 };
 

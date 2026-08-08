@@ -4395,6 +4395,9 @@ pub fn load_weights(
                         .as_deref(),
                     Some("1" | "true" | "on" | "yes")
                 ),
+                // Paged experts is the whole point of this branch: admit on
+                // demand and evict against the budget.
+                policy: hipfire_runtime::weight_pager::ResidencyPolicy::LazyLru,
             },
         )
         .map_err(|e| HipError::new(0, &format!("open expert module pager: {e}")))?;
