@@ -1119,11 +1119,16 @@ fn load_moe_experts_paged(
 ) -> Result<Ffn, String> {
     use hipfire_runtime::weight_pager::ExpertModuleKey;
 
+    // Shaped exactly like `upload_wt_raw`'s result — same `shape`, same
+    // `buf.dtype`, same `gpu_dtype` — so the only difference between the two
+    // paths is who owns the allocation. Nothing reads `buf.dtype` today
+    // (dispatch goes through `gpu_dtype`), but a view that diverges from the
+    // thing it replaces is a trap for whoever reads it first.
     let view = |ptr: u64, len: usize, dtype: DType, m: usize, k: usize| WeightTensor {
         buf: GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, len) },
             shape: vec![len],
-            dtype: DType::Raw,
+            dtype,
         },
         gpu_dtype: dtype,
         m,
@@ -1145,10 +1150,20 @@ fn load_moe_experts_paged(
         let ptrs = pager
             .expert_module_ptrs(key)
             .ok_or_else(|| format!("lfm2moe: L{layer}E{e} resident but has no pointers"))?;
-        // Both projections share the module's quant_type in every artifact this
-        // path accepts; read it from w1 and validate w2 against it.
-        let (qt_gu, _) = read_tensor(hfq, &format!("{p}.feed_forward.experts.{e}.w1.weight"))?;
-        let (qt_dn, _) = read_tensor(hfq, &format!("{p}.feed_forward.experts.{e}.w2.weight"))?;
+        // Metadata only. `read_tensor` would pull the WHOLE tensor off disk and
+        // allocate it just to hand back a u8 — the same bytes the pager is
+        // already streaming for this module, read a second time per expert and
+        // thrown away.
+        let qt_of = |suffix: &str| -> Result<u8, String> {
+            let name = format!("{p}.feed_forward.experts.{e}.{suffix}.weight");
+            hfq.find_tensor_info(&name)
+                .map(|i| i.quant_type)
+                .ok_or_else(|| format!("lfm2moe: tensor not found in HFQ: {name}"))
+        };
+        // Each projection carries its own quant_type; they are read separately
+        // rather than assuming the pair matches.
+        let qt_gu = qt_of("w1")?;
+        let qt_dn = qt_of("w2")?;
         let mut gate_up = view(
             ptrs.gate_up_ptr,
             ptrs.gate_up_len,
