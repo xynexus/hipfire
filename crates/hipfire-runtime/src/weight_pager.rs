@@ -2318,6 +2318,40 @@ mod tests {
         assert_eq!(&prepared.bytes[len..2 * len], &w3[..]);
     }
 
+    /// The layout REAL artifacts ship: `w1, w2, w3` on disk, i.e. down sitting
+    /// BETWEEN the two gate_up halves. Confirmed on both a quantized lfm2_moe
+    /// fixture (qt 36, OqPlusCompact) and a deepseek4 one (qt 19, MQ2G256Lloyd),
+    /// so it is the common case rather than an edge case.
+    ///
+    /// Ordering by `rel_offset` — what this code did before roles existed —
+    /// would fuse w1 with w2 and hand the kernel a `[2 * moe_inter, hidden]`
+    /// matrix whose second half is the down projection.
+    #[test]
+    fn real_artifact_order_puts_down_between_the_gate_up_halves() {
+        let len = 64usize;
+        let (w1, w2, w3) = (vec![0xA1u8; len], vec![0xC2u8; len], vec![0xB3u8; len]);
+        let mut disk = Vec::new();
+        disk.extend_from_slice(&w1);
+        disk.extend_from_slice(&w2);
+        disk.extend_from_slice(&w3);
+        // w1 @ 0, w3 @ 2*len, w2 @ len — the on-disk order both artifacts use.
+        let module = split_gate_up_module(0, 2 * len, len, len, disk.len());
+
+        let prepared = prepare_expert_module(&module, &disk).unwrap();
+        assert_eq!(prepared.gate_up_rel, 0);
+        assert_eq!(&prepared.bytes[..len], &w1[..], "gate half first");
+        assert_eq!(
+            &prepared.bytes[len..2 * len],
+            &w3[..],
+            "up half must follow the gate half, NOT the down projection"
+        );
+        assert_eq!(prepared.gate_up_len, 2 * len);
+        assert_eq!(
+            &prepared.bytes[prepared.down_rel..prepared.down_rel + len],
+            &w2[..]
+        );
+    }
+
     /// A module cannot spell gate_up both ways. Role ordering puts the fused
     /// tensor first and the split halves after it, so accepting both would
     /// overwrite the fused pointer with the gate half and give a length spanning
