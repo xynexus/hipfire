@@ -2549,6 +2549,13 @@ pub const ENV_HIPFIRE_LFM2_DFLASH_SYNC_GEMM: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-lfm2moe/src/dflash.rs:31",
 };
 
+/// `HIPFIRE_LFM2_EXPERT_RESIDENCY` — Selects behavior from recognized values
+pub const ENV_HIPFIRE_LFM2_EXPERT_RESIDENCY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_LFM2_EXPERT_RESIDENCY",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-arch-lfm2moe/src/lfm2moe.rs:1067",
+};
+
 /// `HIPFIRE_LFM2_GRAPH` — Interprets "HIPFIRE_LFM2_GRAPH" from environment to select behavior
 pub const ENV_HIPFIRE_LFM2_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_GRAPH",
@@ -5746,6 +5753,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LFM2_DFLASH,
     ENV_HIPFIRE_LFM2_DFLASH_F16,
     ENV_HIPFIRE_LFM2_DFLASH_SYNC_GEMM,
+    ENV_HIPFIRE_LFM2_EXPERT_RESIDENCY,
     ENV_HIPFIRE_LFM2_GRAPH,
     ENV_HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS,
     ENV_HIPFIRE_LLOYD_FORCE_BASELINE,

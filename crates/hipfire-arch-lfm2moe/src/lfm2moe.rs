@@ -542,9 +542,14 @@ pub struct ExpertWeights {
 pub struct MoeFfn {
     pub router: WeightTensor,        // feed_forward.gate.weight [n_exp, hidden]
     pub expert_bias: GpuTensor,      // feed_forward.expert_bias [n_exp] F32
-    pub experts: Vec<ExpertWeights>, // keep alive (buffers owned here)
+    pub experts: Vec<ExpertWeights>, // see `experts_are_views` for ownership
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// True when routed-expert STORAGE belongs to `Lfm2MoeWeights::expert_pager`
+    /// and the `experts` entries are non-owning views into it. Freeing their
+    /// `buf` here would double-free the pager's allocation, so `free_gpu`
+    /// releases only the sidecars each view genuinely owns.
+    pub experts_are_views: bool,
 }
 
 pub enum Ffn {
@@ -565,6 +570,11 @@ pub struct Lfm2MoeWeights {
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
+    /// Owns every routed-expert allocation when expert residency runs through
+    /// the shared unit (`HIPFIRE_LFM2_EXPERT_RESIDENCY=pin`). One buffer per
+    /// expert module instead of one per projection, and the `MoeFfn.experts`
+    /// entries are views into it. `None` = the historical per-expert uploads.
+    pub expert_pager: Option<hipfire_runtime::weight_pager::WeightPager>,
 }
 
 impl ConvWeights {
@@ -614,11 +624,25 @@ impl MoeFfn {
     pub fn free_gpu(mut self, gpu: &mut Gpu) {
         self.router.free_all(gpu);
         let _ = gpu.free_tensor(self.expert_bias);
-        // Experts own their own buffers (one allocation per expert), so each is
-        // freed exactly once; any shared ParoQuant rotation is skipped via the
-        // `is_alias` check in `WeightTensor::free_all`.
-        for e in self.experts.drain(..) {
-            e.free_gpu(gpu);
+        if self.experts_are_views {
+            // Storage belongs to the pager. Release only what a view genuinely
+            // owns — the AWQ sidecars, which are separate tensors loaded here
+            // and would otherwise leak — and never the aliased `buf`.
+            for mut e in self.experts.drain(..) {
+                if let Some(a) = e.gate_up.awq_scale.take() {
+                    let _ = gpu.free_tensor(a);
+                }
+                if let Some(a) = e.down.awq_scale.take() {
+                    let _ = gpu.free_tensor(a);
+                }
+            }
+        } else {
+            // Experts own their own buffers (one allocation per expert), so each
+            // is freed exactly once; any shared ParoQuant rotation is skipped via
+            // the `is_alias` check in `WeightTensor::free_all`.
+            for e in self.experts.drain(..) {
+                e.free_gpu(gpu);
+            }
         }
         // Pointer tables (device addresses), not the expert blobs themselves.
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
@@ -655,11 +679,49 @@ impl Lfm2MoeWeights {
         for l in self.layers.drain(..) {
             l.free_gpu(gpu);
         }
+        // After the layers, so any view into pager storage is already gone.
+        if let Some(mut pager) = self.expert_pager.take() {
+            pager.free_all(gpu);
+        }
     }
 }
 
 impl Lfm2MoeWeights {
     pub fn load(hfq: &mut HfqFile, cfg: &Lfm2MoeConfig, gpu: &mut Gpu) -> Result<Self, String> {
+        // Routed-expert residency through the shared unit, when asked for. Built
+        // before the layer loop because it owns storage for every layer's
+        // experts; `None` keeps the historical per-expert uploads.
+        let mut expert_pager = match expert_residency_policy()? {
+            None => None,
+            Some(policy) => {
+                let routed = hfq
+                    .modules()
+                    .iter()
+                    .filter(|m| m.kind == hipfire_runtime::hfq_modules::HfqModuleKind::RoutedExpert)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if routed.is_empty() {
+                    return Err(
+                        "HIPFIRE_LFM2_EXPERT_RESIDENCY requires an HFQM routed-expert module \
+                         table; regenerate the artifact with the current hipfire-quantize"
+                            .to_string(),
+                    );
+                }
+                let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
+                    hfq.path(),
+                    hipfire_runtime::weight_pager::PagerConfig {
+                        policy,
+                        ..hipfire_runtime::weight_pager::PagerConfig::pinned()
+                    },
+                )
+                .map_err(|e| format!("lfm2moe: open expert pager: {e}"))?;
+                let n = pager
+                    .register_expert_modules(routed)
+                    .map_err(|e| format!("lfm2moe: register expert modules: {e}"))?;
+                eprintln!("lfm2moe: expert residency={policy:?}, {n} routed modules registered");
+                Some(pager)
+            }
+        };
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -834,6 +896,27 @@ impl Lfm2MoeWeights {
                 )?;
                 let expert_bias =
                     load_f32(hfq, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
+                if let Some(pager) = expert_pager.as_mut() {
+                    let ffn = load_moe_experts_paged(
+                        hfq,
+                        gpu,
+                        pager,
+                        l as u16,
+                        n_exp,
+                        hidden,
+                        moe_inter,
+                        router,
+                        expert_bias,
+                        &p,
+                    )?;
+                    layers.push(Lfm2MoeLayerWeights {
+                        operator_norm,
+                        ffn_norm,
+                        mixer,
+                        ffn,
+                    });
+                    continue;
+                }
                 // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
                 let mut experts = Vec::with_capacity(n_exp);
                 for e in 0..n_exp {
@@ -941,6 +1024,7 @@ impl Lfm2MoeWeights {
                     experts,
                     expert_gate_up_ptrs,
                     expert_down_ptrs,
+                    experts_are_views: false,
                 })
             };
 
@@ -959,8 +1043,164 @@ impl Lfm2MoeWeights {
             embedding_norm,
             lm_head,
             layers,
+            expert_pager,
         })
     }
+}
+
+/// Routed-expert residency through the shared unit, selected by
+/// `HIPFIRE_LFM2_EXPERT_RESIDENCY`.
+///
+/// `pin` moves routed-expert storage into a `WeightPager` under
+/// [`ResidencyPolicy::PinAll`]: one owning allocation per expert MODULE rather
+/// than one per projection, which halves the buffer-object count and removes
+/// the per-expert host-side fuse. Unset keeps the historical per-expert
+/// uploads.
+///
+/// `lru` is deliberately refused rather than silently accepted. Eviction needs
+/// the forward to admit the routed experts it is about to use, per token; the
+/// lfm2 forward has no such hook yet, so accepting the flag would produce a
+/// pager that pins everything anyway while claiming otherwise.
+fn expert_residency_policy(
+) -> Result<Option<hipfire_runtime::weight_pager::ResidencyPolicy>, String> {
+    use hipfire_runtime::weight_pager::ResidencyPolicy;
+    match std::env::var("HIPFIRE_LFM2_EXPERT_RESIDENCY")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") | Some("off") | Some("0") => Ok(None),
+        Some("pin") | Some("pinned") | Some("1") => Ok(Some(ResidencyPolicy::PinAll)),
+        Some("lru") | Some("lazy") => Err(
+            "HIPFIRE_LFM2_EXPERT_RESIDENCY=lru is not implemented: eviction needs a per-token \
+             expert admission hook in the lfm2 forward, which does not exist yet. Use `pin`."
+                .to_string(),
+        ),
+        Some(other) => Err(format!(
+            "HIPFIRE_LFM2_EXPERT_RESIDENCY={other:?} unrecognized; expected `pin` or unset"
+        )),
+    }
+}
+
+/// Map an on-disk expert quant_type to the dtype its RESIDENT bytes carry.
+///
+/// Must mirror what the pager's module preparation actually emits: the OQ
+/// families are repacked into the indexed-MoE block layout (OQ4 canonical →
+/// `Oq4G256`, OQ+compact → `Oq8G256`), everything else is copied verbatim and
+/// keeps its canonical mapping. A disagreement here decodes correct bytes with
+/// the wrong layout and produces plausible garbage.
+fn paged_expert_dtype(qt: u8, k: usize) -> Result<DType, String> {
+    if qt == OQ4_CANONICAL_QT {
+        return Ok(DType::Oq4G256);
+    }
+    if qt == OQ_PLUS_COMPACT_QT {
+        return Ok(DType::Oq8G256);
+    }
+    hipfire_runtime::quant::dtype_for_quant_type(qt, k)
+        .ok_or_else(|| format!("lfm2moe: unsupported paged expert quant_type {qt}"))
+}
+
+/// Build one layer's `MoeFfn` with routed-expert storage owned by `pager`.
+///
+/// The `experts` entries are non-owning `WeightTensor` views: they carry the
+/// shape/dtype/AWQ metadata the forward reads, over buffers the pager owns.
+#[allow(clippy::too_many_arguments)]
+fn load_moe_experts_paged(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    pager: &mut hipfire_runtime::weight_pager::WeightPager,
+    layer: u16,
+    n_exp: usize,
+    hidden: usize,
+    moe_inter: usize,
+    router: WeightTensor,
+    expert_bias: GpuTensor,
+    p: &str,
+) -> Result<Ffn, String> {
+    use hipfire_runtime::weight_pager::ExpertModuleKey;
+
+    let view = |ptr: u64, len: usize, dtype: DType, m: usize, k: usize| WeightTensor {
+        buf: GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, len) },
+            shape: vec![len],
+            dtype: DType::Raw,
+        },
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    };
+
+    let mut experts = Vec::with_capacity(n_exp);
+    for e in 0..n_exp {
+        let key = ExpertModuleKey {
+            layer,
+            expert: e as u16,
+        };
+        pager
+            .ensure_expert_module_resident(key, gpu)
+            .map_err(|err| format!("lfm2moe: L{layer}E{e} residency: {err}"))?;
+        let ptrs = pager
+            .expert_module_ptrs(key)
+            .ok_or_else(|| format!("lfm2moe: L{layer}E{e} resident but has no pointers"))?;
+        // Both projections share the module's quant_type in every artifact this
+        // path accepts; read it from w1 and validate w2 against it.
+        let (qt_gu, _) = read_tensor(hfq, &format!("{p}.feed_forward.experts.{e}.w1.weight"))?;
+        let (qt_dn, _) = read_tensor(hfq, &format!("{p}.feed_forward.experts.{e}.w2.weight"))?;
+        let mut gate_up = view(
+            ptrs.gate_up_ptr,
+            ptrs.gate_up_len,
+            paged_expert_dtype(qt_gu, hidden)?,
+            2 * moe_inter,
+            hidden,
+        );
+        let mut down = view(
+            ptrs.down_ptr,
+            ptrs.down_len,
+            paged_expert_dtype(qt_dn, moe_inter)?,
+            hidden,
+            moe_inter,
+        );
+        // AWQ sidecars are per-layer, emitted once on expert 0 — same contract
+        // as the per-expert path, and the forward reads them off experts[0].
+        if e == 0 {
+            gate_up.awq_scale = load_lfm2_awq_scale(
+                hfq,
+                gpu,
+                &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
+                hidden,
+            );
+            down.awq_scale = load_lfm2_awq_scale(
+                hfq,
+                gpu,
+                &format!("{p}.feed_forward.awq_scale_down.weight"),
+                moe_inter,
+            );
+        }
+        experts.push(ExpertWeights { gate_up, down });
+    }
+
+    let expert_gate_up_ptrs = gpu
+        .alloc_tensor(&[2 * n_exp], DType::F32)
+        .map_err(|e| format!("lfm2moe: alloc gu_ptrs: {e:?}"))?;
+    let expert_down_ptrs = gpu
+        .alloc_tensor(&[2 * n_exp], DType::F32)
+        .map_err(|e| format!("lfm2moe: alloc dn_ptrs: {e:?}"))?;
+    let all: Vec<u16> = (0..n_exp as u16).collect();
+    pager
+        .patch_expert_module_ptr_table(layer, &all, &expert_gate_up_ptrs, &expert_down_ptrs, gpu)
+        .map_err(|e| format!("lfm2moe: fill expert ptr tables: {e:?}"))?;
+
+    Ok(Ffn::Moe(MoeFfn {
+        router,
+        expert_bias,
+        experts,
+        expert_gate_up_ptrs,
+        expert_down_ptrs,
+        experts_are_views: true,
+    }))
 }
 
 // ──────────────────────────── State ────────────────────────────
