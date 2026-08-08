@@ -291,8 +291,37 @@ So the −13.6% quality gain is available for 1065 s of capture instead of
 10746 s. This removes the ceiling Q5 hit: 128k tokens becomes ~70 min rather
 than ~40 h.
 
-Implemented for zaya (`arch-zaya/src/calibration.rs`); every arch's resident
-calibration has the same single-sequence shape and can adopt the same loop.
+### Hoisted to the shared seam, and validated on a second arch
+
+The problem was never zaya-specific. `collect()` now takes
+`sequences: &[&[u32]]` and hands the closure the split view, so the policy is
+central and no arch can silently calibrate under one unbounded context. Taking
+sequences rather than a flat token list also unifies the two notions already in
+the tree — qwen35 and gemma3 drive calibration from a `SampleSet`, and those
+samples are now re-split by the same policy.
+
+The other arches had the same defect wearing different clothes: nemotron,
+minimax and lfm2moe run a per-token decode loop with `pos` running to the end
+and state reset ONCE before the loop, so KV/SSM state grows to the whole
+budget. For nemotron (Mamba-2) that meant the recurrent state carried the
+entire corpus's history — a semantics bug, not just a cost one.
+
+Validated on **nemotron** (Nano-4B-BF16, 8192 tokens, dense):
+
+| arm | wall | hessians | tokens | md5 |
+|---|---|---|---|---|
+| single sequence | 737 s | 92 | 8192 | `e3be7c82…` |
+| 4 x 2048 split | 706 s | 92 | 8192 | `f3606057…` |
+
+Both `diag(H)-vs-Σx²` CONSISTENT. Identical tensor and token counts (nothing
+double-tapped or dropped) with DIFFERENT payload hashes — which is the point:
+the per-sequence `model.reset` genuinely re-scoped the statistics. Timing is
+flat (1.04x), as expected: nemotron's cost is the linear per-token decode loop,
+and only its hybrid attention layers pay the quadratic term. **For a per-token
+arch this change buys correctness, not speed.** The 10.1x is specific to arches
+whose forward is sequence-shaped, like zaya.
+
+minimax and lfm2moe are wired identically but not GPU-tested here.
 
 ## Q7 — the budget curve inverts, because the budget experiment was train-on-test
 
