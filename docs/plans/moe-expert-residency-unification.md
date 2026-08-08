@@ -1,6 +1,7 @@
 # MoE Expert Residency — One Unit, Two Policies
 
-Status: proposed (2026-08-08)
+Status: in progress (2026-08-08) — Phases 0, 1 and 2 landed; Phase 3 revised
+below and not started.
 
 ## Why
 
@@ -210,24 +211,49 @@ that actually get smaller, so their fixtures never hand them a `qt=49`. Phase 2
 touches lfm2moe and Phase 3 touches deepseek4 — if either starts failing on a
 head tensor, check this before suspecting the residency work.
 
-**Phase 1 — `ResidencyPolicy::PinAll`.** Add the policy to `PagerConfig`, wire
-`PinAll` through `ensure_expert_module_resident` / `evict_lru_until`. qwen35
-keeps `LazyLru`, so its behavior is byte-identical. Validate: pager unit tests
-plus an unchanged qwen3_5_moe gate row.
+**Phase 1 — `ResidencyPolicy::PinAll`. DONE (`fc55d47e4`).** `PagerConfig.policy`
+with `LazyLru` (default, unchanged behavior) and `PinAll`. `PinAll` fails closed
+via `may_evict` → `PinnedBudgetExceeded`, checked inside `evict_lru_until` so no
+call site can forget it. 4 new pager unit tests; qwen3_5_moe 12/12 green.
 
-**Phase 2 — lfm2moe onto the shared unit.** Smallest blast radius: it has
-neither packing nor paging today, so it gains both. Expected BO count for
-routed experts drops from `2 × n_exp × n_layers` to one per expert module
-(`PinAll`), and eviction becomes available by config. Validate: `lfm2_moe`
-quant+state rows unchanged; log resident BO count before/after.
+**Phase 2 — lfm2moe onto the shared unit. DONE (`4c068d084`, `a67a4e983`,
+`7a60228a4`).** Split into a pager half and an arch half:
 
-**Phase 3 — role-rank table + deepseek4 and minimax.** Land the `w1`/`w3`/`w2`
-role ranks, re-record the affected tiny fixture hashes in the same commit
-(canonical order changes → hashes change; this is the
-`tiny-gate-baselines-fp16-drift` situation again, so scope `--record` to the
-affected FAMILIES only). Then migrate both loaders, keeping their EP predicates
+- `ModuleRole` + role-ordered layout, so `w1`/`w3`/`w2` name projections just as
+  `gate_up_proj`/`down_proj` do, and a split gate_up is fused contiguously.
+- `ExpertModulePtrs` / `expert_module_ptrs`, so an adopter can build non-owning
+  views over pager-owned storage.
+- `HIPFIRE_LFM2_EXPERT_RESIDENCY=pin`, with explicit ownership
+  (`MoeFfn::experts_are_views`, `Lfm2MoeWeights::expert_pager`).
+
+Validated as an A/B against the same baselines: 8/8 lfm2_moe quant cells pass on
+both arms, and the pinned path is confirmed exercised rather than skipped.
+Routed-expert buffer objects go 16 → 8 on the tiny fixture (one per module
+rather than one per projection).
+
+Two things the plan got wrong, found by building it:
+
+- **Eviction is not "available by config" for lfm2moe.** `PinAll` is; `LazyLru`
+  needs the forward to admit its routed experts per token, and the lfm2 forward
+  has no such hook. The flag refuses `lru` explicitly rather than pinning
+  everything while claiming to page.
+- **The real-world artifact orders its tensors `w1, w2, w3`** — down sits
+  *between* the gate_up halves. Ordering by `rel_offset` would have fused w1
+  with w2. This is why the layout is role-driven, and it was a live case rather
+  than a hypothetical.
+
+**Phase 3 — deepseek4 and minimax onto the shared unit.** Migrate both loaders,
+keeping their EP-ownership predicates and deepseek4's non-owned pointer policy
 as inputs. Validate: `deepseek4`, `deepseek4_compressed`, `minimax` rows
-against the re-recorded baselines, plus a multi-GPU EP smoke on medusa.
+unchanged, plus a multi-GPU EP smoke on medusa.
+
+**The role-rank half of this phase is dropped.** It existed to give `w1`/`w3`/
+`w2` deterministic ordering *within* a module so the fused pair would be
+adjacent. Phase 2a solved that at the pager, by role, independent of on-disk
+order — so changing `expert_role_rank` now buys nothing and would move artifact
+hashes for three families for no functional gain. Contiguity of an expert's
+tensors, which is what makes a module a single page-in range, already holds
+without it.
 
 **Phase 4 — enable eviction where it pays.** deepseek4 is the arch that wants
 it most: the largest expert footprint, and today its only answer to not fitting
@@ -240,8 +266,9 @@ on a measured decode-latency delta, not on the mechanism working.
   upstream's equivalent packing fix hit a gfx12 HipGraph regression and had to
   ship gfx11-only. Any HipGraph-captured MoE path needs an explicit gfx11 vs
   gfx12 A/B before the default flips.
-- **Canonical tensor order is artifact-visible.** Phase 3 moves hashes for
-  three families. Re-record deliberately, in the same commit, scoped by family.
+- ~~**Canonical tensor order is artifact-visible.**~~ Retired: the role-rank
+  change that would have moved those hashes is dropped, because Phase 2a made it
+  unnecessary. No phase now changes artifact bytes.
 - **`PinAll` must not silently regress into paging.** If a `PinAll` model does
   not fit, failing closed with a named error beats thrashing an LRU nobody
   asked for.
