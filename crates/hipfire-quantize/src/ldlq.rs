@@ -190,9 +190,7 @@ pub fn qtip_ldlq_dequant_bits(
     assert_eq!(k % 256, 0, "qtip_ldlq_dequant_bits requires k % 256 == 0");
 
     // Rotate the Hessian, then L with L·Lᵀ = (H_rot + λI)⁻¹.
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     // Rotate the weights into the same domain.
     let nb = k / 256;
@@ -338,6 +336,80 @@ fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
 /// all later columns. The inner per-group quant is oq4's symmetric round (the only
 /// substitution vs the QTIP trellis encode). `None` on Cholesky breakdown →
 /// caller falls back to plain `quantize_oq4g256`.
+/// Identity of the inputs that determine the LDLQ factorization. The weights
+/// are deliberately NOT part of it — the factor depends only on the Hessian,
+/// the rotation and the damping.
+fn ldlq_factor_key(h: &[f32], k: usize, signs1: &[f32], signs2: &[f32], damp: f64) -> u64 {
+    let mut a: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |x: u64| {
+        a ^= x;
+        a = a.wrapping_mul(0x0100_0000_01b3);
+    };
+    eat(k as u64);
+    eat(damp.to_bits());
+    for v in signs1.iter().chain(signs2) {
+        eat(v.to_bits() as u64);
+    }
+    for v in h {
+        eat(v.to_bits() as u64);
+    }
+    a
+}
+
+static LDLQ_FACTOR_CACHE: std::sync::Mutex<Option<(u64, std::sync::Arc<Mat<f64>>)>> =
+    std::sync::Mutex::new(None);
+static LDLQ_FACTOR_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LDLQ_FACTOR_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many LDLQ factorizations were served from cache vs computed.
+pub fn ldlq_factor_cache_stats() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        LDLQ_FACTOR_HITS.load(Relaxed),
+        LDLQ_FACTOR_MISSES.load(Relaxed),
+    )
+}
+
+/// `rotate_hessian` + `inv_cholesky_dispatch`, memoized on the last Hessian.
+///
+/// A layer-POOLED expert Hessian is shared by every routed expert in its layer
+/// — 256 of them on Qwen3.5-35B-A3B — and this prefix depends only on
+/// `(H, k, signs, damp)`, never on the weights. Recomputing it per expert
+/// repeated a K³/3 Cholesky (2.9 GFLOP at K=2048) plus the rotation 255 extra
+/// times per layer for a bit-identical result.
+///
+/// One entry is enough because the quantizer walks tensors in order, so the
+/// experts sharing a donor arrive consecutively. Keying on a fingerprint of the
+/// Hessian itself (rather than a caller-supplied name) keeps this correct for
+/// every caller, including the non-pooled paths where consecutive tensors have
+/// genuinely different Hessians and simply always miss.
+fn rotated_inv_cholesky_cached(
+    h_rowmajor_f32: &[f32],
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+) -> Option<std::sync::Arc<Mat<f64>>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = ldlq_factor_key(h_rowmajor_f32, k, signs1, signs2, damp);
+    if let Ok(slot) = LDLQ_FACTOR_CACHE.lock() {
+        if let Some((cached, factor)) = slot.as_ref() {
+            if *cached == key {
+                LDLQ_FACTOR_HITS.fetch_add(1, Relaxed);
+                return Some(factor.clone());
+            }
+        }
+    }
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    rotate_hessian(&mut h, k, signs1, signs2);
+    let factor = std::sync::Arc::new(inv_cholesky_dispatch(&h, k, damp)?);
+    LDLQ_FACTOR_MISSES.fetch_add(1, Relaxed);
+    if let Ok(mut slot) = LDLQ_FACTOR_CACHE.lock() {
+        *slot = Some((key, factor.clone()));
+    }
+    Some(factor)
+}
+
 pub fn oq4_ldlq_pack(
     weights_f32: &[f32],
     m: usize,
@@ -352,9 +424,7 @@ pub fn oq4_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oq4_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
@@ -475,9 +545,7 @@ pub fn oq3_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oq3_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -595,9 +663,7 @@ pub fn oq2_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oq2_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -706,9 +772,7 @@ pub fn oq8_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oq8_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -820,9 +884,7 @@ pub fn oqplus_tiered_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oqplus_tiered_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -938,9 +1000,7 @@ pub fn oqplus_compact_ldlq_pack(
     assert_eq!(h_rowmajor_f32.len(), k * k);
     assert_eq!(k % 256, 0, "oqplus_compact_ldlq_pack requires k % 256 == 0");
 
-    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
-    rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    let l = rotated_inv_cholesky_cached(h_rowmajor_f32, k, signs1, signs2, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -1478,6 +1538,93 @@ mod tests {
             eh / ei
         );
         assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");
+    }
+
+    /// The factor cache must be transparent: a hit reproduces the packer's bytes
+    /// exactly, and a DIFFERENT Hessian must not be served the cached factor.
+    /// The second half is the one that matters — a cache that over-hits would
+    /// silently quantize every routed expert against another layer's Hessian.
+    #[test]
+    fn ldlq_factor_cache_is_transparent() {
+        let (m, k) = (64usize, 256usize);
+        let signs1 = crate::gen_fwht_signs(42, 256);
+        let signs2 = crate::gen_fwht_signs(1042, 256);
+        let mut rng = Lcg(0x51ded);
+        let w: Vec<f32> = (0..m * k).map(|_| rng.next() as f32).collect();
+
+        // Strongly column-correlated H (AR(1)), as in the OBS tests — a
+        // near-identity Hessian makes LDLQ collapse to RTN, and then two
+        // different Hessians pack to the same bytes and prove nothing.
+        let spd = |seed: u64, rho: f64| {
+            let rows = 256usize;
+            let mut r = Lcg(seed);
+            let mut x = vec![0.0f32; rows * k];
+            for row in 0..rows {
+                let mut prev = 0.0f64;
+                for c in 0..k {
+                    prev = rho * prev + r.next();
+                    x[row * k + c] = prev as f32;
+                }
+            }
+            let mut h = vec![0.0f32; k * k];
+            for row in 0..rows {
+                let base = row * k;
+                for i in 0..k {
+                    let xi = x[base + i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..k {
+                        h[i * k + j] += xi * x[base + j];
+                    }
+                }
+            }
+            for v in h.iter_mut() {
+                *v /= rows as f32;
+            }
+            for i in 0..k {
+                h[i * k + i] += 1e-3;
+            }
+            h
+        };
+        let (ha, hb) = (spd(1, 0.90), spd(2, 0.30));
+        let damp = 0.01f64;
+
+        // Asserted on BYTES, not on the global hit/miss counters: the cache is
+        // process-wide and `cargo test` runs these in parallel, so counter
+        // deltas belong to whichever tests happen to interleave.
+        let a1 = oq4_ldlq_pack(&w, m, k, &ha, &signs1, &signs2, damp).unwrap();
+        // Immediate repeat — served from cache.
+        let a2 = oq4_ldlq_pack(&w, m, k, &ha, &signs1, &signs2, damp).unwrap();
+        assert_eq!(a1, a2, "cached factor changed the packed bytes");
+
+        // Over-hitting is the dangerous failure — it would quantize every routed
+        // expert against another layer's Hessian, silently. Test that at the KEY,
+        // not through the packed bytes: two different Hessians can legitimately
+        // pack to the same 4-bit codes, so byte inequality is a property of the
+        // packer's sensitivity rather than of the cache.
+        assert_ne!(
+            ldlq_factor_key(&ha, k, &signs1, &signs2, damp),
+            ldlq_factor_key(&hb, k, &signs1, &signs2, damp),
+            "different Hessians must not share a cache key"
+        );
+        assert_ne!(
+            ldlq_factor_key(&ha, k, &signs1, &signs2, damp),
+            ldlq_factor_key(&ha, k, &signs1, &signs2, damp * 2.0),
+            "damping must be part of the cache key"
+        );
+        assert_eq!(
+            ldlq_factor_key(&ha, k, &signs1, &signs2, damp),
+            ldlq_factor_key(&ha, k, &signs1, &signs2, damp),
+            "the same inputs must produce the same key"
+        );
+        // Evict with a genuinely different Hessian.
+        let _ = oq4_ldlq_pack(&w, m, k, &hb, &signs1, &signs2, damp).unwrap();
+
+        // `b` evicted the entry, so this recomputes from scratch and must land
+        // exactly where the cached path did.
+        let a3 = oq4_ldlq_pack(&w, m, k, &ha, &signs1, &signs2, damp).unwrap();
+        assert_eq!(a1, a3, "recomputed factor disagrees with the cached one");
     }
 
     /// The int3 packer's OBS feedback (real H) must reduce the H-weighted *output*
