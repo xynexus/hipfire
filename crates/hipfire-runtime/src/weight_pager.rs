@@ -598,6 +598,88 @@ struct PreparedExpertModule {
     down_rel: usize,
 }
 
+/// Which slot of the indexed-MoE contract a routed tensor fills.
+///
+/// The kernels want exactly two pointers per expert: one `gate_up` of shape
+/// `[2 * moe_inter, hidden]` and one `down`. Checkpoints disagree about how to
+/// spell that. qwen35-family artifacts ship `gate_up_proj` already fused;
+/// deepseek4, minimax and lfm2moe ship `w1` (gate) and `w3` (up) as separate
+/// tensors that the arch loaders byte-concatenate at load, plus `w2` for down.
+///
+/// Resolving the role here is what lets one residency unit serve both spellings
+/// without each arch keeping its own loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ModuleRole {
+    /// Pre-fused `gate_up_proj`.
+    GateUp,
+    /// `w1` — the gate half of a split gate_up. Must be emitted immediately
+    /// before [`ModuleRole::GateUpHigh`] with no padding between them.
+    GateUpLow,
+    /// `w3` — the up half of a split gate_up.
+    GateUpHigh,
+    /// `down_proj` or `w2`.
+    Down,
+}
+
+/// Classify a routed tensor by name.
+///
+/// `gate_up_proj` / `down_proj` are matched as substrings, which is what the
+/// pager has always done. The `w1`/`w2`/`w3` spellings are matched on a whole
+/// dotted SEGMENT instead: those names are two characters long and a substring
+/// test would fire on unrelated names.
+fn module_tensor_role(name: &str) -> Option<ModuleRole> {
+    if name.contains("gate_up_proj") {
+        return Some(ModuleRole::GateUp);
+    }
+    if name.contains("down_proj") {
+        return Some(ModuleRole::Down);
+    }
+    name.split('.').find_map(|segment| match segment {
+        "w1" => Some(ModuleRole::GateUpLow),
+        "w3" => Some(ModuleRole::GateUpHigh),
+        "w2" => Some(ModuleRole::Down),
+        _ => None,
+    })
+}
+
+/// True when the module ships `gate_up` as separate `w1`/`w3` tensors.
+///
+/// Such a module always takes the relayout path even if no quant repack is
+/// needed: the two halves have to land adjacent and in gate-then-up order for a
+/// single `gate_up_ptr` to address `[2 * moe_inter, hidden]`, and the on-disk
+/// order is not guaranteed to give that.
+fn module_has_split_gate_up(module: &HfqModuleRecord) -> bool {
+    module
+        .tensors
+        .iter()
+        .any(|t| module_tensor_role(&t.name) == Some(ModuleRole::GateUpLow))
+}
+
+/// Module tensors in the order the resident buffer lays them out: gate_up (or
+/// its `w1`,`w3` halves in that order) first, then down.
+///
+/// Ordering by role rather than by `rel_offset` is what makes the fused region
+/// contiguous regardless of how the artifact happened to serialize the tensors.
+fn module_tensors_in_role_order(
+    module: &HfqModuleRecord,
+) -> Result<Vec<(ModuleRole, &HfqModuleTensor)>, WeightPagerError> {
+    let mut out = Vec::with_capacity(module.tensors.len());
+    for tensor in &module.tensors {
+        let role = module_tensor_role(&tensor.name).ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!(
+                "routed tensor {} in module {} matches no known projection role \
+                 (gate_up_proj/down_proj or w1/w3/w2)",
+                tensor.name, module.module_id
+            ))
+        })?;
+        out.push((role, tensor));
+    }
+    // Stable by role, then by on-disk position so a repeated role is
+    // deterministic rather than dependent on the record's vector order.
+    out.sort_by_key(|(role, tensor)| (*role, tensor.rel_offset));
+    Ok(out)
+}
+
 fn module_tensor_shape(tensor: &HfqModuleTensor) -> Result<(usize, usize), WeightPagerError> {
     let [m, k] = tensor.shape.as_slice() else {
         return Err(WeightPagerError::InvalidModule(format!(
@@ -639,13 +721,28 @@ fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightP
     }
 }
 
-fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
+fn module_requires_quant_repack(module: &HfqModuleRecord) -> bool {
     module.tensors.iter().any(|tensor| {
         matches!(
             QuantType::from_code(tensor.quant_type),
             Some(QuantType::Oq4G256 | QuantType::Oq8G256 | QuantType::OqPlusCompact)
         )
     })
+}
+
+/// Whether the resident buffer must be rebuilt on the host rather than uploaded
+/// verbatim from disk. Either the quant storage needs repacking into the
+/// indexed-MoE block layout, or `gate_up` arrives split and has to be laid out
+/// contiguously.
+fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
+    module_requires_quant_repack(module) || module_has_split_gate_up(module)
+}
+
+/// Whether a tensor's resident bytes follow the previous tensor with no
+/// alignment padding. Only the up half of a split gate_up does: it must abut the
+/// gate half so the pair reads as one `[2 * moe_inter, hidden]` matrix.
+fn module_role_is_glued_to_previous(role: ModuleRole) -> bool {
+    role == ModuleRole::GateUpHigh
 }
 
 fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerError> {
@@ -657,11 +754,11 @@ fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerErr
         }
         return Ok(module.data_size);
     }
-    let mut tensors = module.tensors.iter().collect::<Vec<_>>();
-    tensors.sort_by_key(|tensor| tensor.rel_offset);
     let mut len = 0usize;
-    for tensor in tensors {
-        len = align_up(len, MODULE_TENSOR_ALIGN);
+    for (role, tensor) in module_tensors_in_role_order(module)? {
+        if !module_role_is_glued_to_previous(role) {
+            len = align_up(len, MODULE_TENSOR_ALIGN);
+        }
         len = len
             .checked_add(module_tensor_resident_len(tensor)?)
             .ok_or_else(|| {
@@ -686,14 +783,12 @@ fn prepare_expert_module(
             module.data_size
         )));
     }
-    let mut tensors = module.tensors.iter().collect::<Vec<_>>();
-    tensors.sort_by_key(|tensor| tensor.rel_offset);
     let capacity = module_resident_len(module)?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut gate_up_rel = None;
     let mut down_rel = None;
 
-    for tensor in tensors {
+    for (role, tensor) in module_tensors_in_role_order(module)? {
         let source_end = tensor
             .rel_offset
             .checked_add(tensor.data_size)
@@ -711,8 +806,10 @@ fn prepare_expert_module(
                     tensor.name, tensor.rel_offset, source_end, module.data_size
                 ))
             })?;
-        let aligned = align_up(bytes.len(), MODULE_TENSOR_ALIGN);
-        bytes.resize(aligned, 0);
+        if !module_role_is_glued_to_previous(role) {
+            let aligned = align_up(bytes.len(), MODULE_TENSOR_ALIGN);
+            bytes.resize(aligned, 0);
+        }
         let resident_rel = bytes.len();
         let quant_type = QuantType::from_code(tensor.quant_type).ok_or_else(|| {
             WeightPagerError::InvalidModule(format!(
@@ -744,11 +841,12 @@ fn prepare_expert_module(
             _ => source.to_vec(),
         };
         bytes.extend_from_slice(&transformed);
-        if tensor.name.contains("gate_up_proj") {
-            gate_up_rel = Some(resident_rel);
-        }
-        if tensor.name.contains("down_proj") {
-            down_rel = Some(resident_rel);
+        match role {
+            // The gate half owns the fused pointer; the up half is addressed
+            // through it, which is exactly why it must abut.
+            ModuleRole::GateUp | ModuleRole::GateUpLow => gate_up_rel = Some(resident_rel),
+            ModuleRole::GateUpHigh => {}
+            ModuleRole::Down => down_rel = Some(resident_rel),
         }
     }
 
@@ -1079,11 +1177,12 @@ impl WeightPager {
         let expert = module.expert.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
         })?;
-        if find_module_tensor_rel_ptr(&module, "gate_up_proj").is_none()
-            || find_module_tensor_rel_ptr(&module, "down_proj").is_none()
+        if !module_has_gate_up(&module)
+            || find_module_tensor_rel_ptr(&module, ModuleRole::Down).is_none()
         {
             return Err(WeightPagerError::InvalidModule(format!(
-                "module {} missing gate_up_proj or down_proj tensor",
+                "module {} needs a gate_up (fused gate_up_proj, or both w1 and w3) \
+                 and a down (down_proj or w2)",
                 module.module_id
             )));
         }
@@ -1263,9 +1362,11 @@ impl WeightPager {
             let (tensor, _handle) =
                 self.transport
                     .fetch(module.data_offset, module.data_size, gpu)?;
-            let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
+            // Split gate_up always takes the relayout branch above, so a module
+            // reaching here must carry a pre-fused gate_up.
+            let gate_up_rel = find_module_tensor_rel_ptr(&module, ModuleRole::GateUp)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
+            let down_rel = find_module_tensor_rel_ptr(&module, ModuleRole::Down)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
             (tensor, gate_up_rel, down_rel)
         };
@@ -1648,12 +1749,30 @@ impl From<hip_bridge::HipError> for WeightPagerError {
     }
 }
 
-fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: &str) -> Option<usize> {
+/// On-disk relative offset of the tensor filling `want`.
+///
+/// Only meaningful for modules uploaded verbatim — a module that needs a host
+/// relayout gets its offsets from `prepare_expert_module` instead. A split
+/// `gate_up` always takes the relayout path, so `GateUp` here means a genuinely
+/// pre-fused tensor.
+fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, want: ModuleRole) -> Option<usize> {
     module
         .tensors
         .iter()
-        .find(|t| t.name.contains(role))
+        .find(|t| module_tensor_role(&t.name) == Some(want))
         .map(|t| t.rel_offset)
+}
+
+/// Whether the module carries a usable gate_up: either pre-fused, or both
+/// halves of a split pair.
+fn module_has_gate_up(module: &HfqModuleRecord) -> bool {
+    let has = |want| {
+        module
+            .tensors
+            .iter()
+            .any(|t| module_tensor_role(&t.name) == Some(want))
+    };
+    has(ModuleRole::GateUp) || (has(ModuleRole::GateUpLow) && has(ModuleRole::GateUpHigh))
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,6 +2123,131 @@ mod tests {
         let cfg = PagerConfig::pinned();
         assert_eq!(cfg.policy, ResidencyPolicy::PinAll);
         assert_eq!(cfg.vram_budget_bytes, u64::MAX);
+    }
+
+    fn split_gate_up_module(
+        w1_off: usize,
+        w3_off: usize,
+        w2_off: usize,
+        len: usize,
+        total: usize,
+    ) -> HfqModuleRecord {
+        let t = |name: &str, rel_offset: usize| HfqModuleTensor {
+            name: format!("model.layers.0.feed_forward.experts.0.{name}.weight"),
+            // Plain BF16: no quant repack, so the ONLY reason this module takes
+            // the relayout path is the split gate_up.
+            quant_type: 3,
+            shape: vec![1, len as u32],
+            group_size: 0,
+            rel_offset,
+            data_size: len,
+        };
+        HfqModuleRecord {
+            module_id: "layers.0.experts.0".to_string(),
+            kind: HfqModuleKind::RoutedExpert,
+            layer: Some(0),
+            expert: Some(0),
+            placement_policy: Some("lazy_lru".to_string()),
+            data_offset: 4096,
+            data_size: total,
+            tensors: vec![t("w1", w1_off), t("w3", w3_off), t("w2", w2_off)],
+        }
+    }
+
+    /// `w1`/`w3`/`w2` name a gate_up and a down just as much as
+    /// `gate_up_proj`/`down_proj` do — that is what lets one residency unit
+    /// serve deepseek4, minimax and lfm2moe alongside qwen35.
+    #[test]
+    fn roles_resolve_for_both_projection_spellings() {
+        use ModuleRole::*;
+        let f = module_tensor_role;
+        assert_eq!(
+            f("model.layers.0.mlp.experts.0.gate_up_proj.weight"),
+            Some(GateUp)
+        );
+        assert_eq!(
+            f("model.layers.0.mlp.experts.0.down_proj.weight"),
+            Some(Down)
+        );
+        assert_eq!(f("model.layers.0.ffn.experts.0.w1.weight"), Some(GateUpLow));
+        assert_eq!(
+            f("model.layers.0.ffn.experts.0.w3.weight"),
+            Some(GateUpHigh)
+        );
+        assert_eq!(f("model.layers.0.ffn.experts.0.w2.weight"), Some(Down));
+        assert_eq!(f("model.layers.0.self_attn.q_proj.weight"), None);
+        // `w1` is two characters: matching it as a substring rather than as a
+        // whole dotted segment would classify unrelated tensors.
+        assert_eq!(f("model.layers.0.attn.qw1x.weight"), None);
+        assert_eq!(f("model.layers.0.gw2.weight"), None);
+    }
+
+    /// The gate and up halves must land adjacent, in gate-then-up order, with
+    /// no alignment padding — a single `gate_up_ptr` has to address the pair as
+    /// one `[2 * moe_inter, hidden]` matrix.
+    #[test]
+    fn split_gate_up_is_fused_contiguously() {
+        let len = 64usize;
+        let (w1, w3, w2) = (vec![0xA1u8; len], vec![0xB3u8; len], vec![0xC2u8; len]);
+        let mut disk = Vec::new();
+        disk.extend_from_slice(&w1);
+        disk.extend_from_slice(&w3);
+        disk.extend_from_slice(&w2);
+        let module = split_gate_up_module(0, len, 2 * len, len, disk.len());
+
+        assert!(module_has_split_gate_up(&module));
+        assert!(module_requires_host_repack(&module));
+        assert!(!module_requires_quant_repack(&module));
+
+        let prepared = prepare_expert_module(&module, &disk).unwrap();
+        assert_eq!(prepared.bytes.len(), module_resident_len(&module).unwrap());
+        // gate at 0, up immediately after it — not rounded up to the 32-byte
+        // tensor alignment.
+        assert_eq!(prepared.gate_up_rel, 0);
+        assert_eq!(&prepared.bytes[..len], &w1[..]);
+        assert_eq!(&prepared.bytes[len..2 * len], &w3[..]);
+        // down starts on an aligned boundary after the fused pair.
+        assert_eq!(prepared.down_rel, align_up(2 * len, MODULE_TENSOR_ALIGN));
+        assert_eq!(
+            &prepared.bytes[prepared.down_rel..prepared.down_rel + len],
+            &w2[..]
+        );
+    }
+
+    /// Layout follows the ROLE, not the on-disk order. An artifact that
+    /// serialized w3 before w1 must still produce gate-then-up, or the fused
+    /// matrix is silently transposed in halves and the model produces plausible
+    /// garbage rather than an error.
+    #[test]
+    fn fused_order_is_role_driven_not_disk_driven() {
+        let len = 64usize;
+        let (w1, w3, w2) = (vec![0xA1u8; len], vec![0xB3u8; len], vec![0xC2u8; len]);
+        // Disk order: w3, w1, w2.
+        let mut disk = Vec::new();
+        disk.extend_from_slice(&w3);
+        disk.extend_from_slice(&w1);
+        disk.extend_from_slice(&w2);
+        let module = split_gate_up_module(len, 0, 2 * len, len, disk.len());
+
+        let prepared = prepare_expert_module(&module, &disk).unwrap();
+        assert_eq!(prepared.gate_up_rel, 0);
+        assert_eq!(&prepared.bytes[..len], &w1[..], "gate half must come first");
+        assert_eq!(&prepared.bytes[len..2 * len], &w3[..]);
+    }
+
+    /// A module with no recognizable role is a malformed artifact, and saying so
+    /// beats pointing a kernel at whichever tensor happened to be first.
+    #[test]
+    fn unknown_projection_role_is_rejected() {
+        let mut module = split_gate_up_module(0, 64, 128, 64, 192);
+        module.tensors[1].name = "model.layers.0.feed_forward.experts.0.mystery.weight".to_string();
+        match module_resident_len(&module) {
+            Err(WeightPagerError::InvalidModule(msg)) => {
+                assert!(msg.contains("mystery"), "{msg}");
+                assert!(msg.contains("w1/w3/w2"), "{msg}");
+            }
+            other => panic!("expected InvalidModule, got {other:?}"),
+        }
     }
 
     /// A pinned pager with an explicit budget still refuses to evict rather
