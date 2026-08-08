@@ -242,10 +242,43 @@ Two things the plan got wrong, found by building it:
   with w2. This is why the layout is role-driven, and it was a live case rather
   than a hypothetical.
 
-**Phase 3 — deepseek4 and minimax onto the shared unit.** Migrate both loaders,
-keeping their EP-ownership predicates and deepseek4's non-owned pointer policy
-as inputs. Validate: `deepseek4`, `deepseek4_compressed`, `minimax` rows
-unchanged, plus a multi-GPU EP smoke on medusa.
+**Phase 3 — deepseek4 and minimax. REVISED, and NOT as originally written.**
+
+Migrating these two to the shared unit *under `PinAll`* would be a large
+regression, and the plan's own framing hid it. They do not pack per expert —
+they pack per LAYER. `upload_layer_routed_experts` (`arch.rs:323`) builds one
+`combined` blob across every owned expert and uploads it once, outside the
+expert loop, plus one for `w2`. That is ~2 owning allocations per layer.
+
+The shared unit's granularity is one allocation per expert MODULE. For a
+256-expert / 40-layer model:
+
+| | owning allocations |
+|---|---:|
+| deepseek4 today (per-layer blobs) | ~80 |
+| shared unit at module granularity, pinned | 10,240 |
+
+A 128× increase — precisely the failure mode this plan exists to remove. So
+"migrate deepseek4 and minimax onto the shared unit" is only correct for the
+paging case, and the open question about a coarser unit was a precondition
+rather than something to defer.
+
+The resolution is that **the number that matters is the RESIDENT count, not the
+registered count.** Per-expert granularity is right when paging — residency is
+bounded to the working set, which is the whole point — and wrong when pinning,
+where every registered module is resident at once. Hand-rolled per-layer packing
+is already the correct `PinAll` implementation for these two arches; there is
+nothing to win by rewriting it.
+
+Phase 3 therefore folds into Phase 4: give deepseek4 the pager for **eviction**,
+not for packing, and leave its per-layer blobs as the pinned path. Either the
+pager grows a coarser residency unit (a layer's experts as one allocation, which
+the format permits — `module_id` is free-form and a layer's experts are already
+contiguous), or these arches simply keep two residency implementations chosen by
+policy, which is what the two-policy design allows.
+
+Do not start this without deciding which. Both are defensible; they differ by a
+lot of code.
 
 **The role-rank half of this phase is dropped.** It existed to give `w1`/`w3`/
 `w2` deterministic ordering *within* a module so the fused pair would be
@@ -279,11 +312,11 @@ on a measured decode-latency delta, not on the mechanism working.
 
 ## Open questions
 
-- Should the page/pack unit ever be coarser than one expert (a bucket of K
-  experts, one BO)? Fewer BOs and fewer admissions, but coarser eviction. The
-  module record format already permits it — `module_id` is a free-form string —
-  so this is a policy choice, not a format change. Defer until Phase 4 gives a
-  measured admission-rate number.
+- ~~Should the page/pack unit ever be coarser than one expert?~~ **Answered, and
+  it was a precondition rather than a deferral** — see the revised Phase 3. A
+  coarser unit is required for any *pinned* adopter whose experts outnumber its
+  layers, which is every large MoE. It stays optional for paging, where bounded
+  residency already caps the allocation count.
 - `hipfire-arch-zaya`, `-cohere2`, `-nemotron`: their expert handling in the
   code surveyed so far is host-f32 and calibration-stream paths. Their
   device-side residency was not traced and is out of scope here; confirm before
