@@ -283,6 +283,42 @@ Scope:
 Validate: `deepseek4`, `deepseek4_compressed`, `minimax` rows unchanged, plus a
 multi-GPU EP smoke on medusa.
 
+### The actual blocker: deepseek4 fuses selection into dispatch
+
+Artifacts are ready — a quantized deepseek4 fixture carries 16 routed-expert
+modules with `w1`/`w2`/`w3` naming and the split gate_up the shared unit already
+handles. The obstacle is the forward.
+
+Admission needs host-side expert indices before the indexed GEMV runs.
+qwen35's paged path gets them either from a CPU-computed top-k or, in the
+general case, `download_i32_tensor(gpu, s.topk_indices, k)` — a readback
+*between* the GPU select and the GEMV (`moe_decode.rs:1063-1072`). Its pipeline
+is already split at that seam.
+
+deepseek4's is not. `run_bias_aware` → `pipeline::run_moe_decode_bias_aware`
+performs bias-aware select → gate_up → SwiGLU → rotate → down → combine as one
+call, with `topk_idx_dev` produced and consumed inside it
+(`forward.rs:3713-3760`). There is no host-visible point between routing and
+use, so paging deepseek4 requires splitting that pipeline:
+
+- **(a) split the entry point** — a select-only call plus a resume-with-topk
+  call, or
+- **(b) an admission callback** invoked between select and the indexed GEMV.
+
+Both change `hipfire-dispatch`'s shared MoE pipeline, which qwen35 also uses,
+and both add a launch boundary plus a device sync per layer per token. That
+cost is inherent to paging (qwen35 already pays it), but the restructuring is
+materially larger and riskier than the lfm2moe adoption was, and it lands in a
+hot path.
+
+Note also that `CpuRouter` — the "CPU is the scheduler authority" design the
+pager's own docs describe — has **no callers**. It is written and unused;
+today's admission is driven by GPU top-k plus a readback. Anyone reaching for
+the documented design should know it is aspirational.
+
+Decide (a) vs (b) before writing code. That is a hot-path structure choice, not
+a detail.
+
 **The role-rank half of this phase is dropped.** It existed to give `w1`/`w3`/
 `w2` deterministic ordering *within* a module so the fused pair would be
 adjacent. Phase 2a solved that at the pager, by role, independent of on-disk
