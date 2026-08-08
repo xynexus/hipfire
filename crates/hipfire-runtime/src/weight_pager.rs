@@ -596,6 +596,9 @@ struct PreparedExpertModule {
     bytes: Vec<u8>,
     gate_up_rel: usize,
     down_rel: usize,
+    /// Resident byte length of the (possibly fused) gate_up region and of down.
+    gate_up_len: usize,
+    down_len: usize,
 }
 
 /// Which slot of the indexed-MoE contract a routed tensor fills.
@@ -787,6 +790,8 @@ fn prepare_expert_module(
     let mut bytes = Vec::with_capacity(capacity);
     let mut gate_up_rel = None;
     let mut down_rel = None;
+    let mut gate_up_len = 0usize;
+    let mut down_len = 0usize;
 
     for (role, tensor) in module_tensors_in_role_order(module)? {
         let source_end = tensor
@@ -843,10 +848,17 @@ fn prepare_expert_module(
         bytes.extend_from_slice(&transformed);
         match role {
             // The gate half owns the fused pointer; the up half is addressed
-            // through it, which is exactly why it must abut.
-            ModuleRole::GateUp | ModuleRole::GateUpLow => gate_up_rel = Some(resident_rel),
-            ModuleRole::GateUpHigh => {}
-            ModuleRole::Down => down_rel = Some(resident_rel),
+            // through it, which is exactly why it must abut. The fused length
+            // is therefore both halves.
+            ModuleRole::GateUp | ModuleRole::GateUpLow => {
+                gate_up_rel = Some(resident_rel);
+                gate_up_len = transformed.len();
+            }
+            ModuleRole::GateUpHigh => gate_up_len += transformed.len(),
+            ModuleRole::Down => {
+                down_rel = Some(resident_rel);
+                down_len = transformed.len();
+            }
         }
     }
 
@@ -861,16 +873,18 @@ fn prepare_expert_module(
         bytes,
         gate_up_rel: gate_up_rel.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!(
-                "module {} missing gate_up_proj tensor",
+                "module {} missing a gate_up tensor (gate_up_proj, or w1+w3)",
                 module.module_id
             ))
         })?,
         down_rel: down_rel.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!(
-                "module {} missing down_proj tensor",
+                "module {} missing a down tensor (down_proj or w2)",
                 module.module_id
             ))
         })?,
+        gate_up_len,
+        down_len,
     })
 }
 
@@ -1085,6 +1099,19 @@ struct ResidentModule {
     bytes: u64,
     gate_up_ptr: u64,
     down_ptr: u64,
+    gate_up_len: usize,
+    down_len: usize,
+}
+
+/// Where an expert's two projections live inside the module's single owning
+/// allocation. Device pointers plus byte lengths, which is everything an arch
+/// needs to build a non-owning `WeightTensor` view over pager-owned storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertModulePtrs {
+    pub gate_up_ptr: u64,
+    pub gate_up_len: usize,
+    pub down_ptr: u64,
+    pub down_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1351,25 +1378,43 @@ impl WeightPager {
         {
             self.evict_lru_until(need, gpu)?;
         }
-        let (tensor, gate_up_rel, down_rel) = if module_requires_host_repack(&module) {
-            let disk_bytes = self
-                .transport
-                .read_host(module.data_offset, module.data_size, gpu)?;
-            let prepared = prepare_expert_module(&module, &disk_bytes)?;
-            let tensor = gpu.upload_raw(&prepared.bytes, &[prepared.bytes.len()])?;
-            (tensor, prepared.gate_up_rel, prepared.down_rel)
-        } else {
-            let (tensor, _handle) =
-                self.transport
-                    .fetch(module.data_offset, module.data_size, gpu)?;
-            // Split gate_up always takes the relayout branch above, so a module
-            // reaching here must carry a pre-fused gate_up.
-            let gate_up_rel = find_module_tensor_rel_ptr(&module, ModuleRole::GateUp)
-                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            let down_rel = find_module_tensor_rel_ptr(&module, ModuleRole::Down)
-                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            (tensor, gate_up_rel, down_rel)
-        };
+        let (tensor, gate_up_rel, down_rel, gate_up_len, down_len) =
+            if module_requires_host_repack(&module) {
+                let disk_bytes =
+                    self.transport
+                        .read_host(module.data_offset, module.data_size, gpu)?;
+                let prepared = prepare_expert_module(&module, &disk_bytes)?;
+                let tensor = gpu.upload_raw(&prepared.bytes, &[prepared.bytes.len()])?;
+                (
+                    tensor,
+                    prepared.gate_up_rel,
+                    prepared.down_rel,
+                    prepared.gate_up_len,
+                    prepared.down_len,
+                )
+            } else {
+                let (tensor, _handle) =
+                    self.transport
+                        .fetch(module.data_offset, module.data_size, gpu)?;
+                // Split gate_up always takes the relayout branch above, so a module
+                // reaching here must carry a pre-fused gate_up.
+                let find = |want| {
+                    module
+                        .tensors
+                        .iter()
+                        .find(|t| module_tensor_role(&t.name) == Some(want))
+                        .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))
+                };
+                let gate_up = find(ModuleRole::GateUp)?;
+                let down = find(ModuleRole::Down)?;
+                (
+                    tensor,
+                    gate_up.rel_offset,
+                    down.rel_offset,
+                    gate_up.data_size,
+                    down.data_size,
+                )
+            };
         let base = tensor.buf.as_ptr() as usize;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident_modules.insert(
@@ -1379,6 +1424,8 @@ impl WeightPager {
                 bytes: need,
                 gate_up_ptr: base.saturating_add(gate_up_rel) as u64,
                 down_ptr: base.saturating_add(down_rel) as u64,
+                gate_up_len,
+                down_len,
             },
         );
         self.module_lru.push_back(key);
@@ -1667,6 +1714,25 @@ impl WeightPager {
     /// The configured residency policy.
     pub fn policy(&self) -> ResidencyPolicy {
         self.config.policy
+    }
+
+    /// Where a resident expert's two projections live inside the module's
+    /// single owning allocation.
+    ///
+    /// Intended for [`ResidencyPolicy::PinAll`] adopters, which build
+    /// non-owning `WeightTensor` views over pager-owned storage once at load
+    /// instead of allocating per expert. Under `LazyLru` these pointers are
+    /// only valid until the module is evicted, so use
+    /// `patch_expert_module_ptr_table` there rather than caching them.
+    ///
+    /// `None` if the module is not currently resident.
+    pub fn expert_module_ptrs(&self, key: ExpertModuleKey) -> Option<ExpertModulePtrs> {
+        self.resident_modules.get(&key).map(|m| ExpertModulePtrs {
+            gate_up_ptr: m.gate_up_ptr,
+            gate_up_len: m.gate_up_len,
+            down_ptr: m.down_ptr,
+            down_len: m.down_len,
+        })
     }
 }
 
@@ -2212,6 +2278,10 @@ mod tests {
             &prepared.bytes[prepared.down_rel..prepared.down_rel + len],
             &w2[..]
         );
+        // The fused region spans BOTH halves — a view built with only the gate
+        // half's length would clip the matrix it is supposed to describe.
+        assert_eq!(prepared.gate_up_len, 2 * len);
+        assert_eq!(prepared.down_len, len);
     }
 
     /// Layout follows the ROLE, not the on-disk order. An artifact that
