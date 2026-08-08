@@ -1,0 +1,244 @@
+# MoE Expert Residency — One Unit, Two Policies
+
+Status: proposed (2026-08-08)
+
+## Why
+
+Four arch crates load routed MoE experts four different ways, and the
+difference is not architectural — it is who happened to write the loader:
+
+| Arch | Expert residency | Owning device allocations |
+|---|---|---|
+| `hipfire-arch-deepseek4` (`src/arch.rs:298-357`) | host-side `combined` concat across owned experts, one upload, ptr table = `base + local*stride` | ~2 per layer |
+| `hipfire-arch-minimax` (`src/minimax.rs:686-760`) | same compact-blob pattern, EP-shard aware | ~2 per layer |
+| `hipfire-arch-qwen35` (`src/qwen35/loading.rs:1191-1221`) | slab-aliased, **or** per-tensor, **or** pager-paged, **or** stacked `[E,M,K]` aliases | 1 per 512 MiB bank … or 2 × n_exp × n_layers |
+| `hipfire-arch-lfm2moe` (`src/lfm2moe.rs:838-885`) | per-expert `upload_wt_raw` for gate_up and down | 2 × n_exp × n_layers |
+
+`Gpu::upload_raw` is a bare `hipMalloc` with no pooling
+(`crates/hipfire-rdna/src/dispatch/mod.rs:2018`), so the unpacked shape means
+one buffer object per expert per projection. On a 256-expert / 40-layer
+artifact that is 20,480 BOs. Upstream `warpfront/hipfire` measured that exact
+count at **4.35 GB of pure allocator overhead** on a 7900 XTX with zero change
+in requested payload bytes (PR #534 discussion, fixed there by packing to 80
+owners). Two of our four loaders already avoid it; two do not.
+
+Meanwhile eviction — the other answer to the same problem — is reachable by
+exactly one arch, and only because that arch is the one that called the pager.
+
+## The assumption to retire
+
+Packing and paging are not alternatives, and the pager is not qwen-specific.
+
+`WeightPager` and `hfq_modules` both live in `hipfire-runtime` and are generic
+in `WeightId::Expert { layer, expert, role }`, `ExpertRole`, `ExpertShape`, and
+`HfqModuleKind`. Qwen appears only in doc comments naming the v0.1 target
+(`weight_pager.rs:8`, `:70`, `:917`).
+
+More importantly, the pager's **module** path already *is* packing:
+`register_expert_module` (`weight_pager.rs:1025`) requires a record whose
+`gate_up_proj` and `down_proj` are both locatable by
+`find_module_tensor_rel_ptr`, and `ensure_expert_module_resident` (`:1191`)
+sizes **one** allocation via `module_resident_len` (`:651`) and tracks it in a
+module LRU. One owning buffer, several logical tensors at relative offsets,
+plus eviction. Consolidated ownership and eviction already coexist there.
+
+The real constraint is only that **the pack unit and the page unit must be the
+same unit**. Everything else was wiring.
+
+## What already exists
+
+The container work is done, and it is already arch-neutral:
+
+- **Every MoE `.hfq` ships a routed-expert module table.** The quantizer emits
+  `hfqm_modules` (`hipfire-quantize/src/hfq_out.rs:451-530`, format
+  `hipfire.hfqm.modules.v1`) into the tail metadata, with per-module
+  `data_offset` / `data_size` and per-tensor `rel_offset` / `quant_type` /
+  `shape` / `group_size`.
+- **Grouping is family-independent already.** `expert_key`
+  (`hfq_out.rs:406-413`) finds a `layers.<N>` segment and an `experts.<E>`
+  segment anywhere in the dotted name, so it matches
+  `layers.{L}.ffn.experts.{e}.w1` (deepseek4),
+  `…mlp.experts.{e}.gate_up_proj` (qwen35),
+  `…block_sparse_moe.experts.{e}.w1` (minimax) and
+  `…feed_forward.experts.{e}.w1` (lfm2moe) without change. The comment at
+  `:428-430` states the intent outright: "every expert a contiguous page-in
+  unit while remaining independent of the model-family name."
+- **`canonical_tensor_order` already lays each expert out contiguously**
+  (`hfq_out.rs:431`), which is what makes a module a single-range page-in.
+- **The format already carries a policy field**: `placement_policy`, currently
+  hardcoded to `"lazy_lru"` (`hfq_out.rs:509`).
+- **The consumer ABI is already common.** All four archs hand kernels the same
+  thing: a device `u64` pointer table per projection role, `[2 * n_exp]` F32
+  slots (`qwen35/layout.rs:96-100`, `lfm2moe.rs:546-547`,
+  `deepseek4.rs:347-355`). `patch_expert_ptr_table` (`weight_pager.rs:1270`)
+  already writes into it arch-agnostically.
+- `hipfire_runtime::oq_moe` already holds the shared OQ4 / OQ+compact →
+  MoE-block repack helpers all four loaders call.
+
+So this is not a new subsystem. It is connecting a finished container feature
+to three arch crates that never called it, and adding the one policy the
+runtime side is missing.
+
+## Architecture
+
+### 1. Residency policy on the pager
+
+`PagerConfig` (`weight_pager.rs:850`) currently has `vram_budget_bytes` and
+`trace`; eviction is implicitly always-on and disabled only by setting the
+budget to `u64::MAX`. Make the intent explicit:
+
+```rust
+pub enum ResidencyPolicy {
+    /// Every registered module stays resident for the model's lifetime.
+    /// Equivalent to today's hand-rolled packing: one owning allocation per
+    /// module, no eviction, no per-token admission.
+    PinAll,
+    /// Admit on demand, evict LRU against a byte budget. Today's behavior.
+    LazyLru { vram_budget_bytes: u64 },
+}
+```
+
+`PinAll` is not a new mechanism — it is `ensure_expert_module_resident` with
+eviction switched off and admission hoisted to load time. Packing becomes the
+degenerate case of paging at 100% residency, which is why one code path can
+serve both.
+
+Honor `placement_policy` from the module record as the default, so an artifact
+can express its own intent, with the runtime free to override on VRAM
+pressure.
+
+### 2. Finish the role-rank table
+
+`expert_role_rank` (`hfq_out.rs:415-426`) maps
+`gate_up_proj` / `gate_proj` → 0, `up_proj` → 1, `down_proj` → 2, everything
+else → 3. deepseek4, minimax, and lfm2moe name their projections `w1` / `w3` /
+`w2`, so all three land in the unordered bucket and get no deterministic role
+ordering within a module. Extend the table (`w1` → 0, `w3` → 1, `w2` → 2).
+
+This changes canonical tensor order for those families, so it **moves their
+artifact hashes** — see Risks.
+
+### 3. Arch adoption seam
+
+An arch opts in by supplying what is genuinely arch-specific and nothing else:
+
+- **Fusion**: whether `gate_up` arrives pre-fused (qwen35) or as `w1`‖`w3` to
+  byte-concat (the other three).
+- **Repack**: which `oq_moe` helper applies, if any.
+- **EP ownership predicate**: `|expert| -> bool`, plus the non-owned pointer
+  policy. deepseek4's rule is genuinely its own — non-owned `gate_up` points at
+  a shared *zeroed* dummy so SwiGLU(0,0)=0 contributes nothing, and non-owned
+  `down` reuses the base because its input is zero regardless
+  (`arch.rs:174-185`). That reasoning stays in deepseek4.
+- **AWQ sidecar convention**: lfm2moe attaches one per-layer scale to expert 0
+  (`lfm2moe.rs:894-912`); qwen35 loads per-tensor.
+- **Per-expert dtype bookkeeping**: qwen35 tracks
+  `expert_gate_up_dtypes: Vec<DType>` because mixed-precision induction can
+  leave one expert at BF16 (`layout.rs:115-121`).
+
+Everything else — module registration, allocation, pointer-table construction
+and patching, residency accounting — moves behind the shared unit.
+
+### 4. What deliberately does not change
+
+- **qwen35's slab path stays.** It reaches the same end state by a different
+  mechanism (alias into 512 MiB banks) and is the default on UMA
+  (`HIPFIRE_GPU_SLAB_LOAD=auto` → `gpu.integrated`, `loading.rs:2435-2445`).
+  It is not a loader to unify; it is a second residency backend that already
+  works.
+- **Forward paths stay untouched.** Every arch keeps reading the same pointer
+  table with the same layout. Only the addresses inside it change, from N
+  independent BOs to `base + offset`.
+
+## Phases
+
+Each phase lands independently and is gated before the next starts.
+
+**Phase 0 — parity harness. DONE (2026-08-08).** The gate was red on 14 cells
+across exactly the families this plan touches, so it could not serve as a parity
+oracle. Triaged by bisecting against a worktree at the baseline-record commit
+`5dc01e4b0`:
+
+| cells | verdict |
+|---|---|
+| deepseek4 `oq8`/`oq8+`/`oq8++`, deepseek4_compressed ×3 (6) | **real regression** — green at `0060481ee`, red at `8b9ee5392` |
+| lfm2_moe `oq8`, `oq8+`, `quantize:oq8++` (3) | **real regression** — same boundary |
+| minimax 4 `oq4` cells + `quantize:oq8++` (5) | **pre-existing**, fails identically at `5dc01e4b0` |
+
+Root cause of the 9 regressed cells, all one commit: `8b9ee5392` inserted an
+**unguarded `_` wildcard arm above the `oq8` literals** in
+`HfqInputFormat::from_flag` (`hipfire-quantize/src/main.rs:3919`), replacing a
+guarded `_ if parse_opus_mixed_format(flag).is_some()`. That made
+`"oq8"` / `"oq8+"` / `"oq8++"` unreachable, so `from_flag` returned `None` for
+every OQ8 flag and each call site degraded differently — silently skipped
+tensors (lfm2_moe scoring KLD exactly 0.000000), a wrong-format fallback
+(deepseek4 at 0.0387), or the "no LDLQ-eligible tensors were attempted" hard
+error. `oq4` was unaffected because its arm sits above the wildcard. rustc
+reported the whole thing as `unreachable_patterns`; the warning was the
+diagnosis.
+
+Fixed by ordering: `oq8` arms moved above the wildcard, with a comment pinning
+why the wildcard must stay last. Result — deepseek4, deepseek4_compressed and
+lfm2_moe fully green; whole-gate failures 14 → 7.
+
+**The fix also unmasked minimax.** Its `oq8`/`oq8+` cells were passing only
+because the quantizer was not producing OQ8 at all; with OQ8 restored, minimax
+shows its true 7 failing Opus cells — the exact numbers recorded as an inherited
+breakage in `2026-08-05-opus-across-model-families.md:82-93` (oq4 0.003531,
+oq8 0.000259). That earlier note's scoping table predicted this shape:
+honouring `SourcePrecision` across all formats regressed minimax by "oq8 37x,
+oq4 2.7x", and 0.003531/0.001294 = 2.7x. **minimax remains the one family this
+plan cannot use as an oracle**; scope with `HIPFIRE_TINYQUANT_FAMILIES` to
+exclude it until that cause is found.
+
+**Phase 1 — `ResidencyPolicy::PinAll`.** Add the policy to `PagerConfig`, wire
+`PinAll` through `ensure_expert_module_resident` / `evict_lru_until`. qwen35
+keeps `LazyLru`, so its behavior is byte-identical. Validate: pager unit tests
+plus an unchanged qwen3_5_moe gate row.
+
+**Phase 2 — lfm2moe onto the shared unit.** Smallest blast radius: it has
+neither packing nor paging today, so it gains both. Expected BO count for
+routed experts drops from `2 × n_exp × n_layers` to one per expert module
+(`PinAll`), and eviction becomes available by config. Validate: `lfm2_moe`
+quant+state rows unchanged; log resident BO count before/after.
+
+**Phase 3 — role-rank table + deepseek4 and minimax.** Land the `w1`/`w3`/`w2`
+role ranks, re-record the affected tiny fixture hashes in the same commit
+(canonical order changes → hashes change; this is the
+`tiny-gate-baselines-fp16-drift` situation again, so scope `--record` to the
+affected FAMILIES only). Then migrate both loaders, keeping their EP predicates
+as inputs. Validate: `deepseek4`, `deepseek4_compressed`, `minimax` rows
+against the re-recorded baselines, plus a multi-GPU EP smoke on medusa.
+
+**Phase 4 — enable eviction where it pays.** deepseek4 is the arch that wants
+it most: the largest expert footprint, and today its only answer to not fitting
+is EP sharding across N GPUs, which does nothing for a single-card user. Gate
+on a measured decode-latency delta, not on the mechanism working.
+
+## Risks
+
+- **Device addresses and allocation counts change.** This is exactly where
+  upstream's equivalent packing fix hit a gfx12 HipGraph regression and had to
+  ship gfx11-only. Any HipGraph-captured MoE path needs an explicit gfx11 vs
+  gfx12 A/B before the default flips.
+- **Canonical tensor order is artifact-visible.** Phase 3 moves hashes for
+  three families. Re-record deliberately, in the same commit, scoped by family.
+- **`PinAll` must not silently regress into paging.** If a `PinAll` model does
+  not fit, failing closed with a named error beats thrashing an LRU nobody
+  asked for.
+- **Non-owned EP pointer policy is load-bearing correctness**, not an
+  optimization. Preserve deepseek4's zeroed-dummy semantics verbatim when it
+  moves behind the shared unit; a wrong pointer there is silent numerical
+  corruption, not a crash.
+
+## Open questions
+
+- Should the page/pack unit ever be coarser than one expert (a bucket of K
+  experts, one BO)? Fewer BOs and fewer admissions, but coarser eviction. The
+  module record format already permits it — `module_id` is a free-form string —
+  so this is a policy choice, not a format change. Defer until Phase 4 gives a
+  measured admission-rate number.
+- `hipfire-arch-zaya`, `-cohere2`, `-nemotron`: their expert handling in the
+  code surveyed so far is host-f32 and calibration-stream paths. Their
+  device-side residency was not traced and is out of scope here; confirm before
+  claiming coverage.
