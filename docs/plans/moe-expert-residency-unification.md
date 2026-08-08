@@ -317,7 +317,18 @@ on a measured decode-latency delta, not on the mechanism working.
   coarser unit is required for any *pinned* adopter whose experts outnumber its
   layers, which is every large MoE. It stays optional for paging, where bounded
   residency already caps the allocation count.
-- `hipfire-arch-zaya`, `-cohere2`, `-nemotron`: their expert handling in the
-  code surveyed so far is host-f32 and calibration-stream paths. Their
-  device-side residency was not traced and is out of scope here; confirm before
-  claiming coverage.
+- ~~`hipfire-arch-zaya`, `-cohere2`, `-nemotron` device-side residency not
+  traced.~~ **Traced (2026-08-08):**
+  - **nemotron — unpacked.** `model.rs:334` loops routed experts calling
+    `load_linear_hfq(hfq, gpu, …)` per projection, so one device allocation per
+    projection per expert per layer.
+  - **zaya — unpacked.** `gpu.rs:363` `GpuExpert { gate_up, down }`, one record
+    per expert with two owning `LinearWeight`s, freed individually at `:437`.
+  - **cohere2 — no device-side routed-expert path** in `src/*.rs`; its per-expert
+    loops are calibration-stream only.
+
+  So the per-expert-unpacked shape was never unique to lfm2moe: **three arches
+  had it** (lfm2moe, now converted, plus zaya and nemotron). That raises the
+  value of the shared unit above what this plan assumed when it picked lfm2moe as
+  the only adopter, and it is an argument for resolving the Phase 3 fork in
+  favour of a real shared implementation rather than leaving each arch its own.
