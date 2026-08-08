@@ -12,7 +12,8 @@
 
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{
-    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT as OQ4_QT,
+    decode_bf16_packed, oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT,
+    OQ4_CANONICAL_QT as OQ4_QT,
 };
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::quant::f16_to_f32;
@@ -377,6 +378,33 @@ fn wt_from_raw(
                 .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
             return upload_wt_oq(gpu, &bytes, dtype, m, k);
         }
+        // A lossless recoding left packed — Bf16Lut3 under the default-on
+        // HIPFIRE_BF16L3_RESIDENT head policy, or Bf16Huff. Decode to plain
+        // bf16 rather than keeping it packed: only a GEMV consumer can read the
+        // packed form (`gemv_bf16l3_xf32` is batch-1) and there is no BF16L3
+        // GEMM, so a packed linear weight works at decode and is wrong at
+        // prefill. Without this arm the generic `dtype_for_quant_type`
+        // fallthrough below uploaded the packed bytes tagged as a logical
+        // dtype, which is what regressed all 7 minimax Opus KLD cells in
+        // `1fa0f04dd` — that commit taught six loaders this and minimax was
+        // not one of them. Mirrors `transformer_loader::load_weight`.
+        qt @ (49 | 50) => {
+            let logical = decode_bf16_packed(qt, data, m * k)
+                .ok_or_else(|| format!("minimax: failed to decode recoded weight (qt={qt})"))?;
+            let mut buf = gpu
+                .upload_raw(&logical, &[logical.len()])
+                .map_err(|e| format!("upload_raw: {e:?}"))?;
+            buf.dtype = DType::BF16;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
         _ => {}
     }
     if let Some((bytes, dtype)) = oq8_arch_load(qt, data, m, k) {
@@ -592,7 +620,21 @@ impl MiniMaxWeights {
         let n_exp = cfg.num_local_experts;
 
         // Globals.
-        let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        let (embed_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        // The gather cannot read a packed recoding: a lookup reads one arbitrary
+        // row, while BF16L3's escape plane is only addressable by walking a
+        // block. `embed_tokens` is a head tensor, so the default-on
+        // HIPFIRE_BF16L3_RESIDENT policy hands it over still packed — decode it,
+        // which is exactly what the `HIPFIRE_BF16L3_RESIDENT=0` arm produced.
+        // Previously the quant_type was discarded here and the packed bytes went
+        // to the GPU as-is.
+        let embed_bytes = match embed_qt {
+            49 | 50 => decode_bf16_packed(embed_qt, &embed_bytes, cfg.vocab_size * hidden)
+                .ok_or_else(|| {
+                    format!("minimax: failed to decode recoded embedding (qt={embed_qt})")
+                })?,
+            _ => embed_bytes,
+        };
         let embed = gpu
             .upload_raw(&embed_bytes, &[embed_bytes.len()])
             .map_err(|e| format!("minimax: upload embed: {e:?}"))?;

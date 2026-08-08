@@ -2694,7 +2694,7 @@ pub const ENV_HIPFIRE_MINIMAX_DOWN_FORMAT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ",
     description: "down-AWQ harmful (shared s_down bad approx); opt-in",
-    source: "crates/hipfire-arch-minimax/src/minimax.rs:794",
+    source: "crates/hipfire-arch-minimax/src/minimax.rs:836",
 };
 
 /// `HIPFIRE_MINIMAX_EXPERT_MQ2L` — Set (to any value) to emit MiniMax routed experts as MQ2-Lloyd, the sub-4-bit hipx target. Equivalent to `--format mq2-lloyd` for the experts alone.
