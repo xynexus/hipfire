@@ -291,11 +291,11 @@ pub async fn fetch_file_streamed_with_retry(
                     delay = (delay * 2).min(std::time::Duration::from_secs(30));
                 }
                 if attempt % 5 == 0 || after == before {
-                    eprintln!(
+                    sink.note(&format!(
                         "hub: {} at {:.2} GB — attempt {attempt} ({m})",
                         f.path,
                         after as f64 / 1e9
-                    );
+                    ));
                 }
                 tokio::time::sleep(delay).await;
             }

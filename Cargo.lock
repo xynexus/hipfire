@@ -1783,6 +1783,7 @@ dependencies = [
  "hipfire-steer",
  "hipfire-steer-harness",
  "hipfire-xdna",
+ "indicatif",
  "libc",
  "serde",
  "serde_json",

@@ -53,9 +53,21 @@ use crate::repack::{
 /// counts as plausible.
 const MAX_HEADER: u64 = 512 << 20;
 
-/// How often to print progress. Long enough not to clutter a log, short enough
-/// that a stalled transfer becomes obvious quickly.
-const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to emit a progress *line*. Long enough not to clutter a log, short
+/// enough that a stalled transfer becomes obvious quickly.
+const LINE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often to refresh the bar's caption. A bar is watched live, so a figure
+/// five seconds stale reads as frozen; the bar's own position updates on every
+/// chunk regardless, throttled by indicatif's draw target.
+const BAR_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long without a single new byte before the transfer is called stalled.
+///
+/// This is the state the whole feature exists to surface: a real fetch sat at
+/// ~90 MB for over three minutes mid-shard. Saying so outright beats leaving the
+/// reader to notice that a number has not changed.
+const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Below these, a rate estimate is dominated by connection setup rather than
 /// throughput, and the ETA it implies is worse than none: the first sample of a
@@ -65,17 +77,31 @@ const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 const ETA_MIN_BYTES: u64 = 4 << 20;
 const ETA_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Periodic progress for a transfer that can run for hours.
+/// Progress for a transfer that can run for hours, in whichever form the
+/// terminal can carry.
 ///
 /// Without it the run is silent between the opening line and the summary. On a
 /// 272 MB model over a slow link that was 11 minutes of nothing; on a
 /// multi-hundred-GB one it is indistinguishable from a hang, which is exactly
 /// how it was misread during bring-up.
 ///
-/// Rate and ETA are computed over the whole run rather than the last interval.
+/// # Why both a bar and lines
+///
+/// A bar is the better thing to watch, but indicatif hides itself when stderr
+/// is not a terminal — and a multi-hour fetch is usually run detached, under
+/// `nohup` or CI or ssh, which is precisely where the output matters most.
+/// Rendering only a bar would hand those runs *nothing*, strictly worse than
+/// the lines they have today. So the bar is the interactive form and the
+/// periodic line is the recorded one, and both read the same counters.
+///
+/// # Why the rate is measured over the whole run
+///
 /// A link that drops and resumes then reports the throughput actually being
 /// achieved, instead of a figure that swings between zero and line speed every
-/// time a connection stalls.
+/// time a connection stalls. Stalling is reported explicitly instead, which is
+/// the honest signal — and the reason there is deliberately no `steady_tick`
+/// here: a spinner that keeps animating through a stall makes a dead transfer
+/// look alive, defeating the point of showing progress at all.
 struct Progress {
     /// Total source bytes across every file in the fetch.
     total: u64,
@@ -84,48 +110,120 @@ struct Progress {
     /// Source bytes accepted for the file in flight.
     cur: u64,
     started: std::time::Instant,
+    /// Last time a line was printed or the bar's caption refreshed.
     last: std::time::Instant,
+    /// The high-water mark, and when it was last raised — the basis for calling
+    /// a transfer stalled.
+    watermark: u64,
+    moved_at: std::time::Instant,
+    /// `None` when stderr is not a terminal, which selects line mode.
+    bar: Option<indicatif::ProgressBar>,
 }
 
 impl Progress {
     fn new(total: u64) -> Self {
         let now = std::time::Instant::now();
+        // 4 Hz matches the draw rate hipfire-quantize settles on.
+        let bar = indicatif::ProgressBar::with_draw_target(
+            Some(total),
+            indicatif::ProgressDrawTarget::stderr_with_hz(4),
+        );
+        let bar = if bar.is_hidden() {
+            // Detached: leave a log behind rather than draw to nobody.
+            None
+        } else {
+            bar.set_style(
+                // `decimal_*`, not `{bytes}`: indicatif's default is binary, and
+                // a bar reading `259.82 MiB` beside a log line reading `272 MB`
+                // for the same fetch invites the reader to hunt for a
+                // discrepancy that is not there. The line mode's units are
+                // decimal, so these are too.
+                indicatif::ProgressStyle::with_template(
+                    "hub: [{bar:32}] {decimal_bytes}/{decimal_total_bytes} {msg}",
+                )
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                .progress_chars("=> "),
+            );
+            Some(bar)
+        };
         Progress {
             total,
             done: 0,
             cur: 0,
             started: now,
             last: now,
+            watermark: 0,
+            moved_at: now,
+            bar,
         }
     }
 
     fn advance(&mut self, n: usize, label: &str) {
         self.cur += n as u64;
-        // The first line is due one interval in, so a fetch that finishes
-        // quickly — every unit test, most small repos — prints nothing extra.
-        if self.last.elapsed() < PROGRESS_EVERY {
+        let got = self.done + self.cur;
+        if got > self.watermark {
+            self.watermark = got;
+            self.moved_at = std::time::Instant::now();
+        }
+        if let Some(b) = &self.bar {
+            // Cheap and atomic, so the bar keeps moving between caption
+            // refreshes; the draw target throttles actual redraws.
+            b.set_position(got);
+        }
+        let every = if self.bar.is_some() {
+            BAR_EVERY
+        } else {
+            LINE_EVERY
+        };
+        // The first report is due one interval in, so a fetch that finishes
+        // quickly — every unit test, most small repos — emits nothing extra.
+        if self.last.elapsed() < every {
             return;
         }
-        let elapsed = self.started.elapsed();
         self.last = std::time::Instant::now();
-        let got = self.done + self.cur;
+        let tail = self.tail(label, got);
+        match &self.bar {
+            Some(b) => b.set_message(tail),
+            None => eprintln!(
+                "hub: {} ({:.0}%) — {tail}",
+                fmt_pair(got, self.total),
+                if self.total > 0 {
+                    got as f64 / self.total as f64 * 100.0
+                } else {
+                    0.0
+                },
+            ),
+        }
+    }
+
+    /// `<file> — <rate> — eta <t>`, or a stall notice in place of the ETA.
+    /// Shared by both modes so they can never disagree.
+    fn tail(&self, label: &str, got: u64) -> String {
+        let stalled = self.moved_at.elapsed();
+        if stalled >= STALL_AFTER {
+            return format!("{label} — stalled {}", fmt_dur(stalled.as_secs()));
+        }
+        let elapsed = self.started.elapsed();
         let rate = got as f64 / elapsed.as_secs_f64().max(1e-3);
-        let pct = if self.total > 0 {
-            got as f64 / self.total as f64 * 100.0
-        } else {
-            0.0
-        };
-        let eta = if got >= ETA_MIN_BYTES && elapsed >= ETA_MIN_ELAPSED && rate > 0.0 && self.total > got
+        let eta = if got >= ETA_MIN_BYTES
+            && elapsed >= ETA_MIN_ELAPSED
+            && rate > 0.0
+            && self.total > got
         {
             fmt_dur(((self.total - got) as f64 / rate) as u64)
         } else {
             "--".to_string()
         };
-        eprintln!(
-            "hub: {} ({pct:.0}%) — {label} — {:.1} MB/s — eta {eta}",
-            fmt_pair(got, self.total),
-            rate / 1e6,
-        );
+        format!("{label} — {:.1} MB/s — eta {eta}", rate / 1e6)
+    }
+
+    /// Print around the bar rather than through it. An unsynchronised write to
+    /// stderr would corrupt a live bar mid-redraw.
+    fn note(&self, msg: &str) {
+        match &self.bar {
+            Some(b) => b.suspend(|| eprintln!("{msg}")),
+            None => eprintln!("{msg}"),
+        }
     }
 
     fn finish_file(&mut self) {
@@ -136,8 +234,19 @@ impl Progress {
     /// The in-flight file restarted, so its bytes no longer count toward the
     /// total transferred. Without this an ignored `Range` would inflate the
     /// figure past 100%.
+    ///
+    /// The watermark is left alone deliberately: it tracks whether bytes are
+    /// still arriving at all, and a restart is not a stall.
     fn restart_file(&mut self) {
         self.cur = 0;
+        self.moved_at = std::time::Instant::now();
+    }
+
+    /// Clear the bar so the summary that follows lands on a clean line.
+    fn finish(&self) {
+        if let Some(b) = &self.bar {
+            b.finish_and_clear();
+        }
     }
 }
 
@@ -285,6 +394,7 @@ impl StreamPacker {
     /// Write the index and trailer. `src_bytes` is the summed size of the
     /// source files, for the ratio line.
     pub fn finish(self, src_bytes: u64) -> io::Result<u64> {
+        self.progress.finish();
         let n_files = self.aw.n_files();
         let (total, stats) = self.aw.finish()?;
         eprintln!("{}", repack::summary(n_files, total, src_bytes, &stats));
@@ -405,6 +515,10 @@ impl ByteSink for StreamPacker {
         let label = cur.as_ref().map(|c| c.rel.as_str()).unwrap_or("?");
         progress.advance(bytes.len(), label);
         Ok(())
+    }
+
+    fn note(&self, msg: &str) {
+        self.progress.note(msg);
     }
 
     /// Restart the in-flight file from byte zero.
