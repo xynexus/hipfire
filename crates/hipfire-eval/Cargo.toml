@@ -32,6 +32,20 @@ serde_json = "1"
 # heavy arrow dep — we use the record reader. See memory
 # `project-parquet-crate-training-port`: hipfire-train's data loading should port
 # onto this crate too.
-parquet = { version = "54", default-features = false, features = ["snap", "zstd", "flate2"] }
+# 59, not 54: every parquet from 54 through 58 pins `thrift = "^0.17"`, and
+# thrift 0.17 carries GHSA-2f9f-gq7v-9h6m, an excessive-allocation DoS on
+# malformed input (fixed in thrift 0.23, which `^0.17` cannot reach). arrow-rs
+# dropped the thrift dependency outright in 59, so this does not upgrade the
+# vulnerable crate — it removes it from the tree.
+#
+# 59 also splits `flate2` into backend-specific features and refuses to build
+# without one; `flate2-rust_backend` is miniz_oxide, which is what the old bare
+# `flate2` feature already resolved to, so codec behaviour is unchanged.
+parquet = { version = "59", default-features = false, features = [
+    "snap",
+    "zstd",
+    "flate2",
+    "flate2-rust_backend",
+] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
