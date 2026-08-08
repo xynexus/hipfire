@@ -205,15 +205,13 @@ impl Progress {
         }
         let elapsed = self.started.elapsed();
         let rate = got as f64 / elapsed.as_secs_f64().max(1e-3);
-        let eta = if got >= ETA_MIN_BYTES
-            && elapsed >= ETA_MIN_ELAPSED
-            && rate > 0.0
-            && self.total > got
-        {
-            fmt_dur(((self.total - got) as f64 / rate) as u64)
-        } else {
-            "--".to_string()
-        };
+        let eta =
+            if got >= ETA_MIN_BYTES && elapsed >= ETA_MIN_ELAPSED && rate > 0.0 && self.total > got
+            {
+                fmt_dur(((self.total - got) as f64 / rate) as u64)
+            } else {
+                "--".to_string()
+            };
         format!("{label} — {:.1} MB/s — eta {eta}", rate / 1e6)
     }
 
@@ -579,7 +577,11 @@ pub async fn fetch_to_archive(
         let mut st = StreamProgress::new(f);
         packer.begin_file(f)?;
         match hipfire_hub::run::fetch_file_streamed_with_retry(
-            repo, revision, f, &mut st, &mut packer,
+            repo,
+            revision,
+            f,
+            &mut st,
+            &mut packer,
         )
         .await
         {

@@ -503,7 +503,11 @@ pub(crate) fn encode_and_store(
     piece: &Piece,
     buf: Vec<u8>,
 ) -> std::io::Result<Entry> {
-    debug_assert_eq!(buf.len() as u64, piece.len, "piece filled to the wrong size");
+    debug_assert_eq!(
+        buf.len() as u64,
+        piece.len,
+        "piece filled to the wrong size"
+    );
     aw.stats.before += piece.len;
     let src_hash = xxh3(&buf);
     let (codec, bytes) = encode_piece(&piece.dtype, buf);
@@ -882,13 +886,13 @@ pub fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     for fe in files {
         let path = fe.get("path").and_then(|v| v.as_str()).unwrap_or("?");
         let tally = |res: std::io::Result<u64>,
-                         want: Option<u64>,
-                         what: &str,
-                         checked: &mut usize,
-                         unchecked: &mut usize,
-                         bad: &mut usize,
-                         bytes: &mut u64,
-                         len: u64| match res {
+                     want: Option<u64>,
+                     what: &str,
+                     checked: &mut usize,
+                     unchecked: &mut usize,
+                     bad: &mut usize,
+                     bytes: &mut u64,
+                     len: u64| match res {
             Err(e) => {
                 println!("  READ-ERROR {path} {what}: {e}");
                 *bad += 1;
@@ -1032,10 +1036,10 @@ fn upgrade_archive(src: &Path, dst: &Path) -> Result<(), Box<dyn Error>> {
 
     // Copy one payload across, hashing the stored bytes on the way.
     let carry = |f: &mut File,
-                     w: &mut dyn Write,
-                     off: u64,
-                     len: u64,
-                     pos: &mut u64|
+                 w: &mut dyn Write,
+                 off: u64,
+                 len: u64,
+                 pos: &mut u64|
      -> std::io::Result<(u64, u64, Vec<u8>)> {
         f.seek(SeekFrom::Start(off))?;
         let start = *pos;
@@ -1218,7 +1222,11 @@ mod tests {
                 synth_safetensors(
                     &[
                         ("model.embed_tokens.weight", "BF16", bf16_weights(4096, 1)),
-                        ("model.layers.0.mlp.up.weight", "BF16", bf16_weights(8192, 2)),
+                        (
+                            "model.layers.0.mlp.up.weight",
+                            "BF16",
+                            bf16_weights(8192, 2),
+                        ),
                     ],
                     trailing,
                 ),
@@ -1479,7 +1487,13 @@ mod tests {
         let named: Vec<&str> = plan.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             named,
-            vec!["__unclaimed__@0", "a", "__unclaimed__@12", "b", "__unclaimed__@24"],
+            vec![
+                "__unclaimed__@0",
+                "a",
+                "__unclaimed__@12",
+                "b",
+                "__unclaimed__@24"
+            ],
             "expected leading, interior and trailing gaps around the tensors"
         );
         // A zero-length tensor owns no bytes and needs no piece; the header it is

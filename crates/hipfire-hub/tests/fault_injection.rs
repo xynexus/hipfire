@@ -533,23 +533,19 @@ async fn streamed_dropped_connection_resumes_without_duplicating() {
         &mut sink,
     )
     .await;
-    assert!(first.is_err(), "the dropped attempt should not have succeeded");
+    assert!(
+        first.is_err(),
+        "the dropped attempt should not have succeeded"
+    );
     let carried = st.consumed();
     assert!(
         carried > 0,
         "progress was discarded, so the retry would restart from zero"
     );
 
-    hipfire_hub::fetch_file_streamed(
-        &origin.base,
-        "org/model",
-        "main",
-        &file,
-        &mut st,
-        &mut sink,
-    )
-    .await
-    .expect("resume should complete and verify");
+    hipfire_hub::fetch_file_streamed(&origin.base, "org/model", "main", &file, &mut st, &mut sink)
+        .await
+        .expect("resume should complete and verify");
 
     assert_eq!(sink.resets, 0, "a clean resume must not reset the sink");
     assert_eq!(
@@ -595,18 +591,14 @@ async fn streamed_origin_ignoring_range_restarts_the_sink() {
     .await;
     assert!(st.consumed() > 0, "no partial to resume from");
 
-    hipfire_hub::fetch_file_streamed(
-        &origin.base,
-        "org/model",
-        "main",
-        &file,
-        &mut st,
-        &mut sink,
-    )
-    .await
-    .expect("a full 200 body should still verify");
+    hipfire_hub::fetch_file_streamed(&origin.base, "org/model", "main", &file, &mut st, &mut sink)
+        .await
+        .expect("a full 200 body should still verify");
 
-    assert_eq!(sink.resets, 1, "the sink should have been reset exactly once");
+    assert_eq!(
+        sink.resets, 1,
+        "the sink should have been reset exactly once"
+    );
     assert!(
         sink.got == body,
         "sink holds {} bytes for a {} byte body — the ignored Range spliced two attempts",
