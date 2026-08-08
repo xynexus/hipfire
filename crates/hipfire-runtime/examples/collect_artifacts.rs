@@ -303,6 +303,10 @@ fn main() {
     } else {
         &tokens_owned[..n_tok]
     };
+    // Refuse the frozen eval slice: calibrating on it trains on the test set.
+    if !corpus.is_empty() {
+        hipfire_runtime::calibration::reject_eval_corpus(&corpus).expect("calibration corpus");
+    }
     let kldref_topk = parity_job
         .as_ref()
         .map(|parity| parity.job.options.kldref_top_k)

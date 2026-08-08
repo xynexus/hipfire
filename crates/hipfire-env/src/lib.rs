@@ -231,6 +231,14 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    CALIB_ALLOW_EVAL_CORPUS = "HIPFIRE_CALIB_ALLOW_EVAL_CORPUS", Developer,
+        "Set 1 to allow calibrating on the frozen evaluation slice under \
+         `benchmarks/quality-baselines/`, which is otherwise refused. Doing so \
+         trains on the test set: it inflates every quality number and produces \
+         an inverted-U budget curve, because a calibration that has seen \
+         exactly the evaluated tokens scores best. The only honest use is \
+         deliberately measuring the size of that effect.";
+
     CALIB_SEQ_LEN = "HIPFIRE_CALIB_SEQ_LEN", Developer,
         "Split the calibration token stream into independent sequences of this \
          length instead of one long sequence. Attention is O(seq²), so a single \

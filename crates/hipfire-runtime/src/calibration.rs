@@ -37,6 +37,39 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
+/// Refuse to calibrate on the frozen evaluation slice.
+///
+/// `benchmarks/quality-baselines/slice/` is "the frozen prompt bytes used by
+/// every quant-quality eval" (its README); `benchmarks/calib/` holds the
+/// calibration corpora. Pointing calibration at the eval slice trains on the
+/// test set, and the damage is invisible in the numbers — it shows up as a
+/// large fake improvement plus an inverted-U budget curve, because a
+/// calibration that has seen exactly the evaluated tokens scores best.
+/// That cost this project a retracted "-13.6% from more calibration tokens"
+/// result (`docs/quant-formats/moe-expert-hessians.md`, Q7).
+///
+/// Set `HIPFIRE_CALIB_ALLOW_EVAL_CORPUS=1` to proceed anyway — the only honest
+/// use is deliberately measuring the size of the train-on-test effect.
+pub fn reject_eval_corpus(corpus: &str) -> Result<(), String> {
+    let is_eval = corpus.contains("quality-baselines");
+    if !is_eval || hipfire_env::CALIB_ALLOW_EVAL_CORPUS.get().is_some() {
+        if is_eval {
+            eprintln!(
+                "  calib: WARNING calibrating on the EVAL slice {corpus} \
+                 (HIPFIRE_CALIB_ALLOW_EVAL_CORPUS set) — results are train-on-test"
+            );
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "calib: {corpus} is the frozen EVALUATION slice, not a calibration corpus. \
+         Calibrating on it trains on the test set and silently inflates every \
+         quality number. Use a corpus from `benchmarks/calib/` (e.g. \
+         calib-multi-8m.txt), or set HIPFIRE_CALIB_ALLOW_EVAL_CORPUS=1 if you are \
+         deliberately measuring the train-on-test effect."
+    ))
+}
+
 /// The arch's imatrix-only substring list, or the `HIPFIRE_CALIB_IMATRIX_ONLY`
 /// override. Every arch blocks routed experts from full `[K,K]` Hessians by
 /// default (`vec![".experts."]`), because storing one per expert was assumed

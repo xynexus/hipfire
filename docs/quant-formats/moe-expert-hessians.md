@@ -210,17 +210,22 @@ budget (consistent with the router profiler's CJK finding). Median n/K went
 (747 s → 10659 s), so 32k is the practical ceiling on this path; the ~73k
 needed for median n/K ≈ 2 would be ~40 h.
 
-### The budget dominates everything else measured here
+### The budget appears to dominate — but this measurement is CONFOUNDED (see Q7)
 
 Same method, same code, only 4x the calibration tokens:
 
 **pooled `gate_up` @8k → @32k: −12.92% KLD** (0.555906 → 0.484070),
 95% CI [−17.89%, −7.95%], t = −5.10.
 
-That is **4x the effect of the pooled-Hessian change itself** (−3.09%). The
-8192-token calib was simply badly under-sampled. Attribution caveat: at 32k the
-360 dense Hessians improve too, so this is the whole-model benefit of 4x calib
-tokens, not something expert-specific.
+**⚠ RETRACTED as a budget effect.** Q7 found that the calibration corpus and
+the KLD reference are the SAME FILE read from offset 0, and the reference is
+tokens [0, 32768). So the 8k arm saw 25% of the evaluation set and the 32k arm
+saw exactly 100% of it and nothing else. The measured gain is at least partly
+train-on-test, not a budget effect. Do not cite this number.
+
+Attribution caveat that still applies if the effect is ever re-measured
+cleanly: at 32k the 360 dense Hessians improve too, so it would be the
+whole-model benefit of more calib tokens, not something expert-specific.
 
 ### Per-expert `down_proj` at 32k: neutral on most content, catastrophic on some
 
@@ -289,6 +294,55 @@ than ~40 h.
 Implemented for zaya (`arch-zaya/src/calibration.rs`); every arch's resident
 calibration has the same single-sequence shape and can adopt the same loop.
 
+## Q7 — the budget curve inverts, because the budget experiment was train-on-test
+
+Pushing to 131072 tokens (4x again, now affordable thanks to Q6) did not
+continue the trend. It reversed it:
+
+| calib tokens | mean_kld (pooled `gate_up`) | vs previous |
+|---|---|---|
+| 8k | 0.555906 | — |
+| 32k | 0.480360 | −13.59% |
+| 128k | 0.499066 | **+3.89%** |
+
+32k → 128k: **+3.89% WORSE**, 95% CI [+0.42%, +7.37%], t = +2.19 — the CI
+excludes zero, so the reversal is real, not noise.
+
+An inverted U in calibration size is a red flag, and the cause is a flaw in the
+experiment, not a property of calibration. **The calibration corpus and the KLD
+reference are the same file, both read from offset 0**, and the reference is
+`n_ctx=2048 x max_chunks=16` = tokens [0, 32768):
+
+| calib | tokens read | overlap with the evaluation set |
+|---|---|---|
+| 8k | [0, 8192) | 25% |
+| 32k | [0, 32768) | **exactly 100%, and nothing else** |
+| 128k | [0, 131072) | 100% plus 98k tokens of dilution |
+
+That reproduces the observed curve exactly: eval-set coverage climbs 25% → 100%
+(the apparent −13.6%), then extra data pulls the Hessian toward the wider
+corpus and away from the evaluated tokens (+3.9% back). It is textbook
+train-on-test, and it is the same generalisation failure `opus-quant.md` §7
+already records for `XᵀX` LDLQ — here amplified by an experiment that handed
+the calibration the answer sheet.
+
+**What this does and does not invalidate:**
+
+- **Invalid: the budget claim.** −12.92% / −13.59% must not be cited. Whether
+  calibration budget helps at all is now UNMEASURED on this model.
+- **Still valid: pooled `gate_up` (−3.09%) and the per-expert `down_proj`
+  results.** Both arms of each of those comparisons used the SAME calibration
+  artifact, so they consumed identical data. The absolute KLD is optimistic for
+  every arm equally; the DIFFERENCE between arms is unaffected.
+- **Still valid: Q6's 10.1x sequence-split speedup.** It is a timing result
+  with no statistical claim attached, and its quality check was a
+  no-difference test between two arms on the same tokens.
+
+The clean re-test is cheap now: calibrate from a corpus region DISJOINT from
+the reference's [0, 32768) — e.g. skip the first ~500k characters — and re-run
+the 8k/32k/128k sweep. Until that runs, "more calibration tokens" is not a
+supported recommendation.
+
 ## What to build, if anything
 
 - **`gate_up`: layer-pooled Hessian.** Q1 says pooling costs little
@@ -312,10 +366,15 @@ reduction tiles across model microbatches", and `CapturePolicy` already has a
 
 Settled by measurement:
 
-- **Raise the calibration token budget first, with `HIPFIRE_CALIB_SEQ_LEN=2048`.**
-  It is the largest lever found: −13.59% KLD for 4x the tokens, versus −3.09%
-  for the best Hessian-scoping change — and with the sequence split it costs
-  1065 s rather than 10746 s, so the old O(n²) objection is gone.
+- **Always calibrate on tokens DISJOINT from the evaluation set.** Q7 shows the
+  default of pointing both at the same corpus from offset 0 produces a large
+  fake improvement and an inverted-U budget curve. This is the most important
+  thing on this page.
+- **Use `HIPFIRE_CALIB_SEQ_LEN=2048` regardless.** It is a pure 10.1x capture
+  speedup at equal quality (Q6), independent of every statistical question here.
+- **Calibration token budget: UNMEASURED.** The −13.59% was train-on-test and
+  is retracted. Re-run the sweep on a disjoint corpus region before believing
+  any budget recommendation.
 - **Ship pooled `gate_up`** (`HIPFIRE_POOLED_EXPERT_HESSIAN=1`). −3.09% KLD,
   CI excludes zero, costs nothing to store and needs no new capture.
 - **Do NOT enable per-expert `down_proj`.** At 8k it bought −0.22% (CI spans
@@ -327,11 +386,12 @@ Settled by measurement:
 
 Open, in rough order of value:
 
-1. **Push the token budget further on the pooled arm**, which is where the
-   measured wins are. Now affordable (Q6): 128k tokens is ~70 min. Unknown
-   whether the budget lever keeps paying past 32k or saturates.
-   Port `HIPFIRE_CALIB_SEQ_LEN` to the other arches' resident calibration —
-   they all share the single-sequence shape.
+1. **Re-run the 8k/32k/128k budget sweep on a corpus region disjoint from the
+   reference** (Q7). Everything currently believed about calibration budget
+   rests on a train-on-test measurement. Cheap now: with Q6 a 128k capture is
+   ~65 min, and the whole sweep is a few hours.
+   Also port `HIPFIRE_CALIB_SEQ_LEN` to the other arches' resident calibration
+   — they all share the single-sequence shape.
 2. **Generalise the pooled donor beyond zaya.** The principled donor is the
    ROUTER (`mlp.gate`), which by construction consumes the FFN input — already
    first in `POOLED_HESSIAN_DONORS`, but unverified on a qwen-style MoE.

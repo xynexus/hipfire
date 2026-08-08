@@ -81,6 +81,11 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         hipfire_runtime::hfq::HfqFile::open_index_only(std::path::Path::new(&m.model_path))
             .map(|h| h.index_fingerprint())
             .unwrap_or_else(|_| String::new());
+    // Refuse the frozen eval slice: calibrating on it trains on the test set.
+    if let Err(e) = hipfire_runtime::calibration::reject_eval_corpus(&corpus) {
+        daemon_state.out.error(e);
+        return;
+    }
     let provenance = [
         ("source_model", serde_json::json!(m.model_path)),
         ("source_fingerprint", serde_json::json!(source_fingerprint)),
