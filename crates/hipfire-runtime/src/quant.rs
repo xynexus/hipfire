@@ -283,7 +283,10 @@ pub fn oq_gpu_dtype_for_quant_type(qt: u8) -> Option<hipfire_rdna::DType> {
     use hipfire_rdna::DType;
     Some(match Q::from_code(qt)? {
         Q::OqPlusG256 | Q::Oq8G256 | Q::OqPlusCompact => DType::Oq8G256,
-        Q::Oq4G256 | Q::Oq4G256ArchPacked => DType::Oq4G256,
+        // All three are the same runtime dtype and reach the same kernels;
+        // they differ only in on-disk layout. MoeBlocks is the paged
+        // pre-transformed form, ArchPacked the dense one.
+        Q::Oq4G256 | Q::Oq4G256ArchPacked | Q::Oq4G256MoeBlocks => DType::Oq4G256,
         Q::Oq8G256RowPadded => return None,
         _ => return None,
     })
