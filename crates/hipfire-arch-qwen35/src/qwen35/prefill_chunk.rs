@@ -1712,17 +1712,43 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let total_slots = n * k_top;
     let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
+    // Same correction as the decode path: read the routed dtypes from the
+    // per-expert dtype tables rather than `ffn.experts`, which paged residency
+    // leaves empty. Here the old form was worse than a wrong default — a bare
+    // `ffn.experts[0]` index panics outright on a paged model.
+    let routed_gate_up_dtype = moe_expert_gate_up_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe prefill: routed gate_up dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
+    let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe prefill: routed down dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        experts_all_gate_up_mq4: ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
-        routed_gate_up: ffn.experts[0].gate_up.gpu_dtype,
-        routed_down: ffn.experts[0].down.gpu_dtype,
+        // Empty `.all()` is vacuously true — see the decode-side note.
+        experts_all_gate_up_mq4: if !ffn.expert_gate_up_dtypes.is_empty() {
+            ffn.expert_gate_up_dtypes
+                .iter()
+                .all(|d| *d == DType::MQ4G256)
+        } else if !ffn.experts.is_empty() {
+            ffn.experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        } else {
+            false
+        },
+        routed_gate_up: routed_gate_up_dtype,
+        routed_down: routed_down_dtype,
         has_paro_shared: ffn.paro_shared.is_some(),
     };
 
