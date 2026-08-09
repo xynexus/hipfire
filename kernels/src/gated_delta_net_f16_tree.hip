@@ -6,33 +6,33 @@
 #define HD 128
 #define TILE_ROWS 4
 
-// FP16-tape tree-aware DeltaNet replay — the memory-halved sibling of
-// `gated_delta_net_f32_tree`.
+// FP16 tree-aware DeltaNet replay — the tree half of the f16 state path, and
+// the memory-halved sibling of `gated_delta_net_f32_tree`.
 //
-// Only the TAPE is f16. The pre-block state (`s_init`) stays FP32 and the
-// recurrence runs entirely in FP32 registers; f16 appears solely as the storage
-// format for the per-token tape slots. That split is the point:
+// Both the pre-block state (`s_init`) and the tape are f16, matching
+// `gated_delta_net_f16`: under FP16 state the persistent S matrix IS f16, so a
+// tree replay that read an f32 init would not describe any real configuration.
+// Storage is f16 throughout; arithmetic is FP32 — the tile widens into LDS on
+// load and narrows once per token on the persist-write, so f16 never enters the
+// recurrence itself.
 //
-//   - The tape is what scales with tree WIDTH (n_tokens x n_heads x HD x HD),
-//     so it is the allocation worth halving. At HD=128 an f32 tape costs 64 KiB
-//     per head per token; f16 makes that 32 KiB.
-//   - The persistent DeltaNet state is per-SEQUENCE and is the numerically
-//     sensitive one — qwen35/state.rs is explicit that its precision is not a
-//     free parameter. Leaving it FP32 keeps this kernel orthogonal to that
-//     policy: nothing here changes what the model carries between tokens.
+// Halving matters twice over here. The tape scales with tree WIDTH
+// (n_tokens x n_heads x HD x HD) and is usually the dominant scratch — at
+// HD=128 an f32 tape is 64 KiB per head per token, f16 makes it 32 KiB — while
+// the state it hangs off is per-SEQUENCE and doubled during spec-decode.
 //
-// Why f16 and not the retired Q8 tape: f16 keeps ~11 bits of mantissa with no
-// scales, no per-row absmax, and no stochastic rounding. The Q8 tape needed all
-// three, and its PRNG seed is what leaked execution history into target
-// numerics (issue #17). A straight f16 store has no such state.
+// Why f16 and not the retired Q8 tape: f16 keeps ~11 bits of mantissa with a
+// per-element exponent, no scales, no per-row absmax, and no stochastic
+// rounding. Q8 needed all of those, and its PRNG seed is what leaked execution
+// history into target numerics (issue #17). A straight f16 store is stateless.
 //
-// Accuracy: each tape round-trip costs one f16 rounding (~2^-11 relative). That
-// error enters only through the parent read, so it accumulates with tree DEPTH,
-// not with the number of siblings. For spec-decode drafts — a handful of tokens
-// deep — that is far below the acceptance threshold. It is NOT byte-exact
-// against the linear FP32 kernel, unlike `gated_delta_net_f32_tree`; use the f32
-// tree kernel when exactness against the linear reference is what you are
-// testing.
+// Accuracy: one f16 rounding per tape round-trip (~2^-11 relative), entering
+// only through the parent read, so it accumulates with tree DEPTH rather than
+// sibling count — a spec-decode draft is a handful of tokens deep. It is NOT
+// byte-exact against the linear FP32 kernel; use `gated_delta_net_f32_tree`
+// when exactness against an FP32 reference is the thing under test. Against the
+// f16 LINEAR kernel on a spine it is exact, which is the parity that actually
+// characterises this kernel.
 //
 // Semantics are otherwise identical to the f32 tree kernel: DFS order, read the
 // parent's slot (or `s_init` at a root), persist-write the post-update tile so
@@ -44,7 +44,7 @@ __global__ void gated_delta_net_f16_tree(
     const float* __restrict__ v,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
-    const float* __restrict__ s_init,
+    const _Float16* __restrict__ s_init,
     _Float16* __restrict__ s_tape,
     const int* __restrict__ parent_indices,
     float* __restrict__ output,
@@ -67,17 +67,13 @@ __global__ void gated_delta_net_f16_tree(
 
     for (int t = 0; t < n_tokens; t++) {
         const int parent = parent_indices[t];
-        if (parent >= 0) {
-            const _Float16* src = s_tape + (size_t)parent * token_stride + head_tile_offset;
-            for (int i = tid; i < TILE_ROWS * HD; i += 32)
-                S_tile[i] = (float)src[i];
-        } else {
-            // Root reads the FP32 pre-block state directly — no f16 round-trip
-            // on the way in, so a depth-1 token is exact against f32.
-            const float* src = s_init + head_tile_offset;
-            for (int i = tid; i < TILE_ROWS * HD; i += 32)
-                S_tile[i] = src[i];
-        }
+        // Root reads the pre-block state, children read their parent's tape
+        // slot. Both are f16 under FP16 state, so the widening is the same.
+        const _Float16* src = (parent >= 0)
+            ? (s_tape + (size_t)parent * token_stride + head_tile_offset)
+            : (s_init + head_tile_offset);
+        for (int i = tid; i < TILE_ROWS * HD; i += 32)
+            S_tile[i] = (float)src[i];
 
         const float* q_t = q + t * stride + h * HD;
         const float* k_t = k + t * stride + h * HD;

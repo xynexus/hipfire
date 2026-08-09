@@ -669,19 +669,20 @@ impl Gpu {
         result
     }
 
-    /// FP16-tape tree-aware DeltaNet replay.
+    /// FP16 tree-aware DeltaNet replay — the tree half of the f16 state path.
     ///
-    /// Identical to [`Self::gated_delta_net_f32_tree_batch_seq`] except the tape
-    /// is `_Float16`, halving the scratch that scales with tree width. `s_init`
-    /// stays f32 and the recurrence runs in f32; only the tape narrows, so this
-    /// does not change the precision of the persistent per-sequence state.
+    /// Identical to [`Self::gated_delta_net_f32_tree_batch_seq`] except BOTH
+    /// `s_init` and the tape are `_Float16`, matching
+    /// [`Self::gated_delta_net_f16_batch_seq`]: under FP16 state the persistent
+    /// S matrix is itself f16. Storage f16, arithmetic FP32.
     ///
-    /// Tape layout: `s_tape` is `[n_tokens × n_heads × HD × HD]` f16 — HALF the
-    /// bytes of the f32 entry point, which the caller must size for.
+    /// Layout: `s_init` is `[n_heads × HD × HD]` f16 and `s_tape` is
+    /// `[n_tokens × n_heads × HD × HD]` f16 — HALF the bytes of the f32 entry
+    /// point in both cases, which the caller must size for.
     ///
     /// Costs one f16 rounding per tape round-trip, accumulating with tree DEPTH.
-    /// Not byte-exact against the linear FP32 kernel; use the f32 tree entry
-    /// point when that exactness is what is being tested.
+    /// Not byte-exact against the linear FP32 kernel; against the f16 LINEAR
+    /// kernel on a spine it is exact.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_f16_tree_batch_seq(
@@ -737,6 +738,76 @@ impl Gpu {
             &kernargs![
                 ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr stp,
                 ptr pp, ptr op, i32 nt, i32 nh, i32 hd
+            ],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Linear DeltaNet recurrence with the persistent S state stored as f16 —
+    /// the sanctioned half-precision state path.
+    ///
+    /// Drop-in for [`Self::gated_delta_net_f32_batch_seq`] with one difference
+    /// the caller must honour: `state` is `[n_heads × HD × HD]` **f16**, half
+    /// the bytes. Everything else — argument order, output layout, arithmetic
+    /// precision — is identical, because only the storage format changes.
+    ///
+    /// Unlike the Q8 state path this replaces, there is no scales tensor, no
+    /// `s_ef_residual` accumulator and no stochastic rounding, so it is
+    /// deterministic and a spec-decode snapshot restores exactly what it saved.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f16_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        state: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_f16",
+            kernels::GATED_DELTA_NET_F16_SRC,
+            "gated_delta_net_f16",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f16_batch_seq",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "gated_delta_net_f16",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op,
+                i32 nt, i32 nh, i32 hd
             ],
         );
         if let Some(t) = timer {
