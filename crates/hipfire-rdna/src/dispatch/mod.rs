@@ -4515,11 +4515,12 @@ impl Gpu {
             kernels::EMBEDDING_F16_BATCHED_SRC.to_string(),
         ));
 
-        // DeltaNet kernels
-        specs.push((
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC.to_string(),
-        ));
+        // DeltaNet kernels.
+        //
+        // `gated_delta_net_q8` is NOT precompiled: its source is retired to
+        // `gated_delta_net_q8-disabled.hip` (state.rs POLICY 2026-07-19 —
+        // DeltaNet state must never be Q8). Warming a kernel marked disabled
+        // would cost every startup a compile for a path that must not run.
 
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
