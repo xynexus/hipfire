@@ -664,6 +664,38 @@ fn source_shard_identity(path: &Path) -> Result<SourceShardIdentity, CalibError>
             }
         }
     }
+    // An `.hfq` shard is not safetensors, so its 8-byte prefix is not a header
+    // length and reading one would either error or hash the wrong bytes. Use
+    // the artifact's own index fingerprint — the same class of identity as the
+    // safetensors arm (hash the INDEX, never the payload), which is what keeps
+    // this cheap on a 161 GB source.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("hfq"))
+    {
+        let hfq = crate::hfq::HfqFile::open(path).map_err(|error| {
+            CalibError::InvalidSourcePlan(format!("open {}: {error}", path.display()))
+        })?;
+        let index = serde_json::to_vec(&serde_json::json!({
+            "arch_id": hfq.arch_id,
+            "metadata": hfq.metadata_json,
+            "tensors": hfq.tensors().iter().map(|t| serde_json::json!({
+                "name": t.name,
+                "quant_type": t.quant_type,
+                "shape": t.shape,
+                "data_offset": t.data_offset,
+                "data_size": t.data_size,
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?;
+        return Ok(SourceShardIdentity {
+            file,
+            bytes,
+            identity_kind: "hfq_index_hash".into(),
+            identity: stable_hash_bytes(&index),
+        });
+    }
     Ok(SourceShardIdentity {
         file,
         bytes,
@@ -2947,12 +2979,54 @@ pub struct CalibrationRunInputs {
 pub fn build_calibration_run_inputs(
     command: &CalibrateCommand,
 ) -> Result<CalibrationRunInputs, Box<dyn Error>> {
-    let snapshot = resolve_hf_snapshot(&command.model)?;
-    let source: Box<dyn ModelSource> = Box::new(SafetensorsSource::open(&snapshot)?);
-    let tokenizer_path = source
-        .tokenizer_json_path()
-        .ok_or_else(|| format!("{} has no tokenizer.json", snapshot.display()))?;
-    let tokenizer_json = fs::read_to_string(&tokenizer_path)?;
+    // An `.hfq` is a single file and carries its own tokenizer; a directory is
+    // an HF snapshot or cache root and needs resolving first. Calibrating a
+    // `.hfq` directly is what removes the full restore from the large-model
+    // pipeline — a 244 GB expansion for Qwen3.5-122B-A10B whose only purpose
+    // was to hand this function a directory.
+    let model_is_hfq = command.model.is_file()
+        && command
+            .model
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("hfq"));
+    let (snapshot, source): (PathBuf, Box<dyn ModelSource>) = if model_is_hfq {
+        let hfq = crate::hfq::HfqFile::open(&command.model)?;
+        (command.model.clone(), Box::new(hfq))
+    } else {
+        let snapshot = resolve_hf_snapshot(&command.model)?;
+        let source = SafetensorsSource::open(&snapshot)?;
+        (snapshot, Box::new(source))
+    };
+
+    // A safetensors snapshot ships tokenizer.json beside the shards; an HFQ
+    // embeds it under the `tokenizer` metadata key. Take whichever exists, so
+    // neither container is privileged. `tokenizer_fingerprint` follows the same
+    // split: a file hash when there is a file, the tokenizer bytes otherwise.
+    let tokenizer_path = source.tokenizer_json_path();
+    let (tokenizer_json, tokenizer_fingerprint) = match tokenizer_path.as_ref() {
+        Some(path) => (
+            fs::read_to_string(path)?,
+            file_hash(path).unwrap_or_else(|| "unavailable".into()),
+        ),
+        None => {
+            let metadata: serde_json::Value = serde_json::from_str(source.metadata_json())
+                .map_err(|e| format!("{}: unreadable metadata: {e}", snapshot.display()))?;
+            let embedded = metadata
+                .get("tokenizer")
+                .and_then(|t| t.as_str())
+                .filter(|t| t.trim_start().starts_with('{'))
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no tokenizer.json beside it and no usable embedded tokenizer",
+                        snapshot.display()
+                    )
+                })?
+                .to_string();
+            let fingerprint = stable_hash_bytes(embedded.as_bytes());
+            (embedded, fingerprint)
+        }
+    };
     let tokenizer = Tokenizer::from_hf_json(&tokenizer_json)?;
     let samples = load_corpus_samples(
         &command.corpus,
@@ -2965,7 +3039,7 @@ pub fn build_calibration_run_inputs(
     let corpus_fingerprint = file_hash(&command.corpus).unwrap_or_else(|| "unavailable".into());
     let job = CalibrationJob::new(
         source_manifest.fingerprint.clone(),
-        file_hash(&tokenizer_path).unwrap_or_else(|| "unavailable".into()),
+        tokenizer_fingerprint,
         SampleSet::new(samples, command.context, command.sampling_seed)?,
         options,
     )?

@@ -1025,7 +1025,7 @@ impl CalibrationFamilyAdapter for Qwen35CalibrationAdapter {
             &[model.vocab_size, model.hidden_width],
             "embedding",
         )?;
-        let values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
+        let values = source_payload_f32(view.info.dtype.as_str(), &view.bytes)?;
         if values.len() != model.vocab_size * model.hidden_width {
             return Err(CalibError::InvalidSourcePlan(
                 "embedding payload length does not match its declared shape".into(),

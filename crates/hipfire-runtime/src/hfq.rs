@@ -1492,22 +1492,49 @@ impl HfqFile {
         self.ms_infos.get_or_init(|| {
             self.tensors
                 .iter()
-                .map(|t| TensorInfo {
-                    name: t.name.clone(),
-                    // HFQ's authority is `quant_type`; `dtype` is the
-                    // safetensors-shaped field and only three quant types have
-                    // a faithful spelling. The rest get an explicit marker
-                    // rather than a plausible-looking lie.
-                    dtype: match t.quant_type {
-                        16 => "BF16".to_string(),
-                        1 => "F16".to_string(),
-                        2 => "F32".to_string(),
-                        other => format!("HFQ_QT{other}"),
-                    },
-                    shape: t.shape.iter().map(|&d| d as usize).collect(),
-                    quant_type: t.quant_type,
-                    data_offset: t.data_offset,
-                    data_size: t.data_size,
+                .map(|t| {
+                    // LOGICAL view. A lossless BF16 recoding (Bf16Lut3 /
+                    // Bf16Huff) IS bf16 — the coding is a storage detail — so
+                    // the trait reports it as bf16 and `tensor()` hands back
+                    // expanded bytes to match. Reporting the stored code here
+                    // instead makes every consumer that switches on dtype
+                    // reject a perfectly ordinary bf16 tensor, which is exactly
+                    // how the qwen3.5 calibration adapter first met an `.hfq`
+                    // ("unsupported dtype HFQ_QT49").
+                    //
+                    // Callers that specifically want the STORED form — serving,
+                    // where `gemv_bf16l3` decodes natively and expanding would
+                    // waste the whole point — use HfqFile's inherent accessors,
+                    // which are unaffected.
+                    let logical_qt = if is_packed_bf16(t.quant_type) {
+                        16
+                    } else {
+                        t.quant_type
+                    };
+                    let n: usize = t.shape.iter().map(|&d| d as usize).product();
+                    TensorInfo {
+                        name: t.name.clone(),
+                        // HFQ's authority is `quant_type`; `dtype` is the
+                        // safetensors-shaped field and only three codes have a
+                        // faithful spelling. The rest get an explicit marker
+                        // rather than a plausible-looking lie.
+                        dtype: match logical_qt {
+                            16 => "BF16".to_string(),
+                            1 => "F16".to_string(),
+                            2 => "F32".to_string(),
+                            other => format!("HFQ_QT{other}"),
+                        },
+                        shape: t.shape.iter().map(|&d| d as usize).collect(),
+                        quant_type: logical_qt,
+                        data_offset: t.data_offset,
+                        // A packed tensor's `data_size` is its PHYSICAL length;
+                        // the logical view is two bytes per element.
+                        data_size: if is_packed_bf16(t.quant_type) {
+                            n * 2
+                        } else {
+                            t.data_size
+                        },
+                    }
                 })
                 .collect()
         })
@@ -2099,19 +2126,41 @@ impl ModelSource for HfqFile {
     }
 
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
-        // Borrowed-only, per the trait contract: a compressed-BF16 tensor has
-        // no BF16 buffer in the file to borrow, so the inherent accessor
-        // refuses it and so does this. `tensor()` is the one that can decode.
+        // Borrowed-only, per the trait contract: a tensor whose stored bytes
+        // are not its logical bytes has no logical buffer to borrow, so this
+        // must decline rather than pair packed bytes with the logical
+        // `TensorInfo`. Doing that pairing is a genuinely nasty failure — the
+        // metadata says n*2 bytes of bf16 and the slice is the packed length,
+        // so the caller reads a plausible-looking tensor of the wrong size
+        // ("embedding payload length does not match its declared shape").
+        //
+        // Two distinct cases must both decline: `bf16_packed` (transparently
+        // expanded, which the inherent accessor already refuses) and a
+        // deliberately-resident coding the index still reports as packed.
         let idx = self.resolve_idx(name)?;
+        if is_packed_bf16(self.tensors.get(idx)?.quant_type) {
+            return None;
+        }
         let (_, bytes) = HfqFile::tensor_data(self, name)?;
         Some((self.ms_infos().get(idx)?, bytes))
     }
 
     fn tensor(&self, name: &str) -> Option<(&TensorInfo, std::borrow::Cow<'_, [u8]>)> {
         let idx = self.resolve_idx(name)?;
-        // Borrowed when stored verbatim, owned when a lossless BF16 recoding
-        // has to be expanded — the whole reason the trait needed a Cow.
-        let (_, bytes) = self.tensor_data_cow(name)?;
+        // LOGICAL bytes, matching the logical `TensorInfo` from `ms_infos`.
+        // Borrowed when stored verbatim, owned when a recoding — including a
+        // deliberately-resident Bf16Lut3 head — has to be expanded. That
+        // expansion is the whole reason the trait needed a Cow.
+        let stored_qt = self.tensors.get(idx)?.quant_type;
+        let bytes = if is_packed_bf16(stored_qt) {
+            // Still packed in the index — `expand_bf16_index` declined to
+            // expand it (a resident Bf16Lut3 head). Expand here so the payload
+            // matches the logical `TensorInfo`.
+            std::borrow::Cow::Owned(self.tensor_data_logical(name).ok()?.1)
+        } else {
+            // Verbatim, or already transparently expanded: keep the borrow.
+            self.tensor_data_cow(name)?.1
+        };
         Some((self.ms_infos().get(idx)?, bytes))
     }
 
