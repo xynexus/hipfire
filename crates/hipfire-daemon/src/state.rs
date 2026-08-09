@@ -143,10 +143,39 @@ impl Responder {
     ///   hand-written literals in the daemon did not.
     pub fn emit(&mut self, mut frame: serde_json::Value) {
         stamp_request_id(&mut frame, &self.request_id);
+        // Terminal frames only. Token frames never reach this method — they are
+        // written straight to the sink by `serving-core::events`, which is where
+        // the token half of the executor trace is hooked.
+        if hipfire_runtime::exec_trace::enabled() {
+            self.trace_frame(&frame);
+        }
         // `Display for Value` writes incrementally into the writer, so large
         // payloads (embeddings, the model registry) are not materialised first.
         let _ = writeln!(self.sink, "{frame}");
         let _ = self.sink.flush();
+    }
+
+    /// Record a terminal frame into the executor trace.
+    ///
+    /// `token` is deliberately absent from the match: those are recorded in
+    /// `serving-core::events::emit_text_bytes`, which is the only place they
+    /// actually pass through. Matching on it here as well would double-count
+    /// every token the daemon *does* happen to emit itself, and a doubled series
+    /// halves every inter-token gap — an error in the flattering direction.
+    fn trace_frame(&self, frame: &serde_json::Value) {
+        let Some(kind) = frame.get("type").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let event = match kind {
+            "done" => hipfire_runtime::exec_trace::TraceEvent::Completed,
+            _ => return,
+        };
+        let stream = frame
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(hipfire_runtime::exec_trace::stream_id_of)
+            .unwrap_or(hipfire_runtime::exec_trace::NO_STREAM);
+        hipfire_runtime::exec_trace::record(event, stream, 0, 0);
     }
 
     /// Emit an error frame tagged with the current request id.

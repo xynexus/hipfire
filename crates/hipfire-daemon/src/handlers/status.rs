@@ -51,6 +51,22 @@ pub(crate) fn scheduler_status(daemon_state: &mut DaemonState) {
     daemon_state.out.emit(payload);
 }
 
+/// Dump the executor trace — M0 of the v2 daemon plan.
+///
+/// Deliberately not folded into `scheduler_status`: that answers "what did the
+/// scheduler choose" in counts, this answers "how long did things take" in
+/// nanoseconds, and a caller measuring latency should not have to parse a
+/// counters payload to find out the trace was switched off.
+///
+/// Answering this *is* a dispatch, so the reply's own `dispatch_begin` is
+/// already in the window it returns. That is harmless — it sits after every
+/// token it could be confused with — but it does mean a trace dumped mid-run
+/// includes the dump.
+pub(crate) fn executor_trace(daemon_state: &mut DaemonState) {
+    let payload = hipfire_runtime::exec_trace::snapshot_json();
+    daemon_state.out.emit(payload);
+}
+
 /// Revise the memory budgets and re-apply the ballast reservation.
 ///
 /// The release/reacquire pair is the whole point: changing the numbers without
