@@ -471,6 +471,31 @@ stream* and returns, rather than running one. `batch_runner.rs` is deleted, not 
 
 # Part 2 — Migration
 
+## Status, 2026-08-09
+
+Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
+
+| stage | state | evidence |
+|---|---|---|
+| M0 executor trace | **landed** | 256 tokens → 255 gaps; dispatch span vs stopwatch worst 0.01%; tracing cost −0.12% |
+| M1a `upload_raw` / `GpuPool` | **landed** | pooled 4000 cycles → +0 B VRAM, 0 HIP calls; unpooled 200 cycles → +400 MiB |
+| M1b per-stream sampler RNG | **not started** | see below |
+| M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
+| M1d remaining process globals | **not started** | `RAW_OVERRIDE`, `hipfire_steer`, `load_progress::SINK` |
+| M2 onward | not started | |
+
+**M1b's surface, sized but not yet cut.** `simple_rand` is only 7 sites, all inside
+`hipfire-runtime/src/sampler.rs`, so the RNG itself is easy to make an owned
+`SamplerRng`. The work is upstream of it: `sampler::sample` (9 call sites) and
+`sampler::sample_cpu` (3) are what the decode paths actually call, and each caller has to
+obtain the RNG from its session rather than from the process. So M1b is "add a field to
+session state and thread it through ~12 call sites", not "change one static" — and it must
+land in one piece, because a half-threaded RNG silently falls back to the global for the
+paths that were missed, which looks exactly like working code.
+
+The second half of M1b (on-device `sample_rows` over `ActivationArena::row_seed`) is a
+performance requirement, not a correctness one, and can follow separately.
+
 Ordering principle: the three roles the module plays are separable, and they are sequenced
 in the stated priority order — **preemption first, residency second, unification last.**
 Building residency first would deliver the capacity win, the lowest-ranked goal, while
