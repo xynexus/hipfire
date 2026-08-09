@@ -481,7 +481,8 @@ Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
 | M1a `upload_raw` / `GpuPool` | **landed** | pooled 4000 cycles → +0 B VRAM, 0 HIP calls; unpooled 200 cycles → +400 MiB |
 | M1b per-stream sampler RNG | **landed** | global deleted; greedy unchanged, temp>0 reproducible across an interleaved request |
 | M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
-| M1d remaining process globals | **not started, sized** | three independent sub-tasks; see below |
+| M1d `RAW_OVERRIDE` | **landed** | live cross-request leak found and fixed; regression gate committed |
+| M1d `hipfire_steer`, `load_progress::SINK` | not started | steer couples to M2b |
 | M2 onward | not started | |
 
 **Two corrections to the earlier M1b sizing, both from actually reading the callers.**
@@ -507,15 +508,25 @@ and not an aesthetic one.
 
 **M1d is three independent sub-tasks, not one.** Sized 2026-08-09:
 
-- **`RAW_OVERRIDE`** (`serving-core/src/model.rs:210`) — a `thread_local Cell`, set once in
-  `handlers/generate.rs:134` and read by `effective_raw(m)`, which has **~12 call sites**
-  across `generate.rs`, `qwen35_prefill.rs` and `generate_vl.rs`. Because `effective_raw`
-  only receives `&LoadedModel`, removing the thread-local means threading an
-  `Option<bool>` from the handler down through every enclosing function. Comparable in
-  size to M1b and must likewise land in one piece — a half-threaded override silently
-  falls back to the thread-local on the paths that were missed. Its own doc comment
-  ("the daemon processes generate messages synchronously on one thread") states exactly
-  the assumption the v2 executor breaks.
+- **`RAW_OVERRIDE` — LANDED, and it was a live bug, not just a v2 hazard.** The
+  thread-local was set only by the plain-generate handler and read by
+  `qwen35_materialize_batch_prefill_prompt`; the batch path never wrote it and nothing
+  cleared it. Its doc comment claimed "reset every generate request, so no cross-request
+  leak" — true for `generate`, false for batch.
+
+  Confirmed on gfx1103 with one identical `prefix_hash_preflight` session:
+
+  | | prompt tokens | boundaries | full hash |
+  |---|---|---|---|
+  | fresh daemon | 15 | 3 (`message_end`, `assistant_turn_start`, `full`) | `c8427f59…` |
+  | after one unrelated `generate` with `"raw": true` | **7** | 1 (`full`) | `12317032…` |
+
+  Those hashes are the **KV-reuse cache keys**, so this did not merely reframe a prompt —
+  it changed what a later request matched in the prefix cache. `GenerateBatchPrefillSession`
+  also had no `raw` field at all, so the batch path could only inherit; it now carries one.
+  Fixed by threading `Option<bool>` from the handler through the eleven generate entry
+  points (`generate.rs` ×4, `generate_arch.rs` ×7) and reading `session.raw` in the batch
+  materialiser. Gate: `scripts/v2_m1d_raw_override_gate.py`.
 - **`hipfire_steer::{SESSION, ACTIVE, EPOCH}`** — 8 `is_active()` sites. Coupled to M2b,
   since an active steer session is one of the four escapes that force the hand path;
   worth doing together rather than twice.

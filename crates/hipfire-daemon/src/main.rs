@@ -81,7 +81,7 @@ use hipfire_serving_core::{
     qwen35_prefill, request, session,
 };
 use load::*;
-use model::{CaskConfig, EmbeddingGemmaState, LoadedModel, RAW_OVERRIDE};
+use model::{CaskConfig, EmbeddingGemmaState, LoadedModel};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
 use qwen35_decode::*;
 use qwen35_prefill::*;
