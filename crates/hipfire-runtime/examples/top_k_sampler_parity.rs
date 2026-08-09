@@ -5,7 +5,7 @@
 //! Fixed-seed CPU/GPU parity gate for the shared configurable top-k sampler.
 
 use hipfire_rdna::{DType, Gpu};
-use hipfire_runtime::sampler::{reset_cpu_sampler_rng, sample_top_k_top_p, sampler_rng_snapshot};
+use hipfire_runtime::sampler::{sample_top_k_top_p, SamplerRng};
 
 fn main() {
     const SEED: u32 = 0x1357_9bdf;
@@ -19,9 +19,12 @@ fn main() {
         .map(|index| index as f32 * 0.03125 + (index % 7) as f32 * 0.0001)
         .collect();
 
-    reset_cpu_sampler_rng(SEED);
-    let cpu_token = sample_top_k_top_p(&logits, TEMPERATURE, TOP_K, TOP_P);
-    let cpu_rng = sampler_rng_snapshot();
+    // The CPU stream is now an owned value seeded exactly as the GPU kernel is
+    // below, so this gate compares two RNGs that were pinned together by
+    // construction rather than by a global both happened to read.
+    let mut cpu_stream = SamplerRng::from_seed(SEED);
+    let cpu_token = sample_top_k_top_p(&logits, TEMPERATURE, TOP_K, TOP_P, &mut cpu_stream);
+    let cpu_rng = cpu_stream.state();
 
     let mut gpu = Gpu::init().expect("initialize GPU");
     let logits_gpu = gpu
