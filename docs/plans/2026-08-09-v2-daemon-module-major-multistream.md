@@ -233,6 +233,60 @@ This matters for M5's design, and it is not a bug to fix in passing:
 - It also means the launch-overhead arithmetic in §0.3 understates paged Opus: those
   figures count DRAM bytes and kernel launches, not a host-side transform per module.
 
+### 0.6.1 The fix is an artifact format, not a runtime workaround
+
+Scoped 2026-08-09 at the user's direction: the repack exists because the artifact is not
+stored in the layout the paged path consumes. Store it pre-transformed and page-in becomes
+a verbatim `transport.fetch`. This supersedes the "prefetch must also repack" note above —
+prefetch then only has to move bytes.
+
+**New quant code: `Oq4G256MoeBlocks = 53`** (52 is the highest in use). Document it exactly
+as `Oq4G256ArchPacked = 37` is documented, because it is the same idea one layout over:
+*the quant_type code IS the layout version*, so a stale derived artifact is refused at load
+rather than read as garbage, and the byte length is validated against
+`oq4_moe_packed_len` instead of the 130 B/group canonical form. `Oq8G256` and
+`OqPlusCompact` want siblings later — `module_requires_host_repack` names all three.
+
+**Producer — `hipfire optimize` needs a real upgrade, not a flag.**
+
+1. **It refuses every artifact this applies to, today.** `optimize.rs` bails when
+   `hfq.modules()` is non-empty, and the message says the file "bundles N module(s)"
+   and blames MTP/DFlash sidecars. But `HfqFile::modules()` returns
+   `hfq_modules::HfqModuleRecord` — the **routed-expert table** — so it refuses precisely
+   every paged MoE artifact, for a reason that misnames what it found. Fix the message
+   and the behaviour together.
+2. **Apply the right transform.** Routed-expert tensors take
+   `oq4_canonical_to_moe_blocks` (→ qt 53), NOT the existing dense
+   `oq4_pack_arch_combined` (→ qt 37) which the pager explicitly refuses. The two are
+   per-tensor exclusive: a routed expert gets MoE-blocks, a dense weight gets
+   arch-combined. An artifact can legitimately carry both.
+3. **Round-trip the module table with recomputed offsets.** Rewriting tensor bytes moves
+   every `data_offset` / `data_size` / `rel_offset`. The circularity — metadata contains
+   the offsets, and the offsets depend on the metadata's own length — is **already solved
+   in-repo**: `hipfire-quantize/src/hfq_out.rs:1078-1090` iterates layout and metadata to
+   a fixed point. Reuse that shape rather than inventing one. Module `data_offset` is an
+   **absolute** file offset (`weight_pager.rs:1223`/`:1230` hand it straight to
+   `read_host`/`fetch`); `rel_offset` is within the module.
+
+**Consumer — `weight_pager`, four small changes.**
+`module_requires_host_repack` (`:648`) returns false for qt 53 — that one predicate is the
+entire CPU cost. `prepare_expert_module`'s transform match gains a passthrough arm.
+`module_tensor_resident_len` / `module_resident_len` use the on-disk length, validated
+against `oq4_moe_packed_len`. `register_expert_module`'s refusal list must not reject it.
+
+**Runtime dtype.** `paged_moe_dtype_for_quant` (`qwen35/loading.rs:2463`) maps 53 →
+`DType::Oq4G256`, so dispatch resolution, kernel selection and the indexed path are all
+unchanged — this is a storage change only.
+
+**Open question worth settling before baking it in:** qt 37's own comment says the combined
+layout is identical across current RDNA/CDNA arches and the arch only tags the output name.
+If the MoE-block layout is likewise arch-independent, the derived artifact should NOT take
+a `.gfx1103` tag, and the naming follows the plain machine-section rule instead.
+
+**Verification:** logits byte-identical between canonical-paged and moeblocks-paged on one
+prompt, plus the CPU-time collapse — the before number is the measurement in §0.6(c),
+~96 % of one core with the GPU at 0 %.
+
 **(b) The refusal panics rather than returning an error.**
 `generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
 correct, reject-rather-than-miscompute behaviour — takes the whole daemon down. Today that
