@@ -4021,14 +4021,17 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
+            "oq8" => Some(Self::Oq8),
+            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
+            // Catch-all LAST. The origin/master merge landed this arm above the
+            // oq8 arms — in a region git did not flag as a conflict — which made
+            // every oq8 form unreachable and, since `parse_opus_mixed_format`
+            // does not accept them, rejected `--format oq8` outright.
             _ => match parse_opus_mixed_format(flag) {
                 Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
                 Some(_) => Some(Self::OqPlusCompact),
                 None => None,
             },
-            "oq8" => Some(Self::Oq8),
-            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
-            _ => None,
         }
     }
 }
