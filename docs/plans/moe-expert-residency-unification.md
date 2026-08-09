@@ -359,6 +359,32 @@ can become a metadata-only view and per-expert data continues to be reached
 through the pointer table. Without that, the adoption would need a different
 shape entirely.
 
+**Do the extraction first.** Two attempts at this migration were reverted, both
+for the same structural reason: the packed expert loading is a ~200-line inline
+block inside `MiniMaxWeights::load`, with nested scopes, that produces seven
+bindings consumed by the `layers.push`. Wrapping it in an `if paged { … } else {
+… }` is not a small edit and does not balance cleanly. Extract it into
+`load_layer_experts_packed(...) -> (experts, gu_ptrs, dn_ptrs, gate_lr, up_lr,
+down_lr)` as its own mechanical, separately-verifiable commit — after that the
+paged branch is a three-line `match`.
+
+**A finite VRAM budget is mandatory, not optional.** The packed loader exists
+because the per-expert version cost ~20 GB of fragmentation across ~31.7k
+allocations and OOM'd gfx1151's 96 GB carveout on an 86 GB artifact (the
+rationale is written into the loader comment). `LazyLru` is safe only because
+residency is bounded — an unlimited budget admits every routed expert, never
+evicts, and reproduces exactly that failure. The residency flag must therefore
+require an explicit budget and refuse an unbounded one.
+
+**Refuse two configurations up front**, both because a wrong answer is silent
+rather than loud:
+
+- **EP sharding** — per-expert admission combined with the non-owned-expert
+  pointer policy has no multi-GPU validation, and a wrong pointer there is
+  numerical corruption, not a crash.
+- **LQER low-rank sidecars** — the paged path does not carry them, and silently
+  dropping a low-rank correction degrades quality with nothing to point at.
+
 Two complications specific to minimax, neither present in lfm2moe:
 
 - **EP sharding.** The loader packs only rank-owned experts (`owns()` /
