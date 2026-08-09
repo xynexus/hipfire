@@ -60,6 +60,7 @@ pub fn generate_vl(
         repeat_window,
         max_think_tokens,
         encode_only: _, // qwen35-vl path always decodes
+        raw,
     } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -206,7 +207,7 @@ pub fn generate_vl(
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
     // Compute the raw-prompt flag before the mutable kv/dn borrows below.
-    let vl_raw = effective_raw(m);
+    let vl_raw = effective_raw(m, raw);
     let ss = m
         .active
         .sequence_state
