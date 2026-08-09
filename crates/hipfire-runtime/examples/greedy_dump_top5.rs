@@ -266,10 +266,10 @@ fn main() {
             std::env::var("HIPFIRE_DELTANET_STATE").or_else(|_| std::env::var("HIPFIRE_STATE"));
         match dn_quant_env.as_deref() {
             Ok("fp32" | "f32") => StateQuant::FP32,
-            Ok("q4") => StateQuant::Q4,
-            Ok("q8") | Ok("int8") | Err(_) => StateQuant::Q8,
+            Ok("fp16") | Ok("f16") => StateQuant::FP16,
+            Err(_) => StateQuant::FP32,
             Ok(other) => {
-                panic!("unknown HIPFIRE_DELTANET_STATE/HIPFIRE_STATE={other} (q8|q4|fp32)")
+                panic!("unknown HIPFIRE_DELTANET_STATE/HIPFIRE_STATE={other} (fp32|fp16)")
             }
         }
     };

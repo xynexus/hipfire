@@ -85,9 +85,9 @@ fn md5_file(path: &Path) -> String {
 
 fn parse_state_quant(mode: Option<&str>) -> Result<StateQuant, String> {
     match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
-        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "" | "auto" => Ok(StateQuant::FP32),
         "fp32" | "f32" => Ok(StateQuant::FP32),
-        "q4" | "int4" => Ok(StateQuant::Q4),
+        "fp16" | "f16" => Ok(StateQuant::FP16),
         other => Err(format!(
             "unsupported --state-quant '{other}' (expected q8|fp32|q4)"
         )),
