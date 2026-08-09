@@ -476,6 +476,20 @@ pub const ENV_HIPFIRE_DAEMON_SCHED_DEBUG: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-daemon/src/main.rs:1315",
 };
 
+/// `HIPFIRE_DAEMON_TRACE` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_DAEMON_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DAEMON_TRACE",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-runtime/src/exec_trace.rs:216",
+};
+
+/// `HIPFIRE_DAEMON_TRACE_CAPACITY` — Parses "HIPFIRE_DAEMON_TRACE_CAPACITY" with fallback defaults
+pub const ENV_HIPFIRE_DAEMON_TRACE_CAPACITY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DAEMON_TRACE_CAPACITY",
+    description: "Parses \"HIPFIRE_DAEMON_TRACE_CAPACITY\" with fallback defaults",
+    source: "crates/hipfire-runtime/src/exec_trace.rs:219",
+};
+
 /// `HIPFIRE_DDTREE_BUDGET` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_BUDGET",
@@ -5500,6 +5514,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DAEMON_BIN,
     ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB,
     ENV_HIPFIRE_DAEMON_SCHED_DEBUG,
+    ENV_HIPFIRE_DAEMON_TRACE,
+    ENV_HIPFIRE_DAEMON_TRACE_CAPACITY,
     ENV_HIPFIRE_DDTREE_BUDGET,
     ENV_HIPFIRE_DDTREE_FORCE_SLOW,
     ENV_HIPFIRE_DDTREE_LOGW_CUTOFF,
