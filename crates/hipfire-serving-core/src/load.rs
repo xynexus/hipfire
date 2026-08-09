@@ -341,39 +341,21 @@ pub fn parse_state_quant(
     use hipfire_arch_qwen35::qwen35::{default_state_quant, StateQuant};
     match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(default_state_quant(config)),
-        "q8" | "int8" => {
-            warn_deprecated_state_quant("q8");
-            Ok(StateQuant::Q8)
-        }
         "fp32" | "f32" => Ok(StateQuant::FP32),
-        "q4" | "int4" => {
-            warn_deprecated_state_quant("q4");
-            Ok(StateQuant::Q4)
-        }
-        other => Err(format!(
-            "unsupported DeltaNet state_quant '{other}' (expected auto|fp32|q8|q4)"
+        "fp16" | "f16" => Ok(StateQuant::FP16),
+        // Removed 2026-08-09. Rejected rather than silently mapped to FP32: an
+        // operator who set q8 deliberately should learn it is gone, not get
+        // different numerics without being told.
+        "q8" | "int8" | "q4" | "int4" => Err(format!(
+            "DeltaNet state_quant '{}' was removed — quantized recurrent state \
+             caused silent corruption (long-decode attractors, a rounding seed \
+             leaking execution history, and an error-feedback buffer that broke \
+             spec-decode rollback). Use auto|fp32|fp16.",
+            mode.unwrap_or("")
         )),
-    }
-}
-
-/// One-shot warning for a deprecated quantized DeltaNet state request.
-///
-/// Quantized recurrent state is disallowed by policy: its error compounds across
-/// the sequence, and every DeltaNet-state defect this repo has hit has been
-/// specific to it — long-decode attractors on low-redundancy models, a
-/// stochastic-rounding seed that leaked execution history into target numerics,
-/// and a Q8-only error-feedback buffer that `DeltaNetSnapshot` never restores
-/// (breaking spec-decode losslessness). FP32 has none of them.
-fn warn_deprecated_state_quant(which: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warning: DeltaNet state_quant '{which}' is DEPRECATED — quantized \
-             recurrent state is disallowed by policy (see qwen35::\
-             deltanet_state_fp32_below). Use 'auto' (=FP32) unless you are \
-             running the Q8-only DDTree tree-replay path."
-        );
+        other => Err(format!(
+            "unsupported DeltaNet state_quant '{other}' (expected auto|fp32|fp16)"
+        )),
     }
 }
 
@@ -382,8 +364,7 @@ pub fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static
     use hipfire_arch_qwen35::qwen35::StateQuant;
     match q {
         StateQuant::FP32 => "FP32",
-        StateQuant::Q8 => "Q8",
-        StateQuant::Q4 => "Q4",
+        StateQuant::FP16 => "FP16",
     }
 }
 

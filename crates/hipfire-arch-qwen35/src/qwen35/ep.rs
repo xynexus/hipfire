@@ -683,29 +683,13 @@ fn forward_scratch_layers_multi(
                             n_v_heads,
                             config.linear_value_head_dim,
                         )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
                             &s.dn_q,
                             &s.dn_k,
                             &s.dn_v,
                             &s.dn_alpha,
                             &s.dn_beta,
                             &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            pos as u32,
-                            delta_layer_idx as u32,
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
                             &s.dn_attn_out,
                             1,
                             n_v_heads,
@@ -1551,29 +1535,13 @@ fn forward_scratch_layers_multi(
                             n_v_heads,
                             config.linear_value_head_dim,
                         )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
                             &s.dn_q,
                             &s.dn_k,
                             &s.dn_v,
                             &s.dn_alpha,
                             &s.dn_beta,
                             &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &s.dn_attn_out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            pos as u32,
-                            delta_layer_idx as u32,
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &s.dn_q,
-                            &s.dn_k,
-                            &s.dn_v,
-                            &s.dn_alpha,
-                            &s.dn_beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
                             &s.dn_attn_out,
                             1,
                             n_v_heads,
@@ -2348,7 +2316,13 @@ pub fn forward_prefill_batch_multi_with_caps(
     let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
     let eligible = !force_fallback
         && n_total >= 2
-        && dn_state.quant == StateQuant::Q8
+        // Was `dn_state.quant == StateQuant::Q8`. Q8 state is removed, and it
+        // was never selected at runtime (FP32 has been the default), so this
+        // gate has always been false here — kept false rather than widened to
+        // FP32/FP16, because widening the sibling gate in `qwen35/mod.rs` was
+        // measured to produce garbage (KLD 10.69 vs 0.0389) on a MoE model.
+        // Enabling batched prefill is its own change, with its own validation.
+        && false
         && weights
             .layers
             .iter()
