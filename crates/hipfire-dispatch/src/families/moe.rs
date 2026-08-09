@@ -107,7 +107,45 @@ pub struct MoeResolution {
 
 impl MoeResolution {
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
-        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode_enabled())
+        // origin/master's helper, not an inline env read: it accepts the same
+        // spellings the arch layer does. The inline `== Some("1")` this replaces
+        // is exactly the `=1` vs `=on` split the indexed-OQ handover called
+        // "guaranteed garbage".
+        let oq_indexed_decode = oq_indexed_decode_enabled();
+        let resolved = Self::resolve_with_oq_indexed(d, k, oq_indexed_decode);
+        // `HIPFIRE_MOE_RESOLVE_DEBUG=1` dumps the snapshot this verdict came from.
+        //
+        // The arch layer resolves the same question independently and traces its
+        // own answer, so the two can disagree while both look correct in
+        // isolation — that split has now produced two bugs: the routed-dtype
+        // marshalling defaulting to F32 under paged residency, and a silent
+        // drop to `run_moe_decode_cpu_fallback` (~160 s/layer on one core) while
+        // the arch trace still reported `use_gpu_topk=true`. THIS is the verdict
+        // that selects the path; the arch-side trace is not.
+        if std::env::var("HIPFIRE_MOE_RESOLVE_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[moe-resolve] k={k} oq_gate={oq_indexed_decode} router={:?} \
+                 shared(gate/eg/eu)={:?}/{:?}/{:?} routed(gu/dn)={:?}/{:?} \
+                 all_gu_mq4={} paro_shared={} => idx(mq4/mq6/paro/oq4/oq8)={}/{}/{}/{}/{} \
+                 use_gpu_topk={} needs_x_rot={}",
+                d.router,
+                d.shared_gate,
+                d.shared_expert_gate,
+                d.shared_expert_up,
+                d.routed_gate_up,
+                d.routed_down,
+                d.experts_all_gate_up_mq4,
+                d.has_paro_shared,
+                resolved.routed_indexable_mq4,
+                resolved.routed_indexable_mq6,
+                resolved.routed_indexable_paro,
+                resolved.routed_indexable_oq4,
+                resolved.routed_indexable_oq8,
+                resolved.use_gpu_topk,
+                resolved.needs_x_rot_local,
+            );
+        }
+        resolved
     }
 
     pub fn resolve_with_oq_indexed(d: &MoeDtypes, k: usize, oq_indexed_decode: bool) -> Self {
