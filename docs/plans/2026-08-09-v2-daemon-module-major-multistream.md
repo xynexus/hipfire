@@ -349,6 +349,20 @@ is not taken. The dual-resolution split is real and did cause the routed-dtype b
 is **not** the cause here — that inference was made from "the fallback exists inside the
 bounded window" without checking the branch condition.
 
+**Bisected 2026-08-09 (`HIPFIRE_MOE_STEP_DEBUG=1`).** Timestamped markers through
+`run_moe_decode` put everything up to and including the gate-side GEMV at **0.7 ms**:
+
+```
+[moe-step]   0.0ms enter run_moe_decode
+[moe-step]   0.0ms after check_moe_decode_supported
+[moe-step]   0.1ms after x_rot_local block
+[moe-step]   0.7ms after gate-side GEMV
+```
+
+then silence. So the ~160 s is entirely in the remainder of `run_moe_decode`: the GPU
+top-K path (softmax → `moe_topk_renorm_k8`) and the indexed expert gate_up/down dispatch
+that follows it. Resolution, rotation and the gate side are all exonerated.
+
 **Established:** ~160 s per MoE layer, one core at ~99 %, GPU at 0 %. Execution reaches the
 executor's `resolve` and stalls before the `after paged topk` device sync — so the window
 is inside `run_moe_decode`, on the GPU path, between resolution and top-k.
