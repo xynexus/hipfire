@@ -138,7 +138,43 @@ currently runs ~22.8 tok/s on a 3B-active model — decode speed.
 
 Fix the named gate, re-measure the same 1-chunk build.
 
-### 5. Queue three models that run end-to-end today
+### 5. Queue three models — DONE. Results below.
+
+All four `oq4.25++` builds, scored at n_ctx=2048, max_chunks=16, against each
+model's OWN bf16 reference on the frozen eval slice. **KLD is per-model
+self-relative, so these rank degradation, not absolute quality.**
+
+| model | mean KLD | 95% CI | min / max chunk | artifact | LDLQ |
+|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | **0.038913** | [0.028996, 0.048830] | 0.025 / 0.110 | 17.9 GB | 10550/20791, pooled 10240 |
+| Qwen3.6-35B-A3B | **0.051324** | [0.042859, 0.059789] | 0.026 / 0.088 | 18 GB | 10550/20791, pooled 10240 |
+| Qwen3.5-27B (dense) | **0.110658** | [0.062459, 0.158856] | 0.034 / **0.411** | 16 GB | 496/497 |
+| Qwen3.6-27B (dense) | **0.143372** | [0.080524, 0.206220] | 0.024 / **0.398** | 16 GB | 496/497 |
+
+Stage wall-times: MoE calib 3484s / quant 3518s / ref 3148s / score 1432s.
+Dense streamed calib 1432s / quant **6997s** / ref 371s / score 1913s.
+
+**The dense pair is worth a look before anyone trusts it.** It is NOT a
+coverage defect — the dense models got *near-total* LDLQ (496/497, only
+`lm_head` missing) while the MoE models necessarily skip 10240 expert
+`down_proj`, and the dense pair still scored 2-3x worse. Two things to check:
+
+1. Both CIs are wide and both are driven by a single ~0.4 outlier chunk against
+   a ~0.03 minimum — heavy-tailed, so the mean is not a good summary. n=16
+   cannot resolve this; re-score with more chunks before drawing conclusions.
+2. Both 27Bs are **VL** checkpoints (nested `text_config`, `image_token_id`).
+   The calibration and the eval are text-only, so vision-adjacent weights are
+   quantized with no relevant activation evidence. That is the obvious suspect
+   and it is untested.
+
+Calibration route was forced by shape, not preference: a dense 27B has
+`intermediate_size=17408`, so ONE `down_proj` Hessian is 17408²·4 = 1.13 GiB and
+64 layers is 72 GB resident — `collect_artifacts` OOMed in 48s. The streamed
+engine holds one layer (766 MB). MoE models are unaffected (expert
+`down_proj` is K=512) and stay on the resident path, which is also the one
+wired for the pooled donor.
+
+Original note:
 Same recipe, unchanged: **Qwen3.5-27B**, **Qwen3.6-27B**, **Qwen3.6-35B-A3B**.
 Sources are `.hfa` under `/srv/hipfire/models/`. All fit resident (54/54/70 GB
 bf16 against 124 GB RAM).
