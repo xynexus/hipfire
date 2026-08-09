@@ -29,6 +29,7 @@ pub mod dflash;
 pub mod dispatch;
 pub mod env_docs;
 pub mod eos_filter;
+pub mod exec_trace;
 pub mod ep;
 pub mod hfq;
 pub mod hfq_compose;
