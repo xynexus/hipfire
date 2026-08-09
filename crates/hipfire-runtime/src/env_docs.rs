@@ -1475,28 +1475,28 @@ pub const ENV_HIPFIRE_DUMP_HIDDEN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_HIDDEN_ALL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_ALL",
     description: "Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row of \"x\"",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1851",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1877",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN_ALLLAYERS` — - HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1: capture EVERY layer to per-layer
 pub const ENV_HIPFIRE_DUMP_HIDDEN_ALLLAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_ALLLAYERS",
     description: "- HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1: capture EVERY layer to per-layer",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1858",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1884",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN_LAYER` — Runtime variable controlling dump hidden layer in hipfire
 pub const ENV_HIPFIRE_DUMP_HIDDEN_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_LAYER",
     description: "Runtime variable controlling dump hidden layer in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1862",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1888",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN_POS` — Single-position localize path (PARO batched-vs-pertoken diff)
 pub const ENV_HIPFIRE_DUMP_HIDDEN_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_POS",
     description: "Single-position localize path (PARO batched-vs-pertoken diff)",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1890",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1916",
 };
 
 /// `HIPFIRE_DUMP_LATENT` — Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent
@@ -2294,7 +2294,7 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_ROTATE",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:7159",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:7185",
 };
 
 /// `HIPFIRE_KVARN_SIM` — Environment toggle value controls runtime behavior
@@ -3612,21 +3612,21 @@ pub const ENV_HIPFIRE_PREFILL_SPARSE_THRESHOLD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER",
     description: "Parses \"HIPFIRE_PREFILL_STOP_AFTER_LA_LAYER\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1990",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:2016",
 };
 
 /// `HIPFIRE_PREFILL_STOP_STAGE` — Runtime variable controlling prefill stop stage in hipfire
 pub const ENV_HIPFIRE_PREFILL_STOP_STAGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_STAGE",
     description: "Runtime variable controlling prefill stop stage in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1996",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:2022",
 };
 
 /// `HIPFIRE_PREFILL_STOP_STAGE_LAYER` — Parses "HIPFIRE_PREFILL_STOP_STAGE_LAYER" with fallback defaults
 pub const ENV_HIPFIRE_PREFILL_STOP_STAGE_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PREFILL_STOP_STAGE_LAYER",
     description: "Parses \"HIPFIRE_PREFILL_STOP_STAGE_LAYER\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1993",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:2019",
 };
 
 /// `HIPFIRE_PREFILL_THRESHOLD` — Runtime variable controlling prefill threshold in hipfire
@@ -3973,11 +3973,18 @@ pub const ENV_HIPFIRE_QWEN35_FINITE_TRACE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:1342",
 };
 
+/// `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG` — from outside. "HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1" names them
+pub const ENV_HIPFIRE_QWEN35_MOE_DTYPE_DEBUG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_QWEN35_MOE_DTYPE_DEBUG",
+    description: "from outside. \"HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1\" names them",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:740",
+};
+
 /// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE` — Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
 pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_LEGACY_INLINE",
     description: "Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1554",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1627",
 };
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Runtime variable controlling qwen35 moe oq indexed in hipfire
@@ -5963,6 +5970,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_QWEN35_FFN_BF16_LAYER,
     ENV_HIPFIRE_QWEN35_FFN_BF16_TRACE,
     ENV_HIPFIRE_QWEN35_FINITE_TRACE,
+    ENV_HIPFIRE_QWEN35_MOE_DTYPE_DEBUG,
     ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE,
     ENV_HIPFIRE_QWEN35_MOE_OQ_INDEXED,
     ENV_HIPFIRE_QWEN35_PAGED_EXPERTS,
