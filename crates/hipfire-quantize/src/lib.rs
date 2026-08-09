@@ -31,6 +31,7 @@ pub mod codecs;
 pub mod gguf_import;
 pub mod gptq;
 pub mod hessian_io;
+pub mod hfa;
 #[allow(dead_code)]
 pub mod hfhs_diag;
 pub mod hfq_out;
