@@ -12,6 +12,29 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
+## [High] Indexed OQ MoE decode kernels produce non-finite KLD
+- Category: Correctness / Kernels (Opus routed experts)
+- Location: `gemv_oq4g256_moe_*`/`gemv_oq8g256_moe_*` indexed kernels, gated by
+  `qwen35_moe_oq_indexed_decode_enabled` (`hipfire-arch-qwen35/src/qwen35/mod.rs:1824`)
+- Summary: with `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`, ALL SEVEN Opus cells of the
+  `qwen3_5_moe` tiny fixture fail with **non-finite KLD** (oq4, oq8, oq4+, oq4++,
+  oq4.25++, oq8+, oq8++). With the flag unset the same seven **pass** with drift
+  `-0` against baseline. One variable, opposite verdicts.
+- Reproduce in minutes:
+  `HIPFIRE_TINYQUANT_FAMILIES=qwen3_5_moe HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 ./tests/tiny-quant-gate.sh`
+- Why it matters beyond the flag: **paged routed-expert residency REQUIRES this
+  path.** Under paging `routed_experts_resident` is false by design, so
+  `check_moe_decode_supported` admits only the GPU-top-K indexed route. Paged
+  Opus MoE is therefore blocked on this defect — on a 35B it presents as ~160 s
+  per MoE layer with one core pinned, which is how it was found.
+- Non-indexed Opus MoE decode is healthy; this is specific to the indexed routed
+  kernels.
+- Suggested fix: debug on the tiny fixture, not a 35B. The gate comment already
+  describes this as a known "finite-KLD failure" being debugged, so this entry is
+  a reproduction and a scope statement rather than a new discovery.
+- Scope: Correctness (premier quant family, paged path)
+- Confidence: High (clean A/B, one variable)
+
 ## [High] tiny-quant is RED on master for Opus across four MoE families
 - Category: Correctness / Quant (Opus)
 - Location: `tests/tiny-quant-gate.sh` cells; baselines in `tests/tiny-quant-baselines.txt`
