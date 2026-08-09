@@ -742,6 +742,47 @@ pub(crate) fn moe_ffn_decode_impl(
     // of the HFQ4 ones — same control flow, different kernel binary.
     let use_gpu_topk = dispatch_flags.use_gpu_topk;
     let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
+    // Why a routed decode was refused is otherwise invisible: the dispatch error
+    // carries only `use_gpu_topk`/`routed_experts_resident`, not the dtypes that
+    // decided them, so a refusal on a paged or mixed artifact is unattributable
+    // from outside. `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1` names them.
+    if std::env::var("HIPFIRE_QWEN35_MOE_DTYPE_DEBUG").as_deref() == Ok("1") {
+        match prefill_dtypes {
+            Some(d) => eprintln!(
+                "[moe-dtype] layer={} experts_resident={} n_dtypes={} gate_up={:?} down={:?} \
+                 uniform(gu/dn)={}/{} profile={:?} k={} oq_indexed_gate={} \
+                 idx(mq4/mq6/mq2l/paro/oq4/oq8)={}/{}/{}/{}/{}/{} path={:?} use_gpu_topk={}",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                d.expert_gate_up,
+                d.expert_down,
+                d.expert_gate_up_uniform,
+                d.expert_down_uniform,
+                d.routed_profile,
+                k,
+                qwen35_moe_oq_indexed_decode_enabled(),
+                routed_dtype_indexable_mq4,
+                routed_dtype_indexable_mq6,
+                routed_dtype_indexable_mq2_lloyd,
+                routed_dtype_indexable_paro,
+                routed_dtype_indexable_oq4,
+                routed_dtype_indexable_oq8,
+                dispatch_flags.routed_path,
+                use_gpu_topk,
+            ),
+            None => eprintln!(
+                "[moe-dtype] layer={} MoePrefillDtypes::from_ffn returned None \
+                 (experts_resident={} n_gate_up_dtypes={} expert_gate_up_dtype={:?}) \
+                 -> every indexed path disabled",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                ffn.expert_gate_up_dtype,
+            ),
+        }
+    }
+
     let paged_mixed_routed = ffn.experts.is_empty()
         && prefill_dtypes.is_some_and(|dtypes| dtypes.routed_profile.is_mixed());
     let x_rot_local = if needs_x_rot_local {
@@ -796,25 +837,57 @@ pub(crate) fn moe_ffn_decode_impl(
     } else {
         None
     };
+    // The routed dtypes come from the per-expert dtype tables, NOT from
+    // `ffn.experts`. Under paged residency `experts` is empty by design, so
+    // `experts.first()` yields nothing there — and the previous
+    // `.unwrap_or(DType::F32)` turned "I don't know" into a confident F32,
+    // which the executor's own resolution then read as a non-indexable routed
+    // dtype and refused with `decode-routed-dtype-unsupported-no-fallback`.
+    //
+    // That produced two independent resolutions of the same fact that disagreed:
+    // the arch-side flags above resolved `Uniform(Oq4G256)` / `use_gpu_topk=true`
+    // from `expert_gate_up_dtypes`, while this snapshot said F32. Measured on a
+    // paged Qwen3.6-35B-A3B--oq4 artifact, which is why paged MoE decode failed
+    // for EVERY routed format, not just Opus.
+    //
+    // `moe_expert_gate_up_dtype`/`moe_expert_down_dtype` already prefer the dtype
+    // tables and fall back to resident experts, so they are correct in both modes.
+    let routed_gate_up_dtype = moe_expert_gate_up_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed gate_up dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
+    let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed down dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        experts_all_gate_up_mq4: ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
-        routed_gate_up: ffn
-            .experts
-            .first()
-            .map(|e| e.gate_up.gpu_dtype)
-            .unwrap_or(DType::F32),
-        routed_down: ffn
-            .experts
-            .first()
-            .map(|e| e.down.gpu_dtype)
-            .unwrap_or(DType::F32),
+        // `.all()` over an EMPTY iterator is vacuously true, so the old form
+        // claimed "every routed expert is MQ4" for any paged model regardless of
+        // its actual format. Read the dtype table first, and when neither source
+        // knows, answer `false` — an unknown must not present as uniformity.
+        experts_all_gate_up_mq4: if !ffn.expert_gate_up_dtypes.is_empty() {
+            ffn.expert_gate_up_dtypes
+                .iter()
+                .all(|d| *d == DType::MQ4G256)
+        } else if !ffn.experts.is_empty() {
+            ffn.experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        } else {
+            false
+        },
+        routed_gate_up: routed_gate_up_dtype,
+        routed_down: routed_down_dtype,
         has_paro_shared: ffn.paro_shared.is_some(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
