@@ -651,6 +651,121 @@ fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightP
     }
 }
 
+/// Env-gated phase timing for the paged routed-expert path.
+///
+/// `HIPFIRE_PAGER_TIMING=1` accumulates wall nanoseconds per phase and prints a
+/// cumulative summary every `HIPFIRE_PAGER_TIMING_EVERY` layer admissions
+/// (default 400).
+///
+/// This exists because the paged path is CPU-bound for reasons that were twice
+/// mis-attributed by reading the code — first to the host repack, which a
+/// pre-transformed artifact then disproved by pegging a core just as hard. A
+/// sampling profiler would be the right tool, but `perf_event_paranoid=4` and
+/// `ptrace_scope` block both `perf` and `gdb`/`eu-stack` attach on this box, so
+/// the process has to time itself.
+///
+/// Deliberately coarse: four phases that partition one `ensure_paged_experts_resident`
+/// call, so the answer is "which phase", not "which line". That is enough to
+/// choose where to look next, and it costs two `Instant::now()` per phase when
+/// enabled and one relaxed atomic load when not.
+pub mod page_timing {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Phase {
+        /// D2H readback of the router's top-k indices.
+        TopkReadback = 0,
+        /// Budget admission for the layer's expert set.
+        WouldFit = 1,
+        /// Page-in of the selected experts (fetch and/or host repack).
+        EnsureResident = 2,
+        /// Rewriting the device-side expert pointer table.
+        PatchPtrTable = 3,
+    }
+
+    const N: usize = 4;
+    static NANOS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("HIPFIRE_PAGER_TIMING").as_deref() == Ok("1"))
+    }
+
+    fn dump_every() -> u64 {
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("HIPFIRE_PAGER_TIMING_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(400)
+        })
+    }
+
+    pub fn record(phase: Phase, nanos: u64) {
+        if !enabled() {
+            return;
+        }
+        NANOS[phase as usize].fetch_add(nanos, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Call once per `ensure_paged_experts_resident`; prints on a cadence.
+    pub fn admission(experts_admitted: usize) {
+        if !enabled() {
+            return;
+        }
+        let n = ADMISSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % dump_every() != 0 {
+            return;
+        }
+        let vals: Vec<u64> = NANOS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let total: u64 = vals.iter().sum();
+        if total == 0 {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[pager-timing] no phase time recorded — is the paged path live?");
+            }
+            return;
+        }
+        let pct = |v: u64| (v as f64) * 100.0 / (total as f64);
+        eprintln!(
+            "[pager-timing] admissions={n} last_set={experts_admitted} total={:.2}s | \
+             topk_readback {:.2}s ({:.1}%) | would_fit {:.2}s ({:.1}%) | \
+             ensure_resident {:.2}s ({:.1}%) | patch_ptrs {:.2}s ({:.1}%)",
+            total as f64 / 1e9,
+            vals[0] as f64 / 1e9,
+            pct(vals[0]),
+            vals[1] as f64 / 1e9,
+            pct(vals[1]),
+            vals[2] as f64 / 1e9,
+            pct(vals[2]),
+            vals[3] as f64 / 1e9,
+            pct(vals[3]),
+        );
+    }
+
+    /// Time `f`, attributing its wall time to `phase`.
+    pub fn timed<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t = std::time::Instant::now();
+        let out = f();
+        record(phase, t.elapsed().as_nanos() as u64);
+        out
+    }
+}
+
 fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
     module.tensors.iter().any(|tensor| {
         matches!(
