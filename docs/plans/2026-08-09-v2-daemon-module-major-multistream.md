@@ -331,6 +331,38 @@ a `.gfx1103` tag, and the naming follows the plain machine-section rule instead.
 prompt, plus the CPU-time collapse — the before number is the measurement in §0.6(c),
 ~96 % of one core with the GPU at 0 %.
 
+**(d) The paged CPU stall is the executor's CPU MoE fallback, not the pager.** Located
+2026-08-09 after five wrong hypotheses; recording the answer and the method.
+
+`run_moe_decode` does `if !res.use_gpu_topk { return run_moe_decode_cpu_fallback(..) }`
+(`pipeline/mod.rs:382`). That fallback is self-contained — softmax, CPU top-K + renorm,
+then a **generic per-expert routed loop on the host**. On this model (40 layers, 256
+experts, hidden 2048, moe_inter 512) that is a full MoE FFN per layer on one core:
+measured ~160 s per MoE layer, one core at ~99 %, GPU at 0 %.
+
+**The trap is the same dual-resolution split that caused the dtype bug.** The arch-side
+trace reports `use_gpu_topk=true, path=Oq4` — and it is telling the truth about its own
+resolution. The executor then recomputes `MoeResolution::resolve` from the marshalled
+`MoeDtypes` and reaches its own verdict, which is what actually selects the path. Reading
+the arch trace and concluding "we are on the GPU path" is exactly the mistake to avoid; it
+is the second bug traced to these two resolutions disagreeing.
+
+How it was found, since the search cost far more than the fix will:
+`HIPFIRE_PAGED_MOE_DEBUG=1` brackets the paged path with device syncs. Only
+`after paged rotate_x_mq` printed and `after paged topk` never did, which bounded the stall
+to `moe_decode.rs:841..1126` — and the centralized dispatch inside that window is where the
+fallback returns from. Pager phase timing printing *nothing* was the complementary evidence:
+the admission code is downstream of the fallback's early `return`, so it never ran.
+
+Ruled out along the way, each disproven by measurement rather than argument: the host
+repack (a pre-transformed qt-53 artifact stalls identically), the pager admission phases
+(never reached), and runtime hipcc JIT (the OQ4 MoE kernels are present as `.hsaco` in the
+gfx1103 cache).
+
+**Next:** find why the executor's resolution differs from the arch's for a paged OQ4 layer.
+`MoeResolution::resolve` reads `HIPFIRE_QWEN35_MOE_OQ_INDEXED` itself, so the gate is not
+the difference; the marshalled `MoeDtypes` is the thing to dump at the executor entry.
+
 **(b) The refusal panics rather than returning an error.**
 `generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
 correct, reject-rather-than-miscompute behaviour — takes the whole daemon down. Today that
