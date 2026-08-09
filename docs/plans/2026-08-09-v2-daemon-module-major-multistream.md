@@ -214,6 +214,25 @@ against a smaller MoE here. M5 on this box needs cause 1 fixed. Do **not** requa
 `mq4` to get moving: magnum is deprecated, and routing around the gap buys a measurement on
 a dying format while leaving the premier path broken.
 
+**(c) Paged Opus is CPU-bound on a per-module host repack — a cost specific to the
+premier quant family.** `module_requires_host_repack` (`weight_pager.rs:648`) returns true
+for exactly `Oq4G256 | Oq8G256 | OqPlusCompact`; magnum and the rest take the verbatim
+`transport.fetch` path. So every Opus expert page-in runs
+`oq4_canonical_to_moe_blocks` on the CPU, single-threaded, synchronously inside the
+dispatch — 10,240 modules x 1.52 MiB on the M4 artifact. Observed directly: with the
+refusal fixed, the daemon sits at ~96 % of ONE core with ~415 MB RSS while the GPU idles.
+
+This matters for M5's design, and it is not a bug to fix in passing:
+
+- §1.6's async prefetch is necessary but **not sufficient** for Opus — overlapping the I/O
+  still leaves a serial CPU transform on the critical path. The prefetch engine has to
+  repack too, not merely copy.
+- The alternative is to store the MoE-block layout on disk so page-in is verbatim. That is
+  a quantizer/format change, not a runtime one, and it trades disk portability for
+  page-in cost. Worth a decision before M5 rather than during it.
+- It also means the launch-overhead arithmetic in §0.3 understates paged Opus: those
+  figures count DRAM bytes and kernel launches, not a host-side transform per module.
+
 **(b) The refusal panics rather than returning an error.**
 `generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
 correct, reject-rather-than-miscompute behaviour — takes the whole daemon down. Today that
