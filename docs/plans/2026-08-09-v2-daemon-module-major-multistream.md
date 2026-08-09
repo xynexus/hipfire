@@ -162,6 +162,42 @@ and (b) a suspension point every ~1.6 MiB of weights. **If the N at which the cu
 does not fit in VRAM on the target box, the capacity half of the thesis does not pay on
 that box** — report that, do not tune around it.
 
+## 0.6 Paged residency and OQ4 routed experts do not currently meet
+
+Measured on gfx1103 with the artifact above. Two distinct problems, and the second is a
+v2 concern in its own right.
+
+**(a) Full residency OOMs; paging works, but paged OQ4 decode is refused.**
+
+| load mode | result |
+|---|---|
+| pinned (default) | **OOM** — `hipMalloc: out of memory`, 15 MB free of 43,008 MB, for a 19.1 GB artifact |
+| paged (`HIPFIRE_QWEN35_PAGED_EXPERTS=1`, 8 GiB cache) | **loaded in 10.6 s**, streaming only 2.54 GiB of a 17.77 GiB payload |
+
+The pinned OOM is the allocator overhead `moe-expert-residency-unification.md` already
+records — "20,480 BOs on a 256-expert/40-layer artifact = 4.35 GB pure allocator overhead"
+is *this exact model shape*. So the capacity half of the v2 thesis is demonstrable on this
+box: the model does not fit pinned and does fit paged.
+
+But generation then fails with `moe.decode-routed-dtype-unsupported-no-fallback`
+(`hipfire-dispatch/src/pipeline/mod.rs:220`). The refusal is
+`!use_gpu_topk && !routed_experts_resident`, and under paged residency
+`routed_experts_resident` is **false by design** — the doc at `:196-197` says only the
+GPU-top-K path is available. So paging *requires* a GPU-top-K-indexable routed dtype.
+`MoeResolution::routed_indexable` (`families/moe.rs:133`) does list
+`routed_indexable_oq4`, so OQ4 ought to qualify; it did not resolve that way here, and
+`moe_decode.rs:695-711` has an all-false fallback branch that zeroes every
+`routed_dtype_indexable_*` and `use_gpu_topk`. **Why that branch was taken for a paged OQ4
+artifact is the open question** — it is the gate on M4/M5 using this artifact, and it is
+where the next session should start.
+
+**(b) The refusal panics rather than returning an error.**
+`generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
+correct, reject-rather-than-miscompute behaviour — takes the whole daemon down. Today that
+loses one request. Under the v2 executor it would kill every co-scheduled stream, including
+any realtime one, which makes it a Tier-1 correctness item rather than a papercut. Fixing
+it is independent of (a) and worth doing regardless.
+
 ## 0.5 The residency work this builds on is NOT on master
 
 `ResidencyPolicy` does not exist in `weight_pager.rs` on `origin/master`. Phases 1 and 2
@@ -792,6 +828,34 @@ is latency and latency is provable with super-op suspension alone.
   3. **Disk placement is a measurement decision, not housekeeping.** The artifact must live
      on local NVMe rather than `/srv`: M5's paging numbers come from the pager's transports
      reading the `.hfq` directly, so an NFS-resident artifact would measure the network.
+
+  **Built and verified 2026-08-09** — `~/.hipfire/models/Qwen3.6-35B-A3B--oq4.hfq`, 19.1 GB,
+  20 min of quantize after a 71.9 GB restore (`.hfa` is compressed; the restored bf16
+  checkpoint is ~72 GB, not the 47.8 GB archive size). `artifact inspect` confirms every
+  property M4/M5 needs:
+
+  | property | value |
+  |---|---|
+  | arch_id / format | 6 (qwen3_5_moe) / `oq4` |
+  | layers × routed experts | 40 × 256 = **10,240 expert modules** |
+  | top-k / hidden / moe_inter | 8 / 2048 / 512 |
+  | tensors | 21,093 (from 1,045 source — the 3D stacked experts ARE split per-expert) |
+  | routed-expert module records | **10,240**, `layers.0.experts.0` … `layers.39.experts.255` |
+  | routed quant_type | **34 = `Oq4G256` canonical** (pageable; not 37 ArchPacked) |
+  | module size | uniform **1,597,440 B**, exactly one distinct size |
+
+  The uniform module size matters: §1.6's fixed-frame slab design applies directly — one
+  slab, one frame size, `free.pop()`/`free.push()`, zero fragmentation. And 1.52 MiB is
+  close enough to the 1.59 MiB used in §0.3's launch-overhead table that those figures hold.
+
+  **A correction worth recording:** mid-build I inferred from "Found 1045 tensors" that the
+  quantizer was *not* splitting the stacked `experts.gate_up_proj`, and concluded the
+  artifact would carry no per-expert module records. That was wrong — 1,045 is the *source*
+  count, and each stacked tensor expands into 256 per-expert outputs. The 21,093/10,240
+  figures above are the refutation. The lesson is that a progress counter over inputs says
+  nothing about outputs.
+
+  **Blocker found, and it is two separate problems (see §0.6).**
 
   **Retracted:** this section previously warned off `--format qtip3`/`qtip4` because the
   qtip path self-locked under a parent holding the flock. That self-lock has been deleted —
