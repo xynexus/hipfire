@@ -93,6 +93,16 @@ measured across more models.
 
 `cargo clippy --workspace --all-targets` clean; `./tests/no-gpu-ci.sh` exits 0.
 
+## Artifacts need no reconversion
+
+State precision is a RUNTIME choice, not a stored property: nothing about it is
+written into the `.hfq`. Every existing Qwen3.5 artifact loads unchanged, and
+`DeltaNetState` is built per session from `parse_state_quant`. The only
+behaviour change an operator can see is that an explicit `state_quant = "q8"`
+(or `q4`/`int8`/`int4`) is now REJECTED with an error naming the three failure
+modes, rather than silently mapped to FP32 — deliberate, so a config that asked
+for Q8 does not quietly get different numerics.
+
 ## FP32 is still the default
 
 FP16 stays behind `HIPFIRE_DN_STATE_FP16`. The blocker that forced the
