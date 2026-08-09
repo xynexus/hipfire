@@ -2475,9 +2475,19 @@ pub fn load_model(
         };
         // Q8 DeltaNet state can accumulate quality drift on long generation.
         // The load-time override exists for coherence A/B probes.
-        let dn_quant = if is_bf16_artifact {
-            hipfire_arch_qwen35::qwen35::StateQuant::FP32
-        } else {
+        // `parse_state_quant` decides, for bf16 and quantized artifacts alike.
+        // This used to short-circuit to FP32 when `is_bf16_artifact`, which is
+        // `hfq_has_bf16_weights()` — TRUE for QUANTIZED artifacts too, because
+        // their norm tensors are BF16. The comment on the KV policy below
+        // records the same trap being fixed there ("the prior rule wrongly
+        // force-fp32'd these via the BF16 norms"); the DeltaNet-state branch
+        // kept it, so no state precision could ever be selected for a
+        // quantized model.
+        //
+        // Default behaviour is unchanged: with no override and no
+        // HIPFIRE_DN_STATE_FP16, `parse_state_quant` returns FP32 for every
+        // model. What changes is that an explicit request is now honoured.
+        let dn_quant = {
             let parsed = parse_state_quant(state_quant_override, &config)?;
             resolve_tiny_model_state(&hfq, state_quant_override, parsed)
         };
@@ -3638,9 +3648,19 @@ pub fn load_model_pp(
 
     // Mirror the pp=1 state-mode parser so pp parity probes can force the
     // same DeltaNet state representation.
-    let dn_quant = if is_bf16_artifact {
-        hipfire_arch_qwen35::qwen35::StateQuant::FP32
-    } else {
+    // `parse_state_quant` decides, for bf16 and quantized artifacts alike.
+    // This used to short-circuit to FP32 when `is_bf16_artifact`, which is
+    // `hfq_has_bf16_weights()` — TRUE for QUANTIZED artifacts too, because
+    // their norm tensors are BF16. The comment on the KV policy below
+    // records the same trap being fixed there ("the prior rule wrongly
+    // force-fp32'd these via the BF16 norms"); the DeltaNet-state branch
+    // kept it, so no state precision could ever be selected for a
+    // quantized model.
+    //
+    // Default behaviour is unchanged: with no override and no
+    // HIPFIRE_DN_STATE_FP16, `parse_state_quant` returns FP32 for every
+    // model. What changes is that an explicit request is now honoured.
+    let dn_quant = {
         let parsed = parse_state_quant(state_quant_override, &config)?;
         resolve_tiny_model_state(&hfq, state_quant_override, parsed)
     };
