@@ -41,6 +41,7 @@
 #[allow(unused_imports)]
 use codecs::*;
 pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant};
+use std::borrow::Cow;
 // HFQ writer + provenance/metadata machinery now lives in the library so the
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
@@ -526,11 +527,29 @@ struct TensorMeta {
     data_offsets: [usize; 2],
 }
 
+/// Where a shard's bytes come from.
+///
+/// `Mmap` is a real `.safetensors` file: payload is a borrowed slice of mapped
+/// pages, and `drop_tensor_pages` can hand them back to the kernel. `Archive`
+/// is a shard inside an `.hfa`, whose payload is stored as independently
+/// decodable pieces — it must be decoded into OWNED memory, which is why
+/// `tensor_data` yields a `Cow` rather than a slice. Same reason
+/// `HfqInputFile::tensor_data` already returns one.
+enum ShardBackend {
+    Mmap {
+        file: File,
+        mmap: Mmap,
+        header_size: usize,
+    },
+    Archive {
+        archive: std::sync::Arc<hipfire_quantize::hfa::HfaArchive>,
+        rel: String,
+    },
+}
+
 struct SafetensorsFile {
-    _file: File,
     path: PathBuf,
-    mmap: Mmap,
-    header_size: usize,
+    backend: ShardBackend,
     tensors: HashMap<String, TensorMeta>,
 }
 
@@ -600,10 +619,47 @@ impl SafetensorsFile {
         }
 
         Ok(Self {
-            _file: file,
             path: path.to_path_buf(),
-            mmap,
-            header_size: 8 + header_len,
+            backend: ShardBackend::Mmap {
+                file,
+                mmap,
+                header_size: 8 + header_len,
+            },
+            tensors,
+        })
+    }
+
+    /// One shard inside an `.hfa`, presented with the same surface as a shard
+    /// on disk. The archive stores each shard's safetensors header VERBATIM, so
+    /// the tensor table is parsed from exactly the same JSON the restored file
+    /// would carry — the tensor set and its `data_offsets` are identical either
+    /// way, and only the payload retrieval differs.
+    fn open_in_archive(
+        archive: std::sync::Arc<hipfire_quantize::hfa::HfaArchive>,
+        rel: &str,
+        archive_path: &Path,
+    ) -> Result<Self, String> {
+        let header = archive.shard_header(rel)?;
+        let obj = header
+            .as_object()
+            .ok_or_else(|| format!("hfa: shard {rel} header is not a JSON object"))?;
+        let mut tensors = HashMap::new();
+        for (name, value) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let meta: TensorMeta = serde_json::from_value(value.clone())
+                .map_err(|e| format!("hfa: shard {rel} tensor {name} has invalid metadata: {e}"))?;
+            tensors.insert(name.clone(), meta);
+        }
+        Ok(Self {
+            // `<archive>#<shard>` keeps every shard distinct in the input-hash
+            // ledger, which keys on (path, tensor name).
+            path: PathBuf::from(format!("{}#{rel}", archive_path.display())),
+            backend: ShardBackend::Archive {
+                archive,
+                rel: rel.to_string(),
+            },
             tensors,
         })
     }
@@ -612,22 +668,52 @@ impl SafetensorsFile {
         self.tensors.get(name)
     }
 
-    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, &[u8])> {
+    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, Cow<'_, [u8]>)> {
         let meta = self.tensors.get(name)?;
-        let start = self.header_size + meta.data_offsets[0];
-        let end = self.header_size + meta.data_offsets[1];
-        let data = &self.mmap[start..end];
-        record_input_hash_tensor(&self.path, name, meta, start, data);
-        Some((meta, data))
+        match &self.backend {
+            ShardBackend::Mmap {
+                mmap, header_size, ..
+            } => {
+                let start = header_size + meta.data_offsets[0];
+                let end = header_size + meta.data_offsets[1];
+                let data = &mmap[start..end];
+                record_input_hash_tensor(&self.path, name, meta, start, data);
+                Some((meta, Cow::Borrowed(data)))
+            }
+            ShardBackend::Archive { archive, rel } => {
+                // Decodes only the pieces covering THIS tensor, not the shard.
+                let (bytes, _dtype, _shape) = archive
+                    .tensor_bytes(rel, name)
+                    .map_err(|e| {
+                        eprintln!("error: hfa: cannot read {rel}/{name}: {e}");
+                        std::process::exit(2);
+                    })
+                    .ok()?;
+                // Logical offset within the reconstructed shard — the same value
+                // the mmap arm would see minus its header, and stable across runs.
+                record_input_hash_tensor(&self.path, name, meta, meta.data_offsets[0], &bytes);
+                Some((meta, Cow::Owned(bytes)))
+            }
+        }
     }
 
     /// Advise the kernel to drop page cache for a tensor's data region.
     /// On UMA systems this is critical: 234 GB of mmap'd safetensors
     /// pages compete with hipMalloc for the same physical RAM.
+    ///
+    /// Archive-backed shards decode into owned buffers that the caller already
+    /// drops, so there are no shared pages to release — the equivalent saving
+    /// happens by construction.
     #[cfg(unix)]
     fn drop_tensor_pages(&self, name: &str) {
+        let ShardBackend::Mmap {
+            file, header_size, ..
+        } = &self.backend
+        else {
+            return;
+        };
         if let Some(meta) = self.tensors.get(name) {
-            let start = self.header_size + meta.data_offsets[0];
+            let start = header_size + meta.data_offsets[0];
             let len = meta.data_offsets[1] - meta.data_offsets[0];
             use std::os::unix::io::AsRawFd;
             // POSIX_FADV_DONTNEED = 4
@@ -635,7 +721,7 @@ impl SafetensorsFile {
                 extern "C" {
                     fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
                 }
-                posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
+                posix_fadvise(file.as_raw_fd(), start as i64, len as i64, 4);
             }
         }
     }
@@ -809,10 +895,10 @@ fn tensor_to_f32_with_optional_fp8_scale(
             .tensor_data(sname)
             .unwrap_or_else(|| panic!("FP8 scale tensor missing: {sname}"));
         if smeta.dtype == "F8_E8M0" {
-            return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+            return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, &sbytes, &smeta.shape);
         } else if smeta.dtype == "F32" {
             // MiniMax-M2: e4m3 + F32 block-[128,128] weight_scale_inv (multiply).
-            return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+            return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, &sbytes, &smeta.shape);
         } else {
             panic!(
                 "expected F8_E8M0 or F32 scale for {name}, got {}",
@@ -901,7 +987,7 @@ fn build_rotation_overrides(
             if let Some((meta, raw)) = st.tensor_data(name) {
                 return Some(tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw,
+                    &raw,
                     meta,
                     fp8_scale_for,
                     st_files,
@@ -6951,7 +7037,7 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
                 if meta.shape.len() != 2 {
                     return Err(format!("{wname} is not 2D"));
                 }
-                found = Some((to_f32(bytes, &meta.dtype), meta.shape[0], meta.shape[1]));
+                found = Some((to_f32(&bytes, &meta.dtype), meta.shape[0], meta.shape[1]));
                 break;
             }
         }
@@ -8294,27 +8380,73 @@ fn main() {
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
     let original_input_dir = input_dir.to_string();
-    let input_dir = resolve_model_path(input_dir);
+    // `.hfa` source archive: a HuggingFace snapshot with its BF16 payloads
+    // losslessly recoded. Consumed IN PLACE — the alternative is
+    // `hipfire-coexistence repack --output <dir>`, a full restore that costs
+    // the whole checkpoint again on disk (244 GB for Qwen3.5-122B-A10B) purely
+    // so a quantizer that walks each tensor once can read it.
+    //
+    // Everything downstream is unchanged: the archive stores each shard's
+    // safetensors header VERBATIM, so the tensor table, dtypes and
+    // `data_offsets` are identical to the restored file's. Only payload
+    // retrieval differs, and that is confined to `SafetensorsFile::tensor_data`.
+    let hfa_archive: Option<std::sync::Arc<hipfire_quantize::hfa::HfaArchive>> = {
+        let raw = Path::new(&original_input_dir);
+        if hipfire_quantize::hfa::is_hfa(raw) {
+            match hipfire_quantize::hfa::HfaArchive::open(raw) {
+                Ok(a) => Some(std::sync::Arc::new(a)),
+                Err(e) => {
+                    eprintln!(
+                        "error: cannot open .hfa source archive\n input: {original_input_dir}\n reason: {e}"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let input_dir = if hfa_archive.is_some() {
+        // resolve_model_path expects a directory or model id; an archive is
+        // already an exact path, so keep it as-is for diagnostics.
+        original_input_dir.clone()
+    } else {
+        resolve_model_path(input_dir)
+    };
     let input_dir = Path::new(&input_dir);
     let output_path = Path::new(output_path);
 
     // Read model config
     let config_path = input_dir.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-        eprintln!(
-            "error: cannot read model config\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             expected: {config}\n\
-             reason: {e}\n\
-             hint: pass a Hugging Face snapshot directory, a cache root containing refs/main and snapshots/, or a model id like org/name. \
-             For /srv/huggingface cache roots, refs/main must point to a snapshot containing config.json.",
-            original = original_input_dir,
-            resolved = input_dir.display(),
-            config = config_path.display(),
-        );
-        std::process::exit(2);
-    });
+    let config_str = if let Some(archive) = hfa_archive.as_ref() {
+        let bytes = archive.read_small_file("config.json").unwrap_or_else(|e| {
+            eprintln!(
+                "error: .hfa archive has no readable config.json\n archive: {}\n reason: {e}",
+                input_dir.display()
+            );
+            std::process::exit(2);
+        });
+        String::from_utf8(bytes).unwrap_or_else(|e| {
+            eprintln!("error: .hfa config.json is not valid UTF-8: {e}");
+            std::process::exit(2);
+        })
+    } else {
+        std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read model config\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 expected: {config}\n\
+                 reason: {e}\n\
+                 hint: pass a Hugging Face snapshot directory, a .hfa source archive, a cache root containing refs/main and snapshots/, or a model id like org/name. \
+                 For /srv/huggingface cache roots, refs/main must point to a snapshot containing config.json.",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+                config = config_path.display(),
+            );
+            std::process::exit(2);
+        })
+    };
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
         eprintln!(
             "error: invalid model config JSON\n\
@@ -8579,23 +8711,34 @@ fn main() {
         );
     }
 
-    // Read tokenizer if present
-    let tokenizer_json = input_dir.join("tokenizer.json");
-    let tokenizer_str = if tokenizer_json.exists() {
-        std::fs::read_to_string(&tokenizer_json).ok()
-    } else {
-        None
+    // Companion files (tokenizer, chat template, generation config) come from
+    // the archive when the source is a `.hfa` — it stores them verbatim
+    // alongside the shards. Routing all four reads through one helper is what
+    // keeps an archive source from silently producing an artifact with an empty
+    // tokenizer, which is what a per-call-site `input_dir.join()` did.
+    let read_sidecar = |rel: &str| -> Option<String> {
+        match hfa_archive.as_ref() {
+            Some(archive) => archive
+                .read_small_file(rel)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+            None => {
+                let path = input_dir.join(rel);
+                if path.exists() {
+                    std::fs::read_to_string(&path).ok()
+                } else {
+                    None
+                }
+            }
+        }
     };
 
+    // Read tokenizer if present
+    let tokenizer_str = read_sidecar("tokenizer.json");
+
     // Read tokenizer_config.json (has chat_template)
-    let tokenizer_config_path = input_dir.join("tokenizer_config.json");
-    let tokenizer_config: Option<serde_json::Value> = if tokenizer_config_path.exists() {
-        std::fs::read_to_string(&tokenizer_config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    let tokenizer_config: Option<serde_json::Value> =
+        read_sidecar("tokenizer_config.json").and_then(|s| serde_json::from_str(&s).ok());
     let mut tokenizer_config = match chat_template_override {
         Some(template) => Some(tokenizer_config_with_chat_template(
             tokenizer_config,
@@ -8617,9 +8760,8 @@ fn main() {
             .and_then(|t| t.as_str())
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false);
-        let jinja_path = input_dir.join("chat_template.jinja");
-        if !has_tpl && jinja_path.exists() {
-            if let Ok(tpl) = std::fs::read_to_string(&jinja_path) {
+        if !has_tpl {
+            if let Some(tpl) = read_sidecar("chat_template.jinja") {
                 let obj = tokenizer_config.get_or_insert_with(|| serde_json::json!({}));
                 if let Some(map) = obj.as_object_mut() {
                     map.insert("chat_template".into(), serde_json::Value::String(tpl));
@@ -8638,14 +8780,8 @@ fn main() {
     // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
     // generation_config when config.eos_token_id is absent. Resolves
     // R5 in docs/plans/dots-ocr-devlog.md §7.
-    let generation_config_path = input_dir.join("generation_config.json");
-    let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
-        std::fs::read_to_string(&generation_config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    let generation_config: Option<serde_json::Value> =
+        read_sidecar("generation_config.json").and_then(|s| serde_json::from_str(&s).ok());
 
     // Build metadata for .hfq. The quantization_hash is added after tensor
     // production so it covers the final quantized payload bytes.
@@ -8697,48 +8833,79 @@ fn main() {
         }
     }
 
-    // Load all safetensors files
-    let st_paths = find_safetensors(input_dir).unwrap_or_else(|e| {
+    // Load all safetensors shards — from the directory, or straight out of the
+    // `.hfa` archive without restoring it.
+    let st_files: Vec<SafetensorsFile> = if let Some(archive) = hfa_archive.as_ref() {
+        let shards = archive.safetensors_names();
+        if shards.is_empty() {
+            eprintln!(
+                "error: .hfa archive contains no .safetensors shards\n archive: {}",
+                input_dir.display()
+            );
+            std::process::exit(2);
+        }
         eprintln!(
-            "error: cannot read safetensors shards\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             reason: {e}",
-            original = original_input_dir,
-            resolved = input_dir.display(),
+            "HFA input: {} shard(s), read in place (no restore)",
+            shards.len()
         );
-        std::process::exit(2);
-    });
-    if st_paths.is_empty() {
-        eprintln!(
-            "error: no .safetensors files found in model directory\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             hint: pass the model snapshot directory that contains model-*.safetensors, or the top-level HF cache root with refs/main.",
-            original = original_input_dir,
-            resolved = input_dir.display(),
-        );
-        std::process::exit(2);
-    }
-    let st_files: Vec<SafetensorsFile> = st_paths
-        .iter()
-        .map(|p| {
-            eprintln!("Loading: {}", p.display());
-            SafetensorsFile::open(p).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: cannot open safetensors shard\n\
-                     input: {original}\n\
-                     resolved: {resolved}\n\
-                     shard: {shard}\n\
-                     reason: {e}",
-                    original = original_input_dir,
-                    resolved = input_dir.display(),
-                    shard = p.display(),
-                );
-                std::process::exit(2);
+        shards
+            .iter()
+            .map(|rel| {
+                eprintln!("Loading: {}#{rel}", input_dir.display());
+                SafetensorsFile::open_in_archive(archive.clone(), rel, input_dir).unwrap_or_else(
+                    |e| {
+                        eprintln!(
+                            "error: cannot open shard inside .hfa\n archive: {}\n shard: {rel}\n reason: {e}",
+                            input_dir.display()
+                        );
+                        std::process::exit(2);
+                    },
+                )
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        let st_paths = find_safetensors(input_dir).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read safetensors shards\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 reason: {e}",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+            );
+            std::process::exit(2);
+        });
+        if st_paths.is_empty() {
+            eprintln!(
+                "error: no .safetensors files found in model directory\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 hint: pass the model snapshot directory that contains model-*.safetensors, a .hfa source archive, or the top-level HF cache root with refs/main.",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+            );
+            std::process::exit(2);
+        }
+        st_paths
+            .iter()
+            .map(|p| {
+                eprintln!("Loading: {}", p.display());
+                SafetensorsFile::open(p).unwrap_or_else(|e| {
+                    eprintln!(
+                        "error: cannot open safetensors shard\n\
+                         input: {original}\n\
+                         resolved: {resolved}\n\
+                         shard: {shard}\n\
+                         reason: {e}",
+                        original = original_input_dir,
+                        resolved = input_dir.display(),
+                        shard = p.display(),
+                    );
+                    std::process::exit(2);
+                })
+            })
+            .collect()
+    };
     begin_input_hash();
 
     // Collect all tensor names.
@@ -8785,7 +8952,7 @@ fn main() {
                     }
                     let (m, k) = (meta.shape[0], meta.shape[1]);
                     let w = tensor_to_f32_with_optional_fp8_scale(
-                        name, raw, meta, &empty_fp8, &st_files,
+                        name, &raw, meta, &empty_fp8, &st_files,
                     );
                     if w.len() != m * k {
                         continue;
@@ -9222,7 +9389,7 @@ fn main() {
                 .write_next(
                     entry,
                     |writer| {
-                        writer.write_all(raw_data)?;
+                        writer.write_all(&raw_data)?;
                         Ok(())
                     },
                     |_| {},
@@ -9333,7 +9500,7 @@ fn main() {
         if use_f32_passthrough {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9385,7 +9552,7 @@ fn main() {
             {
                 let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9510,7 +9677,7 @@ fn main() {
             if name.ends_with(".feed_forward.expert_bias") {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9558,7 +9725,7 @@ fn main() {
             if let Some(oq_format) = per_tensor_oq {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9628,7 +9795,7 @@ fn main() {
             {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9664,7 +9831,7 @@ fn main() {
             // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9796,11 +9963,11 @@ fn main() {
                 let (smeta, sbytes) = st_files[*sfi]
                     .tensor_data(sname)
                     .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
-                dequantize_e2m1_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape)
+                dequantize_e2m1_ue8m0_to_f32(&raw_data, &meta.shape, &sbytes, &smeta.shape)
             } else {
                 let vals = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9884,7 +10051,7 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9948,7 +10115,7 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9983,7 +10150,7 @@ fn main() {
         {
             let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9996,7 +10163,7 @@ fn main() {
                 // bf16 from the perturbed f32 so the normal forward yields a
                 // faithful QTIP-2 PPL.
                 let (q, qt, label) = if use_bf16 {
-                    source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data)
+                    source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data)
                 } else {
                     (f32_slice_to_f16_bytes(&f32_data), QuantType::F16, "F16")
                 };
@@ -10683,7 +10850,7 @@ fn main() {
             let src_dtype = meta.dtype.as_str();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10721,7 +10888,7 @@ fn main() {
             let src_dtype = meta.dtype.as_str();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10755,7 +10922,7 @@ fn main() {
         if should_quantize(name) && n_elements >= 32 {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10827,7 +10994,7 @@ fn main() {
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
                 let (quantized, qt, gs, label) = if let Some(ov) = is_embed
-                    .then(|| embed_precision_override(raw_data, &meta.dtype, &f32_data))
+                    .then(|| embed_precision_override(&raw_data, &meta.dtype, &f32_data))
                     .flatten()
                 {
                     // --embed-precision bf16|f16: keep the gather table at source
@@ -10837,7 +11004,7 @@ fn main() {
                     ov
                 } else if use_bf16 {
                     let (data, qt, label) =
-                        source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
+                        source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data);
                     (data, qt, 0u32, label)
                 } else if use_fp16 {
                     let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
@@ -11727,7 +11894,7 @@ fn main() {
             // Quantize vision matrix weights to HFQ4G256/HFQ4G128. Vision norms
             // and biases stay source precision because the VL loaders upload
             // them as F32 side inputs, not dequantized matrix operands.
-            let f32_data = to_f32(raw_data, &meta.dtype);
+            let f32_data = to_f32(&raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let k_dim = if shape.len() == 2 {
@@ -11791,9 +11958,9 @@ fn main() {
             // decoded to the portable F16 fallback because HFQ has no matching
             // raw source codec for them.
             let (data, quant_type, label) = match meta.dtype.as_str() {
-                "F16" | "F32" => source_precision_tensor_bytes(raw_data, &meta.dtype, &[]),
+                "F16" | "F32" => source_precision_tensor_bytes(&raw_data, &meta.dtype, &[]),
                 _ => {
-                    let f32_vals = to_f32(raw_data, &meta.dtype);
+                    let f32_vals = to_f32(&raw_data, &meta.dtype);
                     (f32_slice_to_f16_bytes(&f32_vals), QuantType::F16, "F16")
                 }
             };
@@ -11856,11 +12023,12 @@ fn main() {
             // width, so keeping BF16 in normal MQ/HFQ artifacts remains
             // portable: older arches can downgrade to F16 at load time.
             let f32_data = if meta.dtype == "F32" {
-                to_f32(raw_data, "F32")
+                to_f32(&raw_data, "F32")
             } else {
                 Vec::new()
             };
-            let (data, qt, label) = source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
+            let (data, qt, label) =
+                source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data);
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             quant_log!(
                 "  {label:<10} {} {:?} ({} elements, {:.1} KB)",
