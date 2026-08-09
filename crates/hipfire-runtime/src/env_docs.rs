@@ -2893,6 +2893,13 @@ pub const ENV_HIPFIRE_MOE_PARO_I8_K8: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1514",
 };
 
+/// `HIPFIRE_MOE_RESOLVE_DEBUG` — the arch trace still reported "use_gpu_topk=true". THIS is the verdict
+pub const ENV_HIPFIRE_MOE_RESOLVE_DEBUG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MOE_RESOLVE_DEBUG",
+    description: "the arch trace still reported \"use_gpu_topk=true\". THIS is the verdict",
+    source: "crates/hipfire-dispatch/src/families/moe.rs:88",
+};
+
 /// `HIPFIRE_MQ3_MB4` — Used to configure runtime execution by explicitly setting "HIPFIRE_MQ3_MB4"
 pub const ENV_HIPFIRE_MQ3_MB4: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MQ3_MB4",
@@ -4001,10 +4008,10 @@ pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1669",
 };
 
-/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Runtime variable controlling qwen35 moe oq indexed in hipfire
+/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — The arch layer resolves the same question independently and traces its
 pub const ENV_HIPFIRE_QWEN35_MOE_OQ_INDEXED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_OQ_INDEXED",
-    description: "Runtime variable controlling qwen35 moe oq indexed in hipfire",
+    description: "The arch layer resolves the same question independently and traces its",
     source: "crates/hipfire-dispatch/src/families/moe.rs:74",
 };
 
@@ -5831,6 +5838,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_MOE_MQ2L_N32_GFX1151,
     ENV_HIPFIRE_MOE_PARO_I8,
     ENV_HIPFIRE_MOE_PARO_I8_K8,
+    ENV_HIPFIRE_MOE_RESOLVE_DEBUG,
     ENV_HIPFIRE_MQ3_MB4,
     ENV_HIPFIRE_MTP_DEVICE_TOKEN_CHAIN,
     ENV_HIPFIRE_MTP_GPU_ACCEPT,

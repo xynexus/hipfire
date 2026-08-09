@@ -331,37 +331,43 @@ a `.gfx1103` tag, and the naming follows the plain machine-section rule instead.
 prompt, plus the CPU-time collapse — the before number is the measurement in §0.6(c),
 ~96 % of one core with the GPU at 0 %.
 
-**(d) The paged CPU stall is the executor's CPU MoE fallback, not the pager.** Located
-2026-08-09 after five wrong hypotheses; recording the answer and the method.
+**(d) The paged CPU stall: what is known, and six things it is NOT.** Still open.
 
-`run_moe_decode` does `if !res.use_gpu_topk { return run_moe_decode_cpu_fallback(..) }`
-(`pipeline/mod.rs:382`). That fallback is self-contained — softmax, CPU top-K + renorm,
-then a **generic per-expert routed loop on the host**. On this model (40 layers, 256
-experts, hidden 2048, moe_inter 512) that is a full MoE FFN per layer on one core:
-measured ~160 s per MoE layer, one core at ~99 %, GPU at 0 %.
+An earlier version of this section claimed the cause was the executor dropping to
+`run_moe_decode_cpu_fallback`. **That is retracted.** Instrumenting
+`MoeResolution::resolve` itself (`HIPFIRE_MOE_RESOLVE_DEBUG=1`) shows the executor and the
+arch layer **agree**:
 
-**The trap is the same dual-resolution split that caused the dtype bug.** The arch-side
-trace reports `use_gpu_topk=true, path=Oq4` — and it is telling the truth about its own
-resolution. The executor then recomputes `MoeResolution::resolve` from the marshalled
-`MoeDtypes` and reaches its own verdict, which is what actually selects the path. Reading
-the arch trace and concluding "we are on the GPU path" is exactly the mistake to avoid; it
-is the second bug traced to these two resolutions disagreeing.
+```
+[moe-resolve] k=8 oq_gate=true router=Q8_0 routed(gu/dn)=Oq4G256/Oq4G256
+              => idx(...oq4...)=true use_gpu_topk=true needs_x_rot=true
+[moe-dtype]   layer=0 ... profile=Uniform(Oq4G256) k=8 path=Oq4 use_gpu_topk=true
+```
 
-How it was found, since the search cost far more than the fix will:
-`HIPFIRE_PAGED_MOE_DEBUG=1` brackets the paged path with device syncs. Only
-`after paged rotate_x_mq` printed and `after paged topk` never did, which bounded the stall
-to `moe_decode.rs:841..1126` — and the centralized dispatch inside that window is where the
-fallback returns from. Pager phase timing printing *nothing* was the complementary evidence:
-the admission code is downstream of the fallback's early `return`, so it never ran.
+`use_gpu_topk=true`, so `if !res.use_gpu_topk { return run_moe_decode_cpu_fallback(..) }`
+is not taken. The dual-resolution split is real and did cause the routed-dtype bug, but it
+is **not** the cause here — that inference was made from "the fallback exists inside the
+bounded window" without checking the branch condition.
 
-Ruled out along the way, each disproven by measurement rather than argument: the host
-repack (a pre-transformed qt-53 artifact stalls identically), the pager admission phases
-(never reached), and runtime hipcc JIT (the OQ4 MoE kernels are present as `.hsaco` in the
-gfx1103 cache).
+**Established:** ~160 s per MoE layer, one core at ~99 %, GPU at 0 %. Execution reaches the
+executor's `resolve` and stalls before the `after paged topk` device sync — so the window
+is inside `run_moe_decode`, on the GPU path, between resolution and top-k.
 
-**Next:** find why the executor's resolution differs from the arch's for a paged OQ4 layer.
-`MoeResolution::resolve` reads `HIPFIRE_QWEN35_MOE_OQ_INDEXED` itself, so the gate is not
-the difference; the marshalled `MoeDtypes` is the thing to dump at the executor entry.
+**Disproven by measurement, in order:** the host repack (a pre-transformed qt-53 artifact
+stalls identically); `MoePrefillDtypes::from_ffn` returning `None`; OQ4 not being indexable;
+the pager admission phases (never reached — they are downstream); runtime hipcc JIT of the
+OQ4 MoE kernels (present as `.hsaco`); and the CPU MoE fallback (branch not taken).
+
+**Method note, which is the real lesson.** Six hypotheses, each plausible from reading code,
+each wrong. The two things that produced actual information were both *bounding* moves
+rather than guesses: `HIPFIRE_PAGED_MOE_DEBUG`'s device-sync brackets, which localised the
+stall to a line range, and instrumenting the decision itself rather than reasoning about
+what it would decide. **Next step is mechanical bisection** — timestamped prints at every
+step between `resolve` and the top-k sync — not another candidate.
+
+Also: a `ls <cache>/<fn>.hsaco` probe for "is this kernel precompiled" is unreliable, since
+cache entries are module names, not function names. It reported `rotate_x_mq` missing while
+that kernel demonstrably ran.
 
 **(b) The refusal panics rather than returning an error.**
 `generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
