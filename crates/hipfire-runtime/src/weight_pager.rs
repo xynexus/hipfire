@@ -459,7 +459,11 @@ impl Transport for DirectH2DTransport {
         })?;
         let staging = self.staging.as_ref().expect("direct staging");
         let src = &staging.as_slice()[rel..rel + copy_len];
-        let buf = gpu.hip.malloc(len)?;
+        // Pooled, not `hip.malloc`: eviction returns this buffer to `GpuPool`
+        // via `free_tensor`, so allocating outside the pool would make every
+        // page-in a fresh HIP allocation while every page-out accumulated in a
+        // free-list nothing could reach. See `Gpu::upload_raw_pooled`.
+        let buf = gpu.pool_alloc(len)?;
         gpu.hip.memcpy_htod(&buf, src)?;
         Ok((
             GpuTensor {
@@ -507,7 +511,8 @@ impl Transport for PreadH2DTransport {
         // 2. GPU: alloc + memcpy_htod via the existing hipfire-rdna helper.
         //    `dtype: Raw` because the pager doesn't care about element layout
         //    — that interpretation belongs to `WeightTensor` at the call site.
-        let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
+        // Pooled — see the note in `DirectH2DTransport::fetch`.
+        let tensor = gpu.upload_raw_pooled(&self.staging[..len], &[len])?;
         Ok((tensor, self.next_handle()))
     }
 
@@ -541,7 +546,8 @@ impl Transport for PinnedH2DTransport {
                 &format!("pinned pread {} bytes at offset {}: {}", len, hfq_offset, e),
             )
         })?;
-        let buf = gpu.hip.malloc(len)?;
+        // Pooled — see the note in `DirectH2DTransport::fetch`.
+        let buf = gpu.pool_alloc(len)?;
         let src = &self
             .staging
             .as_ref()
