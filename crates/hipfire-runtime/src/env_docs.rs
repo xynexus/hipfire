@@ -1321,13 +1321,13 @@ pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DN_STATE_EF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_EF",
     description: "HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:191",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:202",
 };
 
-/// `HIPFIRE_DN_STATE_FP32` — Force FP32 DeltaNet recurrent state. Default is FP16 (half the per-sequence state; storage only, arithmetic stays FP32). Set this to get the numerical REFERENCE back: FP32 is what every 'is this precision or a bug?' comparison resolves against, and quantized state hid for months precisely because nobody could diff against an exact baseline. Also the first thing to try if long decode degenerates.
-pub const ENV_HIPFIRE_DN_STATE_FP32: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_DN_STATE_FP32",
-    description: "Force FP32 DeltaNet recurrent state. Default is FP16 (half the per-sequence state; storage only, arithmetic stays FP32). Set this to get the numerical REFERENCE back: FP32 is what every 'is this precision or a bug?' comparison resolves against, and quantized state hid for months precisely because nobody could diff against an exact baseline. Also the first thing to try if long decode degenerates.",
+/// `HIPFIRE_DN_STATE_FP16` — Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32. OFF by default: a live caller of the retired Q8 kernels still exists, and FP16's half-size state makes it fault (GPU memory fault in gated_delta_net_q8). Do not enable until `gated_delta_net_q8*` has no callers.
+pub const ENV_HIPFIRE_DN_STATE_FP16: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DN_STATE_FP16",
+    description: "Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32. OFF by default: a live caller of the retired Q8 kernels still exists, and FP16's half-size state makes it fault (GPU memory fault in gated_delta_net_q8). Do not enable until `gated_delta_net_q8*` has no callers.",
     source: "crates/hipfire-env/src/lib.rs",
 };
 
@@ -5628,7 +5628,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DIFFUSION_W4A8,
     ENV_HIPFIRE_DIR,
     ENV_HIPFIRE_DN_STATE_EF,
-    ENV_HIPFIRE_DN_STATE_FP32,
+    ENV_HIPFIRE_DN_STATE_FP16,
     ENV_HIPFIRE_DOT2_GEMV,
     ENV_HIPFIRE_DOTS_OCR_BF16_RESIDUAL,
     ENV_HIPFIRE_DOTS_OCR_DUMP_DIR,

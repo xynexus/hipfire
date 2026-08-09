@@ -119,10 +119,21 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // That evidence is one prompt on one model, which is why FP32 stays one
     // flag away rather than being deleted: it is the oracle, and losing the
     // ability to diff against it is how quantized state hid for months.
-    if hipfire_env::DN_STATE_FP32.flag() {
-        StateQuant::FP32
-    } else {
+    // REVERTED to FP32-default 2026-08-09, same day it was flipped. FP16 as
+    // the default is UNSAFE while a live caller of the retired Q8 kernels
+    // survives: teacher-forced scoring of a dense 0.8B faulted with
+    //   Memory Fault ... kernel: gated_delta_net_q8
+    // because FP16 state is half-size with a vestigial `s_scales`, so the Q8
+    // kernel reads out of bounds. The Q8 *dispatch functions* were never
+    // deleted — only the StateQuant variants and the call sites that selected
+    // them — so at least one path still reaches them unconditionally.
+    // `prefill_batch.rs:664` is one; the dense-model fault proves there is
+    // another. Restore the default only after `gated_delta_net_q8*` has no
+    // callers left.
+    if hipfire_env::DN_STATE_FP16.flag() {
         StateQuant::FP16
+    } else {
+        StateQuant::FP32
     }
 }
 

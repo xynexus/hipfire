@@ -197,13 +197,12 @@ env_vars! {
          reported `pp512 t/s` from a per-token warm-pass for five arches.";
 
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
-    DN_STATE_FP32 = "HIPFIRE_DN_STATE_FP32", Developer,
-        "Force FP32 DeltaNet recurrent state. Default is FP16 (half the \
-         per-sequence state; storage only, arithmetic stays FP32). Set this to \
-         get the numerical REFERENCE back: FP32 is what every 'is this \
-         precision or a bug?' comparison resolves against, and quantized state \
-         hid for months precisely because nobody could diff against an exact \
-         baseline. Also the first thing to try if long decode degenerates.";
+    DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
+        "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
+         Storage only; arithmetic stays FP32. OFF by default: a live caller of \
+         the retired Q8 kernels still exists, and FP16's half-size state makes \
+         it fault (GPU memory fault in gated_delta_net_q8). Do not enable until \
+         `gated_delta_net_q8*` has no callers.";
 
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,
