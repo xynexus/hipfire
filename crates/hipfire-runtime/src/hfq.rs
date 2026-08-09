@@ -467,6 +467,69 @@ pub struct HfqStreamEntry {
     pub data_len: u64,
 }
 
+
+/// Where every part of an HFQM package will land on disk.
+pub struct HfqmLayout {
+    pub metadata_offset: u64,
+    pub index_offset: u64,
+    pub index_len: u64,
+    /// First byte of the payload region (4 KiB-aligned).
+    pub data_offset: u64,
+    /// Absolute file offset of each entry's payload, in index order. Each is
+    /// 32-byte aligned, because the index stores `offset / 32`.
+    pub tensor_offsets: Vec<u64>,
+}
+
+/// Plan an HFQM package's byte layout without writing it.
+///
+/// Exposed because a tool that rewrites tensor payloads has to know where each
+/// one WILL land before the file exists — `hfqm_modules` records embed absolute
+/// `data_offset`s, so a rewritten artifact needs its module table recomputed
+/// against the new layout. Re-deriving this rule inside such a tool would let
+/// the two drift silently; [`write_hfqm_package_streaming`] calls this same
+/// function, on the same principle that keeps `optimize` and the loader sharing
+/// one `oq4_pack_arch_combined`.
+///
+/// Note the layout depends on `metadata_len`, while a module-bearing metadata
+/// blob depends on the offsets this returns. That circularity is resolved by
+/// iterating to a fixed point: plan, rebuild the metadata, and re-plan until the
+/// metadata length stops changing (only decimal digit widths move, so it
+/// converges in a couple of rounds).
+pub fn plan_hfqm_layout(
+    metadata_len: usize,
+    entries: &[HfqStreamEntry],
+) -> std::io::Result<HfqmLayout> {
+    let metadata_offset = 32u64;
+    let index_offset = metadata_offset + metadata_len as u64;
+    let mut index_len = 4u64;
+    for e in entries {
+        let nb = e.name.as_bytes();
+        if nb.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry name too long: {}", e.name),
+            ));
+        }
+        index_len += 2 + nb.len() as u64 + 1 + 1 + e.shape.len() as u64 * 4 + 4 + 8 + 8;
+    }
+    let data_start = index_offset + index_len;
+    let data_offset = (data_start + 4095) & !4095;
+    let mut tensor_offsets = Vec::with_capacity(entries.len());
+    let mut cursor = data_offset;
+    for e in entries {
+        cursor = (cursor + 31) & !31;
+        tensor_offsets.push(cursor);
+        cursor = cursor.saturating_add(e.data_len);
+    }
+    Ok(HfqmLayout {
+        metadata_offset,
+        index_offset,
+        index_len,
+        data_offset,
+        tensor_offsets,
+    })
+}
+
 /// Streaming HFQM writer: write the header + metadata + index up front (payload
 /// sizes come from `entries`), then call `write_nth(i, w)` once per entry, in
 /// index order, to stream that tensor's `data_len` bytes directly to the file.
@@ -481,28 +544,11 @@ pub fn write_hfqm_package_streaming(
     mut write_nth: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let meta = metadata_json.as_bytes();
-    let metadata_offset = 32u64;
-    let index_offset = metadata_offset + meta.len() as u64;
-    let mut index_len = 4u64;
-    for e in entries {
-        let nb = e.name.as_bytes();
-        if nb.len() > u16::MAX as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("HFQM entry name too long: {}", e.name),
-            ));
-        }
-        index_len += 2 + nb.len() as u64 + 1 + 1 + e.shape.len() as u64 * 4 + 4 + 8 + 8;
-    }
-    let data_start = index_offset + index_len;
-    let data_offset = (data_start + 4095) & !4095;
-    let mut planned_offsets = Vec::with_capacity(entries.len());
-    let mut cursor = data_offset;
-    for e in entries {
-        cursor = (cursor + 31) & !31;
-        planned_offsets.push(cursor);
-        cursor = cursor.saturating_add(e.data_len);
-    }
+    let layout = plan_hfqm_layout(meta.len(), entries)?;
+    let metadata_offset = layout.metadata_offset;
+    let index_offset = layout.index_offset;
+    let data_offset = layout.data_offset;
+    let planned_offsets = layout.tensor_offsets;
     let mut index = Vec::new();
     index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (e, offset) in entries.iter().zip(&planned_offsets) {
