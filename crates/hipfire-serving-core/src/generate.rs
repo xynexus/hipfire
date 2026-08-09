@@ -1908,9 +1908,13 @@ pub fn generate(
     request_stop_sequences: &[String],
     evidence_dir: Option<&str>,
 ) {
-    // Seed the process-global CPU sampler RNG for this request. CPU fallback and
-    // grammar/VL-style sampling should not inherit RNG state from prior requests.
-    hipfire_runtime::sampler::reset_cpu_sampler_rng(0x13579BDF);
+    // No RNG reset here any more. This used to seed a process-global CPU sampler
+    // state so a request would not inherit RNG from its predecessor; the global
+    // is gone (v2 plan, M1b), because with streams interleaved at module
+    // granularity a shared stream makes each request's tokens depend on whatever
+    // else was sampling beside it. The GPU path already carries a function-local
+    // `rng_state`, and `sampler::sample`'s CPU fallback now continues that same
+    // stream instead of a global one.
 
     if m.registered_backend.is_some() {
         // Factory-loaded text families share one prompt/render/serve path. Fast

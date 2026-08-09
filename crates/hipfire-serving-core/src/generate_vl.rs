@@ -41,9 +41,12 @@ pub fn generate_vl(
     stdout: &mut dyn std::io::Write,
     params: &GenerateVLParams,
 ) {
-    // Keep host-side VL sampling deterministic per request instead of carrying
-    // the global CPU sampler state across daemon calls.
-    hipfire_runtime::sampler::reset_cpu_sampler_rng(0x13579BDF);
+    // One RNG stream owned by this request. Was a reset of a process-global
+    // `SAMPLER_STATE`; the global is gone (v2 plan, M1b) because a shared stream
+    // makes each request's tokens depend on whatever else sampled beside it, and
+    // both callers reset it to the *same* constant, so concurrent requests did
+    // not merely share a stream — they repeatedly reset each other onto one.
+    let mut sampler_rng = hipfire_runtime::sampler::SamplerRng::from_seed(0x13579BDF);
 
     let GenerateVLParams {
         id,
@@ -392,7 +395,7 @@ pub fn generate_vl(
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
-    let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
+    let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first, &mut sampler_rng);
     let t_prefill = Instant::now();
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -492,8 +495,12 @@ pub fn generate_vl(
             );
         }
 
-        next_token =
-            sampler::sample_cpu(&mut logits, &m.active.cursor.conversation_tokens, &vl_cfg);
+        next_token = sampler::sample_cpu(
+            &mut logits,
+            &m.active.cursor.conversation_tokens,
+            &vl_cfg,
+            &mut sampler_rng,
+        );
 
         if max_think_tokens > 0 {
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
@@ -580,8 +587,12 @@ pub fn generate_vl(
                         2,
                     );
                 }
-                next_token =
-                    sampler::sample_cpu(&mut logits, &m.active.cursor.conversation_tokens, &vl_cfg);
+                next_token = sampler::sample_cpu(
+                    &mut logits,
+                    &m.active.cursor.conversation_tokens,
+                    &vl_cfg,
+                    &mut sampler_rng,
+                );
             }
         }
     }
