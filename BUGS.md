@@ -12,6 +12,35 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
+## [High] tiny-quant is RED on master for Opus across four MoE families
+- Category: Correctness / Quant (Opus)
+- Location: `tests/tiny-quant-gate.sh` cells; baselines in `tests/tiny-quant-baselines.txt`
+- Summary: `./tests/tiny-affected-gate.sh --require-coverage` fails 14 cells, all
+  Opus, on deepseek4, deepseek4_compressed, lfm2_moe and minimax. Worst is
+  deepseek4 `kld:oq8` at KLD **0.038652 vs baseline 0.000193** — ~200x, against a
+  RELATIVE budget of 25% of baseline (±0.000048). deepseek4_compressed oq8 is
+  0.038414 vs 0.000107. minimax oq4/oq4+/oq4++/oq4.25++ drift ~2-3x. Two cells do
+  not drift but hard-fail the quantizer: `lfm2_moe` and `minimax`
+  `quantize:oq8++(calib)` exit 1 with "calibrated plus format requested, but no
+  LDLQ-eligible tensors were attempted".
+- Pre-existing, NOT from any change on the current branch: verified by reverting
+  the branch's quant-format/pager/quant.rs edits to their parent and re-running
+  the identical gate with the identical `--files-from` list — the failure sets are
+  BYTE-IDENTICAL (same 14 cells, same drift values).
+- Why it was not caught sooner: `tiny-affected-gate` selects a family allowlist
+  from the touched paths, so a green run means "the SELECTED families passed", not
+  "the suite passed". Runs that touched only qwen35 paths never selected these
+  four families. Comparing two gate runs with different `--files-from` inputs
+  compares different tests.
+- Open question: whether the baselines were recorded when these paths worked and
+  something regressed, or the baselines were recorded wrong. The two hard
+  quantizer failures suggest at least part of this is a real code fault, not
+  baseline staleness.
+- Suggested fix: bisect deepseek4 `kld:oq8` first — it is the largest signal and
+  the least ambiguous.
+- Scope: Correctness (premier quant family)
+- Confidence: High (byte-identical reproduction on pristine code)
+
 ## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
 - Category: Correctness / Tooling (hipfire-quantize)
 - Location: crates/hipfire-quantize/src/main.rs `HfqInputFile::open`
