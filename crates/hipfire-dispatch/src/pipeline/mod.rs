@@ -421,6 +421,7 @@ pub fn run_moe_decode(
         }
     }
     hip!(gpu.softmax_f32(p.router_logits))?;
+    moe_step!(__step, "after softmax_f32");
     hip!(gpu.moe_topk_renorm_k8(
         p.router_logits,
         p.topk_indices,
@@ -445,6 +446,7 @@ pub fn run_moe_decode(
         crate::moe_telemetry::record_moe_router_selection(p.layer, &indices, &weights);
     }
 
+    moe_step!(__step, "after topk + any host readback");
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
     // summed exactly once (computed on rank 0 only). Router + shared gate/up
@@ -506,6 +508,7 @@ pub fn run_moe_decode(
         }
     }
 
+    moe_step!(__step, "after shared-expert down");
     // ── Indexed routed experts ────────────────────────────────────────────────
     if res.routed_indexable_mq4 {
         hip!(gpu.ensure_mq_signs())?;
@@ -514,6 +517,7 @@ pub fn run_moe_decode(
     let gate_up_k = p.routed_gate_up_k;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
+    moe_step!(__step, "after routed geometry bind");
 
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
