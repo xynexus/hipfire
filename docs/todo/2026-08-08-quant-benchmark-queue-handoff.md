@@ -55,7 +55,42 @@ Original note, for context:
   256 experts this turns 10240 factorizations into ~40. 13 ldlq tests pass
   including `ldlq_factor_cache_is_transparent`.
 
-### 2. Merge `origin/master`
+### 2. Merge `origin/master` — DONE, on a branch, awaiting a clean tree
+
+Merged, resolved, and verified on **`merge/origin-master-2026-08-09`**
+(commit `4761b42b6`), built in a worktree at `$S/merge-wt` so it never touched
+the dirty main tree. `./tests/no-gpu-ci.sh` exit 0; `cargo test -p
+hipfire-quantize --lib` 123 passed.
+
+All 6 conflicts resolved; the reasoning is in the merge commit message. The one
+that mattered is `codecs.rs`, exactly as this doc warned: upstream re-derived
+the OLD alternating coordinate descent while generalising to G=128 slices, so
+taking theirs would have silently reverted the joint selector. Resolved as our
+algorithm + their slice generality, with a new
+`mixed_clipsearch_is_the_grid_argmin_at_g128` test covering the new size.
+`repack.rs` turned out to be safe to take wholesale — our side was provably
+`rustfmt(base)` and nothing more.
+
+**To land it**, the working tree has to be clean. As of 2026-08-09 it holds 23
+modified files, and every one of the 19 `.rs` files among them is
+**formatting-only** (an uncommitted `cargo fmt`; verified file-by-file as
+`rustfmt(HEAD) == worktree`). Upstream reformats those same files anyway. The
+only uncommitted work with real content is non-Rust and untouched by the merge:
+
+| file | change |
+|---|---|
+| `docs/kernel_work/two-stage-lmhead.md` | +225 |
+| `docs/npu/wire-in-r6-prefill-offload.md` | +218 |
+| `scripts/adhoc/opus-outlier-budget-sweep.sh` | +5 −1 |
+| `benchmarks/npu_gemm_tuning/r6/r6_cache.sh` | +5 |
+| `CLAUDE.md` | −10 |
+
+So: commit (or keep) those five, discard the formatting-only `.rs` churn, then
+`git merge merge/origin-master-2026-08-09` — it fast-forwards. Left undone
+deliberately, because discarding even formatting-only changes is the tree
+owner's call.
+
+Original note:
 88 behind / 50 ahead. **rustfmt does NOT help** — measured, 6 conflicts before
 and after (1.96.0 ships the same rustfmt we run). The 6 are all pre-session
 branch work:
