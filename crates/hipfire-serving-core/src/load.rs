@@ -325,10 +325,9 @@ pub fn profile_chat_template(
 /// Absent or `auto` resolves through the redundancy gate
 /// (`qwen35::default_state_quant`), which yields **FP32** for all current models.
 ///
-/// **Q8 is DEPRECATED (2026-07-19)** — see the policy note on
-/// `qwen35::deltanet_state_fp32_below`. It remains parseable because the tree
-/// DeltaNet replay path (`gated_delta_net_q8_tree_batch_seq`) is Q8-only, but an
-/// explicit request now warns.
+/// **Q8 is REMOVED (2026-08-09)** — the variants, the kernels and their dispatch
+/// entry points are all deleted. It remains parseable so older configs still
+/// load, but an explicit request warns and resolves to FP32.
 ///
 /// This previously mapped absent/`""`/`auto` straight to Q8 — bypassing the gate
 /// entirely — while its own doc comment claimed it fell "back to the arch
@@ -709,9 +708,6 @@ pub fn load_model(
     let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id, &kv_mode);
     let model_memory = hfq_model_memory(path, &hfq);
     warn_if_unoptimized(path, &hfq);
-    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
-    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
-    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     // KV precision policy:
     //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
     //     a quantized KV under bf16 weights is a precision mismatch).
@@ -3474,9 +3470,6 @@ pub fn load_model_pp(
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
     warn_if_unoptimized(path, &hfq);
-    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
-    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
-    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     // KV precision policy:
     //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
     //     a quantized KV under bf16 weights is a precision mismatch).

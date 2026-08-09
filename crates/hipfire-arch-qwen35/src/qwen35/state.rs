@@ -68,12 +68,12 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// ~9.6 GB. FP16 halves it. A real codec only earns its complexity for
 /// high-concurrency serving of 27B-class models.
 ///
-/// # Known conflict
+/// # Formerly a known conflict
 ///
-/// The **tree** DeltaNet replay path is Q8-only — `gated_delta_net_q8_tree_batch_seq`
-/// is the sole tree kernel, with no FP32 variant — so DDTree spec-decode cannot
-/// run under this policy. DDTree is opt-in and off by default. Adding an FP32 (or
-/// FP16) tree kernel is the way to reconcile them; forcing Q8 state is not.
+/// The tree DeltaNet replay path used to be Q8-only, so DDTree spec-decode could
+/// not run under this policy. Resolved 2026-08-09:
+/// `gated_delta_net_{f32,f16}_tree_batch_seq` are the tree kernels now and the
+/// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
 /// is now FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
@@ -94,20 +94,21 @@ pub fn deltanet_state_fp32_below() -> usize {
 ///
 /// The `HIPFIRE_QWEN35_STATE_QUANT` override referenced in earlier revisions of
 /// this comment does **not** exist — no code reads that variable.
-///
-/// NOTE: FP32 state is unsupported by the **tree** DeltaNet replay path
-/// (`gated_delta_net_q8_tree_batch_seq` is the only tree kernel; there is no FP32
-/// variant), so tree-based spec-decode cannot run under the never-Q8 policy.
-/// DDTree is opt-in and off by default. Use the non-tree MTP/DFlash draft paths.
-/// Reconcile by adding an FP32/FP16 tree kernel — not by enabling Q8 state.
 pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     let _ = config;
-    // `.flag()`, NOT `.parse_or(false)`. `parse_or` goes through Rust's
-    // `FromStr for bool`, which accepts ONLY "true"/"false" — so the obvious
-    // `HIPFIRE_DN_STATE_FP16=1` parses as Err and silently falls back to FP32.
-    // That is not hypothetical: it cost a full 24-minute KLD run that reported
-    // "FP16" results identical to FP32 to the last digit, because it had
-    // quietly run FP32 twice. `flag()` accepts 1/true/on/yes.
+    // `.flag()`, NOT `.parse_or(false)`: `parse_or` goes through Rust's
+    // `FromStr for bool`, which accepts ONLY "true"/"false", so `=1` parses as
+    // Err and falls back silently. That cost a 24-minute KLD run which reported
+    // "FP16" numbers identical to FP32 to the last digit because it had quietly
+    // run FP32 twice. `flag()` accepts 1/true/on/yes.
+    //
+    // FP32 is the DEFAULT and the numerical reference; FP16 is opt-in. Measured
+    // teacher-forced (same weights, only the state precision differing): mean
+    // KLD 5.65e-05 on the dense 2B, 2.57e-03 on Qwen3.5-35B-A3B oq4.25++. The
+    // 35B figure is ~45x the 2B one — FP16 state costs MORE on the larger MoE
+    // model, which is why the default has not moved. Keeping FP32 one flag away
+    // also keeps the oracle: losing the ability to diff against it is how
+    // quantized state hid for months.
     if hipfire_env::DN_STATE_FP16.flag() {
         StateQuant::FP16
     } else {
@@ -232,10 +233,9 @@ impl DeltaNetState {
                 //       s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 //   }
                 //
-                // NOTE: the Q8-only DDTree tree-replay path
-                // (`gated_delta_net_q8_tree_batch_seq`) cannot run while this is
-                // disabled. It will now fail LOUDLY here rather than silently
-                // producing a non-lossless spec-decode path.
+                // DDTree tree-replay no longer depends on any of this: it runs
+                // on `gated_delta_net_{f32,f16}_tree_batch_seq`, picked from
+                // the state precision. The Q8 tree kernel is deleted.
                 StateQuant::FP16 => {
                     // Half the bytes. Raw because this is f16 storage the
                     // kernels widen on load — there is no f16 DType at this

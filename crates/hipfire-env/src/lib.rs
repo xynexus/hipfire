@@ -198,13 +198,10 @@ env_vars! {
 
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
-        "Store DeltaNet recurrent state as FP16 instead of FP32, halving \
-         per-sequence state (~149 MB -> ~75 MB on 27B/122B-A10B, doubled again \
-         while spec-decoding). Storage only; arithmetic stays FP32. Default off: \
-         FP32 is the numerical reference, and FP16 is proven only on short \
-         horizons while the failure mode that killed Q8 state was long-decode \
-         attractors on low-redundancy models. Validate long decode on a small \
-         model before trusting it.";
+        "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
+         Storage only; arithmetic stays FP32; no scales, no stochastic rounding, \
+         so spec-decode rollback stays lossless. Opt-in until a teacher-forced \
+         FP32-vs-FP16 KLD comparison covers more than one model.";
 
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,
