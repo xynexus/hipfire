@@ -906,6 +906,16 @@ pub(crate) fn moe_ffn_decode_impl(
             .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
             .collect();
 
+        // Routed geometry comes from `moe_expert_shape`, which prefers
+        // `ffn.expert_shape` and only then falls back to a resident expert.
+        // `ffn.experts.first()` is None under paged residency, and the previous
+        // `map_or(0, ..)` marshalled ZEROS to the executor — which then launched
+        // the indexed down GEMV with `grid.x = 0` and failed
+        // `hipModuleLaunchKernel: invalid argument`. Same silent-default shape as
+        // the routed dtypes above, one struct over.
+        let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
+            HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
+        })?;
         let moe_params = hipfire_dispatch::families::moe::MoeParams {
             layer: layer_idx,
             dtypes: moe_dtypes,
@@ -930,9 +940,9 @@ pub(crate) fn moe_ffn_decode_impl(
             expert_down_ptrs: &ffn.expert_down_ptrs,
             expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
             expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-            routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-            routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-            routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+            routed_gate_up_k: routed_shape.gate_up_k,
+            routed_down_m: routed_shape.down_m,
+            routed_down_k: routed_shape.down_k,
             routed_experts: &routed_experts,
             routed_gate_up_paro: ffn.experts.first().and_then(|e| {
                 e.gate_up
@@ -1685,6 +1695,12 @@ pub(crate) fn moe_ffn_decode_impl(
         .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
         .collect();
 
+    // Routed geometry from `moe_expert_shape` — see the note at the other
+    // `MoeParams` construction in this file. `ffn.experts.first()` is None under
+    // paged residency and would marshal zeros.
+    let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
+        HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
+    })?;
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
         layer: layer_idx,
         dtypes: moe_dtypes,
@@ -1712,9 +1728,9 @@ pub(crate) fn moe_ffn_decode_impl(
         expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-        routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-        routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-        routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+        routed_gate_up_k: routed_shape.gate_up_k,
+        routed_down_m: routed_shape.down_m,
+        routed_down_k: routed_shape.down_k,
         routed_experts: &routed_experts,
         routed_gate_up_paro: ffn.experts.first().and_then(|e| {
             e.gate_up

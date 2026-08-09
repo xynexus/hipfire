@@ -1273,6 +1273,29 @@ impl HipRuntime {
             ptr::null_mut(),
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        if code != 0 {
+            // `hipModuleLaunchKernel: invalid argument` with no further detail is
+            // unattributable: `Function` is an opaque handle carrying no name, so
+            // the launch geometry is the only evidence available at this layer —
+            // and it is usually the answer, since the common causes are a zero
+            // dimension, a block over the 1024-thread limit, or shared memory
+            // above the per-block cap.
+            return self.check(
+                code,
+                &format!(
+                    "hipModuleLaunchKernel (grid={}x{}x{} block={}x{}x{} threads/block={} shared={}B params={})",
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    block[0] as u64 * block[1] as u64 * block[2] as u64,
+                    shared_mem,
+                    params.len(),
+                ),
+            );
+        }
         self.check(code, "hipModuleLaunchKernel")
     }
 
