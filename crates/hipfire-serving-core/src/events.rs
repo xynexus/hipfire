@@ -182,6 +182,18 @@ pub fn emit_text_bytes(stdout: &mut dyn std::io::Write, id: &str, text_bytes: &[
         return;
     }
     if let Ok(text) = std::str::from_utf8(text_bytes) {
+        // Executor trace (v2 plan, M0). Recorded here rather than at the
+        // daemon's `Responder::emit`, which never sees a token: this helper
+        // writes to the sink directly. Timestamped before the write so it
+        // measures when the token was ready, not when the client's socket
+        // accepted it. `id` is the session id under batch ops and the request id
+        // otherwise, so a fused multi-session step yields one series per session.
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::TokenEmitted,
+            hipfire_runtime::exec_trace::stream_id_of(id),
+            0,
+            0,
+        );
         let _ = writeln!(
             stdout,
             r#"{{"type":"token","id":"{}","text":{}}}"#,
