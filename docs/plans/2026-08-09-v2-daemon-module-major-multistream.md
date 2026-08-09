@@ -359,9 +359,30 @@ bounded window" without checking the branch condition.
 [moe-step]   0.7ms after gate-side GEMV
 ```
 
-then silence. So the ~160 s is entirely in the remainder of `run_moe_decode`: the GPU
-top-K path (softmax → `moe_topk_renorm_k8`) and the indexed expert gate_up/down dispatch
-that follows it. Resolution, rotation and the gate side are all exonerated.
+then silence. Extending the same markers through the rest of the function narrows it to a
+single dispatch — the whole prologue costs **1.9 ms**:
+
+```
+[moe-step]   0.5ms after gate-side GEMV
+[moe-step]   0.7ms after softmax_f32
+[moe-step]   1.0ms after topk + any host readback
+[moe-step]   1.8ms after shared-expert down
+[moe-step]   1.9ms after routed geometry bind      <- then ~160 s of silence
+```
+
+So resolution, rotation, gate side, softmax, top-K, the host readback and the shared expert
+are all exonerated, and **the time is inside the indexed routed-expert GEMV dispatch**
+(`gemv_oq4g256_moe_gate_up_k8_indexed_batched` and what follows it).
+
+**Leading candidate, stated as a candidate.** Every `gemv_*` dispatch begins with
+`ensure_kernel(module, src, func)`, and a kernel launch cannot itself burn CPU with the GPU
+idle — but a *runtime compile* can. The gfx1103 cache does contain
+`gemv_oq4g256_moe_*.hsaco`, so this would require the cached entry to be stale against the
+current source hash rather than absent. That is checkable by comparing the cached `.hash`
+against the source, and it would also explain the earlier 3-layers-in-490 s shape (one
+expensive first compile, later layers cheap). **Not yet verified — six hypotheses have
+already been wrong here, so this one is written down as the next thing to test, not as the
+answer.**
 
 **Established:** ~160 s per MoE layer, one core at ~99 %, GPU at 0 %. Execution reaches the
 executor's `resolve` and stalls before the `after paged topk` device sync — so the window
