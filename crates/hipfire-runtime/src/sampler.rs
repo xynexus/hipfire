@@ -158,9 +158,13 @@ pub fn sample(
                 "sampler: GPU sample failed after {GPU_SAMPLE_ATTEMPTS} attempts ({last_err:?}); \
                  falling back to CPU sampling"
             );
-            // `rng_state` is intentionally left unchanged on the fallback path;
-            // exact RNG continuity is best-effort when the GPU sampler is down.
-            sample_cpu(&mut host_logits[..n], history, cfg)
+            // Continue the CALLER's stream rather than a process-global one:
+            // a fallback must not make this request's sampling depend on
+            // whatever else happened to be sampling at the time.
+            let mut fallback_rng = SamplerRng::from_seed(*rng_state);
+            let tok = sample_cpu(&mut host_logits[..n], history, cfg, &mut fallback_rng);
+            *rng_state = fallback_rng.state();
+            tok
         }
         Err(readback_err) => {
             // The device is unusable (even the logits readback failed). Emit a
@@ -184,7 +188,12 @@ pub fn sample(
 /// This is a thin wrapper over `llama::apply_repeat_penalty` +
 /// `llama::sample_top_p` that exists so call sites have one import
 /// path; the math is unchanged.
-pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u32 {
+pub fn sample_cpu(
+    logits: &mut [f32],
+    history: &[u32],
+    cfg: &SamplerConfig,
+    rng: &mut SamplerRng,
+) -> u32 {
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
     }
@@ -205,7 +214,7 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
             logits[tok as usize] = f32::NEG_INFINITY;
         }
     }
-    sample_top_k_top_p(logits, cfg.temperature, cfg.top_k, cfg.top_p)
+    sample_top_k_top_p(logits, cfg.temperature, cfg.top_k, cfg.top_p, rng)
 }
 
 // ─── CPU sampling primitives (relocated from llama.rs in the de-llama cleanup) ───
@@ -409,8 +418,8 @@ pub fn apply_unclosed_attractor_block(
     }
 }
 
-pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
-    sample_top_k_top_p(logits, temperature, 20, top_p)
+pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32, rng: &mut SamplerRng) -> u32 {
+    sample_top_k_top_p(logits, temperature, 20, top_p, rng)
 }
 
 /// Sample with a caller-selected top-k cutoff before nucleus truncation.
@@ -418,7 +427,13 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
 /// The shared GPU sampler supports up to 64 candidates. Clamp the CPU path to
 /// the same range so CPU fallback and GPU execution retain the same candidate
 /// set. `top_k == 0` selects the backend maximum (64).
-pub fn sample_top_k_top_p(logits: &[f32], temperature: f32, top_k: usize, top_p: f32) -> u32 {
+pub fn sample_top_k_top_p(
+    logits: &[f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng: &mut SamplerRng,
+) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
     }
@@ -484,7 +499,7 @@ pub fn sample_top_k_top_p(logits: &[f32], temperature: f32, top_k: usize, top_p:
             break;
         }
     }
-    let r = simple_rand() * trunc_sum;
+    let r = rng.next_f32() * trunc_sum;
     let mut cumulative = 0.0_f32;
     for &k in order.iter().take(trunc_k) {
         cumulative += probs[k];
@@ -562,6 +577,7 @@ pub fn sample_top_p_from_candidates(
     repeat_penalty: f32,
     temperature: f32,
     top_p: f32,
+    rng: &mut SamplerRng,
 ) -> u32 {
     debug_assert_eq!(cand_ids.len(), cand_vals.len());
 
@@ -632,10 +648,10 @@ pub fn sample_top_p_from_candidates(
         }
     }
 
-    // Step 6: top-p filtering + sample. Uses the shared `simple_rand` RNG
+    // Step 6: top-p filtering + sample. Draws from the caller-owned `rng`
     // state, so the RNG stream is identical across the full-CPU and
     // GPU-assisted paths.
-    let r = simple_rand() * sum;
+    let r = rng.next_f32() * sum;
     let mut cumulative = 0.0f32;
     let mut sample_acc = 0.0f32;
     let threshold = top_p * sum;
@@ -646,7 +662,7 @@ pub fn sample_top_p_from_candidates(
             return topk_idx[k];
         }
         if cumulative >= threshold {
-            let r2 = simple_rand() * cumulative;
+            let r2 = rng.next_f32() * cumulative;
             let mut acc2 = 0.0f32;
             for &k2 in &order {
                 acc2 += probs[k2];
@@ -663,73 +679,82 @@ pub fn sample_top_p_from_candidates(
     topk_idx[order[0]]
 }
 
-/// Snapshot + restore the sampler RNG state. Used by HIPFIRE_SAMPLE_COMPARE
-/// to run two samplers against the same seed so token differences reflect
-/// real divergence and not just RNG stream drift.
-pub fn sampler_rng_snapshot() -> u32 {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.load(Ordering::Relaxed)
-}
+/// A sampler RNG stream, owned by whoever is sampling.
+///
+/// This used to be `static SAMPLER_STATE: AtomicU32`, reset per request to the
+/// constant `0x13579BDF` by both `generate` and `generate_vl`. That was already
+/// fragile and becomes wrong under the v2 daemon (M1b): with several streams
+/// interleaved at module granularity, stream *i*'s token depends on how many
+/// other streams happened to draw before it. Per-request seeds stop meaning
+/// anything, an identical request stops being reproducible, and — because both
+/// resets used the *same* constant — concurrent streams did not merely share a
+/// stream, they repeatedly reset each other onto the same one.
+///
+/// It is also why batched decode is restricted to greedy/argmax today: with no
+/// per-row RNG there is no correct way to sample more than one row at a time.
+///
+/// xorshift32. Not crypto-quality; fine for token sampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplerRng(u32);
 
-pub fn sampler_rng_restore(state: u32) {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.store(state, Ordering::Relaxed);
-}
-
-/// Reset the CPU sampler RNG to a deterministic per-request seed.
-pub fn reset_cpu_sampler_rng(seed: u32) {
-    use std::sync::atomic::Ordering;
-    SAMPLER_STATE.store(if seed == 0 { 1 } else { seed }, Ordering::Relaxed);
-}
-
-use std::sync::atomic::AtomicU32;
-static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
-
-/// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
-/// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
-fn simple_rand() -> f32 {
-    use std::sync::atomic::Ordering;
-
-    // Seed from time on first call
-    let mut s = SAMPLER_STATE.load(Ordering::Relaxed);
-    if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        if s == 0 {
-            s = 1;
-        }
+impl SamplerRng {
+    /// A stream from an explicit seed. Seed 0 is remapped to 1, because
+    /// xorshift32 has a fixed point at zero and would emit it forever.
+    pub fn from_seed(seed: u32) -> Self {
+        Self(if seed == 0 { 1 } else { seed })
     }
-    // xorshift32
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
-    SAMPLER_STATE.store(s, Ordering::Relaxed);
-    (s as f32) / (u32::MAX as f32)
+
+    /// A stream seeded from the clock, for callers with no reproducibility
+    /// requirement (standalone examples and one-shot tools).
+    pub fn from_entropy() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(1);
+        Self::from_seed(nanos)
+    }
+
+    /// Raw state, for snapshot/restore. `HIPFIRE_SAMPLE_COMPARE` runs two
+    /// samplers from one seed so that token differences reflect real divergence
+    /// rather than RNG stream drift; this is how it pins them together.
+    pub fn state(self) -> u32 {
+        self.0
+    }
+
+    pub fn set_state(&mut self, state: u32) {
+        *self = Self::from_seed(state);
+    }
+
+    /// Next draw in `[0, 1]`.
+    pub fn next_f32(&mut self) -> f32 {
+        let mut s = self.0;
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        self.0 = s;
+        (s as f32) / (u32::MAX as f32)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `SAMPLER_STATE` is a process-global `AtomicU32`, and cargo runs this
-    /// crate's tests in parallel threads. Any two tests that seed it and then
-    /// assert on what comes out therefore race: one thread's
-    /// `reset_cpu_sampler_rng` can land between the other's reset and its draw,
-    /// so the second draw continues a stream the first never seeded.
+    /// There is deliberately no RNG lock here any more.
     ///
-    /// This is not hypothetical — it failed in CI as `left: 95, right: 52` from
-    /// two identically-seeded `sample_top_k_top_p` calls, while passing locally,
-    /// which is exactly the shape a scheduling race takes.
+    /// These tests used to share a `static SAMPLER_STATE: AtomicU32`, and cargo
+    /// runs them on parallel threads, so any two that seeded it and then asserted
+    /// on the result raced: one thread's reset could land between the other's
+    /// reset and its draw. That was not hypothetical — it failed in CI as
+    /// `left: 95, right: 52` from two identically-seeded `sample_top_k_top_p`
+    /// calls while passing locally, and was worked around with a mutex every
+    /// affected test had to remember to take.
     ///
-    /// Every test that depends on the global RNG takes this lock. Poisoning is
-    /// ignored on purpose: if one such test already failed, the others should
-    /// still report their own result rather than all panic on the mutex.
-    fn lock_sampler_rng() -> std::sync::MutexGuard<'static, ()> {
-        static RNG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        RNG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// With the RNG owned by the caller (`SamplerRng`), each test holds its own
+    /// stream and the race is gone by construction rather than by discipline.
+    /// The mutex being deletable is the clearest evidence that the global was a
+    /// real correctness hazard and not merely an aesthetic one.
 
     #[test]
     fn sample_cpu_applies_presence_and_frequency_penalties() {
@@ -744,7 +769,7 @@ mod tests {
             frequency_penalty: 0.5,
             blocked_tokens: Vec::new(),
         };
-        let tok = sample_cpu(&mut logits, &[1, 1, 2], &cfg);
+        let tok = sample_cpu(&mut logits, &[1, 1, 2], &cfg, &mut SamplerRng::from_seed(7));
         assert_eq!(tok, 3);
         assert!((logits[1] - 2.0).abs() < 1e-6);
         assert!((logits[2] - 2.0).abs() < 1e-6);
@@ -758,18 +783,15 @@ mod tests {
         // repeat_penalty would otherwise mutate the slice.
         let mut logits = vec![1.0_f32, 5.0, 2.0, 7.0, 3.0];
         let cfg = SamplerConfig::greedy();
-        let tok = sample_cpu(&mut logits, &[], &cfg);
+        let tok = sample_cpu(&mut logits, &[], &cfg, &mut SamplerRng::from_seed(7));
         assert_eq!(tok, 3);
     }
 
     #[test]
     fn top_k_64_is_seeded_and_excludes_the_tail() {
-        let _rng = lock_sampler_rng();
         let logits: Vec<f32> = (0..96).map(|index| index as f32 * 0.03125).collect();
-        reset_cpu_sampler_rng(0x1357_9bdf);
-        let first = sample_top_k_top_p(&logits, 1.0, 64, 0.95);
-        reset_cpu_sampler_rng(0x1357_9bdf);
-        let second = sample_top_k_top_p(&logits, 1.0, 64, 0.95);
+        let first = sample_top_k_top_p(&logits, 1.0, 64, 0.95, &mut SamplerRng::from_seed(0x1357_9bdf));
+        let second = sample_top_k_top_p(&logits, 1.0, 64, 0.95, &mut SamplerRng::from_seed(0x1357_9bdf));
         assert_eq!(first, second);
         assert!(first >= 32, "top-k 64 admitted tail token {first}");
     }
@@ -782,7 +804,7 @@ mod tests {
         let mut logits = vec![1.0_f32, 5.0, 2.0, 7.0, 3.0];
         let mut cfg = SamplerConfig::greedy();
         cfg.blocked_tokens = vec![3];
-        let tok = sample_cpu(&mut logits, &[], &cfg);
+        let tok = sample_cpu(&mut logits, &[], &cfg, &mut SamplerRng::from_seed(7));
         assert_eq!(tok, 1);
     }
 
@@ -793,7 +815,7 @@ mod tests {
         let mut logits = vec![1.0_f32, 5.0, 2.0, 7.0, 3.0];
         let mut cfg = SamplerConfig::greedy();
         cfg.blocked_tokens = vec![999, 1234];
-        let tok = sample_cpu(&mut logits, &[], &cfg);
+        let tok = sample_cpu(&mut logits, &[], &cfg, &mut SamplerRng::from_seed(7));
         assert_eq!(tok, 3); // argmax unchanged
     }
 
@@ -809,17 +831,43 @@ mod tests {
     }
 
     #[test]
-    fn cpu_sampler_rng_reset_is_deterministic() {
-        let _rng = lock_sampler_rng();
-        reset_cpu_sampler_rng(123);
-        let first = simple_rand();
-        reset_cpu_sampler_rng(123);
-        let second = simple_rand();
-        assert_eq!(first, second);
+    fn a_seeded_stream_is_reproducible_and_two_streams_are_independent() {
+        let mut a = SamplerRng::from_seed(123);
+        let mut b = SamplerRng::from_seed(123);
+        assert_eq!(a.next_f32(), b.next_f32(), "same seed, same stream");
 
-        reset_cpu_sampler_rng(0);
-        let zero_seeded = sampler_rng_snapshot();
-        assert_ne!(zero_seeded, 0);
+        // The property the v2 executor actually needs: interleaving draws from
+        // one stream must not perturb another. Under the old global this was
+        // false by construction, which is why batched decode is greedy-only.
+        let mut solo = SamplerRng::from_seed(99);
+        let solo_draws: Vec<f32> = (0..4).map(|_| solo.next_f32()).collect();
+
+        let mut interleaved = SamplerRng::from_seed(99);
+        let mut other = SamplerRng::from_seed(1234);
+        let mut interleaved_draws = Vec::new();
+        for _ in 0..4 {
+            interleaved_draws.push(interleaved.next_f32());
+            let _ = other.next_f32();
+        }
+        assert_eq!(solo_draws, interleaved_draws);
+
+        // Seed 0 is xorshift32's fixed point; it must be remapped or the stream
+        // emits zero forever.
+        let mut zero = SamplerRng::from_seed(0);
+        assert_ne!(zero.state(), 0);
+        assert_ne!(zero.next_f32(), 0.0);
+    }
+
+    #[test]
+    fn state_round_trips_for_sample_compare() {
+        let mut rng = SamplerRng::from_seed(0xABCD);
+        let _ = rng.next_f32();
+        let saved = rng.state();
+        let expected = rng.next_f32();
+
+        let mut restored = SamplerRng::from_seed(1);
+        restored.set_state(saved);
+        assert_eq!(restored.next_f32(), expected);
     }
 
     #[test]

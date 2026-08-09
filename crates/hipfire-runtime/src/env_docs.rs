@@ -1300,7 +1300,7 @@ pub const ENV_HIPFIRE_DIFFUSION_W4A8: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIR",
     description: "Runtime variable controlling dir in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1218",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1229",
 };
 
 /// `HIPFIRE_DN_STATE_EF` — HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
@@ -1748,7 +1748,7 @@ pub const ENV_HIPFIRE_EVAL_DATASET_MIRROR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_EVIDENCE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_EVIDENCE_DIR",
     description: "Runtime variable controlling eval evidence dir in hipfire",
-    source: "crates/hipfire-runtime/examples/run.rs:253",
+    source: "crates/hipfire-runtime/examples/run.rs:254",
 };
 
 /// `HIPFIRE_EVAL_KLDREF` — Runtime variable controlling eval kldref in hipfire
@@ -3429,7 +3429,7 @@ pub const ENV_HIPFIRE_PFLASH_DAEMON_LABELS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DEBUG",
     description: "Runtime variable controlling pflash debug in hipfire",
-    source: "crates/hipfire-serving-core/src/generate.rs:2516",
+    source: "crates/hipfire-serving-core/src/generate.rs:2520",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_KV` — Selects behavior from recognized values
@@ -4929,21 +4929,21 @@ pub const ENV_HIPFIRE_VERIFY_GRAPH_TREE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_VISION_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1214",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1225",
 };
 
 /// `HIPFIRE_VISION_CACHE_DIR` — Runtime variable controlling vision cache dir in hipfire
 pub const ENV_HIPFIRE_VISION_CACHE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_DIR",
     description: "Runtime variable controlling vision cache dir in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1217",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1228",
 };
 
 /// `HIPFIRE_VISION_CACHE_MAX_BYTES` — Parses "HIPFIRE_VISION_CACHE_MAX_BYTES" with fallback defaults
 pub const ENV_HIPFIRE_VISION_CACHE_MAX_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_MAX_BYTES",
     description: "Parses \"HIPFIRE_VISION_CACHE_MAX_BYTES\" with fallback defaults",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1226",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1237",
 };
 
 /// `HIPFIRE_VISION_DUMP` — Selects behavior from recognized values
@@ -4964,7 +4964,7 @@ pub const ENV_HIPFIRE_VISION_PROFILE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_VL_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VL_DUMP_DIR",
     description: "little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR",
-    source: "crates/hipfire-runtime/examples/infer.rs:171",
+    source: "crates/hipfire-runtime/examples/infer.rs:172",
 };
 
 /// `HIPFIRE_WARN_GENERIC` — Enabled by default; set to 0 to disable
@@ -5304,7 +5304,7 @@ pub const ENV_NO_COLOR: EnvVarDoc = EnvVarDoc {
 pub const ENV_NO_NGRAM: EnvVarDoc = EnvVarDoc {
     name: "NO_NGRAM",
     description: "Disabled for perf measurement — re-enable after implementing GPU n-gram kernel",
-    source: "crates/hipfire-runtime/examples/infer_vl.rs:373",
+    source: "crates/hipfire-runtime/examples/infer_vl.rs:374",
 };
 
 /// `PARITY_HEAD_DIM` — Runtime variable controlling parity head dim in hipfire
