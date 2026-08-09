@@ -477,7 +477,7 @@ Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
 
 | stage | state | evidence |
 |---|---|---|
-| M0 executor trace | **landed** | 256 tokens → 255 gaps; dispatch span vs stopwatch worst 0.01%; tracing cost −0.12% |
+| M0 executor trace | **landed** | 254 tokens → 253 gaps; dispatch span vs stopwatch worst 0.01%; tracing cost +0.23% |
 | M1a `upload_raw` / `GpuPool` | **landed** | pooled 4000 cycles → +0 B VRAM, 0 HIP calls; unpooled 200 cycles → +400 MiB |
 | M1b per-stream sampler RNG | **landed** | global deleted; greedy unchanged, temp>0 reproducible across an interleaved request |
 | M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
@@ -533,13 +533,27 @@ and not an aesthetic one.
 - **`load_progress::SINK`** — 18 references. Least urgent: a load is not a stream, and the
   per-connection routing bug it once caused was already fixed.
 
-**Separately observed, pre-existing, and NOT caused by M1b: the first generation after a
-model load differs from every later one.** Measured twice, independently — gen0 differs
-from gen1 while gen1..gen4 are byte-identical, and in the M0 trace gate rep 0 emitted 254
-tokens against 256 for every later rep. Greedy decoding never draws from the sampler RNG,
-so this is not sampler state. It is worth its own investigation: greedy decoding should be
-deterministic from the first token, and anything that makes the first pass different is
-also a hazard for the byte-identity gates the later stages depend on.
+**RETRACTED — the "first generation after a load differs" anomaly is not a bug.**
+It was recorded across the M0 and M1b commits as unexplained and needing its own
+investigation ("greedy decoding should be deterministic from the first token"). It is
+explained, and it is intended behaviour: **successive `generate` calls on one worker are a
+conversation.** The daemon accumulates `m.active.cursor.conversation_tokens` and reuses KV
+by longest-common-prefix against it (`generate_arch.rs:684-690`, and the comment at `:576`
+naming the `reset` handler as the thing that clears it). So request N legitimately starts
+from request N-1's context.
+
+Discriminated by experiment rather than argument — run a *different* prompt first and see
+whether the probe's result changes. It did, which rules out warm-up and identifies content
+contamination; and `reset` between requests restores byte-exact reproducibility, including
+across an intervening unrelated generation.
+
+**The consequence for this plan is a methodology rule, not a fix:** any gate asserting
+byte-identity or comparing latency across repeated requests must send `reset` between them,
+or it is measuring a growing conversation. Both v2 gates now do. It mattered — before the
+fix the M0 latency arms drifted 4.6 s → 10.3 s across reps as prefill grew, and the
+resulting tracing-overhead figure was noise against a moving baseline (reported −0.12 %).
+With resets, every rep is 254 tokens in ~4.56 s and the overhead resolves to a real
+**+0.23 %**.
 
 Ordering principle: the three roles the module plays are separable, and they are sequenced
 in the stated priority order — **preemption first, residency second, unification last.**
