@@ -216,10 +216,10 @@ fn decode_step_body(
             .map_err(|e| format!("minimax: htod pos: {e:?}"))?;
     }
 
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Skipped
-    // when capturing (oracle dumper needs the hand path). Default off (opt-in)
-    // until hipx byte-parity validated (minimax only fits on hipx).
+    // #397 Ship 6 — forward-as-pipeline. The per-layer decode routes through the
+    // super-op executor (run_layer_program) BY DEFAULT; HIPFIRE_FORWARD_LOWERED=0
+    // opts back to the hand loop. Skipped when capturing (oracle dumper needs the
+    // hand path). hipx byte-parity validated — see minimax_forward_lowered_enabled.
     // Lowered is the default fast path, but the super-op executor does not run
     // the per-expert calibration taps below — so when activation capture is armed
     // (Collect / collect_artifacts), force the eager hand path. Mirrors the
@@ -716,10 +716,10 @@ fn decode_step_body(
 //
 // MiniMax is a standard MoE transformer — every layer is [Attend, Moe] (no conv,
 // no dense, one variant), so it reuses the Attend + Moe super-ops with no new op
-// kind. ADDITIVE + opt-in (HIPFIRE_FORWARD_LOWERED, default off until hipx
-// byte-parity validated — minimax only fits on hipx). The hand loop in
-// decode_step_body is untouched → default path byte-identical. The block fns
-// mirror the hand-loop arms verbatim; the lowered handlers call them.
+// kind. ADDITIVE and now DEFAULT-ON after hipx byte-parity (minimax only fits on
+// hipx); HIPFIRE_FORWARD_LOWERED=0 opts back out. The hand loop in
+// decode_step_body is untouched and stays reachable. The block fns mirror the
+// hand-loop arms verbatim; the lowered handlers call them.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Attention block (attn-norm folded in). Mirrors the hand-loop attention arm.

@@ -1135,9 +1135,10 @@ fn forward_step_after_x(
     state: &mut Qwen2State,
     pos: usize,
 ) -> HipResult<()> {
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Default
-    // off until fleet byte-parity validated on gfx1100 + gfx1201.
+    // #397 Ship 6 — forward-as-pipeline. The per-layer decode routes through the
+    // super-op executor (run_layer_program) BY DEFAULT; HIPFIRE_FORWARD_LOWERED=0
+    // opts back to the hand loop. Byte-parity validated on gfx1100 — see
+    // qwen2_forward_lowered_enabled.
     if qwen2_forward_lowered_enabled() {
         return forward_step_after_x_lowered(gpu, weights, cfg, state, pos);
     }
