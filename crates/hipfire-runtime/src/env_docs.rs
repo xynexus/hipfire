@@ -2063,7 +2063,7 @@ pub const ENV_HIPFIRE_GQA_CHUNK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GQA_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GQA_FUSED",
     description: "(6) Attention — 4-way select (exact hand-path mirror)",
-    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1912",
+    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1913",
 };
 
 /// `HIPFIRE_GRAPH` — Used to configure runtime execution by explicitly setting "HIPFIRE_GRAPH"
@@ -4586,7 +4586,7 @@ pub const ENV_HIPFIRE_RQ_GROUP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RQ_HAND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_HAND",
     description: "hook, which only the hand arms below carry — force the hand path",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs:41",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs:42",
 };
 
 /// `HIPFIRE_RQ_PROTECT_FRAC` — roughquant-sim: fraction of columns kept at full precision, the rest crushed to a uniform grid and baked back to bf16. Default 0.015. Saliency is diag(H) when a Hessian exists, else the column L2 norm.
