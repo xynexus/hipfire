@@ -3370,24 +3370,48 @@ impl GdnTapeShards {
                 )?;
             }
 
-            // 4. GDN recurrence — advances S_state.
-            g.gated_delta_net_q8_batch_seq(
-                &shard.q_scratch,
-                &shard.k_scratch,
-                &shard.v_scratch,
-                &shard.alpha_bufs[global_la_idx],
-                &shard.beta_bufs[global_la_idx],
-                &dn_state.s_matrices[global_la_idx],
-                &dn_state.s_scales[global_la_idx],
-                &shard.attn_scratch,
-                n_steps,
-                n_v_heads,
-                config.linear_value_head_dim,
-                // Block base: the batched kernel adds its intra-block token
-                // index `t`, so token `t` is seeded at `base_position + t`.
-                shard.base_position as u32,
-                global_la_idx as u32,
-            )?;
+            // 4. GDN recurrence — advances S_state. Same FP32-batched /
+            //    FP16-per-token split as `replay_gdn_inner`, and for the same
+            //    reason: f16 narrows the state once per launch, so replaying an
+            //    accepted prefix must step token by token to match decode.
+            match dn_state.quant {
+                qwen35::StateQuant::FP32 => g.gated_delta_net_f32_batch_seq(
+                    &shard.q_scratch,
+                    &shard.k_scratch,
+                    &shard.v_scratch,
+                    &shard.alpha_bufs[global_la_idx],
+                    &shard.beta_bufs[global_la_idx],
+                    &dn_state.s_matrices[global_la_idx],
+                    &shard.attn_scratch,
+                    n_steps,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                )?,
+                qwen35::StateQuant::FP16 => {
+                    for step in 0..n_steps {
+                        let q = shard.q_scratch.sub_offset(step * v_dim, v_dim);
+                        let k = shard.k_scratch.sub_offset(step * v_dim, v_dim);
+                        let v = shard.v_scratch.sub_offset(step * v_dim, v_dim);
+                        let alpha =
+                            shard.alpha_bufs[global_la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                        let beta =
+                            shard.beta_bufs[global_la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                        let out = shard.attn_scratch.sub_offset(step * v_dim, v_dim);
+                        g.gated_delta_net_f16_batch_seq(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[global_la_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
+                }
+            }
 
             global_la_idx += 1;
         }

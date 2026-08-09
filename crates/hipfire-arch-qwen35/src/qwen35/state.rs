@@ -68,12 +68,12 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// ~9.6 GB. FP16 halves it. A real codec only earns its complexity for
 /// high-concurrency serving of 27B-class models.
 ///
-/// # Known conflict
+/// # Formerly a known conflict
 ///
-/// The **tree** DeltaNet replay path is Q8-only — `gated_delta_net_q8_tree_batch_seq`
-/// is the sole tree kernel, with no FP32 variant — so DDTree spec-decode cannot
-/// run under this policy. DDTree is opt-in and off by default. Adding an FP32 (or
-/// FP16) tree kernel is the way to reconcile them; forcing Q8 state is not.
+/// The tree DeltaNet replay path used to be Q8-only, so DDTree spec-decode could
+/// not run under this policy. Resolved 2026-08-09:
+/// `gated_delta_net_{f32,f16}_tree_batch_seq` are the tree kernels now and the
+/// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
 /// is now FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
@@ -94,12 +94,6 @@ pub fn deltanet_state_fp32_below() -> usize {
 ///
 /// The `HIPFIRE_QWEN35_STATE_QUANT` override referenced in earlier revisions of
 /// this comment does **not** exist — no code reads that variable.
-///
-/// NOTE: FP32 state is unsupported by the **tree** DeltaNet replay path
-/// (`gated_delta_net_q8_tree_batch_seq` is the only tree kernel; there is no FP32
-/// variant), so tree-based spec-decode cannot run under the never-Q8 policy.
-/// DDTree is opt-in and off by default. Use the non-tree MTP/DFlash draft paths.
-/// Reconcile by adding an FP32/FP16 tree kernel — not by enabling Q8 state.
 pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     let _ = config;
     // `.flag()`, NOT `.parse_or(false)`: `parse_or` goes through Rust's
@@ -119,17 +113,17 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // That evidence is one prompt on one model, which is why FP32 stays one
     // flag away rather than being deleted: it is the oracle, and losing the
     // ability to diff against it is how quantized state hid for months.
-    // REVERTED to FP32-default 2026-08-09, same day it was flipped. FP16 as
-    // the default is UNSAFE while a live caller of the retired Q8 kernels
-    // survives: teacher-forced scoring of a dense 0.8B faulted with
+    //
+    // FP16 was made the default and REVERTED the same day (2026-08-09): the
+    // Q8 dispatch functions had never been deleted, only the `StateQuant`
+    // variants that selected them, so surviving `else` arms still reached
+    // them unconditionally and half-size FP16 state faulted with
     //   Memory Fault ... kernel: gated_delta_net_q8
-    // because FP16 state is half-size with a vestigial `s_scales`, so the Q8
-    // kernel reads out of bounds. The Q8 *dispatch functions* were never
-    // deleted — only the StateQuant variants and the call sites that selected
-    // them — so at least one path still reaches them unconditionally.
-    // `prefill_batch.rs:664` is one; the dense-model fault proves there is
-    // another. Restore the default only after `gated_delta_net_q8*` has no
-    // callers left.
+    // The kernels, their dispatch entry points and every caller are now gone,
+    // so that blocker is cleared. FP16 stays opt-in until a teacher-forced
+    // FP32-vs-FP16 KLD run on more than one model says otherwise — the
+    // evidence above is one prompt on one model, which is not enough to move
+    // the default.
     if hipfire_env::DN_STATE_FP16.flag() {
         StateQuant::FP16
     } else {
@@ -254,10 +248,9 @@ impl DeltaNetState {
                 //       s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 //   }
                 //
-                // NOTE: the Q8-only DDTree tree-replay path
-                // (`gated_delta_net_q8_tree_batch_seq`) cannot run while this is
-                // disabled. It will now fail LOUDLY here rather than silently
-                // producing a non-lossless spec-decode path.
+                // DDTree tree-replay no longer depends on any of this: it runs
+                // on `gated_delta_net_{f32,f16}_tree_batch_seq`, picked from
+                // the state precision. The Q8 tree kernel is deleted.
                 StateQuant::FP16 => {
                     // Half the bytes. Raw because this is f16 storage the
                     // kernels widen on load — there is no f16 DType at this

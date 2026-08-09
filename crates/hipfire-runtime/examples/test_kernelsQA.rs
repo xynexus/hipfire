@@ -560,12 +560,9 @@ fn gdn_case(expected_arch: Option<&str>, n_heads: usize, hd: usize) -> CaseOutco
 
     match (|| -> Result<String, String> {
         let s_size = n_heads * hd * hd;
-        let scale_size = n_heads * hd;
-        let s_q8 = gpu
-            .zeros(&[s_size], DType::F32)
-            .map_err(|e| e.to_string())?;
-        let s_scales = gpu
-            .upload_f32(&vec![1.0f32; scale_size], &[scale_size])
+        // f16 state: 2 bytes/element, no scales.
+        let s_f16 = gpu
+            .zeros(&[s_size / 2], DType::F32)
             .map_err(|e| e.to_string())?;
         let q = gpu
             .upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd])
@@ -585,16 +582,14 @@ fn gdn_case(expected_arch: Option<&str>, n_heads: usize, hd: usize) -> CaseOutco
         let o = gpu
             .alloc_tensor(&[n_heads * hd], DType::F32)
             .map_err(|e| e.to_string())?;
-        gpu.gated_delta_net_q8(
-            &q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, 0, 0,
-        )
-        .map_err(|e| e.to_string())?;
+        gpu.gated_delta_net_f16_batch_seq(&q, &k, &v, &alpha, &beta, &s_f16, &o, 1, n_heads, hd)
+            .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
         ensure(
             r[0].is_finite(),
             format!("gdn produced non-finite value {}", r[0]),
         )?;
-        for tensor in [q, k, v, alpha, beta, s_q8, s_scales, o] {
+        for tensor in [q, k, v, alpha, beta, s_f16, o] {
             gpu.free_tensor(tensor).map_err(|e| e.to_string())?;
         }
         Ok(format!("output[0]={:.4}", r[0]))

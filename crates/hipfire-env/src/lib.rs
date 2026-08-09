@@ -199,10 +199,9 @@ env_vars! {
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
         "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
-         Storage only; arithmetic stays FP32. OFF by default: a live caller of \
-         the retired Q8 kernels still exists, and FP16's half-size state makes \
-         it fault (GPU memory fault in gated_delta_net_q8). Do not enable until \
-         `gated_delta_net_q8*` has no callers.";
+         Storage only; arithmetic stays FP32; no scales, no stochastic rounding, \
+         so spec-decode rollback stays lossless. Opt-in until a teacher-forced \
+         FP32-vs-FP16 KLD comparison covers more than one model.";
 
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,

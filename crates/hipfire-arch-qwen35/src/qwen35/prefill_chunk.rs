@@ -2305,9 +2305,9 @@ pub(crate) fn forward_prefill_chunk(
     // tree_verify.pre_rope_k_capture[]. Increments alongside each
     // FullAttention layer iteration regardless of MoE/non-MoE variant.
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
-    let use_q8_gdn_per_token =
+    let use_gdn_per_token =
         force_q8_gdn_per_token || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled());
-    let q8_gdn_serial_frame_base = if use_q8_gdn_per_token
+    let q8_gdn_serial_frame_base = if use_gdn_per_token
         && q8_gdn_verify_serial_frames_enabled()
         && gdn_tape.is_some()
         && tree_verify.is_none()
@@ -2956,29 +2956,25 @@ pub(crate) fn forward_prefill_chunk(
                 }
 
                 // Gated Delta Net — tree variant reads per-token S from
-                // s_tape[parent] (or pre-block s_q8_init at root); linear
+                // s_tape[parent] (or pre-block s_init at root); linear
                 // variant advances dn_state.s_matrices in place.
                 if let Some(parents) = tree_parents {
-                    if matches!(dn_state.quant, StateQuant::FP32) {
-                        return Err(hip_bridge::HipError::new(
-                            0,
-                            "FP32-state batched prefill does not support tree DeltaNet replay yet",
-                        ));
-                    }
-                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
-                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
+                    let tape = pbs.dn_s_tape.as_ref().expect(
+                        "tree-aware LA requires dn_s_tape scratch (check PrefillBatchScratch::new)",
+                    );
+                    let tree = match dn_state.quant {
+                        StateQuant::FP32 => Gpu::gated_delta_net_f32_tree_batch_seq,
+                        StateQuant::FP16 => Gpu::gated_delta_net_f16_tree_batch_seq,
+                    };
+                    tree(
+                        gpu,
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
+                        tape,
                         parents,
                         &pbs.dn_attn_out_batch,
                         n,
@@ -2998,49 +2994,42 @@ pub(crate) fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if use_q8_gdn_per_token {
+                } else if use_gdn_per_token {
+                    // FP16 only — the FP32 arm above is batched, and batched
+                    // vs per-token is identical there (no narrowing). f16
+                    // narrows once per launch, so per-token matters.
                     for step in 0..n {
-                        // #17: the Q8 requant seed is derived from the absolute
-                        // sequence position and the LA layer index, so the old
-                        // `debug_set_gdn_requant_frame` poke that synthesized a
-                        // serial-decode-matching frame here is no longer needed.
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
                         let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
                         let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
                         let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
-                        gpu.gated_delta_net_q8(
+                        gpu.gated_delta_net_f16_batch_seq(
                             &q,
                             &k,
                             &v,
                             &alpha,
                             &beta,
                             &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
                             &out,
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
-                            position_at_row(step) as u32,
-                            delta_layer_idx as u32,
                         )?;
                     }
                 } else {
-                    gpu.gated_delta_net_q8_batch_seq(
+                    gpu.gated_delta_net_f16_batch_seq(
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
-                        position_at_row(0) as u32,
-                        delta_layer_idx as u32,
                     )?;
                 }
 
@@ -6462,79 +6451,80 @@ pub(crate) fn forward_prefill_chunk(
                     );
                 }
                 if let Some(parents) = tree_parents {
-                    if matches!(dn_state.quant, StateQuant::FP32) {
-                        return Err(hip_bridge::HipError::new(
-                            0,
-                            "FP32-state batched prefill does not support tree DeltaNet replay yet",
-                        ));
-                    }
-                    let tape_q8 = pbs
-                        .dn_s_tape_q8
+                    let tape = pbs
+                        .dn_s_tape
                         .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch");
-                    let tape_sc = pbs
-                        .dn_s_tape_scales
-                        .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        .expect("tree-aware LA requires dn_s_tape scratch");
+                    let tree = match dn_state.quant {
+                        StateQuant::FP32 => Gpu::gated_delta_net_f32_tree_batch_seq,
+                        StateQuant::FP16 => Gpu::gated_delta_net_f16_tree_batch_seq,
+                    };
+                    tree(
+                        gpu,
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
+                        tape,
                         parents,
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if use_q8_gdn_per_token {
-                    for step in 0..n {
-                        // #17: the Q8 requant seed is derived from the absolute
-                        // sequence position and the LA layer index, so the old
-                        // `debug_set_gdn_requant_frame` poke that synthesized a
-                        // serial-decode-matching frame here is no longer needed.
-                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
-                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
-                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
-                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
-                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
-                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
-                        gpu.gated_delta_net_q8(
-                            &q,
-                            &k,
-                            &v,
-                            &alpha,
-                            &beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            position_at_row(step) as u32,
-                            delta_layer_idx as u32,
-                        )?;
-                    }
-                } else {
-                    gpu.gated_delta_net_q8_batch_seq(
+                } else if matches!(dn_state.quant, StateQuant::FP32) {
+                    // Was MISSING: this MoE branch fell straight through to the
+                    // Q8 kernels regardless of state precision, reading FP32
+                    // state as int8 and a [n_heads] scales vector as
+                    // [n_heads × head_dim]. Only unreached because batched
+                    // prefill is declined for MoE models (`pbs_eligible`).
+                    gpu.gated_delta_net_f32_batch_seq(
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
-                        position_at_row(0) as u32,
-                        delta_layer_idx as u32,
+                    )?;
+                } else if use_gdn_per_token {
+                    for step in 0..n {
+                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
+                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
+                        gpu.gated_delta_net_f16_batch_seq(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
+                } else {
+                    gpu.gated_delta_net_f16_batch_seq(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 }
                 debug_stop_after!("gdn", layer_idx);

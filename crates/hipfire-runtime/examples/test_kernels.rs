@@ -207,17 +207,14 @@ fn main() {
 
     eprintln!("\n--- GDN (tiled LDS) ---");
     for (label, n_heads, hd) in [
-        ("gdn_q8 h=32 hd=128 (9B DeltaNet)", 32, 128),
-        ("gdn_q8 h=16 hd=128 (4B DeltaNet)", 16, 128),
+        ("gdn_f16 h=32 hd=128 (9B DeltaNet)", 32, 128),
+        ("gdn_f16 h=16 hd=128 (4B DeltaNet)", 16, 128),
     ] {
         test!(label, {
             let s_size = n_heads * hd * hd;
-            let scale_size = n_heads * hd;
-            let s_q8 = gpu
-                .zeros(&[s_size], DType::F32)
-                .map_err(|e| format!("{e}"))?; // int8 but alloc as bytes
-            let s_scales = gpu
-                .upload_f32(&vec![1.0f32; scale_size], &[scale_size])
+            // f16 state: 2 bytes/element, no scales.
+            let s_f16 = gpu
+                .zeros(&[s_size / 2], DType::F32)
                 .map_err(|e| format!("{e}"))?;
             let q = gpu
                 .upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd])
@@ -237,13 +234,13 @@ fn main() {
             let o = gpu
                 .alloc_tensor(&[n_heads * hd], DType::F32)
                 .map_err(|e| format!("{e}"))?;
-            gpu.gated_delta_net_q8(
-                &q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, 0, 0,
+            gpu.gated_delta_net_f16_batch_seq(
+                &q, &k, &v, &alpha, &beta, &s_f16, &o, 1, n_heads, hd,
             )
             .map_err(|e| format!("{e}"))?;
             let r = gpu.download_f32(&o).map_err(|e| format!("{e}"))?;
             assert!(r[0].is_finite(), "gdn produced NaN");
-            for t in [q, k, v, alpha, beta, s_q8, s_scales, o] {
+            for t in [q, k, v, alpha, beta, s_f16, o] {
                 gpu.free_tensor(t).map_err(|e| format!("{e}"))?;
             }
             Ok::<(), String>(())

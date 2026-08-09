@@ -109,7 +109,7 @@ pub use prefill_batch::*;
 ///
 /// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
 /// DeltaNet branch dispatches the tree-aware kernels
-/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
+/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_{f32,f16}_tree_batch_seq`)
 /// which walk per-token ancestor chains via `parent_indices` instead of
 /// the linear-sequence predecessor. This eliminates sibling-subtree
 /// cross-contamination of recurrent state at topk>1. If `parent_indices`

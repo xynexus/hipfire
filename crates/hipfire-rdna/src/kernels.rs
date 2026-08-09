@@ -3207,56 +3207,12 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_routed_batch_seq.hip");
 
-/// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
-/// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
-/// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
-/// RETIRED — the source file is `gated_delta_net_q8-disabled.hip`.
-///
-/// `state.rs` POLICY (2026-07-19): DeltaNet state must never be Q8. The kernel
-/// is kept for reference rather than deleted, but the two dispatch entry points
-/// refuse before they can compile or launch it, and it is no longer in the
-/// warm-up precompile list. The `-disabled` filename is the marker; this
-/// constant only still exists so the retired source stays readable in-tree.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8-disabled.hip");
-
-/// gfx1151 register-state GDN Q8 experiment. Keeps one S row per thread in
-/// registers and preserves the production stochastic-requant ABI.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_REG_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gfx1151/gated_delta_net_q8_reg.gfx1151.hip");
-
-/// Routed Q8 Gated Delta Net for independent request sessions. One block per
-/// session/head/S-tile scans round-major prefix rows and updates only that
-/// session's recurrent Q8 S state.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_routed_batch_seq.hip");
-/// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
-/// requant outside the loop. Supports EF residual. Lower VGPR pressure.
-#[allow(dead_code)]
-pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
-
-/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
-/// to a caller-owned tape buffer, so sibling tokens read the parent's
-/// post-update state rather than the previous sibling's. Required for
-/// correctness when processing a DDTree-linearized token block.
-///
-/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
-/// kernel never advances persistent dn_state.s_matrices — caller runs
-/// linear replay on the accepted spine post-acceptance to commit the
-/// trajectory (same pattern as conv1d_silu_split_tree).
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
-
-/// FP32 tree-aware DeltaNet replay. Same DFS + persist-write semantics as the
-/// Q8 tree kernel, with the tape holding raw f32 — no scales, no requant, no
-/// stochastic rounding. Exists so tree replay (DDTree) does not require Q8
-/// state, which qwen35/state.rs forbids; it is what lets the Q8 tree kernel be
-/// retired without removing DDTree.
+/// FP32 tree-aware DeltaNet replay. DFS order with per-token persist-write to a
+/// caller-owned tape, so sibling tokens read the parent's post-update state
+/// rather than the previous sibling's. The tape holds raw f32 — no scales, no
+/// requant, no stochastic rounding. `s_init` is the pre-block snapshot
+/// (READ-ONLY); the caller replays the accepted spine linearly afterwards to
+/// commit the trajectory (same pattern as conv1d_silu_split_tree).
 ///
 /// Spine topology reproduces `gated_delta_net_f32` called n_tokens=1 N times
 /// byte-exactly (same `col = tid * 4` lane mapping, so the same summation order).
@@ -3300,14 +3256,6 @@ pub const GATED_DELTA_NET_F16_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f16_routed_batch_seq.hip");
-
-/// GDN recurrence with Q4-quantized S state in VRAM.
-/// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
-/// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
-/// 8x compression vs FP32 (8KB + 512B scales per head vs 64KB).
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q4_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q4.hip");
 
 /// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
 /// Eliminates 85µs CPU roundtrip per DeltaNet layer.
