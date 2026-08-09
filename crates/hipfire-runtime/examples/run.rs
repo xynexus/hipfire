@@ -244,7 +244,7 @@ fn main() {
     let mut kv_mode_str: String = "q8".to_string();
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
-    let mut state_quant = qwen35::StateQuant::Q8;
+    let mut state_quant = qwen35::StateQuant::FP32;
     let mut draft_model: Option<String> = None;
     let mut speculative = false;
     let mut spec_k: usize = 4;
@@ -268,10 +268,10 @@ fn main() {
                 state_quant = qwen35::StateQuant::FP32;
             }
             "--q8-state" => {
-                state_quant = qwen35::StateQuant::Q8;
+                state_quant = qwen35::StateQuant::FP32;
             }
             "--q4-state" => {
-                state_quant = qwen35::StateQuant::Q4;
+                state_quant = qwen35::StateQuant::FP32;
             }
             "--temp" => {
                 i += 1;
@@ -345,8 +345,7 @@ fn main() {
     }
     match state_quant {
         qwen35::StateQuant::FP32 => eprintln!("DeltaNet state: FP32"),
-        qwen35::StateQuant::Q8 => eprintln!("DeltaNet state: Q8"),
-        qwen35::StateQuant::Q4 => eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"),
+        qwen35::StateQuant::FP16 => eprintln!("DeltaNet state: FP16"),
     }
     warn_tiny_model_state(model_path, state_quant);
     let target_kv_mode = parse_kv_mode(&kv_mode_str);

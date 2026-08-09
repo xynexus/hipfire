@@ -574,47 +574,20 @@ fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> us
 /// Bring-up helper for the tiny smoke-test models: resolve their abbreviated
 /// config into the concrete state needed to load them.
 pub fn resolve_tiny_model_state(
-    hfq: &HfqFile,
-    override_str: Option<&str>,
+    _hfq: &HfqFile,
+    _override_str: Option<&str>,
     q: hipfire_arch_qwen35::qwen35::StateQuant,
 ) -> hipfire_arch_qwen35::qwen35::StateQuant {
-    use hipfire_arch_qwen35::qwen35::{
-        config_from_hfq, deltanet_state_fp32_below, deltanet_state_redundancy, StateQuant,
-    };
-    // "Explicit" means the caller passed a non-default token; system default
-    // tokens (None, "", "auto", "q8", "int8") all count as unspecified.
-    let explicit = matches!(override_str,
-        Some(s) if !matches!(s.to_ascii_lowercase().as_str(), "" | "auto" | "q8" | "int8"));
-    if explicit || q == StateQuant::FP32 {
-        return q;
-    }
-    let threshold = deltanet_state_fp32_below();
-    // Prefer the redundancy gate; fall back to param count if the qwen35 config
-    // can't be parsed (non-hybrid artifact).
-    if let Some(cfg) = config_from_hfq(hfq) {
-        let redundancy = deltanet_state_redundancy(&cfg);
-        if redundancy < threshold {
-            eprintln!(
-                "  DeltaNet state: auto-upgraded to FP32 (redundancy {redundancy} = \
-                 head_dim×n_value_heads < {threshold}; recurrent state is the numerical \
-                 anchor — pass state_quant=q8 to override)",
-            );
-            return StateQuant::FP32;
-        }
-        return q;
-    }
-    const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
-    let params = hfq_parameter_count(hfq);
-    if params < TINY_MODEL_PARAMS {
-        eprintln!(
-            "  DeltaNet state: auto-upgraded to FP32 ({:.2}B params, config unparsed — \
-             FP32 stable below 2B; pass state_quant=q8 to override)",
-            params as f64 / 1.0e9,
-        );
-        StateQuant::FP32
-    } else {
-        q
-    }
+    // Pass-through. This used to second-guess the caller via the DeltaNet
+    // redundancy threshold, promoting an unspecified state to Q8 above a size
+    // cutoff. Q8 is gone, the threshold with it, and the remaining precisions
+    // are both valid everywhere — so there is nothing left to resolve.
+    //
+    // It was also the reason FP16 could not be selected: with `q = FP16` and no
+    // explicit override, the old body fell through to the threshold and handed
+    // back FP32, silently. `HIPFIRE_DN_STATE_FP16=1` reached
+    // `default_state_quant`, produced FP16, and this function threw it away.
+    q
 }
 
 /// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
