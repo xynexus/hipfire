@@ -3,6 +3,49 @@
 Scoped 2026-08-10, after wiring `.hfa` into `hipfire-quantize` (PR #242) hit the
 same wall from the other side.
 
+## STATUS (2026-08-10): P0–P3 done, P4 done for `.hfq`, open for `.hfa`
+
+| phase | commit | evidence |
+|---|---|---|
+| P0 Cow-yielding `tensor()` | `1442898a7` | safetensors stays `Cow::Borrowed`, asserted by pointer identity |
+| P1 real `ModelSource for HfqFile` | `1442898a7` | `modelsource_parity`: 320/320 tensors identical vs source dir, 1.5 GB |
+| P2 shared bf16 decode | `e389c03e7` | tiny-affected gate: same 8 pre-existing failures, no new |
+| P3 generic `layer_stream` | `46b0ba196` | source manifest fingerprint unchanged (`fnv64:bf8adfccd57b73c5`) |
+| P4 `.hfq` calibrate source | `c620c79a8` | `compare-calibration`: 375 tensors / 277,502,460 values, `max_abs_error 0.0` |
+
+Two corrections to this plan, found by building it:
+
+- **No `TensorDesc` was needed.** `TensorInfo` already carries `quant_type` with
+  an explicit "For HFQ: the quant_type byte" contract. The only real obstacle
+  was the BORROW — the trait hands out `&TensorInfo` and HFQ stores
+  `HfqTensorInfo` — solved by a lazy mirror of the index.
+- **P3 was not the risky step.** `begin`/`step`/`finish` and
+  `source_manifest_identity` already took `&dyn ModelSource`; the entire
+  safetensors binding was two struct fields. The risk was actually in P4, where
+  the trait's borrowed-only accessor silently paired PACKED bytes with LOGICAL
+  metadata — a wrong-size read that the dry-run planner cannot catch because it
+  never touches a payload.
+
+### What is left: `.hfa` as a calibrate source
+
+`impl ModelSource` over an `.hfa` is blocked on WHERE the reader lives, not on
+the trait. `hfa.rs` sits in `hipfire-quantize`; `SafetensorsSource` (and the
+private `derive_arch_id` / `build_metadata_json` / `parse_quant_config` an
+archive-backed source would want to reuse) sit in `hipfire-runtime`; the two
+crates do not depend on each other. `hfa.rs` itself only needs `std` +
+`hipfire_primitives`, so it can move. Two routes:
+
+1. Move `hfa.rs` to a leaf both can see, then give `SafetensorsSource` an
+   archive backend — the same shape PR #242 gave `SafetensorsFile`. Cleanest,
+   but it moves the file PR #242 adds, so land that first.
+2. Build an archive-backed source in `hipfire-coexistence` (which depends on
+   both) and make the three helpers `pub`. No crate moves, but it needs a seam
+   for injecting a source into `build_calibration_run_inputs`.
+
+Not required for a restore-free pipeline, which already works: `.hfa` →
+bf16 `.hfq` reads the archive in place (#242), and calibrate now reads the
+`.hfq`. This step removes the remaining intermediate, not a restore.
+
 ## The problem, precisely
 
 `hipfire_model::ModelSource` is the source abstraction. `impl ModelSource for
