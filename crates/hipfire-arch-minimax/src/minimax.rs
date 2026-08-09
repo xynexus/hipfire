@@ -598,6 +598,252 @@ pub struct MiniMaxWeights {
     pub layers: Vec<MiniMaxLayerWeights>,
 }
 
+/// Pack one layer's routed experts into two blobs and build the per-expert
+/// pointer tables. Extracted verbatim from `MiniMaxWeights::load` so the
+/// residency choice can be a branch at the call site rather than a wrap around
+/// two hundred lines of inline code; behavior is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn load_layer_experts_packed(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    l: usize,
+    n_exp: usize,
+    hidden: usize,
+    inter: usize,
+    p: &str,
+    shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+) -> Result<
+    (
+        Vec<MiniMaxExpertWeights>,
+        GpuTensor,
+        GpuTensor,
+        Option<MiniMaxLowRank>,
+        Option<MiniMaxLowRank>,
+        Option<MiniMaxLowRank>,
+    ),
+    String,
+> {
+    // Routed experts: pack ALL experts of this layer into ONE gate_up
+    // blob + ONE down blob (deepseek4 `upload_layer_routed_experts`
+    // pattern). The old code did a separate `upload_raw`/hipMalloc per
+    // expert per projection — 2*n_exp tiny allocs/layer, ~31.7k total,
+    // each rounded up to HIP's allocation granularity. That fragmentation
+    // wasted ~20GB of VRAM, inflating mq2-lloyd's 86GB file to a ~114GB
+    // resident footprint that OOM'd gfx1151's 96GB carveout. The
+    // `*_indexed` GEMV kernels index experts by device pointer, so one
+    // packed blob + a base+e*stride pointer table is byte- and
+    // result-identical to the per-expert layout (validated against the
+    // tiny oracle: gfx1151 cosine unchanged).
+    let mut gu_combined: Vec<u8> = Vec::new();
+    let mut dn_combined: Vec<u8> = Vec::new();
+    let mut gu_stride = 0usize;
+    let mut dn_stride = 0usize;
+    let mut qt_gu = 0u8;
+    let mut qt_dn = 0u8;
+    // Optional LQER low-rank correction, accumulated per projection from
+    // the per-expert `.w{1,3,2}.lr_u/.lr_v` f32 sidecars (present only when
+    // the .hfq was quantized with HIPFIRE_LOWRANK_R>0). gate=w1, up=w3,
+    // down=w2; empty (rank 0) ⇒ correction disabled.
+    let mut gate_acc = LrAccum::default();
+    let mut up_acc = LrAccum::default();
+    let mut down_acc = LrAccum::default();
+    // EP shard: only upload rank-owned experts into the compact blob.
+    // `local_of_global[e]` maps a global expert id to its slot in the
+    // compact (owned-only) blob, or usize::MAX if not owned by this rank.
+    let owns = |e: usize| {
+        shard
+            .map(|(s, rank)| s.owns_expert(rank, e))
+            .unwrap_or(true)
+    };
+    let mut local_of_global = vec![usize::MAX; n_exp];
+    let mut n_owned = 0usize;
+    for e in 0..n_exp {
+        let ep = format!("{p}.block_sparse_moe.experts.{e}");
+        let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
+        let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
+        let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
+        // OQ experts ship on-disk and are repacked per expert into the
+        // indexed-MoE kernel layout before fusing. OQ4G256 (130 B) → 132 B
+        // int4 blocks; OqPlusCompact (qt=36) expands int4-bulk+int8-outliers
+        // → 260 B int8 blocks (top-w8_frac → int8 tier). w1/w3 are
+        // [inter, hidden]; w2 is [hidden, inter].
+        let (w1, w3, w2) = if qt1 == OQ4_QT {
+            (
+                oq4_ondisk_to_moe_blocks(&w1, inter, hidden)?,
+                oq4_ondisk_to_moe_blocks(&w3, inter, hidden)?,
+                oq4_ondisk_to_moe_blocks(&w2, hidden, inter)?,
+            )
+        } else if qt1 == OQPLUS_COMPACT_QT {
+            (
+                oqplus_compact_to_moe_oq8_blocks(&w1, inter, hidden)?,
+                oqplus_compact_to_moe_oq8_blocks(&w3, inter, hidden)?,
+                oqplus_compact_to_moe_oq8_blocks(&w2, hidden, inter)?,
+            )
+        } else {
+            (w1, w3, w2)
+        };
+        let gu_len = w1.len() + w3.len();
+        if e == 0 {
+            gu_stride = gu_len;
+            dn_stride = w2.len();
+            qt_gu = qt1;
+            qt_dn = qt2;
+            let cap = shard
+                .map(|(s, _)| s.experts_per_rank(n_exp))
+                .unwrap_or(n_exp);
+            gu_combined.reserve(gu_len * cap);
+            dn_combined.reserve(w2.len() * cap);
+        } else if gu_len != gu_stride || w2.len() != dn_stride {
+            return Err(format!(
+                "minimax L{l}E{e}: non-uniform expert stride (gate_up {gu_len}/{gu_stride}, down {}/{dn_stride}); packed layout requires equal-size experts",
+                w2.len()
+            ));
+        }
+        if owns(e) {
+            local_of_global[e] = n_owned;
+            n_owned += 1;
+            gu_combined.extend_from_slice(&w1);
+            gu_combined.extend_from_slice(&w3);
+            dn_combined.extend_from_slice(&w2);
+            // LQER low-rank sidecars per projection (gate=w1, up=w3 carry
+            // [inter×r] output rows; down=w2 carries [hidden×r]). Absent
+            // sidecars are a no-op.
+            let cap = shard
+                .map(|(s, _)| s.experts_per_rank(n_exp))
+                .unwrap_or(n_exp);
+            gate_acc.push(hfq, &format!("{ep}.w1"), inter, cap)?;
+            up_acc.push(hfq, &format!("{ep}.w3"), inter, cap)?;
+            down_acc.push(hfq, &format!("{ep}.w2"), hidden, cap)?;
+        }
+        // Non-owned: w1/w3/w2 read from the file (for stride validation)
+        // then dropped — never uploaded. That is the EP memory win.
+    }
+    if n_owned == 0 {
+        return Err(format!("minimax L{l}: shard rank owns no experts"));
+    }
+    // One allocation per projection. The representative `WeightTensor`'s
+    // buffer IS the packed blob; its m/k describe a SINGLE expert's shape
+    // (the forward's rotate_x_mq / silu_mul_rotate / dtype dispatch read
+    // those + the AWQ scale, never the buffer's full extent — per-expert
+    // data is reached through the pointer table below).
+    // OQ4 expert blobs are already in 132 B kernel layout (repacked per
+    // expert above), so upload them raw as Oq4G256 — NOT through
+    // wt_from_raw, whose OQ4 arm would re-run the dense arch-combined
+    // repack. Other dtypes (MQ*) are byte-identical on disk → kernel.
+    let mut gate_up = if qt_gu == OQ4_QT {
+        upload_wt_oq(gpu, &gu_combined, DType::Oq4G256, 2 * inter, hidden)
+    } else if qt_gu == OQPLUS_COMPACT_QT {
+        upload_wt_oq(gpu, &gu_combined, DType::Oq8G256, 2 * inter, hidden)
+    } else {
+        wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
+    }
+    .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
+    let mut down = if qt_dn == OQ4_QT {
+        upload_wt_oq(gpu, &dn_combined, DType::Oq4G256, hidden, inter)
+    } else if qt_dn == OQPLUS_COMPACT_QT {
+        upload_wt_oq(gpu, &dn_combined, DType::Oq8G256, hidden, inter)
+    } else {
+        wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
+    }
+    .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
+    drop(gu_combined);
+    drop(dn_combined);
+    gate_up.awq_scale = load_mm_awq_scale(
+        hfq,
+        gpu,
+        &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
+        hidden,
+    );
+    if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+        // down-AWQ harmful (shared s_down bad approx); opt-in
+        down.awq_scale = load_mm_awq_scale(
+            hfq,
+            gpu,
+            &format!("{p}.block_sparse_moe.awq_scale_down.weight"),
+            inter,
+        );
+    }
+    if gate_up.awq_scale.is_some() {
+        eprintln!("minimax: AWQ scales attached at L{l} (shared per-layer)");
+    }
+    let gu_base = gate_up.buf.buf.as_ptr() as u64;
+    let dn_base = down.buf.buf.as_ptr() as u64;
+    let experts = vec![MiniMaxExpertWeights { gate_up, down }];
+
+    // Device pointer tables: n_exp u64 device addresses, stored as
+    // [2*n_exp] F32 (8 bytes/ptr). Single-GPU: base + e*stride into the
+    // full packed blob. EP shard: owned e → compact-blob slot
+    // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
+    // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
+    // input is 0, so it reuses the compact down base).
+    let dummy_gu = if shard.is_some() && n_owned < n_exp {
+        let z = gpu
+            .zeros(&[gu_stride / 4], DType::F32)
+            .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
+        let p = z.buf.as_ptr() as u64;
+        std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
+        p
+    } else {
+        gu_base
+    };
+    let gu_bytes: Vec<u8> = (0..n_exp)
+        .flat_map(|e| {
+            let ptr = if owns(e) {
+                gu_base + (local_of_global[e] * gu_stride) as u64
+            } else {
+                dummy_gu
+            };
+            ptr.to_ne_bytes()
+        })
+        .collect();
+    let dn_bytes: Vec<u8> = (0..n_exp)
+        .flat_map(|e| {
+            let ptr = if owns(e) {
+                dn_base + (local_of_global[e] * dn_stride) as u64
+            } else {
+                dn_base // rot input is 0 for non-owned ⇒ output 0 regardless
+            };
+            ptr.to_ne_bytes()
+        })
+        .collect();
+    // Down low-rank U/V: upload the packed blobs and build per-expert
+    // pointer tables mirroring `dn_bytes` (non-owned reuse the base — their
+    // rotated input is 0 so the correction is 0). `None` when no sidecars.
+    let gate_lr = gate_acc.finish(gpu, n_exp, &local_of_global, &owns, "gate")?;
+    let up_lr = up_acc.finish(gpu, n_exp, &local_of_global, &owns, "up")?;
+    let down_lr = down_acc.finish(gpu, n_exp, &local_of_global, &owns, "down")?;
+    if l == 0 {
+        if let Some(r) = gate_lr.as_ref().or(down_lr.as_ref()).map(|x| x.rank) {
+            eprintln!(
+                "minimax: low-rank correction active (rank {r}; gate={} up={} down={})",
+                gate_lr.is_some(),
+                up_lr.is_some(),
+                down_lr.is_some()
+            );
+        }
+    }
+    let expert_gate_up_ptrs = gpu
+        .alloc_tensor(&[2 * n_exp], DType::F32)
+        .map_err(|e| format!("minimax: alloc gu_ptrs: {e:?}"))?;
+    let expert_down_ptrs = gpu
+        .alloc_tensor(&[2 * n_exp], DType::F32)
+        .map_err(|e| format!("minimax: alloc dn_ptrs: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
+        .map_err(|e| format!("minimax: htod gu_ptrs: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
+        .map_err(|e| format!("minimax: htod dn_ptrs: {e:?}"))?;
+    Ok((
+        experts,
+        expert_gate_up_ptrs,
+        expert_down_ptrs,
+        gate_lr,
+        up_lr,
+        down_lr,
+    ))
+}
+
 impl MiniMaxWeights {
     /// Load MiniMax weights. `shard = Some((cfg, rank))` enables **EP shard-aware
     /// loading**: each layer's experts are read from the file but ONLY the
@@ -702,217 +948,8 @@ impl MiniMaxWeights {
                 &[n_exp],
             )?;
 
-            // Routed experts: pack ALL experts of this layer into ONE gate_up
-            // blob + ONE down blob (deepseek4 `upload_layer_routed_experts`
-            // pattern). The old code did a separate `upload_raw`/hipMalloc per
-            // expert per projection — 2*n_exp tiny allocs/layer, ~31.7k total,
-            // each rounded up to HIP's allocation granularity. That fragmentation
-            // wasted ~20GB of VRAM, inflating mq2-lloyd's 86GB file to a ~114GB
-            // resident footprint that OOM'd gfx1151's 96GB carveout. The
-            // `*_indexed` GEMV kernels index experts by device pointer, so one
-            // packed blob + a base+e*stride pointer table is byte- and
-            // result-identical to the per-expert layout (validated against the
-            // tiny oracle: gfx1151 cosine unchanged).
-            let mut gu_combined: Vec<u8> = Vec::new();
-            let mut dn_combined: Vec<u8> = Vec::new();
-            let mut gu_stride = 0usize;
-            let mut dn_stride = 0usize;
-            let mut qt_gu = 0u8;
-            let mut qt_dn = 0u8;
-            // Optional LQER low-rank correction, accumulated per projection from
-            // the per-expert `.w{1,3,2}.lr_u/.lr_v` f32 sidecars (present only when
-            // the .hfq was quantized with HIPFIRE_LOWRANK_R>0). gate=w1, up=w3,
-            // down=w2; empty (rank 0) ⇒ correction disabled.
-            let mut gate_acc = LrAccum::default();
-            let mut up_acc = LrAccum::default();
-            let mut down_acc = LrAccum::default();
-            // EP shard: only upload rank-owned experts into the compact blob.
-            // `local_of_global[e]` maps a global expert id to its slot in the
-            // compact (owned-only) blob, or usize::MAX if not owned by this rank.
-            let owns = |e: usize| {
-                shard
-                    .map(|(s, rank)| s.owns_expert(rank, e))
-                    .unwrap_or(true)
-            };
-            let mut local_of_global = vec![usize::MAX; n_exp];
-            let mut n_owned = 0usize;
-            for e in 0..n_exp {
-                let ep = format!("{p}.block_sparse_moe.experts.{e}");
-                let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
-                let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
-                let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                // OQ experts ship on-disk and are repacked per expert into the
-                // indexed-MoE kernel layout before fusing. OQ4G256 (130 B) → 132 B
-                // int4 blocks; OqPlusCompact (qt=36) expands int4-bulk+int8-outliers
-                // → 260 B int8 blocks (top-w8_frac → int8 tier). w1/w3 are
-                // [inter, hidden]; w2 is [hidden, inter].
-                let (w1, w3, w2) = if qt1 == OQ4_QT {
-                    (
-                        oq4_ondisk_to_moe_blocks(&w1, inter, hidden)?,
-                        oq4_ondisk_to_moe_blocks(&w3, inter, hidden)?,
-                        oq4_ondisk_to_moe_blocks(&w2, hidden, inter)?,
-                    )
-                } else if qt1 == OQPLUS_COMPACT_QT {
-                    (
-                        oqplus_compact_to_moe_oq8_blocks(&w1, inter, hidden)?,
-                        oqplus_compact_to_moe_oq8_blocks(&w3, inter, hidden)?,
-                        oqplus_compact_to_moe_oq8_blocks(&w2, hidden, inter)?,
-                    )
-                } else {
-                    (w1, w3, w2)
-                };
-                let gu_len = w1.len() + w3.len();
-                if e == 0 {
-                    gu_stride = gu_len;
-                    dn_stride = w2.len();
-                    qt_gu = qt1;
-                    qt_dn = qt2;
-                    let cap = shard
-                        .map(|(s, _)| s.experts_per_rank(n_exp))
-                        .unwrap_or(n_exp);
-                    gu_combined.reserve(gu_len * cap);
-                    dn_combined.reserve(w2.len() * cap);
-                } else if gu_len != gu_stride || w2.len() != dn_stride {
-                    return Err(format!(
-                        "minimax L{l}E{e}: non-uniform expert stride (gate_up {gu_len}/{gu_stride}, down {}/{dn_stride}); packed layout requires equal-size experts",
-                        w2.len()
-                    ));
-                }
-                if owns(e) {
-                    local_of_global[e] = n_owned;
-                    n_owned += 1;
-                    gu_combined.extend_from_slice(&w1);
-                    gu_combined.extend_from_slice(&w3);
-                    dn_combined.extend_from_slice(&w2);
-                    // LQER low-rank sidecars per projection (gate=w1, up=w3 carry
-                    // [inter×r] output rows; down=w2 carries [hidden×r]). Absent
-                    // sidecars are a no-op.
-                    let cap = shard
-                        .map(|(s, _)| s.experts_per_rank(n_exp))
-                        .unwrap_or(n_exp);
-                    gate_acc.push(hfq, &format!("{ep}.w1"), inter, cap)?;
-                    up_acc.push(hfq, &format!("{ep}.w3"), inter, cap)?;
-                    down_acc.push(hfq, &format!("{ep}.w2"), hidden, cap)?;
-                }
-                // Non-owned: w1/w3/w2 read from the file (for stride validation)
-                // then dropped — never uploaded. That is the EP memory win.
-            }
-            if n_owned == 0 {
-                return Err(format!("minimax L{l}: shard rank owns no experts"));
-            }
-            // One allocation per projection. The representative `WeightTensor`'s
-            // buffer IS the packed blob; its m/k describe a SINGLE expert's shape
-            // (the forward's rotate_x_mq / silu_mul_rotate / dtype dispatch read
-            // those + the AWQ scale, never the buffer's full extent — per-expert
-            // data is reached through the pointer table below).
-            // OQ4 expert blobs are already in 132 B kernel layout (repacked per
-            // expert above), so upload them raw as Oq4G256 — NOT through
-            // wt_from_raw, whose OQ4 arm would re-run the dense arch-combined
-            // repack. Other dtypes (MQ*) are byte-identical on disk → kernel.
-            let mut gate_up = if qt_gu == OQ4_QT {
-                upload_wt_oq(gpu, &gu_combined, DType::Oq4G256, 2 * inter, hidden)
-            } else if qt_gu == OQPLUS_COMPACT_QT {
-                upload_wt_oq(gpu, &gu_combined, DType::Oq8G256, 2 * inter, hidden)
-            } else {
-                wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
-            }
-            .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
-            let mut down = if qt_dn == OQ4_QT {
-                upload_wt_oq(gpu, &dn_combined, DType::Oq4G256, hidden, inter)
-            } else if qt_dn == OQPLUS_COMPACT_QT {
-                upload_wt_oq(gpu, &dn_combined, DType::Oq8G256, hidden, inter)
-            } else {
-                wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
-            }
-            .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
-            drop(gu_combined);
-            drop(dn_combined);
-            gate_up.awq_scale = load_mm_awq_scale(
-                hfq,
-                gpu,
-                &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
-                hidden,
-            );
-            if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
-                // down-AWQ harmful (shared s_down bad approx); opt-in
-                down.awq_scale = load_mm_awq_scale(
-                    hfq,
-                    gpu,
-                    &format!("{p}.block_sparse_moe.awq_scale_down.weight"),
-                    inter,
-                );
-            }
-            if gate_up.awq_scale.is_some() {
-                eprintln!("minimax: AWQ scales attached at L{l} (shared per-layer)");
-            }
-            let gu_base = gate_up.buf.buf.as_ptr() as u64;
-            let dn_base = down.buf.buf.as_ptr() as u64;
-            let experts = vec![MiniMaxExpertWeights { gate_up, down }];
-
-            // Device pointer tables: n_exp u64 device addresses, stored as
-            // [2*n_exp] F32 (8 bytes/ptr). Single-GPU: base + e*stride into the
-            // full packed blob. EP shard: owned e → compact-blob slot
-            // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
-            // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
-            // input is 0, so it reuses the compact down base).
-            let dummy_gu = if shard.is_some() && n_owned < n_exp {
-                let z = gpu
-                    .zeros(&[gu_stride / 4], DType::F32)
-                    .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
-                let p = z.buf.as_ptr() as u64;
-                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
-                p
-            } else {
-                gu_base
-            };
-            let gu_bytes: Vec<u8> = (0..n_exp)
-                .flat_map(|e| {
-                    let ptr = if owns(e) {
-                        gu_base + (local_of_global[e] * gu_stride) as u64
-                    } else {
-                        dummy_gu
-                    };
-                    ptr.to_ne_bytes()
-                })
-                .collect();
-            let dn_bytes: Vec<u8> = (0..n_exp)
-                .flat_map(|e| {
-                    let ptr = if owns(e) {
-                        dn_base + (local_of_global[e] * dn_stride) as u64
-                    } else {
-                        dn_base // rot input is 0 for non-owned ⇒ output 0 regardless
-                    };
-                    ptr.to_ne_bytes()
-                })
-                .collect();
-            // Down low-rank U/V: upload the packed blobs and build per-expert
-            // pointer tables mirroring `dn_bytes` (non-owned reuse the base — their
-            // rotated input is 0 so the correction is 0). `None` when no sidecars.
-            let gate_lr = gate_acc.finish(gpu, n_exp, &local_of_global, &owns, "gate")?;
-            let up_lr = up_acc.finish(gpu, n_exp, &local_of_global, &owns, "up")?;
-            let down_lr = down_acc.finish(gpu, n_exp, &local_of_global, &owns, "down")?;
-            if l == 0 {
-                if let Some(r) = gate_lr.as_ref().or(down_lr.as_ref()).map(|x| x.rank) {
-                    eprintln!(
-                        "minimax: low-rank correction active (rank {r}; gate={} up={} down={})",
-                        gate_lr.is_some(),
-                        up_lr.is_some(),
-                        down_lr.is_some()
-                    );
-                }
-            }
-            let expert_gate_up_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("minimax: alloc gu_ptrs: {e:?}"))?;
-            let expert_down_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("minimax: alloc dn_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
-                .map_err(|e| format!("minimax: htod gu_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
-                .map_err(|e| format!("minimax: htod dn_ptrs: {e:?}"))?;
+            let (experts, expert_gate_up_ptrs, expert_down_ptrs, gate_lr, up_lr, down_lr) =
+                load_layer_experts_packed(hfq, gpu, l, n_exp, hidden, inter, &p, shard)?;
 
             layers.push(MiniMaxLayerWeights {
                 attn_norm,
