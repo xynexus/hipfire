@@ -1399,6 +1399,7 @@ impl Gpu {
                     buf.as_mut_slice(),
                 )
             }
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("{func_name}: {}", e.message)))
         } else {
             let mut params: Vec<*mut std::ffi::c_void> =
                 args.iter().map(hip_bridge::KernArg::param_ptr).collect();
@@ -1411,6 +1412,11 @@ impl Gpu {
                 self.hip
                     .launch_kernel(func, grid, block, shared_mem, stream, &mut params)
             }
+            // A launch failure that does not name its kernel is unattributable:
+            // `hip_bridge::Function` is an opaque handle, so the name only exists
+            // here. Attach it rather than making the next reader bisect grid
+            // shapes against every `launch_kernargs` call site.
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("{func_name}: {}", e.message)))
         }
     }
 
