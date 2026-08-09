@@ -80,6 +80,10 @@ pub fn generate_mtp(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     request_stop_sequences: &[String],
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
 ) {
     use hipfire_arch_qwen35::mtp_head::{self, MtpKvMode};
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -139,7 +143,7 @@ pub fn generate_mtp(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: effective_raw(m),
+                    raw: effective_raw(m, raw_override),
                 }
                 .build()
             }
@@ -150,7 +154,7 @@ pub fn generate_mtp(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: effective_raw(m),
+            raw: effective_raw(m, raw_override),
         }
         .build()
     };
@@ -507,6 +511,10 @@ pub fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     request_stop_sequences: &[String],
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -575,7 +583,7 @@ pub fn generate_dflash(
                     system: system_prompt,
                     user: prompt,
                     assistant_prefix,
-                    raw: effective_raw(m),
+                    raw: effective_raw(m, raw_override),
                 }
                 .build()
             }
@@ -586,7 +594,7 @@ pub fn generate_dflash(
             system: system_prompt,
             user: prompt,
             assistant_prefix,
-            raw: effective_raw(m),
+            raw: effective_raw(m, raw_override),
         }
         .build()
     };
@@ -1194,6 +1202,10 @@ pub fn generate_multi(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     request_stop_sequences: &[String],
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -1379,7 +1391,7 @@ pub fn generate_multi(
                     },
                     user: "",
                     assistant_prefix,
-                    raw: effective_raw(m),
+                    raw: effective_raw(m, raw_override),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -1394,7 +1406,7 @@ pub fn generate_multi(
             },
             user: "",
             assistant_prefix,
-            raw: effective_raw(m),
+            raw: effective_raw(m, raw_override),
         }
         .build_with_user_tokens(&q_tokens)
     };
@@ -1907,6 +1919,10 @@ pub fn generate(
     prefilled_prompt_tokens: Option<usize>,
     request_stop_sequences: &[String],
     evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
 ) {
     // No RNG reset here any more. This used to seed a process-global CPU sampler
     // state so a request would not inherit RNG from its predecessor; the global
@@ -1950,6 +1966,7 @@ pub fn generate(
             tools,
             messages_history,
             request_stop_sequences,
+            raw_override,
         );
         return;
     }
@@ -1992,6 +2009,7 @@ pub fn generate(
             tools,
             messages_history,
             evidence_dir,
+            raw_override,
         );
         return;
     }
@@ -2022,6 +2040,7 @@ pub fn generate(
             tools,
             messages_history,
             evidence_dir,
+            raw_override,
         );
         return;
     }
@@ -2052,6 +2071,7 @@ pub fn generate(
             tools,
             messages_history,
             evidence_dir,
+            raw_override,
         );
         return;
     }
@@ -2179,6 +2199,7 @@ pub fn generate(
             max_think_tokens,
             tools,
             messages_history,
+            raw_override,
         );
         return;
     }
@@ -2214,6 +2235,7 @@ pub fn generate(
             messages_history,
             prefill_already_done,
             prefilled_prompt_tokens,
+            raw_override,
         );
         return;
     }
@@ -2244,6 +2266,7 @@ pub fn generate(
             tools,
             messages_history,
             request_stop_sequences,
+            raw_override,
         );
         return;
     }
@@ -2326,6 +2349,7 @@ pub fn generate(
             tools,
             messages_history,
             request_stop_sequences,
+            raw_override,
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
@@ -2366,6 +2390,7 @@ pub fn generate(
             tools,
             messages_history,
             request_stop_sequences,
+            raw_override,
         );
         let _ = (
             top_p,
@@ -2709,7 +2734,7 @@ pub fn generate(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: effective_raw(m),
+                    raw: effective_raw(m, raw_override),
                 }
                 .build_with_user_tokens(&q_tokens)
             }
@@ -2724,7 +2749,7 @@ pub fn generate(
             },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
-            raw: effective_raw(m),
+            raw: effective_raw(m, raw_override),
         }
         .build_with_user_tokens(&q_tokens)
     };

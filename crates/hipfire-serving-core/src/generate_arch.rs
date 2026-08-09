@@ -57,6 +57,9 @@ pub fn generate_registered_backend(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     request_stop_sequences: &[String],
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     let Some(tokenizer) = m.tokenizer.as_ref() else {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -66,7 +69,7 @@ pub fn generate_registered_backend(
         emit_error_with_id(stdout, id, "registered backend not loaded".to_string());
         return;
     };
-    let raw = effective_raw(m);
+    let raw = effective_raw(m, raw_override);
     let bos_token = loaded.profile.bos_token;
     let require_official_template = loaded.profile.require_official_template;
     let family = loaded.family;
@@ -1303,6 +1306,9 @@ pub fn generate_nemotron(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -1319,7 +1325,7 @@ pub fn generate_nemotron(
 
     // Frame the prompt up front (releases the shared `m` borrows before the
     // backend `&mut` borrow below). Same scaffold as generate_llama.
-    let raw = effective_raw(m);
+    let raw = effective_raw(m, raw_override);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
@@ -1480,6 +1486,9 @@ pub fn generate_zaya(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -1496,7 +1505,7 @@ pub fn generate_zaya(
 
     // Frame the prompt up front (releases the shared `m` borrows before the
     // backend `&mut` borrow below). Same scaffold as generate_llama.
-    let raw = effective_raw(m);
+    let raw = effective_raw(m, raw_override);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
@@ -1730,6 +1739,9 @@ pub fn generate_llama(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
     evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -1746,7 +1758,7 @@ pub fn generate_llama(
 
     // Build the framed prompt tokens up front (releases the shared `m` borrows
     // before the backend `&mut` borrow below).
-    let raw = effective_raw(m);
+    let raw = effective_raw(m, raw_override);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // Prefer the model's own jinja template when present (opt out with
@@ -2109,6 +2121,9 @@ pub fn generate_minimax(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[prompt_frame::Message]>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -2193,7 +2208,7 @@ pub fn generate_minimax(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: effective_raw(m),
+                        raw: effective_raw(m, raw_override),
                     }
                     .build()
                 }
@@ -2204,7 +2219,7 @@ pub fn generate_minimax(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: effective_raw(m),
+                raw: effective_raw(m, raw_override),
             }
             .build()
         }
@@ -2386,6 +2401,9 @@ pub fn generate_lfm2moe(
     messages_history: Option<&[prompt_frame::Message]>,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -2419,6 +2437,7 @@ pub fn generate_lfm2moe(
             messages_history,
             prefill_already_done,
             prefilled_prompt_tokens,
+            raw_override,
         );
         let _ = top_p;
         return;
@@ -2480,7 +2499,7 @@ pub fn generate_lfm2moe(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: effective_raw(m),
+                        raw: effective_raw(m, raw_override),
                     }
                     .build()
                 }
@@ -2491,7 +2510,7 @@ pub fn generate_lfm2moe(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: effective_raw(m),
+                raw: effective_raw(m, raw_override),
             }
             .build()
         }
@@ -2764,6 +2783,9 @@ fn generate_lfm2moe_dflash(
     messages_history: Option<&[prompt_frame::Message]>,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
+    // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
+    // than read from a global — see `effective_raw`.
+    raw_override: Option<bool>,
 ) {
     if m.eviction.is_some() {
         emit_error_with_id(
@@ -2829,7 +2851,7 @@ fn generate_lfm2moe_dflash(
                         system: system_prompt,
                         user: prompt,
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                        raw: effective_raw(m),
+                        raw: effective_raw(m, raw_override),
                     }
                     .build()
                 }
@@ -2840,7 +2862,7 @@ fn generate_lfm2moe_dflash(
                 system: system_prompt,
                 user: prompt,
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
-                raw: effective_raw(m),
+                raw: effective_raw(m, raw_override),
             }
             .build()
         }
