@@ -374,15 +374,31 @@ So resolution, rotation, gate side, softmax, top-K, the host readback and the sh
 are all exonerated, and **the time is inside the indexed routed-expert GEMV dispatch**
 (`gemv_oq4g256_moe_gate_up_k8_indexed_batched` and what follows it).
 
-**Leading candidate, stated as a candidate.** Every `gemv_*` dispatch begins with
-`ensure_kernel(module, src, func)`, and a kernel launch cannot itself burn CPU with the GPU
-idle — but a *runtime compile* can. The gfx1103 cache does contain
-`gemv_oq4g256_moe_*.hsaco`, so this would require the cached entry to be stale against the
-current source hash rather than absent. That is checkable by comparing the cached `.hash`
-against the source, and it would also explain the earlier 3-layers-in-490 s shape (one
-expensive first compile, later layers cheap). **Not yet verified — six hypotheses have
-already been wrong here, so this one is written down as the next thing to test, not as the
-answer.**
+**Runtime JIT is eliminated (candidate #7).** The cached
+`gemv_oq4g256_moe_gate_up_indexed_batched.hip` in `~/.hipfire/kernels/gfx1103` is
+**byte-identical** to `kernels/src/`, so `ensure_kernel` finds a valid hash match and loads
+the `.hsaco` rather than recompiling. A newer source mtime is not sufficient — the cache
+keys on content.
+
+**The reframing this forces, which should have come first.** This whole investigation has
+been conducted with `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`, which I set to get past the earlier
+dispatch refusal. That gate's own comment says it "re-enables the experimental indexed
+routed OQ decode kernels **while debugging their finite-KLD failure**" — i.e. the path is
+off by default *because it is known broken*. Nothing says that defect is confined to
+numerics; a kernel that computes wrong answers can equally loop pathologically.
+
+So the question was mis-framed. It is not "why is paged Opus slow" — it is **"the OQ
+indexed kernels are known-defective, and this stall is plausibly that defect."** Which
+means the productive next step is not further bisection into
+`gemv_oq4g256_moe_gate_up_k8_indexed_batched`, but establishing whether these kernels work
+*at all* on a small case: run the OQ4 indexed path on the tiny qwen3_5_moe fixture, where a
+wrong or hanging kernel is diagnosable in seconds instead of minutes.
+
+One measurement caveat to carry forward: "GPU use 0%" came from single `rocm-smi` samples
+on an integrated UMA part and was never sampled repeatedly under load. If the GPU is in
+fact busy, 99% host CPU is consistent with HIP's default spin-wait sync, and the story is
+simply "the kernel is pathologically slow" rather than "the host is computing". Do not
+lean on that 0% without resampling.
 
 **Established:** ~160 s per MoE layer, one core at ~99 %, GPU at 0 %. Execution reaches the
 executor's `resolve` and stalls before the `after paged topk` device sync — so the window
