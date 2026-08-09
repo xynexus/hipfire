@@ -473,6 +473,7 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::fs;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -575,6 +576,44 @@ mod tests {
             .unwrap();
         assert!(down.path.ends_with("model-00002-of-00002.safetensors"));
         assert_eq!(down.byte_len, 6);
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `ModelSource::tensor` must stay ZERO-COPY for safetensors.
+    ///
+    /// The Cow return exists so decoding sources can hand back owned buffers.
+    /// Nothing in the type system stops an mmap-backed source from quietly
+    /// returning `Cow::Owned` instead — and on a 244 GB checkpoint that is the
+    /// difference between reading it and copying it. Assert both the variant
+    /// and that the bytes are the SAME memory the borrowed accessor returns,
+    /// since `Cow::Borrowed` of a freshly-copied slice would still pass a
+    /// variant-only check.
+    #[test]
+    fn model_source_tensor_is_zero_copy_for_safetensors() {
+        let dir = temp_dir("tensor-zero-copy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let payload = vec![0x3cu8; 4096];
+        write_shard(&dir.join("model.safetensors"), "weight", &payload);
+
+        let source = SafetensorsSource::open(&dir).unwrap();
+        let (_, cow) = ModelSource::tensor(&source, "weight").unwrap();
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "safetensors tensor() must not copy"
+        );
+        let borrowed = source.tensor_data("weight").unwrap().1;
+        assert_eq!(
+            cow.as_ptr(),
+            borrowed.as_ptr(),
+            "tensor() returned different memory than tensor_data(); it copied"
+        );
+        assert_eq!(&*cow, payload.as_slice());
         drop(source);
         fs::remove_dir_all(dir).unwrap();
     }

@@ -879,6 +879,18 @@ pub struct HfqFile {
     /// existing BF16 consumer keeps working untouched, while file-range users
     /// (layer paging, pread) still get the real compressed extent.
     bf16_packed: Vec<Option<(u8, usize, usize)>>,
+    /// `ModelSource`-shaped mirror of `tensors`, built on first use.
+    ///
+    /// The trait hands out `&TensorInfo`, so a source has to STORE one — and
+    /// HFQ stores `HfqTensorInfo`. That single borrow is what left
+    /// `impl ModelSource for HfqFile` a stub returning `None` for years. The
+    /// mirror is index metadata only (no payloads), a few hundred entries even
+    /// on the largest artifacts, so materialising it is far cheaper than
+    /// reshaping the trait around the difference.
+    ///
+    /// Lazy rather than built in each constructor: `HfqFile` has four, and a
+    /// consumer that never touches the trait should not pay for it.
+    ms_infos: std::cell::OnceCell<Vec<TensorInfo>>,
 }
 
 /// Keep GPU-decodable recodings packed in RAM instead of expanding them at load.
@@ -1069,6 +1081,7 @@ impl HfqFile {
         let mut tensors = tensors;
         let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: path.to_path_buf(),
             mmap: None,
@@ -1180,6 +1193,7 @@ impl HfqFile {
         let mut tensors = tensors;
         let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: path.to_path_buf(),
             mmap: Some(mmap),
@@ -1303,6 +1317,7 @@ impl HfqFile {
         // short-circuits for st-backed files, so config.json is a safe handle.
         let file = File::open(dir.join("config.json"))?;
         Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: dir.to_path_buf(),
             mmap: None,
@@ -1397,6 +1412,38 @@ impl HfqFile {
     /// also omit the outer `model.` prefix entirely, so that variant is tried
     /// as well. Returns `None` only when no variant matches — the per-callsite
     /// `?` early-return is preserved.
+    /// `ModelSource`-shaped view of the tensor index, built once on demand.
+    ///
+    /// Parallel to `self.tensors`, so a `resolve_idx` result indexes both.
+    /// Sizes and offsets are the LOGICAL ones the index already advertises —
+    /// for a transparently-expanded BF16 recoding that is the expanded length,
+    /// matching what `tensor()` hands back. Anything wanting the physical
+    /// extent (layer paging, pread) must keep using `physical_range`.
+    fn ms_infos(&self) -> &[TensorInfo] {
+        self.ms_infos.get_or_init(|| {
+            self.tensors
+                .iter()
+                .map(|t| TensorInfo {
+                    name: t.name.clone(),
+                    // HFQ's authority is `quant_type`; `dtype` is the
+                    // safetensors-shaped field and only three quant types have
+                    // a faithful spelling. The rest get an explicit marker
+                    // rather than a plausible-looking lie.
+                    dtype: match t.quant_type {
+                        16 => "BF16".to_string(),
+                        1 => "F16".to_string(),
+                        2 => "F32".to_string(),
+                        other => format!("HFQ_QT{other}"),
+                    },
+                    shape: t.shape.iter().map(|&d| d as usize).collect(),
+                    quant_type: t.quant_type,
+                    data_offset: t.data_offset,
+                    data_size: t.data_size,
+                })
+                .collect()
+        })
+    }
+
     fn resolve_idx(&self, name: &str) -> Option<usize> {
         if let Some(&idx) = self.tensor_map.get(name) {
             return Some(idx);
@@ -1982,17 +2029,26 @@ impl ModelSource for HfqFile {
         None // HFQ files encode quant_type per-tensor, not via a global config
     }
 
-    fn tensor_data(&self, _name: &str) -> Option<(&TensorInfo, &[u8])> {
-        // HfqFile's tensor_data returns (&HfqTensorInfo, &[u8]).
-        // We can't return a reference to a TensorInfo we don't own,
-        // so this method is not directly usable for HFQ. The HFQ path
-        // continues to use HfqFile's native methods; ModelSource is
-        // primarily for safetensors. See the blanket adapter below.
-        None
+    fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
+        // Borrowed-only, per the trait contract: a compressed-BF16 tensor has
+        // no BF16 buffer in the file to borrow, so the inherent accessor
+        // refuses it and so does this. `tensor()` is the one that can decode.
+        let idx = self.resolve_idx(name)?;
+        let (_, bytes) = HfqFile::tensor_data(self, name)?;
+        Some((self.ms_infos().get(idx)?, bytes))
     }
 
-    fn tensor_info(&self, _name: &str) -> Option<&TensorInfo> {
-        None // HFQ uses its own HfqTensorInfo type
+    fn tensor(&self, name: &str) -> Option<(&TensorInfo, std::borrow::Cow<'_, [u8]>)> {
+        let idx = self.resolve_idx(name)?;
+        // Borrowed when stored verbatim, owned when a lossless BF16 recoding
+        // has to be expanded — the whole reason the trait needed a Cow.
+        let (_, bytes) = self.tensor_data_cow(name)?;
+        Some((self.ms_infos().get(idx)?, bytes))
+    }
+
+    fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        let idx = self.resolve_idx(name)?;
+        self.ms_infos().get(idx)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -3593,6 +3649,66 @@ pub fn load_weights_paroquant_llama(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `impl ModelSource for HfqFile` returned `None` from `tensor_data` and
+    /// `tensor_info` for years, with a comment saying the trait was "primarily
+    /// for safetensors". Anything reaching an HFQ through the trait therefore
+    /// saw an EMPTY model rather than an error — which is how streamed
+    /// calibration ended up hard-wired to the concrete safetensors type.
+    ///
+    /// Guard the fix: through the trait, an HFQ must report its tensors, hand
+    /// back their metadata, and yield bytes identical to the safetensors source
+    /// it was built from.
+    #[test]
+    fn model_source_trait_sees_hfq_tensors() {
+        use hipfire_model::ModelSource;
+
+        let dir = temp_path("modelsource-trait");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "model.embed_tokens.weight".to_string(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": [16, 16],
+                "data_offsets": [0, payload.len()],
+            }),
+        );
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+        std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+
+        let hfq = HfqFile::from_safetensors(&dir).unwrap();
+
+        // The stub reported an empty model here.
+        let names = ModelSource::tensor_names(&hfq);
+        assert!(
+            names.contains(&"model.embed_tokens.weight"),
+            "trait must list HFQ tensors, got {names:?}"
+        );
+
+        let info = ModelSource::tensor_info(&hfq, "model.embed_tokens.weight")
+            .expect("trait must expose tensor metadata for an HFQ");
+        assert_eq!(info.shape, vec![16, 16]);
+        assert_eq!(info.quant_type, 16, "BF16 source keeps its quant type");
+
+        let (_, data) = ModelSource::tensor(&hfq, "model.embed_tokens.weight")
+            .expect("trait must yield tensor bytes for an HFQ");
+        assert_eq!(&*data, payload.as_slice());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

@@ -14,6 +14,7 @@ pub mod tokenizer;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -471,7 +472,29 @@ pub trait ModelSource {
     fn quant_config(&self) -> Option<&QuantConfig>;
 
     /// Look up a tensor by name. Returns metadata + byte slice.
+    ///
+    /// BORROWED-ONLY, and that is a real restriction: a source whose stored
+    /// bytes are not the logical tensor — an HFQ file with a lossless bf16
+    /// recoding (`Bf16Huff` is the default), or any quantized payload — has
+    /// nowhere to put the decoded buffer and must return `None` here. Prefer
+    /// [`ModelSource::tensor`], which can express both.
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])>;
+
+    /// Look up a tensor by name, yielding its LOGICAL payload.
+    ///
+    /// This is the method consumers should reach for. Sources whose stored
+    /// bytes already ARE the logical bytes — safetensors, or an HFQ tensor
+    /// stored verbatim — return `Cow::Borrowed` and copy nothing; sources that
+    /// must decode return `Cow::Owned`. The default delegates to
+    /// [`ModelSource::tensor_data`], so a borrowed-only source needs no change.
+    ///
+    /// Implementors backed by mmap MUST keep returning `Cow::Borrowed`. Silently
+    /// switching to `Cow::Owned` turns a zero-copy read of a 244 GB checkpoint
+    /// into a 244 GB copy, and nothing in the type system will complain.
+    fn tensor(&self, name: &str) -> Option<(&TensorInfo, Cow<'_, [u8]>)> {
+        let (info, data) = self.tensor_data(name)?;
+        Some((info, Cow::Borrowed(data)))
+    }
 
     /// Advise the source that a tensor payload is no longer needed by the
     /// current streaming consumer. File-backed implementations should release
