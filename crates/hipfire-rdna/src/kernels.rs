@@ -4222,6 +4222,15 @@ pub const QUANTIZE_ACT_OQ4_CLIP_SRC: &str =
 pub const GEMM_OQ8_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq8_grouped_wmma.hip");
 
+/// Opus Quant compact-resident W8A8: the `gemm_oq8_grouped_wmma` core reading
+/// OqPlusCompact (qt=36) blocks directly — int4 bulk plus the sparse int8
+/// overlay decoded in-kernel — so oq4.25++ stays ~4.25 bits/weight resident
+/// instead of being expanded to one int8 per weight at load. Same FWHT-rotated
+/// W8A8 semantics as the dense kernel, so the two are bit-comparable. See
+/// `kernels/src/gemm_oq_compact_grouped_wmma.hip`.
+pub const GEMM_OQ_COMPACT_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_grouped_wmma.hip");
+
 /// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
 /// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq8.hip`.

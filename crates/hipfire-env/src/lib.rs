@@ -123,6 +123,31 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// `HF_HUB_CACHE` — HuggingFace's hub cache directory, or `None` when unset or
+/// empty.
+///
+/// Same reasoning as [`home_dir`]: a HuggingFace variable is not a hipfire
+/// variable, so it does not belong in [`env_vars!`] (`HIPFIRE_`-prefixed by
+/// invariant) or in `hipfire help env`. But `clippy.toml` denies `std::env::var`
+/// workspace-wide, so a crate that resolves an HF cache path cannot opt into
+/// enforcement without a sanctioned reader. Precedence between this and
+/// [`hf_home`] is the caller's policy, not this crate's.
+#[allow(clippy::disallowed_methods)]
+pub fn hf_hub_cache() -> Option<std::path::PathBuf> {
+    std::env::var_os("HF_HUB_CACHE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// `HF_HOME` — HuggingFace's home directory, or `None` when unset or empty.
+/// The hub cache lives in its `hub/` subdirectory. See [`hf_hub_cache`].
+#[allow(clippy::disallowed_methods)]
+pub fn hf_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HF_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Declare env vars once; expand into constants **and** the [`ALL`] table.
 ///
 /// The two expansions are the point: a read site that names the constant and a
@@ -161,6 +186,15 @@ env_vars! {
 
     PROMPT_HEAT_LIMIT = "HIPFIRE_PROMPT_HEAT_LIMIT", Developer,
         "Maximum tokens listed in the prompt heat dump. Default 64.";
+
+    KERNEL_TRACE = "HIPFIRE_KERNEL_TRACE", Developer,
+        "Log a per-kernel dispatch histogram. Counted in `Gpu::ensure_kernel`, \
+         the universal dispatch chokepoint, so it catches every launch; off by \
+         default at the cost of one relaxed atomic load. Also enables the \
+         gate-reason diagnostics that say WHY a batched path was declined \
+         (batched-FA, MoE grouped GEMM, prefill_batch_pbs_eligible). Exists \
+         because a measurement can name a path it never took: bench_prefill \
+         reported `pp512 t/s` from a per-token warm-pass for five arches.";
 
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP32_BELOW = "HIPFIRE_DN_STATE_FP32_BELOW", Developer,
@@ -279,6 +313,30 @@ env_vars! {
         "Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 \
          (the default) the pass is a no-op and output is byte-identical to \
          plain `quantize_mq2g256_lloyd_weighted`.";
+
+    // ── Opus compact residency (hipfire-runtime) ────────────────────────────
+    OQ_COMPACT_RESIDENT = "HIPFIRE_OQ_COMPACT_RESIDENT", Developer,
+        "Keep OqPlusCompact (qt=36) weights compact in VRAM instead of expanding \
+         them to one int8 per weight at load. oq4.25++ is ~4.25 bits/weight on \
+         disk but 8 bits resident without this, so the format's VRAM win is lost. \
+         Set 1 to opt in while the compact-resident path is validated; the \
+         default stays on the expanded path.";
+
+    OQ_COMPACT_RESIDENT_ONLY_K = "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K", Developer,
+        "Diagnostic bisection filter for HIPFIRE_OQ_COMPACT_RESIDENT. Comma-separated \
+         list of K (input-dim) values; when set, ONLY tensors whose K appears in the \
+         list stay compact-resident and every other OqPlusCompact tensor takes the \
+         expanded path. Exists to localize the compact-vs-expanded logit divergence \
+         to a projection class by bisecting over shapes — the load-time hook sees \
+         (qt, data, m, k) but not the tensor name, so K is the available handle. \
+         Empty or unset means no filter.";
+
+    OQ_COMPACT_RESIDENT_ONLY_M = "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M", Developer,
+        "Companion to HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K: a comma-separated list of \
+         M (output-dim) values. Both filters must admit a tensor for it to stay \
+         compact-resident, so setting both narrows to a single (M, K) projection \
+         class — the finest grain available at a load hook that sees the shape but \
+         never the tensor name. Empty or unset means no filter.";
 
     LLOYD_K3 = "HIPFIRE_LLOYD_K3", Developer,
         "Set 1 to encode MQ2-Lloyd with a ternary 3-level codebook (\"MQ1.58\") \

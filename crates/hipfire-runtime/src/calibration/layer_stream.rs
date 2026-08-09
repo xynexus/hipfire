@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Family-neutral native layer-stream calibration orchestration.
 
-use hipfire_hash::{file_hash, stable_hash_bytes};
-use hipfire_model::tokenizer::Tokenizer;
-use hipfire_model::ModelSource;
-use hipfire_rdna::Gpu;
 use crate::calibration::boundary::{BoundaryBackend, BoundaryCheckpoint, BoundaryStore};
 use crate::calibration::contracts::{
     BoundaryPrecision, CalibError, CalibrationJob, CalibrationOptions, CalibrationSample,
@@ -12,9 +8,7 @@ use crate::calibration::contracts::{
     ExpertSamplingPolicy, KldRefBuilder, KldRefPayload, KldRefRow, LayerExpert, SampleSet,
 };
 use crate::calibration::residual_probe::ResidualProbe;
-use crate::calibration::schedule::{
-    LayerMicrobatch, MicrobatchGeometry, MicrobatchPlanner,
-};
+use crate::calibration::schedule::{LayerMicrobatch, MicrobatchGeometry, MicrobatchPlanner};
 use crate::calibration::source::{
     LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
     TensorLoadPlan, TensorOwner,
@@ -28,6 +22,10 @@ use crate::calibration::{
 };
 use crate::hfq::HfqFile;
 use crate::safetensors_source::SafetensorsSource;
+use hipfire_hash::{file_hash, stable_hash_bytes};
+use hipfire_model::tokenizer::Tokenizer;
+use hipfire_model::ModelSource;
+use hipfire_rdna::Gpu;
 use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -200,8 +198,7 @@ impl CalibrateCommand {
         // with any of them is a user error; the default just yields.
         // `--finalize-completed` is deliberately excluded — it *requires*
         // resume, so it must not step aside.
-        let unresumable =
-            boundary_ram || residual_probe_output.is_some() || cask_output.is_some();
+        let unresumable = boundary_ram || residual_probe_output.is_some() || cask_output.is_some();
         if unresumable && !resume_explicit {
             resume = false;
         }
@@ -375,7 +372,6 @@ pub fn resolve_adapter(source: &dyn ModelSource) -> Result<ResolvedAdapter, Cali
         adapter,
     })
 }
-
 
 pub fn resolve_hf_snapshot(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     if path.join("config.json").is_file() {
@@ -3584,9 +3580,8 @@ mod tests {
 
         // Finalization only publishes an existing spool — no side outputs.
         let mut with_cask = base.to_vec();
-        with_cask.extend(
-            ["--finalize-completed", "--cask-output", "sidecar.hfq"].map(str::to_string),
-        );
+        with_cask
+            .extend(["--finalize-completed", "--cask-output", "sidecar.hfq"].map(str::to_string));
         assert!(CalibrateCommand::parse(&with_cask).is_err());
     }
 
@@ -3633,7 +3628,6 @@ mod tests {
         no_cask_output.drain(idx..idx + 2);
         assert!(CalibrateCommand::parse(&no_cask_output).is_err());
     }
-
 
     fn temp_output(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -3880,4 +3874,3 @@ mod tests {
         assert!(validate_kld_batch_rows(batch, &reordered).is_err());
     }
 }
-

@@ -26,9 +26,7 @@
 //! (gemma3's collector is the reference) rather than the pre-refactor one.
 
 use crate::calibration::contracts::{KldRefBuilder, KldRefRow};
-use crate::calibration::{
-    collect_grouped, logsumexp, topk_logits, CalibForward, CalibSummary,
-};
+use crate::calibration::{collect_grouped, logsumexp, topk_logits, CalibForward, CalibSummary};
 use crate::kv::KvCache;
 use crate::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
 use crate::weights::{weight_gemv, WeightTensor};
@@ -118,8 +116,13 @@ fn decode_step_logits(
         .map_err(|e| format!("llama calib embed: {e}"))?;
     llama::forward_scratch_compute(gpu, weights, config, pos, kv, scratch)
         .map_err(|e| format!("llama calib layers: {e}"))?;
-    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)
-        .map_err(|e| format!("llama calib final norm: {e}"))?;
+    gpu.rmsnorm_f32(
+        &scratch.x,
+        &weights.output_norm,
+        &scratch.tmp,
+        config.norm_eps,
+    )
+    .map_err(|e| format!("llama calib final norm: {e}"))?;
     let logits = gpu
         .alloc_owned(&[config.vocab_size], DType::F32)
         .map_err(|e| format!("llama calib logits alloc: {e}"))?;

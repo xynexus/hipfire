@@ -43,15 +43,21 @@ fn main() {
     }
     let iters = 20usize;
     let n = 2048usize; // DiT tokens (≈ 1024²/... representative compute-bound regime)
-    // (label, M=out_features, K=in_features) — Krea-2 DiT (hidden 6144, FFN 16384).
+                       // (label, M=out_features, K=in_features) — Krea-2 DiT (hidden 6144, FFN 16384).
     let shapes = [
         ("attn q/o/gate M6144 K6144", 6144usize, 6144usize),
         ("attn kv (GQA)  M1536 K6144", 1536usize, 6144usize),
         ("ffn gate/up    M16384 K6144", 16384usize, 6144usize),
         ("ffn down       M6144 K16384", 6144usize, 16384usize),
     ];
-    println!("DiT bf16 GEMM  arch={}  N={n}  iters={iters}  peak={PEAK_TFLOPS} TFLOP/s", gpu.arch);
-    println!("{:<30} {:>10} {:>10}   {:>10} {:>10}   speedup", "shape", "tiled ms", "tiled %pk", "lds ms", "lds %pk");
+    println!(
+        "DiT bf16 GEMM  arch={}  N={n}  iters={iters}  peak={PEAK_TFLOPS} TFLOP/s",
+        gpu.arch
+    );
+    println!(
+        "{:<30} {:>10} {:>10}   {:>10} {:>10}   speedup",
+        "shape", "tiled ms", "tiled %pk", "lds ms", "lds %pk"
+    );
 
     for (label, m, k) in shapes {
         let mut w = gpu.upload_raw(&bf16_bytes(7, m * k), &[m, k]).unwrap();
@@ -95,7 +101,10 @@ fn main() {
     // per WMMA; the knee where time rises = the free-compute budget a QTIP/codebook
     // decode or correction branch hides in for ~zero warm-step cost.
     println!("\n--- free-ALU headroom (attn M6144 K6144, N={n}) ---");
-    println!("{:>8}  {:>10}  {:>10}  {:>12}", "extra", "ms", "vs 0", "extra-FMA/WMMA");
+    println!(
+        "{:>8}  {:>10}  {:>10}  {:>12}",
+        "extra", "ms", "vs 0", "extra-FMA/WMMA"
+    );
     let (m, k) = (6144usize, 6144usize);
     let mut w = gpu.upload_raw(&bf16_bytes(7, m * k), &[m, k]).unwrap();
     w.dtype = DType::BF16;
@@ -105,7 +114,9 @@ fn main() {
     for &extra in &[0usize, 8, 16, 32, 48, 64, 96, 128, 192, 256] {
         macro_rules! med {
             ($call:expr) => {{
-                for _ in 0..3 { $call; }
+                for _ in 0..3 {
+                    $call;
+                }
                 gpu.device_synchronize().unwrap();
                 let mut ms = Vec::new();
                 for _ in 0..iters {
@@ -118,8 +129,12 @@ fn main() {
                 ms[ms.len() / 2]
             }};
         }
-        let t = med!(gpu.bench_bf16_lds_freealu(&w, &x, &y, m, k, n, extra).unwrap());
-        if extra == 0 { base = t; }
+        let t = med!(gpu
+            .bench_bf16_lds_freealu(&w, &x, &y, m, k, n, extra)
+            .unwrap());
+        if extra == 0 {
+            base = t;
+        }
         println!("{extra:>8}  {t:>10.3}  {:>9.2}x  {extra:>12}", t / base);
     }
     gpu.free_tensor(y).ok();

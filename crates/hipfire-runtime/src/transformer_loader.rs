@@ -282,9 +282,9 @@ impl<'a> TransformerLoader<'a> {
             // compact) via the shared `oq8_arch_load`, parallel to the OQ4 arm
             // below — the single arch-agnostic OQ8 dispatch every loader routes
             // through.
-            qt @ (33 | 35 | 36) => {
+            qt @ (33 | 35 | 36 | 52) => {
                 let (bytes, dtype) = oq8_arch_load(qt, &data, m, k)
-                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
                 self.upload_weight_bytes(gpu, bytes, dtype, m, k)?
             }
             OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {

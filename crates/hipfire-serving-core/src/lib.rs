@@ -26,6 +26,7 @@
     clippy::unnecessary_cast
 )]
 
+pub mod batch_executor;
 pub mod dummy;
 pub mod embedding_batch;
 pub mod embedding_runtime;

@@ -270,8 +270,7 @@ fn main() {
     // `layers.0.self_attn.q_norm.weight`, a tensor it does not have.
     let is_llama = matches!(hfq.arch_id, 0 | 1);
     let qcfg = (!is_llama).then(|| qwen35::config_from_hfq(&hfq).expect("qwen35 config"));
-    let lcfg = is_llama
-        .then(|| hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config"));
+    let lcfg = is_llama.then(|| hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config"));
     // The KV cache is arch-agnostic; only these three dims are needed to build it.
     let (kv_layers, kv_heads, kv_head_dim) = match (&qcfg, &lcfg) {
         (Some(c), _) => (c.n_layers, c.n_kv_heads, c.head_dim),
@@ -317,30 +316,13 @@ fn main() {
     let mut kv_cache = match kv_mode.as_str() {
         // fp32 KV — the substrate for the KVarN sim (HIPFIRE_KVARN_SIM=1
         // degrades K in-place per GROUP; plain f32 is the lossless baseline).
-        "f32" | "fp16" => KvCache::new_gpu(
-            &mut gpu,
-            kv_layers,
-            kv_heads,
-            kv_head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            kv_layers,
-            kv_heads,
-            kv_head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            kv_layers,
-            kv_heads,
-            kv_head_dim,
-            kv_max,
-        )
-        .unwrap(),
+        "f32" | "fp16" => {
+            KvCache::new_gpu(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
+        "q8" => KvCache::new_gpu_q8(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap(),
+        "asym4" => {
+            KvCache::new_gpu_asym4(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
         "kvarn" => KvCache::new_gpu_kvarn(
             &mut gpu,
             kv_layers,
@@ -350,14 +332,9 @@ fn main() {
             KvCache::kvarn_bits_from_env(),
         )
         .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            kv_layers,
-            kv_heads,
-            kv_head_dim,
-            kv_max,
-        )
-        .unwrap(),
+        "asym3" => {
+            KvCache::new_gpu_asym3(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
         "asym2" => {
             let is_kv_layer: Vec<bool> = qcfg
                 .as_ref()
@@ -366,14 +343,8 @@ fn main() {
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_asym2_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                kv_heads,
-                kv_head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_asym2_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht4" => {
             let is_kv_layer: Vec<bool> = qcfg
@@ -383,14 +354,8 @@ fn main() {
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht4_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                kv_heads,
-                kv_head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht4_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht3" => {
             let is_kv_layer: Vec<bool> = qcfg
@@ -400,14 +365,8 @@ fn main() {
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht3_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                kv_heads,
-                kv_head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht2" => {
             let is_kv_layer: Vec<bool> = qcfg
@@ -417,14 +376,8 @@ fn main() {
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht2_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                kv_heads,
-                kv_head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht2_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         other => {
             panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)")
@@ -508,9 +461,11 @@ fn main() {
         }
 
         let logits = if is_llama {
-            gpu.download_f32(&lscratch.as_ref().unwrap().logits).unwrap()
+            gpu.download_f32(&lscratch.as_ref().unwrap().logits)
+                .unwrap()
         } else {
-            gpu.download_f32(&qscratch.as_ref().unwrap().logits).unwrap()
+            gpu.download_f32(&qscratch.as_ref().unwrap().logits)
+                .unwrap()
         };
         let target = window[pos + 1] as usize;
         // NLL via the shared hipfire_kld reduction: log_z is the same max-shifted

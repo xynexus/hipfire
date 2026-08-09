@@ -2654,9 +2654,9 @@ fn load_weight_tensor(
         // this call); only OQ4 W4A4 (below) was wired here before, so families
         // loading through `load_weights_hfq` panicked on 35 despite the generic
         // dtype-dispatched kernels already supporting them.
-        qt @ (33 | 35 | 36 | 38) => {
+        qt @ (33 | 35 | 36 | 38 | 52) => {
             let (bytes, gpu_dtype) = oq8_arch_load(qt, data, m, k)
-                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/38");
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/38/52");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
