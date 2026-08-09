@@ -168,24 +168,13 @@ fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
 /// do not know. Decoding here rather than in those means they only ever see
 /// logical codes — a new caller cannot forget the case.
 fn hfq_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("nemotron hfq: missing tensor {name:?}"))?;
-    if matches!(info.quant_type, 49 | 50) {
-        // Element count from the shape, NOT `data_size`: a tensor that reaches
-        // here is one `expand_bf16_index` declined to expand, so its
-        // `data_size` is still the packed physical length.
-        let n: usize = info.shape.iter().map(|&d| d as usize).product();
-        let logical = hipfire_runtime::hfq::decode_bf16_packed(info.quant_type, &data, n)
-            .ok_or_else(|| {
-                format!(
-                    "nemotron hfq: failed to decode recoded tensor {name} (qt={})",
-                    info.quant_type
-                )
-            })?;
-        return Ok((16, logical));
-    }
-    Ok((info.quant_type, data))
+    use hipfire_runtime::hfq::LogicalReadError;
+    hfq.tensor_data_logical(name).map_err(|e| match e {
+        LogicalReadError::Missing => format!("nemotron hfq: missing tensor {name:?}"),
+        LogicalReadError::Decode(qt) => {
+            format!("nemotron hfq: failed to decode recoded tensor {name} (qt={qt})")
+        }
+    })
 }
 
 pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str, String> {

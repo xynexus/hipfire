@@ -31,24 +31,13 @@ use hipfire_runtime::weights::WeightTensor;
 /// arms know. Decoding here rather than in each arm means the arms only ever
 /// see logical codes — a new caller cannot forget the case.
 fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("lfm2moe: tensor not found in HFQ: {name}"))?;
-    if matches!(info.quant_type, 49 | 50) {
-        // Element count from the shape, NOT `data_size`: a tensor that reaches
-        // here is one `expand_bf16_index` declined to expand, so its
-        // `data_size` is still the packed physical length.
-        let n: usize = info.shape.iter().map(|&d| d as usize).product();
-        let logical = hipfire_runtime::hfq::decode_bf16_packed(info.quant_type, &data, n)
-            .ok_or_else(|| {
-                format!(
-                    "lfm2moe: failed to decode recoded tensor {name} (qt={})",
-                    info.quant_type
-                )
-            })?;
-        return Ok((16, logical));
-    }
-    Ok((info.quant_type, data))
+    use hipfire_runtime::hfq::LogicalReadError;
+    hfq.tensor_data_logical(name).map_err(|e| match e {
+        LogicalReadError::Missing => format!("lfm2moe: tensor not found in HFQ: {name}"),
+        LogicalReadError::Decode(qt) => {
+            format!("lfm2moe: failed to decode recoded tensor {name} (qt={qt})")
+        }
+    })
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {

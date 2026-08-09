@@ -100,9 +100,8 @@ fn main() {
         // expanding it here would defeat the reason it is stored that way.
         // Note 0xFF is the safetensors sentinel ("use dtype"), NOT a coding, so
         // it must not by itself count as a difference.
-        const PACKED_BF16: [u8; 2] = [49, 50]; // Bf16Lut3, Bf16Huff
-        let packed_side =
-            PACKED_BF16.contains(&ia.quant_type) || PACKED_BF16.contains(&ib.quant_type);
+        let packed_side = hipfire_runtime::hfq::is_packed_bf16(ia.quant_type)
+            || hipfire_runtime::hfq::is_packed_bf16(ib.quant_type);
         if packed_side && da.len() != db.len() {
             println!(
                 "STORAGE {name}: qt {} ({} B) vs qt {} ({} B) — packed coding, kept resident",

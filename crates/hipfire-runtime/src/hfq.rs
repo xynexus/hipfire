@@ -1006,6 +1006,49 @@ pub fn decode_bf16_packed(stored_qt: u8, packed: &[u8], n: usize) -> Option<Vec<
     storage::expand(stored, packed, n, decode_threads()).map(|b| b.into_owned())
 }
 
+/// True for the lossless BF16 recodings: `Bf16Lut3` (49) and `Bf16Huff` (50).
+///
+/// A tensor carrying one of these reaches an arch loader with a quant code the
+/// loader's dtype match arms do not know — `--format bf16` applies `Bf16Huff`
+/// by DEFAULT, and `expand_bf16_index` deliberately leaves `Bf16Lut3` head
+/// tensors packed. Named rather than open-coded as `matches!(qt, 49 | 50)`,
+/// which is how the same three-line check ended up in five arch crates.
+#[inline]
+pub fn is_packed_bf16(qt: u8) -> bool {
+    matches!(qt, 49 | 50)
+}
+
+/// Decode a possibly-recoded payload to its logical form.
+///
+/// Returns the LOGICAL quant code with the bytes: `(16, expanded)` for a
+/// recoding, otherwise the input unchanged and borrowed. `n` is the ELEMENT
+/// count, which callers must take from the shape rather than `data_size` — a
+/// tensor reaching here is one `expand_bf16_index` declined to expand, so its
+/// `data_size` is still the packed physical length.
+pub fn decode_recoded_bf16<'a>(
+    qt: u8,
+    data: &'a [u8],
+    n: usize,
+) -> Option<(u8, std::borrow::Cow<'a, [u8]>)> {
+    if !is_packed_bf16(qt) {
+        return Some((qt, std::borrow::Cow::Borrowed(data)));
+    }
+    decode_bf16_packed(qt, data, n).map(|v| (16u8, std::borrow::Cow::Owned(v)))
+}
+
+/// Why [`HfqFile::tensor_data_logical`] could not produce logical bytes.
+///
+/// Distinguishes absent from present-but-undecodable, because reporting a
+/// present-but-compressed tensor as MISSING sends the reader after a broken
+/// artifact instead of an unsupported storage coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalReadError {
+    /// No tensor by that name.
+    Missing,
+    /// Present, but the recoding at this quant code would not expand.
+    Decode(u8),
+}
+
 /// Threads used to expand a bit-serial payload. Every core, always — decode is
 /// pure compute over independent chunks and reaches ~21 GB/s here, well past any
 /// disk it overlaps with, so there is nothing worth tuning.
@@ -1412,6 +1455,32 @@ impl HfqFile {
     /// also omit the outer `model.` prefix entirely, so that variant is tried
     /// as well. Returns `None` only when no variant matches — the per-callsite
     /// `?` early-return is preserved.
+    /// Read a tensor's bytes with any lossless BF16 recoding decoded to plain
+    /// bf16, returning the LOGICAL quant code alongside.
+    ///
+    /// This is what an arch loader wants: decoding once at the read boundary
+    /// means the loader's dtype match arms only ever see logical codes, so a
+    /// new caller cannot forget the case. Five arch crates each grew a private
+    /// copy of exactly this (`16cb54d56`); they now share one.
+    ///
+    /// Note this is deliberately NOT what [`ModelSource::tensor`] does — that
+    /// returns the payload for the coding the artifact DECLARES, so a
+    /// `Bf16Lut3` head stays packed for the kernel that decodes it natively.
+    /// Use this when you need bf16 in hand; use `tensor()` when you want the
+    /// tensor as stored.
+    pub fn tensor_data_logical(&self, name: &str) -> Result<(u8, Vec<u8>), LogicalReadError> {
+        let (info, data) = self
+            .tensor_data_vec(name)
+            .ok_or(LogicalReadError::Missing)?;
+        if !is_packed_bf16(info.quant_type) {
+            return Ok((info.quant_type, data));
+        }
+        let n: usize = info.shape.iter().map(|&d| d as usize).product();
+        let qt = info.quant_type;
+        let logical = decode_bf16_packed(qt, &data, n).ok_or(LogicalReadError::Decode(qt))?;
+        Ok((16, logical))
+    }
+
     /// `ModelSource`-shaped view of the tensor index, built once on demand.
     ///
     /// Parallel to `self.tensors`, so a `resolve_idx` result indexes both.
