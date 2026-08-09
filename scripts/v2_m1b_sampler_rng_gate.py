@@ -57,7 +57,18 @@ class Daemon:
             if f.get("type") in terminals:
                 return got
 
+    def reset(self):
+        """Clear the conversation so the next generate starts from empty.
+
+        Successive generates on one worker are a conversation with LCP-based KV
+        prefix reuse, so without this an "identical" request is not identical —
+        it inherits the previous turn's context.
+        """
+        self.send({"type": "reset", "id": "reset"})
+        self.collect({"reset"})
+
     def generate(self, rid, temperature, max_tokens=48):
+        self.reset()
         self.send({
             "type": "generate", "id": rid, "prompt": PROMPT,
             "temperature": temperature, "max_tokens": max_tokens,
@@ -83,15 +94,6 @@ def main():
     try:
         d.send({"type": "load", "id": "l", "model": MODEL, "params": {"max_seq": 2048}})
         d.collect({"loaded"})
-
-        # PRE-EXISTING, NOT AN RNG ISSUE: the first generation after a load
-        # differs from every later one. Measured here as gen0 != gen1 while
-        # gen1..gen4 are all byte-identical, and independently in the M0 trace
-        # gate, where rep 0 emitted 254 tokens against 256 for every later rep.
-        # Greedy decoding never draws from the sampler RNG, so this predates and
-        # is unrelated to M1b — but it does mean any determinism check has to
-        # warm up first or it measures the load, not the sampler.
-        d.generate("warmup", 0.0)
 
         print("== 1. greedy is deterministic")
         g1 = d.generate("g1", 0.0)

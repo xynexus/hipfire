@@ -99,6 +99,14 @@ def run_arm(model: str, max_tokens: int, reps: int, trace: bool, max_seq: int):
 
         rates, walls = [], []
         for rep in range(reps):
+            # Successive generates on one worker form a CONVERSATION: the daemon
+            # reuses KV by longest-common-prefix against the accumulated
+            # `conversation_tokens` (generate_arch.rs:684-690). Without a reset,
+            # rep N prefills a longer context than rep N-1, so tok/s drifts
+            # monotonically and reps are not comparable. `reset` clears it and
+            # makes each rep measure identical work.
+            daemon.send({"type": "reset", "id": f"reset-{rep}"})
+            daemon.read_until({"reset"})
             frame = {
                 "type": "generate",
                 "id": f"gen-{rep}",
