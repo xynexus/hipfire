@@ -377,11 +377,14 @@ fn main() {
     // collapses to a greedy attractor on hard prompts and produces
     // visible loops in the last 256 tokens. text_thinking() defaults
     // to penalty=1.15, window=128.
-    let sample_one = |logits: &mut [f32], history: &[u32]| -> u32 {
+    // One stream for the whole run: a fresh RNG per call would redraw from a
+    // new seed every token, which is not what the daemon path it mirrors does.
+    let mut sampler_rng = sampler::SamplerRng::from_entropy();
+    let mut sample_one = |logits: &mut [f32], history: &[u32]| -> u32 {
         if sc.repeat_penalty != 1.0 && sc.repeat_window > 0 {
             sampler::apply_repeat_penalty(logits, history, sc.repeat_window, sc.repeat_penalty);
         }
-        sampler::sample_top_p(logits, temp, sc.top_p)
+        sampler::sample_top_p(logits, temp, sc.top_p, &mut sampler_rng)
     };
 
     let mut next_token = sample_one(&mut logits, &token_history);

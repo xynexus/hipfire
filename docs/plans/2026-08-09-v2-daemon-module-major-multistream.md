@@ -479,22 +479,39 @@ Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
 |---|---|---|
 | M0 executor trace | **landed** | 256 tokens → 255 gaps; dispatch span vs stopwatch worst 0.01%; tracing cost −0.12% |
 | M1a `upload_raw` / `GpuPool` | **landed** | pooled 4000 cycles → +0 B VRAM, 0 HIP calls; unpooled 200 cycles → +400 MiB |
-| M1b per-stream sampler RNG | **not started** | see below |
+| M1b per-stream sampler RNG | **landed** | global deleted; greedy unchanged, temp>0 reproducible across an interleaved request |
 | M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
 | M1d remaining process globals | **not started** | `RAW_OVERRIDE`, `hipfire_steer`, `load_progress::SINK` |
 | M2 onward | not started | |
 
-**M1b's surface, sized but not yet cut.** `simple_rand` is only 7 sites, all inside
-`hipfire-runtime/src/sampler.rs`, so the RNG itself is easy to make an owned
-`SamplerRng`. The work is upstream of it: `sampler::sample` (9 call sites) and
-`sampler::sample_cpu` (3) are what the decode paths actually call, and each caller has to
-obtain the RNG from its session rather than from the process. So M1b is "add a field to
-session state and thread it through ~12 call sites", not "change one static" — and it must
-land in one piece, because a half-threaded RNG silently falls back to the global for the
-paths that were missed, which looks exactly like working code.
+**Two corrections to the earlier M1b sizing, both from actually reading the callers.**
+The count of "~12 call sites of `sampler::sample`/`sample_cpu`" conflated two different
+functions: most `sample_top_p` hits were `gpu.sample_top_p`, a **method on `Gpu`** (the GPU
+sampler), which already takes a seed per call and returns the advanced state. And
+`sampler::sample` already took `rng_state: &mut u32`. So the GPU path was never on the
+global at all — only the CPU primitives were, plus `sample`'s CPU *fallback*, which used
+the global and then deliberately left `rng_state` untouched.
 
 The second half of M1b (on-device `sample_rows` over `ActivationArena::row_seed`) is a
-performance requirement, not a correctness one, and can follow separately.
+performance requirement, not a correctness one, and follows separately.
+
+**A finding that makes the case sharper than the plan did.** Both `generate` and
+`generate_vl` reset the global to the *same hardcoded constant* `0x13579BDF`. So
+concurrent requests did not merely share a stream — they repeatedly reset each other onto
+an identical one. The test module also carried a `lock_sampler_rng()` mutex added because
+the global produced a real CI flake (`left: 95, right: 52` from two identically-seeded
+`sample_top_k_top_p` calls, passing locally). That mutex is now deleted: with the RNG
+owned, the race is gone by construction rather than by every test remembering to take a
+lock. Being able to delete it is the clearest evidence the global was a correctness hazard
+and not an aesthetic one.
+
+**Separately observed, pre-existing, and NOT caused by M1b: the first generation after a
+model load differs from every later one.** Measured twice, independently — gen0 differs
+from gen1 while gen1..gen4 are byte-identical, and in the M0 trace gate rep 0 emitted 254
+tokens against 256 for every later rep. Greedy decoding never draws from the sampler RNG,
+so this is not sampler state. It is worth its own investigation: greedy decoding should be
+deterministic from the first token, and anything that makes the first pass different is
+also a hazard for the byte-identity gates the later stages depend on.
 
 Ordering principle: the three roles the module plays are separable, and they are sequenced
 in the stated priority order — **preemption first, residency second, unification last.**
