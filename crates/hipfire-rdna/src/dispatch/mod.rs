@@ -1993,9 +1993,64 @@ impl Gpu {
     }
 
     /// Upload raw bytes to GPU (for quantized weights).
+    ///
+    /// **Allocates outside [`GpuPool`], while [`Gpu::free_tensor`] frees back
+    /// INTO it.** For load-time uploads that is harmless — they are allocated
+    /// once and released at unload, when `pool.drain` returns everything to HIP.
+    /// For anything that *churns* it is a monotonic leak: each freed buffer
+    /// lands in a free-list the next `upload_raw` cannot see. Churning callers
+    /// (the weight pager's transports) must use [`Gpu::upload_raw_pooled`].
+    ///
+    /// This stays `&self` deliberately. Making it `&mut self` so it could reach
+    /// the pool would touch 693 call sites, many of which hold another borrow of
+    /// `Gpu` across the call — a far larger and riskier change than the bug
+    /// warrants, given the one-shot callers are not affected by it.
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
+        self.hip.memcpy_htod(&buf, data)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
+    }
+
+    /// `(total_new, total_reused)` from the buffer pool.
+    ///
+    /// Exposed so a paging workload can assert the property that matters: cold
+    /// loads must stop calling HIP once the working set is cached. A rising
+    /// `total_new` under steady-state churn means allocation and free are
+    /// hitting different allocators.
+    pub fn pool_counters(&self) -> (usize, usize) {
+        (self.pool.total_new, self.pool.total_reused)
+    }
+
+    /// A raw pooled device buffer of at least `len` bytes.
+    ///
+    /// For callers that do their own copy (async, offset, or from a pinned
+    /// staging slab) and so cannot use [`Gpu::upload_raw_pooled`]. Pairs with
+    /// [`Gpu::free_tensor`], which returns the buffer to the same pool.
+    pub fn pool_alloc(&mut self, len: usize) -> HipResult<DeviceBuffer> {
+        self.bind_thread()?;
+        self.pool.alloc(&self.hip, len)
+    }
+
+    /// [`Gpu::upload_raw`], but allocating from [`GpuPool`] so the buffer can be
+    /// reused after [`Gpu::free_tensor`] returns it there.
+    ///
+    /// This is the allocation/free symmetry the paging path needs. Without it,
+    /// a pager cycling expert modules through a bounded VRAM budget allocates
+    /// fresh from HIP on every cold load while every eviction accumulates in the
+    /// pool's free-list — VRAM grows in proportion to paging traffic, and the
+    /// symptom is a gradual slowdown long before it is an OOM.
+    ///
+    /// The pooled buffer may be *larger* than `data`, exactly as `alloc_tensor`
+    /// already allows: `shape` and `dtype` describe the payload, the copy moves
+    /// `data.len()` bytes, and nothing downstream reads past the shape.
+    pub fn upload_raw_pooled(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let buf = self.pool.alloc(&self.hip, data.len())?;
         self.hip.memcpy_htod(&buf, data)?;
         Ok(GpuTensor {
             buf,

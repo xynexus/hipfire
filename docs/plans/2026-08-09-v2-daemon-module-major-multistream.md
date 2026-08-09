@@ -498,13 +498,34 @@ measured wall time within 2 %; tracing on versus off changes tok/s by < 1 %, A/B
 Four independent, individually revertible fixes. Each converts a latent bug into a certain
 one under module churn.
 
-**M1a — `Gpu::upload_raw` bypasses `GpuPool` while eviction frees into it.**
+**M1a — `Gpu::upload_raw` bypasses `GpuPool` while eviction frees into it. LANDED.**
 `hipfire-rdna/src/dispatch/mod.rs:2018` calls `self.hip.malloc()` directly; `free_tensor`
 (`:2062`) calls `pool.free()`. Every evicted expert's VRAM lands in a free list the next
-cold load cannot reach — a monotonic leak at the rate of paging traffic. Fix structurally
-via §1.6's fixed-frame slabs. *Exit:* 4000 module fetches through a budget holding 200;
-`GpuPool::total_new` plateaus below 250 and process VRAM is flat across the last 3000.
-*Falsified if* `total_new` tracks fetch count.
+cold load cannot reach — a monotonic leak at the rate of paging traffic.
+
+**The sizing in the original draft was wrong and is retracted.** It called the fix "a
+signature change across every `upload_raw` call site", implying something mechanical.
+There are **693 `upload_raw` call sites**, many holding another borrow of `Gpu` across the
+call, so `&self` → `&mut self` would have been a large and genuinely risky change.
+
+It is not needed. The asymmetry only *bites* on a churning caller — a load-once /
+free-at-unload caller is unaffected, because `pool.drain` returns everything at teardown.
+The only churning callers are the pager's three transports, and `Transport::fetch` already
+takes `&mut Gpu`. So the fix is `Gpu::upload_raw_pooled` / `Gpu::pool_alloc` plus **three
+call sites**, with `upload_raw` left `&self` and documented as load-path-only.
+
+*Exit (met), `cargo run --release -p hipfire-rdna --example pool_churn_upload_raw` on
+gfx1103:*
+
+| path | cycles | pool `total_new` | pool `total_reused` | VRAM growth |
+|---|---|---|---|---|
+| pooled (fixed) | 4000 | **0** | 4000 | **+0 B** |
+| unpooled (pre-fix) | 200 | — | — | **+400 MiB** |
+
+The contrast run leaks 251.6 modules' worth in 200 cycles rather than 200 — HIP rounds
+allocations up, so the stranded bytes exceed the payload. The fixed-frame slabs of §1.6
+remain the M5 design; they subsume this and make the bug structurally unreachable, but
+they are not needed to close the leak.
 
 **M1b — per-stream sampler RNG.** `static SAMPLER_STATE: AtomicU32`
 (`hipfire-runtime/src/sampler.rs:686`) is why batch decode is greedy-only. With streams
