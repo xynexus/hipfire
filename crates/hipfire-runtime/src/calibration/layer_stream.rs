@@ -2925,7 +2925,14 @@ fn tune_geometry_for_gpu(
 /// factored form of the CLI's original inline source/adapter/job construction.
 pub struct CalibrationRunInputs {
     pub snapshot: PathBuf,
-    pub source: SafetensorsSource,
+    /// Boxed trait object, not the concrete safetensors reader.
+    ///
+    /// The engine core was already generic — `LayerStreamEngine::begin` and
+    /// `source_manifest_identity` both take `&dyn ModelSource`. Only this field
+    /// and its sibling on `DaemonCalibration` pinned the whole calibrate path
+    /// to safetensors, which is why an `.hfq`/`.hfa` could not be calibrated
+    /// from even after `HfqFile` learned to implement the trait.
+    pub source: Box<dyn ModelSource>,
     pub adapter: Box<dyn CalibrationFamilyAdapter>,
     pub adapter_family: &'static str,
     pub adapter_version: &'static str,
@@ -2941,7 +2948,7 @@ pub fn build_calibration_run_inputs(
     command: &CalibrateCommand,
 ) -> Result<CalibrationRunInputs, Box<dyn Error>> {
     let snapshot = resolve_hf_snapshot(&command.model)?;
-    let source = SafetensorsSource::open(&snapshot)?;
+    let source: Box<dyn ModelSource> = Box::new(SafetensorsSource::open(&snapshot)?);
     let tokenizer_path = source
         .tokenizer_json_path()
         .ok_or_else(|| format!("{} has no tokenizer.json", snapshot.display()))?;
@@ -2954,7 +2961,7 @@ pub fn build_calibration_run_inputs(
         command.context,
     )?;
     let options = command.options()?;
-    let source_manifest = source_manifest_identity(&source)?;
+    let source_manifest = source_manifest_identity(source.as_ref())?;
     let corpus_fingerprint = file_hash(&command.corpus).unwrap_or_else(|| "unavailable".into());
     let job = CalibrationJob::new(
         source_manifest.fingerprint.clone(),
@@ -2963,7 +2970,7 @@ pub fn build_calibration_run_inputs(
         options,
     )?
     .with_corpus_fingerprint(corpus_fingerprint)?;
-    let resolved = resolve_adapter(&source)?;
+    let resolved = resolve_adapter(source.as_ref())?;
     Ok(CalibrationRunInputs {
         snapshot,
         source,
@@ -3012,7 +3019,7 @@ fn engine_for(command: &CalibrateCommand) -> LayerStreamEngine {
 /// own `acquire_gpu_lock`.
 pub struct DaemonCalibration {
     adapter: Box<dyn CalibrationFamilyAdapter>,
-    source: SafetensorsSource,
+    source: Box<dyn ModelSource>,
     job: CalibrationJob,
     session: CalibrationSession,
     output: PathBuf,
@@ -3049,7 +3056,7 @@ impl DaemonCalibration {
         {
             fs::create_dir_all(parent)?;
         }
-        match engine_for(command).begin(adapter.as_mut(), &source, gpu, &job)? {
+        match engine_for(command).begin(adapter.as_mut(), source.as_ref(), gpu, &job)? {
             CalibrationSessionStart::Complete(result) => {
                 Ok(DaemonCalibrationStart::Complete(Box::new(result)))
             }
@@ -3072,7 +3079,7 @@ impl DaemonCalibration {
     /// Run exactly one layer — the calibration quantum. One daemon GPU turn.
     pub fn step(&mut self, gpu: &mut Gpu) -> Result<CalibrationStep, CalibError> {
         self.session
-            .step(self.adapter.as_mut(), &self.source, gpu, &self.job)
+            .step(self.adapter.as_mut(), self.source.as_ref(), gpu, &self.job)
     }
 
     /// Consume a session that [`Self::step`] reported as `Paused`.
@@ -3089,7 +3096,7 @@ impl DaemonCalibration {
             session,
             ..
         } = self;
-        session.finish(adapter.as_mut(), &source, gpu, &job)
+        session.finish(adapter.as_mut(), source.as_ref(), gpu, &job)
     }
 
     pub fn output(&self) -> &Path {
