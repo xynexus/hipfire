@@ -3210,9 +3210,16 @@ pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
 /// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
 /// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
 /// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
+/// RETIRED — the source file is `gated_delta_net_q8-disabled.hip`.
+///
+/// `state.rs` POLICY (2026-07-19): DeltaNet state must never be Q8. The kernel
+/// is kept for reference rather than deleted, but the two dispatch entry points
+/// refuse before they can compile or launch it, and it is no longer in the
+/// warm-up precompile list. The `-disabled` filename is the marker; this
+/// constant only still exists so the retired source stays readable in-tree.
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8.hip");
+    include_str!("../../../kernels/src/gated_delta_net_q8-disabled.hip");
 
 /// gfx1151 register-state GDN Q8 experiment. Keeps one S row per thread in
 /// registers and preserves the production stochastic-requant ABI.
@@ -3244,6 +3251,31 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
+
+/// FP32 tree-aware DeltaNet replay. Same DFS + persist-write semantics as the
+/// Q8 tree kernel, with the tape holding raw f32 — no scales, no requant, no
+/// stochastic rounding. Exists so tree replay (DDTree) does not require Q8
+/// state, which qwen35/state.rs forbids; it is what lets the Q8 tree kernel be
+/// retired without removing DDTree.
+///
+/// Spine topology reproduces `gated_delta_net_f32` called n_tokens=1 N times
+/// byte-exactly (same `col = tid * 4` lane mapping, so the same summation order).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_tree.hip");
+
+/// FP16-tape tree-aware DeltaNet replay. Only the TAPE is f16 — `s_init` stays
+/// FP32 and the recurrence runs in FP32 registers — so it halves the scratch
+/// that scales with tree width without touching the persistent per-sequence
+/// state whose precision qwen35/state.rs governs.
+///
+/// Not byte-exact against the linear FP32 kernel (one f16 rounding per tape
+/// round-trip, accumulating with tree DEPTH, not sibling count). Use the f32
+/// tree kernel when exactness against the linear reference is the thing under
+/// test.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_tree.hip");
 
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
