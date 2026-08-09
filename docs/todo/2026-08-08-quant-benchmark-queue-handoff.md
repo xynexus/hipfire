@@ -411,3 +411,44 @@ Also proposed: count every batch=1 dispatch taken while `rows > 1`, keyed by
 the gates on nonzero. Do not ban batch=1 kernels — they are genuinely faster at
 N=1 (no WMMA padding waste, no activation staging, M-only grid, fused
 residual epilogues). The defect is only ever taking one when `rows > 1`.
+
+## DeltaNet Q8 removal — the last mile (2026-08-09)
+
+Q8/Q4 are gone from `StateQuant`, but the Q8 **dispatch functions** in
+`hipfire-rdna/src/dispatch/gated.rs` still exist and are still CALLED. Renaming
+`gated_delta_net_q8.hip` to `-disabled.hip` did not make them unreachable; it
+just made them look retired. Under FP32 the surviving callers are harmless, so
+every check passed. Under FP16 the state is half-size with a vestigial
+`s_scales`, and a teacher-forced score of a dense Qwen3.5-0.8B died with:
+
+    Memory Fault Error ... kernel: gated_delta_net_q8
+
+That is why FP16-by-default was reverted (c2412857a). FP16 stays available via
+`HIPFIRE_DN_STATE_FP16`, and enabling it is UNSAFE until this is finished.
+
+Deleting the dispatch fns + their kernel constants makes the compiler produce
+the exact list, which no amount of grepping did — the call sites do not mention
+`StateQuant` at all, so they are invisible to a variant search:
+
+| site | arm |
+|---|---|
+| `prefill_chunk.rs:2972` / `:6479` | `gated_delta_net_q8_tree_batch_seq` |
+| `prefill_chunk.rs:3013` / `:6507` | `gated_delta_net_q8` (per-token) |
+| `prefill_chunk.rs:3030` / `:6524` | `gated_delta_net_q8_batch_seq` |
+| `prefill_batch.rs:664` | `gated_delta_net_q8_routed_batch_seq` |
+| `speculative.rs:3374` | (surfaced by the compiler; unexamined) |
+
+Replacements all exist and are hardware-validated: `gated_delta_net_f32/f16`
+`_batch_seq`, `_routed_batch_seq`, `_tree_batch_seq`.
+
+The one piece of real work, and why this was not finished in-session: the TREE
+arms need a tape buffer sized for the new precision. `pbs.dn_s_tape_q8` +
+`dn_s_tape_scales` are Q8-shaped; an f32 tape is 4x the bytes and an f16 tape 2x,
+with no scales at all. So `PrefillBatchScratch` has to grow the right buffer
+before those two arms can be rewritten. The other six sites are mechanical.
+
+Order that works: delete the dispatch fns first, let the compiler enumerate, fix
+scratch, rewrite arms, then re-run the teacher-forced comparison (build a KLD ref
+with `HIPFIRE_DN_STATE_FP32=1`, score the SAME weights with FP16 — only the state
+precision differs, so any KLD is precision alone). That test found this bug in
+5 seconds after four rounds of greps missed it.
