@@ -662,7 +662,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_STATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_TOPK",
     description: "DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1163",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1167",
 };
 
 /// `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` — Runtime variable controlling deepseek4 expert layer end in hipfire
@@ -683,7 +683,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_F32_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
     description: "Unscatter + SwiGLU·clamp",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1253",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1257",
 };
 
 /// `HIPFIRE_DEEPSEEK4_GEN_TOKENS` — Runtime variable controlling deepseek4 gen tokens in hipfire
@@ -746,63 +746,63 @@ pub const ENV_HIPFIRE_DEEPSEEK4_MOE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_8W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_8W",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1203",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1207",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_CND` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_CND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_CND",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1202",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1206",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1354",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1358",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1192",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1196",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` — ── Grouped vs scalar gate ────────────────────────────────────────────────
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE",
     description: "── Grouped vs scalar gate ────────────────────────────────────────────────",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1187",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1191",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W` — Shared research levers (read once; default 4w on gfx11+)
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W",
     description: "Shared research levers (read once; default 4w on gfx11+)",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1195",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1199",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_MMQLOAD` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_MMQLOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_MMQLOAD",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1204",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1208",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_N32` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_N32: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_N32",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1201",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1205",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_NOSYNC` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_NOSYNC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_NOSYNC",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1205",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1209",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MTP_ADDON` — Convention 1: append ".mtp-addon.hfq" (legacy)
