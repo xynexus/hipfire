@@ -14,10 +14,11 @@ use hipfire_rdna::{Gpu, GpuTensor};
 // ── State quantization ─────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+/// Mirrors `hipfire_arch_qwen35::qwen35::StateQuant`; keep the two in step.
+/// Q8/Q4 removed 2026-08-09 (silent corruption); FP32 default, FP16 opt-in.
 pub enum StateQuant {
     FP32,
-    Q8,
-    Q4,
+    FP16,
 }
 
 // ── Parameter structs ──────────────────────────────────

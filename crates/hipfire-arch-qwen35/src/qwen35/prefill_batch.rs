@@ -1128,9 +1128,9 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
                 "grouped MoE session fused prefix row {idx} has unsupported KV quantization flags; first MoE target is plain Q8 KV"
             ));
         }
-        if !matches!(signature.dn_quant, StateQuant::Q8 | StateQuant::FP32) {
+        if !matches!(signature.dn_quant, StateQuant::FP32 | StateQuant::FP16) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports Q8 or FP32",
+                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports FP32 or FP16",
                 signature.dn_quant,
             ));
         }
@@ -4057,7 +4057,11 @@ pub fn forward_prefill_grouped_moe_session_batch(
     // the already-implemented routed recurrence branch once for the batch.
     let delta_q8 = signatures
         .first()
-        .map(|signature| signature.dn_quant == StateQuant::Q8)
+        // Was `== StateQuant::Q8`. Q8 is removed and was never selected, so
+        // this stayed false in practice. `gated_delta_net_f16_routed_batch_seq`
+        // now exists and is validated, so wiring FP16 here is a real follow-up —
+        // but it changes which recurrence runs, so it needs its own measurement.
+        .map(|signature| matches!(signature.dn_quant, StateQuant::FP32) && false)
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =

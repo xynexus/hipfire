@@ -77,7 +77,7 @@ fn run_pp1(path: &str, prompt: &[u32]) -> Vec<u32> {
         4096,
     )
     .expect("kv");
-    let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::Q8).expect("dn");
+    let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::FP32).expect("dn");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, 4096).expect("scratch");
 
     for (i, &tok) in prompt.iter().enumerate() {
@@ -127,7 +127,8 @@ fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
     )
     .expect("kv multi");
     let (mut dn, _la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::FP32)
+            .expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
     let dev_last = gpus.output_device;

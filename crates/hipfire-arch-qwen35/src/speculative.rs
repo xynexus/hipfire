@@ -4652,29 +4652,13 @@ impl GdnTape {
                         n_v_heads,
                         value_head_dim,
                     )?,
-                    qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8(
+                    qwen35::StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
                         &q,
                         &k,
                         &v,
                         &alpha,
                         &beta,
                         &dn_state.s_matrices[la_idx],
-                        &dn_state.s_scales[la_idx],
-                        &out,
-                        1,
-                        n_v_heads,
-                        value_head_dim,
-                        (self.base_position + step) as u32,
-                        la_idx as u32,
-                    )?,
-                    qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &q,
-                        &k,
-                        &v,
-                        &alpha,
-                        &beta,
-                        &dn_state.s_matrices[la_idx],
-                        &dn_state.s_scales[la_idx],
                         &out,
                         1,
                         n_v_heads,
@@ -4802,29 +4786,13 @@ impl GdnTape {
                         n_v_heads,
                         value_head_dim,
                     )?,
-                    qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8(
+                    qwen35::StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
                         &q,
                         &k,
                         &v,
                         &alpha,
                         &beta,
                         &dn_state.s_matrices[la_idx],
-                        &dn_state.s_scales[la_idx],
-                        &out,
-                        1,
-                        n_v_heads,
-                        value_head_dim,
-                        (self.base_position + step) as u32,
-                        la_idx as u32,
-                    )?,
-                    qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &q,
-                        &k,
-                        &v,
-                        &alpha,
-                        &beta,
-                        &dn_state.s_matrices[la_idx],
-                        &dn_state.s_scales[la_idx],
                         &out,
                         1,
                         n_v_heads,
@@ -5075,12 +5043,19 @@ impl GdnTape {
                     n_v_heads,
                     value_head_dim,
                 )?,
-                qwen35::StateQuant::Q8 => {
-                    // Rollback parity is defined against decode's per-token
-                    // recurrent-state cadence. The batched Q8 helper
-                    // requantizes once after N tokens, which is fine for
+                qwen35::StateQuant::FP16 => {
+                    // Per-token, NOT the batched helper — same reason the Q8 arm
+                    // this replaces looped. Rollback parity is defined against
+                    // decode's per-token recurrent-state cadence, and the batched
+                    // f16 kernel narrows the state to f16 ONCE after N tokens
+                    // instead of once per token. That is fine for
                     // throughput-oriented prefill but not for replaying the
-                    // AR-equivalent accepted prefix.
+                    // AR-equivalent accepted prefix, where the replayed state
+                    // must match what decode would have produced step by step.
+                    //
+                    // FP32 above can stay batched because it has no narrowing at
+                    // all, so batched and per-token are identical there. f16 is
+                    // the case where the distinction reappears.
                     for step in 0..n_steps {
                         let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
                         let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
@@ -5088,38 +5063,20 @@ impl GdnTape {
                         let alpha = self.alpha_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
                         let beta = self.beta_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
                         let out = self.attn_scratch.sub_offset(step * v_dim, v_dim);
-                        gpu.gated_delta_net_q8(
+                        gpu.gated_delta_net_f16_batch_seq(
                             &q,
                             &k,
                             &v,
                             &alpha,
                             &beta,
                             &dn_state.s_matrices[la_idx],
-                            &dn_state.s_scales[la_idx],
                             &out,
                             1,
                             n_v_heads,
                             value_head_dim,
-                            // Replay row `step` is the token at absolute
-                            // position `base_position + step` (issue #17).
-                            (self.base_position + step) as u32,
-                            la_idx as u32,
                         )?;
                     }
                 }
-                qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
             }
 
             la_idx += 1;
