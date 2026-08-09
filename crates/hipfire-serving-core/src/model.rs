@@ -201,22 +201,23 @@ impl DdtreeState {
     }
 }
 
-thread_local! {
-    /// Per-request raw-prompt override, parsed from the generate message's
-    /// optional `"raw"` field. `None` = use the auto default (raw iff the model
-    /// has no chat_template). Set at the top of the generate handler (the daemon
-    /// processes generate messages synchronously on one thread), read by
-    /// `effective_raw`. Reset every generate request, so no cross-request leak.
-    pub static RAW_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Effective raw-prompt flag for prompt framing. An explicit request `"raw"`
+/// Effective raw-prompt flag for prompt framing. An explicit request override
 /// wins; otherwise default to raw for base/completion models (no chat_template)
 /// and framed for chat models (has a chat_template).
-pub fn effective_raw(m: &LoadedModel) -> bool {
-    RAW_OVERRIDE
-        .with(|c| c.get())
+///
+/// `override_` used to be a `thread_local RAW_OVERRIDE` cell whose doc claimed
+/// "reset every generate request, so no cross-request leak". That held only for
+/// `generate`: the **batch prefill path never set it and never cleared it**, so a
+/// batch prefill inherited whatever the last plain `generate` left behind.
+///
+/// Measured on gfx1103 before the fix, one identical `prefix_hash_preflight`
+/// session: a fresh daemon materialised a 15-token chat-framed prompt with three
+/// semantic boundaries; after a single unrelated `generate` carrying
+/// `"raw": true`, the same request materialised **7 tokens** with one `full`
+/// boundary. Those hashes are the KV-reuse cache keys, so the leak did not just
+/// reframe a prompt — it changed what a later request matched in the prefix cache.
+pub fn effective_raw(m: &LoadedModel, override_: Option<bool>) -> bool {
+    override_
         .or_else(|| {
             m.registered_backend
                 .as_ref()
