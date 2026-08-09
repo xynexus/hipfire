@@ -118,7 +118,66 @@ the **3731 s** baseline, and an **md5 match** against the existing
 `Qwen3.5-35B-A3B--oq4.25++.hfq`. A byte match on a real 10240-expert workload is
 the strongest available proof the cache is transparent.
 
-### 4. Fix the MoE grouped-GEMM decline — SKIPPED (policy-blocked, not a gate bug)
+### 4. Batched MoE prefill — RE-OPENED 2026-08-09. Not policy-blocked after all.
+
+The "policy conflict" below is **wrong**, and the experiment that disproves it
+took an hour. Measured, not reasoned:
+
+Widening the `pbs_eligible` state-quant arm to admit `DeltaNetMoe`/`FullAttnMoe`
+alongside the two dense kinds lets a MoE model into batched prefill **under
+FP32 state, with no Q8 anywhere** — so `state.rs`'s "never Q8" policy is never
+engaged. The gate passed on Qwen3.5-35B-A3B on the first try.
+
+Why that was always going to work, and why the old reading was too pessimistic:
+
+- An FP32 batched DeltaNet path already exists —
+  `gated_delta_net_f32_batch_seq` (`dispatch/gated.rs:146`), and for MoE
+  specifically `gated_delta_net_f32_routed_batch_seq` (:197). FP32 is
+  unsupported ONLY for tree replay (`prefill_chunk.rs:2962` returns an explicit
+  error), which is spec-decode/MTP, not scoring. There is **no FP16 path** —
+  FP32 and Q8 are the only two implemented, so `state.rs`'s FP16 alternative is
+  aspirational.
+- The per-layer admissibility closure ALREADY validates `DeltaNetMoe` and
+  `FullAttnMoe` properly. Only the state-quant arm omitted them.
+- The tree-verify forward keeps its own separate eligibility check, so widening
+  this gate cannot route FP32 models into the unsupported tree path.
+
+**What actually blocks it** is one missing kernel arm, not a policy:
+
+    kernel not registered: FusedGateUpOq8G256
+
+`oq4.25++` promotes the shared expert to OQ8, and the batched **shared-expert
+fused gate_up** has no OQ8 implementation. Everything around it does:
+shared-expert `down` (`gemv_oq8g256_residual_sigmoid_scaled_gpu_batched`),
+routed `gate_up` and routed `down` are all batched-OQ8 already. The codebase
+even documents the hole at `prefill_chunk.rs:2677` ("No fused oq8 PREFILL arm
+exists"). Note `moe_ffn_batched_admissible` ADMITS the layer the registry
+cannot serve — the predicate and the kernel table disagree, which is why this
+surfaces as a runtime error rather than a clean decline.
+
+Two ways to close it:
+
+1. Wire the existing `fused_gate_up_oq8_wmma` (`dispatch/fused.rs:2670`,
+   kernel source `kernels/src/fused_gate_up_oq8_wmma.hip`). It wants
+   PRE-QUANTIZED activations (`xq`, `xs`), unlike the OQ4 arm which takes f32
+   and quantizes internally, so it needs int8 activation scratch in
+   `PrefillBatchScratch` plus a quantize step. Then register
+   `(FusedGateUpOq8G256, ArchPredicate::HasWmma)` in `fused_qkv_table.rs` and
+   add the arm in `families/fused_qkv.rs`.
+2. Add a plain batched OQ8 projection and call it twice. Today the only batched
+   OQ8 entry points are the three specialised ones above — there is no generic
+   one to reuse.
+
+Either way, tighten `moe_ffn_batched_admissible` in the SAME change so an
+unservable dtype declines to per-token instead of erroring.
+
+The prize is worth it: this is also what gates the 397B (§8), and it is the
+difference between per-token and batched prefill on every MoE model.
+
+The experimental gate change was reverted — on its own it converts
+slow-but-working into a hard error for every `oq4.25++` model.
+
+Superseded original note:
 
 The premise below was wrong, and the trace says so. The predicted
 `MoE grouped GEMM declined` line **never fired**; the grouped MoE path was never
@@ -235,7 +294,38 @@ Plus a `RefMeta` header (calibs now carry `source_fingerprint`).
 (`hipfire-coexistence calibrate`, which does per-layer/per-expert capture and
 can emit kldref). Quantized ≈65 GB, so scoring fits once §6 lands.
 
-### 8. Qwen3.5-397B-A17B — BLOCKED, do not start
+### 8. Qwen3.5-397B-A17B — REASSESSED 2026-08-09. Not a capacity problem.
+
+Both reasons given below are wrong.
+
+**The deadlock is fixed.** Root cause was `mmap.advise(Sequential)` triggering
+291 GiB of readahead whose kworker held an inode lock against the slab loader's
+O_DIRECT fd on the same inode. Fixed in `hfq.rs` — 64 GiB threshold (line 1109)
+and `FADV_DONTNEED` (line 1342), both verified present after the origin/master
+merge. Post-fix it loads and generates. It is not a crash risk.
+
+**"~380 GB quantized" was wrong** — at the 35B's measured 3.84x it is ~190 GB.
+
+**Capacity is not the blocker, because scoring does not need it resident.**
+Real config from the archive index: 60 layers, hidden 4096, 512 experts, top-10,
+moe_intermediate 1024 → 12.08 GB per layer bf16, 724.7 GB total. Streamed and
+double-buffered that is 5.6 GB quantized resident, leaving ~118 GB. The entire
+16x2048 = 32,768-token scoring job is ~12 GB of activations, so it fits in ONE
+batch: a single streaming pass, 1.4-2.8 min of quantized weight read at
+1-2 GB/s plus ~0.4 min of compute.
+
+**The actual blocker is §4.** The 397B is `qwen3_5_moe` with hybrid
+`linear_attention`/`full_attention` layers, so it hits the same `pbs_eligible`
+gate. Without batched prefill, scoring runs per-token — and per-token against
+streamed weights means re-reading ~190 GB PER TOKEN, which is the real reason
+anything about this model ever looked hopeless. Land the §4 kernel arm and the
+397B benchmark becomes ordinary work.
+
+Still true: do not attempt a RESIDENT load, and the DFlash sidecar at
+`/srv/hipfire/models/Qwen3.5-397B-A17B-DFlash--bf16.hfq` is the drafter (6
+layers, 2.58 GB), not the model. The model exists only as the 550 GB `.hfa`.
+
+Superseded original note:
 794 GB bf16, ~380 GB quantized against 124 GB RAM. Calibration is possible
 streamed, but scoring is not, so there is no benchmark at the end. Also has a
 documented history of deadlocking amdgpu on this box (hard reboot).
