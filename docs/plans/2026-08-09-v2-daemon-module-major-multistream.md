@@ -387,6 +387,24 @@ routed OQ decode kernels **while debugging their finite-KLD failure**" — i.e. 
 off by default *because it is known broken*. Nothing says that defect is confined to
 numerics; a kernel that computes wrong answers can equally loop pathologically.
 
+**Confirmed 2026-08-09 by A/B on the tiny fixture — one variable, opposite verdicts:**
+
+| `HIPFIRE_QWEN35_MOE_OQ_INDEXED` | `tiny-quant qwen3_5_moe` |
+|---|---|
+| `1` | **FAIL — 7/7 Opus cells "non-finite KLD"** |
+| unset | **PASS — 7/7**, drift `-0` on every cell |
+
+The indexed OQ decode path is broken, on its own, independent of paging, the 35B artifact,
+the pre-transformed format, and everything else this investigation touched. It reproduces
+in minutes on a fixture instead of 160 s per layer on a 35B, and `tiny-quant` is therefore
+the right harness for fixing it.
+
+**Consequences for this plan.** Paged Opus MoE decode is blocked on repairing these
+kernels, not on anything in §1.6's residency design — M5 cannot be measured on Opus until
+they are fixed. `oq4`/`oq8` on the NON-indexed path is healthy (the control arm above), so
+resident Opus MoE is unaffected; it is specifically the indexed routed path that paging
+requires.
+
 So the question was mis-framed. It is not "why is paged Opus slow" — it is **"the OQ
 indexed kernels are known-defective, and this stall is plausibly that defect."** Which
 means the productive next step is not further bisection into
