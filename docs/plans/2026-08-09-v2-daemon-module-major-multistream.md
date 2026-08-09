@@ -773,12 +773,31 @@ is latency and latency is provable with super-op suspension alone.
   Dense is *correct* here: it isolates the scheduling claim from the MoE claim.
 - **Bulk:** the same artifact as a second resident worker driving a LoRA session, so VRAM
   is not the confound.
-- **MoE artifact for M4–M7:** a qwen3.5 MoE with per-expert module records **and the
-  indexed expert layout**, which `MODEL-SUPPORT.md` records as opt-in — the default is a
-  dense-layout OQ fallback, so promoting it is a prerequisite. Sources are on the mount
-  (`Qwen3.6-35B-A3B`, `Qwen3.5-35B-A3B`); check disk headroom first. **Do not pick
-  `--format qtip3`/`qtip4`** — the qtip path self-locks under a parent holding the flock
-  and deadlocks; it only stays quiet today because the induction default is `oq4.25++`.
+- **MoE artifact for M4–M7:** built 2026-08-09 from
+  `/srv/hipfire/models/Qwen3.6-35B-A3B.hfa`. Three things learned doing it, each a trap:
+
+  1. **`.hfa` is not a quantizer input.** It is an `HFAR0002` HuggingFace *archive*
+     produced by `hipfire-coexistence hub fetch`; `hipfire-quantize --input` accepts only a
+     model dir, a `.gguf`, or a `.hfq`. Restore first with
+     `hipfire-coexistence repack --input <a.hfa> --output <dir>` (lossless, byte-identical).
+  2. **`--format oq4` is already the right layout, and `hipfire optimize` would destroy
+     it.** The quantizer emits canonical `Oq4G256`, which is exactly what
+     `WeightPager::register_expert_module` accepts (via `oq4_canonical_to_moe_blocks`). The
+     dense `Oq4G256ArchPacked` that the pager *refuses* — "regenerate a canonical pageable
+     artifact" — is produced only by the separate `hipfire optimize` tool
+     (`hipfire-runtime/src/oq4_arch.rs:14-30`). So `MODEL-SUPPORT.md`'s "indexed OQ remains
+     opt-in" is about the **load path**, not the storage format: quantize plainly, and do
+     **not** optimize the artifact or it silently stops being pageable — a failure that
+     would present as an M5 bug rather than an artifact mistake.
+  3. **Disk placement is a measurement decision, not housekeeping.** The artifact must live
+     on local NVMe rather than `/srv`: M5's paging numbers come from the pager's transports
+     reading the `.hfq` directly, so an NFS-resident artifact would measure the network.
+
+  **Retracted:** this section previously warned off `--format qtip3`/`qtip4` because the
+  qtip path self-locked under a parent holding the flock. That self-lock has been deleted —
+  zero `lock_blocking` calls remain in the quantizer, and both
+  `hipfire-quantize/src/main.rs:4992-4999` and the crate's `gpu` feature comment say so.
+  Wrapping it in `hipfire lock`, as AGENTS.md asks, is now correct.
 
 Procedure: ten alternating 30-second windows **in one daemon lifetime** (solo / loaded /
 solo / …), reporting the paired difference — forced by gfx1103's ~8.6 % first-run position
