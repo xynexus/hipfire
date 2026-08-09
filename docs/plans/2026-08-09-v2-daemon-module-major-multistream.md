@@ -214,24 +214,45 @@ against a smaller MoE here. M5 on this box needs cause 1 fixed. Do **not** requa
 `mq4` to get moving: magnum is deprecated, and routing around the gap buys a measurement on
 a dying format while leaving the premier path broken.
 
-**(c) Paged Opus is CPU-bound on a per-module host repack — a cost specific to the
-premier quant family.** `module_requires_host_repack` (`weight_pager.rs:648`) returns true
+**(c) Paged Opus is CPU-bound — but NOT on the host repack. That attribution is
+RETRACTED.**
+
+The original claim here was that `module_requires_host_repack` (`weight_pager.rs:648`),
+true for exactly `Oq4G256 | Oq8G256 | OqPlusCompact`, put an `oq4_canonical_to_moe_blocks`
+transform on every page-in and that this was the ~96 %-of-one-core cost. That was inferred
+from the predicate existing, not measured, and it is **wrong**.
+
+Tested by building the pre-transformed artifact (qt 53, verified: 10,240 modules,
+1,622,016 B each) and running both through the same paged configuration. The packed
+artifact does **no** repack — and is still pegged at **99.6 % of one core with the GPU at
+0 %**, 10 minutes of CPU for a single-token generation. Identical symptom to canonical.
+So the cost is common to both formats and is somewhere else in the paged path.
+
+What this does and does not invalidate:
+- The **qt 53 format still stands on its own merits** — it removes a real transform, and
+  storage that matches the consuming layout is right regardless. It is simply not the fix
+  for this symptom.
+- **The "prefetch must also repack" note is withdrawn** along with the attribution.
+- **What is actually eating the CPU is unknown.** Candidates that are common to both
+  formats: `touch_module_lru`'s O(n) `iter().position()` + `VecDeque::remove` over 10,240
+  entries (§1.6 already flags it), `would_fit_expert_module_set`, the per-layer
+  `patch_expert_module_ptr_table`, or the per-MoE-layer D2H top-k readback. **Do not guess
+  again — profile.**
+- **Profiling is currently blocked on this box:** `perf_event_paranoid=4` refuses
+  `perf record`, and `ptrace_scope` refuses `gdb`/`eu-stack` attach ("Operation not
+  permitted"). Either relax one of those, or add timing instrumentation to the pager the
+  way `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG` was added — that env-gated trace is what located the
+  dtype bug after two wrong hypotheses.
+
+The methodological point, since this is the third time the same shape has bitten in this
+work: a predicate that *could* explain a symptom is not evidence that it *does*. The
+earlier `moe.decode-routed-dtype-unsupported` chase went the same way — two confident wrong
+causes before an instrumented run gave the real one in a single line. `module_requires_host_repack` (`weight_pager.rs:648`) returns true
 for exactly `Oq4G256 | Oq8G256 | OqPlusCompact`; magnum and the rest take the verbatim
 `transport.fetch` path. So every Opus expert page-in runs
 `oq4_canonical_to_moe_blocks` on the CPU, single-threaded, synchronously inside the
 dispatch — 10,240 modules x 1.52 MiB on the M4 artifact. Observed directly: with the
 refusal fixed, the daemon sits at ~96 % of ONE core with ~415 MB RSS while the GPU idles.
-
-This matters for M5's design, and it is not a bug to fix in passing:
-
-- §1.6's async prefetch is necessary but **not sufficient** for Opus — overlapping the I/O
-  still leaves a serial CPU transform on the critical path. The prefetch engine has to
-  repack too, not merely copy.
-- The alternative is to store the MoE-block layout on disk so page-in is verbatim. That is
-  a quantizer/format change, not a runtime one, and it trades disk portability for
-  page-in cost. Worth a decision before M5 rather than during it.
-- It also means the launch-overhead arithmetic in §0.3 understates paged Opus: those
-  figures count DRAM bytes and kernel launches, not a host-side transform per module.
 
 ### 0.6.1 The fix is an artifact format, not a runtime workaround
 
