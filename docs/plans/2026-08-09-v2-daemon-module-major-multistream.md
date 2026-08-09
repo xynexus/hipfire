@@ -481,7 +481,7 @@ Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
 | M1a `upload_raw` / `GpuPool` | **landed** | pooled 4000 cycles → +0 B VRAM, 0 HIP calls; unpooled 200 cycles → +400 MiB |
 | M1b per-stream sampler RNG | **landed** | global deleted; greedy unchanged, temp>0 reproducible across an interleaved request |
 | M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
-| M1d remaining process globals | **not started** | `RAW_OVERRIDE`, `hipfire_steer`, `load_progress::SINK` |
+| M1d remaining process globals | **not started, sized** | three independent sub-tasks; see below |
 | M2 onward | not started | |
 
 **Two corrections to the earlier M1b sizing, both from actually reading the callers.**
@@ -504,6 +504,23 @@ the global produced a real CI flake (`left: 95, right: 52` from two identically-
 owned, the race is gone by construction rather than by every test remembering to take a
 lock. Being able to delete it is the clearest evidence the global was a correctness hazard
 and not an aesthetic one.
+
+**M1d is three independent sub-tasks, not one.** Sized 2026-08-09:
+
+- **`RAW_OVERRIDE`** (`serving-core/src/model.rs:210`) — a `thread_local Cell`, set once in
+  `handlers/generate.rs:134` and read by `effective_raw(m)`, which has **~12 call sites**
+  across `generate.rs`, `qwen35_prefill.rs` and `generate_vl.rs`. Because `effective_raw`
+  only receives `&LoadedModel`, removing the thread-local means threading an
+  `Option<bool>` from the handler down through every enclosing function. Comparable in
+  size to M1b and must likewise land in one piece — a half-threaded override silently
+  falls back to the thread-local on the paths that were missed. Its own doc comment
+  ("the daemon processes generate messages synchronously on one thread") states exactly
+  the assumption the v2 executor breaks.
+- **`hipfire_steer::{SESSION, ACTIVE, EPOCH}`** — 8 `is_active()` sites. Coupled to M2b,
+  since an active steer session is one of the four escapes that force the hand path;
+  worth doing together rather than twice.
+- **`load_progress::SINK`** — 18 references. Least urgent: a load is not a stream, and the
+  per-connection routing bug it once caused was already fixed.
 
 **Separately observed, pre-existing, and NOT caused by M1b: the first generation after a
 model load differs from every later one.** Measured twice, independently — gen0 differs
