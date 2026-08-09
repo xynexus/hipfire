@@ -48,6 +48,7 @@ const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
 
 fn main() {
+    let mut sampler_rng = sampler::SamplerRng::from_entropy();
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -309,7 +310,7 @@ fn main() {
     } else {
         sc.answer_temp
     };
-    let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
+    let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng);
 
     let t_gen = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();

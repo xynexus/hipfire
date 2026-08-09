@@ -36,6 +36,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    let mut sampler_rng = sampler::SamplerRng::from_entropy();
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
@@ -171,7 +172,7 @@ fn main() {
                 sc.repeat_window,
                 sc.repeat_penalty,
             );
-            let _tok = sampler::sample_top_p(&logits, sc.answer_temp, sc.top_p);
+            let _tok = sampler::sample_top_p(&logits, sc.answer_temp, sc.top_p, &mut sampler_rng);
             let _ = rng_state;
             history.push(warmup_tok);
         }

@@ -331,6 +331,8 @@ fn main() {
     // RNG for the production sampler path. Seeded matching the daemon
     // default so behavior is reproducible across runs.
     let mut rng_state_u32: u32 = 0x13579BDFu32;
+    // The CPU-side stream, matching the GPU path's seed above.
+    let mut sampler_rng = sampler::SamplerRng::from_seed(0x13579BDF);
 
     if !use_guards {
         eprint!("<think>");
@@ -362,7 +364,7 @@ fn main() {
             &mut rng_state_u32,
         )
     } else {
-        sampler::sample_top_p(&logits, sc.think_temp, sc.top_p)
+        sampler::sample_top_p(&logits, sc.think_temp, sc.top_p, &mut sampler_rng)
     };
 
     for _gi in 0..max_gen {
@@ -502,8 +504,13 @@ fn main() {
             }
 
             if sample_compare {
-                // Snapshot RNG so both samplers see the same state.
-                let rng_before = sampler::sampler_rng_snapshot();
+                // Fork the stream by value so both arms start identically.
+                // `SamplerRng` is `Copy`, so this replaces the old
+                // snapshot/restore dance against a process-global RNG — and it
+                // cannot be perturbed by anything else sampling in between,
+                // which the global version could not promise.
+                let mut rng_gpu_arm = sampler_rng;
+                let mut rng_cpu_arm = sampler_rng;
 
                 // GPU-assisted path (advances RNG)
                 let mut cand_vals_gpu = cand_vals.clone();
@@ -515,11 +522,10 @@ fn main() {
                     sc.repeat_penalty,
                     temp,
                     sc.top_p,
+                    &mut rng_gpu_arm,
                 );
-                let rng_after_gpu = sampler::sampler_rng_snapshot();
 
-                // Restore and run full-CPU path
-                sampler::sampler_rng_restore(rng_before);
+                // Full-CPU path, from the same starting state.
                 logits = gpu.download_f32(&scratch.logits).unwrap();
                 sampler::apply_repeat_penalty(
                     &mut logits,
@@ -527,8 +533,9 @@ fn main() {
                     sc.repeat_window,
                     sc.repeat_penalty,
                 );
-                let cpu_tok = sampler::sample_top_p(&logits, temp, sc.top_p);
-                let rng_after_cpu = sampler::sampler_rng_snapshot();
+                let cpu_tok = sampler::sample_top_p(&logits, temp, sc.top_p, &mut rng_cpu_arm);
+                let rng_after_gpu = rng_gpu_arm.state();
+                let rng_after_cpu = rng_cpu_arm.state();
 
                 if cpu_tok != gpu_tok || rng_after_cpu != rng_after_gpu {
                     eprintln!(
@@ -538,6 +545,7 @@ fn main() {
                         gpu_tok,
                         pos
                     );
+                    let rng_before = sampler_rng.state();
                     eprintln!("   rng state: before={rng_before:#x} after_gpu={rng_after_gpu:#x} after_cpu={rng_after_cpu:#x}");
                     // Show the top-128 candidate set + which of them the CPU's top-20 came from
                     let mut sorted: Vec<(u32, f32)> = cand_ids
@@ -552,7 +560,8 @@ fn main() {
                     }
                     panic!("sample comparison failed");
                 }
-                // Both matched and advanced RNG to the same state. Leave it at rng_after_gpu.
+                // Both matched and advanced to the same state; adopt the GPU arm.
+                sampler_rng = rng_gpu_arm;
                 gpu_tok
             } else {
                 sampler::sample_top_p_from_candidates(
@@ -563,6 +572,7 @@ fn main() {
                     sc.repeat_penalty,
                     temp,
                     sc.top_p,
+                    &mut sampler_rng,
                 )
             }
         } else {
@@ -573,7 +583,7 @@ fn main() {
                 sc.repeat_window,
                 sc.repeat_penalty,
             );
-            sampler::sample_top_p(&logits, temp, sc.top_p)
+            sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng)
         };
     }
 

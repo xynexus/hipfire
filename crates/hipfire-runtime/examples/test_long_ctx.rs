@@ -43,6 +43,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    let mut sampler_rng = sampler::SamplerRng::from_entropy();
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
@@ -266,7 +267,7 @@ it?"
         // ── Decode ──
         println!("\n<<< TURN {} ASSISTANT:", turn_idx + 1);
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = sampler::sample_top_p(&logits, temp, top_p);
+        let mut next_token = sampler::sample_top_p(&logits, temp, top_p, &mut sampler_rng);
 
         let t_gen = Instant::now();
         let mut generated: Vec<u32> = Vec::new();
@@ -366,7 +367,7 @@ it?"
             } else {
                 sc.answer_temp
             };
-            next_token = sampler::sample_top_p(&logits, t, top_p);
+            next_token = sampler::sample_top_p(&logits, t, top_p, &mut sampler_rng);
 
             if seq_pos + 4 >= max_seq {
                 eprintln!("\n[ctx exhausted at seq_pos={}]", seq_pos);
