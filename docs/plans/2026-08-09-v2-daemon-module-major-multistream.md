@@ -184,12 +184,35 @@ But generation then fails with `moe.decode-routed-dtype-unsupported-no-fallback`
 `!use_gpu_topk && !routed_experts_resident`, and under paged residency
 `routed_experts_resident` is **false by design** — the doc at `:196-197` says only the
 GPU-top-K path is available. So paging *requires* a GPU-top-K-indexable routed dtype.
-`MoeResolution::routed_indexable` (`families/moe.rs:133`) does list
-`routed_indexable_oq4`, so OQ4 ought to qualify; it did not resolve that way here, and
-`moe_decode.rs:695-711` has an all-false fallback branch that zeroes every
-`routed_dtype_indexable_*` and `use_gpu_topk`. **Why that branch was taken for a paged OQ4
-artifact is the open question** — it is the gate on M4/M5 using this artifact, and it is
-where the next session should start.
+Traced further, and **there are two causes, not one**:
+
+**Cause 1 — the indexed OQ decode kernels are disabled because they are numerically
+broken.** `routed_dtype_indexable_oq4 = oq_indexed_decode && …`
+(`qwen35/mod.rs:1774`), and `oq_indexed_decode` is
+`qwen35_moe_oq_indexed_decode_enabled()` (`:1824`), whose own comment says:
+*"`HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` re-enables the experimental indexed routed OQ decode
+kernels **while debugging their finite-KLD failure**."* So this is not "experimental,
+opt-in" — the premier quant family's indexed routed decode is switched off because it
+produces wrong output, and nothing else can serve paged residency.
+
+**This is the sharpest instance yet of the pattern already recorded for the fused dense
+batch path: the fast paths admit deprecated and special-use formats and exclude the premier
+one.** Here the premier path exists, is wired, and is disabled pending a numerics fix.
+
+**Cause 2 — setting the flag is not sufficient.** With
+`HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` the refusal is unchanged, so dtype resolution under paged
+residency is failing independently. The suspect is `MoePrefillDtypes::from_ffn`
+(`qwen35/mod.rs:1644`): with `ffn.experts` empty it takes a branch requiring
+`ffn.expert_gate_up_dtype`/`expert_down_dtype` to be `Some`, and the pager's
+`oq4_canonical_to_moe_blocks` repack may present a different `DType` than `Oq4G256`
+anyway. **Resolving which of those it is, is where the next session starts** — it is a
+two-line instrumentation question, not a design question.
+
+**Consequence for sequencing.** M4 is *dispatch* work and does not need paging, so it can
+proceed against a pinned artifact on a box with a large enough carveout (halo, 128 GB), or
+against a smaller MoE here. M5 on this box needs cause 1 fixed. Do **not** requantize to
+`mq4` to get moving: magnum is deprecated, and routing around the gap buys a measurement on
+a dying format while leaving the premier path broken.
 
 **(b) The refusal panics rather than returning an error.**
 `generate.rs:2979` `unwrap()`s the dispatch result, so an unsupported-dtype *refusal* — the
