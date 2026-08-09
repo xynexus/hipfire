@@ -197,14 +197,13 @@ env_vars! {
          reported `pp512 t/s` from a per-token warm-pass for five arches.";
 
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
-    DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
-        "Store DeltaNet recurrent state as FP16 instead of FP32, halving \
-         per-sequence state (~149 MB -> ~75 MB on 27B/122B-A10B, doubled again \
-         while spec-decoding). Storage only; arithmetic stays FP32. Default off: \
-         FP32 is the numerical reference, and FP16 is proven only on short \
-         horizons while the failure mode that killed Q8 state was long-decode \
-         attractors on low-redundancy models. Validate long decode on a small \
-         model before trusting it.";
+    DN_STATE_FP32 = "HIPFIRE_DN_STATE_FP32", Developer,
+        "Force FP32 DeltaNet recurrent state. Default is FP16 (half the \
+         per-sequence state; storage only, arithmetic stays FP32). Set this to \
+         get the numerical REFERENCE back: FP32 is what every 'is this \
+         precision or a bug?' comparison resolves against, and quantized state \
+         hid for months precisely because nobody could diff against an exact \
+         baseline. Also the first thing to try if long decode degenerates.";
 
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,

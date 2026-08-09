@@ -102,16 +102,27 @@ pub fn deltanet_state_fp32_below() -> usize {
 /// Reconcile by adding an FP32/FP16 tree kernel — not by enabling Q8 state.
 pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     let _ = config;
-    // `.flag()`, NOT `.parse_or(false)`. `parse_or` goes through Rust's
-    // `FromStr for bool`, which accepts ONLY "true"/"false" — so the obvious
-    // `HIPFIRE_DN_STATE_FP16=1` parses as Err and silently falls back to FP32.
-    // That is not hypothetical: it cost a full 24-minute KLD run that reported
-    // "FP16" results identical to FP32 to the last digit, because it had
-    // quietly run FP32 twice. `flag()` accepts 1/true/on/yes.
-    if hipfire_env::DN_STATE_FP16.flag() {
-        StateQuant::FP16
-    } else {
+    // `.flag()`, NOT `.parse_or(false)`: `parse_or` goes through Rust's
+    // `FromStr for bool`, which accepts ONLY "true"/"false", so `=1` parses as
+    // Err and falls back silently. That cost a 24-minute KLD run which reported
+    // "FP16" numbers identical to FP32 to the last digit because it had quietly
+    // run FP32 twice.
+    //
+    // FP16 is the DEFAULT as of 2026-08-09, with FP32 as the opt-out. Evidence:
+    // on Qwen3.5-35B-A3B, +0.68% mean KLD (0.039176 vs 0.038913), ~40x smaller
+    // than the CI half-width; and on the low-redundancy 2B — where Q8 broke
+    // first — greedy decode tracked FP32 EXACTLY for 720 tokens with
+    // degeneration metrics unchanged (unique_ratio 0.3325 vs 0.3317, max_freq
+    // 0.0450 vs 0.0458), against Q8's recorded signature of 0.625 -> 0.555 and
+    // 0.055 -> 0.078.
+    //
+    // That evidence is one prompt on one model, which is why FP32 stays one
+    // flag away rather than being deleted: it is the oracle, and losing the
+    // ability to diff against it is how quantized state hid for months.
+    if hipfire_env::DN_STATE_FP32.flag() {
         StateQuant::FP32
+    } else {
+        StateQuant::FP16
     }
 }
 
