@@ -1585,10 +1585,12 @@ fn dummy_release_sessions_removes_state() {
 #[test]
 fn selects_fused_backend_by_default_for_fused_candidate_plans() {
     let fused_grouped_ok = || Ok::<(), String>(());
+    let fused_dense_ok = || Ok::<(), String>(());
     assert_eq!(
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
             None,
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1598,6 +1600,7 @@ fn selects_fused_backend_by_default_for_fused_candidate_plans() {
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
             None,
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1607,6 +1610,7 @@ fn selects_fused_backend_by_default_for_fused_candidate_plans() {
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::SerialExact,
             Some("auto"),
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1880,10 +1884,12 @@ fn auto_grouped_moe_decode_stays_serial_when_native_route_is_unsupported() {
 #[test]
 fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
     let fused_grouped_ok = || Ok::<(), String>(());
+    let fused_dense_ok = || Ok::<(), String>(());
     assert_eq!(
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
             Some("fused"),
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1892,6 +1898,7 @@ fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
     let err = select_qwen35_prefill_batch_backend(
         GenerateBatchPrefillPlan::SerialExact,
         Some("fused"),
+        fused_dense_ok(),
         fused_grouped_ok(),
     )
     .unwrap_err();
@@ -1899,6 +1906,7 @@ fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
     let moe_err = select_qwen35_prefill_batch_backend(
         GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
         Some("fused"),
+        fused_dense_ok(),
         fused_grouped_ok(),
     )
     .unwrap();
@@ -1908,10 +1916,12 @@ fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
 #[test]
 fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
     let fused_grouped_ok = || Ok::<(), String>(());
+    let fused_dense_ok = || Ok::<(), String>(());
     assert_eq!(
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
             Some("fused_moe"),
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1921,6 +1931,7 @@ fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
             Some("grouped_moe"),
+            fused_dense_ok(),
             fused_grouped_ok(),
         )
         .unwrap(),
@@ -1929,6 +1940,7 @@ fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
     let dense_err = select_qwen35_prefill_batch_backend(
         GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
         Some("fused_moe"),
+        fused_dense_ok(),
         fused_grouped_ok(),
     )
     .unwrap_err();
@@ -1936,6 +1948,7 @@ fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
     let serial_err = select_qwen35_prefill_batch_backend(
         GenerateBatchPrefillPlan::SerialExact,
         Some("grouped_moe"),
+        fused_dense_ok(),
         fused_grouped_ok(),
     )
     .unwrap_err();
@@ -1951,6 +1964,7 @@ fn auto_grouped_moe_falls_back_to_serial_when_fused_capability_fails() {
         select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
             None,
+            Ok(()),
             unsupported.clone(),
         )
         .unwrap(),
@@ -1959,10 +1973,40 @@ fn auto_grouped_moe_falls_back_to_serial_when_fused_capability_fails() {
     let err = select_qwen35_prefill_batch_backend(
         GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
         Some("fused_moe"),
+        Ok(()),
         unsupported,
     )
     .unwrap_err();
     assert!(err.contains("requires K_TOP=8"));
+}
+
+/// Dense mirror of the grouped-MoE fallback above: an AWQ-calibrated model
+/// (`mq4+`) is dtype-eligible but the fused body does not apply its `awq_scale`,
+/// so selection must route it to serial rather than let it reach the kernel.
+#[test]
+fn auto_dense_falls_back_to_serial_when_fused_capability_fails() {
+    let unsupported = Err::<(), String>(
+        "dense session fused prefix does not support lm_head (AWQ pre-scaled weights: the fused body does not apply the awq_scale sidecar; dtype MQ4G256)"
+            .to_string(),
+    );
+    assert_eq!(
+        select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+            None,
+            unsupported.clone(),
+            Ok(()),
+        )
+        .unwrap(),
+        Qwen35PrefillBatchBackend::SerialReference
+    );
+    let err = select_qwen35_prefill_batch_backend(
+        GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        Some("fused"),
+        unsupported,
+        Ok(()),
+    )
+    .unwrap_err();
+    assert!(err.contains("awq_scale"));
 }
 
 #[test]

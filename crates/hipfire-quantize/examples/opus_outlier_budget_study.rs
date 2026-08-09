@@ -38,7 +38,7 @@ const CLIP_GRID: [f32; 14] = [
 /// The pre-P2 selector, verbatim: int4-only seed, then two rounds of
 /// set-at-fixed-scale / scale-at-fixed-set. Kept local — it exists only as the
 /// baseline this study measures against, and must not drift back into the lib.
-fn old_alternating(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
+fn old_alternating(group: &[f32; 256], n_out: usize) -> (f32, Vec<usize>) {
     fn int4_seed(group: &[f32; 256]) -> f32 {
         const SEED_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
         let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -60,7 +60,7 @@ fn old_alternating(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
         }
         best_scale
     }
-    fn refit(group: &[f32; 256], idx: &[usize; 256], n_out: usize, fallback: f32) -> f32 {
+    fn refit(group: &[f32; 256], idx: &[usize], n_out: usize, fallback: f32) -> f32 {
         let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let mut best_scale = fallback.max(1e-12);
         let mut best_err = mixed_overlay_error(group, best_scale, idx, n_out);

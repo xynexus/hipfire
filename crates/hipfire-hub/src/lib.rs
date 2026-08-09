@@ -98,18 +98,26 @@ impl From<reqwest::Error> for Error {
 pub struct RepoFile {
     pub path: String,
     pub size: u64,
-    /// LFS oid — a SHA-256 of the content. `None` for small non-LFS files,
-    /// which the hub does not give a content hash for.
+    /// LFS oid — a SHA-256 of the content. `None` for a small non-LFS file.
     pub sha256: Option<String>,
+    /// Git blob SHA-1, present for every file the tree API lists.
+    ///
+    /// For a non-LFS file this is the only content hash the hub offers, and it
+    /// is a real one: `sha1("blob <len>\0" + content)`. Verified against all 13
+    /// non-LFS files of amd/chatglm3-6b-onnx-ryzenai-npu, 13 matches, 0
+    /// mismatches. Treating those files as merely length-checkable left
+    /// integrity on the table.
+    pub git_oid: Option<String>,
 }
 
 impl RepoFile {
-    /// Whether this file can be proven correct, or only checked by length.
+    /// Whether the file can be proven correct at all.
     ///
-    /// Callers must report which of the two applied rather than implying a
-    /// stronger guarantee than was actually made.
+    /// Callers must report *which* hash applied rather than implying a stronger
+    /// guarantee than was made: SHA-256 over the content, or the weaker git
+    /// blob SHA-1.
     pub fn is_content_addressed(&self) -> bool {
-        self.sha256.is_some()
+        self.sha256.is_some() || self.git_oid.is_some()
     }
 }
 
@@ -161,10 +169,16 @@ pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
             .and_then(|l| l.get("oid"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let git_oid = e
+            .get("oid")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() == 40)
+            .map(|s| s.to_string());
         out.push(RepoFile {
             path: path.to_string(),
             size,
             sha256,
+            git_oid,
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -230,6 +244,24 @@ pub async fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
+/// Git blob hash of a file already on disk: `sha1("blob <len>\0" + content)`.
+pub async fn git_blob_sha1_file(path: &Path) -> Result<String> {
+    use sha1::Digest as _;
+    let len = tokio::fs::metadata(path).await?.len();
+    let mut h = sha1::Sha1::new();
+    h.update(format!("blob {len}\0").as_bytes());
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -237,6 +269,179 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Where a streamed transfer's bytes go instead of to a blob file.
+///
+/// This is a trait rather than a closure because the consumer carries state
+/// across chunks — the safetensors header it has not finished reading, the
+/// tensor piece it is filling — and has to be told when to throw that state
+/// away.
+pub trait ByteSink {
+    /// The next bytes, in order, from the start of the file.
+    fn chunk(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    /// Discard everything accepted for this file; the transfer restarts at 0.
+    fn reset(&mut self) -> std::io::Result<()>;
+    /// Report a transfer event — a resume, a retry — to whatever is rendering
+    /// this fetch.
+    ///
+    /// The default writes to stderr, which is what this module used to do
+    /// directly. A sink drawing a progress bar overrides it so the message can
+    /// be printed *around* the bar: an unsynchronised write to stderr corrupts
+    /// a live bar, and the hub has no way to suspend one it does not own.
+    fn note(&self, msg: &str) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Resume state for a streamed transfer, carried across retry attempts.
+///
+/// A store-backed fetch resumes from the `.part` on disk and re-hashes its
+/// prefix. A streamed one has no `.part` — the bytes were consumed as they
+/// passed — so the digest state has to live here instead, which means resume
+/// works only within the process that started it.
+///
+/// That is the trade the single-copy archive buys. A fetch interrupted by a
+/// dropped connection still resumes byte-for-byte, which is the case that
+/// actually happens and the one a fixed attempt budget cannot survive; a fetch
+/// interrupted by the *process* dying restarts that file rather than the repo.
+pub struct StreamProgress {
+    sha: Sha256,
+    /// Retained only when the hub offers no SHA-256, so the weaker git blob
+    /// SHA-1 can still be checked. Those files are the small non-LFS ones —
+    /// configs and tokenizers — so holding them is bounded in practice.
+    side: Option<Vec<u8>>,
+    consumed: u64,
+}
+
+impl StreamProgress {
+    pub fn new(file: &RepoFile) -> Self {
+        StreamProgress {
+            sha: Sha256::new(),
+            side: file.sha256.is_none().then(Vec::new),
+            consumed: 0,
+        }
+    }
+
+    /// Source bytes accepted so far — the progress measure the retry loop
+    /// judges attempts by.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    fn accept(&mut self, chunk: &[u8]) {
+        self.sha.update(chunk);
+        if let Some(buf) = &mut self.side {
+            buf.extend_from_slice(chunk);
+        }
+        self.consumed += chunk.len() as u64;
+    }
+
+    fn restart(&mut self) {
+        self.sha = Sha256::new();
+        if let Some(buf) = &mut self.side {
+            buf.clear();
+        }
+        self.consumed = 0;
+    }
+}
+
+/// Fetch one file straight into `sink`, verified, without ever staging it on
+/// disk.
+///
+/// This is the same transfer as [`fetch_file_from`] with the blob file removed:
+/// the digest is still computed over every byte on the wire and still checked
+/// before the caller is told the file is good. What changes is *when* the caller
+/// learns that. A blob is renamed into place only after it verifies, so nothing
+/// downstream ever sees unverified bytes; a sink has already consumed them by
+/// then, so the sink — not this function — owns undoing that. `Error::Digest`
+/// is the signal to do so.
+pub async fn fetch_file_streamed(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    file: &RepoFile,
+    st: &mut StreamProgress,
+    sink: &mut dyn ByteSink,
+) -> Result<()> {
+    let url = format!("{base}/{repo}/resolve/{revision}/{}", file.path);
+
+    let mut req = auth(client()?.get(&url));
+    if st.consumed > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", st.consumed));
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(classify(status, &file.path));
+    }
+    // A server that ignores Range answers 200 with the whole body. There is no
+    // way to skip the prefix without re-deriving the sink's internal state, so
+    // take the honest option and start the file over.
+    let resuming = st.consumed > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if st.consumed > 0 && !resuming {
+        st.restart();
+        sink.reset()?;
+    } else if resuming {
+        sink.note(&format!(
+            "hub: resuming {} at {:.2} GB",
+            file.path,
+            st.consumed as f64 / 1e9
+        ));
+    }
+
+    let want = resp
+        .headers()
+        .get("x-linked-etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string())
+        .filter(|s| s.len() == 64)
+        .or_else(|| file.sha256.clone());
+
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            // Keep the progress: the next attempt ranges from here rather than
+            // starting over, which is what makes a multi-GB shard finish at all
+            // on a link that drops.
+            Err(e) => return Err(Error::Retryable(format!("{}: {e}", file.path))),
+        };
+        sink.chunk(&chunk)?;
+        st.accept(&chunk);
+    }
+
+    let got = hex(&st.sha.clone().finalize());
+    if let Some(want) = &want {
+        if &got != want {
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got,
+            });
+        }
+    } else if let Some(want) = &file.git_oid {
+        use sha1::Digest as _;
+        let body = st.side.as_deref().unwrap_or(&[]);
+        let mut g = sha1::Sha1::new();
+        g.update(format!("blob {}\0", st.consumed).as_bytes());
+        g.update(body);
+        let got_git = hex(&g.finalize());
+        if &got_git != want {
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got: got_git,
+            });
+        }
+    } else if file.size != 0 && st.consumed != file.size {
+        return Err(Error::Fatal(format!(
+            "{}: got {} bytes, expected {}",
+            file.path, st.consumed, file.size
+        )));
+    }
+    Ok(())
 }
 
 /// Download one file into the blob store, verified, and commit it atomically.
@@ -267,8 +472,8 @@ pub async fn fetch_file_from(
 ) -> Result<PathBuf> {
     // A content-addressed blob we already hold is already proven; there is
     // nothing to gain by fetching it again.
-    if let Some(sha) = &file.sha256 {
-        let blob = store.blob_path(sha);
+    if let Some(name) = file.sha256.as_deref().or(file.git_oid.as_deref()) {
+        let blob = store.blob_path(name);
         if blob.exists() {
             return Ok(blob);
         }
@@ -387,6 +592,31 @@ pub async fn fetch_file_from(
                 got,
             });
         }
+    } else if let Some(want) = &file.git_oid {
+        // No LFS digest, but the tree API's `oid` is a git blob hash and is
+        // verifiable. Length alone would accept a same-size wrong file.
+        use sha1::Digest as _;
+        let mut g = sha1::Sha1::new();
+        g.update(format!("blob {written}\0").as_bytes());
+        let mut rd = tokio::fs::File::open(&part).await?;
+        let mut buf = vec![0u8; 8 << 20];
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut rd, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            g.update(&buf[..n]);
+        }
+        drop(rd);
+        let got_git = hex(&g.finalize());
+        if &got_git != want {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(Error::Digest {
+                path: file.path.clone(),
+                want: want.clone(),
+                got: got_git,
+            });
+        }
     } else if file.size != 0 && written != file.size {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(Error::Fatal(format!(
@@ -395,7 +625,16 @@ pub async fn fetch_file_from(
         )));
     }
 
-    let final_path = store.blob_path(want.as_deref().unwrap_or(&got));
+    // Name the blob the way the HF cache does: the LFS sha256 when there is
+    // one, otherwise the git blob sha1 that serves as the etag. Naming a
+    // non-LFS blob by its content sha256 instead makes it invisible to every
+    // lookup that starts from the tree API, which is how this was found.
+    let blob_name = want
+        .as_deref()
+        .or(file.git_oid.as_deref())
+        .unwrap_or(&got)
+        .to_string();
+    let final_path = store.blob_path(&blob_name);
     if let Some(p) = final_path.parent() {
         tokio::fs::create_dir_all(p).await?;
     }

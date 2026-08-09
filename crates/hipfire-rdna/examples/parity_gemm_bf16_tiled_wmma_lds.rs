@@ -19,7 +19,10 @@ fn f32_to_bf16_value(x: f32) -> f32 {
     f32::from_bits((f32_to_bf16_bits(x) as u32) << 16)
 }
 fn bf16_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+        .collect()
 }
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
@@ -40,8 +43,10 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
     let y_tiled = gpu.alloc_tensor(&[b, m], DType::F32).unwrap();
     let y_lds = gpu.alloc_tensor(&[b, m], DType::F32).unwrap();
 
-    gpu.gemm_bf16_tiled_wmma(&w_gpu, &x_gpu, &y_tiled, m, k, b, 4, 4).unwrap();
-    gpu.gemm_bf16_tiled_wmma_lds(&w_gpu, &x_gpu, &y_lds, m, k, b).unwrap();
+    gpu.gemm_bf16_tiled_wmma(&w_gpu, &x_gpu, &y_tiled, m, k, b, 4, 4)
+        .unwrap();
+    gpu.gemm_bf16_tiled_wmma_lds(&w_gpu, &x_gpu, &y_lds, m, k, b)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let yt = gpu.download_f32(&y_tiled).unwrap();
     let yl = gpu.download_f32(&y_lds).unwrap();
@@ -74,7 +79,10 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
         "  M={m:<6} K={k:<5} B={b:<5}: LDS-vs-tiled max_abs={exact:.6} [{}]  {}  -> {}",
         if exact_pass { "BIT-EXACT" } else { "DIFF!" },
         if k <= 256 {
-            format!("cpu={cpu_max:.5}(tol {cpu_tol:.5})[{}]", if cpu_pass { "ok" } else { "FAIL" })
+            format!(
+                "cpu={cpu_max:.5}(tol {cpu_tol:.5})[{}]",
+                if cpu_pass { "ok" } else { "FAIL" }
+            )
         } else {
             "cpu=skip(K>256)".to_string()
         },
@@ -86,7 +94,10 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP gemm_bf16_tiled_wmma_lds parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP gemm_bf16_tiled_wmma_lds parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
     println!("gemm_bf16_tiled_wmma_lds parity on {}", gpu.arch);

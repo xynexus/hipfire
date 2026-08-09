@@ -204,7 +204,10 @@ fn run_shape_gx(gpu: &mut Gpu, m: usize, k: usize, b: usize, group: usize, group
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP gemm_oq4_grouped_wmma_lds parity: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP gemm_oq4_grouped_wmma_lds parity: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
     let group = 256usize;
@@ -225,7 +228,11 @@ fn main() {
         all &= run_shape(&mut gpu, m, k, b, group);
     }
     println!("decoupled activation group (gemm_oq4_grouped_wmma_lds_gx):");
-    for (m, k, b) in [(1024usize, 1024usize, 512usize), (1536, 1024, 512), (1000, 1024, 100)] {
+    for (m, k, b) in [
+        (1024usize, 1024usize, 512usize),
+        (1536, 1024, 512),
+        (1000, 1024, 100),
+    ] {
         for gx in [256usize, 128, 64] {
             all &= run_shape_gx(&mut gpu, m, k, b, group, gx);
         }

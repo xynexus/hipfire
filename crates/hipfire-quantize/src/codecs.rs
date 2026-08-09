@@ -10,6 +10,7 @@
 // Helpers still defined in main.rs (crate root); codecs is a descendant module
 // so it can reference these private items. They will move here in a later batch.
 use crate::{cpu_fwht_256, f16_to_f32, f32_to_f16};
+use hipfire_primitives::fwht::signed_fwht;
 use hipfire_quant_format::QuantType;
 
 /// Block byte length for a fixed-geometry format — single-sourced from
@@ -537,41 +538,41 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
 
 /// Rank group positions by int8-upgrade gain; the first `n_out` are the overlay.
 /// `pub` so budget studies can score allocations without re-deriving the metric.
-pub fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
+///
+/// Slice-typed rather than `[f32; 256]` so one selector covers every group size
+/// (G=128 as well as G=256).
+pub fn mixed_overlay_indices(group: &[f32], scale: f32, n_out: usize) -> Vec<usize> {
     let inv = 1.0 / scale.max(1e-12);
     // Precomputed, NOT recomputed inside the comparator. A 256-element sort runs
-    // ~2000 comparisons and the old form evaluated `gain` twice per comparison —
-    // ~4000 evaluations to rank 256 values. `mixed_clipsearch` calls this once
-    // per scale candidate, so that waste was multiplied by the grid.
-    let gains: [f32; 256] = core::array::from_fn(|index| {
-        let value = group[index];
-        let q4 = (value * inv).round().clamp(-7.0, 7.0);
-        let q8 = (value * inv).round().clamp(-127.0, 127.0);
-        let error4 = value - q4 * scale;
-        let error8 = value - q8 * scale;
-        error4 * error4 - error8 * error8
-    });
-    let mut indices: [usize; 256] = core::array::from_fn(|index| index);
-    indices[..].sort_unstable_by(|&left, &right| {
+    // ~2000 comparisons and evaluating the gain inside the comparator costs two
+    // evaluations per comparison — ~4000 to rank 256 values. `mixed_clipsearch`
+    // calls this once per scale candidate, so that waste is multiplied by the grid.
+    let gains: Vec<f32> = group
+        .iter()
+        .map(|&value| {
+            let q4 = (value * inv).round().clamp(-7.0, 7.0);
+            let q8 = (value * inv).round().clamp(-127.0, 127.0);
+            let error4 = value - q4 * scale;
+            let error8 = value - q8 * scale;
+            error4 * error4 - error8 * error8
+        })
+        .collect();
+    let mut indices: Vec<usize> = (0..group.len()).collect();
+    indices.sort_unstable_by(|&left, &right| {
         gains[right]
             .partial_cmp(&gains[left])
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| left.cmp(&right))
     });
-    debug_assert!((1..=256).contains(&n_out));
+    debug_assert!((1..=group.len()).contains(&n_out));
     indices
 }
 
 /// SSE of the mixed encoding: overlay slots clamp to int8, the bulk to int4.
 /// The objective `mixed_clipsearch` minimises; `pub` for the same reason.
-pub fn mixed_overlay_error(
-    group: &[f32; 256],
-    scale: f32,
-    indices: &[usize; 256],
-    n_out: usize,
-) -> f32 {
+pub fn mixed_overlay_error(group: &[f32], scale: f32, indices: &[usize], n_out: usize) -> f32 {
     let inv = 1.0 / scale.max(1e-12);
-    let mut is_w8 = [false; 256];
+    let mut is_w8 = vec![false; group.len()];
     for &index in &indices[..n_out] {
         is_w8[index] = true;
     }
@@ -612,8 +613,10 @@ const MIXED_CLIP_GRID: [f32; 14] = [
 /// biased seed — the seed scale is chosen as if EVERY position were clamped to
 /// ±7, but `n_out` of them are not, so it systematically over-shrinks before the
 /// set is ever considered, and the alternation can only descend from there.
-pub fn mixed_clipsearch(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
-    debug_assert!((1..=256).contains(&n_out));
+/// origin/master re-derived that alternating form while generalising the codec
+/// to G=128 slices; this keeps the joint search and takes the slice generality.
+pub fn mixed_clipsearch(group: &[f32], n_out: usize) -> (f32, Vec<usize>) {
+    debug_assert!((1..=group.len()).contains(&n_out));
     let amax = group.iter().fold(0.0f32, |max, value| max.max(value.abs()));
     let mut best_scale = (amax / 7.0).max(1e-12);
     let mut best_indices = mixed_overlay_indices(group, best_scale, n_out);
@@ -1146,18 +1149,57 @@ pub fn quantize_oqplus_compact(
     signs2: &[f32],
     w8_frac: f32,
 ) -> Vec<u8> {
-    let group_size = 256usize;
-    let n_out = ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, 255);
-    let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
+    quantize_oqplus_compact_g(f32_data, signs1, signs2, w8_frac, 256)
+}
+
+/// Group-generic `OqPlusCompact`. `group` must be a power of two and divide the
+/// FWHT length of `signs1`/`signs2`, which the CALLER supplies — G=256 uses sign
+/// seeds 42/1042, G=128 uses 43/1043 (matching `ensure_mq_signs_128`, the table
+/// the runtime rotate uploads). Passing the wrong pair silently rotates by a
+/// different transform, so the seeds are the caller's contract to get right.
+///
+/// G=128 exists for COVERAGE, not size: the group must divide K, so a model
+/// whose K is a multiple of 128 but not 256 cannot use G=256 at all. Matching
+/// G=256's quality costs ~+0.125 bits/weight — see
+/// docs/experiments/2026-08-06-oq-compact-group-size.md.
+pub fn quantize_oqplus_compact_g(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    w8_frac: f32,
+    group_size: usize,
+) -> Vec<u8> {
+    assert!(
+        group_size.is_power_of_two() && group_size >= 32,
+        "OQ+C group must be a power of two >= 32 (got {group_size})"
+    );
+    assert_eq!(
+        signs1.len(),
+        group_size,
+        "signs1 length must equal the group"
+    );
+    assert_eq!(
+        signs2.len(),
+        group_size,
+        "signs2 length must equal the group"
+    );
+    // The overlay index is a u8, so a position must fit in 0..=255; that also
+    // caps n_out itself at 255.
+    let n_out =
+        ((w8_frac as f64 * group_size as f64).round() as usize).clamp(1, group_size.min(256) - 1);
+    let header = 2 + group_size / 2; // f16 scale + packed nibbles
+    let block_bytes = header + 2 * n_out;
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
     for b in 0..n_blocks {
         let start = b * group_size;
         let end = (start + group_size).min(n);
-        let mut group = [0.0f32; 256];
+        // Sized to the group, not a fixed 256: `signed_fwht` is the generic
+        // power-of-two form that `cpu_fwht_256` wraps.
+        let mut group = vec![0.0f32; group_size];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
-        cpu_fwht_256(&mut group, signs1, signs2);
+        signed_fwht(&mut group, signs1, signs2);
         let (scale, idx) = mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;
@@ -1165,13 +1207,13 @@ pub fn quantize_oqplus_compact(
         output[out_off] = (scale_f16 & 0xFF) as u8;
         output[out_off + 1] = (scale_f16 >> 8) as u8;
         // Bulk int4 nibbles (every position; outlier slots get overridden on load).
-        for i in 0..128 {
+        for i in 0..group_size / 2 {
             let qlo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
             let qhi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
             output[out_off + 2 + i] = ((qlo as u8) & 0xf) | (((qhi as u8) & 0xf) << 4);
         }
         // Sparse int8 outlier overlay: (u8 index-in-group, i8 value).
-        let tbl = out_off + 130;
+        let tbl = out_off + header;
         for (s, &pos) in idx[..n_out].iter().enumerate() {
             let q8 = (group[pos] * inv).round().clamp(-127.0, 127.0) as i8;
             output[tbl + 2 * s] = pos as u8;
@@ -2955,5 +2997,33 @@ mod tests {
         assert!(scale.is_finite() && scale > 0.0, "scale {scale}");
         assert_eq!(indices.len(), 256);
         assert!(mixed_overlay_error(&group, scale, &indices, 3).is_finite());
+    }
+
+    /// Same argmin property at G=128. `mixed_clipsearch_is_the_grid_argmin`
+    /// covers G=256 only, and the group size is exactly what changed in the
+    /// origin/master merge: upstream generalised this codec from `[f32; 256]`
+    /// to slices while re-deriving the OLD alternating search. The merge keeps
+    /// the joint search and takes the slice generality, so the smaller group
+    /// needs its own cover or the new size is untested.
+    #[test]
+    fn mixed_clipsearch_is_the_grid_argmin_at_g128() {
+        let group: Vec<f32> = (0..128)
+            .map(|i| (i as f32 * 0.173).sin() * 1.7 + if i % 23 == 0 { 9.0 } else { 0.0 })
+            .collect();
+        for n_out in [1, 3, 7, 15] {
+            let (best_scale, best_indices) = mixed_clipsearch(&group, n_out);
+            assert_eq!(best_indices.len(), 128);
+            let best_error = mixed_overlay_error(&group, best_scale, &best_indices, n_out);
+            let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for clip in MIXED_CLIP_GRID {
+                let scale = (clip * amax / 7.0).max(1e-12);
+                let indices = mixed_overlay_indices(&group, scale, n_out);
+                let error = mixed_overlay_error(&group, scale, &indices, n_out);
+                assert!(
+                    best_error <= error + 1e-6,
+                    "n_out={n_out}: clip {clip} scores {error} < returned {best_error}"
+                );
+            }
+        }
     }
 }

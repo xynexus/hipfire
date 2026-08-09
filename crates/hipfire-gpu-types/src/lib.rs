@@ -68,6 +68,28 @@ pub enum DType {
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
     Oq8G256, // Opus Quant W8A8: symmetric signed-INT8, FWHT-rotated, per-group f32 scale (iu8 WMMA).
+    // Opus Quant W8A8, compact-resident: the on-disk OqPlusCompact (qt=36) blocks
+    // kept as-is on device instead of expanded to one int8 per weight at load.
+    //   [f16 scale | 128 packed signed-int4 | N_out * (u8 idx, i8 val)]
+    //   block_stride = 130 + 2*N_out, one block per (row, 256-group)
+    // FWHT-rotated like Oq8G256 and consumed by the same W8A8 math — the kernel
+    // decodes the nibbles and applies the overlay per tile — but the byte layout
+    // is block-structured with an in-block f16 scale rather than a flat int8
+    // plane plus a split f32 scale plane, so it must be a distinct dtype for the
+    // same reason the DflashOq*Plain variants are: a loader or GEMM that treated
+    // it as Oq8G256 would read 4-bit data as 8-bit and silently produce garbage.
+    // `block_stride` is not carried here — it is derivable as
+    // `bytes / (M * K/256)` at the call site.
+    OqCompactG256,
+    // Same block structure as OqCompactG256 at a 128-element group: header is
+    // `2 + 128/2` = 66 bytes rather than 130, and `block_stride` derives as
+    // `bytes / (M * K/128)`. Distinct dtype rather than a parameter because the
+    // group also selects the FWHT length (128-point, sign seeds 43/1043, the
+    // one MQ4G128 already uses) — reading it as G256 would rotate by the wrong
+    // transform. It exists for COVERAGE of models whose K is a multiple of 128
+    // but not 256, not to beat G=256 on size; see
+    // docs/experiments/2026-08-06-oq-compact-group-size.md.
+    OqCompactG128,
     // DFLASH plain-basis Opus storage. These variants preserve the arch-20
     // sidecar's original interleaved blocks on device:
     //   Oq8Plain        [f16 scale | 256 i8]                       (258 B)
@@ -130,6 +152,11 @@ impl DType {
             | DType::DflashOq4MixedPlain
             | DType::W8A8Ref
             | DType::Oq8G256
+            // OqCompactG256 is block-structured with a variable-width overlay
+            // table, so like Bf16L3 it has no per-element stride: a length is
+            // `M * (K/256) * (130 + 2*N_out)`, never `n * size()`.
+            | DType::OqCompactG256
+            | DType::OqCompactG128
             // BF16L3's payload is planar with a variable escape plane, so
             // there is no per-element stride at all — byte-level, like Raw.
             // Anything computing a length as `n * size()` is wrong for it and

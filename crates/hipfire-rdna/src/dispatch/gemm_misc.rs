@@ -1447,8 +1447,16 @@ impl Gpu {
         group: usize,
         group_x: usize,
     ) -> HipResult<()> {
-        assert_eq!(group % group_x, 0, "gemm_oq4_grouped_wmma_lds_gx: group_x must divide group");
-        assert_eq!(group_x % 64, 0, "gemm_oq4_grouped_wmma_lds_gx: group_x must be a multiple of 64");
+        assert_eq!(
+            group % group_x,
+            0,
+            "gemm_oq4_grouped_wmma_lds_gx: group_x must divide group"
+        );
+        assert_eq!(
+            group_x % 64,
+            0,
+            "gemm_oq4_grouped_wmma_lds_gx: group_x must be a multiple of 64"
+        );
         self.gemm_oq4_grouped_wmma_lds_inner(
             w_i4, w_scales, x_i4, x_scales, y_f32, m, k, batch_size, group, group_x, false,
         )
@@ -1489,16 +1497,37 @@ impl Gpu {
         bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % 64, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of 64");
-        assert_eq!(group % 64, 0, "gemm_oq4_grouped_wmma_lds: group must be a multiple of 64");
-        assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of group");
+        assert_eq!(
+            k % 64,
+            0,
+            "gemm_oq4_grouped_wmma_lds: K must be a multiple of 64"
+        );
+        assert_eq!(
+            group % 64,
+            0,
+            "gemm_oq4_grouped_wmma_lds: group must be a multiple of 64"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_oq4_grouped_wmma_lds: K must be a multiple of group"
+        );
         let decoupled = group_x != group;
         let (entry, src) = if decoupled {
-            ("gemm_oq4_grouped_wmma_lds_gx", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+            (
+                "gemm_oq4_grouped_wmma_lds_gx",
+                kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC,
+            )
         } else if bf16 {
-            ("gemm_oq4_grouped_wmma_lds_bf16out", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+            (
+                "gemm_oq4_grouped_wmma_lds_bf16out",
+                kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC,
+            )
         } else {
-            ("gemm_oq4_grouped_wmma_lds", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+            (
+                "gemm_oq4_grouped_wmma_lds",
+                kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC,
+            )
         };
         self.ensure_kernel(entry, src, entry)?;
         let wp = w_i4.buf.as_ptr();

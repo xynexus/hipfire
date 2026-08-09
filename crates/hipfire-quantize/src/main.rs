@@ -3398,10 +3398,50 @@ fn resolve_hf_cache_root(path: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+/// HF hub cache roots to search, most specific first — the same precedence
+/// `huggingface_hub` itself uses: `HF_HUB_CACHE`, then `$HF_HOME/hub`, then the
+/// default `~/.cache/huggingface/hub`.
+///
+/// Searching only the default was a real miss: a host that points its cache at a
+/// shared mount via `HF_HOME` would re-download a model it already had.
+fn hf_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = hipfire_env::hf_hub_cache() {
+        roots.push(dir);
+    }
+    if let Some(dir) = hipfire_env::hf_home() {
+        roots.push(dir.join("hub"));
+    }
+    if let Some(home) = hipfire_env::home_dir() {
+        roots.push(home.join(".cache/huggingface/hub"));
+    }
+    roots
+}
+
+/// Run the HuggingFace download CLI.
+///
+/// Prefers `hf` (huggingface_hub >= 1.0) and falls back to the legacy
+/// `huggingface-cli` for older installs. Current huggingface_hub releases have
+/// REMOVED `huggingface-cli` — it exits non-zero with a deprecation notice — so
+/// calling it first silently broke `--input <org/name>` for any uncached model.
+fn run_hf_download(model_id: &str) -> std::io::Result<std::process::ExitStatus> {
+    match std::process::Command::new("hf")
+        .args(["download", model_id])
+        .status()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("huggingface-cli")
+                .args(["download", model_id])
+                .status()
+        }
+        other => other,
+    }
+}
+
 /// Resolve a model input to a local directory path.
 /// Accepts: local path, HuggingFace model ID (org/name), or HF cache path.
 /// If the input looks like a HF model ID and isn't a local path, tries to find it
-/// in the HF cache or downloads it via huggingface-cli.
+/// in any configured HF cache root, then downloads it via the HuggingFace CLI.
 fn resolve_model_path(input: &str) -> String {
     let path = Path::new(input);
 
@@ -3424,36 +3464,48 @@ fn resolve_model_path(input: &str) -> String {
             let org = parts[0];
             let name = parts[1];
 
-            // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
-            let home = hipfire_env::home_dir().unwrap_or_default();
-            // Join rather than format: `home` is a PathBuf, and string-building
-            // a path breaks on any home directory that is not plain UTF-8.
-            let cache_dir = home
-                .join(".cache/huggingface/hub")
-                .join(format!("models--{org}--{name}"));
+            // Check every configured cache root:
+            // <root>/models--{org}--{name}/snapshots/*/
+            // Join rather than format: the roots are PathBufs, and
+            // string-building a path breaks on any non-UTF-8 component.
+            let repo_dir = format!("models--{org}--{name}");
+            let cache_dirs: Vec<PathBuf> = hf_cache_roots()
+                .into_iter()
+                .map(|root| root.join(&repo_dir))
+                .collect();
 
-            if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
-                eprintln!("Resolved {input} -> {}", snapshot.display());
-                return snapshot.to_string_lossy().to_string();
+            for cache_dir in &cache_dirs {
+                if let Some(snapshot) = resolve_hf_cache_root(cache_dir) {
+                    eprintln!("Resolved {input} -> {}", snapshot.display());
+                    return snapshot.to_string_lossy().to_string();
+                }
             }
 
-            // Not in cache — try to download
-            eprintln!("Model {input} not found locally. Downloading via huggingface-cli...");
-            let status = std::process::Command::new("huggingface-cli")
-                .args(["download", input])
-                .status();
-
-            match status {
+            // Not in any cache root — try to download.
+            eprintln!("Model {input} not found locally. Downloading via the HuggingFace CLI...");
+            match run_hf_download(input) {
                 Ok(s) if s.success() => {
-                    // Retry cache lookup after download
-                    if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
-                        eprintln!("Downloaded {input} -> {}", snapshot.display());
-                        return snapshot.to_string_lossy().to_string();
+                    // Retry the lookup: the download may land in whichever root
+                    // the CLI's own env resolution picked.
+                    for cache_dir in &cache_dirs {
+                        if let Some(snapshot) = resolve_hf_cache_root(cache_dir) {
+                            eprintln!("Downloaded {input} -> {}", snapshot.display());
+                            return snapshot.to_string_lossy().to_string();
+                        }
                     }
+                    eprintln!(
+                        "Download reported success but no snapshot with config.json appeared under: {}",
+                        cache_dirs
+                            .iter()
+                            .map(|d| d.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
-                Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
+                Ok(s) => eprintln!("HuggingFace download failed with status {s}"),
                 Err(e) => eprintln!(
-                    "Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"
+                    "Failed to run the HuggingFace CLI (`hf`, or legacy `huggingface-cli`): {e}. \
+                     Install with: pip install -U huggingface_hub"
                 ),
             }
         }
@@ -3674,6 +3726,9 @@ struct OpusMixedSpec {
     outliers_per_group: usize,
     w8_frac: f32,
     recipe: OqCalibrationRecipe,
+    /// 256 (qt 36) or 128 (qt 52). The group must divide K, so 128 exists to fit
+    /// models whose K is a multiple of 128 but not 256 — coverage, not size.
+    group: usize,
 }
 
 fn parse_opus_mixed_format(format: &str) -> Option<OpusMixedSpec> {
@@ -3684,24 +3739,39 @@ fn parse_opus_mixed_format(format: &str) -> Option<OpusMixedSpec> {
     } else {
         (format, OqCalibrationRecipe::Plain)
     };
+    // `g128` selects the 128-element group (qt 52). The bit arithmetic differs:
+    // the header is 2 + G/2 bytes and each outlier costs 2 bytes per group, so
+    // G=256 is 4.0625 + n/16 and G=128 is 4.125 + n/8. The same number therefore
+    // names a DIFFERENT format at each group, which is why the group has to be
+    // part of the flag rather than inferred.
+    let (base, group) = match base.strip_suffix("g128") {
+        Some(stripped) => (stripped, 128usize),
+        None => (base, 256usize),
+    };
     let bits_text = base.strip_prefix("oq")?;
     if !bits_text.contains('.') {
         return None;
     }
     let requested_bits = bits_text.parse::<f32>().ok()?;
-    let outliers_exact = (requested_bits - 4.0625) * 16.0;
+    let (base_bits, per_outlier, max_outliers) = if group == 128 {
+        (4.125f32, 0.125f32, 31isize)
+    } else {
+        (4.0625f32, 0.0625f32, 62isize)
+    };
+    let outliers_exact = (requested_bits - base_bits) / per_outlier;
     let outliers_per_group = outliers_exact.round() as isize;
-    if !(1..=62).contains(&outliers_per_group)
+    if !(1..=max_outliers).contains(&outliers_per_group)
         || (outliers_exact - outliers_per_group as f32).abs() > 1e-4
     {
         return None;
     }
     let outliers_per_group = outliers_per_group as usize;
     Some(OpusMixedSpec {
-        storage_bits: 4.0625 + outliers_per_group as f32 / 16.0,
+        storage_bits: base_bits + outliers_per_group as f32 * per_outlier,
         outliers_per_group,
-        w8_frac: outliers_per_group as f32 / 256.0,
+        w8_frac: outliers_per_group as f32 / group as f32,
         recipe,
+        group,
     })
 }
 
@@ -3881,6 +3951,8 @@ enum HfqInputFormat {
     Oq6,
     Oq4,
     OqPlusCompact,
+    /// `OqPlusCompact` at a 128-element group (qt 52), for K not divisible by 256.
+    OqPlusCompactG128,
     Oq8,
     Oq8Plus,
 }
@@ -3890,9 +3962,16 @@ fn stacked_expert_oq_format(
     use_oq4: bool,
     use_oq8: bool,
     use_oq8_plus: bool,
+    // 256 or 128; ignored unless `use_opus_mixed`. Threaded through because the
+    // flag's group would otherwise be lost here and silently fall back to 256.
+    opus_group: usize,
 ) -> Option<HfqInputFormat> {
     if use_opus_mixed {
-        Some(HfqInputFormat::OqPlusCompact)
+        Some(if opus_group == 128 {
+            HfqInputFormat::OqPlusCompactG128
+        } else {
+            HfqInputFormat::OqPlusCompact
+        })
     } else if use_oq4 {
         Some(HfqInputFormat::Oq4)
     } else if use_oq8_plus {
@@ -3942,7 +4021,11 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
-            _ if parse_opus_mixed_format(flag).is_some() => Some(Self::OqPlusCompact),
+            _ => match parse_opus_mixed_format(flag) {
+                Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
+                Some(_) => Some(Self::OqPlusCompact),
+                None => None,
+            },
             "oq8" => Some(Self::Oq8),
             "oq8+" | "oq8++" => Some(Self::Oq8Plus),
             _ => None,
@@ -4205,6 +4288,7 @@ fn quantize_hfq_source_tensor(
                 | HfqInputFormat::Oq8
                 | HfqInputFormat::Oq8Plus
                 | HfqInputFormat::OqPlusCompact
+                | HfqInputFormat::OqPlusCompactG128
         )
     {
         return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
@@ -4657,6 +4741,46 @@ fn quantize_hfq_source_tensor(
                 })
             };
             (q, QuantType::OqPlusCompact, 256, "OQ+C")
+        }
+        HfqInputFormat::OqPlusCompactG128 => {
+            // Same tiered W4A8 scheme at a 128-element group (qt 52), for models
+            // whose K is a multiple of 128 but not 256 and so cannot use qt 36 at
+            // all. Coverage, not size: matching G=256's quality costs about
+            // +0.125 bits/weight (docs/experiments/2026-08-06-oq-compact-group-size.md).
+            //
+            // The 128-point FWHT uses sign seeds 43/1043 — the table
+            // `ensure_mq_signs_128` uploads for the runtime rotate. Using the
+            // G=256 pair here would rotate the weights by a transform the
+            // forward never inverts, which looks like plausible garbage rather
+            // than an error, so the signs are built locally rather than reusing
+            // the 256-length `signs1`/`signs2` in scope.
+            let signs1_128 = gen_fwht_signs(43, 128);
+            let signs2_128 = gen_fwht_signs(1043, 128);
+            let m_dim = shape[0] as usize;
+            let w8_frac =
+                outliers_per_group_for(name, OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01));
+            // `oqplus_compact_ldlq_pack` emits 256-element blocks, so tiered LDLQ
+            // has no G=128 form yet. Refuse rather than silently writing blocks
+            // of the wrong group.
+            if OQ4_LDLQ_HESSIAN.get().is_some() {
+                return Err(format!(
+                    "{name}: --ldlq is not supported at group 128 (oq*g128); \
+                     oqplus_compact_ldlq_pack emits 256-element blocks. Use a \
+                     g128 format without '++', or G=256 for this tensor."
+                )
+                .into());
+            }
+            let scaled = awq_scales_for(name).map(|scales| {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                scaled
+            });
+            let w: &[f32] = scaled.as_deref().unwrap_or(&f32_data);
+            let q = quantize_opus_rows(w, m_dim, k, |row| {
+                quantize_oqplus_compact_g(row, &signs1_128, &signs2_128, w8_frac, 128)
+            });
+            (q, QuantType::OqPlusCompactG128, 128, "OQ+C128")
         }
         HfqInputFormat::F16
         | HfqInputFormat::Bf16
@@ -7529,6 +7653,7 @@ fn main() {
             fmt,
             HfqInputFormat::Oq4
                 | HfqInputFormat::OqPlusCompact
+                | HfqInputFormat::OqPlusCompactG128
                 | HfqInputFormat::Oq8
                 | HfqInputFormat::Oq8Plus
                 | HfqInputFormat::Oq2
@@ -10334,8 +10459,13 @@ fn main() {
                 || tiered_layer_is_mq3
                 || antirez_mq3)
                 && supports_g256;
-            let stacked_oq_format =
-                stacked_expert_oq_format(use_opus_mixed, use_oq4, use_oq8, use_oq8_plus);
+            let stacked_oq_format = stacked_expert_oq_format(
+                use_opus_mixed,
+                use_oq4,
+                use_oq8,
+                use_oq8_plus,
+                opus_mixed_spec.map(|s| s.group).unwrap_or(256),
+            );
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -10645,7 +10775,24 @@ fn main() {
         // `-spec` declares exactly those tensors as `SourcePrecision` (finer than the
         // importance-255 protected set, so attn/embed are NOT swept in); we read that
         // class arch-keyed, replacing the old `is_deepseek4_keep_f16` name-match.
-        if (use_deepseek4_source_precision
+        // deepseek4's MLA compressor/indexer streams must stay at source precision
+        // whatever the OUTPUT format — that is a property of those tensors, not of
+        // the deepseek4-* formats. Gating it on `use_deepseek4_source_precision`
+        // meant a generic OQ build quantized them anyway, which is exactly the
+        // "compressor/indexer OQ dtype routing" that blocked deepseek4_compressed
+        // from every Opus cell.
+        //
+        // Scoped to deepseek4 deliberately. `precision_class_via_ingest` consults
+        // EVERY arch's spec, so honouring it unconditionally changes far more than
+        // this blocker asked. Measured on gfx1103 when it was unconditional: all 9
+        // gemma4_ple cells IMPROVED (hfq4 -69%, oq8+/oq8++ -39%) but every minimax
+        // Opus cell REGRESSED (oq8 0.000007 -> 0.000259, 37x worse; oq4 2.7x). The
+        // gemma4 win looks worth having and the minimax regression needs a cause
+        // before anyone widens this — see
+        // docs/plans/2026-08-05-opus-across-model-families.md.
+        let honour_source_precision =
+            use_deepseek4_source_precision || arch_id == ARCH_ID_DEEPSEEK4_FLASH;
+        if (honour_source_precision
             && precision_class_via_ingest(arch_id, name)
                 == Some(hipfire_arch_api::PrecisionClass::SourcePrecision)
             || keep_f16_mtp)
@@ -11532,7 +11679,11 @@ fn main() {
                             .flat_map(|value| value.to_le_bytes())
                             .collect();
                         let oq_format = if use_opus_mixed {
-                            HfqInputFormat::OqPlusCompact
+                            if opus_mixed_spec.map(|s| s.group) == Some(128) {
+                                HfqInputFormat::OqPlusCompactG128
+                            } else {
+                                HfqInputFormat::OqPlusCompact
+                            }
                         } else if use_oq4 {
                             HfqInputFormat::Oq4
                         } else if use_oq8_plus {
@@ -15722,22 +15873,31 @@ mod tests {
     #[test]
     fn stacked_expert_oq_format_includes_mixed_opus() {
         assert_eq!(
-            stacked_expert_oq_format(true, false, false, false),
+            stacked_expert_oq_format(true, false, false, false, 256),
             Some(HfqInputFormat::OqPlusCompact)
         );
+        // The group is what the flag carried, not a default: losing it here is
+        // exactly the silent fall back to 256 the parameter exists to prevent.
         assert_eq!(
-            stacked_expert_oq_format(false, true, false, false),
+            stacked_expert_oq_format(true, false, false, false, 128),
+            Some(HfqInputFormat::OqPlusCompactG128)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, true, false, false, 256),
             Some(HfqInputFormat::Oq4)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, true, false),
+            stacked_expert_oq_format(false, false, true, false, 256),
             Some(HfqInputFormat::Oq8)
         );
         assert_eq!(
-            stacked_expert_oq_format(false, false, false, true),
+            stacked_expert_oq_format(false, false, false, true, 256),
             Some(HfqInputFormat::Oq8Plus)
         );
-        assert_eq!(stacked_expert_oq_format(false, false, false, false), None);
+        assert_eq!(
+            stacked_expert_oq_format(false, false, false, false, 256),
+            None
+        );
     }
 
     #[test]

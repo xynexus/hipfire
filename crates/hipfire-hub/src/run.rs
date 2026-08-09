@@ -23,7 +23,9 @@ pub enum FileState {
     Corrupt { want: String, got: String },
     /// Nothing on disk.
     Missing,
-    /// Present, but the hub offers no content hash, so only length was checked.
+    /// Verified, but against the weaker git blob SHA-1 rather than a SHA-256.
+    GoodGitOid,
+    /// Present, and the hub offers no content hash at all.
     LengthOnly,
     /// On disk but unreadable — a bad sector, which on a no-redundancy array
     /// the filesystem cannot repair. This is a state to report and re-fetch,
@@ -57,7 +59,23 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
                     }
                 }
             }
-            None => FileState::LengthOnly,
+            // No LFS digest: fall back to the git blob hash, which is still a
+            // content hash and still catches a wrong file of the right size.
+            None => match (&f.git_oid, store.blob_path_for(&f)) {
+                (Some(want), Some(blob)) if blob.exists() => {
+                    match crate::git_blob_sha1_file(&blob).await {
+                        Ok(got) if &got == want => FileState::GoodGitOid,
+                        Ok(got) => FileState::Corrupt {
+                            want: want.clone(),
+                            got,
+                        },
+                        Err(Error::Io(e)) => FileState::Unreadable(e.to_string()),
+                        Err(e) => return Err(e),
+                    }
+                }
+                (Some(_), Some(_)) => FileState::Missing,
+                _ => FileState::LengthOnly,
+            },
         };
         out.push((f, state));
     }
@@ -81,10 +99,19 @@ pub async fn fetch(
     let store = Store::new(root, repo);
     std::fs::create_dir_all(store.dir().join("blobs"))?;
 
+    // Claim any partial left by a run that died before sweeping the rest:
+    // an interrupted transfer is progress, not litter.
+    let adopted = store.adopt_orphan_parts().unwrap_or(0);
+    if adopted > 0 {
+        eprintln!(
+            "hub: resuming {:.2} GB left by an interrupted run",
+            adopted as f64 / 1e9
+        );
+    }
     let freed = store.sweep_stale_parts().unwrap_or(0);
     if freed > 0 {
         eprintln!(
-            "hub: swept {:.2} GB of stale .part files",
+            "hub: swept {:.2} GB of unusable .part files",
             freed as f64 / 1e9
         );
     }
@@ -218,6 +245,60 @@ async fn fetch_with_retry(
             }
             // A digest mismatch is not transient noise: the bytes on the wire
             // were wrong. Surface it rather than papering over it with retries.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Retryable(format!(
+        "{}: gave up after {MAX_ATTEMPTS} attempts",
+        f.path
+    )))
+}
+
+/// [`fetch_with_retry`] for a streamed transfer.
+///
+/// Same rule — only consecutive *stalled* attempts count toward giving up — but
+/// progress is measured from the resume state rather than a `.part` on disk,
+/// because a streamed transfer leaves no file to measure.
+pub async fn fetch_file_streamed_with_retry(
+    repo: &str,
+    revision: &str,
+    f: &RepoFile,
+    st: &mut crate::StreamProgress,
+    sink: &mut dyn crate::ByteSink,
+) -> Result<()> {
+    const MAX_STALLED: u32 = 5;
+    const MAX_ATTEMPTS: u32 = 200;
+
+    let mut stalled = 0u32;
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let before = st.consumed();
+        match crate::fetch_file_streamed(crate::HUB, repo, revision, f, st, sink).await {
+            Ok(()) => return Ok(()),
+            Err(Error::Retryable(m)) => {
+                let after = st.consumed();
+                if after > before {
+                    stalled = 0;
+                    delay = std::time::Duration::from_secs(1);
+                } else {
+                    stalled += 1;
+                    if stalled >= MAX_STALLED {
+                        return Err(Error::Retryable(format!(
+                            "{}: {MAX_STALLED} consecutive attempts made no progress ({m})",
+                            f.path
+                        )));
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+                if attempt % 5 == 0 || after == before {
+                    sink.note(&format!(
+                        "hub: {} at {:.2} GB — attempt {attempt} ({m})",
+                        f.path,
+                        after as f64 / 1e9
+                    ));
+                }
+                tokio::time::sleep(delay).await;
+            }
             Err(e) => return Err(e),
         }
     }
