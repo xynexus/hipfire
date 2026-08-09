@@ -31,10 +31,18 @@
 //! - `Conv`                              → LFM2 depthwise causal short-conv mixer (+ conv state)
 //! - `Escape(EscapeKind)`                → irregular/stateful: deepseek4 compressor/indexer/SWA, etc.
 //!
-//! NOTE: nothing here is on a live path yet. The live forward remains
-//! `execute_steps`; this substrate is wired behind `HIPFIRE_FORWARD_LOWERED`
-//! (default off) in later steps, validated byte-identical via the
-//! `HIPFIRE_FORWARD_ORACLE` dual-run.
+//! NOTE: this substrate is **LIVE and DEFAULT-ON** for single-GPU decode as of
+//! 2026-06-07, on qwen35, qwen2, deepseek4, minimax and lfm2moe — each gates on
+//! `HIPFIRE_FORWARD_LOWERED != "0"`, i.e. opt-OUT. Byte-parity was validated per
+//! arch against the hand path before each flip (see each arch's
+//! `*_forward_lowered_enabled` doc comment for the fleet/md5 evidence), with
+//! `HIPFIRE_FORWARD_ORACLE` available for dual-run diffing.
+//!
+//! Two things this does NOT cover, and both matter to anyone building on it:
+//! only **decode** is lowered — prefill is still hand-written control flow — and
+//! each arch keeps escape conditions that force the hand path (capture/oracle
+//! dumping, and for qwen35 also hidden-state ring buffers, GDN tape capture,
+//! `HIPFIRE_RQ_HAND=1` and an active `hipfire_steer` session).
 
 use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::context::DispatchCtx;
@@ -518,10 +526,11 @@ pub fn dispatch_super_op<B: ForwardBindings>(
 /// `WeightRef` construction — that was all frozen at lower time). Total match
 /// over `SuperOpKind`; each arm calls the arch-supplied [`ForwardBindings`].
 ///
-/// This is the forward-as-pipeline hot path. It is NOT on any live path until an
-/// arch's forward (qwen35 first) builds a `LoweredForward` at load and calls this
-/// behind `HIPFIRE_FORWARD_LOWERED` (default off), oracle-validated byte-identical
-/// vs the hand `execute_steps` path before the default is flipped per arch.
+/// This is the forward-as-pipeline hot path, and it is LIVE: qwen35, qwen2,
+/// deepseek4, minimax and lfm2moe all build a `LoweredForward` at load and reach
+/// this on every decode token by default, each having been oracle-validated
+/// byte-identical vs its hand path before its flip (2026-06-07).
+/// `HIPFIRE_FORWARD_LOWERED=0` opts an arch back to its hand loop.
 pub fn run_layer_program<B: ForwardBindings>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
