@@ -256,6 +256,20 @@ fn moe_gemv_plain(
         .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+/// Mechanical bisection marker for the MoE decode path.
+///
+/// `HIPFIRE_MOE_STEP_DEBUG=1` prints a timestamped label at each step. This is a
+/// bounding instrument, not a hypothesis: six plausible causes for the paged
+/// ~160 s/layer stall were wrong, and the only progress came from localising
+/// where time went rather than guessing what consumed it.
+macro_rules! moe_step {
+    ($t:expr, $label:literal) => {
+        if std::env::var("HIPFIRE_MOE_STEP_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[moe-step] {:>8.1}ms {}", $t.elapsed().as_secs_f64() * 1e3, $label);
+        }
+    };
+}
+
 pub fn run_moe_decode(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -283,7 +297,10 @@ pub fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
+    let __step = std::time::Instant::now();
+    moe_step!(__step, "enter run_moe_decode");
     check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    moe_step!(__step, "after check_moe_decode_supported");
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP
@@ -329,6 +346,7 @@ pub fn run_moe_decode(
         None
     };
 
+    moe_step!(__step, "after x_rot_local block");
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
@@ -379,6 +397,7 @@ pub fn run_moe_decode(
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
+    moe_step!(__step, "after gate-side GEMV");
     if !res.use_gpu_topk {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
