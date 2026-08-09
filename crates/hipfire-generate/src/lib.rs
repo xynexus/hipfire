@@ -271,6 +271,9 @@ pub struct GenerateVLParams<'a> {
     /// Encode + cache the image embeddings only, then return without running the
     /// LM decode. Used to pre-warm the vision-embedding cache for a dataset.
     pub encode_only: bool,
+    /// Explicit prompt-framing override; `None` = auto. Carried per request
+    /// instead of read from a thread-local — see `effective_raw`.
+    pub raw: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -428,6 +431,15 @@ pub struct GenerateBatchPrefillSession {
     pub max_think_tokens: usize,
     pub semantic_boundary_checkpoints: bool,
     pub state_handle: GenerateBatchPrefillStateHandle,
+    /// Explicit prompt-framing override; `None` = auto (raw iff the model has no
+    /// chat_template).
+    ///
+    /// The batch path previously had no way to express this at all: framing came
+    /// from a `thread_local RAW_OVERRIDE` that only the plain-`generate` handler
+    /// ever set, and never cleared, so a batch prefill inherited whatever the
+    /// last unrelated `generate` left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -866,8 +878,14 @@ pub fn validate_generate_batch_prefill(
             None => false,
         };
 
+        // Explicit per-session override, mirroring the plain-generate request's
+        // optional `"raw"`. Absent → None → auto, which is the behaviour a batch
+        // prefill should have had all along instead of inheriting a thread-local.
+        let raw = session.get("raw").and_then(|v| v.as_bool());
+
         parsed_sessions.push(GenerateBatchPrefillSession {
             id: session_id.to_string(),
+            raw,
             prompt: session
                 .get("prompt")
                 .and_then(|v| v.as_str())
@@ -1627,6 +1645,7 @@ mod tests {
     fn prefill_session(id: &str) -> GenerateBatchPrefillSession {
         GenerateBatchPrefillSession {
             id: id.to_string(),
+            raw: None,
             prompt: Some("hello".to_string()),
             suffix_tokens: None,
             system_prompt: None,

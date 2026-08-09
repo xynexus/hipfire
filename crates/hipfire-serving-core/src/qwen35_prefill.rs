@@ -332,7 +332,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
                     system: system_prompt,
                     user: "",
                     assistant_prefix,
-                    raw: effective_raw(m),
+                    raw: effective_raw(m, session.raw),
                 }
                 .build_with_user_tokens(&raw_q_tokens))
             }
@@ -347,7 +347,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
             },
             user: "",
             assistant_prefix,
-            raw: effective_raw(m),
+            raw: effective_raw(m, session.raw),
         }
         .build_with_user_tokens(&raw_q_tokens))
     }
