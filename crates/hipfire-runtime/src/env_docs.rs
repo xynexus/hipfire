@@ -2645,7 +2645,7 @@ pub const ENV_HIPFIRE_LM_HEAD_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LOAD_TRANSPORT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LOAD_TRANSPORT",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/weight_pager.rs:1018",
+    source: "crates/hipfire-runtime/src/weight_pager.rs:1133",
 };
 
 /// `HIPFIRE_LOCAL` — Force local-spawn behavior and skip serve HTTP in documented workflows
@@ -3296,7 +3296,21 @@ pub const ENV_HIPFIRE_PACK_IDENTITY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PAGED_MOE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PAGED_MOE_DEBUG",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:471",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:477",
+};
+
+/// `HIPFIRE_PAGER_TIMING` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_PAGER_TIMING: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_PAGER_TIMING",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-runtime/src/weight_pager.rs:701",
+};
+
+/// `HIPFIRE_PAGER_TIMING_EVERY` — Runtime variable controlling pager timing every in hipfire
+pub const ENV_HIPFIRE_PAGER_TIMING_EVERY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_PAGER_TIMING_EVERY",
+    description: "Runtime variable controlling pager timing every in hipfire",
+    source: "crates/hipfire-runtime/src/weight_pager.rs:707",
 };
 
 /// `HIPFIRE_PARO_BATCHED` — Runtime variable controlling paro batched in hipfire
@@ -3977,14 +3991,14 @@ pub const ENV_HIPFIRE_QWEN35_FINITE_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_MOE_DTYPE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_DTYPE_DEBUG",
     description: "from outside. \"HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1\" names them",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:740",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:746",
 };
 
 /// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE` — Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
 pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_LEGACY_INLINE",
     description: "Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1637",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1649",
 };
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Runtime variable controlling qwen35 moe oq indexed in hipfire
@@ -4019,7 +4033,7 @@ pub const ENV_HIPFIRE_QWEN35_RESIDENCY_MODE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD",
     description: "Runtime variable controlling qwen35 routed only moe forward in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:615",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:621",
 };
 
 /// `HIPFIRE_QWEN35_STAGE_SYNC` — Runtime variable controlling qwen35 stage sync in hipfire
@@ -5875,6 +5889,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_OUTLIERS_BY_LAYER,
     ENV_HIPFIRE_PACK_IDENTITY,
     ENV_HIPFIRE_PAGED_MOE_DEBUG,
+    ENV_HIPFIRE_PAGER_TIMING,
+    ENV_HIPFIRE_PAGER_TIMING_EVERY,
     ENV_HIPFIRE_PARO_BATCHED,
     ENV_HIPFIRE_PARO_FA3_FUSED,
     ENV_HIPFIRE_PARO_FUSED_PACK2,

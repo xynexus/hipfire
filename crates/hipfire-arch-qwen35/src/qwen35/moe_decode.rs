@@ -424,30 +424,36 @@ pub(crate) fn ensure_paged_experts_resident(
         .collect::<Vec<_>>();
     unique.sort_unstable();
     unique.dedup();
+    use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+
     let mut pager = pager.borrow_mut();
-    pager
-        .would_fit_expert_module_set(ffn.layer_idx, &unique)
-        .map_err(|e| HipError::new(0, &format!("page expert module set: {e}")))?;
+    page_timing::timed(Phase::WouldFit, || {
+        pager.would_fit_expert_module_set(ffn.layer_idx, &unique)
+    })
+    .map_err(|e| HipError::new(0, &format!("page expert module set: {e}")))?;
     for &expert in &unique {
-        pager
-            .ensure_expert_module_resident(
+        page_timing::timed(Phase::EnsureResident, || {
+            pager.ensure_expert_module_resident(
                 hipfire_runtime::weight_pager::ExpertModuleKey {
                     layer: ffn.layer_idx,
                     expert,
                 },
                 gpu,
             )
-            .map_err(|e| HipError::new(0, &format!("page expert module: {e}")))?;
+        })
+        .map_err(|e| HipError::new(0, &format!("page expert module: {e}")))?;
     }
-    pager
-        .patch_expert_module_ptr_table(
+    page_timing::timed(Phase::PatchPtrTable, || {
+        pager.patch_expert_module_ptr_table(
             ffn.layer_idx,
             &unique,
             &ffn.expert_gate_up_ptrs,
             &ffn.expert_down_ptrs,
             gpu,
         )
-        .map_err(|e| HipError::new(0, &format!("patch expert module ptrs: {e}")))?;
+    })
+    .map_err(|e| HipError::new(0, &format!("patch expert module ptrs: {e}")))?;
+    page_timing::admission(unique.len());
     Ok(())
 }
 
@@ -1144,11 +1150,17 @@ pub(crate) fn moe_ffn_decode_impl(
         }
     }
     if ffn.experts.is_empty() {
+        // The D2H top-k readback is a full device sync per MoE layer per token —
+        // one of the candidates for the paged path's CPU cost, so it is timed
+        // separately from the pager phases inside `ensure_paged_experts_resident`.
         let indices = if let Some(indices) = topk_indices_cpu.as_ref() {
             indices.clone()
         } else {
-            download_i32_tensor(gpu, s.topk_indices, k)?
-                .into_iter()
+            use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+            let raw = page_timing::timed(Phase::TopkReadback, || {
+                download_i32_tensor(gpu, s.topk_indices, k)
+            })?;
+            raw.into_iter()
                 .map(router_index_i32_to_usize)
                 .collect::<Vec<_>>()
         };
