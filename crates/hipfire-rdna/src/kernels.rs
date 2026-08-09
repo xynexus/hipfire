@@ -3290,6 +3290,17 @@ pub const GATED_DELTA_NET_F16_TREE_SRC: &str =
 pub const GATED_DELTA_NET_F16_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f16.hip");
 
+/// Routed FP16-state DeltaNet for independent sessions — the f16 counterpart of
+/// `gated_delta_net_f32_routed_batch_seq`, and the entry point where f16 pays
+/// off most: state is per-SEQUENCE, so cross-session batching is exactly the
+/// high-concurrency case whose resident state f16 halves.
+///
+/// The pointers in `state_ptrs` address f16 buffers, HALF the f32 stride — a
+/// caller holding f32 state must not reach this kernel.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_routed_batch_seq.hip");
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.

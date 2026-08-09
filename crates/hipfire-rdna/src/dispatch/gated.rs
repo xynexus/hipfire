@@ -746,6 +746,81 @@ impl Gpu {
         result
     }
 
+    /// Routed FP16-state DeltaNet for independent sessions — the f16
+    /// counterpart of [`Self::gated_delta_net_f32_routed_batch_seq`], with the
+    /// same argument order.
+    ///
+    /// This is where f16 earns its keep. State is per-SEQUENCE, so its footprint
+    /// scales with concurrency, and this is the cross-session batched path: one
+    /// state per session behind `state_ptrs`, so halving each halves the whole
+    /// fleet's resident state.
+    ///
+    /// The pointers in `state_ptrs` must address **f16** buffers — half the f32
+    /// stride. Passing f32 state here reads every element at the wrong offset,
+    /// which is why the state's precision and this kernel are chosen together.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f16_routed_batch_seq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state_ptrs: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        output: &GpuTensor,
+        ptr_layer_stride: usize,
+        delta_layer_index: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_f16_routed_batch_seq",
+            kernels::GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC,
+            "gated_delta_net_f16_routed_batch_seq",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let spp = state_ptrs.buf.as_ptr();
+        let rsp = row_session_indices.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = delta_layer_index as i32;
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f16_routed_batch_seq",
+            bytes,
+        );
+        let n_tiles = (128 / 4) as u32;
+        let result = self.launch_kernargs(
+            "gated_delta_net_f16_routed_batch_seq",
+            [n_heads as u32, n_tiles, n_sessions as u32],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr rsp, ptr op,
+                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd
+            ],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Linear DeltaNet recurrence with the persistent S state stored as f16 —
     /// the sanctioned half-precision state path.
     ///
