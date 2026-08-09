@@ -6,25 +6,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Correctness test for the non-Q8 tree DeltaNet kernels.
+//! Correctness test for the non-Q8 DeltaNet kernels: the FP32/FP16 tree
+//! variants and the FP16 state kernel.
 //!
 //! These exist so DDTree tree-replay does not require Q8 state, which
-//! `qwen35/state.rs` forbids. Before the Q8 tree kernel can be retired, its
-//! replacements have to be shown to actually replay a tree correctly — a kernel
-//! that merely compiles proves nothing.
+//! `qwen35/state.rs` forbids, and so "never Q8" stops meaning "always FP32".
+//! Before the Q8 kernels can be retired, the replacements have to be shown to
+//! actually work — a kernel that merely compiles proves nothing.
 //!
-//! Two claims are checked, both against the SAME reference: the per-token linear
-//! FP32 kernel called N times on a rolling state, which is what tree spine
-//! semantics are defined to reproduce.
+//! The reference throughout is the per-token linear kernel called N times on a
+//! rolling state, which is what tree spine semantics are defined to reproduce.
+//! Four things are checked:
 //!
-//!   1. `gated_delta_net_f32_tree` on a spine is BYTE-EXACT against it. That is
-//!      why the kernel uses the `col = tid * 4` lane mapping of the FP32 linear
+//!   1. `gated_delta_net_f32_tree` on a spine is BYTE-EXACT against FP32 linear.
+//!      That is why it uses the `col = tid * 4` lane mapping of the FP32 linear
 //!      kernel rather than the Q8 family's stride-32 layout: summation order
 //!      fixes the low bits, so exactness requires matching the kernel you claim
 //!      exactness against.
-//!   2. `gated_delta_net_f16_tree` is close but NOT exact — one f16 rounding per
-//!      tape round-trip. Asserting a bound rather than equality is the point;
-//!      if it ever came back byte-exact the tape would not be f16.
+//!   2. `gated_delta_net_f16` (f16 STATE) vs FP32 linear — the measurement of
+//!      what half-precision state actually costs, with both arms started from
+//!      bit-identical, exactly-f16-representable values so the comparison is of
+//!      storage format and not of initial conditions.
+//!   3. `gated_delta_net_f16_tree` on a spine is BYTE-EXACT against the f16
+//!      LINEAR kernel. This is the strong check on the tree: same storage, same
+//!      lane mapping, same summation order, so a wrong tape stride or a
+//!      mis-resolved parent shows up here even though the loose FP32-relative
+//!      bound in (4) would absorb it.
+//!   4. Neither f16 arm is byte-exact against FP32. If either ever were, the
+//!      storage would not be narrowing and the memory saving would be fictional
+//!      — so equality is a FAILURE here, not a pass.
 //!
 //! Build: `cargo run --release --features deltanet \
 //!   --example test_gated_delta_net_tree_f32 -p hipfire-rdna`
