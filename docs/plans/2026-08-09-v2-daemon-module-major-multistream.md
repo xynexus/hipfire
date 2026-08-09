@@ -247,6 +247,15 @@ rather than read as garbage, and the byte length is validated against
 `oq4_moe_packed_len` instead of the 130 B/group canonical form. `Oq8G256` and
 `OqPlusCompact` want siblings later — `module_requires_host_repack` names all three.
 
+**Consumer — LANDED 2026-08-09.** `Oq4G256MoeBlocks = 53` exists, `block_bytes()` reports
+132 (f32 scale + 128 nibbles, versus canonical's f16 at 130), `module_tensor_resident_len`
+validates it against `oq4_moe_packed_len`, and `oq_gpu_dtype_for_quant_type` maps it to
+`DType::Oq4G256` so dispatch, kernel selection and the indexed path are untouched. It is
+deliberately **absent** from `module_requires_host_repack`, which is the entire saving —
+that one predicate is what makes page-in a verbatim fetch. Two tests pin the contract: the
+new code needs no repack while canonical still does, and both resolve to the *same* resident
+length so a slab can never be sized wrong.
+
 **Producer — `hipfire optimize` needs a real upgrade, not a flag.**
 
 1. **It refuses every artifact this applies to, today.** `optimize.rs` bails when
@@ -260,7 +269,21 @@ rather than read as garbage, and the byte length is validated against
    `oq4_pack_arch_combined` (→ qt 37) which the pager explicitly refuses. The two are
    per-tensor exclusive: a routed expert gets MoE-blocks, a dense weight gets
    arch-combined. An artifact can legitimately carry both.
-3. **Round-trip the module table with recomputed offsets.** Rewriting tensor bytes moves
+3. **Round-trip the module table with recomputed offsets — and expose the layout planner
+   rather than duplicating it.** `write_hfqm_package_mem` passes `hfq.metadata_json`
+   through **unchanged**, so module records keep stale offsets; that is the real reason the
+   tool refuses these artifacts. The writer's layout is deterministic and visible
+   (`hfq.rs:484-503`): `metadata_offset = 32`, `index_offset = 32 + meta.len()`,
+   `index_len = 4 + Σ(2 + name + 1 + 1 + 4·rank + 4 + 8 + 8)`, `data_offset =
+   align_4096(index_offset + index_len)`, then a sequential cursor.
+
+   **Do not re-derive that in the tool.** The repo's own rule is that the transform is "the
+   SAME function the loader calls, so the tool and the loader can never drift" — the layout
+   deserves the same treatment. Add a public planner in `hfq.rs` that both
+   `write_hfqm_package_streaming` and the tool call, then iterate metadata↔offsets to a
+   fixed point in memory (only digit widths change, so it converges in 2–3 rounds). That
+   is the same fixed-point `hipfire-quantize/src/hfq_out.rs:1078-1090` already runs, and it
+   needs no extra write of a 19 GB payload. Rewriting tensor bytes moves
    every `data_offset` / `data_size` / `rel_offset`. The circularity — metadata contains
    the offsets, and the offsets depend on the metadata's own length — is **already solved
    in-repo**: `hipfire-quantize/src/hfq_out.rs:1078-1090` iterates layout and metadata to
