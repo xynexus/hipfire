@@ -18,6 +18,16 @@ pub const SCHED_PRIORITY_REALTIME: u8 = 0;
 pub const SCHED_PRIORITY_DEFAULT: u8 = 64;
 pub const SCHED_PRIORITY_OPPORTUNISTIC: u8 = 255;
 
+/// Default lease reclaim timeout: 10 minutes.
+///
+/// Chosen to be far longer than any legitimate quantum rather than close to one.
+/// The longest real holders are a calibration layer (tens of seconds on a large
+/// model) and a training quantum; a lease held past ten minutes is a dead holder,
+/// not a slow one. Erring long matters because reaping a *live* lease releases
+/// its resources and can put a second batch on the GPU beside it — a worse
+/// failure than the wedge reaping exists to prevent.
+pub const DEFAULT_LEASE_TIMEOUT_MS: u64 = 600_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceBudget {
     pub system_memory_budget_bytes: u64,
@@ -414,6 +424,13 @@ pub struct WorkloadBatchLease {
     pub class: WorkloadClass,
     pub workloads: Vec<WorkloadSpec>,
     pub resources: WorkloadResources,
+    /// When `next_batch` granted this lease, in the caller's `now_ms` clock.
+    ///
+    /// Exists so a lease whose holder died without calling
+    /// [`ContinuousWorkScheduler::complete`] can be reaped. Without it a dropped
+    /// exclusive lease wedges `next_batch` forever, and the correctness of that
+    /// is held together by discipline across every call site.
+    pub granted_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -440,6 +457,12 @@ pub struct ContinuousWorkScheduler {
     active: BTreeMap<u64, WorkloadBatchLease>,
     next_lease_id: u64,
     last_scheduled_owner: Vec<Option<String>>,
+    /// How long a lease may be held before `next_batch` reclaims it, or `None`
+    /// to never reclaim. See [`ContinuousWorkScheduler::set_lease_timeout_ms`].
+    lease_timeout_ms: Option<u64>,
+    /// Leases reclaimed because their holder never called `complete`. Non-zero
+    /// is always a bug report about a caller, never normal operation.
+    leases_reaped_total: u64,
 }
 
 impl ContinuousWorkScheduler {
@@ -453,7 +476,50 @@ impl ContinuousWorkScheduler {
             active: BTreeMap::new(),
             next_lease_id: 1,
             last_scheduled_owner: vec![None; 256],
+            lease_timeout_ms: Some(DEFAULT_LEASE_TIMEOUT_MS),
+            leases_reaped_total: 0,
         }
+    }
+
+    /// Set the lease reclaim timeout; `None` disables reclaiming entirely.
+    ///
+    /// The default is deliberately generous ([`DEFAULT_LEASE_TIMEOUT_MS`]),
+    /// because reaping is not free of risk: it releases the lease's resources on
+    /// the assumption that its holder is gone, and if the holder is in fact
+    /// still running, the scheduler may grant a second batch alongside it. That
+    /// is a worse failure than the wedge it prevents, so the timeout must be far
+    /// longer than any legitimate quantum rather than tuned close to one.
+    pub fn set_lease_timeout_ms(&mut self, timeout_ms: Option<u64>) {
+        self.lease_timeout_ms = timeout_ms;
+    }
+
+    /// Leases reclaimed because `complete` was never called.
+    pub fn leases_reaped_total(&self) -> u64 {
+        self.leases_reaped_total
+    }
+
+    /// Drop leases held longer than the timeout, returning their ids.
+    ///
+    /// Called at the top of [`ContinuousWorkScheduler::next_batch`], which is
+    /// the only place it matters: a stale lease is harmless until it blocks a
+    /// grant. Reclaiming on a timer instead would need a clock the scheduler
+    /// deliberately does not have — every method takes `now_ms` from its caller,
+    /// which is what keeps this crate pure and testable.
+    pub fn reap_expired_leases(&mut self, now_ms: u64) -> Vec<u64> {
+        let Some(timeout) = self.lease_timeout_ms else {
+            return Vec::new();
+        };
+        let expired: Vec<u64> = self
+            .active
+            .iter()
+            .filter(|(_, lease)| now_ms.saturating_sub(lease.granted_ms) > timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            self.active.remove(id);
+        }
+        self.leases_reaped_total += expired.len() as u64;
+        expired
     }
 
     pub fn enqueue(&mut self, mut workload: WorkloadSpec) -> Result<(), String> {
@@ -540,6 +606,11 @@ impl ContinuousWorkScheduler {
     }
 
     pub fn next_batch(&mut self, now_ms: u64) -> Option<WorkloadBatchLease> {
+        // Reclaim first: a lease whose holder died must not be able to block
+        // every workload class forever. Post-M4 the daemon arbitrates text,
+        // image, training and induction through one scheduler, so a single
+        // panicking handler would otherwise stall all four.
+        self.reap_expired_leases(now_ms);
         if self
             .active
             .values()
@@ -598,6 +669,7 @@ impl ContinuousWorkScheduler {
             class: seed.class,
             workloads,
             resources,
+            granted_ms: now_ms,
         };
         self.next_lease_id = self.next_lease_id.saturating_add(1);
         self.active.insert(lease.lease_id, lease.clone());
@@ -2625,6 +2697,89 @@ mod tests {
 
         assert_eq!(lease.class, WorkloadClass::ImageGeneration);
         assert_eq!(lease.workloads.len(), 2);
+    }
+
+    /// A holder that never calls `complete` must not wedge the scheduler
+    /// forever. Before the reaper this was held together by discipline across
+    /// ten call sites; post-M4 one panicking handler would stall text, image,
+    /// training and induction at once, because they share one scheduler.
+    #[test]
+    fn a_dropped_exclusive_lease_is_reclaimed_rather_than_wedging_forever() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler
+            .enqueue(WorkloadSpec::singleton(
+                "train",
+                WorkloadClass::Training,
+                1,
+                0,
+                WorkloadResources {
+                    vram_bytes: 20_000,
+                    gpu_slots: 4,
+                    cpu_threads: 8,
+                    ..WorkloadResources::default()
+                },
+            ))
+            .unwrap();
+        let leaked = scheduler.next_batch(0).unwrap();
+        assert!(leaked.workloads[0].exclusive);
+        // Deliberately no `complete(leaked.lease_id)` — this is the bug.
+
+        scheduler.enqueue(token_workload("decode", 0, 1)).unwrap();
+        assert!(
+            scheduler.next_batch(1).is_none(),
+            "an exclusive lease still blocks while it is plausibly alive"
+        );
+
+        let after = DEFAULT_LEASE_TIMEOUT_MS + 1;
+        let decode = scheduler
+            .next_batch(after)
+            .expect("the stale lease must be reclaimed");
+        assert_eq!(decode.class, WorkloadClass::TokenDecode);
+        assert_eq!(scheduler.leases_reaped_total(), 1);
+    }
+
+    /// The counter is what distinguishes "recovered from a leak" from "never
+    /// leaked". Without it a reaped lease looks exactly like a completed one,
+    /// and the caller bug that produced it stays invisible.
+    #[test]
+    fn completing_a_lease_normally_never_counts_as_reaped() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("decode", 0, 0)).unwrap();
+        let lease = scheduler.next_batch(0).unwrap();
+        scheduler.complete(lease.lease_id).unwrap();
+        // Long past the timeout: a completed lease is simply not there to reap.
+        scheduler.reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS * 10);
+        assert_eq!(scheduler.leases_reaped_total(), 0);
+    }
+
+    /// Reaping a lease whose holder is still running would release its resources
+    /// and let a second batch onto the GPU beside it — worse than the wedge it
+    /// prevents. So the boundary is checked exactly, not approximately.
+    #[test]
+    fn a_lease_inside_the_timeout_is_never_reaped() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("decode", 0, 0)).unwrap();
+        let lease = scheduler.next_batch(0).unwrap();
+        assert_eq!(lease.granted_ms, 0);
+
+        assert!(scheduler.reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS).is_empty());
+        assert_eq!(
+            scheduler.reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS + 1),
+            vec![lease.lease_id]
+        );
+    }
+
+    /// Opting out has to actually opt out: a deployment whose quanta legitimately
+    /// exceed the timeout needs a way to keep the old behaviour.
+    #[test]
+    fn a_disabled_timeout_never_reaps() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.set_lease_timeout_ms(None);
+        scheduler.enqueue(token_workload("decode", 0, 0)).unwrap();
+        let lease = scheduler.next_batch(0).unwrap();
+        assert!(scheduler.reap_expired_leases(u64::MAX).is_empty());
+        assert_eq!(scheduler.leases_reaped_total(), 0);
+        assert!(scheduler.complete(lease.lease_id).is_some());
     }
 
     #[test]

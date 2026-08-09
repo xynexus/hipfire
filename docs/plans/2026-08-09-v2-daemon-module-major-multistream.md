@@ -536,12 +536,28 @@ before it: per-request seeds become meaningless and replay becomes impossible. T
 *Exit:* two sessions with distinct seeds at `temperature=0.8`, decoded in one batched step,
 byte-identical to each run alone.
 
-**M1c — lease reaper.** `complete(lease_id)` (`hipfire-scheduler/src/lib.rs:608`) has no
-timeout and `next_batch` (`:542`) consults `active`; a dropped exclusive lease wedges every
-workload forever, across 10 call sites held together by discipline. With the scheduler
-in-process and leases taken per module batch, this becomes a liveness bug on every panic.
-Return an RAII `LeaseGuard`; add `reap_expired`. *Exit:* drop a `Training` lease without
-completing it; `next_batch` returns `Some` after the reap interval and a counter increments.
+**M1c — lease reaper. LANDED.** `complete(lease_id)` had no timeout and `next_batch`
+consults `active`; a dropped exclusive lease wedged every workload forever, across 10 call
+sites held together by discipline. With the scheduler in-process and leases taken per
+module batch, this becomes a liveness bug on every panic.
+
+Implemented as `granted_ms` on the lease plus `reap_expired_leases(now_ms)` called at the
+top of `next_batch`, with `leases_reaped_total()` and a settable
+`set_lease_timeout_ms(Option<u64>)`. **Not** an RAII `LeaseGuard` as the draft suggested:
+`WorkloadBatchLease` is `Clone` and is handed across a channel to a runner, so a `Drop`
+impl would fire on every clone that went out of scope and complete leases that were still
+running. Reclaiming on a timeout observed by the scheduler is the version that cannot
+misfire on a copy.
+
+The timeout defaults to a deliberately generous 10 minutes, and the reason is the risk
+direction: reaping a *live* lease releases its resources and can put a second batch on the
+GPU beside it, which is worse than the wedge. So it must be far longer than any legitimate
+quantum rather than tuned near one.
+
+*Exit (met):* four unit tests — a dropped exclusive `Training` lease blocks while plausibly
+alive then is reclaimed past the timeout with the counter at 1; a normally completed lease
+never counts as reaped; the boundary is exact (`timeout` does not reap, `timeout + 1`
+does); and `None` disables reclaiming entirely. 41/41 scheduler tests pass.
 
 **M1d — the remaining process globals become per-stream:** `RAW_OVERRIDE`,
 `hipfire_steer::{SESSION, ACTIVE, EPOCH}`, `load_progress::SINK`.
