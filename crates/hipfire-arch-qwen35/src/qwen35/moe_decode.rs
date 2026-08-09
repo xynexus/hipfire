@@ -431,7 +431,13 @@ pub(crate) fn ensure_paged_experts_resident(
         pager.would_fit_expert_module_set(ffn.layer_idx, &unique)
     })
     .map_err(|e| HipError::new(0, &format!("page expert module set: {e}")))?;
-    for &expert in &unique {
+    // Reported PER EXPERT, not just aggregated into the phase total: the
+    // aggregate is only printed once a whole admission completes, so a stall
+    // inside this loop would show as silence rather than as a large number.
+    // That is exactly what happened the first two times this was instrumented.
+    let admit_start = std::time::Instant::now();
+    for (i, &expert) in unique.iter().enumerate() {
+        let t = std::time::Instant::now();
         page_timing::timed(Phase::EnsureResident, || {
             pager.ensure_expert_module_resident(
                 hipfire_runtime::weight_pager::ExpertModuleKey {
@@ -442,6 +448,20 @@ pub(crate) fn ensure_paged_experts_resident(
             )
         })
         .map_err(|e| HipError::new(0, &format!("page expert module: {e}")))?;
+        if page_timing::enabled() {
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if ms > 1.0 || i + 1 == unique.len() {
+                eprintln!(
+                    "[pager-expert] layer={} {}/{} expert={} {:.1}ms (set so far {:.1}ms)",
+                    ffn.layer_idx,
+                    i + 1,
+                    unique.len(),
+                    expert,
+                    ms,
+                    admit_start.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+        }
     }
     page_timing::timed(Phase::PatchPtrTable, || {
         pager.patch_expert_module_ptr_table(
