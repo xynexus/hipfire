@@ -75,12 +75,20 @@ RDNA3.5, dense + MoE) and the full coherence battery." The gate is consumed at
 `decode_layers.rs:42`. The same pattern is live in `hipfire-arch-qwen2`,
 `hipfire-arch-deepseek4`, `hipfire-arch-minimax` and `hipfire-arch-lfm2moe`.
 
-**Two doc comments say the opposite, and they must be fixed before anyone else reasons
-about this design** — `hipfire-dispatch/src/pipeline/superop.rs:34` ("nothing here is on
-a live path yet … default off") and `qwen35/decode_layers.rs:31` ("Default off → the hand
-arms below run unchanged"). Both are stale. One of the two design passes read them and
-concluded the substrate was unproven, which would have added an entire de-risking stage
-this plan does not need.
+**Eight doc comments across five files say the opposite** — the substrate header
+(`superop.rs:34`, "nothing here is on a live path yet … default off"), the doc on
+`run_layer_program` itself (`superop.rs:531`, "It is NOT on any live path"), and one or
+two per arch in `qwen35/decode_layers.rs`, `qwen2.rs`, `minimax/forward.rs` and
+`lfm2moe/forward.rs`. Every one is contradicted by the gate body directly below it, and
+minimax's contradicts itself two lines later ("Default off (opt-in)" then "Lowered is the
+default fast path"). Only deepseek4's comments were already correct, and they are the
+model the rest were rewritten to. One of the two design passes read these and concluded
+the substrate was unproven, which would have added an entire de-risking stage this plan
+does not need.
+
+**Fixed 2026-08-09 in the commit following this doc** — comment-only, no behavior change.
+The original count in this section said "two"; a sweep found eight, and that is the
+finding: the stale claim propagated by copy-paste as each arch was flipped.
 
 Why it matters: **the lowered forward is the only place in hipfire where a forward pass
 is data rather than control flow.** `LoweredForward = Vec<LayerProgram>` of POD `SuperOp`s
