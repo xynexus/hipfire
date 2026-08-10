@@ -181,10 +181,22 @@ into full investigations here.
   - The **top-k indices are valid** (132, 129, 38, 213, 21, 253, 244, 193, all
     within `0..n_exp`), so the GPU-side top-k is fine. The kernel dereferences a
     null pointer, which is the 719 and the MES hang.
-- **Why nothing populates it:**
-  - `patch_expert_ptr_table` (`weight_pager.rs:1397`) has **zero callers**
-    workspace-wide. Its only other occurrences are two doc mentions and its own
-    two internal panic strings.
+- **Why nothing populates it — CORRECTED 2026-08-10, my first reading conflated
+  two functions:**
+  - There are **two** patch functions. `patch_expert_ptr_table` (weight-level,
+    keyed on `resident`) genuinely has **zero callers**. But
+    `patch_expert_module_ptr_table` (module-level, keyed on `resident_modules`)
+    has **two**: `ensure_paged_experts_resident` (`moe_decode.rs:467`, under a
+    `Phase::PatchPtrTable` timing span) and an example.
+  - So the earlier claim "the only function that would patch it has zero call
+    sites" was **wrong**, and so was "paged + indexed MoE has never worked on any
+    path". The patching machinery exists and is wired — on the qwen35 HAND decode
+    path and on `prefill_chunk.rs`. Paged+indexed would work there.
+  - The defect is narrower and entirely about *reachability*: the **lowered
+    super-op pipeline is default-ON and calls neither**
+    `ensure_paged_experts_resident` nor any patch function, and its `MoeParams`
+    carries no pager. So in the default configuration the table is never written,
+    which is what the `non_null=0/256` dump measured.
   - `ensure_paged_experts_resident` has exactly two callers —
     `moe_decode.rs:1187` (qwen35 hand decode) and `prefill_chunk.rs:855` (chunked
     prefill) — and **neither is the lowered pipeline**, which is default-ON and is
@@ -197,8 +209,9 @@ into full investigations here.
   `patch_expert_ptr_table`") and `:253` ("The forward path uses interior
   mutability (`borrow_mut`) at the MoE dispatch site to call `ensure_resident` /
   `patch_expert_ptr_table`"). Neither call happens.
-- **So paged + indexed MoE has never worked on any path**, and the earlier "~160 s
-  per MoE layer" reading was this same null-pointer wedge all along.
+- **So paged + indexed MoE is broken on the DEFAULT path** (lowered pipeline),
+  though it is wired on the hand decode path and `prefill_chunk`. The earlier
+  "~160 s per MoE layer" reading was this same null-pointer wedge all along.
 - **Fix is a design decision, not a patch** — either thread pager access into the
   lowered MoE path so residency + table patching happen where the dispatch does,
   or refuse the paged+indexed combination in backend *selection* with a named
