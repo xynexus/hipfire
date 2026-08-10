@@ -11,7 +11,8 @@
 use std::path::Path;
 
 use crate::{
-    cache::Store, fetch_file, list_files, preflight, sha256_file, Error, RepoFile, Result,
+    cache::Store, fetch_file, list_files, preflight, sha256_file, ChunkMiss, Error, RepoFile,
+    Result,
 };
 
 /// What a check found for one file.
@@ -20,7 +21,17 @@ pub enum FileState {
     /// Blob present and its digest matches.
     Good,
     /// Blob present, digest does not match — the failure a read test cannot see.
-    Corrupt { want: String, got: String },
+    ///
+    /// `windows` names the chunks that actually differ, when a table was
+    /// recorded for this blob. That is the difference between "this 4 GB shard
+    /// is wrong" and a list of byte ranges [`repair`] can fetch. `None` means no
+    /// table (a blob fetched before tables existed), and repair falls back to
+    /// refetching the file.
+    Corrupt {
+        want: String,
+        got: String,
+        windows: Option<Vec<ChunkMiss>>,
+    },
     /// Nothing on disk.
     Missing,
     /// Verified, but against the weaker git blob SHA-1 rather than a SHA-256.
@@ -35,8 +46,17 @@ pub enum FileState {
 }
 
 /// Hash every local blob against the hub's digest.
-pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(RepoFile, FileState)>> {
-    let files = list_files(repo, revision).await?;
+///
+/// `only` restricts the sweep to paths matching a glob. Verifying costs a full
+/// read of everything it covers, so on a large repo checking one shard should
+/// not mean hashing the other fifteen.
+pub async fn verify(
+    root: &Path,
+    repo: &str,
+    revision: &str,
+    only: Option<&str>,
+) -> Result<Vec<(RepoFile, FileState)>> {
+    let files = filtered(list_files(repo, revision).await?, repo, only)?;
     let store = Store::new(root, repo);
     let mut out = Vec::with_capacity(files.len());
     for f in files {
@@ -50,7 +70,14 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
                     // filed under: a blob can rot in place.
                     match sha256_file(&blob).await {
                         Ok(got) if &got == want => FileState::Good,
+                        // Only now, and only when a table exists: localizing
+                        // costs a second read of the file, which is worth
+                        // paying for a blob already known to be wrong and not
+                        // worth paying for the ones that are fine.
                         Ok(got) => FileState::Corrupt {
+                            windows: store
+                                .read_chunks(want)
+                                .and_then(|t| t.mismatched(&blob).ok()),
                             want: want.clone(),
                             got,
                         },
@@ -66,6 +93,9 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
                     match crate::git_blob_sha1_file(&blob).await {
                         Ok(got) if &got == want => FileState::GoodGitOid,
                         Ok(got) => FileState::Corrupt {
+                            windows: store
+                                .read_chunks(want)
+                                .and_then(|t| t.mismatched(&blob).ok()),
                             want: want.clone(),
                             got,
                         },
@@ -89,13 +119,7 @@ pub async fn fetch(
     revision: &str,
     include: Option<&str>,
 ) -> Result<usize> {
-    let mut files = list_files(repo, revision).await?;
-    if let Some(pat) = include {
-        files.retain(|f| glob_match(pat, &f.path));
-    }
-    if files.is_empty() {
-        return Err(Error::Fatal(format!("{repo}: no files matched")));
-    }
+    let files = filtered(list_files(repo, revision).await?, repo, include)?;
     let store = Store::new(root, repo);
     std::fs::create_dir_all(store.dir().join("blobs"))?;
 
@@ -139,8 +163,8 @@ pub async fn fetch(
 ///
 /// This is the operation the store actually needs: one bad shard in sixteen
 /// should cost one shard, not the repo.
-pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
-    let states = verify(root, repo, revision).await?;
+pub async fn repair(root: &Path, repo: &str, revision: &str, only: Option<&str>) -> Result<usize> {
+    let states = verify(root, repo, revision, only).await?;
     let store = Store::new(root, repo);
     let broken: Vec<&RepoFile> = states
         .iter()
@@ -159,11 +183,15 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
     }
     for (f, s) in &states {
         match s {
-            FileState::Corrupt { want, got } => eprintln!(
-                "hub: CORRUPT {} (expected {}…, got {}…)",
+            FileState::Corrupt { want, got, windows } => eprintln!(
+                "hub: CORRUPT {} (expected {}…, got {}…){}",
                 f.path,
                 &want[..16.min(want.len())],
-                &got[..16.min(got.len())]
+                &got[..16.min(got.len())],
+                match windows {
+                    Some(w) => format!(" — {} damaged window(s)", w.len()),
+                    None => String::new(),
+                }
             ),
             FileState::Missing => eprintln!("hub: MISSING {}", f.path),
             FileState::Unreadable(e) => eprintln!("hub: UNREADABLE {} ({e})", f.path),
@@ -179,6 +207,32 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
 
     let mut fixed = 0usize;
     for f in broken {
+        // Patch only the damaged windows when the table says which they are.
+        // One bad 4 MiB window in a 4 GB shard is a 4 MiB transfer instead of
+        // 4 GB, which on this link is seconds against half an hour.
+        let windows = states.iter().find_map(|(g, s)| match s {
+            FileState::Corrupt {
+                want,
+                windows: Some(w),
+                ..
+            } if g.path == f.path && !w.is_empty() => Some((want.clone(), w.clone())),
+            _ => None,
+        });
+        if let Some((want, w)) = windows {
+            match repair_windows(crate::HUB, repo, revision, f, &store, &w, &want).await {
+                Ok(true) => {
+                    store.link(revision, &f.path, &store.blob_path(&want))?;
+                    fixed += 1;
+                    eprintln!("hub: repaired {} ({} window(s))", f.path, w.len());
+                    continue;
+                }
+                // Anything unexpected falls through to the whole-file fetch
+                // rather than failing the run: the slow path always works, and a
+                // repair that refuses to repair is the worse outcome.
+                Ok(false) => {}
+                Err(e) => eprintln!("hub: {} window repair failed ({e}) — refetching", f.path),
+            }
+        }
         // Remove the bad blob first so the fetch cannot mistake it for a hit.
         if let Some(sha) = &f.sha256 {
             let _ = std::fs::remove_file(store.blob_path(sha));
@@ -189,6 +243,79 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
         eprintln!("hub: repaired {}", f.path);
     }
     Ok(fixed)
+}
+
+/// Replace just the damaged windows of a blob, then re-prove the whole file.
+///
+/// `base` is the origin, so the fault-injection suite can serve ranges from a
+/// local socket. Production always passes [`crate::HUB`].
+///
+/// `Ok(false)` means "not repairable this way, use the slow path" — a truncated
+/// blob, a table that does not describe the file on disk, a window that came
+/// back wrong. None of those are errors; they are cases the whole-file fetch
+/// already handles better.
+///
+/// The window hashes localize the damage; the file's own SHA-256 is what
+/// authorises the result. That ordering is what makes it safe to splice bytes
+/// from a fresh request into a file that was already wrong — nothing is
+/// committed until the complete file hashes to what the hub says it should.
+pub async fn repair_windows(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    f: &RepoFile,
+    store: &Store,
+    windows: &[ChunkMiss],
+    want: &str,
+) -> Result<bool> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let Some(table) = store.read_chunks(want) else {
+        return Ok(false);
+    };
+    let blob = store.blob_path(want);
+    let on_disk = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    // A blob of the wrong length is not a patch job. The resuming whole-file
+    // fetch is already good at exactly that case.
+    if on_disk != table.src_len() || windows.iter().any(|w| w.len == 0) {
+        return Ok(false);
+    }
+
+    let bytes: u64 = windows.iter().map(|w| w.len).sum();
+    eprintln!(
+        "hub: {} — {} of {} window(s) differ, fetching {:.2} MB instead of {:.2} GB",
+        f.path,
+        windows.len(),
+        table.hashes().len(),
+        bytes as f64 / 1e6,
+        on_disk as f64 / 1e9
+    );
+
+    let part = store.part_path(&f.path);
+    std::fs::copy(&blob, &part)?;
+    {
+        let mut out = std::fs::OpenOptions::new().write(true).open(&part)?;
+        for w in windows {
+            let got = crate::fetch_range(base, repo, revision, &f.path, w.at, w.len).await?;
+            // Prove each window before it lands. Without this a bad range would
+            // only surface as a whole-file digest failure at the end, with no
+            // indication which of the fetches was the bad one.
+            if blake3::hash(&got).as_bytes() != &table.hashes()[w.index] {
+                let _ = std::fs::remove_file(&part);
+                return Ok(false);
+            }
+            out.seek(SeekFrom::Start(w.at))?;
+            out.write_all(&got)?;
+        }
+        out.sync_all()?;
+    }
+
+    if sha256_file(&part).await? != want {
+        let _ = std::fs::remove_file(&part);
+        return Ok(false);
+    }
+    std::fs::rename(&part, &blob)?;
+    Ok(true)
 }
 
 /// Retry only what retrying can fix, and judge attempts by progress.
@@ -309,6 +436,28 @@ pub async fn fetch_file_streamed_with_retry(
 }
 
 /// Minimal `*` glob, enough for `--include '*.safetensors'`.
+/// Apply a path glob, refusing a pattern that matches nothing.
+///
+/// Erroring rather than returning an empty set is the point: a typo'd glob that
+/// silently verified zero files would report success, which is the worst answer
+/// an integrity check can give.
+fn filtered(files: Vec<RepoFile>, repo: &str, pat: Option<&str>) -> Result<Vec<RepoFile>> {
+    let files = match pat {
+        Some(p) => files
+            .into_iter()
+            .filter(|f| glob_match(p, &f.path))
+            .collect(),
+        None => files,
+    };
+    if files.is_empty() {
+        return Err(Error::Fatal(match pat {
+            Some(p) => format!("{repo}: no files matched {p:?}"),
+            None => format!("{repo}: no files"),
+        }));
+    }
+    Ok(files)
+}
+
 fn glob_match(pat: &str, s: &str) -> bool {
     let mut parts = pat.split('*');
     let Some(first) = parts.next() else {
@@ -344,5 +493,45 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("config.json", "config.json"));
         assert!(!glob_match("model-*", "tokenizer.json"));
+    }
+
+    /// `--only` makes the matcher load-bearing for an integrity check, where a
+    /// pattern that is too loose would quietly skip files. These pin the two
+    /// behaviours that decide that: a suffix pattern anchors at the end, and a
+    /// bare wildcard matches in the middle.
+    #[test]
+    fn glob_anchors_a_suffix_and_matches_in_the_middle() {
+        assert!(!glob_match("*.json", "tokenizer.json.lock"));
+        assert!(glob_match("*00003*", "model-00003-of-00004.safetensors"));
+        assert!(!glob_match("*00003*", "model-00001-of-00004.safetensors"));
+    }
+
+    fn f(path: &str) -> RepoFile {
+        RepoFile {
+            path: path.into(),
+            size: 1,
+            sha256: None,
+            git_oid: None,
+        }
+    }
+
+    /// A pattern that matches nothing is an error, not an empty pass. A verify
+    /// reporting success over zero files is the worst answer it can give.
+    #[test]
+    fn a_pattern_matching_nothing_is_refused() {
+        let files = vec![f("tokenizer.json"), f("model-00001.safetensors")];
+        let err = filtered(files.clone(), "org/model", Some("*.bin"))
+            .expect_err("an unmatched glob must not pass silently");
+        assert!(format!("{err}").contains("*.bin"), "unhelpful: {err}");
+
+        let kept = filtered(files.clone(), "org/model", Some("*.safetensors")).expect("match");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "model-00001.safetensors");
+        assert_eq!(
+            filtered(files, "org/model", None)
+                .expect("unfiltered")
+                .len(),
+            2
+        );
     }
 }
