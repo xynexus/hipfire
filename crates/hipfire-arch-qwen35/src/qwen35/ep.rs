@@ -123,6 +123,8 @@ pub fn forward_ep(
             .zip(dn_per_rank.iter())
         {
             binds.push(Qwen35Bindings {
+                // EP has its own residency story; leave paged refused here.
+                pager: None,
                 layer: &w.layers[layer_idx],
                 s,
                 config,
