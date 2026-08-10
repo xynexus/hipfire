@@ -537,6 +537,20 @@ def plan_stages_to_run(
     return planned, bundle_dependency_invalidated
 
 
+#: Recipe fields recorded but excluded from the recipe fingerprint. Must match
+#: `_UNHASHED_PATH_FIELDS` in scripts/two_pass_quantize.py and
+#: `UNHASHED_PATH_FIELDS` in crates/hipfire-coexistence/src/induction/recipe.rs.
+_UNHASHED_PATH_FIELDS = frozenset(
+    {
+        "cask_artifact",
+        "calibration_artifact",
+        "corpus",
+        "model",
+        "quantized_artifact",
+    }
+)
+
+
 def _target_recipe_fingerprint(
     *,
     target: Path,
@@ -582,7 +596,19 @@ def _target_recipe_fingerprint(
         "expert_coverage_policy": expert_coverage_policy.replace("-", "_"),
         "quant_args": quant_args,
     }
-    encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
+    # Third twin of the same fingerprint (two_pass_quantize.recipe_manifest and
+    # the Rust Recipe::build are the others). Path fields are excluded from the
+    # hash so the fingerprint identifies the recipe rather than one machine's
+    # filesystem — all three must drop exactly the same keys.
+    #
+    # Duplicated rather than imported: this script SHELLS OUT to
+    # two_pass_quantize.py, so importing it would be a new coupling for one
+    # constant. `test_induction_target_fingerprint_matches_two_pass_recipe`
+    # compares the two fingerprints directly and fails if they drift.
+    hashed = {
+        key: value for key, value in recipe.items() if key not in _UNHASHED_PATH_FIELDS
+    }
+    encoded = json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
