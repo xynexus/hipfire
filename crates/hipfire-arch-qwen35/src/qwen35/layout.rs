@@ -86,8 +86,15 @@ pub struct MoeFfnWeights {
     /// Routed expert weights. Populated when this layer is fully resident
     /// (`paged_experts == false`); **empty `Vec`** when `paged_experts == true`
     /// (the [`hipfire_runtime::weight_pager::WeightPager`] owns the buffers, and the
-    /// indexed kernels read pointers from `expert_*_ptrs` which the pager
-    /// patches per-token via `patch_expert_ptr_table`).
+    /// indexed kernels read pointers from `expert_*_ptrs`).
+    ///
+    /// **The paged half of that is NOT wired (verified 2026-08-10).** This comment
+    /// used to say the pager "patches per-token via `patch_expert_ptr_table`". It
+    /// does not: `patch_expert_ptr_table` has zero call sites workspace-wide, so
+    /// under paged residency `expert_*_ptrs` stays all-zero and the indexed
+    /// kernels dereference null — which wedges the GPU (see BUGS.md, MES hang on
+    /// `gemv_oq4g256_moe_gate_up_k8_indexed_batched`). Treat paged + indexed MoE
+    /// as unimplemented, not as working machinery.
     pub experts: Vec<ExpertWeights>, // num_experts (= 256 for A3B); empty in paged mode
     pub shared_expert: SharedExpertWeights,
     pub shared_expert_gate: WeightTensor, // [1, hidden] — row-vector projecting to scalar
@@ -262,10 +269,21 @@ pub struct Qwen35Weights {
     pub rq_corrections: std::collections::HashMap<(u32, RqProj), RqCorr>,
 
     /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
-    /// with `Qwen35Config::paged_experts == true`. The forward path uses
-    /// interior mutability (`borrow_mut`) at the MoE dispatch site to call
-    /// `ensure_resident` / `patch_expert_ptr_table`. `None` means the model
-    /// is fully resident — no behavior change vs main.
+    /// with `Qwen35Config::paged_experts == true`. `None` means the model is
+    /// fully resident — no behavior change vs main.
+    ///
+    /// **Reachability, corrected 2026-08-10.** This used to claim "the forward
+    /// path uses interior mutability (`borrow_mut`) at the MoE dispatch site to
+    /// call `ensure_resident` / `patch_expert_ptr_table`". Only half of that is
+    /// true, and only on paths that are not the default:
+    /// - `ensure_paged_experts_resident` is called from `moe_decode.rs` (the qwen35
+    ///   HAND decode path) and `prefill_chunk.rs`. The **lowered super-op pipeline
+    ///   is default-ON and calls neither**, and its `MoeParams` carries no pager at
+    ///   all, so it cannot.
+    /// - `patch_expert_ptr_table` is called from **nowhere**.
+    ///
+    /// Consequence: on the default path the expert pointer table is never written.
+    /// Do not assume this field being `Some` means paging is active at dispatch.
     pub pager: Option<std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
 }
 
