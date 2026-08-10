@@ -111,8 +111,8 @@ fn main() {
 
     let dn_quant = match std::env::var("HIPFIRE_DELTANET_STATE").ok().as_deref() {
         Some("fp32" | "f32") => qwen35::StateQuant::FP32,
-        Some("q4" | "int4") => qwen35::StateQuant::Q4,
-        _ => qwen35::StateQuant::Q8,
+        Some("fp16" | "f16") => qwen35::StateQuant::FP16,
+        _ => qwen35::StateQuant::FP32,
     };
     eprintln!("DeltaNet state: {dn_quant:?}");
 

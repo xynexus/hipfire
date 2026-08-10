@@ -75,8 +75,20 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let all = tokenizer.encode(&bounded);
     let n_tok = all.len().min(max_tokens);
     let tokens = all[..n_tok].to_vec();
+    // Index-only, so cheap even on a multi-GB source. Ties the calib to the
+    // exact artefact it saw — a path alone does not, once that path is rebuilt.
+    let source_fingerprint =
+        hipfire_runtime::hfq::HfqFile::open_index_only(std::path::Path::new(&m.model_path))
+            .map(|h| h.index_fingerprint())
+            .unwrap_or_else(|_| String::new());
+    // Refuse the frozen eval slice: calibrating on it trains on the test set.
+    if let Err(e) = hipfire_runtime::calibration::reject_eval_corpus(&corpus) {
+        daemon_state.out.error(e);
+        return;
+    }
     let provenance = [
         ("source_model", serde_json::json!(m.model_path)),
+        ("source_fingerprint", serde_json::json!(source_fingerprint)),
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
     ];

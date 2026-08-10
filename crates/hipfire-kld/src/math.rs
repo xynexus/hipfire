@@ -50,19 +50,31 @@ pub fn top_k_log_softmax(logits: &[f32], top_k: usize) -> TopKReduction {
 
     // Rank by logit descending, tie-break by id ascending (matches the
     // historical heap/sort order so byte-identical refs reproduce).
-    let mut order: Vec<u32> = (0..logits.len() as u32).collect();
-    order.sort_by(|&a, &b| {
-        logits[b as usize]
-            .total_cmp(&logits[a as usize])
-            .then_with(|| a.cmp(&b))
-    });
+    //
+    // Selection, not a sort. This runs once per scored position — 1023 per
+    // 2048-token chunk — and fully ordering a 248320-entry vocabulary to keep
+    // 256 of it cost ~5.8 ms each, ~6 s per chunk, which was 70% of a reference
+    // build's wall time with the GPU idle (kernel trace: 3.21 s of GPU against
+    // 10.5 s of chunk). Two costs: `sort_by` is the STABLE sort, so it also
+    // allocates a scratch buffer per call, and the comparator indexes back into
+    // `logits`, making every comparison two random loads over a 1 MB array.
+    //
+    // The comparator is a total order (`total_cmp` then id), so selecting the
+    // first k and ordering only those reproduces the full sort's prefix
+    // exactly — byte-identical references, no tie ambiguity to preserve.
+    let cmp = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1));
+    let mut order: Vec<(f32, u32)> = logits.iter().copied().zip(0u32..).collect();
+    if k < order.len() {
+        order.select_nth_unstable_by(k, &cmp);
+        order.truncate(k);
+    }
+    order.sort_unstable_by(&cmp);
 
     let mut indices = vec![0u32; top_k];
     let mut log_probs = vec![f32::NEG_INFINITY; top_k];
     let mut top_p_sum = 0.0f64;
-    for i in 0..k {
-        let idx = order[i];
-        let log_p = ((logits[idx as usize] as f64) - lz) as f32;
+    for (i, &(logit, idx)) in order.iter().take(k).enumerate() {
+        let log_p = ((logit as f64) - lz) as f32;
         indices[i] = idx;
         log_probs[i] = log_p;
         top_p_sum += (log_p as f64).exp();
@@ -150,6 +162,47 @@ pub fn score_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Selection must reproduce the full sort's prefix exactly — references
+    /// built before and after the change have to stay byte-identical, so the
+    /// tie order (logit desc, id asc) is part of the contract, not an artifact.
+    #[test]
+    fn top_k_log_softmax_matches_full_sort_prefix() {
+        fn reference(logits: &[f32], top_k: usize) -> (Vec<u32>, Vec<f32>) {
+            let k = top_k.min(logits.len());
+            let lz = log_z(logits);
+            let mut order: Vec<u32> = (0..logits.len() as u32).collect();
+            order.sort_by(|&a, &b| {
+                logits[b as usize]
+                    .total_cmp(&logits[a as usize])
+                    .then_with(|| a.cmp(&b))
+            });
+            let mut idx = vec![0u32; top_k];
+            let mut lp = vec![f32::NEG_INFINITY; top_k];
+            for i in 0..k {
+                let id = order[i];
+                idx[i] = id;
+                lp[i] = ((logits[id as usize] as f64) - lz) as f32;
+            }
+            (idx, lp)
+        }
+
+        // Tie-heavy: 11 distinct values over 400 slots puts the k-boundary
+        // inside a run of equal logits, where the id tiebreak is what decides.
+        let tied: Vec<f32> = (0..400).map(|i| ((i * 31) % 11) as f32).collect();
+        // Plus an all-distinct case and one shorter than k.
+        let distinct: Vec<f32> = (0..300).map(|i| (i as f32) * -0.37 + 5.0).collect();
+        let short = vec![1.0f32, -2.0, 0.5];
+
+        for logits in [&tied, &distinct, &short] {
+            for &k in &[1usize, 8, 256] {
+                let got = top_k_log_softmax(logits, k);
+                let (idx, lp) = reference(logits, k);
+                assert_eq!(got.indices, idx, "indices k={k} len={}", logits.len());
+                assert_eq!(got.log_probs, lp, "log_probs k={k} len={}", logits.len());
+            }
+        }
+    }
 
     #[test]
     fn log_z_matches_naive() {

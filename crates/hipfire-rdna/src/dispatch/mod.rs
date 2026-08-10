@@ -139,28 +139,6 @@ pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 #[allow(dead_code)]
 static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
 
-/// Deterministic seed for the Q8 GatedDeltaNet stochastic-rounding RNG.
-///
-/// Must be a pure function of *where we are in the sequence*, never of *how
-/// many dispatches have happened* — two runs that reach the same sequence
-/// position must round identically regardless of how they got there
-/// (issue #17).
-///
-/// - `seq_pos` is the absolute sequence position of the **first** token in
-///   the block being processed. The batched kernel adds its intra-block token
-///   index `t` to `frame`, so `seq_pos + t` is that token's absolute position.
-/// - `delta_layer` is the DeltaNet (linear-attention) layer index. The kernels
-///   already mix head, state row, and lane into the RNG, but **not** the layer;
-///   without this term every LA layer would dither with an identical noise
-///   sequence at a given position (correlated dither across layers). Folding it
-///   in at `2^24` keeps the `frame + t` contract intact and stays collision-free
-///   for sequence positions below ~16.7M.
-#[cfg(feature = "deltanet")]
-#[inline]
-pub(crate) fn gdn_requant_seed(seq_pos: u32, delta_layer: u32) -> i32 {
-    seq_pos.wrapping_add(delta_layer.wrapping_mul(1 << 24)) as i32
-}
-
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
 /// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
@@ -3891,18 +3869,6 @@ impl Gpu {
     }
 
     #[cfg(feature = "deltanet")]
-    fn gdn_q8_reg_gfx1151_enabled(&self) -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| {
-            // HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state
-            // GDN Q8 probe. Default off after A3B pp256 prefill regressed
-            // 11.8ms -> 168.5ms total GDN time.
-            std::env::var("HIPFIRE_GDN_Q8_REG_GFX1151").as_deref() == Ok("1")
-        });
-        enabled && self.arch.starts_with("gfx1151")
-    }
-
-    #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     fn conv1d_silu_split_f32_n_gfx1151(
         &mut self,
@@ -4269,8 +4235,8 @@ impl Gpu {
                 kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string(),
             ),
             (
-                "gated_delta_net_q8_tree",
-                kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string(),
+                "gated_delta_net_f32_tree",
+                kernels::GATED_DELTA_NET_F32_TREE_SRC.to_string(),
             ),
             ("sigmoid_mul", kernels::SIGMOID_MUL_SRC.to_string()),
             ("topk_logits", kernels::TOPK_LOGITS_SRC.to_string()),
@@ -4515,12 +4481,6 @@ impl Gpu {
             kernels::EMBEDDING_F16_BATCHED_SRC.to_string(),
         ));
 
-        // DeltaNet kernels
-        specs.push((
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC.to_string(),
-        ));
-
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
@@ -4711,7 +4671,7 @@ impl Gpu {
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
-                "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
+                "gated_delta_net_f32_tree" => vec!["gated_delta_net_f32_tree"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
                 "topk_logits" => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],
@@ -4719,7 +4679,6 @@ impl Gpu {
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
                 "deinterleave" => vec!["deinterleave_f32"],
                 "repeat_interleave_qk" => vec!["repeat_interleave_qk_f32"],
-                "gated_delta_net_q8" => vec!["gated_delta_net_q8"],
                 // MQ4 GEMV module exports both the main GEMV and the standalone
                 // x rotation kernel used by the prerotated dispatch path.
                 "gemv_mq4g256" => vec!["gemv_mq4g256", "mq_rotate_x"],

@@ -115,6 +115,24 @@ enum Oq4LdlqHessian {
     Hfhs(crate::hfhs_diag::HfhsFull),
 }
 
+/// Routed-expert projections that read the LAYER-SHARED FFN input, and so may
+/// borrow a layer-pooled Hessian. `down_proj`/`w2` are deliberately absent:
+/// they read that expert's own SwiGLU intermediate, and the per-expert input
+/// profiles measured near-orthogonal (cosine 0.04-0.35, `moe_expert_saliency_
+/// study`), so pooling them would average unrelated bases.
+const POOLABLE_EXPERT_LEAVES: &[&str] = &["gate_up_proj", "gate_proj", "up_proj", "w1", "w3"];
+
+/// Tensors that consume the same layer FFN input as the routed experts' gate/up
+/// and therefore carry the pooled Hessian already. The router is the principled
+/// donor — it decides routing FROM that input, so it sees it by construction.
+/// `mlp.gate.down_proj` is zaya's equivalent (its gate block reads `normed`);
+/// the shared expert reads the same input on qwen-style MoE.
+const POOLED_HESSIAN_DONORS: &[&str] = &[
+    "mlp.gate",
+    "mlp.gate.down_proj",
+    "mlp.shared_expert.gate_proj",
+];
+
 impl Oq4LdlqHessian {
     fn k_of(&self, name: &str) -> Option<usize> {
         match self {
@@ -132,6 +150,11 @@ impl Oq4LdlqHessian {
         }
     }
 }
+
+/// How many tensors were quantized against a borrowed layer-pooled Hessian.
+/// Reported at the end of the run so a pooled build is never mistaken for one
+/// where every expert had its own.
+static POOLED_HESSIAN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 
@@ -312,17 +335,90 @@ static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
 
+/// Layer-pooled Hessian donor for a routed-expert projection that reads the
+/// layer-shared FFN input. Routed experts are captured imatrix-only, so without
+/// this `--ldlq` silently RTN-quantizes every one of them.
+///
+/// Safe because the donor must match K exactly: a tensor consuming a different
+/// activation has a different width and is rejected rather than silently
+/// mis-weighting the solve.
+fn pooled_donor_candidates(name: &str) -> Vec<String> {
+    let Some((prefix, rest)) = name.split_once(".mlp.experts.") else {
+        return Vec::new();
+    };
+    // `<expert-index>.<leaf>` — reject anything that is not a routed expert.
+    // Quantizer-side names carry a `.weight` suffix that calib names do not.
+    let Some((idx, leaf)) = rest.split_once('.') else {
+        return Vec::new();
+    };
+    let leaf = leaf.strip_suffix(".weight").unwrap_or(leaf);
+    if idx.parse::<u32>().is_err() || !POOLABLE_EXPERT_LEAVES.contains(&leaf) {
+        return Vec::new();
+    }
+    POOLED_HESSIAN_DONORS
+        .iter()
+        .map(|d| format!("{prefix}.{d}"))
+        .collect()
+}
+
+fn pooled_hessian_donor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<String> {
+    // NOT `parse_or::<bool>`: `bool::from_str` accepts only "true"/"false", so
+    // the documented `=1` would silently parse-fail and disable the flag.
+    if !matches!(
+        hipfire_env::POOLED_EXPERT_HESSIAN.get().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    ) {
+        return None;
+    }
+    pooled_donor_candidates(name)
+        .into_iter()
+        .find(|donor| idx.k_of(donor) == Some(k))
+}
+
+/// Routed-expert leaves whose tensors skip LDLQ entirely, from
+/// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES`. Lets ONE calibration artifact produce
+/// both the with- and without-per-expert-Hessian arms of a comparison, so the
+/// two differ only in the thing under test rather than in their capture.
+fn ldlq_skipped_expert_leaf(name: &str) -> bool {
+    let Some(raw) = hipfire_env::LDLQ_SKIP_EXPERT_LEAVES.get() else {
+        return false;
+    };
+    let Some((_, rest)) = name.split_once(".mlp.experts.") else {
+        return false;
+    };
+    let Some((idx, leaf)) = rest.split_once('.') else {
+        return false;
+    };
+    if idx.parse::<u32>().is_err() {
+        return false;
+    }
+    let leaf = leaf.strip_suffix(".weight").unwrap_or(leaf);
+    raw.split(',')
+        .map(str::trim)
+        .any(|s| !s.is_empty() && s == leaf)
+}
+
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if ldlq_skipped_expert_leaf(name) {
+        LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES)");
+        return None;
+    }
     let candidates = calibration_tensor_name_candidates(name);
-    let Some((key, hk)) = candidates
+    let direct = candidates
         .iter()
-        .find_map(|key| idx.k_of(key).map(|hk| (key.as_str(), hk)))
-    else {
+        .find_map(|key| idx.k_of(key).map(|hk| (key.to_string(), hk)));
+    let Some((key, hk)) = direct.or_else(|| {
+        let donor = pooled_hessian_donor(idx, name, k)?;
+        POOLED_HESSIAN_HITS.fetch_add(1, Ordering::Relaxed);
+        Some((donor, k))
+    }) else {
         LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (no Hessian entry for {candidates:?})");
         return None;
     };
+    let key = key.as_str();
     if hk != k {
         LDLQ_K_MISMATCH.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
@@ -362,6 +458,15 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
     eprintln!(
         "  LDLQ tensors:     success={success} attempts={attempts} missing={missing} k_mismatch={k_mismatch} pack_failed={pack_failed}"
     );
+    // Never let a pooled build be mistaken for one where every expert had its
+    // own Hessian — the two are different experiments.
+    let pooled = POOLED_HESSIAN_HITS.load(Ordering::Relaxed);
+    if pooled > 0 {
+        eprintln!(
+            "  LDLQ pooled:      {pooled} routed-expert tensor(s) used a LAYER-POOLED Hessian \
+             (HIPFIRE_POOLED_EXPERT_HESSIAN=1)"
+        );
+    }
     if strict && success == 0 {
         return Err(format!(
             "calibrated plus format requested, but LDLQ applied to zero tensors (attempts={attempts}, missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
@@ -3916,14 +4021,17 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
+            "oq8" => Some(Self::Oq8),
+            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
+            // Catch-all LAST. The origin/master merge landed this arm above the
+            // oq8 arms — in a region git did not flag as a conflict — which made
+            // every oq8 form unreachable and, since `parse_opus_mixed_format`
+            // does not accept them, rejected `--format oq8` outright.
             _ => match parse_opus_mixed_format(flag) {
                 Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
                 Some(_) => Some(Self::OqPlusCompact),
                 None => None,
             },
-            "oq8" => Some(Self::Oq8),
-            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
-            _ => None,
         }
     }
 }
@@ -4015,16 +4123,30 @@ fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String>
 /// ragged matrix would otherwise join the tail of one row to the head of the
 /// next, which does not match either the HFQ matrix contract or the runtime's
 /// `K.div_ceil(256)` group indexing.
-fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, mut pack_row: F) -> Vec<u8>
+/// Pack an Opus matrix row by row, IN PARALLEL.
+///
+/// The sibling `quantize_*g256` encoders in `codecs.rs` already rayon over their
+/// block chunks; this row loop was the one serial link, so the whole non-LDLQ
+/// Opus path ran on a single core while the LDLQ path used every core. Rows are
+/// independent — the codec carries no cross-row state — and `collect` into an
+/// ordered Vec keeps the output byte-identical to the serial form.
+///
+/// Thread-safety note: `pack_row` runs on rayon workers, so it must not touch a
+/// thread_local set by the caller. Today's closures only call pure codec
+/// functions; the AWQ sidecar is written before this is entered, and the clip
+/// override is a global `AtomicBool` precisely because a thread_local there was
+/// already caught being invisible to workers (see `codecs::CLIP_DISABLED`).
+fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, pack_row: F) -> Vec<u8>
 where
-    F: FnMut(&[f32]) -> Vec<u8>,
+    F: Fn(&[f32]) -> Vec<u8> + Sync + Send,
 {
+    use rayon::prelude::*;
     assert_eq!(weights.len(), m * k, "Opus matrix shape");
-    let mut output = Vec::new();
-    for row in weights.chunks_exact(k) {
-        output.extend_from_slice(&pack_row(row));
-    }
-    output
+    weights
+        .par_chunks_exact(k)
+        .map(&pack_row)
+        .collect::<Vec<Vec<u8>>>()
+        .concat()
 }
 
 fn pad_opus_columns(weights: &[f32], m: usize, k: usize) -> (Vec<f32>, usize) {
@@ -15359,6 +15481,65 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pooled_donors_only_for_shared_input_expert_projections() {
+        // Quantizer-side names carry `.weight`; calib names do not. Both must
+        // resolve, or the fallback silently never fires on real tensors.
+        let w = pooled_donor_candidates("model.layers.7.mlp.experts.3.gate_up_proj.weight");
+        assert!(w.contains(&"model.layers.7.mlp.gate.down_proj".to_string()));
+        assert!(
+            pooled_donor_candidates("model.layers.7.mlp.experts.3.down_proj.weight").is_empty()
+        );
+
+        // gate/up read the layer-shared FFN input, so they may borrow.
+        let d = pooled_donor_candidates("model.layers.7.mlp.experts.3.gate_up_proj");
+        assert!(d.contains(&"model.layers.7.mlp.gate".to_string()));
+        assert!(d.contains(&"model.layers.7.mlp.gate.down_proj".to_string()));
+        assert!(
+            !pooled_donor_candidates("model.language_model.layers.2.mlp.experts.11.w1").is_empty()
+        );
+
+        // down_proj/w2 read the expert's OWN SwiGLU intermediate — a private
+        // basis (cosine 0.04-0.35 between experts), so pooling is invalid.
+        assert!(pooled_donor_candidates("model.layers.7.mlp.experts.3.down_proj").is_empty());
+        assert!(pooled_donor_candidates("model.layers.7.mlp.experts.3.w2").is_empty());
+
+        // Dense tensors and non-expert paths never borrow.
+        assert!(pooled_donor_candidates("model.layers.7.mlp.gate_proj").is_empty());
+        assert!(pooled_donor_candidates("model.layers.7.mlp.shared_expert.gate_proj").is_empty());
+        // `experts.<not-a-number>` is not a routed expert.
+        assert!(
+            pooled_donor_candidates("model.layers.7.mlp.experts.pooled.gate_up_proj").is_empty()
+        );
+    }
+
+    #[test]
+    fn ldlq_expert_leaf_skip_is_scoped_to_routed_experts() {
+        // Serialised with other env-mutating tests would be ideal, but this
+        // reads one variable and restores it immediately.
+        std::env::set_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", "down_proj,w2");
+        assert!(ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
+        assert!(ldlq_skipped_expert_leaf("model.layers.3.mlp.experts.7.w2"));
+        // gate/up is the arm under comparison and must NOT be skipped.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.gate_up_proj.weight"
+        ));
+        // Dense tensors that merely end in the same leaf must not be caught —
+        // this is the whole reason it parses the expert index.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.gate.down_proj.weight"
+        ));
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.shared_expert.down_proj.weight"
+        ));
+        std::env::remove_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES");
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
+    }
 
     /// Build a fake source mmap with a v2 tail blob at `offset`, plus the
     /// matching front `tail_metadata` pointer. Returns (front_json, mmap_bytes).

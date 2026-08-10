@@ -109,7 +109,7 @@ pub use prefill_batch::*;
 ///
 /// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
 /// DeltaNet branch dispatches the tree-aware kernels
-/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
+/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_{f32,f16}_tree_batch_seq`)
 /// which walk per-token ancestor chains via `parent_indices` instead of
 /// the linear-sequence predecessor. This eliminates sibling-subtree
 /// cross-contamination of recurrent state at topk>1. If `parent_indices`
@@ -1150,18 +1150,32 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32 | DType::F16
+        // BF16 was excluded on gfx1151 by the BUG-001 guard: the batched
+        // FullAttention BF16 q/k/v projection was reported to inflate `fa_q`
+        // ~9x there, so BF16 prefill was routed through the per-token
+        // `forward_scratch` loop and described as "slightly slower".
+        //
+        // That failure no longer reproduces, and "slightly" was off by a factor
+        // of 28. Re-tested on gfx1151 / qwen3.5-0.8b bf16, 2048-token chunk:
+        // prefill 58.5 -> 1646.3 tok/s, PPL 24.0318 -> 24.0551, top-1 argmax
+        // agreeing at 99.36%. Nothing resembling layer-0 garbage. The llama
+        // analogue (BUGS.md, "Batched prefill garbage for bf16/f16 llama
+        // models") was root-caused to missing BF16 projection arms rather than
+        // an attention-kernel fault and fixed; this reads as the same defect,
+        // and the guard outlived it.
+        //
+        // CAVEAT, deliberately accepted: the batched path is not numerically
+        // identical to per-token. Typical |delta logit| is ~6e-2 (max 2.4e-1)
+        // against ~4e-6 for pure reordering, and only 15% of positions keep the
+        // same top-256 set. The deltas are flat across position (5.99e-2 first
+        // half vs 6.60e-2 second), so this is a per-position path difference —
+        // most likely q8 KV scales taken per-tile in the batched attention
+        // versus per-token in the fallback — not accumulating drift. Anything
+        // that needs the two to agree bit-for-bit must pin the path explicitly.
+        | DType::BF16
     );
     if always_ok {
         return true;
-    }
-    // BUG-001 guard: the batched FullAttention BF16 q/k/v projection inflates
-    // `fa_q` ~9x on gfx1151 → garbage output (q8/asym KV enables the batched
-    // arm). F16/F32 batched are fine; only BF16 is broken on this arch. Route
-    // BF16 prefill through the per-token forward_scratch path here (correct,
-    // slightly slower) until the batched-arm projection is fixed; gfx1103 et al.
-    // keep the fast batched path. See BUGS.md / trigger a21dccf75.
-    if dt == DType::BF16 {
-        return arch != "gfx1151";
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
@@ -2004,9 +2018,8 @@ pub fn prefill_batch_pbs_eligible(
     }
     !force_fallback
         && n >= MIN_BATCH
-        && matches!(dn_state.quant, StateQuant::Q8 | StateQuant::FP32)
-        && (dn_state.quant == StateQuant::Q8
-            || weights
+        && matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16)
+        && (weights
                 .layers
                 .iter()
                 .all(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_))))
@@ -3660,21 +3673,14 @@ mod tests {
     }
 
     #[test]
-    fn deltanet_state_gate_keys_on_redundancy() {
+    fn deltanet_state_defaults_to_fp32_and_fp16_is_opt_in() {
         let cfg = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
-        // redundancy = linear_key_head_dim (8) × linear_num_value_heads (1) = 8
+        // Redundancy is still reported — it names WHERE to validate a precision
+        // change (small models first; that is where quantized state broke) — but
+        // it no longer SELECTS anything. The threshold that once chose Q8 above a
+        // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-
-        // Default threshold (usize::MAX) ⇒ FP32 for every real model.
-        std::env::remove_var("HIPFIRE_DN_STATE_FP32_BELOW");
         assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
-
-        // Boundary: redundancy < threshold ⇒ FP32; otherwise Q8.
-        std::env::set_var("HIPFIRE_DN_STATE_FP32_BELOW", "9");
-        assert_eq!(default_state_quant(&cfg), StateQuant::FP32); // 8 < 9
-        std::env::set_var("HIPFIRE_DN_STATE_FP32_BELOW", "8");
-        assert_eq!(default_state_quant(&cfg), StateQuant::Q8); // 8 < 8 is false
-        std::env::remove_var("HIPFIRE_DN_STATE_FP32_BELOW");
     }
 
     #[test]
@@ -4299,7 +4305,7 @@ mod tests {
             kv_quant_asym3: false,
             kv_quant_asym4: false,
             kv_quant_fwht: false,
-            dn_quant: StateQuant::Q8,
+            dn_quant: StateQuant::FP32,
         };
         validate_dense_prefill_session_batch_state_signatures(&[q8, q8])
             .expect("matching signatures are batchable");
@@ -4312,7 +4318,10 @@ mod tests {
         assert!(err.contains("incompatible KV/DeltaNet state signature"));
 
         let mut different_dn_quant = q8;
-        different_dn_quant.dn_quant = StateQuant::FP32;
+        // A genuinely different precision. Was Q8-vs-FP32; with Q8 removed the
+        // mismatch has to be expressed as FP32-vs-FP16, or the two halves are
+        // identical and the test asserts nothing.
+        different_dn_quant.dn_quant = StateQuant::FP16;
         let err = validate_dense_prefill_session_batch_state_signatures(&[q8, different_dn_quant])
             .unwrap_err();
         assert!(err.contains("incompatible KV/DeltaNet state signature"));
@@ -4781,17 +4790,12 @@ mod tests {
             .unwrap_err();
         assert!(compact_err.contains("compacted KV offset"));
 
-        let q8_dn = DensePrefillSessionBatchStateSignature {
-            dn_quant: StateQuant::Q8,
-            ..fp32_sig
-        };
-        let q8_err = validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
-            &test_qwen35_config_with_layers(vec![LayerType::LinearAttention]),
-            &[q8_dn, q8_dn],
-            &plan,
-        )
-        .unwrap_err();
-        assert!(q8_err.contains("DeltaNet state"));
+        // The "quantized DeltaNet state is rejected" case is GONE, and not
+        // because the check was dropped: Q8/Q4 no longer exist as StateQuant
+        // variants, so an invalid state cannot be constructed to test with.
+        // The type system now enforces what this runtime check used to — a
+        // strictly stronger guarantee, and the reason there is nothing left to
+        // assert here.
     }
 
     #[test]
@@ -4826,7 +4830,7 @@ mod tests {
             kv_quant_asym3: false,
             kv_quant_asym4: false,
             kv_quant_fwht: false,
-            dn_quant: StateQuant::Q8,
+            dn_quant: StateQuant::FP32,
         };
 
         validate_grouped_moe_prefill_session_batch_state_contract(
@@ -4880,7 +4884,7 @@ mod tests {
             kv_quant_asym3: false,
             kv_quant_asym4: false,
             kv_quant_fwht: false,
-            dn_quant: StateQuant::Q8,
+            dn_quant: StateQuant::FP32,
         };
 
         let dense_err = validate_grouped_moe_prefill_session_batch_state_contract(
@@ -4907,18 +4911,9 @@ mod tests {
         .unwrap_err();
         assert!(fp32_err.contains("must use Q8 KV state"));
 
-        let q4_delta = DensePrefillSessionBatchStateSignature {
-            dn_quant: StateQuant::Q4,
-            ..q8_sig
-        };
-        let q4_err = validate_grouped_moe_prefill_session_batch_state_contract(
-            &moe_config,
-            &[q4_delta, q4_delta],
-            &plan,
-            "gfx1151",
-        )
-        .unwrap_err();
-        assert!(q4_err.contains("supports Q8 or FP32"));
+        // Likewise: a quantized DeltaNet state is no longer representable,
+        // so the arm that rejected it has nothing to reject. The KV-state
+        // contract above still carries this test's weight.
 
         let asym_kv = DensePrefillSessionBatchStateSignature {
             kv_quant_asym3: true,
@@ -5194,7 +5189,7 @@ mod tests {
                     s_matrices: &s0_dn_s,
                     s_scales: &s0_dn_sc,
                     conv_states: &s0_dn_conv,
-                    quant: StateQuant::Q8,
+                    quant: StateQuant::FP32,
                 },
                 logits: &s0_logits,
             },
@@ -5209,7 +5204,7 @@ mod tests {
                     s_matrices: &s1_dn_s,
                     s_scales: &s1_dn_sc,
                     conv_states: &s1_dn_conv,
-                    quant: StateQuant::Q8,
+                    quant: StateQuant::FP32,
                 },
                 logits: &s1_logits,
             },
@@ -5285,7 +5280,7 @@ mod tests {
                     s_matrices: &s0_dn_s,
                     s_scales: &[],
                     conv_states: &s0_dn_conv,
-                    quant: StateQuant::Q8,
+                    quant: StateQuant::FP32,
                 },
                 logits: &s0_logits,
             },
@@ -5300,7 +5295,7 @@ mod tests {
                     s_matrices: &s1_dn_s,
                     s_scales: &s1_dn_sc,
                     conv_states: &s1_dn_conv,
-                    quant: StateQuant::Q8,
+                    quant: StateQuant::FP32,
                 },
                 logits: &s1_logits,
             },

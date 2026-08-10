@@ -225,7 +225,7 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
             kv_quant_asym3: false,
             kv_quant_asym4: false,
             kv_quant_fwht: false,
-            dn_quant: qwen35::StateQuant::Q8,
+            dn_quant: qwen35::StateQuant::FP32,
         };
         session_count
     ];

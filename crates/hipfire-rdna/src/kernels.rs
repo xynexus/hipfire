@@ -3207,51 +3207,55 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_routed_batch_seq.hip");
 
-/// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
-/// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
-/// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8.hip");
-
-/// gfx1151 register-state GDN Q8 experiment. Keeps one S row per thread in
-/// registers and preserves the production stochastic-requant ABI.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_REG_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gfx1151/gated_delta_net_q8_reg.gfx1151.hip");
-
-/// Routed Q8 Gated Delta Net for independent request sessions. One block per
-/// session/head/S-tile scans round-major prefix rows and updates only that
-/// session's recurrent Q8 S state.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_routed_batch_seq.hip");
-/// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
-/// requant outside the loop. Supports EF residual. Lower VGPR pressure.
-#[allow(dead_code)]
-pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
-
-/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
-/// to a caller-owned tape buffer, so sibling tokens read the parent's
-/// post-update state rather than the previous sibling's. Required for
-/// correctness when processing a DDTree-linearized token block.
+/// FP32 tree-aware DeltaNet replay. DFS order with per-token persist-write to a
+/// caller-owned tape, so sibling tokens read the parent's post-update state
+/// rather than the previous sibling's. The tape holds raw f32 — no scales, no
+/// requant, no stochastic rounding. `s_init` is the pre-block snapshot
+/// (READ-ONLY); the caller replays the accepted spine linearly afterwards to
+/// commit the trajectory (same pattern as conv1d_silu_split_tree).
 ///
-/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
-/// kernel never advances persistent dn_state.s_matrices — caller runs
-/// linear replay on the accepted spine post-acceptance to commit the
-/// trajectory (same pattern as conv1d_silu_split_tree).
+/// Spine topology reproduces `gated_delta_net_f32` called n_tokens=1 N times
+/// byte-exactly (same `col = tid * 4` lane mapping, so the same summation order).
 #[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
+pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_tree.hip");
 
-/// GDN recurrence with Q4-quantized S state in VRAM.
-/// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
-/// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
-/// 8x compression vs FP32 (8KB + 512B scales per head vs 64KB).
+/// FP16 tree-aware DeltaNet replay. Both `s_init` and the tape are f16, matching
+/// [`GATED_DELTA_NET_F16_SRC`] — under FP16 state the persistent S matrix IS
+/// f16. Storage f16, arithmetic FP32.
+///
+/// Not byte-exact against the linear FP32 kernel (one f16 rounding per tape
+/// round-trip, accumulating with tree DEPTH, not sibling count). Use the f32
+/// tree kernel when exactness against an FP32 reference is the thing under
+/// test; against the f16 LINEAR kernel on a spine it IS exact.
 #[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q4_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q4.hip");
+pub const GATED_DELTA_NET_F16_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_tree.hip");
+
+/// Linear DeltaNet recurrence with the persistent S state stored as f16 —
+/// the sanctioned half-precision state path (qwen35/state.rs names FP16 or a
+/// purpose-built codec as the only alternatives to FP32, and rules out Q8).
+///
+/// Storage f16, arithmetic FP32: the tile widens into LDS once per call and
+/// narrows once at the end, so a multi-token batch pays a single rounding
+/// rather than one per token. Exactly half the state bytes of
+/// [`GATED_DELTA_NET_SRC`], with no scales tensor, no error-feedback
+/// accumulator and no stochastic rounding — so unlike Q8 it is deterministic
+/// and spec-decode rollback is trivially lossless.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16.hip");
+
+/// Routed FP16-state DeltaNet for independent sessions — the f16 counterpart of
+/// `gated_delta_net_f32_routed_batch_seq`, and the entry point where f16 pays
+/// off most: state is per-SEQUENCE, so cross-session batching is exactly the
+/// high-concurrency case whose resident state f16 halves.
+///
+/// The pointers in `state_ptrs` address f16 buffers, HALF the f32 stride — a
+/// caller holding f32 state must not reach this kernel.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_routed_batch_seq.hip");
 
 /// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
 /// Eliminates 85µs CPU roundtrip per DeltaNet layer.
@@ -4364,6 +4368,7 @@ pub const LMHEAD_COARSE_COMPACT_SRC: &str =
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
 pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
 pub const GEMV_BF16L3_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3_xf32.hip");
+pub const GEMM_BF16L3_XF32_SRC: &str = include_str!("../../../kernels/src/gemm_bf16l3_xf32.hip");
 
 /// Expand a BF16H (Huffman-coded exponent) payload to plain BF16 on device.
 ///

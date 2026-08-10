@@ -549,7 +549,7 @@ pub fn linearize_tree(
 /// slot in the linearized block, the slot index of its parent in the same
 /// linearization, or `-1` for the root slot (slot 0, the seed token).
 ///
-/// Tree-aware kernels (`conv1d_silu_split_tree`, `gated_delta_net_q8_tree`)
+/// Tree-aware kernels (`conv1d_silu_split_tree`, `gated_delta_net_{f32,f16}_tree`)
 /// consume this array to walk per-token ancestor chains instead of the
 /// linear-sequence predecessor. For the GDN kernel: `parent_indices[t] < 0`
 /// means "read from the pre-block initial state" (s_q8_init); otherwise

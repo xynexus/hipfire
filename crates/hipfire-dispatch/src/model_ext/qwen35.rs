@@ -14,10 +14,11 @@ use hipfire_rdna::{Gpu, GpuTensor};
 // ── State quantization ─────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+/// Mirrors `hipfire_arch_qwen35::qwen35::StateQuant`; keep the two in step.
+/// Q8/Q4 removed 2026-08-09 (silent corruption); FP32 default, FP16 opt-in.
 pub enum StateQuant {
     FP32,
-    Q8,
-    Q4,
+    FP16,
 }
 
 // ── Parameter structs ──────────────────────────────────
@@ -84,15 +85,19 @@ pub struct DeltaNetTreeParams<'a> {
     pub v_batch: &'a GpuTensor,
     pub gate_batch: &'a GpuTensor,
     pub beta_batch: &'a GpuTensor,
-    pub s_q8_init: &'a GpuTensor,
-    pub s_scales_init: &'a GpuTensor,
-    pub s_tape_q8: &'a GpuTensor,
-    pub s_tape_scales: &'a GpuTensor,
+    /// Pre-block state snapshot (READ-ONLY). f32 or f16 per `quant`.
+    pub s_init: &'a GpuTensor,
+    /// Per-token tape, `[n_tokens x n_heads x HD x HD]`. No scales: neither f32
+    /// nor f16 needs them — that pair of buffers existed only for Q8.
+    pub s_tape: &'a GpuTensor,
     pub parent_indices: &'a GpuTensor,
     pub output_batch: &'a GpuTensor,
     pub n_tokens: usize,
     pub n_heads: usize,
     pub head_dim: usize,
+    /// Picks the tree kernel. The tape's element size follows it, so a mismatch
+    /// reads every element at the wrong offset.
+    pub quant: StateQuant,
 }
 
 /// Parameters for DeltaNet conv-state ring-buffer management.
@@ -109,18 +114,12 @@ pub struct ConvStateParams<'a> {
 pub trait Qwen35ModelExt {
     /// Run a single-token DeltaNet state update.
     ///
-    /// Dispatches to `gated_delta_net_f32`, `gated_delta_net_q8`,
-    /// or `gated_delta_net_q4` based on `params.quant`.
-    fn run_delta_net_step(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetStepParams,
-    ) -> Result<(), String>;
+    /// Dispatches to the f32 or f16 kernel based on `params.quant`.
+    fn run_delta_net_step(&self, gpu: &mut Gpu, params: &DeltaNetStepParams) -> Result<(), String>;
 
     /// Run batched sequential DeltaNet updates (prefill).
     ///
-    /// Dispatches to `gated_delta_net_q8_batch_seq` for Q8 state,
-    /// or loops the single-token kernel for FP32/Q4.
+    /// Dispatches to the f32 or f16 batched kernel.
     fn run_delta_net_batch(
         &self,
         gpu: &mut Gpu,
@@ -129,12 +128,8 @@ pub trait Qwen35ModelExt {
 
     /// Run tree-batched DeltaNet (speculative-decode path).
     ///
-    /// Only supported with Q8 state (the tree tape mechanism is Q8-specific).
-    fn run_delta_net_tree(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetTreeParams,
-    ) -> Result<(), String>;
+    /// f32 and f16 both supported; the Q8-only era ended with the Q8 tree kernel.
+    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String>;
 
     /// Zero the conv-state ring buffer.
     fn reset_conv_state(
@@ -148,30 +143,31 @@ pub trait Qwen35ModelExt {
 // ── Default implementations ────────────────────────────
 
 impl Qwen35ModelExt for () {
-    fn run_delta_net_step(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetStepParams,
-    ) -> Result<(), String> {
+    fn run_delta_net_step(&self, gpu: &mut Gpu, params: &DeltaNetStepParams) -> Result<(), String> {
         match params.quant {
             StateQuant::FP32 => gpu.gated_delta_net_f32(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.output,
-                1, params.n_heads, params.head_dim,
+                params.q,
+                params.k,
+                params.v,
+                params.gate,
+                params.beta,
+                params.state,
+                params.output,
+                1,
+                params.n_heads,
+                params.head_dim,
             ),
-            StateQuant::Q8 => gpu.gated_delta_net_q8(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.s_scales, params.output,
-                1, params.n_heads, params.head_dim,
-                params.seq_pos as u32, params.delta_layer as u32,
-            ),
-            StateQuant::Q4 => gpu.gated_delta_net_q4(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.s_scales, params.output,
-                1, params.n_heads, params.head_dim,
+            StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
+                params.q,
+                params.k,
+                params.v,
+                params.gate,
+                params.beta,
+                params.state,
+                params.output,
+                1,
+                params.n_heads,
+                params.head_dim,
             ),
         }
         .map_err(|e| format!("delta_net_step: {e:?}"))
@@ -182,59 +178,69 @@ impl Qwen35ModelExt for () {
         gpu: &mut Gpu,
         params: &DeltaNetBatchParams,
     ) -> Result<(), String> {
+        // Both precisions have a real batched kernel now, so the old
+        // "loop the single-token kernel" fallback is gone. It existed because
+        // Q4 had no batch variant.
         match params.quant {
-            StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                params.q_batch, params.k_batch, params.v_batch,
-                params.gate_batch, params.beta_batch,
-                params.state, params.s_scales, params.output_batch,
-                params.n_tokens, params.n_heads, params.head_dim,
-                params.seq_pos as u32, params.delta_layer as u32,
+            StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.state,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
             ),
-            _ => {
-                // FP32/Q4: loop single-token kernel.
-                // Q4 batch variant doesn't exist in the kernel set yet.
-                let stride = params.n_heads * params.head_dim;
-                for i in 0..params.n_tokens {
-                    let q = params.q_batch.sub_offset(i * stride, stride);
-                    let k = params.k_batch.sub_offset(i * stride, stride);
-                    let v = params.v_batch.sub_offset(i * stride, stride);
-                    let g = params.gate_batch.sub_offset(i * params.n_heads, params.n_heads);
-                    let b = params.beta_batch.sub_offset(i * params.n_heads, params.n_heads);
-                    let o = params.output_batch.sub_offset(i * stride, stride);
-                    match params.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32(
-                            &q, &k, &v, &g, &b,
-                            params.state, &o,
-                            1, params.n_heads, params.head_dim,
-                        ),
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &q, &k, &v, &g, &b,
-                            params.state, params.s_scales, &o,
-                            1, params.n_heads, params.head_dim,
-                        ),
-                        _ => unreachable!(),
-                    }
-                    .map_err(|e| format!("delta_net_batch token {i}: {e:?}"))?;
-                }
-                Ok(())
-            }
+            StateQuant::FP16 => gpu.gated_delta_net_f16_batch_seq(
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.state,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
+            ),
         }
         .map_err(|e| format!("delta_net_batch: {e:?}"))
     }
 
-    fn run_delta_net_tree(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetTreeParams,
-    ) -> Result<(), String> {
-        gpu.gated_delta_net_q8_tree_batch_seq(
-            params.q_batch, params.k_batch, params.v_batch,
-            params.gate_batch, params.beta_batch,
-            params.s_q8_init, params.s_scales_init,
-            params.s_tape_q8, params.s_tape_scales,
-            params.parent_indices, params.output_batch,
-            params.n_tokens, params.n_heads, params.head_dim,
-        )
+    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String> {
+        match params.quant {
+            StateQuant::FP32 => gpu.gated_delta_net_f32_tree_batch_seq(
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.s_init,
+                params.s_tape,
+                params.parent_indices,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
+            ),
+            StateQuant::FP16 => gpu.gated_delta_net_f16_tree_batch_seq(
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.s_init,
+                params.s_tape,
+                params.parent_indices,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
+            ),
+        }
         .map_err(|e| format!("delta_net_tree: {e:?}"))
     }
 
@@ -244,7 +250,8 @@ impl Qwen35ModelExt for () {
         state: &GpuTensor,
         _conv_state_size: usize,
     ) -> Result<(), String> {
-        gpu.hip.memset(&state.buf, 0, state.buf.size())
+        gpu.hip
+            .memset(&state.buf, 0, state.buf.size())
             .map_err(|e| format!("reset_conv_state: {e:?}"))
     }
 }

@@ -325,10 +325,9 @@ pub fn profile_chat_template(
 /// Absent or `auto` resolves through the redundancy gate
 /// (`qwen35::default_state_quant`), which yields **FP32** for all current models.
 ///
-/// **Q8 is DEPRECATED (2026-07-19)** — see the policy note on
-/// `qwen35::deltanet_state_fp32_below`. It remains parseable because the tree
-/// DeltaNet replay path (`gated_delta_net_q8_tree_batch_seq`) is Q8-only, but an
-/// explicit request now warns.
+/// **Q8 is REMOVED (2026-08-09)** — the variants, the kernels and their dispatch
+/// entry points are all deleted. It remains parseable so older configs still
+/// load, but an explicit request warns and resolves to FP32.
 ///
 /// This previously mapped absent/`""`/`auto` straight to Q8 — bypassing the gate
 /// entirely — while its own doc comment claimed it fell "back to the arch
@@ -341,39 +340,21 @@ pub fn parse_state_quant(
     use hipfire_arch_qwen35::qwen35::{default_state_quant, StateQuant};
     match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(default_state_quant(config)),
-        "q8" | "int8" => {
-            warn_deprecated_state_quant("q8");
-            Ok(StateQuant::Q8)
-        }
         "fp32" | "f32" => Ok(StateQuant::FP32),
-        "q4" | "int4" => {
-            warn_deprecated_state_quant("q4");
-            Ok(StateQuant::Q4)
-        }
-        other => Err(format!(
-            "unsupported DeltaNet state_quant '{other}' (expected auto|fp32|q8|q4)"
+        "fp16" | "f16" => Ok(StateQuant::FP16),
+        // Removed 2026-08-09. Rejected rather than silently mapped to FP32: an
+        // operator who set q8 deliberately should learn it is gone, not get
+        // different numerics without being told.
+        "q8" | "int8" | "q4" | "int4" => Err(format!(
+            "DeltaNet state_quant '{}' was removed — quantized recurrent state \
+             caused silent corruption (long-decode attractors, a rounding seed \
+             leaking execution history, and an error-feedback buffer that broke \
+             spec-decode rollback). Use auto|fp32|fp16.",
+            mode.unwrap_or("")
         )),
-    }
-}
-
-/// One-shot warning for a deprecated quantized DeltaNet state request.
-///
-/// Quantized recurrent state is disallowed by policy: its error compounds across
-/// the sequence, and every DeltaNet-state defect this repo has hit has been
-/// specific to it — long-decode attractors on low-redundancy models, a
-/// stochastic-rounding seed that leaked execution history into target numerics,
-/// and a Q8-only error-feedback buffer that `DeltaNetSnapshot` never restores
-/// (breaking spec-decode losslessness). FP32 has none of them.
-fn warn_deprecated_state_quant(which: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warning: DeltaNet state_quant '{which}' is DEPRECATED — quantized \
-             recurrent state is disallowed by policy (see qwen35::\
-             deltanet_state_fp32_below). Use 'auto' (=FP32) unless you are \
-             running the Q8-only DDTree tree-replay path."
-        );
+        other => Err(format!(
+            "unsupported DeltaNet state_quant '{other}' (expected auto|fp32|fp16)"
+        )),
     }
 }
 
@@ -382,8 +363,7 @@ pub fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static
     use hipfire_arch_qwen35::qwen35::StateQuant;
     match q {
         StateQuant::FP32 => "FP32",
-        StateQuant::Q8 => "Q8",
-        StateQuant::Q4 => "Q4",
+        StateQuant::FP16 => "FP16",
     }
 }
 
@@ -593,47 +573,20 @@ fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> us
 /// Bring-up helper for the tiny smoke-test models: resolve their abbreviated
 /// config into the concrete state needed to load them.
 pub fn resolve_tiny_model_state(
-    hfq: &HfqFile,
-    override_str: Option<&str>,
+    _hfq: &HfqFile,
+    _override_str: Option<&str>,
     q: hipfire_arch_qwen35::qwen35::StateQuant,
 ) -> hipfire_arch_qwen35::qwen35::StateQuant {
-    use hipfire_arch_qwen35::qwen35::{
-        config_from_hfq, deltanet_state_fp32_below, deltanet_state_redundancy, StateQuant,
-    };
-    // "Explicit" means the caller passed a non-default token; system default
-    // tokens (None, "", "auto", "q8", "int8") all count as unspecified.
-    let explicit = matches!(override_str,
-        Some(s) if !matches!(s.to_ascii_lowercase().as_str(), "" | "auto" | "q8" | "int8"));
-    if explicit || q == StateQuant::FP32 {
-        return q;
-    }
-    let threshold = deltanet_state_fp32_below();
-    // Prefer the redundancy gate; fall back to param count if the qwen35 config
-    // can't be parsed (non-hybrid artifact).
-    if let Some(cfg) = config_from_hfq(hfq) {
-        let redundancy = deltanet_state_redundancy(&cfg);
-        if redundancy < threshold {
-            eprintln!(
-                "  DeltaNet state: auto-upgraded to FP32 (redundancy {redundancy} = \
-                 head_dim×n_value_heads < {threshold}; recurrent state is the numerical \
-                 anchor — pass state_quant=q8 to override)",
-            );
-            return StateQuant::FP32;
-        }
-        return q;
-    }
-    const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
-    let params = hfq_parameter_count(hfq);
-    if params < TINY_MODEL_PARAMS {
-        eprintln!(
-            "  DeltaNet state: auto-upgraded to FP32 ({:.2}B params, config unparsed — \
-             FP32 stable below 2B; pass state_quant=q8 to override)",
-            params as f64 / 1.0e9,
-        );
-        StateQuant::FP32
-    } else {
-        q
-    }
+    // Pass-through. This used to second-guess the caller via the DeltaNet
+    // redundancy threshold, promoting an unspecified state to Q8 above a size
+    // cutoff. Q8 is gone, the threshold with it, and the remaining precisions
+    // are both valid everywhere — so there is nothing left to resolve.
+    //
+    // It was also the reason FP16 could not be selected: with `q = FP16` and no
+    // explicit override, the old body fell through to the threshold and handed
+    // back FP32, silently. `HIPFIRE_DN_STATE_FP16=1` reached
+    // `default_state_quant`, produced FP16, and this function threw it away.
+    q
 }
 
 /// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
@@ -653,6 +606,19 @@ pub fn load_model(
     pp: usize,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
+    // The serving path takes hipfire containers only. A HuggingFace
+    // safetensors directory is an external format: converting it is offline
+    // tooling's job (AGENTS.md — "conversion and compatibility concerns are
+    // offline tooling"), and routing it here silently misclassified every
+    // non-ParoQuant checkpoint, failing deep in the loader with the unrelated
+    // "ParoQuant model must have quantization_config".
+    if Path::new(path).is_dir() {
+        return Err(format!(
+            "{path} is a directory; the daemon loads .hfq containers only. \
+             Convert it first: `hipfire-quantize --input {path} --output <model>--bf16.hfq --format bf16` \
+             (or another --format). An .hfa archive unpacks with `hipfire-coexistence repack`."
+        ));
+    }
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
@@ -687,13 +653,6 @@ pub fn load_model(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    // ─── ParoQuant / safetensors directory path ────────────────────────────
-    // If the path is a directory with config.json, try loading as a
-    // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
-    if Path::new(path).is_dir() {
-        return load_model_safetensors(path, max_seq, &kv_mode, gpu);
-    }
-
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let compose_manifest = compose_manifest_from_metadata(&hfq.metadata_json)
         .map_err(|error| format!("embedded component manifest: {error}"))?;
@@ -755,9 +714,6 @@ pub fn load_model(
     let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id, &kv_mode);
     let model_memory = hfq_model_memory(path, &hfq);
     warn_if_unoptimized(path, &hfq);
-    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
-    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
-    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     // KV precision policy:
     //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
     //     a quantized KV under bf16 weights is a precision mismatch).
@@ -2515,9 +2471,19 @@ pub fn load_model(
         };
         // Q8 DeltaNet state can accumulate quality drift on long generation.
         // The load-time override exists for coherence A/B probes.
-        let dn_quant = if is_bf16_artifact {
-            hipfire_arch_qwen35::qwen35::StateQuant::FP32
-        } else {
+        // `parse_state_quant` decides, for bf16 and quantized artifacts alike.
+        // This used to short-circuit to FP32 when `is_bf16_artifact`, which is
+        // `hfq_has_bf16_weights()` — TRUE for QUANTIZED artifacts too, because
+        // their norm tensors are BF16. The comment on the KV policy below
+        // records the same trap being fixed there ("the prior rule wrongly
+        // force-fp32'd these via the BF16 norms"); the DeltaNet-state branch
+        // kept it, so no state precision could ever be selected for a
+        // quantized model.
+        //
+        // Default behaviour is unchanged: with no override and no
+        // HIPFIRE_DN_STATE_FP16, `parse_state_quant` returns FP32 for every
+        // model. What changes is that an explicit request is now honoured.
+        let dn_quant = {
             let parsed = parse_state_quant(state_quant_override, &config)?;
             resolve_tiny_model_state(&hfq, state_quant_override, parsed)
         };
@@ -3510,9 +3476,6 @@ pub fn load_model_pp(
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
     warn_if_unoptimized(path, &hfq);
-    // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
-    // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
-    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     // KV precision policy:
     //   * BF16-DOMINANT model (full-precision artifact) -> force fp32 KV (mixing
     //     a quantized KV under bf16 weights is a precision mismatch).
@@ -3678,9 +3641,19 @@ pub fn load_model_pp(
 
     // Mirror the pp=1 state-mode parser so pp parity probes can force the
     // same DeltaNet state representation.
-    let dn_quant = if is_bf16_artifact {
-        hipfire_arch_qwen35::qwen35::StateQuant::FP32
-    } else {
+    // `parse_state_quant` decides, for bf16 and quantized artifacts alike.
+    // This used to short-circuit to FP32 when `is_bf16_artifact`, which is
+    // `hfq_has_bf16_weights()` — TRUE for QUANTIZED artifacts too, because
+    // their norm tensors are BF16. The comment on the KV policy below
+    // records the same trap being fixed there ("the prior rule wrongly
+    // force-fp32'd these via the BF16 norms"); the DeltaNet-state branch
+    // kept it, so no state precision could ever be selected for a
+    // quantized model.
+    //
+    // Default behaviour is unchanged: with no override and no
+    // HIPFIRE_DN_STATE_FP16, `parse_state_quant` returns FP32 for every
+    // model. What changes is that an explicit request is now honoured.
+    let dn_quant = {
         let parsed = parse_state_quant(state_quant_override, &config)?;
         resolve_tiny_model_state(&hfq, state_quant_override, parsed)
     };

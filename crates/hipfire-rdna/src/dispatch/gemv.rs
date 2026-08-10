@@ -4868,6 +4868,16 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // Calibration tap. BF16 is excluded from the `weight_gemv` wrapper tap
+        // (`capture_at_weight_gemv_wrapper`) on the premise that it terminates
+        // in the capture-aware `gemm_bf16_x_bf16_wmma_labeled` — true for
+        // batched GEMM, but NOT here: at batch=1 the gemv family routes
+        // `KernelKey::GemvBf16` straight to this kernel. Without this the only
+        // bf16 linear that reaches `weight_gemv` at batch 1 (w_down, via
+        // `weight_gemv_residual`'s generic tail) gets no Hessian/imatrix, so
+        // bf16-sourced calibs came out with mlp.down_proj missing entirely.
+        // `gemv_f16_xf32` has always tapped here; bf16 just never did.
+        self.maybe_capture_activation(w, x, 1, k);
         self.launch_gemv_generic("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, w, x, y, m, k)
     }
 
@@ -5139,6 +5149,182 @@ impl Gpu {
             m,
             k,
         )
+    }
+
+    /// BF16L3 weight × F32 activations → F32, batched over `n` columns.
+    ///
+    /// `x` is [n, k] and `y` is [n, m], both row-major per column — the layout a
+    /// per-position logits buffer already has. Bit-identical to calling
+    /// [`Self::gemv_bf16l3_xf32`] once per column, but the decode and the weight
+    /// read are shared across a tile of columns instead of repeated per column.
+    ///
+    /// The GEMV form reads the whole packed matrix per output column, which on
+    /// an lm_head is 367 MB per position. Tiling columns cuts that by the tile
+    /// width; the kernel's `BF16L3_NT` (8) sets it, and this loops the tiles.
+    pub fn gemm_bf16l3_xf32(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_xf32 requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_xf32",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_xf32",
+        )?;
+        const NT: usize = 32; // must match BF16L3_NT in the kernel
+        let wp = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = n as i32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_xf32", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let cb = col as i32;
+            let nc = cols as i32;
+            result = self.launch_kernargs(
+                "gemm_bf16l3_xf32",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 ni, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// BF16L3 weight × F32 activations → F32 via WMMA, decoding each A fragment
+    /// in-kernel. `x` is [n, k] F32 (staged to BF16 like the plain-BF16 path),
+    /// `y` is [n, m] F32.
+    ///
+    /// Same tiling and the same `wmma_f32_16x16x16_bf16` compute as
+    /// `gemm_bf16_x_bf16_wmma_gfx1151_m128` — LUT3 is treated purely as a
+    /// storage format, so this reads 1.38x fewer weight bytes for identical
+    /// math, instead of competing with WMMA using scalar FMAs the way
+    /// [`Self::gemm_bf16l3_xf32`] does.
+    pub fn gemm_bf16l3_wmma(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_wmma requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_wmma_m128",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_wmma_m128",
+        )?;
+        let wp = w.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x, n * k)?;
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = n as i32;
+        let grid_m = m.div_ceil(128) as u32;
+        let grid_b = n.div_ceil(16) as u32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_wmma", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16l3_wmma_m128",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// [`Self::gemm_bf16l3_wmma`] with the decode done cooperatively by the
+    /// whole wave into an LDS A-tile, rather than each lane decoding its own
+    /// fragment.
+    ///
+    /// The per-lane form decodes every element twice (lanes 0-15 and 16-31 map
+    /// to the same rows) and walks 16 dependent cursor steps; this decodes each
+    /// element once with 8 independent steps per lane, as `gemv_bf16l3_xf32`
+    /// does. The A-tile costs 8 KB of LDS per warp, so this runs 4 warps and 64
+    /// rows per block instead of 8 and 128.
+    pub fn gemm_bf16l3_wmma_coop(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_bf16l3_wmma_coop requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16l3_wmma_coop",
+            kernels::GEMM_BF16L3_XF32_SRC,
+            "gemm_bf16l3_wmma_coop",
+        )?;
+        let wp = w.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x, n * k)?;
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = n as i32;
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = n.div_ceil(16) as u32;
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16l3_wmma_coop", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16l3_wmma_coop",
+            [grid_m, grid_b, 1],
+            [128, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].

@@ -857,24 +857,11 @@ pub fn oqplus_tiered_ldlq_pack(
                 for (c, g) in grp.iter_mut().enumerate() {
                     *g = rr_row[c0 + c] as f32;
                 }
-                let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                // Joint (scale, outlier set): outliers are the top n_out by
+                // int8-upgrade gain (int4_err² − int8_err²), chosen against the
+                // scale they will actually be encoded at.
+                let (scale, idx) = crate::codecs::mixed_clipsearch(&grp, n_out);
                 let inv = 1.0 / scale;
-                // Outliers: top n_out by int8-upgrade gain (int4_err² − int8_err²).
-                let gain = |i: usize| -> f32 {
-                    let v = grp[i];
-                    let q4 = (v * inv).round().clamp(-7.0, 7.0);
-                    let q8 = (v * inv).round().clamp(-127.0, 127.0);
-                    let e4 = v - q4 * scale;
-                    let e8 = v - q8 * scale;
-                    e4 * e4 - e8 * e8
-                };
-                let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-                idx.sort_unstable_by(|&a, &c| {
-                    gain(c)
-                        .partial_cmp(&gain(a))
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                        .then_with(|| a.cmp(&c))
-                });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
                     is_w8[i] = true;
@@ -988,23 +975,11 @@ pub fn oqplus_compact_ldlq_pack(
                 for (c, g) in grp.iter_mut().enumerate() {
                     *g = rr_row[c0 + c] as f32;
                 }
-                let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                // Joint (scale, outlier set) — same selector as the non-LDLQ
+                // compact packer, so the two agree on everything but the OBS
+                // error feedback.
+                let (scale, idx) = crate::codecs::mixed_clipsearch(&grp, n_out);
                 let inv = 1.0 / scale;
-                let gain = |i: usize| -> f32 {
-                    let v = grp[i];
-                    let q4 = (v * inv).round().clamp(-7.0, 7.0);
-                    let q8 = (v * inv).round().clamp(-127.0, 127.0);
-                    let e4 = v - q4 * scale;
-                    let e8 = v - q8 * scale;
-                    e4 * e4 - e8 * e8
-                };
-                let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-                idx.sort_unstable_by(|&a, &c| {
-                    gain(c)
-                        .partial_cmp(&gain(a))
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                        .then_with(|| a.cmp(&c))
-                });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
                     is_w8[i] = true;

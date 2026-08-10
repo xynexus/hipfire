@@ -1074,6 +1074,25 @@ impl Gpu {
         // path's bf16 gemv funnels here via gemm_bf16_x_bf16_wmma). Captures the
         // input activation before the compute. No-op when unarmed.
         self.maybe_capture_activation(a_bf16, x_f32, batch_size, k);
+        // N-heavy first for wide M. The m128 form gives each warp one 16x16
+        // output tile, so at a 256-column window its 16 column-blocks each
+        // re-read all of A; the N-heavy form keeps 4 accumulators and reuses
+        // each A fragment 4 times. Measured on gfx1151 against m128 (lower is
+        // faster): at N=256 lm_head 0.34x, ffn_gate 0.56x, dn_qkv 0.70x; at
+        // N=64, 0.39x / 0.25x / 0.18x. It LOSES below M~2048 (M=1024 shapes run
+        // 1.2x at N=256 and 2.0x at N=64), which is what the threshold encodes.
+        // Numerically identical to m128 — both match a CPU reference to the same
+        // digits (`bench_bf16l3_vs_bf16_gemm`).
+        if self.arch == "gfx1151"
+            && m >= 2048
+            && batch_size >= 16
+            && k % 16 == 0
+            && std::env::var("HIPFIRE_BF16_DENSE_NHEAVY").ok().as_deref() != Some("0")
+            && std::env::var("HIPFIRE_BF16_DENSE_M128").ok().as_deref() != Some("0")
+        {
+            return self
+                .gemm_bf16_x_bf16_wmma_gfx1151_nheavy(a_bf16, x_f32, y_f32, m, k, batch_size);
+        }
         if self.arch == "gfx1151"
             && m >= 128
             && batch_size >= 16

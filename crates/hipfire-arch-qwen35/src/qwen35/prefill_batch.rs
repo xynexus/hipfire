@@ -114,18 +114,20 @@ pub struct PrefillBatchScratch {
     pub grouped_moe_scratch: Option<grouped_moe::GroupedMoeScratch>,
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
-    // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
-    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
-    // since LA dispatch is serial per-cycle. Only allocated when the model
-    // has LA layers (linear_num_value_heads > 0). Call sites that pass
-    // parent_indices must ensure these tensors exist.
+    // Per-token S-state tape consumed by the gated_delta_net_{f32,f16}_tree
+    // kernels when TreeVerifyCtx.parent_indices is Some. Reused across LA
+    // layers since LA dispatch is serial per-cycle. Only allocated when the
+    // model has LA layers (linear_num_value_heads > 0). Call sites that pass
+    // parent_indices must ensure this tensor exists.
     //
-    // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
-    // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
+    // [max_batch × n_v_heads × head_dim × head_dim], sized at 4 bytes/element:
+    // f32 uses the buffer exactly, f16 uses the first half. Sizing for the
+    // wider case keeps the allocation independent of `DeltaNetState::quant`,
+    // which is per-session and not known here. Neither precision has scales,
+    // so the Q8-era scales tape is gone.
     //
-    // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
-    pub dn_s_tape_q8: Option<GpuTensor>,
-    pub dn_s_tape_scales: Option<GpuTensor>,
+    // At max_batch=22, n_v_heads=16, head_dim=128 → 23.1 MB.
+    pub dn_s_tape: Option<GpuTensor>,
 }
 
 /// One independent dense-Qwen35 request/session row for the future fused
@@ -613,8 +615,13 @@ pub fn prefill_session_batch_attention_q8_layer(
     )
 }
 
+/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
+///
+/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
+/// f16 state, which is why the caller selects this by `DeltaNetState::quant`
+/// rather than by model. No scales: f16 carries a per-element exponent.
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -630,45 +637,22 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
     n_heads: usize,
     head_dim: usize,
 ) -> HipResult<()> {
-    if delta_layer_index >= route_shape.dn_s_layers
-        || delta_layer_index >= route_shape.dn_scale_layers
-    {
+    if delta_layer_index >= route_shape.dn_s_layers {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "grouped MoE session prefill routed Q8 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                "grouped MoE session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
                 route_shape,
             ),
         ));
     }
-    // #17 — Q8 requant seed. Every other GDN caller passes the absolute
-    // sequence position of the block it is processing. This one CANNOT: the
-    // kernel takes a single `frame` scalar, but this launch covers rows from
-    // MULTIPLE sessions that sit at DIFFERENT absolute positions (the
-    // per-row positions live device-side in `device_tables.row_positions`,
-    // and the kernel mixes `row_session_indices` only for state routing, not
-    // into the RNG). A single scalar cannot represent them.
-    //
-    // Passing a constant here still fixes the actual defect: the seed is no
-    // longer a function of how many dispatches have happened, so execution
-    // history (e.g. a different spec-decode drafter) can no longer perturb
-    // these numerics. What it does NOT give is decorrelation ACROSS sequence
-    // positions within this path — every position in a multi-session prefix
-    // batch dithers from the same base. Layers are still decorrelated, since
-    // `delta_layer_index` is mixed into the seed by the dispatcher.
-    //
-    // Making this per-position correct requires the kernel to read
-    // `row_positions` (a kernel change, deliberately out of scope here).
-    // FLAGGED FOR DESIGN DECISION — do not "fix" by reintroducing a counter.
-    const ROUTED_BATCH_SEQ_POS: u32 = 0;
-    gpu.gated_delta_net_q8_routed_batch_seq(
+    gpu.gated_delta_net_f16_routed_batch_seq(
         q_batch,
         k_batch,
         v_batch,
         gate_batch,
         beta_batch,
         &device_tables.dn_s_ptrs,
-        &device_tables.dn_scale_ptrs,
         &device_tables.row_session_indices,
         out_batch,
         route_shape.dn_s_layers,
@@ -677,7 +661,6 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
         n_heads,
         head_dim,
         sessions,
-        ROUTED_BATCH_SEQ_POS,
     )
 }
 
@@ -1128,9 +1111,9 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
                 "grouped MoE session fused prefix row {idx} has unsupported KV quantization flags; first MoE target is plain Q8 KV"
             ));
         }
-        if !matches!(signature.dn_quant, StateQuant::Q8 | StateQuant::FP32) {
+        if !matches!(signature.dn_quant, StateQuant::FP32 | StateQuant::FP16) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports Q8 or FP32",
+                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports FP32 or FP16",
                 signature.dn_quant,
             ));
         }
@@ -2931,7 +2914,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
-    delta_q8: bool,
+    delta_f16: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
         gpu,
@@ -2950,7 +2933,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         None,
         None,
         true,
-        delta_q8,
+        delta_f16,
     )
 }
 
@@ -3144,7 +3127,7 @@ fn forward_grouped_moe_session_batch_layers(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     kv_q8: bool,
-    delta_q8: bool,
+    delta_f16: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -3456,8 +3439,8 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count * k_dim * 4,
                     )?;
                 }
-                if delta_q8 {
-                    grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+                if delta_f16 {
+                    grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
                         gpu,
                         device_tables,
                         route_shape,
@@ -4055,9 +4038,12 @@ pub fn forward_prefill_grouped_moe_session_batch(
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     // Signature validation guarantees one state layout for every row. Select
     // the already-implemented routed recurrence branch once for the batch.
-    let delta_q8 = signatures
+    // FP16 state is half the stride of FP32, so the routed kernel and the state
+    // precision must be chosen together — the f32 kernel over f16 state reads
+    // every element at the wrong offset.
+    let delta_f16 = signatures
         .first()
-        .map(|signature| signature.dn_quant == StateQuant::Q8)
+        .map(|signature| matches!(signature.dn_quant, StateQuant::FP16))
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
@@ -4130,7 +4116,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
-        delta_q8,
+        delta_f16,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
@@ -4281,20 +4267,15 @@ impl PrefillBatchScratch {
             } else {
                 None
             },
-            dn_s_tape_q8: if config.linear_num_value_heads > 0 {
+            dn_s_tape: if config.linear_num_value_heads > 0 {
+                // 4 bytes/element — the f32 tree kernel's stride. The f16 tree
+                // kernel uses the first half of the same buffer.
                 let bytes = max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
-                    * config.linear_value_head_dim;
+                    * config.linear_value_head_dim
+                    * 4;
                 Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
-            } else {
-                None
-            },
-            dn_s_tape_scales: if config.linear_num_value_heads > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
-                    DType::F32,
-                )?)
             } else {
                 None
             },
@@ -4346,8 +4327,7 @@ impl PrefillBatchScratch {
             self.moe_hidden_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
-            self.dn_s_tape_q8,
-            self.dn_s_tape_scales,
+            self.dn_s_tape,
         ]
         .into_iter()
         .flatten()
@@ -4370,7 +4350,7 @@ impl PrefillBatchScratch {
 /// byte-identical to decode. FA layers always use a per-token gather/scatter
 /// fallback — the FA causal attention kernel can't yet be batched (task #71).
 ///
-/// `gated_delta_net_q8_batch_seq` runs one launch per LA layer; the kernel
+/// `gated_delta_net_{f32,f16}_batch_seq` runs one launch per LA layer; the kernel
 /// loops over the N tokens internally and requants the Q8 state after every
 /// token, matching the decode requant cadence (distributionally equivalent to
 /// decode, not byte-identical — the stochastic-rounding frame differs).
@@ -4398,7 +4378,7 @@ impl PrefillBatchScratch {
 ///
 /// `gdn_tape`: if `Some`, captures the post-processed `(q, k, v, α, β)` for
 /// every DN (LinearAttention) layer and block position BEFORE the batched
-/// `gated_delta_net_q8_batch_seq` call. Enables the DFlash rollback path
+/// `gated_delta_net_{f32,f16}_batch_seq` call. Enables the DFlash rollback path
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
@@ -5373,7 +5353,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // preamble (rmsnorm, rotate, 4-way fused GEMM) and FFN (gate_up + down).
     // 256 costs ~80 MB of scratch on 9B vs 20 MB at 64 — trivial on modern
     // cards — and drops chunk count for pp2048 from 32 → 8. The inner
-    // gated_delta_net_q8_batch_seq loop is still sequential per token, so
+    // gated_delta_net batch_seq loop is still sequential per token, so
     // the per-chunk DeltaNet cost is linear in N either way; raising the
     // batch just amortizes the NON-DeltaNet kernels more.
     //

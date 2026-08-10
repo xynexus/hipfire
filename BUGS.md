@@ -4,13 +4,68 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## [Critical] Example Bug
-- Category: Architecture / Maintainability
-- Location: crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-rdna/src/dispatch/mod.rs
-- Summary: This is an example of a brief bug report
-- Suggested fix: Do nothing 
-- Scope: Architectural
-- Confidence: High
+## [FIXED] down_proj gets no Hessian/imatrix on bf16 models — `gemv_bf16_xf32` never tapped
+- Category: Correctness / Calibration
+- Location: `crates/hipfire-rdna/src/dispatch/gemv.rs` `gemv_bf16_xf32`
+  (L4863); gate is `capture_at_weight_gemv_wrapper`
+  (`crates/hipfire-runtime/src/weights.rs` L384).
+- Root cause: `weight_gemv` deliberately SKIPS its tap for BF16 and F16, because
+  those "terminate in capture-aware RDNA entrypoints" and tapping both would
+  double-count. That premise held for F16 (`gemv_f16_xf32` taps at L5648) and
+  for batched BF16 (`gemm_bf16_x_bf16_wmma_labeled` taps), but NOT for BF16 at
+  batch 1: `KernelKey::GemvBf16` routes to `gemv_bf16_xf32`, which tapped
+  nowhere. So the wrapper deferred to a chokepoint that did not exist and the
+  activation was captured by neither.
+  Only down_proj showed the loss because it is the only qwen35 linear that
+  reaches `weight_gemv` at batch 1 in bf16 — via `weight_gemv_swiglu_residual`
+  -> generic `_ =>` tail -> `weight_gemv_residual` -> generic `_ =>` tail. qkv
+  and gate/up are captured by the fused kernels
+  (`dispatch/fused.rs` L2982-2985, L3076-3077); everything else goes batched.
+  Quantized weights were never affected — they keep the wrapper tap.
+- Fix (2026-08-07): one `maybe_capture_activation` in `gemv_bf16_xf32`, matching
+  what `gemv_f16_xf32` has always done. Verified: the same qwen3.5-0.8b calib
+  goes 162 hessians / 11 kinds -> 186 / 12, with `mlp.down_proj` x24 present —
+  +24 is exactly one per layer, and 186/12 matches the known-good 2026-08-06
+  artefact.
+- Evidence that led here: fresh qwen3.5-0.8b calib
+  (`collect_artifacts --max-tokens 512`) yielded 162 / 11 — linear_attn x5,
+  mlp.gate_proj, mlp.up_proj, self_attn x4, `mlp.down_proj` absent. NOT caused
+  by batched prefill: `HIPFIRE_PREFILL_BATCHED=0` reproduced the identical
+  162 / 11, which is what pointed at a dtype-gated tap rather than a path.
+- Impact: silent where it bites. `--ldlq` does not fail on a missing Hessian,
+  it logs `ldlq: skip <t>` and falls back to RTN, so an `oq*++` built from an
+  affected calib quietly RTN-quantizes its down_proj — the widest FFN matrix
+  and the one the outlier-budget study found most sensitive — while reporting
+  success.
+  BUT the blast radius is narrow, and an earlier revision of this entry
+  overstated it as "any bf16-sourced calib is suspect". A full audit of all 26
+  retained calib artefacts (local + `/srv/hipfire/calib`, via
+  `hipfire-coexistence artifact inspect`) found ZERO with the missing-down_proj
+  signature. The reason: a calib built from an HF **safetensors directory**
+  loads F16, and `gemv_f16_xf32` has always tapped; a calib built from a
+  **quantized** artefact keeps the `weight_gemv` wrapper tap. Only a calib
+  sourced from a **bf16 `.hfq`** hits the gap, and that workflow only started
+  being used on 2026-08-07. Check provenance with `artifact inspect` —
+  `metadata.source_model` — before assuming an artefact is affected.
+- Still open: the collector has no coverage assertion. A dense arch should
+  produce one Hessian per admitted projection per layer, and a shortfall should
+  fail rather than write a partial artefact — that would have caught this at
+  the point of writing instead of at quantize time.
+- Related (also FIXED 2026-08-07): `qwen3.5-{0.8b,2b,4b}.calib.hfq` were a
+  SEPARATE and older defect — built 2026-06-27 from `*.q8f16ref.hfq` sources at
+  128 tokens, they carried `kinds=1`, down_proj ONLY, the mirror image of this
+  bug. All three have been rebuilt from bf16 sources at 512 tokens and now
+  carry the full 12 kinds (186/186/248 hessians), local and `/srv` copies
+  md5-identical. The root cause of THAT defect was never diagnosed — the
+  artefacts are replaced, but if a `q8f16ref` source is ever used for
+  calibration again, audit the result.
+  `/srv/hipfire/calib/FLUX.2-klein-base-4B.calib.hfq` is empty (`n_hessian`
+  absent, 0 kinds, 6 MB) and is a third, separate issue. The remaining 22
+  artefacts audit clean.
+- Scope: Calibration / quantization quality
+- Confidence: Confirmed by rebuild (an earlier revision of this entry blamed
+  `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
+  tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
 ## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
 - Category: Correctness / Tooling (hipfire-quantize)

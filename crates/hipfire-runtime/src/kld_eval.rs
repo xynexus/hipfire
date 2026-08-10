@@ -11,20 +11,57 @@
 use crate::arch::SimpleAr;
 use hipfire_rdna::Gpu;
 
+/// A contiguous run of scored positions handed to the consumer in one call.
+///
+/// The seam yields WINDOWS, not single positions, because everything the
+/// consumer does per position — `log_z` over the vocabulary, top-K selection,
+/// per-position scoring — is independent across positions and therefore
+/// parallel. A one-position-at-a-time callback structurally prevented that: it
+/// pinned ~1.2 s of per-chunk CPU work to a single core while the GPU sat idle
+/// (rocprofv3: 3.21 s of GPU against 10.5 s of chunk wall).
+///
+/// Producers that genuinely have one row at a time (the decode-loop archs) emit
+/// one-row windows and lose nothing.
+pub struct ScoredWindow<'a> {
+    /// Index of this window's first position, relative to `scoring_start`.
+    pub j0: usize,
+    /// `rows() * vocab` logits, row-major.
+    pub logits: &'a [f32],
+    pub vocab: usize,
+    /// The actual next token for each row.
+    pub nexts: &'a [u32],
+}
+
+impl<'a> ScoredWindow<'a> {
+    pub fn rows(&self) -> usize {
+        self.nexts.len()
+    }
+    /// Full-vocabulary logits for row `i` of this window.
+    pub fn row(&self, i: usize) -> &'a [f32] {
+        &self.logits[i * self.vocab..(i + 1) * self.vocab]
+    }
+    /// Rows in order, for a `rayon` bridge.
+    pub fn par_rows(&self) -> rayon::slice::ChunksExact<'a, f32> {
+        use rayon::prelude::*;
+        self.logits.par_chunks_exact(self.vocab)
+    }
+}
+
 /// Forward a token chunk (teacher-forced, fresh per-chunk state) and yield
 /// per-position logits over the scored window. The one seam every KLD driver
 /// funnels through; one impl per arch (blanket over [`SimpleAr`]).
 pub trait ChunkScoredForward {
-    /// Run the model over `chunk` and invoke `at_scored(j, full_logits, next)`
-    /// for each scored position `j` in `[scoring_start, chunk.len() - 1)`, where
-    /// `full_logits` predicts token `chunk[scoring_start + j + 1]` and `next` is
-    /// that actual next token. State is fresh per call.
+    /// Run the model over `chunk` and invoke `at_scored` for contiguous windows
+    /// covering every scored position in `[scoring_start, chunk.len() - 1)`.
+    /// Row `i` of a window predicts `chunk[scoring_start + j0 + i + 1]`, which is
+    /// also `nexts[i]`. Windows arrive in order and partition the range exactly.
+    /// State is fresh per call.
     fn forward_chunk_scored(
         &mut self,
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&ScoredWindow<'_>),
     ) -> Result<(), String>;
 
     /// Vocabulary size (for reference provenance).
@@ -41,12 +78,13 @@ impl<T: SimpleAr> ChunkScoredForward for T {
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&ScoredWindow<'_>),
     ) -> Result<(), String> {
         let n = chunk.len();
         if n < 2 {
             return Ok(());
         }
+        let vocab = SimpleAr::vocab_size(self);
         for pos in 0..n - 1 {
             if pos == 0 {
                 self.prefill(gpu, &chunk[..1])?;
@@ -57,7 +95,14 @@ impl<T: SimpleAr> ChunkScoredForward for T {
                 let lg = gpu
                     .download_f32(self.logits())
                     .map_err(|e| format!("kld forward: download logits: {e:?}"))?;
-                at_scored(pos - scoring_start, &lg, chunk[pos + 1] as usize);
+                // A decode loop has exactly one row available at a time; the
+                // window is the unit of delivery, not a claim about batching.
+                at_scored(&ScoredWindow {
+                    j0: pos - scoring_start,
+                    logits: &lg,
+                    vocab,
+                    nexts: &[chunk[pos + 1]],
+                });
             }
         }
         Ok(())
@@ -78,7 +123,7 @@ impl ChunkScoredForward for &mut dyn ChunkScoredForward {
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&ScoredWindow<'_>),
     ) -> Result<(), String> {
         (**self).forward_chunk_scored(gpu, chunk, scoring_start, at_scored)
     }
@@ -160,25 +205,37 @@ pub fn kld_self_score(
         let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
 
         // Pass 1: reference top-K reductions for the scored positions.
+        // Windows arrive in order and partition the range, so appending keeps
+        // `reds` indexed by `j`.
         let mut reds: Vec<TopKReduction> = Vec::new();
-        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |_j, lg, _next| {
-            reds.push(top_k_log_softmax(lg, top_k));
+        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |w| {
+            use rayon::prelude::*;
+            reds.par_extend(w.par_rows().map(|lg| top_k_log_softmax(lg, top_k)));
         })?;
 
         // Pass 2: score the same model against the in-memory reference.
         let mut klds: Vec<f32> = Vec::with_capacity(reds.len());
         let mut nlls: Vec<f32> = Vec::new();
-        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |j, lg, next| {
-            let red = &reds[j];
-            let rb = RefBlock {
-                top_indices: &red.indices,
-                top_log_probs: &red.log_probs,
-                residual_mass: red.residual_mass,
-            };
-            let s = score_position(&rb, lg, next);
-            klds.push(s.kld);
-            if let Some(n) = s.nll {
-                nlls.push(n);
+        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |w| {
+            use rayon::prelude::*;
+            let scored: Vec<_> = w
+                .par_rows()
+                .enumerate()
+                .map(|(i, lg)| {
+                    let red = &reds[w.j0 + i];
+                    let rb = RefBlock {
+                        top_indices: &red.indices,
+                        top_log_probs: &red.log_probs,
+                        residual_mass: red.residual_mass,
+                    };
+                    score_position(&rb, lg, w.nexts[i] as usize)
+                })
+                .collect();
+            for s in scored {
+                klds.push(s.kld);
+                if let Some(n) = s.nll {
+                    nlls.push(n);
+                }
             }
         })?;
 
@@ -244,11 +301,20 @@ pub fn kld_build_ref(
     for c in 0..n_chunk {
         let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
         out_tokens.extend_from_slice(chunk);
-        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |_j, lg, _next| {
-            let r = top_k_log_softmax(lg, top_k);
-            top_indices.extend_from_slice(&r.indices);
-            top_log_probs.extend_from_slice(&r.log_probs);
-            residual_mass.push(r.residual_mass);
+        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |w| {
+            use rayon::prelude::*;
+            // The reference build's dominant cost: `log_z` over the vocabulary
+            // plus top-K selection, per position, both independent across
+            // positions. Reduce the window in parallel, then append in order.
+            let rs: Vec<_> = w
+                .par_rows()
+                .map(|lg| top_k_log_softmax(lg, top_k))
+                .collect();
+            for r in rs {
+                top_indices.extend_from_slice(&r.indices);
+                top_log_probs.extend_from_slice(&r.log_probs);
+                residual_mass.push(r.residual_mass);
+            }
         })?;
         on_chunk(c, n_chunk, scored_per_chunk);
     }
@@ -292,11 +358,18 @@ pub fn kld_score(
         let chunk = &archive.tokens[c * n_ctx..c * n_ctx + n_ctx];
         let mut klds: Vec<f32> = Vec::new();
         let mut nlls: Vec<f32> = Vec::new();
-        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |j, lg, next| {
-            let s = score_position(&archive.block(c, j), lg, next);
-            klds.push(s.kld);
-            if let Some(n) = s.nll {
-                nlls.push(n);
+        fwd.forward_chunk_scored(gpu, chunk, scoring_start, &mut |w| {
+            use rayon::prelude::*;
+            let scored: Vec<_> = w
+                .par_rows()
+                .enumerate()
+                .map(|(i, lg)| score_position(&archive.block(c, w.j0 + i), lg, w.nexts[i] as usize))
+                .collect();
+            for s in scored {
+                klds.push(s.kld);
+                if let Some(n) = s.nll {
+                    nlls.push(n);
+                }
             }
         })?;
 

@@ -1739,6 +1739,40 @@ impl HfqFile {
         &self.tensors
     }
 
+    /// Stable content fingerprint over the metadata and tensor index — NOT the
+    /// payload, so it is index-only cheap even on a 40 GB artefact.
+    ///
+    /// Recorded by calibration writers as `source_fingerprint` so a `.calib.hfq`
+    /// can be tied back to the exact artefact it was captured from. A calib is
+    /// only valid for the weights it saw; matching the source PATH proves
+    /// nothing once that path is rebuilt. Scope matches the
+    /// `hfq_metadata_and_tensor_index_v1` fingerprint `hipfire-coexistence`
+    /// reports, but is computed independently — that one is `pub(crate)` there
+    /// and the runtime must not depend on the coexistence crate.
+    pub fn index_fingerprint(&self) -> String {
+        // FNV-1a/64. Chosen over a cryptographic hash because this detects
+        // accidental mismatch, not tampering, and must stay cheap.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        eat(self.metadata_json.as_bytes());
+        eat(&self.arch_id.to_le_bytes());
+        for t in &self.tensors {
+            eat(t.name.as_bytes());
+            eat(&[t.quant_type]);
+            eat(&t.group_size.to_le_bytes());
+            eat(&t.data_size.to_le_bytes());
+            for d in &t.shape {
+                eat(&d.to_le_bytes());
+            }
+        }
+        format!("fnv64:{h:016x}")
+    }
+
     /// The lossless recoding a tensor is STORED as, if any: `(quant_type,
     /// packed byte length)`.
     ///

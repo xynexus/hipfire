@@ -126,7 +126,8 @@ fn main() {
 
     println!("\n── DeltaNetState::new_with_quant_multi ───────────────────");
     let (dn, la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("DN multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::FP32)
+            .expect("DN multi");
     let n_la = config
         .layer_types
         .iter()
@@ -173,7 +174,7 @@ fn main() {
     println!("\n  [1/3] DeltaNetState::new_with_quant_multi Q8 — first LA on dev 0");
     gpus.devices[1].bind_thread().expect("misbind dev 1");
     let (dn2, la_to_device2) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::FP32)
             .expect("DN regression");
     let attr = gpus.devices[0]
         .hip

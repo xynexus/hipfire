@@ -75,4 +75,55 @@ mod tests {
             assert!((a - b).abs() < 1e-4, "involution drift: {a} vs {b}");
         }
     }
+
+    /// The transform destroys per-channel saliency, exactly and by construction.
+    ///
+    /// Every entry of a signed Hadamard has the same magnitude (`1/√n`), so for
+    /// any per-channel weighting `s`, the rotated weighting's diagonal is
+    /// `[R·diag(s)·Rᵀ]ᵢᵢ = Σⱼ Rᵢⱼ²·sⱼ = mean(s)` — the SAME value at every
+    /// position. Anything that ranks positions INSIDE a rotated group by a
+    /// per-input-channel saliency is therefore multiplying every candidate by
+    /// one constant, which cannot reorder them.
+    ///
+    /// This is why the plan's E1 ("reweight the gain in `mixed_overlay_indices`
+    /// by GuidedQuant saliency") is a no-op: the mixed overlay selects in the
+    /// rotated domain. Saliency has to act BEFORE the rotation (which is what
+    /// the `+` AWQ pass does) or account for the off-diagonal mass of
+    /// `R·diag(s)·Rᵀ` (which is what `++` LDLQ does).
+    #[test]
+    fn rotation_flattens_any_per_channel_saliency() {
+        let n = 256;
+        let signs1 = gen_fwht_signs(42, n);
+        let signs2 = gen_fwht_signs(1042, n);
+        // Heavy-tailed saliency — the case a reweight would most want to exploit.
+        let saliency: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 + 0.5).powi(3)).collect();
+
+        // Column j of R, obtained by transforming the j-th basis vector, gives
+        // [R·diag(s)·Rᵀ]ᵢᵢ = Σⱼ Rᵢⱼ²·sⱼ without materialising R.
+        let mut diagonal = vec![0.0f32; n];
+        for (j, &s) in saliency.iter().enumerate() {
+            let mut basis = vec![0.0f32; n];
+            basis[j] = 1.0;
+            cpu_fwht_256(&mut basis, &signs1, &signs2);
+            for (d, r) in diagonal.iter_mut().zip(basis.iter()) {
+                *d += r * r * s;
+            }
+        }
+
+        let mean = saliency.iter().sum::<f32>() / n as f32;
+        let (lo, hi) = diagonal
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        assert!(
+            (hi - lo) / mean < 1e-4,
+            "saliency survived the rotation: spread {} over mean {mean}",
+            hi - lo
+        );
+        assert!(
+            (lo - mean).abs() / mean < 1e-4,
+            "rotated weight {lo} is not mean(s) {mean}"
+        );
+    }
 }

@@ -82,7 +82,7 @@ fn main() {
     )
     .unwrap();
     let mut dn_state =
-        DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
+        DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::FP32).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
     // Warmup

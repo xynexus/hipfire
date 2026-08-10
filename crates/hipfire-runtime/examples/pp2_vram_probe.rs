@@ -134,7 +134,8 @@ fn main() {
 
     // Stage 4: DeltaNetState
     let (dn, la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::FP32)
+            .expect("dn multi");
     let after_dn = used_gb(&gpus, &baseline_free);
     let dn_delta: Vec<f64> = after_dn
         .iter()

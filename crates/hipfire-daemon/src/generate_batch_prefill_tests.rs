@@ -92,7 +92,7 @@ fn q8_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignature
     qwen35::DensePrefillSessionBatchStateSignature {
         kv_quantized: true,
         kv_quant_q8: true,
-        dn_quant: qwen35::StateQuant::Q8,
+        dn_quant: qwen35::StateQuant::FP32,
         ..fp32_decode_state_signature()
     }
 }
@@ -1780,11 +1780,9 @@ fn fused_dense_decode_accepts_only_fp32_uncompacted_state_signatures() {
             .unwrap_err();
     assert!(err.contains("unsupported KV quantization"));
 
-    let mut q8_dn = fp32;
-    q8_dn.dn_quant = qwen35::StateQuant::Q8;
-    let err = validate_qwen35_fused_dense_decode_session_signatures(&config, &[q8_dn, q8_dn], 2)
-        .unwrap_err();
-    assert!(err.contains("Q8 DeltaNet state"));
+    // The "Q8 DeltaNet state is rejected" case is gone with the variant: an
+    // invalid state can no longer be constructed, so the runtime check this
+    // exercised is now enforced by the type system instead.
 }
 
 #[test]

@@ -73,9 +73,17 @@ pub fn collect_calibration_artifacts(
         vec![".experts.".to_string()], // routed MoE experts: imatrix-only
         output,
         &static_meta,
-        |gpu| {
-            let kldref =
-                forward_calib(gpu, model, tokens, kldref_topk).map_err(|e| e.to_string())?;
+        &[tokens],
+        |gpu, sequences| {
+            // `forward_calib` opens with `model.reset(gpu)`, so calling it once
+            // per sequence IS the per-sequence reset — which for Mamba-2 also
+            // stops the recurrent state carrying the whole corpus's history.
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            for seq in sequences {
+                kldref.extend(
+                    forward_calib(gpu, model, seq, kldref_topk).map_err(|e| e.to_string())?,
+                );
+            }
             let extra_tensors = kldref_extra(&kldref);
             let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
             if !kldref.is_empty() {
