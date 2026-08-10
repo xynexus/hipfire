@@ -67,7 +67,33 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
-## [Critical] KV cache is allocated for max_position_embeddings, ignoring max_seq
+## [FIXED] max_seq was inflated by the generation budget, sizing KV for a 132K context
+**Resolved `21aca50bb`.** `--max-seq` is now a hard cap. Title corrected: the
+cache was never sized from `max_position_embeddings` — that was an inference from
+arithmetic that happened to land near 262144/2. The real chain is:
+
+    ~/.hipfire/config.json sets max_tokens = 131072 (a deliberate 128K server)
+      -> load_params_for_model_config: max_seq = max(max_seq, max_tokens + 1024)
+      -> 512 becomes 132096
+      -> every session allocates KV for a 132K context (~34 MiB per tensor)
+      -> 42 GiB device full on the FIRST request; concurrency capped at 2
+
+Confirmed by bisection: `--max-tokens 64` gave `max_seq=1088`, unset gave
+`max_seq=132096`. After the fix, `max_seq=1028` and four sequential requests
+succeed where 2-4 previously OOMed. Batched prefill stops being memory-bound and
+now fails on a functional grouped-MoE error instead.
+
+**`max_tokens = 131072` is NOT a defect** — an earlier revision of this entry
+flagged it as unexplained and suspected a resolution bug. It is the operator's
+own config asking for a 128K context, and the config was doing exactly that. The
+bug was only that an explicit CLI cap did not win over it.
+
+**Operational consequence worth knowing:** with that config as-is, the *default*
+server posture on this box allocates ~1.37 GB of KV per session, so multi-stream
+serving is impossible without either lowering `max_seq`/`max_tokens` in the
+config or passing `--max-seq` per run.
+
+
 - Category: Correctness / Capacity (KV sizing) — root cause of the batch-prefill OOM
 - Measured 2026-08-10 on `Qwen3.6-35B-A3B--oq4` (nix1, gfx1103, 42 GiB GTT).
 - **`--max-seq` has no effect on KV allocation.** `--max-seq 128` and
