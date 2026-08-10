@@ -5,6 +5,29 @@ This is a research direction, not a tuning item — it proposes changing the
 quantization ALGORITHM, so every phase below is gated on quality evidence, not
 speed.
 
+## Acceptance criterion — the only one that counts
+
+**None of this replaces the existing quantizer unless it produces an equal or
+better KLD against the reference.** Not a lower proxy loss, not a faster run, not
+a smaller artifact. Teacher-forced KLD on the same weights, against a `kld_eval`
+reference built from the current `oq4.25++` pipeline, is the gate.
+
+This is stated first because P0 already produced a 5.75× lower proxy loss, and a
+proxy-loss win is precisely the kind of number that can coexist with worse model
+quality. `tr((W−Ŵ)H(W−Ŵ)ᵀ)` is what the algorithm optimises; it is NOT what the
+model is judged on. Every optimisation in this repo that was adopted on a proxy
+and retracted later followed that pattern.
+
+Concretely, to land any phase:
+
+1. Build both artifacts from the SAME calib and the SAME source weights.
+2. `hipfire-daemon` `kld_eval build_ref` on the incumbent, `score` on the
+   candidate — same corpus, same n_ctx, same chunk count, so the delta is the
+   quantizer alone.
+3. Candidate KLD <= incumbent KLD. If it is worse, the change does not land,
+   however much faster it is.
+4. Report what got WORSE alongside what got better.
+
 ## What it is trying to fix
 
 Measured on the 122B conversion (see
@@ -122,6 +145,44 @@ which wants gradients of the actual loss rather than forward-only `XᵀX`) needs
 
 Each phase must beat or match the CURRENT artifact on KLD before the next starts.
 
+### P0 RESULT (2026-08-10): ADMM reaches a much lower objective — with caveats
+
+`crates/hipfire-quantize/examples/admm_probe.rs`. Controlled comparison: same
+objective, same int4 grid, same domain, synthetic `W` and `H = XᵀX`.
+
+| shape | LDLQ sweep vs RTN | ADMM vs RTN |
+|---|---|---|
+| m=16 k=1024 | −55.4% | **−92.3%** |
+| m=32 k=512 | −25.5% | **−92.3%** |
+| m=16 k=256 (ONE group) | −0.0% | **−93.9%** |
+
+Output verified representable: 0/16384 values off-grid, max \|code\| = 7.00.
+A lower objective would be meaningless otherwise.
+
+**Why ADMM wins is partly a defect in the current packer, not only algorithmic
+superiority.** `oq4_ldlq_pack` propagates error only to columns `>= c0 + 256` —
+i.e. ACROSS 256-column blocks, never WITHIN one. All 256 columns of a block are
+quantized from the same block-entry residual. With a single block it therefore
+degenerates EXACTLY to RTN, which the k=256 row shows (−0.0%). ADMM optimises
+intra-block as well, and that is where most of its margin comes from.
+
+**That implies a cheaper first move than any of this**: add intra-block error
+feedback to the existing sweep (standard GPTQ is column-by-column). Small diff,
+same algorithm, no new risk. Do that before adopting ADMM.
+
+**ρ is the whole ballgame and the default is badly wrong.** At `ρ = λ` (the
+damping) ADMM DIVERGES — it gets worse with more iterations (+74.8% at 15 iters).
+It only works at `ρ ≈ 100–1000 · λ`, i.e. on the order of the Hessian's own
+scale. This is exactly the tuning sensitivity flagged as the risk of the
+approach, now confirmed rather than hypothesised.
+
+**What P0 does NOT establish.** Synthetic weights and synthetic activations, not
+a real tensor. Proxy loss is not KLD — a lower `tr((W−Ŵ)H(W−Ŵ)ᵀ)` does not
+guarantee a better model, and this repo has been burned by exactly that gap. The
+timings are unoptimised CPU and say nothing about the GPU shape. P1 must rerun
+this against a REAL `W` and a REAL pooled Hessian from the 122B calib artifact
+before anything moves into the pipeline.
+
 - **P0 — offline harness.** Reimplement the existing LDLQ objective as an ADMM
   loop on ONE tensor, offline, and reproduce the current packed output within
   tolerance. No pipeline changes. This is where `ρ`/iteration count get tuned and
@@ -134,7 +195,7 @@ Each phase must beat or match the CURRENT artifact on KLD before the next starts
 - **P3 — fuse with QAT.** Requires resolving the frozen-codes fork above. Only
   worth starting once P1 shows the quantization quality holds.
 
-## Validation, non-negotiable
+## Validation, non-negotiable (see the acceptance criterion at the top)
 
 This repo has repeatedly been bitten by quantization changes that were faster and
 quietly worse — the retracted "budget is the biggest lever" result, the
