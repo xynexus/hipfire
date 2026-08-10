@@ -514,6 +514,46 @@ fn gemma3_kv_mode(kv_mode: &str) -> (hipfire_runtime::kv::KvQuantMode, usize) {
 /// the default, `kvarn2` the aggressive cold/CASK tier) instead of only the
 /// hard-coded 4-bit tier. Non-kvarn tokens never reach this (the match arm
 /// guards on the `kvarn*` patterns), so the fallback is a harmless 4.
+/// KV modes being retired down to two families: **KVarN** (quantized, fused
+/// write + causal flash) and the **unquantized** family (fp32 today; bf16/fp16
+/// do not exist in `KvQuantMode` yet and are the gap to fill).
+///
+/// Everything else — q4/q8, int8/int8c, hfq4kv/hfq8, asym2/3/4, fwht2/3/4 — is a
+/// separate storage layout with its own constructors and its own prefill arm, and
+/// that combinatorial spread is what makes the KV surface 51 constructors across
+/// 3000 lines.
+///
+/// Gated rather than deleted first, on purpose: refusing at load names every
+/// model and config that still depends on a retired mode, which is the point —
+/// the breakage IS the inventory. Deleting the constructors first would surface
+/// the same information as a wall of compile errors with no runtime context.
+///
+/// `HIPFIRE_KV_ALLOW_DEPRECATED=1` re-admits them for a transition period.
+const DEPRECATED_KV_MODES: &[&str] = &[
+    "q4", "q8", "int8", "int8c", "hfq4kv", "hfq4", "hfq8", "asym2", "asym3", "asym4", "fwht2",
+    "fwht3", "fwht4", "turbo4",
+];
+
+fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
+    if !DEPRECATED_KV_MODES.contains(&kv_mode) {
+        return Ok(());
+    }
+    if std::env::var("HIPFIRE_KV_ALLOW_DEPRECATED").ok().as_deref() == Some("1") {
+        eprintln!(
+            "  WARNING: kv_mode={kv_mode} is deprecated and will be removed; running only \
+             because HIPFIRE_KV_ALLOW_DEPRECATED=1. Migrate to kvarn (kvarn2/kvarn/kvarn8) \
+             or fp32."
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "kv_mode={kv_mode} is deprecated. hipfire is retiring KV storage down to two \
+         families: kvarn (kvarn2 / kvarn / kvarn4 / kvarn8) and unquantized (fp32). \
+         Set HIPFIRE_KV_ALLOW_DEPRECATED=1 to run it during migration, or pick a \
+         supported mode."
+    ))
+}
+
 fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
     match kv_mode {
         "kvarn8" => 8,
@@ -732,6 +772,7 @@ pub fn load_model(
     if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
+    reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
@@ -3494,6 +3535,7 @@ pub fn load_model_pp(
     if kv_mode.is_empty() {
         kv_mode = "fp32".to_string();
     }
+    reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
