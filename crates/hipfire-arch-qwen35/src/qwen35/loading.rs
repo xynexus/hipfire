@@ -6334,13 +6334,17 @@ fn load_moe_expert(
     name: &str,
     m: usize,
     k: usize,
+    oq_indexed_decode: bool,
 ) -> HipResult<WeightTensor> {
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    // Shared parse — see `oq_indexed_decode_enabled`. The repack below and the
-    // dispatch predicate must never disagree on what enables this path.
-    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_enabled();
+    // `oq_indexed_decode` arrives as a PARAMETER, deliberately. origin/master
+    // read the shared `oq_indexed_decode_enabled()` here instead, to stop the
+    // repack and the dispatch predicate disagreeing — same goal, but reading it
+    // here would shadow the argument and drop the OTHER half of the predicate:
+    // the caller ANDs the env flag with `k_top == INDEXED_MOE_K_TOP`, because a
+    // top-2 model must not get kernel-layout weights no kernel will read.
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6442,6 +6446,15 @@ fn load_moe_ffn(
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
+    // Repack routed OQ experts into the indexed kernels' block layout ONLY when
+    // those kernels can actually run. They are `*_k8_indexed*` — the dispatcher
+    // admits them via `use_gpu_topk`, which requires `k_top == INDEXED_MOE_K_TOP`.
+    // Repacking on the env flag alone (as this did) hands kernel-layout weights
+    // to a model whose top-k keeps it on the NON-indexed fallback, which then
+    // decodes 132 B/260 B blocks as canonical 130 B/258 B ones — silent garbage,
+    // observed as non-finite KLD on every Opus cell of a top-2 fixture.
+    let oq_indexed_decode = super::qwen35_moe_oq_indexed_decode_enabled()
+        && config.num_experts_per_tok == super::INDEXED_MOE_K_TOP;
     for x in 0..n_exp {
         let gate_up = load_moe_expert(
             hfq,
@@ -6450,6 +6463,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi,
             config.dim,
+            oq_indexed_decode,
         )?;
         let down = load_moe_expert(
             hfq,
@@ -6458,6 +6472,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
             config.dim,
             mi,
+            oq_indexed_decode,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }

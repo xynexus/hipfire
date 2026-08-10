@@ -1813,7 +1813,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
         MoeDecodeIndexedRoutedPath::None
     };
     let routed_dtype_indexable = routed_path != MoeDecodeIndexedRoutedPath::None;
-    let use_gpu_topk = k_top == 8 && routed_dtype_indexable;
+    let use_gpu_topk = k_top == INDEXED_MOE_K_TOP && routed_dtype_indexable;
     let needs_x_rot_local = gate_side_mq4
         || routed_gate_up_mq4
         || routed_gate_up_mq6
@@ -1845,10 +1845,24 @@ fn moe_decode_dispatch_flags_for_dtypes(
     }
 }
 
-fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
+/// K_TOP the indexed MoE kernels are built for. Every `*_k8_indexed*` kernel
+/// hard-codes an 8-deep top-k (the dispatchers launch `grid.y = 8`), so a model
+/// routing a different top-k cannot use them.
+///
+/// This constant exists because the value was previously written out twice, in
+/// two crates' worth of apart decisions that had to agree and did not: the
+/// dispatcher gated the indexed kernels on `k_top == 8`, while the loader
+/// repacked experts into those kernels' block layout on the env flag ALONE. A
+/// top-2 model therefore got kernel-layout weights that no kernel ever read,
+/// and the non-indexed fallback decoded them as canonical blocks — silent
+/// garbage. Both sites now read this.
+pub(crate) const INDEXED_MOE_K_TOP: usize = 8;
+
+pub(crate) fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
     // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
     // falls back. One shared parse — this must agree with the loader's
     // MoE-block repack or the dispatch runs against un-repacked weights.
+    // `pub(crate)` because loading.rs ANDs it with the k_top check above.
     hipfire_dispatch::families::moe::oq_indexed_decode_enabled()
 }
 
@@ -5706,6 +5720,39 @@ mod tests {
         assert!(!flags.routed_dtype_indexable_oq4);
         assert!(!flags.use_gpu_topk);
         assert!(!flags.needs_x_rot_local);
+    }
+
+    /// The loader repacks routed OQ experts into the indexed kernels' block
+    /// layout, and the dispatcher decides whether those kernels run. Both must
+    /// key on the SAME top-k, or the repack lands on a model that never reaches
+    /// the kernels and the non-indexed fallback decodes kernel-layout blocks as
+    /// canonical ones — silent garbage (non-finite KLD on every Opus cell).
+    ///
+    /// This pins the shared constant and the dispatch side of that contract. The
+    /// loader side reads `INDEXED_MOE_K_TOP` directly (`load_moe_ffn`), which is
+    /// what keeps the two from drifting apart again.
+    #[test]
+    fn indexed_moe_k_top_gates_oq_repack_and_dispatch_together() {
+        // Every indexed MoE kernel is `*_k8_indexed*` and is launched with
+        // grid.y = 8; this constant is that 8.
+        assert_eq!(INDEXED_MOE_K_TOP, 8);
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::Oq4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+
+        // A top-k the kernels are not built for must NOT take the indexed path.
+        for k_top in [1usize, 2, 4, 6, 10] {
+            let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, k_top, false);
+            assert!(
+                !flags.use_gpu_topk,
+                "k_top={k_top} != INDEXED_MOE_K_TOP must not admit the k8 kernels"
+            );
+        }
+
+        // And the constant is the only value that does.
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, INDEXED_MOE_K_TOP, false);
+        assert_eq!(flags.use_gpu_topk, flags.routed_dtype_indexable_oq4);
     }
 
     #[test]
