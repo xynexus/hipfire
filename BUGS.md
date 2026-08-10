@@ -55,12 +55,32 @@ into full investigations here.
   "the suite passed". Runs that touched only qwen35 paths never selected these
   four families. Comparing two gate runs with different `--files-from` inputs
   compares different tests.
-- Open question: whether the baselines were recorded when these paths worked and
-  something regressed, or the baselines were recorded wrong. The two hard
-  quantizer failures suggest at least part of this is a real code fault, not
-  baseline staleness.
-- Suggested fix: bisect deepseek4 `kld:oq8` first — it is the largest signal and
-  the least ambiguous.
+- **RESOLVED as to cause, and a fix already exists off-master (found 2026-08-10).**
+  The open question below was answered before this entry was written, on the
+  unmerged branch `fix/oq8-from-flag-and-rotation-guards`
+  (`docs/plans/moe-expert-residency-unification.md`, Phase 0, commit `691e7730e`
+  — that file exists ONLY on that branch). Do not re-bisect this.
+  - **9 of the 14 are one real regression**: deepseek4 ×3, deepseek4_compressed ×3,
+    lfm2_moe ×3. Green at `0060481ee`, red at `8b9ee5392`.
+  - **Root cause**: `8b9ee5392` inserted an unguarded `_` wildcard arm *above* the
+    `oq8` literals in `HfqInputFormat::from_flag`
+    (`hipfire-quantize/src/main.rs:3919`), replacing a guarded
+    `_ if parse_opus_mixed_format(flag).is_some()`. That made `"oq8"`/`"oq8+"`/
+    `"oq8++"` unreachable, so `from_flag` returned `None` for every OQ8 flag and
+    each call site degraded differently — silently skipped tensors (lfm2_moe
+    scoring KLD exactly 0.000000), a wrong-format fallback (deepseek4 at 0.0387),
+    or the "no LDLQ-eligible tensors were attempted" hard error. `oq4` was
+    unaffected because its arm sits above the wildcard. **rustc reported this as
+    `unreachable_patterns` — the warning was the diagnosis.**
+  - **The remaining 5 are minimax and are genuinely pre-existing**, failing
+    identically at the baseline-record commit `5dc01e4b0`. Fixing the wildcard
+    *unmasks* minimax rather than fixing it: its oq8 cells were passing only
+    because the quantizer was not producing OQ8 at all. Cross-referenced to
+    `2026-08-05-opus-across-model-families.md:82-93` (oq4 0.003531, oq8 0.000259).
+    **minimax cannot serve as a parity oracle**; scope it out with
+    `HIPFIRE_TINYQUANT_FAMILIES` until that separate cause is found.
+- Action for master: this is a merge/cherry-pick decision, not a debugging task.
+  The 14-cell figure above remains accurate *for master as it stands today*.
 - Scope: Correctness (premier quant family)
 - Confidence: High (byte-identical reproduction on pristine code)
 
