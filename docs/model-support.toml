@@ -339,49 +339,49 @@ arch = 6
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ4 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ4 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ4+ routed experts use dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ4+ routed experts use dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq4++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ4++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ4++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq4.25++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE mixed OQ4.25++ quantizes, loads, and decodes through the dense-layout OQ fallback by default; calibrated tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+note = "Qwen3.5 MoE mixed OQ4.25++ quantizes, loads, and decodes through the dense-layout OQ fallback by default; calibrated tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ8 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ8 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ8+ uses dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ8+ uses dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 [[gate]]
 arch = 6
 quant = "oq8++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.5 MoE OQ8++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+note = "Qwen3.5 MoE OQ8++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in **and is currently broken — see BUGS.md**. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 # DeepSeek4 (arch 9) OQ load now repacks canonical/arch-packed OQ tensors in the
 # native loader before `lowered` execution. OQ dense/shared tensors are emitted
