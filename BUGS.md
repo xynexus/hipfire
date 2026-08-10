@@ -67,6 +67,67 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [High] Paged Opus MoE on the 35B WEDGES THE GPU during prefill (MES hang → driver reset)
+- Category: Correctness / Stability (paged residency, prefill)
+- Measured 2026-08-10 on nix1 (gfx1103) at `b30c13d4d`, daemon rebuilt at HEAD.
+- Repro: `HIPFIRE_QWEN35_PAGED_EXPERTS=1 HIPFIRE_QWEN35_EXPERT_CACHE_MB=16384
+  HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`, load `Qwen3.6-35B-A3B--oq4.hfq`, generate
+  anything. Load succeeds in ~8 s; the first generate never returns a token.
+- **The kernel driver is the ground truth:**
+  ```
+  amdgpu: MES failed to respond to msg=REMOVE_QUEUE
+  amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+  amdgpu: MES might be in unrecoverable state, issue a GPU reset
+  amdgpu: GPU reset(36) succeeded!
+  [drm] device wedged, but recovered through reset
+  ```
+- **Userspace stack at the hang** (daemon launched as a gdb child —
+  `ptrace_scope` forbids attaching, and no sysctl was changed):
+  ```
+  #0  rocr::core::InterruptSignal::WaitRelaxed        <- busy-poll
+  #2  hsa_signal_wait_scacquire
+  #3  rocr::AMD::AqlQueue::ExecutePM4
+  #4  rocr::AMD::GpuAgent::InvalidateCodeCaches
+  #8  hsa_executable_freeze
+  #16 hipModuleLoad
+  #18 hipfire_rdna::dispatch::Gpu::ensure_kernel
+  #19 hipfire_rdna::dispatch::misc::..::deinterleave_f32
+  #20 Qwen35Bindings::run_attend
+  #22 forward_scratch_layers_lowered
+  #25 forward_prefill_batch_with_pbs_opts             <- PREFILL, not decode
+  #27 hipfire_serving_core::generate::generate
+  ```
+  It hangs in the FIRST-USE JIT load of `deinterleave_f32`, waiting on a PM4
+  completion the wedged GPU never signals.
+- **This retires the "~160 s per MoE layer with one core pinned" reading.** That
+  symptom is `WaitRelaxed` busy-polling in an active wait state — HSA spinning on
+  a dead GPU — **not** host-side repack work. One core at 100% with the GPU idle
+  looked like CPU-bound dequant and is nothing of the kind.
+- **Consequently the qt-53 `Oq4G256MoeBlocks` artifact does not help here, and the
+  measurement says so.** Both arms are identical:
+
+  | artifact | load | gen wall | cpu_frac | tokens |
+  |---|---|---|---|---|
+  | `--oq4.moeblocks.hfq` (qt 53, repack-free) | 7.6 s | 1846 s | 1.00 | **0** |
+  | `--oq4.hfq` (canonical, repacks per page-in) | 8.9 s | 569 s (killed) | 1.00 | **0** |
+
+  `module_requires_host_repack` correctly excludes qt 53 (verified), so the packed
+  arm genuinely skips the repack — and hangs the same way. The repack was never
+  the bottleneck. qt-53 remains the right storage shape for a pager; it simply
+  does not address this defect.
+- **Scope limit — do not over-read this.** Only the PAGED path was measured. A
+  non-paged 35B was not tested, so "Opus MoE on the 35B is broken" is NOT
+  established; "paged Opus MoE prefill wedges the GPU" is.
+- Related: `AGENTS.local.md` records a gfx1103 hazard of exactly this shape
+  (page-fault → MES hang → full reset). A memory note claiming that hazard was
+  nullified should be treated as suspect until re-checked.
+- Next: bisect whether the wedge needs the MoE prefill at all (try a paged load +
+  a 1-token generate with a trivial prompt), and whether it reproduces without
+  `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`. Both are ~10 min runs, but each one costs a
+  GPU reset, so they want supervision.
+- Scope: Stability (wedges the device), blocks M5 on this box
+- Confidence: High (kernel reset log + userspace stack + paired A/B)
+
 ## [FIXED] Routed OQ experts repacked for kernels that never ran — non-finite KLD
 **Title corrected 2026-08-10.** This was filed as "indexed OQ MoE decode kernels
 produce non-finite KLD". That was a **misattribution**: the kernels were never
