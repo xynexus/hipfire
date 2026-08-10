@@ -2182,6 +2182,7 @@ name = "hipfire-quant-format"
 version = "0.3.0"
 dependencies = [
  "hipfire-primitives",
+ "serde_json",
 ]
 
 [[package]]
