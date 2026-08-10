@@ -829,16 +829,36 @@ pub(crate) fn effective_request_max_tokens(default_max_tokens: u32, requested: O
     }
 }
 
+/// The context to load for a request. **`max_seq` is a hard cap: a request can
+/// never enlarge it.**
+///
+/// This used to return `max(default_max_seq, request_max_tokens + 1024 + …)`, so
+/// any client could inflate the operator's context — and every increase is paid
+/// in KV. Measured on the 35B: `--max-seq 512` with a request asking
+/// `max_tokens=2000` produced `max_seq=3024`, a ~6x inflation from a single
+/// remote parameter, on a box where per-session KV is what exhausts the device.
+/// That made the operator's cap unenforceable against untrusted callers.
+///
+/// A request whose budget exceeds the context now truncates instead of resizing
+/// the server. `request_max_tokens` and `has_image` are kept in the signature
+/// because callers pass them and because the shortfall is worth reporting.
 pub(crate) fn required_load_max_seq(
     default_max_seq: u32,
     request_max_tokens: u32,
     has_image: bool,
 ) -> u32 {
     let visual_headroom = if has_image { 1024_u64 } else { 0 };
-    let required = u64::from(request_max_tokens) + 1024 + visual_headroom;
-    u64::from(default_max_seq)
-        .max(required)
-        .min(u64::from(MAX_LOAD_MAX_SEQ)) as u32
+    let wanted = u64::from(request_max_tokens) + 1024 + visual_headroom;
+    let cap = u64::from(default_max_seq).min(u64::from(MAX_LOAD_MAX_SEQ));
+    if wanted > cap {
+        tracing::debug!(
+            request_max_tokens,
+            has_image,
+            max_seq = cap,
+            "request generation budget exceeds max_seq; truncating rather than enlarging context"
+        );
+    }
+    cap as u32
 }
 
 fn now_ms() -> u64 {
@@ -3669,12 +3689,19 @@ mod tests {
             512
         );
 
+        // A budget that fits changes nothing.
         assert_eq!(required_load_max_seq(4096, 512, false), 4096);
-        assert_eq!(required_load_max_seq(4096, 8192, false), 9216);
-        assert_eq!(required_load_max_seq(4096, 8192, true), 10240);
-        assert_eq!(
-            required_load_max_seq(4096, MAX_LOAD_MAX_SEQ, true),
-            MAX_LOAD_MAX_SEQ
-        );
+        // A budget that does NOT fit must not enlarge the context. These two
+        // previously asserted 9216 and 10240 — i.e. a client could grow the
+        // server's KV by asking for more tokens. Measured on the 35B:
+        // --max-seq 512 with max_tokens=2000 gave max_seq=3024.
+        assert_eq!(required_load_max_seq(4096, 8192, false), 4096);
+        assert_eq!(required_load_max_seq(4096, 8192, true), 4096);
+        // The adversarial case, and the reason this is a cap rather than a floor:
+        // a single request asking for the maximum token budget previously drove
+        // the load context all the way to MAX_LOAD_MAX_SEQ (524288). Every one of
+        // those slots is paid for in KV, so an untrusted caller could size the
+        // server's memory. The operator's 4096 must survive it.
+        assert_eq!(required_load_max_seq(4096, MAX_LOAD_MAX_SEQ, true), 4096);
     }
 }
