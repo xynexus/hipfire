@@ -851,7 +851,22 @@ impl HipRuntime {
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
-        self.check(code, "hipMalloc")?;
+        // Attach the requested size. A bare "hipMalloc: out of memory" cannot
+        // distinguish a sizing bug (an absurd request) from genuine pressure or a
+        // pool-placement problem, and this allocator is the only place the size
+        // exists — the same reasoning as naming the kernel on a launch failure.
+        if code != 0 && std::env::var("HIPFIRE_MALLOC_BACKTRACE").ok().as_deref() == Some("1") {
+            // The size alone says whether a request is absurd; it does not say
+            // which buffer asked for it. Opt-in because capturing a backtrace on
+            // every failure would be noise on paths that recover by retrying
+            // smaller.
+            eprintln!(
+                "[hipMalloc FAILED] {size} bytes ({:.2} MiB), code={code}\n{}",
+                size as f64 / (1024.0 * 1024.0),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        self.check(code, &format!("hipMalloc({size} bytes = {:.2} MiB)", size as f64 / (1024.0 * 1024.0)))?;
         Ok(DeviceBuffer { ptr, size })
     }
 

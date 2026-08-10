@@ -96,10 +96,47 @@ into full investigations here.
   VRAM rather than GTT would OOM almost immediately and would scale with batch.
   Worth checking which allocation in the batched prefill path is not GTT-backed
   before assuming the sizes are simply too large.
-- Next: instrument the failing `hipMalloc` with its requested size (the dispatch
-  chokepoint already attaches kernel names to launch errors; the allocator needs
-  the same treatment), then decide whether it is a sizing bug or a pool-placement
-  bug.
+- **CHASED 2026-08-10. Not a MoE bug at all — it is KV allocation, and there are
+  two distinct walls.** `HipRuntime::malloc` now names its size, and
+  `HIPFIRE_MALLOC_BACKTRACE=1` names the caller.
+  - **Wall 1 — fp32 KV allocates 258 MiB in a single chunk.**
+    ```
+    hipMalloc(270532608 bytes = 258.00 MiB): out of memory
+      0 hip_bridge::ffi::HipRuntime::malloc
+      1 hipfire_rdna::pool::GpuPool::alloc
+      3 hipfire_rdna::dispatch::Gpu::zeros
+      4 hipfire_runtime::kv::KvCache::alloc_k_v_filtered
+      7 hipfire_serving_core::session::qwen35_allocate_session_state
+      9 run_generate_batch_prefill_serial_qwen35
+     11 hipfire_daemon::handlers::batch::prefill
+    ```
+    The 19 GB model loads fine because it is many per-tensor allocations; this is
+    the first single buffer to cross the line. `rocm-smi` reports the dedicated
+    VRAM pool as exactly 256 MiB on this APU, so a 258 MiB request cannot be
+    served from it.
+    **`--kv-cache q8` clears this wall** (confirmed: log shows `KV cache: Q8`, the
+    258 MiB OOM disappears). Note `AGENTS`-adjacent prior art: fp32 KV also forces
+    per-token prefill, so it was never the right mode for batching anyway.
+  - **Wall 2 — the batch path CLONES the KV cache per session.** With Q8 it gets
+    further and then fails at:
+    ```
+    failed to create checkpoint qwen35-checkpoint:batch-...:
+      clone qwen35 checkpoint kv.k_gpu[3] alloc:
+      hipMalloc(71860224 bytes = 68.53 MiB): out of memory
+    ```
+    `kv.k_gpu[3]` is one layer's K tensor, so a checkpoint clone costs roughly a
+    second full KV cache per session (10 KV-carrying layers x k and v). That is
+    the real capacity model of batched prefill on this arch and it is not
+    documented anywhere.
+- **Status: batch >= 2 on the 35B is still blocked**, but the blocker is now
+  specific and located rather than "OOM somewhere". Next is to establish whether
+  the checkpoint clone is necessary for every batched session or only for ones
+  that may be forked/rewound — if the latter, the batch path should share the KV
+  and clone lazily.
+- Instrumentation landed with this: `HipRuntime::malloc` reports the requested
+  size on failure, and `HIPFIRE_MALLOC_BACKTRACE=1` captures the allocating
+  stack. The bare "hipMalloc: out of memory" this started from could not
+  distinguish a sizing bug from pool placement from genuine pressure.
 - Scope: Capacity — blocks the multi-stream half of the v2 thesis
 - Confidence: High (three-way discrimination, identical error)
 
