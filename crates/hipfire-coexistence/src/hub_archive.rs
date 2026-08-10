@@ -45,7 +45,7 @@ use hipfire_hub::{ByteSink, RepoFile, StreamProgress};
 
 use crate::repack::{
     self, blob_plan, encode_and_store, raw_file_entry, safetensors_file_entry, ArchiveWriter,
-    Entry, Piece,
+    ChunkHasher, Entry, Piece,
 };
 
 /// A safetensors header this refuses to treat as one. Mirrors the cap in
@@ -292,6 +292,10 @@ struct CurFile {
     /// Archive position to return to if this file has to be undone.
     mark: (u64, usize),
     stage: Stage,
+    /// Source-keyed chunk table, built from the bytes as they arrive. The wire
+    /// delivers the file in order, so this is the same stream `pack` hashes off
+    /// disk and the two produce identical tables for identical files.
+    chunks: ChunkHasher,
 }
 
 /// Packs a sequence of streamed files into one archive.
@@ -328,6 +332,7 @@ impl StreamPacker {
             size: file.size,
             mark,
             stage,
+            chunks: ChunkHasher::new(),
         });
         Ok(())
     }
@@ -336,10 +341,15 @@ impl StreamPacker {
     pub fn finish_file(&mut self) -> Result<(), Box<dyn Error>> {
         let cur = self.cur.take().ok_or("finish_file outside a file")?;
         self.progress.finish_file();
-        match cur.stage {
+        let CurFile {
+            rel, stage, chunks, ..
+        } = cur;
+        let table = chunks.finish();
+        match stage {
             Stage::Verbatim => {
                 let (off, len, x) = self.aw.end_payload();
-                self.aw.push_file(raw_file_entry(&cur.rel, off, len, x));
+                self.aw
+                    .push_file(raw_file_entry(&rel, off, len, x, Some(&table)));
                 self.aw.stats.n_verbatim_files += 1;
             }
             // A file that ended mid-header never reached its tensors. It cannot
@@ -348,7 +358,7 @@ impl StreamPacker {
             Stage::Header { buf } => {
                 return Err(format!(
                     "{}: stream ended after {} bytes, inside the safetensors header",
-                    cur.rel,
+                    rel,
                     buf.len()
                 )
                 .into());
@@ -364,7 +374,7 @@ impl StreamPacker {
                 if idx < plan.len() || !buf.is_empty() {
                     return Err(format!(
                         "{}: stream ended with {} of {} tensor pieces filled",
-                        cur.rel,
+                        rel,
                         idx,
                         plan.len()
                     )
@@ -374,7 +384,12 @@ impl StreamPacker {
                 let hlen = hdr.len() as u64;
                 let (hdr_off, _, _) = self.aw.store(&hdr)?;
                 self.aw.push_file(safetensors_file_entry(
-                    &cur.rel, hdr_off, hlen, blob_len, &entries,
+                    &rel,
+                    hdr_off,
+                    hlen,
+                    blob_len,
+                    &entries,
+                    Some(&table),
                 ));
             }
         }
@@ -507,6 +522,12 @@ impl StreamPacker {
 
 impl ByteSink for StreamPacker {
     fn chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Hashed before `feed` consumes them: the table is keyed to the source
+        // file, so it wants the bytes as they arrive on the wire, not whatever
+        // the state machine buffers or reorders on the way into the archive.
+        if let Some(cur) = self.cur.as_mut() {
+            cur.chunks.update(bytes);
+        }
         self.feed(bytes)?;
         // Disjoint field borrows: naming the file costs no allocation per chunk.
         let Self { cur, progress, .. } = self;
@@ -539,6 +560,10 @@ impl ByteSink for StreamPacker {
             size,
             mark,
             stage,
+            // A restart replays the file from byte zero, so the partial table
+            // has to go with it. Keeping it would hash the retried prefix twice
+            // and shift every window after the resume point.
+            chunks: ChunkHasher::new(),
         });
         Ok(())
     }
