@@ -225,24 +225,28 @@ impl MoeResolution {
 ///
 /// **The contract is a safety property, not a convenience.** The indexed kernels
 /// do `A = expert_ptrs[topk_indices[..]]` and dereference `A` with no validation.
-/// An implementation that returns `Ok(())` while leaving any selected slot null
-/// causes a GPU-side null dereference, which on gfx1103 is an `amdgpu` MES hang
-/// and a full device reset — it takes down every other process on the GPU and is
-/// not recoverable in-process. Returning `Err` is always preferable to returning
-/// `Ok` with an incomplete table.
+/// An implementation that returns `Ok(())` while leaving any selected expert
+/// non-resident causes a GPU-side null dereference, which on gfx1103 is an
+/// `amdgpu` MES hang and a full device reset — it takes down every other process
+/// on the GPU and is not recoverable in-process. Returning `Err` is always
+/// preferable to returning `Ok` with incomplete residency.
+///
+/// **This does NOT patch the pointer table.** The pager maintains the table
+/// itself on every residency transition (push), so an implementation only has to
+/// make the experts resident and the slots follow. That split is deliberate: the
+/// previous design had each dispatch site patch after ensuring, and the
+/// default-ON lowered pipeline simply never did, leaving the table all-zero.
 pub trait ExpertResidency {
-    /// Make every expert in `selected` resident for `layer`, and write their
-    /// device addresses into `gate_up_ptrs` / `down_ptrs` at the matching slot.
+    /// Make every expert in `selected` resident for `layer`.
     ///
-    /// On `Ok(())` every slot named by `selected` MUST be non-null. Slots not in
-    /// `selected` are not read by this dispatch and may be anything.
-    fn ensure_resident_and_patch(
+    /// On `Ok(())` every expert named by `selected` MUST be resident, and hence
+    /// have a live slot in the pager-maintained pointer table. Experts not in
+    /// `selected` are not read by this dispatch.
+    fn ensure_resident(
         &self,
         gpu: &mut hipfire_rdna::Gpu,
         layer: usize,
         selected: &[u32],
-        gate_up_ptrs: &GpuTensor,
-        down_ptrs: &GpuTensor,
     ) -> Result<(), DispatchError>;
 }
 

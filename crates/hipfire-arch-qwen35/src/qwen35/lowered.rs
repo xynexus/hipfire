@@ -128,6 +128,10 @@ pub(crate) fn lower_variant(v: Q35Variant) -> LayerProgram {
 /// iteration so the borrows stay scoped. `kv_cache` is the only `&mut` (DeltaNet
 /// state is mutated through interior-mutable GpuTensor buffers via shared refs).
 pub(crate) struct Qwen35Bindings<'a> {
+    /// Weight pager, `Some` only for paged-expert models. `run_moe` forwards it
+    /// so the lowered path can make selected experts resident before dispatch.
+    pub(crate) pager:
+        Option<&'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     pub(crate) layer: &'a LayerWeights,
     pub(crate) s: &'a Qwen35Scratch,
     pub(crate) config: &'a Qwen35Config,
@@ -504,7 +508,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s, self.layer_idx)
+        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s, self.layer_idx, self.pager)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
@@ -651,6 +655,7 @@ pub(crate) fn forward_scratch_layers_lowered(
         let program = lower_variant(variant_of(layer));
         {
             let mut bind = Qwen35Bindings {
+                pager: weights.pager.as_ref(),
                 layer,
                 s,
                 config,

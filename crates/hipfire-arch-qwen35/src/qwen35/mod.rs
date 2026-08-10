@@ -3221,6 +3221,11 @@ fn moe_ffn_dispatch(
     config: &Qwen35Config,
     s: &Qwen35Scratch,
     layer_idx: usize,
+    // Threaded through rather than hardcoded `None`, which is what kept the
+    // lowered path from ever paging: `moe_ffn_decode_impl` builds its residency
+    // provider from this, so a `None` here means the paged configuration is
+    // refused no matter what the pager and the pointer tables are doing.
+    pager: Option<&std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
 ) -> HipResult<()> {
     let r = if ffn_all_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
@@ -3230,10 +3235,10 @@ fn moe_ffn_dispatch(
             config.dim,
             config.norm_eps,
         )?;
-        moe_ffn_decode_with_scratch_prerotated(gpu, None, ffn, x, x, config, s, layer_idx)
+        moe_ffn_decode_with_scratch_prerotated(gpu, pager, ffn, x, x, config, s, layer_idx)
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_with_scratch(gpu, None, ffn, &s.tmp, x, config, s, layer_idx)
+        moe_ffn_decode_with_scratch(gpu, pager, ffn, &s.tmp, x, config, s, layer_idx)
     };
     r?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
