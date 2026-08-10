@@ -1394,6 +1394,25 @@ impl WeightPager {
     /// `WeightId::Expert{layer, expert: idx, role: GateUp}` and
     /// `WeightId::Expert{layer, expert: idx, role: Down}` for every idx in
     /// `top_indices` — this method asserts that and panics on miss (loader bug).
+    ///
+    /// # THIS FUNCTION HAS NO CALLERS (verified 2026-08-10)
+    ///
+    /// Nothing in the workspace calls it, so under paged residency the expert
+    /// pointer tables are allocated and left **all zero**. The indexed MoE kernels
+    /// read `expert_ptrs[topk_indices[..]]` and dereference the result, so they
+    /// dereference null and wedge the GPU — an `amdgpu` MES hang and a full device
+    /// reset, observed on a 35B (BUGS.md, `gemv_oq4g256_moe_gate_up_k8_indexed_batched`,
+    /// HIP 719, measured `non_null=0/256` immediately before the launch).
+    ///
+    /// Being `pub` in a library crate is why rustc never flagged it: `dead_code`
+    /// does not fire on public items, so this sat unreferenced while two doc
+    /// comments in `hipfire-arch-qwen35/src/qwen35/layout.rs` described it as live
+    /// machinery.
+    ///
+    /// Wiring it up is not sufficient on its own: the **default** execution path is
+    /// the lowered super-op pipeline, whose `MoeParams` carries no pager, so it has
+    /// nothing to call this on. Fixing paged+indexed MoE means giving that path
+    /// pager access, or refusing the combination in backend selection.
     pub fn patch_expert_ptr_table(
         &self,
         layer: u16,
