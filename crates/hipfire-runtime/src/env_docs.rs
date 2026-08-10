@@ -2549,6 +2549,13 @@ pub const ENV_HIPFIRE_LATENTKV_TRAIN: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-train/examples/latent_kv_recovery.rs:160",
 };
 
+/// `HIPFIRE_LDLQ_INTRA_BLOCK` — Set 1 to propagate LDLQ error feedback WITHIN each 256-column group, not only across groups. The default packer quantizes all 256 columns of a block from the same block-entry residual and only propagates to later BLOCKS, so a single-block tensor degenerates exactly to RTN. Enabling this makes it column-by-column, which is what standard GPTQ does. Measured offline (examples/admm_probe) at equal cost: proxy loss vs RTN goes from -55.4% to -93.0% at k=1024, and it matches or beats an ADMM formulation on 3 of 4 shapes. OFF by default until it clears the KLD gate — it CHANGES quantizer output.
+pub const ENV_HIPFIRE_LDLQ_INTRA_BLOCK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_LDLQ_INTRA_BLOCK",
+    description: "Set 1 to propagate LDLQ error feedback WITHIN each 256-column group, not only across groups. The default packer quantizes all 256 columns of a block from the same block-entry residual and only propagates to later BLOCKS, so a single-block tensor degenerates exactly to RTN. Enabling this makes it column-by-column, which is what standard GPTQ does. Measured offline (examples/admm_probe) at equal cost: proxy loss vs RTN goes from -55.4% to -93.0% at k=1024, and it matches or beats an ADMM formulation on 3 of 4 shapes. OFF by default until it clears the KLD gate — it CHANGES quantizer output.",
+    source: "crates/hipfire-env/src/lib.rs",
+};
+
 /// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES` — Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose tensors skip `--ldlq` even when the calibration carries a Hessian for them. Exists so ONE calibration artifact can produce both arms of a per-expert-Hessian comparison, which keeps the arms differing only in the thing under test instead of in their capture.
 pub const ENV_HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES",
@@ -5796,6 +5803,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LATENTKV_EVAL,
     ENV_HIPFIRE_LATENTKV_RANK,
     ENV_HIPFIRE_LATENTKV_TRAIN,
+    ENV_HIPFIRE_LDLQ_INTRA_BLOCK,
     ENV_HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES,
     ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER,
     ENV_HIPFIRE_LFM2_DFLASH,

@@ -379,6 +379,76 @@ pub fn oq4_ldlq_pack(
     const BLOCK_BYTES: usize = 130; // 2 (f16 scale) + 128 nibbles
     let mut out = vec![0u8; m * nb * BLOCK_BYTES];
 
+    // Intra-block error feedback (HIPFIRE_LDLQ_INTRA_BLOCK). The loop below
+    // quantizes all 256 columns of a block from the SAME block-entry residual
+    // and only propagates to later BLOCKS, so within a group there is no error
+    // feedback at all — a single-block tensor degenerates exactly to RTN.
+    // Standard GPTQ is column-by-column. This arm does that: each column is
+    // quantized against a residual already carrying every previous column's
+    // error, and propagation runs to every later column rather than to the next
+    // block boundary. Rows stay independent, so the rayon parallelism is intact;
+    // the total propagation work is the same O(k²/2) per row either way, which
+    // is why it measures at equal cost.
+    if hipfire_env::LDLQ_INTRA_BLOCK.flag() {
+        let blocks: Vec<Vec<[u8; BLOCK_BYTES]>> = residual
+            .par_chunks_mut(k)
+            .map(|rr| {
+                let mut row_blocks = Vec::with_capacity(nb);
+                for blk in 0..nb {
+                    let c0 = blk * 256;
+                    // Scale still comes from the block-entry residual: the
+                    // artifact stores exactly one scale per group, so this must
+                    // not become per-column.
+                    let mut grp = [0.0f32; 256];
+                    for (c, g) in grp.iter_mut().enumerate() {
+                        *g = rr[c0 + c] as f32;
+                    }
+                    let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                    let inv = 1.0 / scale;
+                    let mut block = [0u8; BLOCK_BYTES];
+                    let s16 = crate::f32_to_f16(scale);
+                    block[0] = (s16 & 0xFF) as u8;
+                    block[1] = (s16 >> 8) as u8;
+
+                    let mut codes = [0i8; 256];
+                    for c in 0..256 {
+                        let col = c0 + c;
+                        let cur = rr[col] as f32;
+                        let q = (cur * inv).round().clamp(-7.0, 7.0);
+                        codes[c] = q as i8;
+                        let ucc = l[(col, col)];
+                        if ucc <= 0.0 {
+                            continue;
+                        }
+                        let err = (cur as f64 - (q * scale) as f64) / ucc;
+                        if err == 0.0 {
+                            continue;
+                        }
+                        for f in (col + 1)..k {
+                            let usf = l[(f, col)];
+                            if usf != 0.0 {
+                                rr[f] -= err * usf;
+                            }
+                        }
+                    }
+                    for i in 0..128 {
+                        block[2 + i] =
+                            ((codes[2 * i] as u8) & 0xf) | (((codes[2 * i + 1] as u8) & 0xf) << 4);
+                    }
+                    row_blocks.push(block);
+                }
+                row_blocks
+            })
+            .collect();
+        for (row, row_blocks) in blocks.iter().enumerate() {
+            for (blk, block) in row_blocks.iter().enumerate() {
+                let off = (row * nb + blk) * BLOCK_BYTES;
+                out[off..off + BLOCK_BYTES].copy_from_slice(block);
+            }
+        }
+        return Some(out);
+    }
+
     for blk in 0..nb {
         let c0 = blk * 256;
         let c1 = c0 + 256;

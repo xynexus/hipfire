@@ -299,6 +299,17 @@ env_vars! {
          Raises GPU residency during capture — one [K,K] f32 per captured \
          tensor. See `docs/quant-formats/moe-expert-hessians.md`.";
 
+    LDLQ_INTRA_BLOCK = "HIPFIRE_LDLQ_INTRA_BLOCK", Developer,
+        "Set 1 to propagate LDLQ error feedback WITHIN each 256-column group, \
+         not only across groups. The default packer quantizes all 256 columns of \
+         a block from the same block-entry residual and only propagates to later \
+         BLOCKS, so a single-block tensor degenerates exactly to RTN. Enabling \
+         this makes it column-by-column, which is what standard GPTQ does. \
+         Measured offline (examples/admm_probe) at equal cost: proxy loss vs RTN \
+         goes from -55.4% to -93.0% at k=1024, and it matches or beats an ADMM \
+         formulation on 3 of 4 shapes. OFF by default until it clears the KLD \
+         gate — it CHANGES quantizer output.";
+
     POOLED_EXPERT_HESSIAN = "HIPFIRE_POOLED_EXPERT_HESSIAN", Developer,
         "Set 1 to let a routed MoE expert's gate/up projection borrow the \
          LAYER-POOLED Hessian under `--ldlq` when it has none of its own. \

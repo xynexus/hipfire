@@ -134,6 +134,57 @@ fn ldlq_sweep(w: &[f32], h: &[f64], m: usize, k: usize, damp: f64) -> Option<Vec
     Some(out)
 }
 
+/// The proposed cheap fix: same sweep, but propagate error WITHIN the 256-column
+/// block as well as across blocks — i.e. standard GPTQ, column by column.
+///
+/// The group scale is still chosen once at block entry from the block's current
+/// residual (that is what the format stores), but each column is quantized
+/// against a residual that already carries every previous column's error.
+fn ldlq_sweep_intra(w: &[f32], h: &[f64], m: usize, k: usize, damp: f64) -> Option<Vec<f32>> {
+    let l = inv_cholesky_lower_rotated_fast(h, k, damp)?;
+    let mut residual: Vec<f64> = w.iter().map(|&v| v as f64).collect();
+    let mut out = vec![0.0f32; m * k];
+
+    for blk in 0..(k / GROUP) {
+        let c0 = blk * GROUP;
+        for r in 0..m {
+            // Scale from the block-entry residual — unchanged from production,
+            // since the artifact stores one scale per group.
+            let grp: Vec<f32> = (0..GROUP)
+                .map(|c| residual[r * k + c0 + c] as f32)
+                .collect();
+            let scale = symmetric_clipsearch(&grp, QMAX);
+            let inv = 1.0 / scale;
+
+            for c in 0..GROUP {
+                let col = c0 + c;
+                // Quantize the CURRENT residual, not the block-entry one.
+                let cur = residual[r * k + col] as f32;
+                let q = (cur * inv).round().clamp(-QMAX, QMAX) * scale;
+                out[r * k + col] = q;
+
+                let ucc = l[(col, col)];
+                if ucc <= 0.0 {
+                    continue;
+                }
+                let err = (cur as f64 - q as f64) / ucc;
+                if err == 0.0 {
+                    continue;
+                }
+                // Propagate to EVERY later column, including the rest of this
+                // block. That inner reach is the whole difference.
+                for f in (col + 1)..k {
+                    let usf = l[(f, col)];
+                    if usf != 0.0 {
+                        residual[r * k + f] -= err * usf;
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// H·v for ONE row vector, computed as the operator it is. The whole point:
 /// ADMM never needs `H` factorized, and in the real pipeline would not even
 /// need it FORMED — `H·v = Xᵀ(X·v)`.
@@ -335,6 +386,19 @@ fn main() {
         (40, 16, 100.0),
         (40, 16, 300.0),
     ];
+    let t = std::time::Instant::now();
+    let q_intra = ldlq_sweep_intra(&w, &h, m, k, damp).expect("cholesky");
+    let l_intra = proxy_loss(&w, &q_intra, &h, m, k);
+    let dt_intra = t.elapsed();
+    println!(
+        "  {:<24} {:>14.4}  {:>8.1}%  {:?}{}",
+        "LDLQ + intra-block",
+        l_intra,
+        100.0 * (l_intra - l_rtn) / l_rtn,
+        dt_intra,
+        if l_intra <= l_ldlq { "   <= LDLQ" } else { "" }
+    );
+
     for &(iters, cg, rho_mul) in &sweep {
         let rho = rho_mul * damp;
         let t = std::time::Instant::now();
@@ -389,5 +453,59 @@ fn main() {
         m * k,
         max_code
     );
-    println!("(lower proxy loss is better; RTN is the no-feedback floor to beat)");
+    production_check(&w, &h, m, k);
+    println!("\n(lower proxy loss is better; RTN is the no-feedback floor to beat)");
+}
+
+/// Exercise the PRODUCTION packer both ways. The probe above proves the
+/// algorithm; this proves the arm is actually wired into `oq4_ldlq_pack` and
+/// that both paths emit well-formed oq4 blocks. Quality of the real artifact is
+/// settled by the KLD gate, not here.
+#[allow(dead_code)]
+fn production_check(w: &[f32], h: &[f64], m: usize, k: usize) {
+    let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+    let signs1: Vec<f32> = (0..256)
+        .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+        .collect();
+    let signs2: Vec<f32> = (0..256)
+        .map(|i| if i % 5 == 0 { -1.0 } else { 1.0 })
+        .collect();
+    let damp = 0.01 * (0..k).map(|i| h[i * k + i]).sum::<f64>() / k as f64;
+
+    let run = |on: bool| -> Vec<u8> {
+        if on {
+            std::env::set_var("HIPFIRE_LDLQ_INTRA_BLOCK", "1");
+        } else {
+            std::env::remove_var("HIPFIRE_LDLQ_INTRA_BLOCK");
+        }
+        hipfire_quantize::ldlq::oq4_ldlq_pack(w, m, k, &h32, &signs1, &signs2, damp)
+            .expect("oq4_ldlq_pack")
+    };
+
+    let base = run(false);
+    let intra = run(true);
+    std::env::remove_var("HIPFIRE_LDLQ_INTRA_BLOCK");
+
+    let expect_len = m * (k / 256) * 130;
+    assert_eq!(base.len(), expect_len, "default arm emitted wrong length");
+    assert_eq!(intra.len(), expect_len, "intra arm emitted wrong length");
+
+    // Every nibble must decode inside the symmetric int4 range the format allows.
+    let mut worst = 0i32;
+    for blk in intra.chunks(130) {
+        for &byte in &blk[2..] {
+            for nib in [(byte & 0xf) as i8, (byte >> 4) as i8] {
+                let v = if nib >= 8 { nib - 16 } else { nib } as i32;
+                worst = worst.max(v.abs());
+            }
+        }
+    }
+    let differing = base.iter().zip(&intra).filter(|(a, b)| a != b).count();
+    println!(
+        "\nproduction oq4_ldlq_pack: {} bytes both arms, max |code| = {} (<= 7), \
+         {} / {} bytes differ between arms",
+        expect_len, worst, differing, expect_len
+    );
+    assert!(worst <= 7, "intra arm emitted an out-of-range int4 code");
+    assert!(differing > 0, "flag had NO effect — the arm is not wired");
 }
