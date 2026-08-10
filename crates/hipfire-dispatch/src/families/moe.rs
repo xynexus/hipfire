@@ -215,6 +215,37 @@ impl MoeResolution {
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
+/// Makes routed experts dereferenceable by the indexed MoE kernels under paged
+/// residency.
+///
+/// **Why a trait and not a field.** `WeightPager` lives in `hipfire-runtime`,
+/// which depends on *this* crate — so the pager cannot be held here directly
+/// without a dependency cycle. The provider is implemented on the runtime/arch
+/// side, where the pager already is, and passed in as a trait object.
+///
+/// **The contract is a safety property, not a convenience.** The indexed kernels
+/// do `A = expert_ptrs[topk_indices[..]]` and dereference `A` with no validation.
+/// An implementation that returns `Ok(())` while leaving any selected slot null
+/// causes a GPU-side null dereference, which on gfx1103 is an `amdgpu` MES hang
+/// and a full device reset — it takes down every other process on the GPU and is
+/// not recoverable in-process. Returning `Err` is always preferable to returning
+/// `Ok` with an incomplete table.
+pub trait ExpertResidency {
+    /// Make every expert in `selected` resident for `layer`, and write their
+    /// device addresses into `gate_up_ptrs` / `down_ptrs` at the matching slot.
+    ///
+    /// On `Ok(())` every slot named by `selected` MUST be non-null. Slots not in
+    /// `selected` are not read by this dispatch and may be anything.
+    fn ensure_resident_and_patch(
+        &self,
+        gpu: &mut hipfire_rdna::Gpu,
+        layer: usize,
+        selected: &[u32],
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+    ) -> Result<(), DispatchError>;
+}
+
 pub struct MoeParams<'a> {
     /// Index of the decoder layer this MoE block belongs to. Carried purely so
     /// the executor can attribute router-selection telemetry to a layer; the
@@ -267,6 +298,11 @@ pub struct MoeParams<'a> {
     /// per slot either way.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// Residency provider for paged experts. `None` means either fully resident
+    /// (the tables were filled at load from `MoeFfnWeights::experts`) or paged
+    /// with no provider — and `check_moe_decode_supported` refuses the latter
+    /// rather than dispatching against a table that is still all-zero.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,

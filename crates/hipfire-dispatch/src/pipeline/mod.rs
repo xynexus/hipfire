@@ -200,6 +200,7 @@ pub fn check_moe_decode_supported(
     k: usize,
     n_exp: usize,
     routed_experts_resident: bool,
+    paged_residency_available: bool,
 ) -> Result<(), DispatchError> {
     // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
@@ -239,10 +240,11 @@ pub fn check_moe_decode_supported(
     // This is dtype-agnostic — MQ4/MQ6/MQ2L/PARO/OQ4/OQ8 all read the same null
     // table — so the refusal is deliberately broad rather than Opus-specific.
     //
-    // Removing this check requires making the table non-null on the path that
-    // dispatches, not merely calling `patch_expert_ptr_table` somewhere: the
-    // default lowered pipeline carries no pager in `MoeParams` and cannot call it.
-    if use_gpu_topk && !routed_experts_resident {
+    // `paged_residency_available` is the escape: a caller that supplies an
+    // `ExpertResidency` provider will have the table patched for the selected
+    // experts before the dispatch, so the combination becomes legal. Absent a
+    // provider it stays refused — the table is still all-zero.
+    if use_gpu_topk && !routed_experts_resident && !paged_residency_available {
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "decode-paged-expert-ptr-table-unpopulated",
@@ -327,7 +329,13 @@ pub fn run_moe_decode(
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
     let __step = std::time::Instant::now();
     moe_step!(__step, "enter run_moe_decode");
-    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    check_moe_decode_supported(
+        res.use_gpu_topk,
+        p.k,
+        p.n_exp,
+        !p.routed_experts.is_empty(),
+        p.expert_residency.is_some(),
+    )?;
     moe_step!(__step, "after check_moe_decode_supported");
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
