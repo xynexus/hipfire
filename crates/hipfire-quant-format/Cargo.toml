@@ -7,3 +7,4 @@ description = "Canonical on-disk HFQ quant_type byte-contract, shared by the off
 
 [dependencies]
 hipfire-primitives = { path = "../hipfire-primitives" }
+serde_json = "1"

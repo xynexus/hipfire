@@ -20,6 +20,14 @@
 //! `hipfire_runtime::quant::dtype_for_quant_type`, which matches on the
 //! variants here.
 
+/// Random-access reader for `.hfa` source archives.
+///
+/// Lives here because an `.hfa` is an on-disk container and this crate is the
+/// on-disk contract between the writer (`hipfire-quantize`) and every reader
+/// (`hipfire-runtime`, the per-arch crates). It started in `hipfire-quantize`,
+/// where only the writer side could see it — which is why calibration, on the
+/// reader side, could not consume an archive.
+pub mod hfa;
 pub mod storage;
 
 /// On-disk HFQ weight encoding id (`#[repr(u8)]`; the stored byte is the
