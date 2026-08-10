@@ -1005,7 +1005,7 @@ pub const ENV_HIPFIRE_DEVICES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_DRAFT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_DRAFT",
     description: "Runtime variable controlling dflash draft in hipfire",
-    source: "crates/hipfire-server/src/routes/chat.rs:241",
+    source: "crates/hipfire-server/src/routes/chat.rs:260",
 };
 
 /// `HIPFIRE_DFLASH_GOLDEN_DIR` — Runtime variable controlling dflash golden dir in hipfire
