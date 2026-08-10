@@ -527,6 +527,17 @@ pub async fn fetch_file_from(
     if let Some(name) = file.sha256.as_deref().or(file.git_oid.as_deref()) {
         let blob = store.blob_path(name);
         if blob.exists() {
+            // Backfill a table for a blob that predates them — anything fetched
+            // by another client, or by this one before chunk tables existed.
+            // Without this a store can never acquire tables at all: the blob is
+            // already correct, so nothing ever re-downloads it, so `repair`
+            // would be stuck on the whole-file path forever. One sequential
+            // read, and only the first time.
+            if store.read_chunks(name).is_none() {
+                if let Ok(t) = crate::ChunkTable::of_file(&blob, crate::CHUNK) {
+                    let _ = store.write_chunks(name, &t);
+                }
+            }
             return Ok(blob);
         }
     }
