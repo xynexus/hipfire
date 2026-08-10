@@ -4201,6 +4201,11 @@ mod tests {
     /// written to protect and had been failing CI ever since.
     #[test]
     fn dense_prefill_bf16_is_batchable_in_qwen35() {
+        // gfx1151 is in this list deliberately. The BUG-001 guard that used to
+        // exclude it was removed with measured justification (see the BF16 arm of
+        // `is_batchable_la`): prefill 58.5 -> 1646.3 tok/s, PPL 24.0318 -> 24.0551,
+        // top-1 argmax agreeing at 99.36%. This test still asserted the old guard
+        // and so was red on every arch after that change landed.
         for arch in [
             "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
             "gfx942",
