@@ -1,33 +1,69 @@
 # TODO: tune the three kernels that own streamed calibration
 
-Opened 2026-08-10 from a `rocprofv3 --kernel-trace` of the live
-Qwen3.5-122B-A10B `oq4.25++` calibration. These three kernels are **87.8%** of
-GPU time, and none of them has had a tuning pass.
+Opened 2026-08-10 from `rocprofv3 --kernel-trace` slices of the live
+Qwen3.5-122B-A10B `oq4.25++` conversion. Three kernels are **~84%** of
+calibration GPU time and none has had a tuning pass; a fourth item covers the
+quantize stage, which is the larger half of a conversion by wall clock (~7 h
+against ~1.5 h here).
 
 ## The measurement
 
-Two layers (24–25) of the real 122B run, profiled in place. 92.3% of the
-profiled span was GPU-busy on kernels (258.3 s kernel / 279.7 s span), so this
-is compute-bound — not I/O-bound and not launch-bound.
+Two `rocprofv3 --kernel-trace` slices of the real 122B run, taken in place.
+88–92% of each profiled span was GPU-busy on kernels, so this is compute-bound —
+not I/O-bound and not launch-bound.
 
-| kernel | share | total | calls | avg |
-|---|---|---|---|---|
-| `attention_f32_routed_batched` | **38.3%** | 98.8 s | 256 | 386 ms |
-| `calib_hessian_outer_f32` | **26.0%** | 67.2 s | 9,672 | 6.9 ms |
-| `gemm_bf16_moe_grouped_wmma_gfx1151` | **23.5%** | 60.7 s | 1,024 | 59.3 ms |
-| `gemm_bf16_x_bf16_wmma_gfx1151_nheavy` | 5.7% | 14.7 s | 1,792 | 8.2 ms |
-| `__amd_rocclr_copyBuffer` | 1.4% | 3.5 s | 2,482,243 | 1.4 µs |
+**Sample A — layers 24+25 (one FULL-attention layer, one linear).** 258.3 s
+kernel / 279.7 s span.
 
-Two traps for whoever reads this DB next:
+| kernel | share | calls | avg |
+|---|---|---|---|
+| `attention_f32_routed_batched` | 38.3% | 256 | 386 ms |
+| `calib_hessian_outer_f32` | 26.0% | 9,672 | 6.9 ms |
+| `gemm_bf16_moe_grouped_wmma_gfx1151` | 23.5% | 1,024 | 59.3 ms |
+| `gemm_bf16_x_bf16_wmma_gfx1151_nheavy` | 5.7% | 1,792 | 8.2 ms |
+| `__amd_rocclr_copyBuffer` | 1.4% | 2,482,243 | 1.4 µs |
+
+**Sample B — layers 1–3 (ALL linear attention).** 249.6 s kernel / 283.5 s span.
+
+| kernel | share | calls |
+|---|---|---|
+| `calib_hessian_outer_f32` | 41.4% | 14,508 |
+| `gemm_bf16_moe_grouped_wmma_gfx1151` | 37.2% | 1,536 |
+| `gemm_bf16_x_bf16_wmma_gfx1151_nheavy` | 9.2% | 3,072 |
+| `gated_delta_net_f32_routed_batch_seq` | 4.0% | 768 |
+| `attention_f32_routed_batched` | — | absent by construction |
+
+### Weighting matters — sample A alone gives the WRONG ranking
+
+`full_attention_interval: 4`, so the model is **36 linear + 12 full** layers.
+Sample A is one of each, which over-weights full-attention layers 2:1 against
+their true 1:3 share. Decomposing A with B (subtract B's per-linear-layer cost
+from A) gives per-layer kernel time of **83.2 s linear vs 175.1 s full — a 2.10×
+ratio**, which independently matches the observed wall clock (98 s vs 196 s).
+Reweighting to 36:12:
+
+| kernel | WHOLE MODEL | (sample A alone said) |
+|---|---|---|
+| `calib_hessian_outer_f32` | **32.1%** | 26.0% |
+| `gemm_bf16_moe_grouped_wmma_gfx1151` | **28.9%** | 23.5% |
+| `attention_f32_routed_batched` | **23.3%** | 38.3% — *rank 1 → rank 3* |
+| `gemm_bf16_x_bf16_wmma_gfx1151_nheavy` | 7.1% | 5.7% |
+| `gated_delta_net_f32_routed_batch_seq` | 2.4% | 1.3% |
+
+Attention is still large and still the only scalar-f32 hot kernel, but it runs on
+a quarter of the layers and is **not** the top cost. Profile a representative
+layer MIX, or reweight, before ranking anything on a hybrid model.
+
+Two traps for whoever reads these DBs next:
 
 - `top_kernels.total_duration` is in **microseconds**. Reading it as ns makes
   the job look 0.09%-GPU-busy and launch-bound, which is wrong by 1000×.
   Cross-check against `SUM(end-start)` on `rocpd_kernel_dispatch_*`, which is ns.
-- The 2.48M `copyBuffer` calls look alarming and are not: 1.4 µs each, 1.4% of
-  time. Call count is not cost.
+- The millions of `copyBuffer` calls look alarming and are not: ~1.4 µs each,
+  1–2% of time. Call count is not cost.
 
-Absolute times carry ~47% profiler overhead (279.7 s profiled vs ~190 s
-unprofiled for two layers). Proportions are sound; don't quote the seconds.
+Absolute times carry ~47% profiler overhead. Proportions are sound; don't quote
+the seconds.
 
 ### Reproducing
 
@@ -46,13 +82,14 @@ rocprofv3 --kernel-trace --stats -d out -o run -- \
   --pause-after-layers 25 --output M.calib.hfq
 ```
 
+For a LINEAR-only sample, target layers 1–3 and write to a scratch output.
 Calibration resumes from its boundary checkpoint, so a profiled slice costs
 nothing but the profiler overhead — the layers it does are real work.
 
-## 1. `calib_hessian_outer_f32` — 26%, and half the work is redundant
+## 1. `calib_hessian_outer_f32` — 32% whole-model, and half the work is redundant
 
-`kernels/src/calib_reduce.hip:66`. Start here: it is the cheapest real win in
-the file.
+`kernels/src/calib_reduce.hip:66`. Start here: reweighting makes it both the
+LARGEST single cost and the cheapest real win in the file.
 
 `H = XᵀX` is **symmetric**, and the kernel computes the whole thing. Every
 `(i,j)` is written (`H[i*K+j] += acc`), and the launch grid is the full
@@ -60,8 +97,8 @@ the file.
 
 - **Lever A — skip the mirror half.** Launch only blocks with
   `blockIdx.y <= blockIdx.x` and mirror-write, or keep the square grid and early-
-  `return` the strictly-lower blocks after writing both triangles. ~2× on 26% of
-  runtime ⇒ ~13% end-to-end. Check first whether any consumer reads the lower
+  `return` the strictly-lower blocks after writing both triangles. ~2× on 32% of
+  runtime ⇒ ~16% end-to-end. Check first whether any consumer reads the lower
   triangle expecting it to be populated independently; the LDLQ/AWQ paths in
   `hipfire-quantize` are the ones to audit.
 - **Lever B — WMMA.** The inner loop is *already* a 16×16×16 tiled GEMM with
@@ -76,31 +113,7 @@ the file.
 
 Do A first and measure; it is a small diff with no numerical risk.
 
-## 2. `attention_f32_routed_batched` — 38%, and it is scalar f32
-
-`kernels/src/attention_f32_routed_batched.hip` (113 lines). The single largest
-consumer, and the only hot kernel with no WMMA and no packed math at all.
-386 ms per call is enormous next to the 8–59 ms of the WMMA GEMMs beside it.
-
-Three separate problems, in likely payoff order:
-
-- **The PV loop's access pattern is the worst case.** Line ~106:
-  `for d: for t: val += scores[t] * v_cache[t*n_kv_heads*head_dim + kv_h*head_dim + d]`.
-  Each thread walks `t` with a stride of `n_kv_heads*head_dim` floats — 4 KB at
-  8×128 — so every iteration is its own cache line. Stage V tiles through LDS,
-  or transpose the loop so consecutive threads read consecutive `d`.
-- **QKᵀ and PV are both GEMM-shaped and scalar.** `for t: for d: dot += q[d]*k[d]`
-  is a rank-1 dot per thread. Both products are 16×16×16-tileable; the repo
-  already has the builtins wired for gfx1151.
-- **Softmax does two full block reductions with `__syncthreads()` inside the
-  loop.** Fine when it is 1% of the kernel; worth revisiting only after the two
-  above, since it will not be the limiter until then.
-
-Note this is a **runtime** kernel, not calibration-only, so a win here also
-helps serving on every full-attention layer — the reason it tops this list is
-that calibration hammers it, not that calibration is special.
-
-## 3. `gemm_bf16_moe_grouped_wmma_gfx1151` — 23%, missing the N-heavy treatment
+## 2. `gemm_bf16_moe_grouped_wmma_gfx1151` — 29% whole-model, missing the N-heavy treatment
 
 `kernels/src/gfx1151/gemm_bf16_moe_grouped_wmma.gfx1151.hip:23`. Already WMMA
 (`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`), so this is tuning, not porting.
@@ -123,11 +136,82 @@ wins were wave64 + double-buffered LDS + N-heavy 2×8 + BK64, and the recorded
 DEAD ENDS were register-blocking, `__shfl`, and LDS bank-padding. Do not
 re-derive those.
 
+## 3. `attention_f32_routed_batched` — 23% whole-model, and it is scalar f32
+
+`kernels/src/attention_f32_routed_batched.hip` (113 lines). The only hot kernel
+with no WMMA and no packed math at all, and by far the most expensive single
+call: 386 ms against the 8–59 ms of the WMMA GEMMs beside it. It runs on only
+the 12 full-attention layers, which is why it is 23% and not the 38% the blended
+sample suggested.
+
+Three separate problems, in likely payoff order:
+
+- **The PV loop's access pattern is the worst case.** Line ~106:
+  `for d: for t: val += scores[t] * v_cache[t*n_kv_heads*head_dim + kv_h*head_dim + d]`.
+  Each thread walks `t` with a stride of `n_kv_heads*head_dim` floats — 4 KB at
+  8×128 — so every iteration is its own cache line. Stage V tiles through LDS,
+  or transpose the loop so consecutive threads read consecutive `d`.
+- **QKᵀ and PV are both GEMM-shaped and scalar.** `for t: for d: dot += q[d]*k[d]`
+  is a rank-1 dot per thread. Both products are 16×16×16-tileable; the repo
+  already has the builtins wired for gfx1151.
+- **Softmax does two full block reductions with `__syncthreads()` inside the
+  loop.** Fine when it is 1% of the kernel; worth revisiting only after the two
+  above, since it will not be the limiter until then.
+
+Note this is a **runtime** kernel, not calibration-only, so a win here also
+helps serving on every full-attention layer. It ranked first on the blended
+sample and only third once reweighted — still worth doing, and the serving
+benefit is why it is not last.
+
 ## Sequencing
 
-1. Hessian symmetry (small diff, no numerical risk, ~13% end-to-end).
-2. MoE GEMM N-heavy port (the shape is already proven next door).
-3. Attention PV staging, then WMMA (largest prize, largest change).
+Unchanged by the reweighting, and now better justified: the cheapest item is
+also the biggest.
+
+1. Hessian symmetry (small diff, no numerical risk, ~16% end-to-end).
+2. MoE GEMM N-heavy port (29%; the shape is already proven next door).
+3. Attention PV staging, then WMMA (23%, and it also helps serving).
+4. Batched expert factorization — see below; a quantize-side, not calibrate-side,
+   cost, but the one that governs whether a 397B is practical.
+
+## 4. LDLQ factorization — the quantize-stage cost, and why it is not Cholesky's fault
+
+Not in the traces above (this is `hipfire-quantize`, not calibrate), but it
+dominates the OTHER half of a conversion: ~7 h of the 122B run, against ~1.5 h
+of calibration.
+
+The unit of work is not the 1949 tensors — MoE expert weights are STACKED, so
+`mlp.experts.gate_up_proj` expands to 256 per-expert factorizations. That is
+48 × 256 = **12,288 Cholesky factorizations at K=3072**, ~9.7 GFLOP each.
+
+Three things are already settled, so do not re-derive them:
+
+- **Caching the factor across experts does not work.** Tried in `03f7a2612`,
+  reverted in `dc18bdd39` with measurements: `oq4.25++` maps to the AwqLdlq
+  recipe whose AWQ half rebases the Hessian per tensor (`H' = diag(1/s) H
+  diag(1/s)`, damping from the rebased diagonal), so every expert has a
+  different `H'` AND a different `λ`. The cache could never hit and its key
+  alone made the build 2× slower.
+- **The algebraic shortcut is invalid**: `(DHD + λI)⁻¹ ≠ D(H + λ'I)⁻¹D`.
+- **GPU Cholesky is 34× SLOWER** (`HIPFIRE_GPU_CHOLESKY`, off by default): the
+  trailing update is faster on device, but ~4500 block iterations each pay two
+  device syncs and a ~4 MB panel round-trip.
+
+Krylov methods do not substitute: LDLQ consumes the triangular FACTOR entry by
+entry and propagates `(w−ŵ)/L[c,c]` to later columns in order, so it needs `L`,
+not a solve, and the error feedback is inherently sequential within a tensor.
+
+The parallelism is BETWEEN factorizations, not within one:
+
+- **Batched factorization.** The 12,288 problems are independent. One K=3072
+  Cholesky cannot fill the GPU without paying per-panel syncs; a batched
+  `potrf` amortises them into one dispatch. Same flops, right shape.
+- **`f64` → `f32`.** `inv_cholesky_dispatch` takes `h: &[f64]` and returns
+  `Mat<f64>`. f64 is heavily rate-limited on gfx1151, so this may be several×
+  for free — IF conditioning tolerates it against the damping. Measure the
+  Hessian error, do not assume.
+- Note `down_proj` is already RTN (no Hessian is captured for it), so the entire
+  bill is `gate_up`.
 
 Each needs a before/after `rocprofv3` slice using the recipe above, and
 correctness checked with
