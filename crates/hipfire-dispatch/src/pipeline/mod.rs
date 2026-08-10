@@ -222,6 +222,34 @@ pub fn check_moe_decode_supported(
             quant: "",
         });
     }
+    // (c) paged residency + the indexed GPU-top-K path. This combination is
+    // ADMITTED BY DESIGN and BROKEN IN FACT, so it is refused by name until the
+    // pointer table is actually populated.
+    //
+    // The indexed kernels read `expert_ptrs[topk_indices[..]]` and dereference the
+    // result. That table is filled at load by iterating `MoeFfnWeights::experts`
+    // (`qwen35/loading.rs`), which is **empty by design under paging** — so
+    // `memcpy_htod` writes zero bytes and every slot stays null. The only function
+    // that would patch it per-token, `WeightPager::patch_expert_ptr_table`, has
+    // ZERO call sites workspace-wide.
+    //
+    // Measured on a 35B: `non_null=0/256` immediately before
+    // `gemv_oq4g256_moe_gate_up_k8_indexed_batched`, then HIP 719, an amdgpu MES
+    // hang, and a full GPU reset that takes down everything else on the device.
+    // This is dtype-agnostic — MQ4/MQ6/MQ2L/PARO/OQ4/OQ8 all read the same null
+    // table — so the refusal is deliberately broad rather than Opus-specific.
+    //
+    // Removing this check requires making the table non-null on the path that
+    // dispatches, not merely calling `patch_expert_ptr_table` somewhere: the
+    // default lowered pipeline carries no pager in `MoeParams` and cannot call it.
+    if use_gpu_topk && !routed_experts_resident {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "decode-paged-expert-ptr-table-unpopulated",
+            arch: "",
+            quant: "",
+        });
+    }
     Ok(())
 }
 
