@@ -1888,7 +1888,7 @@ pub const ENV_HIPFIRE_FP8_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FUSED_HFQ4_2ROW_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3278",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3312",
 };
 
 /// `HIPFIRE_GATE_UP_VARIANT` — Runtime variable controlling gate up variant in hipfire
@@ -2154,7 +2154,7 @@ pub const ENV_HIPFIRE_HFQ4G128_MMQ: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4G256_MMQ_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3261",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3295",
 };
 
 /// `HIPFIRE_HFQ4_GATE_UP_FAST` — HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the
@@ -2224,7 +2224,7 @@ pub const ENV_HIPFIRE_HIPCC_EXTRA_FLAGS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HIP_WAIT",
     description: "Runtime variable controlling hip wait in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:733",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:751",
 };
 
 /// `HIPFIRE_HOST_PROFILE_BIN` — Runtime variable controlling host profile bin in hipfire
@@ -2561,6 +2561,13 @@ pub const ENV_HIPFIRE_LATENTKV_TRAIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LATENTKV_TRAIN",
     description: "Runtime variable controlling latentKV train in hipfire",
     source: "crates/hipfire-train/examples/latent_kv_recovery.rs:160",
+};
+
+/// `HIPFIRE_LAUNCH_TRACE` — Selects behavior from recognized values
+pub const ENV_HIPFIRE_LAUNCH_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_LAUNCH_TRACE",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:33",
 };
 
 /// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES` — Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose tensors skip `--ldlq` even when the calibration carries a Hessian for them. Exists so ONE calibration artifact can produce both arms of a per-expert-Hessian comparison, which keeps the arms differing only in the thing under test instead of in their capture.
@@ -2904,7 +2911,7 @@ pub const ENV_HIPFIRE_MOE_HFQ6_V2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MOE_INDEXED_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_INDEXED_2ROW_GFX1151",
     description: "Opt-in (\"1\") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3296",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3330",
 };
 
 /// `HIPFIRE_MOE_MQ2L_N32_GFX1151` — Runtime variable controlling moe mq2l n32 gfx1151 in hipfire
@@ -4852,7 +4859,7 @@ pub const ENV_HIPFIRE_STEER_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TARGET_ARCH",
     description: "Runtime variable controlling target arch in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:762",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:780",
 };
 
 /// `HIPFIRE_TEST_LATENT` — Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump
@@ -5847,6 +5854,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LATENTKV_EVAL,
     ENV_HIPFIRE_LATENTKV_RANK,
     ENV_HIPFIRE_LATENTKV_TRAIN,
+    ENV_HIPFIRE_LAUNCH_TRACE,
     ENV_HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES,
     ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER,
     ENV_HIPFIRE_LFM2_DFLASH,

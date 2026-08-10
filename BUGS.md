@@ -139,6 +139,40 @@ into full investigations here.
   dead GPU (the first `hipModuleLoad` after the fault, in `deinterleave_f32` under
   `run_attend`), not where it faulted. The fault is upstream, in whatever the
   indexed path dispatched before it. Do not read `deinterleave_f32` as the culprit.
+- **CULPRIT IDENTIFIED 2026-08-10 — `gemv_oq4g256_moe_gate_up_k8_indexed_batched`.**
+  Found in ONE run with `HIPFIRE_LAUNCH_TRACE=2` (added for this; it synchronizes
+  after every launch so an async fault is attributed to the kernel that caused it
+  instead of its successor):
+  ```
+  [launch] gemv_oq4_grouped                              <- sync ok
+  [launch] scaled_add_inplace_gpu_scalar_f32             <- sync ok
+  [launch] gemv_oq4g256_moe_gate_up_k8_indexed_batched grid=[1024,8,1] block=[32,1,1]
+  [launch] gemv_oq4g256_moe_gate_up_k8_indexed_batched <- SYNC FAILED code=719
+                                             hipDeviceSynchronize: unspecified launch failure
+  ```
+  - HIP **719** = in-kernel memory fault. Reset counter 36 -> 37 confirms the wedge.
+  - **28 launches succeeded first, and this kernel had 0 prior successes** — it
+    faults the very first time it runs, not after N iterations.
+  - Immediately prior: `gemv_oq4_grouped` (dense OQ4) and `mq_rotate_x` both fine,
+    so OQ4 weights and the rotation basis are not implicated. It is specifically
+    the indexed routed gate_up.
+- **Two structural explanations tried and DISPROVEN — do not re-litigate:**
+  1. "batched prefill never ensures expert residency": `prefill_batch.rs` neither
+     dispatches these kernels nor touches the pointer table (0 references each).
+     The stack goes `forward_prefill_batch` -> `forward_scratch_layers` -> lowered
+     -> `run_moe`, so `moe_decode.rs` is the dispatcher.
+  2. "residency is not ensured on the paged path": `ensure_paged_experts_resident`
+     is called unconditionally at `moe_decode.rs:1187` whenever
+     `ffn.experts.is_empty()`, i.e. before the dispatch at :1256+. And
+     `patch_expert_ptr_table` (`weight_pager.rs:1397`) *panics* on a non-resident
+     module, so a missing expert would abort, not fault the device.
+- **Next diagnostic (cheapest first):** immediately before that launch, read back
+  `ffn.expert_gate_up_ptrs` and the 8 selected indices and assert each selected
+  slot is non-null and inside a resident allocation. That distinguishes a bad
+  pointer table from a genuine in-kernel indexing bug (`row_ptr = A + row *
+  groups_per_row * 132` with `M=1024`, `grid.x=1024`) — the two remaining classes.
+  `HIPFIRE_PAGED_MOE_DEBUG=1` exists but only labels and syncs; it does not dump
+  the table.
 - **Separate defect found by the flag-off run:** the refusal works, and then kills
   the daemon.
   ```
