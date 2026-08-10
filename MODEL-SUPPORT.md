@@ -234,7 +234,11 @@ Projection of the prefill axis over **weight-quant × gfx-class**, computed from
 
 ### Batched prefill: kv-mode (derived)
 
-Projection of the prefill axis over **kv-mode**, from `kv_mode_prefill_batchable`. Only Q8 and the rotated asym K modes have a batched flash-masked prefill kernel; fp32 and no-kv (SSM) fall back to per-token decode.
+Projection of the prefill axis over **kv-mode**, from `kv_mode_prefill_batchable`. Only Q8 and the rotated asym K modes have a batched **flash** (tiled) masked prefill kernel.
+
+**Scope — corrected 2026-08-10. This table is the LLaMA-family path, not a universal claim.** `kv_mode_prefill_batchable` has exactly three consumers: `llama_prefill_batchable`, an assertion in `llama.rs`, and this generator. **qwen35 does not consult it** and has its own fp32 arm: inside the batched prefill path, `prefill_chunk.rs` branches `if kv_cache.quant_q8 { attention_q8_0_kv_batched_masked } else { attention_f32_batched_masked }`, so fp32 KV takes a batched masked prefill kernel there rather than falling back to per-token. The earlier wording ("fp32 and no-kv fall back to per-token decode") read as universal and was wrong for arch 6.
+
+Two further gaps this axis does not show: **kvarn is absent from `kv_cache_prefill_mode` entirely**, so a kvarn cache is classified `Fp32` and reported non-batchable despite `attention_flash_kvarn_tile_batched` and `attention_kvarn_routed_batched` existing; and there is **no fp16/bf16 KV mode** in `KvQuantMode` at all, so those cannot batch because they cannot be selected.
 
 | KV mode | Batched prefill |
 |---|---|
