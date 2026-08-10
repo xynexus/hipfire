@@ -46,8 +46,17 @@ pub enum FileState {
 }
 
 /// Hash every local blob against the hub's digest.
-pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(RepoFile, FileState)>> {
-    let files = list_files(repo, revision).await?;
+///
+/// `only` restricts the sweep to paths matching a glob. Verifying costs a full
+/// read of everything it covers, so on a large repo checking one shard should
+/// not mean hashing the other fifteen.
+pub async fn verify(
+    root: &Path,
+    repo: &str,
+    revision: &str,
+    only: Option<&str>,
+) -> Result<Vec<(RepoFile, FileState)>> {
+    let files = filtered(list_files(repo, revision).await?, repo, only)?;
     let store = Store::new(root, repo);
     let mut out = Vec::with_capacity(files.len());
     for f in files {
@@ -110,13 +119,7 @@ pub async fn fetch(
     revision: &str,
     include: Option<&str>,
 ) -> Result<usize> {
-    let mut files = list_files(repo, revision).await?;
-    if let Some(pat) = include {
-        files.retain(|f| glob_match(pat, &f.path));
-    }
-    if files.is_empty() {
-        return Err(Error::Fatal(format!("{repo}: no files matched")));
-    }
+    let files = filtered(list_files(repo, revision).await?, repo, include)?;
     let store = Store::new(root, repo);
     std::fs::create_dir_all(store.dir().join("blobs"))?;
 
@@ -160,8 +163,8 @@ pub async fn fetch(
 ///
 /// This is the operation the store actually needs: one bad shard in sixteen
 /// should cost one shard, not the repo.
-pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
-    let states = verify(root, repo, revision).await?;
+pub async fn repair(root: &Path, repo: &str, revision: &str, only: Option<&str>) -> Result<usize> {
+    let states = verify(root, repo, revision, only).await?;
     let store = Store::new(root, repo);
     let broken: Vec<&RepoFile> = states
         .iter()
@@ -433,6 +436,28 @@ pub async fn fetch_file_streamed_with_retry(
 }
 
 /// Minimal `*` glob, enough for `--include '*.safetensors'`.
+/// Apply a path glob, refusing a pattern that matches nothing.
+///
+/// Erroring rather than returning an empty set is the point: a typo'd glob that
+/// silently verified zero files would report success, which is the worst answer
+/// an integrity check can give.
+fn filtered(files: Vec<RepoFile>, repo: &str, pat: Option<&str>) -> Result<Vec<RepoFile>> {
+    let files = match pat {
+        Some(p) => files
+            .into_iter()
+            .filter(|f| glob_match(p, &f.path))
+            .collect(),
+        None => files,
+    };
+    if files.is_empty() {
+        return Err(Error::Fatal(match pat {
+            Some(p) => format!("{repo}: no files matched {p:?}"),
+            None => format!("{repo}: no files"),
+        }));
+    }
+    Ok(files)
+}
+
 fn glob_match(pat: &str, s: &str) -> bool {
     let mut parts = pat.split('*');
     let Some(first) = parts.next() else {
@@ -468,5 +493,45 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("config.json", "config.json"));
         assert!(!glob_match("model-*", "tokenizer.json"));
+    }
+
+    /// `--only` makes the matcher load-bearing for an integrity check, where a
+    /// pattern that is too loose would quietly skip files. These pin the two
+    /// behaviours that decide that: a suffix pattern anchors at the end, and a
+    /// bare wildcard matches in the middle.
+    #[test]
+    fn glob_anchors_a_suffix_and_matches_in_the_middle() {
+        assert!(!glob_match("*.json", "tokenizer.json.lock"));
+        assert!(glob_match("*00003*", "model-00003-of-00004.safetensors"));
+        assert!(!glob_match("*00003*", "model-00001-of-00004.safetensors"));
+    }
+
+    fn f(path: &str) -> RepoFile {
+        RepoFile {
+            path: path.into(),
+            size: 1,
+            sha256: None,
+            git_oid: None,
+        }
+    }
+
+    /// A pattern that matches nothing is an error, not an empty pass. A verify
+    /// reporting success over zero files is the worst answer it can give.
+    #[test]
+    fn a_pattern_matching_nothing_is_refused() {
+        let files = vec![f("tokenizer.json"), f("model-00001.safetensors")];
+        let err = filtered(files.clone(), "org/model", Some("*.bin"))
+            .expect_err("an unmatched glob must not pass silently");
+        assert!(format!("{err}").contains("*.bin"), "unhelpful: {err}");
+
+        let kept = filtered(files.clone(), "org/model", Some("*.safetensors")).expect("match");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "model-00001.safetensors");
+        assert_eq!(
+            filtered(files, "org/model", None)
+                .expect("unfiltered")
+                .len(),
+            2
+        );
     }
 }
