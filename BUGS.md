@@ -67,7 +67,48 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
-## [High] Indexed OQ MoE decode kernels produce non-finite KLD
+## [FIXED] Routed OQ experts repacked for kernels that never ran — non-finite KLD
+**Title corrected 2026-08-10.** This was filed as "indexed OQ MoE decode kernels
+produce non-finite KLD". That was a **misattribution**: the kernels were never
+dispatched at all on the fixture that reproduced it. Kept below because the
+reproduction and the reasoning that led to the real cause are still useful.
+
+- **Real root cause: two independent decisions about the same question, allowed
+  to disagree.** The dispatcher admits the indexed MoE kernels through
+  `use_gpu_topk`, which requires `k_top == 8` — every one of them is a
+  `*_k8_indexed*` kernel launched with `grid.y = 8`. The loader
+  (`load_moe_expert`) repacked routed OQ experts from the canonical block layout
+  (OQ4 130 B `[f16 scale|128 nib]`, OQ8 258 B) into those kernels' layout
+  (132 B / 260 B, f32 scale) on the strength of `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`
+  **alone**.
+  So on a model routing top-k != 8, the experts were rewritten into kernel layout
+  and then decoded by the NON-indexed fallback, which reads them as canonical
+  blocks — every group misaligned by 2 B and the scale reconstructed from
+  `[f16 scale | first 2 payload bytes]`, which is trivially huge or NaN. Hence
+  non-finite, on every Opus cell, in both the oq4 and oq8 families.
+- **Why the tiny fixture reproduced it and nothing else did:** it is
+  `hidden=256, moe_intermediate=128, num_experts=8, num_experts_per_tok=2`.
+  Top-2, so `use_gpu_topk` is false and the fallback runs. MiniMax and the 35B
+  route top-8 and stay on the indexed path, where the repack is exactly right —
+  which is why arch 10 reports finite KLD through the same kernels.
+- **Fix:** `INDEXED_MOE_K_TOP` (`qwen35/mod.rs`) is now the single definition of
+  the 8, read by both `use_gpu_topk` and the loader; `load_moe_expert` takes the
+  decision as a parameter instead of re-deriving it from the env.
+- **Verified:** `HIPFIRE_TINYQUANT_FAMILIES=qwen3_5_moe HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`
+  goes 7/7 non-finite -> **7/7 pass**, drift `-0` on six cells, `findings: 0`.
+  Control (flag unset) still passes. Workspace lib suite 98 targets / 0 failures.
+- **What this does NOT establish.** With `k_top=2` the indexed kernels still do
+  not execute, so this is NOT evidence that they are numerically correct — it
+  only removes the corruption that was being blamed on them. The tiny fixture
+  cannot exercise them at all. Exercising them needs a top-8 MoE fixture, which
+  the tiny battery does not currently have.
+- **Latent, separate, still open:** the paged arm of that same guard is
+  `use_gpu_topk || ffn.experts.is_empty()`, so a **paged** model takes the indexed
+  path regardless of its top-k — while the kernels still hard-code `grid.y = 8`.
+  A paged top-k != 8 model would read `topk_indices` past its end. Harmless for
+  the 35B (top-8); a real hazard for any paged model that is not.
+
+<details><summary>Original entry as filed (kept for the reproduction)</summary>
 - Category: Correctness / Kernels (Opus routed experts)
 - Location: `gemv_oq4g256_moe_*`/`gemv_oq8g256_moe_*` indexed kernels, gated by
   `qwen35_moe_oq_indexed_decode_enabled` (`hipfire-arch-qwen35/src/qwen35/mod.rs:1824`)
@@ -98,11 +139,16 @@ into full investigations here.
     the flag is OQ-specific and is not expected to reach the MQ kernels.
   So the defect is in the indexed OQ routed kernels themselves, spanning **both**
   the oq4 and oq8 families, and it is not collateral from the OQ8 flag bug.
+  **^ That last sentence was WRONG** — a clean one-variable A/B told me the flag
+  caused the failure, and I read that as "the kernels the flag enables are
+  broken". The flag also switches the *loader*, and that is what broke. A
+  one-variable experiment localises the variable, not the mechanism.
 - Suggested fix: debug on the tiny fixture, not a 35B. The gate comment already
   describes this as a known "finite-KLD failure" being debugged, so this entry is
   a reproduction and a scope statement rather than a new discovery.
 - Scope: Correctness (premier quant family, paged path)
 - Confidence: High (clean A/B, one variable)
+</details>
 
 ## [RESOLVED by rebase] tiny-quant was RED for Opus across four MoE families
 - Category: Correctness / Quant (Opus)
