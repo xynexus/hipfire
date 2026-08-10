@@ -128,11 +128,36 @@ into full investigations here.
     second full KV cache per session (10 KV-carrying layers x k and v). That is
     the real capacity model of batched prefill on this arch and it is not
     documented anywhere.
-- **Status: batch >= 2 on the 35B is still blocked**, but the blocker is now
-  specific and located rather than "OOM somewhere". Next is to establish whether
-  the checkpoint clone is necessary for every batched session or only for ones
-  that may be forked/rewound — if the latter, the batch path should share the KV
-  and clone lazily.
+- **Answered 2026-08-10: the clone is UNCONDITIONAL, and it is not for batching
+  correctness.** `run_generate_batch_prefill_serial_qwen35`
+  (`qwen35_prefill.rs:1925`) ends with a bare loop:
+  ```rust
+  for session in &result.sessions {
+      ...
+      emit_qwen35_prefill_checkpoint(m, gpu, arena_backend, hook)?;  // no guard
+  }
+  ```
+  and `emit_qwen35_prefill_checkpoint`'s own doc says what it is for: emitting a
+  boundary "so clients can resume from a cached prefix". That is **prefix
+  caching** — a feature — and `clone_gpu_tensor` implements it as a deep
+  device-to-device copy "to snapshot session state without aliasing the live
+  buffers". So peak batch-prefill memory is ~2x KV per session, paid whether or
+  not any client ever resumes.
+- **Recommended fix, in order of increasing scope:**
+  1. Make the checkpoint opt-in per request (clients that will not resume should
+     not pay for the snapshot). Smallest change, unblocks the batch sweep.
+  2. Make it lazy / copy-on-write — snapshot only when the live KV is first
+     mutated past the boundary.
+  3. Leave it and document 2x KV as the batch capacity model, which caps batch
+     width at roughly half what the KV budget suggests.
+  This is a **semantics** change, not an allocation fix: prefix-cache resume is
+  observable behaviour clients may depend on, so it wants a decision rather than
+  a patch.
+- Also noted in passing: the function is named `..._serial_qwen35` and prefills
+  the batch's sessions in a loop. Whether "batched prefill" is actually fused
+  across sessions on this path, or serial-with-a-batch-envelope, was not
+  established and is worth checking before any throughput conclusion is drawn
+  from it.
 - Instrumentation landed with this: `HipRuntime::malloc` reports the requested
   size on failure, and `HIPFIRE_MALLOC_BACKTRACE=1` captures the allocating
   stack. The bare "hipMalloc: out of memory" this started from could not
