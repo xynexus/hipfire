@@ -139,8 +139,28 @@ into full investigations here.
   - Every other caller of the validator is a test in `qwen35/mod.rs` (~4856-4951),
     including one asserting the fp32 rejection, so those pin the current contract
     and will need updating with it.
-- Next: extend that validator (and the `..._q8_kv` fused path it guards) to accept
-  kvarn. Until then `serial` + kvarn caps usable concurrency at 3.
+- **Port sized 2026-08-10 — and relaxing the validator ALONE would be a
+  correctness bug.** `prefill_batch.rs` dispatches exactly two attention kernels:
+  ```
+  gpu.attention_f32_routed_batched
+  gpu.attention_q8_0_routed_batched
+  ```
+  There is no kvarn arm and no asym arm, across 37 KV-mode branches in the file.
+  So admitting kvarn at the contract without adding a dispatch arm would route
+  kvarn-quantized KV into the Q8 (or fp32) kernel — silent wrong output, not an
+  error. This is the same accept-and-miscompute class as the indexed-OQ null table
+  earlier in this branch, and it is why the validator must not simply be widened.
+- **The kernel needed already exists:** `attention_kvarn_routed_batched.hip`
+  (alongside `attention_flash_kvarn_tile_batched.hip`). So the port is two
+  coordinated edits, not new kernel work:
+  1. add a kvarn arm dispatching `attention_kvarn_routed_batched` beside the
+     existing f32/q8 arms, and
+  2. extend `validate_grouped_moe_prefill_session_batch_state_contract` to accept
+     `kv_quant_kvarn` — in that order, so the contract never admits a mode the
+     dispatch cannot serve.
+  The tests in `qwen35/mod.rs` (~4856-4951) pin the current contract and move with
+  step 2.
+- Until then `serial` + kvarn caps usable concurrency at 3.
 - Scope: blocks multi-stream measurement on the target model
 - Confidence: High (explicit runtime error naming the requirement)
 
