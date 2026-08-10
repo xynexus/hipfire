@@ -90,8 +90,34 @@ into full investigations here.
   `serial` is untried.
 - Consequence: batch >= 2 on the 35B remains blocked, but the blocker has moved
   from memory exhaustion to a single KV-mode coupling with a named owner.
-- Next: port the grouped-MoE fused prefill batch path off its Q8 requirement to
-  kvarn, or confirm `serial` is a viable interim and use it for the batch sweep.
+- **`serial` IS a viable interim, and it produced the first multi-stream
+  generation on this model (2026-08-10).**
+  `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial` with kvarn:
+
+  | batch | ok | aggregate tok/s | per-stream tok/s |
+  |---|---|---|---|
+  | 2 | **2/2** | 7.86 | 3.93 |
+  | 3 | **3/3** | 7.19 | 2.40 |
+  | 4 | 0/4 | — | fails |
+
+  (`auto` does NOT work — unchanged error. Only `serial` does.)
+- **The Q8 coupling is in TWO paths, not one, and the second has a batch
+  threshold.** Under `serial` the prefill error disappears and the SAME
+  requirement reappears at decode:
+  ```
+  batch decode: qwen35 fused grouped-MoE native decode advance:
+    "grouped MoE session fused prefix row 0 must use Q8 KV state ..."
+  ```
+  It is clean at batch 2-3 and fires at batch 4, so the fused grouped-MoE decode
+  advance appears to engage at batch >= 4 and hard-requires Q8. The port target is
+  therefore both the fused prefill AND the fused decode path.
+- **Throughput result worth noting on its own: batching buys nothing here yet.**
+  Aggregate is FLAT from batch 2 to 3 (7.86 -> 7.19 tok/s) while per-stream falls
+  3.93 -> 2.40. At these widths the sessions are serialising rather than sharing a
+  pass over weights, which is precisely the property the v2 module-major design
+  exists to fix — and it is now measurable on the target model instead of blocked.
+- Next: port the fused grouped-MoE prefill AND decode paths off Q8 to kvarn. Until
+  then `serial` + kvarn caps usable concurrency at 3.
 - Scope: blocks multi-stream measurement on the target model
 - Confidence: High (explicit runtime error naming the requirement)
 
