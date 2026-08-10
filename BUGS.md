@@ -104,10 +104,28 @@ into full investigations here.
 - Diagnosis needed the allocator to report free/total at failure; a bare
   "out of memory" on a 68 MiB request looked like pool placement or
   fragmentation and was neither.
-- Next: find why max_seq does not reach the KV constructor on the serving path
-  (`physical_cap` is plumbed for the daemon path — the load frame reports
-  `physical_cap: 2048` — so the server path is the suspect), then re-measure the
-  batch sweep, which should stop being memory-bound entirely.
+- **LOCALIZED 2026-08-10.** `physical_cap` is derived in `load.rs` as
+  `requested.clamp(512.min(max_seq), max_seq)` — it is *clamped to* `max_seq` and
+  cannot exceed it. The observed cache is ~264K positions, so `load_model`'s
+  `max_seq` argument is itself ~264K, not the operator's 512. The value is lost
+  BEFORE `load_model`, not inside the KV constructors (which faithfully use
+  `m.max_seq` / `m.physical_cap`).
+  `hipfire serve --max-seq N` inserts `max_seq` into the CLI config layer
+  (`commands/serve.rs`), the same mechanism `--kv-cache` uses and which demonstrably
+  works — so the gap is between that config value and the daemon load frame's
+  `params`. The daemon path plumbs it correctly (its load frame reports
+  `physical_cap: 2048` at `max_seq: 2048`); the server path is where it is dropped.
+- **Re-measured after the kvarn session-arm fix (`c67e7ee91`)**, because the
+  earlier `physical_cap=132096` reading came from the asym3 fallback cache that
+  fix removed — the kvarn log line never printed a cap, so that number could not
+  be carried forward:
+  - failing allocation halved, 68.53 MiB -> **34.77 MiB** (second cache gone)
+  - still `free=39.1 MiB of 43,008 MiB`
+  - 36,458,496 B / 17,664 B-per-tile = 2064 tiles x 128 tok = **264,192
+    positions**, i.e. still the model's full context rather than the requested 512
+  So the sizing defect is independent of the mode-mismatch defect and survives it.
+- Next: forward the resolved `max_seq` into the server's load-frame params, then
+  re-measure the batch sweep, which should stop being memory-bound entirely.
 - Scope: Capacity / correctness — caps concurrency at 2 and blocks all
   multi-stream measurement
 - Confidence: High (16x max_seq change with byte-identical allocation;
