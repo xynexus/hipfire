@@ -554,7 +554,7 @@ fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
     ))
 }
 
-fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
+pub(crate) fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
     match kv_mode {
         "kvarn8" => 8,
         "kvarn2" => 2,
