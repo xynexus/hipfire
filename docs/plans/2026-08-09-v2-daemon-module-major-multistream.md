@@ -719,6 +719,13 @@ dependency this does not remove: decode does a **D2H readback of top-k** before
 CPU-router mispredict rate before committing**; this is the most likely place the design
 underdelivers.
 
+**SUPERSEDED — the measurement below was taken at a degenerate cache budget.**
+16 GiB exceeds the model's entire 15.9 GiB expert set, so the cache filled and
+never evicted; "zero evictions" was cited as evidence when it actually meant the
+test could not exhibit the pressure prefetch exists to relieve. A budget sweep
+(next block) reverses the conclusion in the constrained regime. Kept because the
+*unconstrained* numbers are still correct and still bound the upside there.
+
 **MEASURED 2026-08-10 — do not build the CPU-router prefetch. Both halves of the
 case for it are false on real numbers.** Paged Opus MoE on
 `Qwen3.6-35B-A3B--oq4.hfq` (40 layers, 256 experts, top-8, 16 GiB expert cache),
@@ -745,6 +752,42 @@ Note the corollary that also softens §0.4's capacity argument on this box:
 routing is skewed enough that 48 tokens × 3 generations touched only 6011 of
 10,240 modules (59%), and the whole set fits in cache anyway — so expert
 residency is not the binding constraint at this model size.
+
+**BUDGET SWEEP 2026-08-10 — residency policy dominates once the cache is smaller
+than the working set.** Same model and prompt, three 32-token generations per
+budget, `decode_tok_s` per generation:
+
+| budget | cold-loads | evictions | gen1 | gen2 | gen3 |
+|---|---|---|---|---|---|
+| 2 GiB | 18798 | **17475** | 4.1 | **0.9** | 2.2 |
+| 4 GiB | 12159 | 9512 | 4.7 | 7.5 | 6.9 |
+| 8 GiB | 5335 | **40** | 4.9 | 12.5 | 12.5 |
+| 16 GiB | 5335 | **0** | 4.9 | 12.6 | 12.8 |
+
+- **The touched working set is ~8.3 GiB** (5335 modules x 1.55 MiB). Cold-loads
+  are *identical* at 8 and 16 GiB, so anything above ~8 GiB is pure headroom and
+  measures nothing about residency.
+- **Degradation is not graceful.** 2 GiB collapses to 0.9 tok/s — 14x slower than
+  12.8 — with evictions (17475) running nearly 1:1 against cold-loads (18798).
+  Almost every module fetched is evicted before it is reused: LRU thrash, not
+  capacity shortfall. Note gen2 at 2 GiB is *worse than gen1*, i.e. warming the
+  cache actively hurt.
+- **This is where §1.5's SIEVE argument earns its place.** Expert reuse is
+  frequency-skewed (144 tokens touched 59% of modules), and LRU is precisely the
+  policy that lets one sweep of cold experts evict the hot set. The 2 GiB row is
+  what that failure looks like.
+- **It also partially revives the prefetch case**, but bounded: at 2 GiB the run
+  fetches ~196 modules/token (~304 MiB/token). Prefetch can *hide* that latency
+  behind compute; it cannot remove the traffic. Fix the policy first — thrash at
+  1:1 evict:fetch is a policy failure, and prefetching into a cache that
+  immediately evicts what it fetched buys nothing.
+
+**Caveat on all of the above: batch size 1.** Every number here is single-stream
+decode (`batch=1` in the dispatch dumps). That is the worst case for §0.4's
+amortization curve — top-8 experts per layer, no sharing. A wide batch touches
+far more distinct experts per step but amortizes each module's bytes across more
+tokens, so both the working set and the crossover move. The sweep should be
+repeated at batch > 1 before any residency policy is tuned on it.
 
 **Where the 72 ms actually goes is the open question.** 3B active params at oq4
 is ~1.5 GB/token, i.e. ~15 ms at gfx1103's ~100 GB/s — so warm decode is running
