@@ -84,6 +84,20 @@ into full investigations here.
   per MoE layer with one core pinned, which is how it was found.
 - Non-indexed Opus MoE decode is healthy; this is specific to the indexed routed
   kernels.
+- **RE-VERIFIED on the rebased base 2026-08-10, and the result is now STRONGER.**
+  The original A/B was taken on `da38cc16f`, which also carried the `from_flag`
+  wildcard defect — so an obvious objection was that the three OQ8-family cells
+  failed because `--format oq8` was being rejected outright, not because of any
+  kernel. That objection is now dead: on `origin/master` `33d9dcbd2` the wildcard
+  is fixed and all seven Opus cells **still** fail with non-finite KLD, while the
+  same seven pass with the flag unset on that same base. 82 commits of master work
+  did not touch it.
+  - control (flag unset): oq4, oq8, oq4+, oq4++, oq4.25++, oq8+, oq8++ — 7/7 pass
+  - `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`: the same 7 — 7/7 non-finite KLD
+  - `q8f16`, `mq3`, `mq4`, `mq6` pass in both arms, but that is weak evidence:
+    the flag is OQ-specific and is not expected to reach the MQ kernels.
+  So the defect is in the indexed OQ routed kernels themselves, spanning **both**
+  the oq4 and oq8 families, and it is not collateral from the OQ8 flag bug.
 - Suggested fix: debug on the tiny fixture, not a 35B. The gate comment already
   describes this as a known "finite-KLD failure" being debugged, so this entry is
   a reproduction and a scope statement rather than a new discovery.
