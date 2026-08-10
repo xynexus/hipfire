@@ -789,6 +789,36 @@ far more distinct experts per step but amortizes each module's bytes across more
 tokens, so both the working set and the crossover move. The sweep should be
 repeated at batch > 1 before any residency policy is tuned on it.
 
+**FIRST MULTI-STREAM DATA 2026-08-10 — and it supports the thesis this plan is
+built on.** Concurrency on the 35B was blocked for most of this branch by two
+KV-sizing defects (an operator cap silently overridden at load, then again
+per-request; fixed in `21aca50bb` / `f2d59b442`) and is now reachable at widths
+2-3 via `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial` with kvarn:
+
+| batch | ok | aggregate tok/s | per-stream tok/s |
+|---|---|---|---|
+| 2 | 2/2 | 7.86 | 3.93 |
+| 3 | 3/3 | 7.19 | 2.40 |
+| 4 | 0/4 | — | fused grouped-MoE decode requires Q8 KV |
+
+**Aggregate throughput is FLAT while per-stream falls proportionally.** 2 -> 3
+streams moves aggregate 7.86 -> 7.19 tok/s (down, within noise of flat) while
+per-stream drops 3.93 -> 2.40. That is the signature of sessions *serialising*
+rather than sharing a pass over weights — precisely the deficiency §0 describes
+and that module-major execution exists to remove. Until now that claim rested on
+the architecture of `batch_runner.rs`; it now has a measurement on the target
+model.
+
+Read it carefully, though — it is not yet evidence FOR the amortization curve:
+- widths 2-3 are far below the N where §0.4 predicts sharing pays (the curve only
+  bends past ~`n_exp / k` token-slots), so this measures the pathology, not the
+  remedy;
+- it runs the `serial` prefill backend, not the fused one, so some of the
+  flatness may be prefill serialisation rather than decode;
+- batch >= 4 is still blocked on the fused grouped-MoE path hard-requiring Q8 KV
+  (see BUGS.md), so 16/64/128 — the widths §0.4's table actually argues about —
+  remain unmeasured.
+
 **Where the 72 ms actually goes is the open question.** 3B active params at oq4
 is ~1.5 GB/token, i.e. ~15 ms at gfx1103's ~100 GB/s — so warm decode is running
 about 5× off roofline. The launch-overhead and LRU costs this plan already names
