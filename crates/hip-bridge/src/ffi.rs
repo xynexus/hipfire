@@ -866,7 +866,32 @@ impl HipRuntime {
                 std::backtrace::Backtrace::force_capture()
             );
         }
-        self.check(code, &format!("hipMalloc({size} bytes = {:.2} MiB)", size as f64 / (1024.0 * 1024.0)))?;
+        if code != 0 {
+            // Report free/total at the moment of failure. Without it, an OOM on a
+            // modest request is unattributable: it could be genuine exhaustion,
+            // fragmentation, or the request landing in a pool smaller than the
+            // device's headline capacity. Those need different fixes.
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let info_code = unsafe { (self.fn_mem_get_info)(&mut free, &mut total) };
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            let where_ = if info_code == 0 {
+                format!(
+                    ", free={:.1} MiB of total={:.1} MiB",
+                    mib(free),
+                    mib(total)
+                )
+            } else {
+                String::new()
+            };
+            return Err(HipError::new(
+                code,
+                &format!(
+                    "hipMalloc({size} bytes = {:.2} MiB){where_}",
+                    mib(size)
+                ),
+            ));
+        }
         Ok(DeviceBuffer { ptr, size })
     }
 

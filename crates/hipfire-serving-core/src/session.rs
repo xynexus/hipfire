@@ -161,10 +161,15 @@ impl Qwen35RequestSessionState {
         let buffer_size = tensor.buf.size();
         gpu.bind_thread()
             .map_err(|e| format!("clone qwen35 checkpoint {label} bind gpu: {e:?}"))?;
-        let buf = gpu
-            .hip
-            .malloc(buffer_size)
-            .map_err(|e| format!("clone qwen35 checkpoint {label} alloc: {e:?}"))?;
+        let buf = gpu.hip.malloc(buffer_size).map_err(|e| {
+            // Include shape/dtype: a byte count alone cannot say whether an
+            // oversized clone is a geometry bug (wrong head count, wrong
+            // max_seq) or genuine pressure.
+            format!(
+                "clone qwen35 checkpoint {label} alloc: {e:?} (shape={:?} dtype={:?} bytes={})",
+                tensor.shape, tensor.dtype, buffer_size
+            )
+        })?;
         gpu.hip
             .memcpy_dtod_at(&buf, 0, &tensor.buf, 0, buffer_size)
             .map_err(|e| format!("clone qwen35 checkpoint {label} copy: {e:?}"))?;
