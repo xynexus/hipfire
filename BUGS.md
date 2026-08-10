@@ -67,6 +67,34 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [High] Grouped-MoE fused prefill-session batch requires Q8 KV — blocks batching on kvarn
+- Category: Capacity / KV-mode coupling — the first real dependent the KV
+  deprecation surfaced
+- Surfaced 2026-08-10 once the KV sizing fixes (`21aca50bb`, `f2d59b442`) made
+  batched prefill stop being memory-bound. The error is explicit:
+  ```
+  qwen35 grouped-MoE fused prefill-session batch backend failed:
+    "grouped MoE session fused prefix row 0 must use Q8 KV state for the MQ4
+     control path"
+  ; use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial
+  ```
+- **This is the deprecation working as intended.** Q8 is now gated at load
+  (`6a4e32b68`), and this path hard-requires it — so the fused grouped-MoE batch
+  backend is a concrete port target for the kvarn migration, not an unrelated
+  bug. It is exactly the "break it and the breakage names what needs fixing"
+  outcome that was the point of gating rather than deleting.
+- **The suggested fallback does not work.** Setting
+  `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto` on the server process leaves the
+  error unchanged at batch 4 and batch 16. Either `auto` still selects the fused
+  backend, or the env does not reach the spawned daemon — untested which.
+  `serial` is untried.
+- Consequence: batch >= 2 on the 35B remains blocked, but the blocker has moved
+  from memory exhaustion to a single KV-mode coupling with a named owner.
+- Next: port the grouped-MoE fused prefill batch path off its Q8 requirement to
+  kvarn, or confirm `serial` is a viable interim and use it for the batch sweep.
+- Scope: blocks multi-stream measurement on the target model
+- Confidence: High (explicit runtime error naming the requirement)
+
 ## [FIXED] max_seq was inflated by the generation budget, sizing KV for a 132K context
 **Resolved `21aca50bb`.** `--max-seq` is now a hard cap. Title corrected: the
 cache was never sized from `max_position_embeddings` — that was an inference from
