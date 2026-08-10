@@ -166,13 +166,43 @@ into full investigations here.
      `ffn.experts.is_empty()`, i.e. before the dispatch at :1256+. And
      `patch_expert_ptr_table` (`weight_pager.rs:1397`) *panics* on a non-resident
      module, so a missing expert would abort, not fault the device.
-- **Next diagnostic (cheapest first):** immediately before that launch, read back
-  `ffn.expert_gate_up_ptrs` and the 8 selected indices and assert each selected
-  slot is non-null and inside a resident allocation. That distinguishes a bad
-  pointer table from a genuine in-kernel indexing bug (`row_ptr = A + row *
-  groups_per_row * 132` with `M=1024`, `grid.x=1024`) — the two remaining classes.
-  `HIPFIRE_PAGED_MOE_DEBUG=1` exists but only labels and syncs; it does not dump
-  the table.
+- **ROOT CAUSE, measured 2026-08-10: the expert pointer table is never populated.
+  `patch_expert_ptr_table` is DEAD CODE — it has zero call sites.**
+  Host-side dump immediately before the faulting launch
+  (`HIPFIRE_MOE_PTR_TABLE_DUMP=1`, added at the dispatcher):
+  ```
+  [ptr_table] oq4 gate_up batched (pre-launch): n_exp=256 non_null=0/256 k_top=8 batch=1
+  [ptr_table]   slot=0 expert=132 ptr=0x0000000000000000  <== NULL
+  [ptr_table]   slot=1 expert=129 ptr=0x0000000000000000  <== NULL
+  ...  all 8 selected slots NULL
+  ```
+  - **0 of 256 slots non-null** — not just the selected ones; the table was never
+    written at all.
+  - The **top-k indices are valid** (132, 129, 38, 213, 21, 253, 244, 193, all
+    within `0..n_exp`), so the GPU-side top-k is fine. The kernel dereferences a
+    null pointer, which is the 719 and the MES hang.
+- **Why nothing populates it:**
+  - `patch_expert_ptr_table` (`weight_pager.rs:1397`) has **zero callers**
+    workspace-wide. Its only other occurrences are two doc mentions and its own
+    two internal panic strings.
+  - `ensure_paged_experts_resident` has exactly two callers —
+    `moe_decode.rs:1187` (qwen35 hand decode) and `prefill_chunk.rs:855` (chunked
+    prefill) — and **neither is the lowered pipeline**, which is default-ON and is
+    what actually runs (`dispatch_super_op` is in the fault stack).
+  - The lowered pipeline's `MoeParams` carries **no pager field at all**, so that
+    path structurally cannot patch the table even if it tried.
+- **Two doc comments describe this wiring as if it exists** and should be corrected
+  along with the fix: `qwen35/layout.rs:90` ("the indexed kernels read pointers
+  from `expert_*_ptrs` which the pager patches per-token via
+  `patch_expert_ptr_table`") and `:253` ("The forward path uses interior
+  mutability (`borrow_mut`) at the MoE dispatch site to call `ensure_resident` /
+  `patch_expert_ptr_table`"). Neither call happens.
+- **So paged + indexed MoE has never worked on any path**, and the earlier "~160 s
+  per MoE layer" reading was this same null-pointer wedge all along.
+- **Fix is a design decision, not a patch** — either thread pager access into the
+  lowered MoE path so residency + table patching happen where the dispatch does,
+  or refuse the paged+indexed combination in backend *selection* with a named
+  predicate (the repo rule for exactly this class). Recorded rather than chosen.
 - **Separate defect found by the flag-off run:** the refusal works, and then kills
   the daemon.
   ```
