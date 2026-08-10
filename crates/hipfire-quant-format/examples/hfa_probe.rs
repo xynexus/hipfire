@@ -7,7 +7,7 @@
 //! With a restored directory it compares; without one it just reports what the
 //! archive contains.
 
-use hipfire_quantize::hfa::HfaArchive;
+use hipfire_quant_format::hfa::HfaArchive;
 use std::collections::HashMap;
 
 fn main() {

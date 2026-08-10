@@ -644,6 +644,33 @@ fn safetensors_header_identity(path: &Path) -> Result<String, CalibError> {
 }
 
 fn source_shard_identity(path: &Path) -> Result<SourceShardIdentity, CalibError> {
+    // An archive-backed shard's path is the synthetic `<archive>#<shard>` the
+    // source built; there is no file at it to hash. Identify it by the shard's
+    // own header instead — same class as the other arms (hash the index, never
+    // the payload), which is what keeps this cheap on a 180 GB archive.
+    if let Some((archive_path, shard)) = path.to_string_lossy().rsplit_once('#') {
+        let archive_path = Path::new(archive_path);
+        if archive_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("hfa"))
+        {
+            let archive = hipfire_quant_format::hfa::HfaArchive::open(archive_path)
+                .map_err(CalibError::InvalidSourcePlan)?;
+            let header = archive
+                .shard_header(shard)
+                .map_err(CalibError::InvalidSourcePlan)?;
+            let encoded = serde_json::to_vec(&header)
+                .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?;
+            return Ok(SourceShardIdentity {
+                file: shard.to_string(),
+                bytes: fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0),
+                identity_kind: "hfa_shard_header_hash".into(),
+                identity: stable_hash_bytes(&encoded),
+            });
+        }
+    }
+    // Every remaining arm needs a real file at `path`.
     let bytes = fs::metadata(path)
         .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?
         .len();
@@ -2984,20 +3011,27 @@ pub fn build_calibration_run_inputs(
     // `.hfq` directly is what removes the full restore from the large-model
     // pipeline — a 244 GB expansion for Qwen3.5-122B-A10B whose only purpose
     // was to hand this function a directory.
-    let model_is_hfq = command.model.is_file()
-        && command
-            .model
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("hfq"));
-    let (snapshot, source): (PathBuf, Box<dyn ModelSource>) = if model_is_hfq {
-        let hfq = crate::hfq::HfqFile::open(&command.model)?;
-        (command.model.clone(), Box::new(hfq))
-    } else {
-        let snapshot = resolve_hf_snapshot(&command.model)?;
-        let source = SafetensorsSource::open(&snapshot)?;
-        (snapshot, Box::new(source))
-    };
+    let model_ext = command
+        .model
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let model_is_file = command.model.is_file();
+    let (snapshot, source): (PathBuf, Box<dyn ModelSource>) =
+        if model_is_file && model_ext.as_deref() == Some("hfq") {
+            let hfq = crate::hfq::HfqFile::open(&command.model)?;
+            (command.model.clone(), Box::new(hfq))
+        } else if model_is_file && model_ext.as_deref() == Some("hfa") {
+            // Read the archive in place. Restoring it first costs the whole
+            // checkpoint again on disk (244 GB for Qwen3.5-122B-A10B) purely to
+            // produce a directory this function then walks exactly once.
+            let archive = crate::safetensors_source::SafetensorsSource::open_hfa(&command.model)?;
+            (command.model.clone(), Box::new(archive))
+        } else {
+            let snapshot = resolve_hf_snapshot(&command.model)?;
+            let source = SafetensorsSource::open(&snapshot)?;
+            (snapshot, Box::new(source))
+        };
 
     // A safetensors snapshot ships tokenizer.json beside the shards; an HFQ
     // embeds it under the `tokenizer` metadata key. Take whichever exists, so
