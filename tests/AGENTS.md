@@ -49,5 +49,15 @@ a measurement that looks clean.
 - **`pkill -f` / `pgrep -f` match the pattern against your own command line.**
   They will kill the invoking shell or count their own waiter loop as a live job.
   Match on the executable (`pgrep -x`) or exclude self.
+- **A GPU-lock test fails if you are holding the lock.**
+  `resource_lock_rejects_live_holder_and_frees_on_drop` asserts a live holder is
+  rejected — so a daemon or `hipfire serve` you left running makes it fail, and
+  the error names YOUR pid as the blocker. Kill by pid and confirm
+  `hipfire lock status` says free before running the suite; a lingering
+  verification server looks exactly like a code regression.
+- **Gate the commit on every check you ran, not the last one.** `cargo test ... ;
+  ./tests/no-gpu-ci.sh; RC=$?; [ $RC -eq 0 ] && git commit` commits on a red test
+  suite, because `$?` only carries the gate. Capture each result and require all
+  of them.
 - **Confirm the binary under test is the one you just built.** An A/B against a
   stale `target/release` binary silently measures the old code.
