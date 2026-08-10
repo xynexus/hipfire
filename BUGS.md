@@ -67,7 +67,38 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
-## [High] Paged Opus MoE on the 35B WEDGES THE GPU during prefill (MES hang → driver reset)
+## [FIXED 2026-08-10] Paged Opus MoE on the 35B wedged the GPU (MES hang → driver reset)
+**Resolved — paged Opus MoE now generates on the 35B.** The pointer table went
+`non_null=0/256` → **`8/256`** (exactly the selected experts, real device
+addresses), the reset counter held at **39 → 39** where every prior attempt cost
+a reset, and the model produced coherent output. Same selected expert IDs as the
+failing runs (132, 129, 38, 213, 21, 253, 244, 193), so those are precisely the
+slots that used to read null.
+
+The fix is five pieces, and four of them were correct-but-unreachable for several
+commits because of the fifth:
+1. **Push residency** — the pager maintains the table itself on page-in, evict and
+   teardown, so no dispatch site can forget (`f8f0902b3`).
+2. **Registration** — every MoE layer hands its tables to the pager at load
+   (`517c9c60a`).
+3. **`ExpertResidency` reshaped** to residency-only; patching is the pager's job.
+4. **Readback + ensure** in the lowered path — it now learns which experts to page
+   in. A D2H sync per MoE layer, accepted deliberately; option (b), speculative
+   paging via the unused `CpuRouter`, is what removes it.
+5. **Threading** — `Qwen35Bindings` → `run_moe` → `moe_ffn_dispatch`. That last
+   helper **hardcoded `None` for the pager**, discarding it before
+   `moe_ffn_decode_impl` could build a provider. Everything above it worked and
+   was simply never reached.
+
+Regression: tiny-quant 188 pass / 3 fail — the same pre-existing `oq4.25++` trio,
+two byte-identical and `zaya` moving inside its documented flake band. Resident
+path unaffected. Workspace 98 targets / 0 failures.
+
+Kept below as the investigation record; the measurements are still accurate for
+the state they describe.
+
+<details><summary>Original entry and investigation</summary>
+
 - Category: Correctness / Stability (paged residency, prefill)
 - Measured 2026-08-10 on nix1 (gfx1103) at `b30c13d4d`, daemon rebuilt at HEAD.
 - Repro: `HIPFIRE_QWEN35_PAGED_EXPERTS=1 HIPFIRE_QWEN35_EXPERT_CACHE_MB=16384
@@ -259,6 +290,8 @@ into full investigations here.
   a signature/caller change rather than a one-line edit. **Not** attempted here.
 - Scope: Stability (wedges the device), blocks M5 on this box
 - Confidence: High (kernel reset log + userspace stack + paired A/B)
+
+</details>
 
 ## [FIXED] Routed OQ experts repacked for kernels that never ran — non-finite KLD
 **Title corrected 2026-08-10.** This was filed as "indexed OQ MoE decode kernels

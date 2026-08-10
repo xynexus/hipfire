@@ -324,6 +324,43 @@ pub(crate) fn download_i32_tensor(
     Ok(data)
 }
 
+/// `ExpertResidency` over the qwen35 weight pager (option A).
+///
+/// Only makes the selected experts resident — it does not touch the pointer
+/// table, because the pager maintains that itself on every residency transition.
+/// That is the whole reason the split exists: the previous shape had each
+/// dispatch site patch after ensuring, and the default-ON lowered pipeline never
+/// did, so the table stayed all-zero and the kernels dereferenced null.
+struct PagerExpertResidency<'a> {
+    pager: &'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>,
+}
+
+impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'_> {
+    fn ensure_resident(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        selected: &[u32],
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let mut pager = self.pager.borrow_mut();
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            // Propagate the pager's own message. A residency failure here means
+            // the kernel would read a null slot and wedge the device, so this
+            // must surface as an error and never be swallowed.
+            pager.ensure_expert_module_resident(key, gpu).map_err(|e| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "paged expert residency layer={layer} expert={expert}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
@@ -676,6 +713,10 @@ pub(crate) fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // Residency provider for the lowered MoE path. `Some` exactly when this model
+    // is paged; a fully-resident model gets `None` and the lowered path keeps
+    // top-K on-device with no readback, unchanged.
+    let residency_provider = pager.map(|p| PagerExpertResidency { pager: p });
     let _ = hidden;
 
     let router_logits = s.router_logits;
@@ -955,10 +996,12 @@ pub(crate) fn moe_ffn_decode_impl(
             shared_down_w: ffn.shared_expert.down.dispatch_ref(),
             expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
             expert_down_ptrs: &ffn.expert_down_ptrs,
-            // No provider yet: the qwen35 pager is not wired to the lowered
-            // MoE seam, so paged residency stays refused rather than
-            // dispatching against an unpopulated pointer table.
-            expert_residency: None,
+            // Option A: the lowered path reads top-k back and makes the
+            // selected experts resident before dispatch. The pointer table
+            // follows automatically (push), so this only supplies residency.
+            expert_residency: residency_provider
+                .as_ref()
+                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
             routed_gate_up_k: routed_shape.gate_up_k,
             routed_down_m: routed_shape.down_m,
             routed_down_k: routed_shape.down_k,
@@ -1270,9 +1313,12 @@ pub(crate) fn moe_ffn_decode_impl(
         k,
         n_exp,
         !ffn.experts.is_empty(),
-        // The hand path has no ExpertResidency provider wired yet (that is the
-        // lowered path's seam), so paged stays refused here.
-        false,
+        // A provider is attached exactly when this model is paged, and it is
+        // handed to `run_moe_decode` via `MoeParams::expert_residency`. This
+        // guard runs BEFORE that delegation, so it has to agree with it —
+        // hardcoding `false` here refuses the configuration the lowered path is
+        // now able to serve.
+        residency_provider.is_some(),
     )
     .map_err(|e| HipError::new(0, &format!("qwen35 moe decode: {e:?}")))?;
 
@@ -1740,10 +1786,12 @@ pub(crate) fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
-            // No provider yet: the qwen35 pager is not wired to the lowered
-            // MoE seam, so paged residency stays refused rather than
-            // dispatching against an unpopulated pointer table.
-            expert_residency: None,
+            // Option A: the lowered path reads top-k back and makes the
+            // selected experts resident before dispatch. The pointer table
+            // follows automatically (push), so this only supplies residency.
+            expert_residency: residency_provider
+                .as_ref()
+                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
         routed_gate_up_k: routed_shape.gate_up_k,
         routed_down_m: routed_shape.down_m,
         routed_down_k: routed_shape.down_k,

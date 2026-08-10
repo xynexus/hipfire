@@ -465,6 +465,43 @@ pub fn run_moe_decode(
         p.n_exp,
         p.norm_topk_prob
     ))?;
+    // Paged residency (option A): make the selected experts resident before the
+    // indexed kernels dereference their pointer-table slots.
+    //
+    // This costs a D2H sync per MoE layer per token, which this path otherwise
+    // avoids on purpose (see the histogram note directly below). That cost is
+    // accepted deliberately: without it the lowered path cannot know WHICH experts
+    // to page in, and a selected-but-non-resident expert reads a null slot — an
+    // MES hang and a full GPU reset, not a recoverable error. Correctness first;
+    // option (b) replaces this with speculative paging via `CpuRouter` so the
+    // sync can come back out.
+    //
+    // Only runs when a provider is attached, i.e. paged models. Fully-resident
+    // models keep top-K on-device and pay nothing.
+    if let Some(residency) = p.expert_residency {
+        hip!(gpu.bind_thread())?;
+        let mut idx = vec![0i32; p.k];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let selected: Vec<u32> = idx
+            .iter()
+            .filter(|v| **v >= 0 && (**v as usize) < p.n_exp)
+            .map(|v| *v as u32)
+            .collect();
+        // A router index outside [0, n_exp) means the top-k kernel produced
+        // garbage; dispatching would index the table out of bounds. Refuse by
+        // name rather than letting the kernel fault the device.
+        if selected.len() != idx.len() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "decode-topk-index-out-of-range",
+                arch: "",
+                quant: "",
+            });
+        }
+        residency.ensure_resident(gpu, p.layer, &selected)?;
+    }
     // Feed the shared router histogram (see the CPU-fallback call below for why
     // this port was missing it). Gated on the histogram being armed because,
     // unlike the fallback, this path keeps top-K on-device — recording costs a

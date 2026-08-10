@@ -690,7 +690,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_STATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_TOPK",
     description: "DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1203",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1240",
 };
 
 /// `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` — Runtime variable controlling deepseek4 expert layer end in hipfire
@@ -711,7 +711,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_F32_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
     description: "Unscatter + SwiGLU·clamp",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1293",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1330",
 };
 
 /// `HIPFIRE_DEEPSEEK4_GEN_TOKENS` — Runtime variable controlling deepseek4 gen tokens in hipfire
@@ -774,63 +774,63 @@ pub const ENV_HIPFIRE_DEEPSEEK4_MOE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_8W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_8W",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1243",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1280",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_CND` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_CND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_CND",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1242",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1279",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1394",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1431",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1232",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1269",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` — ── Grouped vs scalar gate ────────────────────────────────────────────────
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE",
     description: "── Grouped vs scalar gate ────────────────────────────────────────────────",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1227",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1264",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W` — Shared research levers (read once; default 4w on gfx11+)
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W",
     description: "Shared research levers (read once; default 4w on gfx11+)",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1235",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1272",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_MMQLOAD` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_MMQLOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_MMQLOAD",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1244",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1281",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_N32` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_N32: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_N32",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1241",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1278",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MOE_NOSYNC` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_DEEPSEEK4_MOE_NOSYNC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_MOE_NOSYNC",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1245",
+    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:1282",
 };
 
 /// `HIPFIRE_DEEPSEEK4_MTP_ADDON` — Convention 1: append ".mtp-addon.hfq" (legacy)
@@ -1734,7 +1734,7 @@ pub const ENV_HIPFIRE_EP_KV_SEQ: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EP_PEER_ALLREDUCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PEER_ALLREDUCE",
     description: "RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:282",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:284",
 };
 
 /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` — Environment toggle value controls runtime behavior
@@ -1755,14 +1755,14 @@ pub const ENV_HIPFIRE_EP_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EP_PREFILL_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_PREFILL_TIMING",
     description: "Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:275",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:277",
 };
 
 /// `HIPFIRE_EP_SKIP_ALLREDUCE` — Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
 pub const ENV_HIPFIRE_EP_SKIP_ALLREDUCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_SKIP_ALLREDUCE",
     description: "Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:276",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:278",
 };
 
 /// `HIPFIRE_EVAL_DATASET_MIRROR` — Runtime variable controlling eval dataset mirror in hipfire
@@ -1867,7 +1867,7 @@ pub const ENV_HIPFIRE_FORCE_UNFUSED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_FORWARD_LOWERED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FORWARD_LOWERED",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/lowered.rs:624",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/lowered.rs:628",
 };
 
 /// `HIPFIRE_FP16` — Used to configure runtime execution by explicitly setting "HIPFIRE_FP16"
@@ -3359,7 +3359,7 @@ pub const ENV_HIPFIRE_PACK_IDENTITY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PAGED_MOE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PAGED_MOE_DEBUG",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:497",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:534",
 };
 
 /// `HIPFIRE_PAGER_TIMING` — Environment toggle value controls runtime behavior
@@ -3387,7 +3387,7 @@ pub const ENV_HIPFIRE_PARO_BATCHED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_FA3_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FA3_FUSED",
     description: "Runtime variable controlling paro fa3 fused in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1670",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1672",
 };
 
 /// `HIPFIRE_PARO_FUSED_PACK2` — Runtime variable controlling paro fused pack2 in hipfire
@@ -3408,21 +3408,21 @@ pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_GATE_UP_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_GATE_UP_FUSED",
     description: "Runtime variable controlling paro gate up fused in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1282",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1284",
 };
 
 /// `HIPFIRE_PARO_LA2_FUSED` — Runtime variable controlling paro la2 fused in hipfire
 pub const ENV_HIPFIRE_PARO_LA2_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_LA2_FUSED",
     description: "Runtime variable controlling paro la2 fused in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1384",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1386",
 };
 
 /// `HIPFIRE_PARO_LA4_FUSED` — Runtime variable controlling paro la4 fused in hipfire
 pub const ENV_HIPFIRE_PARO_LA4_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_LA4_FUSED",
     description: "Runtime variable controlling paro la4 fused in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1380",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/ep.rs:1382",
 };
 
 /// `HIPFIRE_PARO_LA_GATES_MQ4G128` — Used to configure runtime execution by explicitly setting "HIPFIRE_PARO_LA_GATES_MQ4G128"
@@ -4068,14 +4068,14 @@ pub const ENV_HIPFIRE_QWEN35_FINITE_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_MOE_DTYPE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_DTYPE_DEBUG",
     description: "from outside. \"HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1\" names them",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:766",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:807",
 };
 
 /// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE` — Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
 pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_LEGACY_INLINE",
     description: "Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1692",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1738",
 };
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — The arch layer resolves the same question independently and traces its
@@ -4110,7 +4110,7 @@ pub const ENV_HIPFIRE_QWEN35_RESIDENCY_MODE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD",
     description: "Runtime variable controlling qwen35 routed only moe forward in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:641",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:678",
 };
 
 /// `HIPFIRE_QWEN35_STAGE_SYNC` — Runtime variable controlling qwen35 stage sync in hipfire
