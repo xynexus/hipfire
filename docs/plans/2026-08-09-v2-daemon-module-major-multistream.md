@@ -1024,7 +1024,17 @@ expert.
 ### M5 — The cache becomes the executor's residency authority
 
 **Depends on Phases 1–2 of `moe-expert-residency-unification.md` landing on master
-first** (§0.5). `MoeExpert(e)` lowers to `ensure_module_resident` → dispatch → touch. The
+first** (§0.5). **Correction (2026-08-10): that document is not on master and not on this
+branch.** It exists only on the unmerged topic branch
+`fix/oq8-from-flag-and-rotation-guards` (added by `691e7730e`, 2026-08-08), which was the
+checked-out branch when this plan was written — hence the citation. Every reference to it
+in this plan, including this dependency and the `ResidencyPolicy::{LazyLru, PinAll}`
+discussion in §0.5, describes work that is **written but unmerged**. `PinAll` in
+particular does not exist on master. So M5's stated prerequisite is not merely "not yet
+done" — it is *done elsewhere and awaiting a merge decision*, which is a different kind
+of blocker and a cheaper one. Resolve the merge before sequencing M5.
+
+`MoeExpert(e)` lowers to `ensure_module_resident` → dispatch → touch. The
 paths exist; what changes is that the *executor* calls them and the budget comes from
 `ResourceReservationManager` rather than `qwen35_expert_cache_budget_bytes()`. Sub-items:
 SIEVE (M5a), real async transport plus `hipEventQuery` (M5b), emitting and consuming the
@@ -1242,7 +1252,13 @@ remains the byte-identity oracle.
   design pass (§0.1).
 - `docs/plans/2026-07-25-daemon-merge-training-induction-scheduler.md` — mark M4d and M5–M8
   superseded; keep M0–M4c as landed history.
-- `docs/plans/moe-expert-residency-unification.md` — Phase 3's deepseek4 blocker is now also
+- `docs/plans/moe-expert-residency-unification.md` — **not on master; lives only on the
+  unmerged branch `fix/oq8-from-flag-and-rotation-guards` (`691e7730e`).** Its Phase 0 also
+  already root-caused the 14-cell tiny-quant breakage filed in `BUGS.md`: 9 cells are one
+  regression from `8b9ee5392` (an unguarded `_` arm above the `oq8` literals in
+  `HfqInputFormat::from_flag` made every OQ8 flag unreachable) and are fixed there; the
+  other 5 are minimax and are separately pre-existing. Merging that branch is a decision,
+  not a debugging task. Phase 3's deepseek4 blocker is now also
   M4's arch-coverage boundary, and Phases 1–2 are M5's dependency. Cross-link both.
 - `MODEL-SUPPORT.md` — arch 6's indexed-OQ default changes at M5.
 - `crates/hipfire-daemon/AGENTS.md` — still claims `/tmp/hipfire-gpu.lock`; the code
