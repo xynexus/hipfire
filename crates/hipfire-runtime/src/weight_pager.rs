@@ -1027,6 +1027,16 @@ pub struct WeightPager {
     resident_modules: HashMap<ExpertModuleKey, ResidentModule>,
     module_lru: VecDeque<ExpertModuleKey>,
     module_stats: ModulePagerStats,
+    /// Device expert-pointer tables, registered once per layer at load and then
+    /// maintained by the pager itself on every residency transition (push model).
+    ///
+    /// The alternative — having each dispatch site call
+    /// `patch_expert_module_ptr_table` after ensuring residency — is what the hand
+    /// decode path does, and it fails open: the default-ON lowered pipeline simply
+    /// never calls it, so the table stays all-zero and the indexed kernels
+    /// dereference null, wedging the GPU. Correctness must not depend on every
+    /// caller remembering, so residency changes update the table here instead.
+    expert_ptr_tables: HashMap<u16, ExpertPtrTables>,
     /// Transport implementation (v0.1: pread + H2D, future: io_uring + P2P).
     transport: Box<dyn Transport>,
     /// Construction-time config.
@@ -1068,6 +1078,13 @@ struct Resident {
     bytes: u64,
 }
 
+/// Non-owning aliases of one layer's device expert-pointer tables. The arch owns
+/// the tensors; the pager writes 8-byte slots into them on residency transitions.
+struct ExpertPtrTables {
+    gate_up: hip_bridge::DeviceBuffer,
+    down: hip_bridge::DeviceBuffer,
+}
+
 struct ResidentModule {
     tensor: GpuTensor,
     bytes: u64,
@@ -1094,6 +1111,7 @@ impl WeightPager {
             catalog: HashMap::new(),
             module_catalog: HashMap::new(),
             resident_modules: HashMap::new(),
+            expert_ptr_tables: HashMap::new(),
             module_lru: VecDeque::new(),
             module_stats: ModulePagerStats::default(),
             transport,
@@ -1357,15 +1375,22 @@ impl WeightPager {
         };
         let base = tensor.buf.as_ptr() as usize;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+        let gate_up_ptr = base.saturating_add(gate_up_rel) as u64;
+        let down_ptr = base.saturating_add(down_rel) as u64;
         self.resident_modules.insert(
             key,
             ResidentModule {
                 tensor,
                 bytes: need,
-                gate_up_ptr: base.saturating_add(gate_up_rel) as u64,
-                down_ptr: base.saturating_add(down_rel) as u64,
+                gate_up_ptr,
+                down_ptr,
             },
         );
+        // Push hook 1 of 3 — page-in. The slot must be live before any kernel can
+        // select this expert, and this is the only point at which it becomes
+        // selectable, so publishing here is what makes the table self-maintaining.
+        self.write_expert_ptr_slot(gpu, key, gate_up_ptr, down_ptr)
+            .map_err(WeightPagerError::Hip)?;
         self.module_lru.push_back(key);
         self.module_stats.module_cold_loads = self.module_stats.module_cold_loads.saturating_add(1);
         if self.config.trace {
@@ -1413,6 +1438,64 @@ impl WeightPager {
     /// the lowered super-op pipeline, whose `MoeParams` carries no pager, so it has
     /// nothing to call this on. Fixing paged+indexed MoE means giving that path
     /// pager access, or refusing the combination in backend selection.
+    /// Register the device pointer tables for `layer`. Call once at load, before
+    /// any expert of that layer can become resident.
+    ///
+    /// The pager keeps non-owning aliases: the arch owns the tensors, and the
+    /// pager only writes 8-byte slots into them. Registering a layer twice
+    /// replaces the aliases, which is what a model reload wants.
+    ///
+    /// A layer that is never registered is simply not maintained — page-ins for it
+    /// write nowhere. That is why `MoeFfnWeights` must register before dispatch,
+    /// and why `paged_ptr_tables_registered()` exists for selection to check.
+    pub fn register_expert_ptr_tables(
+        &mut self,
+        layer: u16,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+    ) {
+        self.expert_ptr_tables.insert(
+            layer,
+            ExpertPtrTables {
+                // SAFETY: non-owning aliases. The arch owns these tensors for the
+                // lifetime of the model; the pager only writes into them and never
+                // frees them.
+                gate_up: unsafe { gate_up_ptrs.buf.alias() },
+                down: unsafe { down_ptrs.buf.alias() },
+            },
+        );
+    }
+
+    /// True when `layer`'s tables are registered, i.e. the pager will keep them
+    /// consistent with residency. Backend selection uses this to decide whether
+    /// the indexed paged path is safe to admit.
+    pub fn expert_ptr_tables_registered(&self, layer: u16) -> bool {
+        self.expert_ptr_tables.contains_key(&layer)
+    }
+
+    /// Write one expert's slot in the registered tables. `(0, 0)` nulls it.
+    ///
+    /// Errors are propagated rather than swallowed: a failed write leaves the
+    /// table disagreeing with residency, and the kernels dereference it without
+    /// validation, so a silent failure here is a GPU wedge later.
+    fn write_expert_ptr_slot(
+        &self,
+        gpu: &mut Gpu,
+        key: ExpertModuleKey,
+        gate_up_ptr: u64,
+        down_ptr: u64,
+    ) -> HipResult<()> {
+        let Some(tables) = self.expert_ptr_tables.get(&key.layer) else {
+            return Ok(());
+        };
+        let offset = (key.expert as usize) * 8;
+        gpu.hip
+            .memcpy_htod_offset(&tables.gate_up, offset, &gate_up_ptr.to_le_bytes())?;
+        gpu.hip
+            .memcpy_htod_offset(&tables.down, offset, &down_ptr.to_le_bytes())?;
+        Ok(())
+    }
+
     pub fn patch_expert_ptr_table(
         &self,
         layer: u16,
@@ -1547,6 +1630,13 @@ impl WeightPager {
                     budget,
                 })?;
             if let Some(r) = self.resident_modules.remove(&key) {
+                // Push hook 2 of 3 — eviction. Null the slot BEFORE freeing the
+                // buffer: between the free and the null the table would name
+                // memory the pager no longer owns, and the indexed kernels read
+                // it without validation. A stale pointer is worse than a null one
+                // (null faults immediately; stale may silently read reused VRAM).
+                self.write_expert_ptr_slot(gpu, key, 0, 0)
+                    .map_err(WeightPagerError::Hip)?;
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
                 self.module_stats.module_evictions =
@@ -1577,6 +1667,17 @@ impl WeightPager {
     pub fn free_all(&mut self, gpu: &mut Gpu) {
         for (_id, r) in self.resident.drain() {
             let _ = gpu.free_tensor(r.tensor);
+        }
+        // Push hook 3 of 3 — bulk teardown. This is the one an explicit
+        // patch-at-the-call-site design misses: nothing here ever looked like a
+        // "dispatch", so no caller would have thought to re-patch, and every slot
+        // would name freed memory. Collect first because `drain()` borrows self.
+        let drained: Vec<ExpertModuleKey> = self.resident_modules.keys().copied().collect();
+        for key in drained {
+            // Best-effort: free_all is a teardown path and must not fail. A failed
+            // null here is still safer than the old behaviour, where the slot was
+            // never cleared at all.
+            let _ = self.write_expert_ptr_slot(gpu, key, 0, 0);
         }
         for (_key, r) in self.resident_modules.drain() {
             let _ = gpu.free_tensor(r.tensor);
@@ -1790,6 +1891,38 @@ mod tests {
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         assert_eq!(pager.registered_count(), 0);
         assert_eq!(pager.vram_used_bytes(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unregistered layer must be reported as unmaintained, and slot writes
+    /// for it must be a silent no-op rather than an error.
+    ///
+    /// This is the predicate backend selection keys on. If it ever returned true
+    /// for a layer the pager is not maintaining, selection would admit the indexed
+    /// paged path against a table nobody updates — which is precisely the null
+    /// dereference that wedges the GPU (BUGS.md, `non_null=0/256`). Getting a
+    /// false positive here is therefore a device-crash bug, not a logic slip.
+    #[test]
+    fn unregistered_layer_is_not_maintained_and_slot_writes_are_noops() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-ptrtbl-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        assert!(
+            !pager.expert_ptr_tables_registered(0),
+            "a layer nobody registered must never report as maintained"
+        );
+        assert!(!pager.expert_ptr_tables_registered(39));
+
+        // No GPU is touched: with no tables registered the write returns early,
+        // which is what makes a fully-resident model pay nothing for this path.
+        // (The device-write half is verified end to end with
+        // HIPFIRE_MOE_PTR_TABLE_DUMP on real hardware — a unit test cannot
+        // allocate device tables.)
         let _ = std::fs::remove_file(&path);
     }
 
