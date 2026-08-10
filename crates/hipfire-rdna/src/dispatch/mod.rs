@@ -37,6 +37,68 @@ fn launch_trace_level() -> u8 {
     })
 }
 
+/// `HIPFIRE_MOE_PTR_TABLE_DUMP=1` — dump an indexed-MoE expert pointer table and
+/// the selected top-k from the HOST, immediately before the launch that consumes
+/// them.
+///
+/// The indexed kernels do `A = expert_ptrs[topk_indices[..]]` and dereference `A`
+/// directly, so a null or stale slot faults the device — and HIP attributes that
+/// fault to whatever touches the queue NEXT, not to the kernel that caused it.
+/// Reading the table host-side beforehand separates "bad pointer table" from
+/// "in-kernel indexing bug" without costing a GPU reset per attempt.
+///
+/// This lives at the DISPATCHER rather than a call site, for the same reason
+/// `HIPFIRE_LAUNCH_TRACE` does: `gemv_oq4g256_moe_gate_up_k8_indexed_batched` has
+/// five dispatch sites (qwen35 hand decode, qwen35 chunked prefill, two in the
+/// lowered pipeline, and lfm2moe/minimax). Instrumenting the wrong one prints
+/// nothing while the fault happens anyway — which is exactly what happened on the
+/// first attempt at this.
+pub(crate) fn dump_moe_ptr_table(
+    gpu: &Gpu,
+    label: &str,
+    expert_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    k_top: usize,
+    batch_size: usize,
+) {
+    if std::env::var("HIPFIRE_MOE_PTR_TABLE_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Table is [2 * n_exp] f32 slots = n_exp u64 device addresses.
+    let n_exp = expert_ptrs.numel() / 2;
+    let n_idx = k_top.saturating_mul(batch_size.max(1));
+    let mut table = vec![0u64; n_exp];
+    let mut idx = vec![0i32; n_idx];
+    {
+        let tb =
+            unsafe { std::slice::from_raw_parts_mut(table.as_mut_ptr() as *mut u8, n_exp * 8) };
+        if let Err(e) = gpu.hip.memcpy_dtoh(tb, &expert_ptrs.buf) {
+            eprintln!("[ptr_table] {label}: ptr readback failed: {}", e.message);
+            return;
+        }
+        let ib = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, n_idx * 4) };
+        if let Err(e) = gpu.hip.memcpy_dtoh(ib, &topk_indices.buf) {
+            eprintln!("[ptr_table] {label}: topk readback failed: {}", e.message);
+            return;
+        }
+    }
+    let non_null = table.iter().filter(|p| **p != 0).count();
+    eprintln!(
+        "[ptr_table] {label}: n_exp={n_exp} non_null={non_null}/{n_exp} k_top={k_top} batch={batch_size}"
+    );
+    for (slot, raw) in idx.iter().enumerate() {
+        if *raw < 0 || *raw as usize >= n_exp {
+            eprintln!("[ptr_table]   slot={slot} expert={raw} <== OUT OF RANGE (n_exp={n_exp})");
+            continue;
+        }
+        let p = table[*raw as usize];
+        eprintln!(
+            "[ptr_table]   slot={slot} expert={raw} ptr=0x{p:016x}{}",
+            if p == 0 { "  <== NULL" } else { "" }
+        );
+    }
+}
+
 fn raw_upload_chunks(
     total_bytes: usize,
     max_chunk_bytes: usize,

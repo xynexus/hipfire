@@ -1888,7 +1888,7 @@ pub const ENV_HIPFIRE_FP8_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_FUSED_HFQ4_2ROW_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3312",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3374",
 };
 
 /// `HIPFIRE_GATE_UP_VARIANT` — Runtime variable controlling gate up variant in hipfire
@@ -2000,7 +2000,7 @@ pub const ENV_HIPFIRE_GEMM_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GEMV_MROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMV_MROW",
     description: "Multi-row register-blocked variant (HIPFIRE_GEMV_MROW): each wave owns",
-    source: "crates/hipfire-rdna/src/dispatch/gemv.rs:4579",
+    source: "crates/hipfire-rdna/src/dispatch/gemv.rs:4587",
 };
 
 /// `HIPFIRE_GEMV_ROWS` — Runtime variable controlling gemv rows in hipfire
@@ -2154,7 +2154,7 @@ pub const ENV_HIPFIRE_HFQ4G128_MMQ: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4G256_MMQ_GFX1151",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3295",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3357",
 };
 
 /// `HIPFIRE_HFQ4_GATE_UP_FAST` — HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the
@@ -2224,7 +2224,7 @@ pub const ENV_HIPFIRE_HIPCC_EXTRA_FLAGS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HIP_WAIT",
     description: "Runtime variable controlling hip wait in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:751",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:813",
 };
 
 /// `HIPFIRE_HOST_PROFILE_BIN` — Runtime variable controlling host profile bin in hipfire
@@ -2911,7 +2911,7 @@ pub const ENV_HIPFIRE_MOE_HFQ6_V2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MOE_INDEXED_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_INDEXED_2ROW_GFX1151",
     description: "Opt-in (\"1\") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3330",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:3392",
 };
 
 /// `HIPFIRE_MOE_MQ2L_N32_GFX1151` — Runtime variable controlling moe mq2l n32 gfx1151 in hipfire
@@ -2933,6 +2933,13 @@ pub const ENV_HIPFIRE_MOE_PARO_I8_K8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MOE_PARO_I8_K8",
     description: "Runtime variable controlling moe paro i8 k8 in hipfire",
     source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1514",
+};
+
+/// `HIPFIRE_MOE_PTR_TABLE_DUMP` — Table is [2 * n_exp] f32 slots = n_exp u64 device addresses
+pub const ENV_HIPFIRE_MOE_PTR_TABLE_DUMP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MOE_PTR_TABLE_DUMP",
+    description: "Table is [2 * n_exp] f32 slots = n_exp u64 device addresses",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:64",
 };
 
 /// `HIPFIRE_MOE_RESOLVE_DEBUG` — the arch trace still reported "use_gpu_topk=true". THIS is the verdict
@@ -4859,7 +4866,7 @@ pub const ENV_HIPFIRE_STEER_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TARGET_ARCH",
     description: "Runtime variable controlling target arch in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/mod.rs:780",
+    source: "crates/hipfire-rdna/src/dispatch/mod.rs:842",
 };
 
 /// `HIPFIRE_TEST_LATENT` — Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump
@@ -5907,6 +5914,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_MOE_MQ2L_N32_GFX1151,
     ENV_HIPFIRE_MOE_PARO_I8,
     ENV_HIPFIRE_MOE_PARO_I8_K8,
+    ENV_HIPFIRE_MOE_PTR_TABLE_DUMP,
     ENV_HIPFIRE_MOE_RESOLVE_DEBUG,
     ENV_HIPFIRE_MOE_STEP_DEBUG,
     ENV_HIPFIRE_MQ3_MB4,

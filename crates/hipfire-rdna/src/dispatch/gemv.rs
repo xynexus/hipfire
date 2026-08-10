@@ -3936,6 +3936,14 @@ impl Gpu {
             kernels::GEMV_OQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC,
             "gemv_oq4g256_moe_gate_up_k8_indexed_batched",
         )?;
+        super::dump_moe_ptr_table(
+            self,
+            "oq4 gate_up batched (pre-launch)",
+            expert_ptrs,
+            topk_indices,
+            k_top,
+            batch_size,
+        );
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x.buf.as_ptr();
