@@ -92,203 +92,15 @@ const CH: usize = 8 << 20;
 /// -- not this constant.
 pub(crate) const UNIT: u64 = 1 << 30;
 
-/// Window for the source-keyed chunk table.
+/// Source-keyed chunk tables live in `hipfire-hub`, which owns fetching and
+/// verifying files and is the crate that acts on a mismatched window. The
+/// archive is one producer of a table; `hub fetch` is the other, and both must
+/// agree byte for byte, so there is exactly one implementation.
 ///
-/// Fixed windows over the ORIGINAL file's bytes, not over stored payloads. The
-/// hub can only serve a repair as a `Range` against the original file, so a
-/// table keyed to anything else needs a translation step before it can be acted
-/// on. Source-keying also survives a codec change: re-pack with different
-/// `bf16_huff` settings and the table still describes the same file, where a
-/// table over stored bytes would be invalidated wholesale.
-///
-/// 4 MiB keeps a repair request far below the size at which this link drops a
-/// body, while keeping the index small -- a 17.7 GB model is ~4.2k hashes, or
-/// 132 KB after base64.
-pub(crate) const CHUNK: usize = 4 << 20;
-
-/// Rolling BLAKE3-256 over fixed windows of a file's source bytes.
-///
-/// # Why BLAKE3 here when payloads use XXH3
-///
-/// The two answer different questions, and the split is deliberate. [`xxh3`]
-/// above detects an archive that rotted at rest; the only adversary there is a
-/// bad sector, and a fast non-cryptographic hash is exactly the right tool.
-///
-/// The chunk table is aimed at repair and, later, at distribution -- a signed
-/// index whose hashes authenticate the payloads transitively, so a chunk can be
-/// trusted before the whole file has been seen. That needs collision
-/// resistance, which XXH3 does not offer at any width.
-///
-/// Measured on this hardware (Strix Halo, 2 GiB of real BF16): XXH3 37.0 GB/s,
-/// BLAKE3 9.2 GB/s single-threaded. BLAKE3 is 4x slower and it does not matter,
-/// because the bar is not XXH3 -- it is 99x the array's 93 MB/s, 18x the bf16
-/// encoder and 7x the single-threaded decoder, so it cannot become the
-/// bottleneck in any stage of this path.
-///
-/// # Migration away from XXH3
-///
-/// The per-payload `xxh3`/`src_xxh3` fields are still written and still
-/// checked. Archives already on the array carry them, and rewriting a 12 GB
-/// archive to change a checksum is a format break for no gain. New readers
-/// should prefer the chunk table where it is present.
-///
-/// The intended end state, once every live archive has been re-packed with a
-/// table: stop writing `xxh3`/`src_xxh3`, keep reading them so existing
-/// archives still verify, exactly as `MAGIC_V1` is kept readable today. Until
-/// then both are emitted and a `chunks` field is optional, so an older binary
-/// ignores it and restores correctly.
-pub(crate) struct ChunkHasher {
-    size: usize,
-    cur: blake3::Hasher,
-    filled: usize,
-    hashes: Vec<[u8; 32]>,
-    total: u64,
-}
-
-impl ChunkHasher {
-    pub(crate) fn new() -> Self {
-        Self::with_size(CHUNK)
-    }
-
-    /// Verification must re-hash at the window the table was WRITTEN with, not
-    /// whatever [`CHUNK`] happens to be today. Otherwise changing the constant
-    /// silently invalidates every archive already on the array.
-    pub(crate) fn with_size(size: usize) -> Self {
-        Self {
-            size: size.max(1),
-            cur: blake3::Hasher::new(),
-            filled: 0,
-            hashes: Vec::new(),
-            total: 0,
-        }
-    }
-
-    /// Feed the next run of source bytes. Callers must supply the file's bytes
-    /// in order and in full; the window boundary is a file offset, not a
-    /// boundary of whatever buffer happened to arrive.
-    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
-        self.total += bytes.len() as u64;
-        while !bytes.is_empty() {
-            let take = (self.size - self.filled).min(bytes.len());
-            self.cur.update(&bytes[..take]);
-            self.filled += take;
-            bytes = &bytes[take..];
-            if self.filled == self.size {
-                self.hashes.push(*self.cur.finalize().as_bytes());
-                self.cur = blake3::Hasher::new();
-                self.filled = 0;
-            }
-        }
-    }
-
-    /// Flush the trailing partial window. A file whose length is not a multiple
-    /// of [`CHUNK`] ends in a short chunk, which is hashed over its real length
-    /// rather than padded -- padding would make two different files collide.
-    pub(crate) fn finish(mut self) -> ChunkTable {
-        if self.filled > 0 {
-            self.hashes.push(*self.cur.finalize().as_bytes());
-        }
-        ChunkTable {
-            size: self.size,
-            src_len: self.total,
-            hashes: self.hashes,
-        }
-    }
-}
-
-pub(crate) struct ChunkTable {
-    size: usize,
-    src_len: u64,
-    hashes: Vec<[u8; 32]>,
-}
-
-impl ChunkTable {
-    /// Bytes hashed so far. `pack` checks this against the file's real length,
-    /// which is what catches a blob plan that failed to tile its shard.
-    pub(crate) fn src_len(&self) -> u64 {
-        self.src_len
-    }
-
-    fn hashes(&self) -> &[[u8; 32]] {
-        &self.hashes
-    }
-
-    fn json(&self) -> serde_json::Value {
-        use base64::Engine as _;
-        let mut flat = Vec::with_capacity(self.hashes.len() * 32);
-        for h in &self.hashes {
-            flat.extend_from_slice(h);
-        }
-        serde_json::json!({
-            "algo": "blake3-256",
-            "size": self.size,
-            // Packed then base64'd rather than an array of hex strings: 4.2k
-            // hashes cost 132 KB this way against roughly 270 KB as JSON text,
-            // and the decoded blob slices by index without parsing.
-            "hashes": base64::engine::general_purpose::STANDARD.encode(&flat),
-        })
-    }
-
-    /// Byte ranges of `path` that do not match `want`, as `(index, from, len)`.
-    ///
-    /// This is what the table exists for. Inside an archive the per-piece
-    /// `src_xxh3` already proves a restore decoded correctly, so the chunk check
-    /// there is a consistency guard and little more. The case it is actually
-    /// aimed at has no archive: a raw HF-cache tree on disk, damaged or
-    /// half-written, where the returned ranges map straight onto `Range`
-    /// requests against the origin.
-    ///
-    /// A short final chunk is compared over its real length, so a truncated file
-    /// reports its tail as mismatched rather than reading past the end.
-    pub(crate) fn mismatched_chunks(
-        path: &Path,
-        size: usize,
-        want: &[[u8; 32]],
-    ) -> std::io::Result<Vec<(usize, u64, u64)>> {
-        let mut f = File::open(path)?;
-        let total = f.metadata()?.len();
-        let mut out = Vec::new();
-        let mut buf = vec![0u8; size];
-        for (i, w) in want.iter().enumerate() {
-            let from = (i as u64) * size as u64;
-            if from >= total {
-                out.push((i, from, 0));
-                continue;
-            }
-            let n = (total - from).min(size as u64) as usize;
-            f.seek(SeekFrom::Start(from))?;
-            f.read_exact(&mut buf[..n])?;
-            if blake3::hash(&buf[..n]).as_bytes() != w {
-                out.push((i, from, n as u64));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Read a table back out of an index entry. `None` when the entry predates
-    /// chunk tables, which is not an error -- it just means this archive can
-    /// only be checked at payload granularity.
-    fn from_json(v: &serde_json::Value) -> Option<(usize, Vec<[u8; 32]>)> {
-        use base64::Engine as _;
-        let c = v.get("chunks")?;
-        if c.get("algo").and_then(|a| a.as_str())? != "blake3-256" {
-            return None;
-        }
-        let size = c.get("size").and_then(|s| s.as_u64())? as usize;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(c.get("hashes").and_then(|h| h.as_str())?)
-            .ok()?;
-        if size == 0 || raw.len() % 32 != 0 {
-            return None;
-        }
-        Some((
-            size,
-            raw.chunks_exact(32)
-                .map(|c| c.try_into().expect("chunks_exact(32)"))
-                .collect(),
-        ))
-    }
-}
+/// See [`hipfire_hub::chunks`] for why the window is keyed to the source file
+/// and why the hash is cryptographic where [`xxh3`] above is not, and for the
+/// plan to retire `xxh3`/`src_xxh3` once every live archive carries a table.
+pub(crate) use hipfire_hub::{ChunkHasher, ChunkTable};
 
 /// Encode one piece of a blob.
 ///
@@ -799,8 +611,8 @@ pub(crate) fn raw_file_entry(
     let mut e =
         serde_json::json!({ "path": rel, "kind": "raw", "off": off, "len": len, "xxh3": xxh3 });
     if let (Some(t), Some(map)) = (chunks, e.as_object_mut()) {
-        map.insert("src_len".into(), t.src_len.into());
-        map.insert("chunks".into(), t.json());
+        map.insert("src_len".into(), t.src_len().into());
+        map.insert("chunks".into(), t.to_json());
     }
     e
 }
@@ -823,8 +635,8 @@ pub(crate) fn safetensors_file_entry(
         })).collect::<Vec<_>>()
     });
     if let (Some(t), Some(map)) = (chunks, e.as_object_mut()) {
-        map.insert("src_len".into(), t.src_len.into());
-        map.insert("chunks".into(), t.json());
+        map.insert("src_len".into(), t.src_len().into());
+        map.insert("chunks".into(), t.to_json());
     }
     e
 }
@@ -907,7 +719,7 @@ fn restore(
             .ok_or("index entry has no path")?;
         // Parsed up front so the hasher is built only when there is a table to
         // check it against, and at the window that table was written with.
-        let want_chunks = ChunkTable::from_json(fe);
+        let want_chunks = fe.get("chunks").and_then(ChunkTable::from_json);
         let sink: Sink = match (out_dir, check) {
             (Some(d), _) => {
                 let dest = d.join(rel);
@@ -933,7 +745,7 @@ fn restore(
             sink,
             chunks: want_chunks
                 .as_ref()
-                .map(|(size, _)| ChunkHasher::with_size(*size)),
+                .map(|t| ChunkHasher::with_size(t.size())),
         };
 
         match fe.get("kind").and_then(|v| v.as_str()) {
@@ -1022,33 +834,37 @@ fn restore(
         // Chunk check before the whole-file compare: when both would fail, the
         // chunk indices say WHERE, which is the difference between "this file is
         // wrong" and a Range request that fixes it.
-        if let (Some((size, want)), Some(got)) = (&want_chunks, o.chunks.take()) {
+        if let (Some(want), Some(got)) = (&want_chunks, o.chunks.take()) {
             let got = got.finish();
+            if want.hashes().len() != got.hashes().len() {
+                return Err(format!(
+                    "verify: {rel} reconstructs {} chunks, index records {}",
+                    got.hashes().len(),
+                    want.hashes().len()
+                )
+                .into());
+            }
             let bad: Vec<usize> = want
+                .hashes()
                 .iter()
                 .zip(got.hashes())
                 .enumerate()
                 .filter(|(_, (w, g))| w != g)
                 .map(|(i, _)| i)
                 .collect();
-            if want.len() != got.hashes().len() {
-                return Err(format!(
-                    "verify: {rel} reconstructs {} chunks, index records {}",
-                    got.hashes().len(),
-                    want.len()
-                )
-                .into());
-            }
             if !bad.is_empty() {
                 let ranges: Vec<String> = bad
                     .iter()
                     .take(8)
-                    .map(|i| format!("{}-{}", i * size, (i + 1) * size - 1))
+                    .map(|i| {
+                        let (at, len) = want.range(*i);
+                        format!("{at}-{}", at + len - 1)
+                    })
                     .collect();
                 return Err(format!(
                     "verify: {rel} differs in {} of {} chunks; refetch bytes {}{}",
                     bad.len(),
-                    want.len(),
+                    want.hashes().len(),
                     ranges.join(", "),
                     if bad.len() > 8 { ", ..." } else { "" }
                 )
@@ -1691,15 +1507,22 @@ mod tests {
         let (mut checked, mut multi) = (0usize, false);
         for fe in index["files"].as_array().expect("files") {
             let rel = fe["path"].as_str().expect("path");
-            let (size, want) =
-                ChunkTable::from_json(fe).unwrap_or_else(|| panic!("{rel} carries no chunk table"));
-            assert_eq!(size, CHUNK, "{rel}: unexpected window");
+            let table = fe
+                .get("chunks")
+                .and_then(ChunkTable::from_json)
+                .unwrap_or_else(|| panic!("{rel} carries no chunk table"));
+            assert_eq!(table.size(), hipfire_hub::CHUNK, "{rel}: unexpected window");
             let bytes = std::fs::read(src.join(rel)).expect("read source");
             let got: Vec<[u8; 32]> = bytes
-                .chunks(size)
+                .chunks(table.size())
                 .map(|c| *blake3::hash(c).as_bytes())
                 .collect();
-            assert_eq!(want, got, "{rel}: table does not describe the source");
+            assert_eq!(
+                table.hashes(),
+                got,
+                "{rel}: table does not describe the source"
+            );
+            assert_eq!(table.src_len(), bytes.len() as u64, "{rel}: wrong length");
             multi |= got.len() > 1;
             checked += 1;
         }
@@ -1707,78 +1530,6 @@ mod tests {
         assert!(
             multi,
             "no file spanned more than one window, so boundaries went untested"
-        );
-    }
-
-    /// Windows are file offsets, not buffer boundaries.
-    ///
-    /// `pack` feeds an 8-byte length prefix, then a header, then pieces; the
-    /// streaming packer feeds whatever the socket happened to deliver. Both must
-    /// produce the same table, so the hasher cannot be sensitive to how the
-    /// bytes were handed over.
-    #[test]
-    fn chunk_hasher_ignores_how_the_bytes_arrive() {
-        let data = bf16_weights(40_000, 3);
-        let size = 4096;
-        let whole = {
-            let mut h = ChunkHasher::with_size(size);
-            h.update(&data);
-            h.finish()
-        };
-        let mut piecemeal = ChunkHasher::with_size(size);
-        let (mut i, mut step) = (0usize, 1usize);
-        while i < data.len() {
-            let n = step.min(data.len() - i);
-            piecemeal.update(&data[i..i + n]);
-            i += n;
-            step = step * 3 + 1;
-        }
-        let piecemeal = piecemeal.finish();
-        assert!(whole.hashes().len() > 1, "fixture is a single window");
-        assert_eq!(whole.hashes(), piecemeal.hashes());
-        assert_eq!(whole.src_len(), data.len() as u64);
-    }
-
-    /// A damaged byte must implicate exactly one window — that is the whole
-    /// point, since the window is what gets refetched.
-    #[test]
-    fn mismatched_chunks_names_only_the_damaged_window() {
-        let t = Tmp::new("locate");
-        let f = t.join("blob.bin");
-        let data = bf16_weights(40_000, 11);
-        let size = 4096;
-        std::fs::write(&f, &data).expect("write");
-        let table = {
-            let mut h = ChunkHasher::with_size(size);
-            h.update(&data);
-            h.finish()
-        };
-        assert!(
-            ChunkTable::mismatched_chunks(&f, size, table.hashes())
-                .expect("scan")
-                .is_empty(),
-            "an undamaged file reported damage"
-        );
-
-        let mut bad = data.clone();
-        bad[3 * size + 17] ^= 0x01;
-        std::fs::write(&f, &bad).expect("rewrite");
-        let got = ChunkTable::mismatched_chunks(&f, size, table.hashes()).expect("scan");
-        assert_eq!(
-            got.len(),
-            1,
-            "one flipped bit implicated {} windows",
-            got.len()
-        );
-        assert_eq!((got[0].0, got[0].1), (3, (3 * size) as u64));
-
-        // Truncation is the other half-written case: the tail must be reported
-        // as missing rather than read past the end of the file.
-        std::fs::write(&f, &data[..2 * size + 5]).expect("truncate");
-        let got = ChunkTable::mismatched_chunks(&f, size, table.hashes()).expect("scan");
-        assert!(
-            got.iter().any(|(i, _, _)| *i == 2),
-            "truncated tail was not reported"
         );
     }
 

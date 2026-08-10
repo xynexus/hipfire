@@ -66,20 +66,28 @@ fn serve(body: Vec<u8>, fault: Fault) -> Origin {
     }
 }
 
-/// Parse `Range: bytes=N-`, returning N.
-fn read_request_range(s: &mut TcpStream) -> Option<u64> {
+/// Parse `Range: bytes=N-` or `Range: bytes=N-M`, returning `(N, Some(M))`.
+///
+/// Chunk repair asks for a bounded range; resume asks for an open-ended one.
+/// The origin has to answer both or the two paths cannot be tested together.
+fn read_request_range(s: &mut TcpStream) -> Option<(u64, Option<u64>)> {
     let mut r = BufReader::new(s.try_clone().ok()?);
-    let mut from = None;
+    let mut range = None;
     loop {
         let mut line = String::new();
         if r.read_line(&mut line).ok()? == 0 || line == "\r\n" {
             break;
         }
         if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-            from = v.trim().trim_end_matches('-').parse::<u64>().ok();
+            let v = v.trim();
+            let (a, b) = v.split_once('-').unwrap_or((v, ""));
+            range = a
+                .parse::<u64>()
+                .ok()
+                .map(|from| (from, b.parse::<u64>().ok()));
         }
     }
-    from
+    range
 }
 
 fn handle(
@@ -87,12 +95,17 @@ fn handle(
     body: &[u8],
     fault: Fault,
     hit: usize,
-    range_from: Option<u64>,
+    range_from: Option<(u64, Option<u64>)>,
 ) -> std::io::Result<()> {
-    let start = range_from.unwrap_or(0) as usize;
+    let start = range_from.map(|(a, _)| a).unwrap_or(0) as usize;
     let partial = range_from.is_some() && !matches!(fault, Fault::IgnoreRange);
     let slice = if partial && start <= body.len() {
-        &body[start..]
+        // An inclusive end, per RFC 9110, and clamped: a bounded range is what
+        // chunk repair sends.
+        match range_from.and_then(|(_, b)| b) {
+            Some(last) => &body[start..((last as usize) + 1).min(body.len())],
+            None => &body[start..],
+        }
     } else {
         body
     };
@@ -671,4 +684,166 @@ async fn streamed_truncated_body_does_not_verify() {
         sink.got.len() < body.len(),
         "the sink should hold only what arrived"
     );
+}
+
+// ── chunk tables: localize, then patch only what is damaged ─────────────────
+
+/// A fetch must leave a table behind, or repair has nothing to localize with.
+#[tokio::test]
+async fn a_successful_fetch_records_a_chunk_table() {
+    let fx = fixture("chunk-record");
+    let body = payload(300 * 1024);
+    let sha = sha256_hex(&body);
+    let origin = serve(body.clone(), Fault::None);
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: body.len() as u64,
+        sha256: Some(sha.clone()),
+        git_oid: None,
+    };
+
+    fetch_file_from(&origin.base, "org/model", "main", &file, &fx.store)
+        .await
+        .expect("fetch");
+
+    let table = fx.store.read_chunks(&sha).expect("no chunk table recorded");
+    assert_eq!(table.src_len(), body.len() as u64);
+    // Built while streaming, so it must equal a table computed from the file
+    // that actually landed — the one way an in-stream hasher goes wrong is by
+    // disagreeing with the bytes on disk.
+    let independent =
+        hipfire_hub::ChunkTable::of_file(&fx.store.blob_path(&sha), table.size()).expect("rehash");
+    assert_eq!(
+        table, independent,
+        "in-stream table disagrees with the blob"
+    );
+}
+
+/// The point of the whole exercise: one damaged window costs one window.
+#[tokio::test]
+async fn window_repair_fetches_only_the_damaged_range() {
+    let fx = fixture("chunk-repair");
+    // Several windows, so "repaired the whole file" and "repaired one window"
+    // are distinguishable.
+    let window = 64 * 1024;
+    let body = payload(window * 5);
+    let sha = sha256_hex(&body);
+    let path = "model.safetensors";
+
+    // Stand in for a healthy prior fetch: blob committed, table recorded.
+    let blob = fx.store.blob_path(&sha);
+    std::fs::write(&blob, &body).unwrap();
+    let mut h = hipfire_hub::ChunkHasher::with_size(window);
+    h.update(&body);
+    let table = h.finish();
+    fx.store.write_chunks(&sha, &table).unwrap();
+
+    // Rot one window in place, leaving the length intact — the failure a read
+    // test cannot see.
+    let mut rotted = body.clone();
+    rotted[2 * window + 11] ^= 0xff;
+    std::fs::write(&blob, &rotted).unwrap();
+
+    let damaged = table.mismatched(&blob).expect("scan");
+    assert_eq!(
+        damaged.iter().map(|c| c.index).collect::<Vec<_>>(),
+        vec![2],
+        "one flipped byte should implicate exactly one window"
+    );
+
+    let origin = serve(body.clone(), Fault::None);
+    let file = RepoFile {
+        path: path.into(),
+        size: body.len() as u64,
+        sha256: Some(sha.clone()),
+        git_oid: None,
+    };
+    let fixed = hipfire_hub::run::repair_windows(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &fx.store,
+        &damaged,
+        &sha,
+    )
+    .await
+    .expect("repair");
+
+    assert!(fixed, "window repair declined a repairable blob");
+    assert_eq!(
+        std::fs::read(&blob).unwrap(),
+        body,
+        "blob was not restored byte for byte"
+    );
+    // One request for one window. A whole-file refetch would also restore the
+    // bytes, so without this the test would pass on the slow path it exists to
+    // avoid.
+    assert_eq!(
+        origin.hits.load(Ordering::SeqCst),
+        1,
+        "expected a single ranged request"
+    );
+}
+
+/// A truncated blob is not a patch job: the resuming whole-file fetch handles
+/// it better, so window repair must decline rather than splice.
+#[tokio::test]
+async fn window_repair_declines_a_truncated_blob() {
+    let fx = fixture("chunk-truncated");
+    let window = 64 * 1024;
+    let body = payload(window * 4);
+    let sha = sha256_hex(&body);
+
+    let blob = fx.store.blob_path(&sha);
+    let mut h = hipfire_hub::ChunkHasher::with_size(window);
+    h.update(&body);
+    let table = h.finish();
+    fx.store.write_chunks(&sha, &table).unwrap();
+    std::fs::write(&blob, &body[..window * 2 + 7]).unwrap();
+
+    let damaged = table.mismatched(&blob).expect("scan");
+    assert!(!damaged.is_empty(), "truncation went unnoticed");
+
+    let origin = serve(body.clone(), Fault::None);
+    let file = RepoFile {
+        path: "model.safetensors".into(),
+        size: body.len() as u64,
+        sha256: Some(sha.clone()),
+        git_oid: None,
+    };
+    let fixed = hipfire_hub::run::repair_windows(
+        &origin.base,
+        "org/model",
+        "main",
+        &file,
+        &fx.store,
+        &damaged,
+        &sha,
+    )
+    .await
+    .expect("repair");
+    assert!(!fixed, "a truncated blob should fall back, not be patched");
+    assert_eq!(
+        origin.hits.load(Ordering::SeqCst),
+        0,
+        "declining should not cost a request"
+    );
+}
+
+/// An origin that ignores Range would otherwise turn "repair one window" into
+/// "download the file", silently.
+#[tokio::test]
+async fn a_range_request_answered_with_the_whole_body_is_refused() {
+    let fx = fixture("chunk-norange");
+    let body = payload(128 * 1024);
+    let origin = serve(body.clone(), Fault::IgnoreRange);
+    let err = hipfire_hub::fetch_range(&origin.base, "org/model", "main", "m.bin", 1024, 4096)
+        .await
+        .expect_err("a 200 must not be accepted as a range");
+    assert!(
+        format!("{err}").contains("not 206"),
+        "unhelpful error: {err}"
+    );
+    let _ = &fx;
 }

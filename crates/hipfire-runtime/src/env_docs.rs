@@ -206,7 +206,7 @@ pub const ENV_HF_HUB_CACHE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_TOKEN: EnvVarDoc = EnvVarDoc {
     name: "HF_TOKEN",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-hub/src/lib.rs:136",
+    source: "crates/hipfire-hub/src/lib.rs:139",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire

@@ -11,7 +11,8 @@
 use std::path::Path;
 
 use crate::{
-    cache::Store, fetch_file, list_files, preflight, sha256_file, Error, RepoFile, Result,
+    cache::Store, fetch_file, list_files, preflight, sha256_file, ChunkMiss, Error, RepoFile,
+    Result,
 };
 
 /// What a check found for one file.
@@ -20,7 +21,17 @@ pub enum FileState {
     /// Blob present and its digest matches.
     Good,
     /// Blob present, digest does not match — the failure a read test cannot see.
-    Corrupt { want: String, got: String },
+    ///
+    /// `windows` names the chunks that actually differ, when a table was
+    /// recorded for this blob. That is the difference between "this 4 GB shard
+    /// is wrong" and a list of byte ranges [`repair`] can fetch. `None` means no
+    /// table (a blob fetched before tables existed), and repair falls back to
+    /// refetching the file.
+    Corrupt {
+        want: String,
+        got: String,
+        windows: Option<Vec<ChunkMiss>>,
+    },
     /// Nothing on disk.
     Missing,
     /// Verified, but against the weaker git blob SHA-1 rather than a SHA-256.
@@ -50,7 +61,14 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
                     // filed under: a blob can rot in place.
                     match sha256_file(&blob).await {
                         Ok(got) if &got == want => FileState::Good,
+                        // Only now, and only when a table exists: localizing
+                        // costs a second read of the file, which is worth
+                        // paying for a blob already known to be wrong and not
+                        // worth paying for the ones that are fine.
                         Ok(got) => FileState::Corrupt {
+                            windows: store
+                                .read_chunks(want)
+                                .and_then(|t| t.mismatched(&blob).ok()),
                             want: want.clone(),
                             got,
                         },
@@ -66,6 +84,9 @@ pub async fn verify(root: &Path, repo: &str, revision: &str) -> Result<Vec<(Repo
                     match crate::git_blob_sha1_file(&blob).await {
                         Ok(got) if &got == want => FileState::GoodGitOid,
                         Ok(got) => FileState::Corrupt {
+                            windows: store
+                                .read_chunks(want)
+                                .and_then(|t| t.mismatched(&blob).ok()),
                             want: want.clone(),
                             got,
                         },
@@ -159,11 +180,15 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
     }
     for (f, s) in &states {
         match s {
-            FileState::Corrupt { want, got } => eprintln!(
-                "hub: CORRUPT {} (expected {}…, got {}…)",
+            FileState::Corrupt { want, got, windows } => eprintln!(
+                "hub: CORRUPT {} (expected {}…, got {}…){}",
                 f.path,
                 &want[..16.min(want.len())],
-                &got[..16.min(got.len())]
+                &got[..16.min(got.len())],
+                match windows {
+                    Some(w) => format!(" — {} damaged window(s)", w.len()),
+                    None => String::new(),
+                }
             ),
             FileState::Missing => eprintln!("hub: MISSING {}", f.path),
             FileState::Unreadable(e) => eprintln!("hub: UNREADABLE {} ({e})", f.path),
@@ -179,6 +204,32 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
 
     let mut fixed = 0usize;
     for f in broken {
+        // Patch only the damaged windows when the table says which they are.
+        // One bad 4 MiB window in a 4 GB shard is a 4 MiB transfer instead of
+        // 4 GB, which on this link is seconds against half an hour.
+        let windows = states.iter().find_map(|(g, s)| match s {
+            FileState::Corrupt {
+                want,
+                windows: Some(w),
+                ..
+            } if g.path == f.path && !w.is_empty() => Some((want.clone(), w.clone())),
+            _ => None,
+        });
+        if let Some((want, w)) = windows {
+            match repair_windows(crate::HUB, repo, revision, f, &store, &w, &want).await {
+                Ok(true) => {
+                    store.link(revision, &f.path, &store.blob_path(&want))?;
+                    fixed += 1;
+                    eprintln!("hub: repaired {} ({} window(s))", f.path, w.len());
+                    continue;
+                }
+                // Anything unexpected falls through to the whole-file fetch
+                // rather than failing the run: the slow path always works, and a
+                // repair that refuses to repair is the worse outcome.
+                Ok(false) => {}
+                Err(e) => eprintln!("hub: {} window repair failed ({e}) — refetching", f.path),
+            }
+        }
         // Remove the bad blob first so the fetch cannot mistake it for a hit.
         if let Some(sha) = &f.sha256 {
             let _ = std::fs::remove_file(store.blob_path(sha));
@@ -189,6 +240,79 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
         eprintln!("hub: repaired {}", f.path);
     }
     Ok(fixed)
+}
+
+/// Replace just the damaged windows of a blob, then re-prove the whole file.
+///
+/// `base` is the origin, so the fault-injection suite can serve ranges from a
+/// local socket. Production always passes [`crate::HUB`].
+///
+/// `Ok(false)` means "not repairable this way, use the slow path" — a truncated
+/// blob, a table that does not describe the file on disk, a window that came
+/// back wrong. None of those are errors; they are cases the whole-file fetch
+/// already handles better.
+///
+/// The window hashes localize the damage; the file's own SHA-256 is what
+/// authorises the result. That ordering is what makes it safe to splice bytes
+/// from a fresh request into a file that was already wrong — nothing is
+/// committed until the complete file hashes to what the hub says it should.
+pub async fn repair_windows(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    f: &RepoFile,
+    store: &Store,
+    windows: &[ChunkMiss],
+    want: &str,
+) -> Result<bool> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let Some(table) = store.read_chunks(want) else {
+        return Ok(false);
+    };
+    let blob = store.blob_path(want);
+    let on_disk = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    // A blob of the wrong length is not a patch job. The resuming whole-file
+    // fetch is already good at exactly that case.
+    if on_disk != table.src_len() || windows.iter().any(|w| w.len == 0) {
+        return Ok(false);
+    }
+
+    let bytes: u64 = windows.iter().map(|w| w.len).sum();
+    eprintln!(
+        "hub: {} — {} of {} window(s) differ, fetching {:.2} MB instead of {:.2} GB",
+        f.path,
+        windows.len(),
+        table.hashes().len(),
+        bytes as f64 / 1e6,
+        on_disk as f64 / 1e9
+    );
+
+    let part = store.part_path(&f.path);
+    std::fs::copy(&blob, &part)?;
+    {
+        let mut out = std::fs::OpenOptions::new().write(true).open(&part)?;
+        for w in windows {
+            let got = crate::fetch_range(base, repo, revision, &f.path, w.at, w.len).await?;
+            // Prove each window before it lands. Without this a bad range would
+            // only surface as a whole-file digest failure at the end, with no
+            // indication which of the fetches was the bad one.
+            if blake3::hash(&got).as_bytes() != &table.hashes()[w.index] {
+                let _ = std::fs::remove_file(&part);
+                return Ok(false);
+            }
+            out.seek(SeekFrom::Start(w.at))?;
+            out.write_all(&got)?;
+        }
+        out.sync_all()?;
+    }
+
+    if sha256_file(&part).await? != want {
+        let _ = std::fs::remove_file(&part);
+        return Ok(false);
+    }
+    std::fs::rename(&part, &blob)?;
+    Ok(true)
 }
 
 /// Retry only what retrying can fix, and judge attempts by progress.

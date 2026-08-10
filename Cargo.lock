@@ -2092,6 +2092,8 @@ dependencies = [
 name = "hipfire-hub"
 version = "0.3.0"
 dependencies = [
+ "base64",
+ "blake3",
  "futures-util",
  "libc",
  "reqwest",

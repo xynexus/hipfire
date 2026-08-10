@@ -682,7 +682,19 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                         // Reported apart from a SHA-256 match: the git blob
                         // hash is a real content check but a weaker one.
                         GoodGitOid => gitok += 1,
-                        Corrupt { want, got } => {
+                        Corrupt { want, got, windows } => {
+                            // Naming the windows is the point of recording a
+                            // table: it turns "this shard is wrong" into the
+                            // byte ranges `hub repair` will fetch.
+                            if let Some(w) = windows {
+                                let span: u64 = w.iter().map(|c| c.len).sum();
+                                eprintln!(
+                                    "  {} damaged window(s) in {} — {:.2} MB to refetch",
+                                    w.len(),
+                                    f.path,
+                                    span as f64 / 1e6
+                                );
+                            }
                             bad += 1;
                             eprintln!(
                                 "  CORRUPT {} expected {}… got {}…",

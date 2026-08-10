@@ -53,6 +53,38 @@ impl Store {
         self.root.join("blobs").join(sha256)
     }
 
+    /// Chunk table for a blob, filed under the same digest.
+    ///
+    /// Keyed by the blob's CORRECT hash, so it describes the content that
+    /// *should* be there. That is what makes it useful after the blob rots: the
+    /// table is still the intended file and the mismatched windows are exactly
+    /// the bytes to refetch. A table keyed by what is currently on disk would
+    /// agree with the damage.
+    ///
+    /// A dotted suffix rather than a sibling directory so it lands beside the
+    /// blob and is removed by the same cleanup; HF's own tools ignore names
+    /// they do not recognise in `blobs/`.
+    pub fn chunks_path(&self, sha256: &str) -> PathBuf {
+        self.root.join("blobs").join(format!("{sha256}.chunks"))
+    }
+
+    /// `None` when no table was recorded — a blob fetched before tables existed,
+    /// or one whose table this build cannot read. Callers fall back to
+    /// whole-file verification.
+    pub fn read_chunks(&self, sha256: &str) -> Option<crate::ChunkTable> {
+        let raw = std::fs::read(self.chunks_path(sha256)).ok()?;
+        crate::ChunkTable::from_json(&serde_json::from_slice(&raw).ok()?)
+    }
+
+    /// Written after the blob is committed, so a table never outlives a fetch
+    /// that was rolled back.
+    pub fn write_chunks(&self, sha256: &str, table: &crate::ChunkTable) -> std::io::Result<()> {
+        let path = self.chunks_path(sha256);
+        let tmp = path.with_extension("chunks.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&table.to_json())?)?;
+        std::fs::rename(&tmp, &path)
+    }
+
     /// PID-scoped so two runs against the same store cannot adopt each other's
     /// partial writes. A `.part` from a dead process is inert rather than
     /// dangerous: it will never be renamed into place by anyone else.

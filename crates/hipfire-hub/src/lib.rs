@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 pub mod cache;
+pub mod chunks;
 pub mod run;
+
+pub use chunks::{ChunkHasher, ChunkMiss, ChunkTable, CHUNK};
 
 const HUB: &str = "https://huggingface.co";
 const UA: &str = concat!("hipfire-hub/", env!("CARGO_PKG_VERSION"));
@@ -444,6 +447,55 @@ pub async fn fetch_file_streamed(
     Ok(())
 }
 
+/// Fetch one byte range of a file.
+///
+/// The building block for chunk repair: a damaged window costs its own bytes
+/// rather than the whole shard. A 4 GB shard with one bad 4 MiB window is a
+/// 4 MiB transfer here against 4 GB for a refetch, which on this link is the
+/// difference between seconds and half an hour.
+///
+/// Refuses a `200`. A server that ignores `Range` answers with the entire body,
+/// and quietly accepting that would turn "repair one window" into "download the
+/// file, twice" — the caller is expected to fall back to a whole-file fetch
+/// rather than have that hidden from it.
+pub async fn fetch_range(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    path: &str,
+    from: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let url = format!("{base}/{repo}/resolve/{revision}/{path}");
+    let last = from + len - 1;
+    let resp = auth(client()?.get(&url))
+        .header(reqwest::header::RANGE, format!("bytes={from}-{last}"))
+        .send()
+        .await
+        .map_err(|e| Error::Retryable(format!("{path}: range request: {e}")))?;
+
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(Error::Fatal(format!(
+            "{path}: range {from}-{last} answered {}, not 206",
+            resp.status()
+        )));
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| Error::Retryable(format!("{path}: range body: {e}")))?;
+    if body.len() as u64 != len {
+        return Err(Error::Retryable(format!(
+            "{path}: range {from}-{last} returned {} bytes, wanted {len}",
+            body.len()
+        )));
+    }
+    Ok(body.to_vec())
+}
+
 /// Download one file into the blob store, verified, and commit it atomically.
 ///
 /// The digest is computed while streaming, so a wrong file is rejected without
@@ -491,6 +543,11 @@ pub async fn fetch_file_from(
     // state: it costs one sequential read and removes a whole class of
     // resume-corruption bug.
     let mut h = Sha256::new();
+    // Built in the same passes as the digest, so recording a chunk table costs
+    // no extra read. It follows `h` exactly -- same feeds, same reset -- because
+    // both describe the same byte stream and disagreeing about the prefix is the
+    // one way this could produce a table that looks valid and is not.
+    let mut ch = crate::ChunkHasher::new();
     let mut written = 0u64;
     if let Ok(md) = tokio::fs::metadata(&part).await {
         let have = md.len();
@@ -503,6 +560,7 @@ pub async fn fetch_file_from(
                     break;
                 }
                 h.update(&buf[..n]);
+                ch.update(&buf[..n]);
             }
             written = have;
         } else {
@@ -525,6 +583,7 @@ pub async fn fetch_file_from(
     let resuming = written > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
     if written > 0 && !resuming {
         h = Sha256::new();
+        ch = crate::ChunkHasher::new();
         written = 0;
         let _ = tokio::fs::remove_file(&part).await;
     }
@@ -571,6 +630,7 @@ pub async fn fetch_file_from(
             }
         };
         h.update(&chunk);
+        ch.update(&chunk);
         out.write_all(&chunk).await?;
         written += chunk.len() as u64;
     }
@@ -639,5 +699,9 @@ pub async fn fetch_file_from(
         tokio::fs::create_dir_all(p).await?;
     }
     tokio::fs::rename(&part, &final_path).await?;
+    // Only after the blob is committed, so a table never describes a transfer
+    // that was rejected. Best-effort: a store that cannot hold the sidecar still
+    // holds a correct blob, and verify falls back to the whole-file digest.
+    let _ = store.write_chunks(&blob_name, &ch.finish());
     Ok(final_path)
 }
