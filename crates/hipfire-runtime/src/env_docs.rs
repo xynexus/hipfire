@@ -1454,7 +1454,7 @@ pub const ENV_HIPFIRE_DSPARK_Q8_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DTOH_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DTOH_DUMP",
     description: "Enabled when set to 1",
-    source: "crates/hip-bridge/src/ffi.rs:1100",
+    source: "crates/hip-bridge/src/ffi.rs:1115",
 };
 
 /// `HIPFIRE_DUMMY_GENERATE_DELAY_MS` — Parses "HIPFIRE_DUMMY_GENERATE_DELAY_MS" with fallback defaults
@@ -2704,6 +2704,13 @@ pub const ENV_HIPFIRE_LOWRANK_R: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-env/src/lib.rs",
 };
 
+/// `HIPFIRE_MALLOC_BACKTRACE` — which buffer asked for it. Opt-in because capturing a backtrace on
+pub const ENV_HIPFIRE_MALLOC_BACKTRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_MALLOC_BACKTRACE",
+    description: "which buffer asked for it. Opt-in because capturing a backtrace on",
+    source: "crates/hip-bridge/src/ffi.rs:858",
+};
+
 /// `HIPFIRE_MAX_GEN` — Runtime variable controlling max gen in hipfire
 pub const ENV_HIPFIRE_MAX_GEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MAX_GEN",
@@ -2722,14 +2729,14 @@ pub const ENV_HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MEMCPY_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MEMCPY_DUMP",
     description: "Enabled when set to 1",
-    source: "crates/hip-bridge/src/ffi.rs:1133",
+    source: "crates/hip-bridge/src/ffi.rs:1148",
 };
 
 /// `HIPFIRE_MEMSET_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_MEMSET_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MEMSET_DUMP",
     description: "Enabled when set to 1",
-    source: "crates/hip-bridge/src/ffi.rs:1185",
+    source: "crates/hip-bridge/src/ffi.rs:1200",
 };
 
 /// `HIPFIRE_MINIMAX_CAPTURE_POSTATTN` — Runtime variable controlling minimax capture postattn in hipfire
@@ -5881,6 +5888,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LOAD_TRANSPORT,
     ENV_HIPFIRE_LOCAL,
     ENV_HIPFIRE_LOWRANK_R,
+    ENV_HIPFIRE_MALLOC_BACKTRACE,
     ENV_HIPFIRE_MAX_GEN,
     ENV_HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE,
     ENV_HIPFIRE_MEMCPY_DUMP,
