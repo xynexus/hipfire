@@ -1656,6 +1656,14 @@ pub fn qwen35_allocate_session_state(
         .q35_kv_mode
         .as_deref()
         .ok_or_else(|| "qwen35 KV mode missing; reload model before batch prefill".to_string())?;
+    // What this session is actually sized for. Printed unconditionally because
+    // the per-mode constructor banners are inconsistent — asym/q8 report
+    // `physical_cap=N / max_seq=N`, kvarn reports neither — so an over-sized KV
+    // was invisible on the mode operators are meant to use.
+    eprintln!(
+        "  session KV: mode={kv_mode} max_seq={} physical_cap={}",
+        m.max_seq, m.physical_cap
+    );
     let kv_cache = match kv_mode {
         "fp32" | "f32" => {
             let is_kv_layer = qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
@@ -1731,6 +1739,10 @@ pub fn qwen35_allocate_session_state(
             ));
         }
         // KVarN. Without this arm a kvarn-loaded model fell through to `other`
+        // (see below) — and note the kvarn constructor's own banner does NOT
+        // print physical_cap/max_seq the way the asym/q8 ones do, so without the
+        // trace above there is no way to see what context a kvarn session was
+        // sized for.
         // and silently got an asym3 session cache — a DIFFERENT quant from the
         // one it was loaded with, and one the load-time deprecation gate now
         // refuses outright. That mismatch was visible in the log as two "KV
