@@ -1253,6 +1253,22 @@ pub(crate) fn moe_ffn_decode_impl(
         return Ok(());
     }
 
+    // The branch below takes the indexed path when experts are PAGED
+    // (`experts.is_empty()`) regardless of `use_gpu_topk` — but every indexed
+    // kernel is `*_k8_indexed*` and is launched with `grid.y = INDEXED_MOE_K_TOP`.
+    // A paged model whose top-k is not that value would have those kernels read
+    // `topk_indices` past its end. Refuse by name instead, reusing the predicate
+    // the lowered executor already applies at `pipeline/mod.rs` rather than
+    // growing a third copy of the rule. Costs nothing on the supported paths:
+    // resident experts satisfy it, and paged + k_top == 8 sets `use_gpu_topk`.
+    hipfire_dispatch::pipeline::check_moe_decode_supported(
+        use_gpu_topk,
+        k,
+        n_exp,
+        !ffn.experts.is_empty(),
+    )
+    .map_err(|e| HipError::new(0, &format!("qwen35 moe decode: {e:?}")))?;
+
     if use_gpu_topk || ffn.experts.is_empty() {
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
         // IDs and weights from device buffers, zero D2H sync.

@@ -4061,7 +4061,7 @@ pub const ENV_HIPFIRE_QWEN35_MOE_DTYPE_DEBUG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_LEGACY_INLINE",
     description: "Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1669",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1685",
 };
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — The arch layer resolves the same question independently and traces its
