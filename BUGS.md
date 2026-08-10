@@ -67,6 +67,52 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [Critical] KV cache is allocated for max_position_embeddings, ignoring max_seq
+- Category: Correctness / Capacity (KV sizing) — root cause of the batch-prefill OOM
+- Measured 2026-08-10 on `Qwen3.6-35B-A3B--oq4` (nix1, gfx1103, 42 GiB GTT).
+- **`--max-seq` has no effect on KV allocation.** `--max-seq 128` and
+  `--max-seq 2048` produce the byte-identical request and the identical
+  free-memory progression:
+  ```
+  --max-seq 128 : hipMalloc(71860224 bytes = 68.53 MiB), free=79.1 MiB
+  --max-seq 2048: hipMalloc(71860224 bytes = 68.53 MiB), free=79.1 MiB
+  ```
+  A 16x change in configured context changes nothing.
+- **It is sizing for the model's full context.** 71,860,224 / 262,144
+  (`max_position_embeddings`) = **274.1 bytes/position**, which is exactly
+  2 `num_key_value_heads` x 256 `head_dim` at 4-bit kvarn (256 B) plus ~18 B of
+  scales. The allocation is for 256K positions regardless of what the operator
+  asked for.
+- **Cost per session: ~1.37 GB** (68.53 MiB x 10 KV-carrying layers x {K,V}),
+  against an expected ~40 MB at max_seq=512. That is ~35x over-allocation and it
+  is why concurrency caps at 2 on a 42 GiB device.
+- **Also a per-request leak, separately.** Sequential requests (same session,
+  which should reuse state) decline monotonically:
+  ```
+  req 1 ok | req 2 free=79.1 | req 3 free=53.1 | req 4 free=27.1 | then flat
+  ```
+  ~26 MiB lost per request until nothing is left. Consistent with the v2 plan's
+  risk 1: `GpuTensor` has no `Drop` and `serving-core/src/model.rs:266` already
+  documents ~2 GB/forward accumulation on a missed free.
+- **After ONE request the device is at 79 MiB free of 43,008 MiB.** A 19 GB model
+  leaves ~42 GiB consumed, i.e. ~2.2x its own size, before any concurrency.
+- **This supersedes the earlier "batched prefill OOMs" diagnosis.** The
+  checkpoint clone was not oversized — it was a normal-sized clone of a KV cache
+  that is itself ~35x too large. Every "wall" seen previously (fp32's 258 MiB
+  single buffer, the 68.53 MiB clone, kvarn hitting the same number) is the same
+  root cause seen through different call sites.
+- Diagnosis needed the allocator to report free/total at failure; a bare
+  "out of memory" on a 68 MiB request looked like pool placement or
+  fragmentation and was neither.
+- Next: find why max_seq does not reach the KV constructor on the serving path
+  (`physical_cap` is plumbed for the daemon path — the load frame reports
+  `physical_cap: 2048` — so the server path is the suspect), then re-measure the
+  batch sweep, which should stop being memory-bound entirely.
+- Scope: Capacity / correctness — caps concurrency at 2 and blocks all
+  multi-stream measurement
+- Confidence: High (16x max_seq change with byte-identical allocation;
+  positions x bytes arithmetic matches max_position_embeddings exactly)
+
 ## [High] Batched prefill OOMs on the 35B at batch=4 — blocks all multi-stream measurement
 - Category: Correctness / Capacity (batched prefill)
 - Measured 2026-08-10 on nix1 (gfx1103, 45.1 GB GTT) via `hipfire serve` +
