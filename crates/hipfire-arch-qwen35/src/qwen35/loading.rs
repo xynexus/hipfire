@@ -5077,6 +5077,35 @@ pub fn load_weights(
         gib(loaded_bytes),
     );
 
+    // Push residency: hand every MoE layer's device pointer tables to the pager
+    // so it can keep them consistent with residency on its own (page-in, evict,
+    // teardown). Must happen after the layer loop — the tables are allocated per
+    // layer inside it — and before the pager moves into `Qwen35Weights`.
+    //
+    // Registration is what makes `expert_ptr_tables_registered()` true, which is
+    // what lets backend selection admit the indexed paged path. A layer that is
+    // somehow not registered stays refused rather than dispatching against an
+    // unmaintained table.
+    if let Some(p) = pager.as_mut() {
+        let mut registered_tables = 0usize;
+        for layer in &layers {
+            let ffn = match layer {
+                LayerWeights::DeltaNetMoe(l) => Some(&l.ffn),
+                LayerWeights::FullAttnMoe(l) => Some(&l.ffn),
+                _ => None,
+            };
+            if let Some(ffn) = ffn {
+                p.register_expert_ptr_tables(
+                    ffn.layer_idx,
+                    &ffn.expert_gate_up_ptrs,
+                    &ffn.expert_down_ptrs,
+                );
+                registered_tables += 1;
+            }
+        }
+        eprintln!("  paged experts: registered {registered_tables} expert pointer tables");
+    }
+
     let slab_storage = slab_index.map(|idx| idx.storage);
     let rq_corrections = load_rq_corrections(hfq, gpu)?;
     Ok(Qwen35Weights {
