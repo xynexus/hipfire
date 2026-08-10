@@ -19,6 +19,24 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// `HIPFIRE_LAUNCH_TRACE` — diagnostic kernel-launch tracing at the single
+/// dispatch chokepoint. `0`/unset off (one cached env read, no per-launch cost),
+/// `1` prints every launch, `2` also synchronizes after each one.
+///
+/// Level 2 exists because kernel launches are asynchronous: a device fault
+/// surfaces at whatever unrelated call touches the queue next, so a kernel that
+/// wedges the GPU gets blamed on its successor. Synchronizing per launch makes
+/// the last traced line the kernel that actually faulted, at ruinous cost to
+/// throughput — a bisection tool, not something to leave on.
+fn launch_trace_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("HIPFIRE_LAUNCH_TRACE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
 fn raw_upload_chunks(
     total_bytes: usize,
     max_chunk_bytes: usize,
@@ -1371,7 +1389,11 @@ impl Gpu {
         shared_mem: u32,
         args: &[hip_bridge::KernArg],
     ) -> HipResult<()> {
-        if self.capture_mode || self.flags.force_blob_path {
+        let trace = launch_trace_level();
+        if trace > 0 {
+            eprintln!("[launch] {func_name} grid={grid:?} block={block:?} smem={shared_mem}");
+        }
+        let launch_result = if self.capture_mode || self.flags.force_blob_path {
             let mut blob = hip_bridge::KernargBlob::new();
             for a in args {
                 blob.push_arg(a);
@@ -1417,7 +1439,19 @@ impl Gpu {
             // here. Attach it rather than making the next reader bisect grid
             // shapes against every `launch_kernargs` call site.
             .map_err(|e| hip_bridge::HipError::new(e.code, &format!("{func_name}: {}", e.message)))
+        };
+        // Level 2 synchronizes after every launch. Launches are asynchronous, so
+        // a device fault normally surfaces at some LATER unrelated call — which is
+        // how a wedge in one kernel gets misattributed to whatever ran next (a
+        // `hipModuleLoad`, say). Synchronizing here makes the last traced line the
+        // kernel that actually faulted. Ruinous for throughput; that is the point.
+        if trace >= 2 {
+            match self.hip.device_synchronize() {
+                Ok(()) => eprintln!("[launch] {func_name} <- sync ok"),
+                Err(e) => eprintln!("[launch] {func_name} <- SYNC FAILED code={} {}", e.code, e.message),
+            }
         }
+        launch_result
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
