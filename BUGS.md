@@ -202,7 +202,34 @@ into full investigations here.
 - **Fix is a design decision, not a patch** — either thread pager access into the
   lowered MoE path so residency + table patching happen where the dispatch does,
   or refuse the paged+indexed combination in backend *selection* with a named
-  predicate (the repo rule for exactly this class). Recorded rather than chosen.
+  predicate (the repo rule for exactly this class).
+  - **B (refuse) LANDED** `6a4e32b68`: `check_moe_decode_supported` case (c).
+    Verified on the 35B — reset counter 39 -> 39, no wedge, named refusal.
+  - **A (residency) seam LANDED** `b60ffaad7`: `ExpertResidency` trait in
+    `hipfire-dispatch` + `MoeParams::expert_residency`. A trait rather than a
+    pager field because `hipfire-runtime` depends on `hipfire-dispatch`, so
+    holding a `WeightPager` here would be a dependency cycle. No provider is
+    wired yet, so behaviour is unchanged and the GPU stays safe.
+- **Before implementing the provider, decide pull vs push — the codebase already
+  has a documented position (checked 2026-08-10).** The trait as written is a
+  PULL model: the caller passes `selected`, which needs the top-k on the host,
+  which needs a D2H sync per MoE layer per token. The lowered path
+  **deliberately avoids exactly that**. `pipeline/mod.rs` already contains a
+  `memcpy_dtoh` of `topk_indices`, but it is gated on
+  `moe_router_histogram_active()` and carries the comment: *"unlike the fallback,
+  this path keeps top-K on-device — recording costs a per-token device->host copy,
+  so it must stay off by default."*
+  So a pull-model provider would make unconditional a cost the lowered path
+  currently treats as opt-in telemetry, at ~48 syncs per march on a 40-layer
+  model. The v2 plan flags the same readback as "the most likely place the design
+  underdelivers".
+  - **The push alternative avoids it entirely:** register the pointer tables with
+    the pager once at load, and have the pager write a slot whenever it pages a
+    module in (and null it on eviction). No host-side top-k, no per-token sync,
+    and no pager state in `MoeParams`. Open question is whether every residency
+    mutation — crucially eviction — can be funnelled through one place.
+  - If push is chosen, `ExpertResidency` should be re-shaped (or dropped) before
+    a provider is written against the current pull signature.
 - **Separate defect found by the flag-off run:** the refusal works, and then kills
   the daemon.
   ```
