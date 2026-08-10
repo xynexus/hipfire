@@ -955,6 +955,10 @@ pub(crate) fn moe_ffn_decode_impl(
             shared_down_w: ffn.shared_expert.down.dispatch_ref(),
             expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
             expert_down_ptrs: &ffn.expert_down_ptrs,
+            // No provider yet: the qwen35 pager is not wired to the lowered
+            // MoE seam, so paged residency stays refused rather than
+            // dispatching against an unpopulated pointer table.
+            expert_residency: None,
             routed_gate_up_k: routed_shape.gate_up_k,
             routed_down_m: routed_shape.down_m,
             routed_down_k: routed_shape.down_k,
@@ -1266,6 +1270,9 @@ pub(crate) fn moe_ffn_decode_impl(
         k,
         n_exp,
         !ffn.experts.is_empty(),
+        // The hand path has no ExpertResidency provider wired yet (that is the
+        // lowered path's seam), so paged stays refused here.
+        false,
     )
     .map_err(|e| HipError::new(0, &format!("qwen35 moe decode: {e:?}")))?;
 
@@ -1733,6 +1740,10 @@ pub(crate) fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+            // No provider yet: the qwen35 pager is not wired to the lowered
+            // MoE seam, so paged residency stays refused rather than
+            // dispatching against an unpopulated pointer table.
+            expert_residency: None,
         routed_gate_up_k: routed_shape.gate_up_k,
         routed_down_m: routed_shape.down_m,
         routed_down_k: routed_shape.down_k,
