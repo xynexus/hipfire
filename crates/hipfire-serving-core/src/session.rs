@@ -1730,6 +1730,27 @@ pub fn qwen35_allocate_session_state(
                 config.head_dim
             ));
         }
+        // KVarN. Without this arm a kvarn-loaded model fell through to `other`
+        // and silently got an asym3 session cache — a DIFFERENT quant from the
+        // one it was loaded with, and one the load-time deprecation gate now
+        // refuses outright. That mismatch was visible in the log as two "KV
+        // cache:" lines per session (kvarn at load, asym3 here).
+        //
+        // There is no speed argument for resolving a second time: qwen35's
+        // batched-prefill chain takes kvarn as its FIRST arm and fuses attention
+        // into the KV write, so kvarn is batched here exactly as q8/asym are.
+        // The separate ladder is a leftover from when the choice was fp16 vs
+        // asym3 and only the rotated modes had a batched masked kernel.
+        "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" => kv::KvCache::new_gpu_kvarn_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+            crate::load::kvarn_bits_from_mode(kv_mode),
+        )
+        .map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
             kv::KvCache::new_gpu_asym3_capped(
