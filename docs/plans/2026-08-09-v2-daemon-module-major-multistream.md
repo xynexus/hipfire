@@ -765,7 +765,7 @@ Branch `feat/v2-daemon-module-major`. `./tests/no-gpu-ci.sh` exits 0 throughout.
 | M1b per-stream sampler RNG | **landed** | global deleted; greedy unchanged, temp>0 reproducible across an interleaved request |
 | M1c lease reaper | **landed** | 4 unit tests; 41/41 scheduler tests |
 | M1d `RAW_OVERRIDE` | **landed** | live cross-request leak found and fixed; regression gate committed |
-| M1d `hipfire_steer`, `load_progress::SINK` | not started | steer couples to M2b |
+| M1d `hipfire_steer`, `load_progress::SINK` | deferred, with cause | steer couples to M2b; `SINK` audited 2026-08-10 — correctly scoped today, becomes a bug only once §F moves loading to its own thread |
 | M2 onward | not started | |
 
 **Two corrections to the earlier M1b sizing, both from actually reading the callers.**
@@ -815,6 +815,25 @@ and not an aesthetic one.
   worth doing together rather than twice.
 - **`load_progress::SINK`** — 18 references. Least urgent: a load is not a stream, and the
   per-connection routing bug it once caused was already fixed.
+
+  **Audited 2026-08-10 and deliberately deferred — there is no live bug.** The global is
+  `Mutex<Option<Box<ProgressFn>>>` (`crates/hipfire-runtime/src/load_progress.rs:30`) with
+  exactly one installer and two clears in the whole workspace: install at
+  `handlers/lifecycle.rs:461`, clear at `:479` (the one early return in between) and `:500`
+  (immediately after `load_model` returns, before the result is matched). Every path out of
+  the installed window clears; the only leak is a panic inside `load_model`, which is fatal
+  to the daemon anyway. So the sink is *scoped correctly today*, and an RAII guard here
+  would be tidiness, not a fix.
+
+  It becomes a real bug under exactly one condition, and that condition is created by this
+  plan rather than existing now: §F moves loading to its **own thread**, at which point two
+  overlapping loads clobber one another's sink and load A's progress frames route to load
+  B's connection — the same misrouting class the stderr-scraping fix was meant to end. The
+  right shape (thread-local, RAII guard, or a sink passed explicitly through the loader
+  signatures) depends on whether that thread serialises loads, which M3/M5 decides.
+  **Fixing it before then means guessing the answer, and a thread-local guessed wrong
+  silently drops progress frames rather than failing loudly** — the chat UI's load bar is
+  not covered by any test. Do it with the loader-thread move, not before.
 
 **RETRACTED — the "first generation after a load differs" anomaly is not a bug.**
 It was recorded across the M0 and M1b commits as unexplained and needing its own
