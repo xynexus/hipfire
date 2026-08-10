@@ -90,7 +90,7 @@ into full investigations here.
 - Scope: Correctness (premier quant family, paged path)
 - Confidence: High (clean A/B, one variable)
 
-## [High] tiny-quant is RED on master for Opus across four MoE families
+## [RESOLVED by rebase] tiny-quant was RED for Opus across four MoE families
 - Category: Correctness / Quant (Opus)
 - Location: `tests/tiny-quant-gate.sh` cells; baselines in `tests/tiny-quant-baselines.txt`
 - Summary: `./tests/tiny-affected-gate.sh --require-coverage` fails 14 cells, all
@@ -146,10 +146,44 @@ into full investigations here.
     `2026-08-05-opus-across-model-families.md:82-93` (oq4 0.003531, oq8 0.000259).
     **minimax cannot serve as a parity oracle**; scope it out with
     `HIPFIRE_TINYQUANT_FAMILIES` until that separate cause is found.
-- Action: rebase the topic branch onto `origin/master`; nothing to cherry-pick.
-  The 14-cell figure above describes `da38cc16f`, which is no longer master.
+- **DONE — rebased 2026-08-10, and the 14 cells are gone.** On the rebased base
+  the gate is **188 pass / 3 fail**. deepseek4, deepseek4_compressed, lfm2_moe
+  **and minimax** now pass every cell.
+- **A prediction recorded here was wrong, and the reason matters.** The Phase 0
+  analysis predicted 7 survivors, all minimax, on the theory that fixing the
+  wildcard *unmasks* minimax rather than repairing it. Minimax passes clean. That
+  analysis was performed on a different tree, and the rebase brought 82 commits of
+  master work, not just the one-line reorder — so it was a hypothesis about
+  another base, not a forecast for this one. Do not carry cross-base predictions
+  forward without re-measuring.
 - Scope: Correctness (premier quant family)
 - Confidence: High (byte-identical reproduction on pristine code)
+
+## [Medium] tiny-quant: three `oq4.25++(calib)` cells breach budget — two on the GOOD side
+- Category: Correctness / Quant (mixed Opus) + gate tolerance design
+- Location: `tests/tiny-quant-gate.sh`; baselines in `tests/tiny-quant-baselines.txt`
+- Summary: on `origin/master` at `33d9dcbd2` the gate is **188 pass / 3 fail**, and
+  all three failures are the same cell, `kld:oq4.25++(calib)`:
+
+  | family | measured | baseline | budget | direction |
+  |---|---|---|---|---|
+  | qwen3_legacy | 0.004369 | 0.005979 | ±0.001495 | **better** by 0.00161 |
+  | gemma4_moe | 0.005952 | 0.003077 | ±0.000769 | **worse**, ~1.9x |
+  | zaya | 0.000023 | 0.000036 | ±0.000010 | **better** by 0.000013 |
+
+- **"3 failures" overstates it.** Only `gemma4_moe` is a real degradation. The
+  other two are *improvements* that trip a **symmetric** relative tolerance —
+  the gate flags movement, not loss. `zaya` is the clearest case: at absolute
+  magnitudes of 2e-5, a 25% budget is ±1e-5, so almost any change trips it.
+- Pre-existing, NOT from the v2 branch: verified by running the identical three
+  families in a detached worktree at pristine `origin/master` — the failures
+  reproduce with byte-identical measured values, baselines and budgets.
+- Two separable actions: (a) investigate `gemma4_moe` oq4.25++ as a genuine ~1.9x
+  mixed-Opus regression; (b) decide whether the KLD budget should be one-sided,
+  or carry an absolute floor so near-zero cells stop failing for improving.
+  Re-recording the baselines would hide (a) — do (a) first.
+- Scope: Correctness (mixed Opus) + gate design
+- Confidence: High (byte-identical reproduction at pristine origin/master)
 
 ## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
 - Category: Correctness / Tooling (hipfire-quantize)
