@@ -55,11 +55,23 @@ into full investigations here.
   "the suite passed". Runs that touched only qwen35 paths never selected these
   four families. Comparing two gate runs with different `--files-from` inputs
   compares different tests.
-- **RESOLVED as to cause, and a fix already exists off-master (found 2026-08-10).**
-  The open question below was answered before this entry was written, on the
-  unmerged branch `fix/oq8-from-flag-and-rotation-guards`
-  (`docs/plans/moe-expert-residency-unification.md`, Phase 0, commit `691e7730e`
-  — that file exists ONLY on that branch). Do not re-bisect this.
+- **RESOLVED as to cause, AND ALREADY FIXED ON `origin/master` (corrected 2026-08-10
+  after actually fetching).** Do not re-bisect this, and do not re-fix it.
+  - `origin/master` advanced `da38cc16f` → `33d9dcbd2` (82 commits) during this
+    work, and the reordered `from_flag` is there now, with a comment pinning why
+    the catch-all must stay last.
+  - **This branch is based on the stale `da38cc16f` and still carries the bug.**
+    `cargo build -p hipfire-quantize` emits `unreachable pattern` at
+    `main.rs:3924`/`:3925` — the `"oq8"` and `"oq8+" | "oq8++"` arms. The remedy is
+    a rebase onto `origin/master`, not a code change here.
+  - **Therefore every tiny-quant number measured on this branch was taken on a base
+    with a known, since-fixed OQ8 defect.** One-variable A/Bs run on this branch
+    remain valid as *relative* results (both arms share the base); absolute cell
+    verdicts do not.
+  - The analysis below was first written on the local-only branch
+    `fix/oq8-from-flag-and-rotation-guards`
+    (`docs/plans/moe-expert-residency-unification.md`, Phase 0, `691e7730e`); that
+    *document* is on no origin ref, but its fix reached master by another route.
   - **9 of the 14 are one real regression**: deepseek4 ×3, deepseek4_compressed ×3,
     lfm2_moe ×3. Green at `0060481ee`, red at `8b9ee5392`.
   - **Root cause**: `8b9ee5392` inserted an unguarded `_` wildcard arm *above* the
@@ -79,8 +91,8 @@ into full investigations here.
     `2026-08-05-opus-across-model-families.md:82-93` (oq4 0.003531, oq8 0.000259).
     **minimax cannot serve as a parity oracle**; scope it out with
     `HIPFIRE_TINYQUANT_FAMILIES` until that separate cause is found.
-- Action for master: this is a merge/cherry-pick decision, not a debugging task.
-  The 14-cell figure above remains accurate *for master as it stands today*.
+- Action: rebase the topic branch onto `origin/master`; nothing to cherry-pick.
+  The 14-cell figure above describes `da38cc16f`, which is no longer master.
 - Scope: Correctness (premier quant family)
 - Confidence: High (byte-identical reproduction on pristine code)
 
