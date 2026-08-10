@@ -409,7 +409,8 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
             res_k4.use_gpu_topk,
             4,
             /*n_exp=*/ 64,
-            /*resident=*/ true
+            /*resident=*/ true,
+            /*paged_residency=*/ false
         )
         .is_ok(),
         "MQ4G256 k=4 with resident experts is a VALID fallback case — guard must not reject it"
@@ -428,7 +429,7 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     );
     // With RESIDENT experts the GPU-top-K path is admitted.
     assert!(
-        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ true).is_ok(),
+        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ true, /*paged_residency=*/ false).is_ok(),
         "GPU-top-K path with resident experts is the normal fast path"
     );
     // ...but NOT under paging. This assertion is inverted from what it was, and
@@ -438,23 +439,23 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     // populated (see `check_moe_decode_supported` case (c)), so the indexed
     // kernels dereference null and wedge the GPU.
     assert!(
-        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ false).is_err(),
+        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ false, /*paged_residency=*/ false).is_err(),
         "paged + indexed must be refused: the expert ptr table is never populated"
     );
 
     // (a) out-of-range k errors gracefully (no panic): k == 0 and k > n_exp.
     assert!(
-        check_moe_decode_supported(false, 0, 64, true).is_err(),
+        check_moe_decode_supported(false, 0, 64, true, /*paged_residency=*/ false).is_err(),
         "k == 0 must be rejected (would panic select_nth_unstable_by(k-1))"
     );
     assert!(
-        check_moe_decode_supported(false, 65, 64, true).is_err(),
+        check_moe_decode_supported(false, 65, 64, true, /*paged_residency=*/ false).is_err(),
         "k > n_exp must be rejected (would panic select_nth_unstable_by(k-1))"
     );
 
     // (b) routed dtype on NEITHER path: not GPU-top-K AND no resident experts.
     assert!(
-        check_moe_decode_supported(/*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false).is_err(),
+        check_moe_decode_supported(/*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false, /*paged_residency=*/ false).is_err(),
         "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
     );
 }
@@ -485,15 +486,36 @@ fn paged_experts_refused_for_every_indexed_routed_dtype() {
         };
         let res = MoeResolution::resolve(&dtypes, 8);
         assert!(
-            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ false).is_err(),
+            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ false, /*paged_residency=*/ false).is_err(),
             "paged {dtype:?} must be refused — the expert ptr table is never populated"
         );
         // Resident is the supported configuration and must stay admitted, so the
         // refusal cannot be read as "paged models are simply unsupported".
         assert!(
-            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ true).is_ok(),
+            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ true, /*paged_residency=*/ false).is_ok(),
             "resident {dtype:?} must remain admitted"
         );
+        // An ExpertResidency provider unlocks paged residency, but ONLY for the
+        // indexed path. That asymmetry is real, not an oversight: a provider
+        // patches the device pointer table the indexed kernels read, whereas the
+        // CPU-top-K fallback iterates `routed_experts` — which is empty under
+        // paging, so no amount of residency makes it runnable. A dtype that does
+        // not resolve to `use_gpu_topk` therefore stays refused by case (b).
+        let with_provider =
+            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ false, /*paged_residency=*/ true);
+        if res.use_gpu_topk {
+            assert!(
+                with_provider.is_ok(),
+                "paged {dtype:?} WITH a residency provider must be admitted on the indexed path \
+                 — otherwise the option-A seam is scaffolding that never opens"
+            );
+        } else {
+            assert!(
+                with_provider.is_err(),
+                "paged {dtype:?} is not GPU-top-K-indexable, and the CPU fallback needs resident \
+                 experts — a residency provider must NOT admit it"
+            );
+        }
     }
 }
 
