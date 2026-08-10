@@ -719,6 +719,41 @@ dependency this does not remove: decode does a **D2H readback of top-k** before
 CPU-router mispredict rate before committing**; this is the most likely place the design
 underdelivers.
 
+**MEASURED 2026-08-10 — do not build the CPU-router prefetch. Both halves of the
+case for it are false on real numbers.** Paged Opus MoE on
+`Qwen3.6-35B-A3B--oq4.hfq` (40 layers, 256 experts, top-8, 16 GiB expert cache),
+three 48-token generations in one daemon lifetime:
+
+| generation | decode tok/s | ms/token | cumulative cold-loads | evictions |
+|---|---|---|---|---|
+| 1 (cold) | 5.4 | 185 | — | 0 |
+| 2 | 12.0 | 83 | — | 0 |
+| 3 (warm) | **13.9** | **72** | 6011 total | **0** |
+
+1. **The sync is noise.** 40 layers × ~15 µs ≈ 0.6 ms against a 72 ms warm token
+   — **0.8%**. Removing it perfectly returns under one percent, so the readback
+   was never the thing worth engineering away.
+2. **The misses it would prefetch are a warmup transient, not steady state.**
+   Zero evictions across all three generations; peak 6011 modules resident
+   (9.3 GiB) against a 16 GiB budget, out of a 10,240-module (15.9 GiB) total
+   set. The working set *fits*, so once warm there is nothing left to prefetch
+   and a long-running server pays the fill exactly once. Decode improving 2.6×
+   (5.4 → 13.9 tok/s) with no evictions is the cache filling, not routing
+   prediction succeeding.
+
+Note the corollary that also softens §0.4's capacity argument on this box:
+routing is skewed enough that 48 tokens × 3 generations touched only 6011 of
+10,240 modules (59%), and the whole set fits in cache anyway — so expert
+residency is not the binding constraint at this model size.
+
+**Where the 72 ms actually goes is the open question.** 3B active params at oq4
+is ~1.5 GB/token, i.e. ~15 ms at gfx1103's ~100 GB/s — so warm decode is running
+about 5× off roofline. The launch-overhead and LRU costs this plan already names
+(384 per-expert dispatches ≈ 3 ms; `touch_module_lru`'s O(n) scan ≈ 2 ms) are
+together under 10% of it. That points at kernel efficiency, consistent with the
+prior finding that the warm step is ~92% GEMM at ~2% kernel efficiency —
+a different investigation from residency, and the one with the actual headroom.
+
 ## 1.7 Process structure
 
 One process. Main thread supervises and holds no GPU. An **executor thread owns `Gpu`**,
