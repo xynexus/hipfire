@@ -274,8 +274,16 @@ the state they describe.
     mutation — crucially eviction — can be funnelled through one place.
   - If push is chosen, `ExpertResidency` should be re-shaped (or dropped) before
     a provider is written against the current pull signature.
-- **Separate defect found by the flag-off run:** the refusal works, and then kills
-  the daemon.
+- **Separate defect found by the flag-off run — FIXED 2026-08-10.** The refusal
+  worked, and then killed the daemon. `generate.rs` now reports it and unwinds
+  like the other fallible steps in that function, so the client receives
+  `{"type":"error","message":"prefill failed: unsupported moe.decode-..."}` and
+  the worker survives. Verified: daemon exit 101 (panic) -> 0, zero panics.
+  Sizing note: an earlier revision of this entry called it a signature/caller
+  refactor because `generate()` returns `()` and `?` is unavailable. That was the
+  wrong conclusion from a right fact — the function already has a
+  `write_error(...)` + `qwen35_restore_or_error(...)` + `return` idiom for exactly
+  this, so the fix is local. The original defect:
   ```
   thread 'main' panicked at crates/hipfire-serving-core/src/generate.rs:2979:18:
   called `Result::unwrap()` on an `Err` value:

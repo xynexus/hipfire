@@ -2962,7 +2962,14 @@ pub fn generate(
                     remaining = rest;
                 }
             } else {
-                qwen35::forward_prefill_batch(
+                // A prefill failure here used to `.unwrap()`, which killed the
+                // whole daemon process — the client saw the socket close with no
+                // explanation. That is not hypothetical: the paged-MoE capability
+                // refusals (`unsupported moe.decode-*`) surface exactly here, so a
+                // configuration the runtime deliberately declines took down every
+                // other session on the worker. Report it and unwind like the other
+                // fallible steps in this function do.
+                if let Err(e) = qwen35::forward_prefill_batch(
                     gpu,
                     weights,
                     config,
@@ -2975,8 +2982,11 @@ pub fn generate(
                     None,
                     None,
                     None,
-                )
-                .unwrap();
+                ) {
+                    write_error(stdout, id, &format!("prefill failed: {e}"));
+                    qwen35_restore_or_error(stdout, id, m, gpu, session);
+                    return;
+                }
                 session.cursor.seq_pos += new_tokens.len();
             }
             session
