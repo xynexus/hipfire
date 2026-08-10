@@ -461,6 +461,20 @@ def _sha256_file(path: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+#: Recipe fields recorded in the manifest but excluded from
+#: `recipe_fingerprint`. See the note in `recipe_manifest`; the Rust twin is
+#: `UNHASHED_PATH_FIELDS` in crates/hipfire-coexistence/src/induction/recipe.rs.
+_UNHASHED_PATH_FIELDS = frozenset(
+    {
+        "cask_artifact",
+        "calibration_artifact",
+        "corpus",
+        "model",
+        "quantized_artifact",
+    }
+)
+
+
 def recipe_manifest(
     *,
     model: Path,
@@ -508,7 +522,14 @@ def recipe_manifest(
     }
     if cask_output is not None:
         recipe["cask_artifact"] = str(cask_output.resolve())
-    encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
+    # Path fields are recorded but NOT hashed — a resolved absolute path says
+    # where a thing sits on one machine, not what it is, so hashing them made
+    # the fingerprint identify a filesystem layout instead of a recipe (a
+    # symlinked corpus or a different HF cache root was enough to change it).
+    # `corpus_sha256` already pins the corpus by content. Must stay in lockstep
+    # with `UNHASHED_PATH_FIELDS` in crates/hipfire-coexistence/src/induction/recipe.rs.
+    hashed = {k: v for k, v in recipe.items() if k not in _UNHASHED_PATH_FIELDS}
+    encoded = json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
     return {**recipe, "recipe_fingerprint": f"sha256:{hashlib.sha256(encoded).hexdigest()}"}
 
 

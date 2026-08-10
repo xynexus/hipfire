@@ -159,12 +159,8 @@ impl VisionWeights {
 /// tower arrives with a quant code the dtype matches below do not know. Returns
 /// `(logical_qt, bytes)` — unchanged for anything that is not a recoding.
 fn decode_recoded<'a>(qt: u8, data: &'a [u8], n: usize, name: &str) -> (u8, Cow<'a, [u8]>) {
-    if matches!(qt, 49 | 50) {
-        let logical = hipfire_runtime::hfq::decode_bf16_packed(qt, data, n)
-            .unwrap_or_else(|| panic!("{name}: failed to decode recoded vision tensor (qt={qt})"));
-        return (16, Cow::Owned(logical));
-    }
-    (qt, Cow::Borrowed(data))
+    hipfire_runtime::hfq::decode_recoded_bf16(qt, data, n)
+        .unwrap_or_else(|| panic!("{name}: failed to decode recoded vision tensor (qt={qt})"))
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {

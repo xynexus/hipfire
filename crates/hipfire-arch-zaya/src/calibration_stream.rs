@@ -912,7 +912,7 @@ fn load_block_weights(
     // exactly as the resident collector performs it.
     let balancing_biases = {
         let view = reader.read(&name("balancing_biases"))?;
-        let values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
+        let values = source_payload_f32(view.info.dtype.as_str(), &view.bytes)?;
         if values.len() != n_route {
             return Err(CalibError::InvalidSourcePlan(format!(
                 "ZAYA block {block} balancing_biases has {} values, expected {n_route}",
@@ -1982,7 +1982,7 @@ impl CalibrationFamilyAdapter for ZayaCalibrationAdapter {
         let values = {
             let view = reader.read("embedding")?;
             validate_source_shape(view.info, &[model.vocab_size, hidden], "embedding")?;
-            source_payload_f32(view.info.dtype.as_str(), view.bytes)?
+            source_payload_f32(view.info.dtype.as_str(), &view.bytes)?
         };
         if values.len() != model.vocab_size * hidden {
             return Err(CalibError::InvalidSourcePlan(

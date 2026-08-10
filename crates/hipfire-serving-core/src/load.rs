@@ -326,8 +326,9 @@ pub fn profile_chat_template(
 /// (`qwen35::default_state_quant`), which yields **FP32** for all current models.
 ///
 /// **Q8 is REMOVED (2026-08-09)** — the variants, the kernels and their dispatch
-/// entry points are all deleted. It remains parseable so older configs still
-/// load, but an explicit request warns and resolves to FP32.
+/// entry points are all deleted. An explicit `q8`/`q4` is REJECTED, not mapped
+/// to FP32: an operator who set it deliberately should learn it is gone rather
+/// than get different numerics without being told.
 ///
 /// This previously mapped absent/`""`/`auto` straight to Q8 — bypassing the gate
 /// entirely — while its own doc comment claimed it fell "back to the arch

@@ -4191,20 +4191,25 @@ mod tests {
         }
     }
 
+    /// gfx1151 is in this list now, not excluded from it.
+    ///
+    /// The BUG-001 guard that kept BF16 dense prefill off gfx1151's batched
+    /// projection path was retired in `22d0d2825`, with the measurement in the
+    /// comment on `is_batchable_la`: prefill 58.5 -> 1646.3 tok/s, PPL 24.0318
+    /// -> 24.0551, top-1 argmax agreeing at 99.36%, no layer-0 garbage. The
+    /// assertion that gfx1151 must NOT be batchable outlived the guard it was
+    /// written to protect and had been failing CI ever since.
     #[test]
     fn dense_prefill_bf16_is_batchable_in_qwen35() {
         for arch in [
-            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201", "gfx942",
+            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+            "gfx942",
         ] {
             assert!(
                 is_batchable_la(DType::BF16, arch),
                 "BF16 dense prefill must stay on the batched BF16 WMMA-capable path on {arch}"
             );
         }
-        assert!(
-            !is_batchable_la(DType::BF16, "gfx1151"),
-            "BUG-001 keeps BF16 dense prefill off the broken gfx1151 batched projection path"
-        );
     }
 
     #[test]
