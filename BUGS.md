@@ -67,6 +67,42 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [High] Batched prefill OOMs on the 35B at batch=4 — blocks all multi-stream measurement
+- Category: Correctness / Capacity (batched prefill)
+- Measured 2026-08-10 on nix1 (gfx1103, 45.1 GB GTT) via `hipfire serve` +
+  concurrent `/v1/chat/completions`, `--max-seq 512`, 32 max_tokens.
+- Error, identical in every failing config:
+  ```
+  batch prefill: daemon generate_batch_prefill error: HipError(2): hipMalloc: out of memory
+  ```
+- **It is the model, not residency.** Discriminated three ways:
+
+  | model | residency | batch 4 |
+  |---|---|---|
+  | `qwen3.5-0.8b--oq4++` | resident | **OK** — 22.3 aggregate tok/s, 5.6/stream |
+  | `Qwen3.6-35B-A3B--oq4` | paged, 2 GiB budget | **OOM** |
+  | `Qwen3.6-35B-A3B--oq4` | resident (paging off) | **OOM** |
+
+  So the batch runner itself works; the 35B specifically cannot batch-prefill.
+  Single-stream on the same 35B artifact is fine (13.9 tok/s warm), so this is a
+  batched-path allocation, not model capacity.
+- **Why it matters beyond the immediate ask:** every performance number in this
+  investigation is `batch=1`, which is the worst case for the MoE amortization
+  curve. The whole capacity argument for module-major execution
+  (`docs/plans/2026-08-09-...` 0.4) rests on behaviour at N=16..128 streams, and
+  right now that regime **cannot be measured on the target model at all**.
+- Suspicion, unverified: `rocm-smi` reports VRAM total = 256 MB on this APU (the
+  dedicated carve-out; the 45.1 GB is GTT). An allocation that must land in real
+  VRAM rather than GTT would OOM almost immediately and would scale with batch.
+  Worth checking which allocation in the batched prefill path is not GTT-backed
+  before assuming the sizes are simply too large.
+- Next: instrument the failing `hipMalloc` with its requested size (the dispatch
+  chokepoint already attaches kernel names to launch errors; the allocator needs
+  the same treatment), then decide whether it is a sizing bug or a pool-placement
+  bug.
+- Scope: Capacity — blocks the multi-stream half of the v2 thesis
+- Confidence: High (three-way discrimination, identical error)
+
 ## [FIXED 2026-08-10] Paged Opus MoE on the 35B wedged the GPU (MES hang → driver reset)
 **Resolved — paged Opus MoE now generates on the 35B.** The pointer table went
 `non_null=0/256` → **`8/256`** (exactly the selected experts, real device
