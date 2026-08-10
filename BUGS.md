@@ -102,11 +102,25 @@ reproduction and the reasoning that led to the real cause are still useful.
   only removes the corruption that was being blamed on them. The tiny fixture
   cannot exercise them at all. Exercising them needs a top-8 MoE fixture, which
   the tiny battery does not currently have.
-- **Latent, separate, still open:** the paged arm of that same guard is
-  `use_gpu_topk || ffn.experts.is_empty()`, so a **paged** model takes the indexed
-  path regardless of its top-k — while the kernels still hard-code `grid.y = 8`.
-  A paged top-k != 8 model would read `topk_indices` past its end. Harmless for
-  the 35B (top-8); a real hazard for any paged model that is not.
+- **Latent hazard this surfaced — NARROWED, then fixed (2026-08-10).** The paged
+  arm of that same guard is `use_gpu_topk || ffn.experts.is_empty()`, so a paged
+  model takes the indexed path regardless of its top-k while the kernels
+  hard-code `grid.y = INDEXED_MOE_K_TOP`. A paged top-k != 8 model would read
+  `topk_indices` past its end.
+  - **First filed as unqualified; that was too broad.** The lowered/super-op
+    executor — which is the DEFAULT path — already refuses this at
+    `hipfire-dispatch/src/pipeline/mod.rs:302` via `check_moe_decode_supported`
+    (`!use_gpu_topk && !routed_experts_resident` →
+    `decode-routed-dtype-unsupported-no-fallback`), and
+    `coverage_tests.rs:446` already asserts exactly that case errors. So the
+    exposure was only ever the **qwen35 arch hand path**, which had zero calls to
+    that predicate, and is reached only through the four documented escapes
+    (hidden-state ring, GDN tape capture, `HIPFIRE_RQ_HAND=1`,
+    `hipfire_steer::is_active()`).
+  - **Fixed** by calling the same `check_moe_decode_supported` from
+    `qwen35/moe_decode.rs` before that branch, rather than adding a third copy of
+    the rule. Costs nothing on supported paths: resident experts satisfy it, and
+    paged + top-8 sets `use_gpu_topk`.
 
 <details><summary>Original entry as filed (kept for the reproduction)</summary>
 - Category: Correctness / Kernels (Opus routed experts)
@@ -238,10 +252,22 @@ reproduction and the reasoning that led to the real cause are still useful.
 - Pre-existing, NOT from the v2 branch: verified by running the identical three
   families in a detached worktree at pristine `origin/master` — the failures
   reproduce with byte-identical measured values, baselines and budgets.
+- **`zaya` is FLAKY, not failing (observed 2026-08-10).** A later full-gate run on
+  the same commit reported **2** failing cells, not 3: `zaya` passed. Nothing in
+  that path changed between runs. This is the predicted consequence of scoring a
+  2e-5 cell against a ±25% relative budget (±1e-5) — the cell flips on ordinary
+  run-to-run variation. Treat `zaya/oq4.25++` as a tolerance defect, and do not
+  read a single green run as having fixed it.
+- **Do not re-record baselines from one run.** `--record` would bake in whichever
+  side of the flake that run landed on, and would also silently absorb the real
+  `gemma4_moe` regression.
+- Also note the gate's `findings: N` counts **skips as well as failures** — a run
+  showing 9 findings here is 2 fails plus 7 explicitly blocked `deepseek4_mtp`
+  cells. Read the `fail` lines, not the findings count.
 - Two separable actions: (a) investigate `gemma4_moe` oq4.25++ as a genuine ~1.9x
-  mixed-Opus regression; (b) decide whether the KLD budget should be one-sided,
-  or carry an absolute floor so near-zero cells stop failing for improving.
-  Re-recording the baselines would hide (a) — do (a) first.
+  mixed-Opus regression — it is the one cell that is reproducibly worse; (b) give
+  the KLD budget an absolute floor (and consider making it one-sided) so near-zero
+  cells stop flipping. Re-recording the baselines would hide (a) — do (a) first.
 - Scope: Correctness (mixed Opus) + gate design
 - Confidence: High (byte-identical reproduction at pristine origin/master)
 
