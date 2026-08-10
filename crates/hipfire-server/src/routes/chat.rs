@@ -221,9 +221,28 @@ fn load_params_for_model_config(
 ) -> ModelLoadParams {
     let resolved = cfg.resolve_for_model(model_arg);
     let mut params = load_params_from_config(&resolved);
+    // `max_seq` is a HARD CAP on context, not a floor to be inflated.
+    //
+    // This used to do `params.max_seq = min_viable` — silently raising the
+    // operator's context cap to `max_tokens + 1024`. With `max_tokens` unset it
+    // resolves to ~131072, so `--max-seq 512` became 132096 and every session
+    // allocated KV for a 132K context: measured at ~34 MiB per tensor, filling a
+    // 42 GiB device on the FIRST request and capping concurrency at 2. The
+    // operator's cap is exactly the knob for avoiding that, so it must win.
+    //
+    // A generation budget larger than the context is now the caller's problem to
+    // resolve (clamp `max_tokens`, or raise `max_seq` deliberately) rather than
+    // something silently paid for in KV.
     let min_viable = resolved.max_tokens.saturating_add(1024);
     if params.max_seq < min_viable {
-        params.max_seq = min_viable;
+        eprintln!(
+            "  NOTE: max_tokens={} would need {min_viable} context but max_seq={} — \
+             honouring max_seq. Requests generating past {} tokens will be truncated; \
+             raise --max-seq if you need the longer budget.",
+            resolved.max_tokens,
+            params.max_seq,
+            params.max_seq.saturating_sub(1024)
+        );
     }
     maybe_attach_dflash_draft(&resolved, model_path, &mut params);
     maybe_attach_cask_sidecar(&resolved, model_path, &mut params);
@@ -3317,8 +3336,22 @@ mod tests {
         assert!(env.dflash_ngram_block);
     }
 
+    /// `max_seq` is a HARD CAP and is no longer bumped to cover `max_tokens`.
+    ///
+    /// This assertion is inverted from what it was, and the inversion is
+    /// deliberate. It previously required `max_seq: 1024 + max_tokens: 4096 ->
+    /// 5120`, matching a reference server. That bump is defensible in isolation —
+    /// generating 4096 tokens in a 1024 context truncates confusingly — but it
+    /// silently overrides an explicit operator cap, and the cap is the only knob
+    /// for bounding KV.
+    ///
+    /// Measured consequence on `Qwen3.6-35B-A3B--oq4` with `--max-seq 512`:
+    /// `max_tokens` resolved to ~131072 in the serve path, so `max_seq` became
+    /// 132096 and each session allocated KV for a 132K context — filling a 42 GiB
+    /// device on the FIRST request. With the cap honoured, `max_seq` is 1028 and
+    /// four sequential requests succeed.
     #[test]
-    fn load_params_bump_max_seq_to_cover_generation_budget_like_bun() {
+    fn load_params_honour_max_seq_as_a_hard_cap() {
         let cfg = HipfireConfig {
             max_seq: 1024,
             max_tokens: 4096,
@@ -3327,7 +3360,10 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-0.8b-mq4", None);
 
-        assert_eq!(params.max_seq, 5120);
+        assert_eq!(
+            params.max_seq, 1024,
+            "an explicit max_seq must not be inflated by the generation budget"
+        );
     }
 
     #[test]
