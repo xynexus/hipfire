@@ -426,9 +426,20 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         res_k8.use_gpu_topk,
         "MQ4G256 k=8 must be GPU-top-K-indexable"
     );
+    // With RESIDENT experts the GPU-top-K path is admitted.
     assert!(
-        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ false).is_ok(),
-        "GPU-top-K path is valid even under paged (non-resident) residency"
+        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ true).is_ok(),
+        "GPU-top-K path with resident experts is the normal fast path"
+    );
+    // ...but NOT under paging. This assertion is inverted from what it was, and
+    // the inversion is the bug fix: it previously read "GPU-top-K path is valid
+    // even under paged (non-resident) residency", which encoded an assumption
+    // that reality violates. Under paging the expert pointer table is never
+    // populated (see `check_moe_decode_supported` case (c)), so the indexed
+    // kernels dereference null and wedge the GPU.
+    assert!(
+        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ false).is_err(),
+        "paged + indexed must be refused: the expert ptr table is never populated"
     );
 
     // (a) out-of-range k errors gracefully (no panic): k == 0 and k > n_exp.
@@ -446,6 +457,44 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         check_moe_decode_supported(/*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false).is_err(),
         "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
     );
+}
+
+/// Paged residency must be refused for EVERY routed dtype, not just Opus.
+///
+/// The expert pointer table is filled at load by iterating `MoeFfnWeights::experts`,
+/// which is empty under paging, and nothing patches it afterwards — so the indexed
+/// kernels dereference null and wedge the GPU (amdgpu MES hang + device reset,
+/// measured `non_null=0/256` on a 35B). That is a property of the table, not of the
+/// quantisation, so this pins the refusal across the whole indexed dtype family
+/// rather than letting a future dtype quietly re-enter the broken path.
+#[test]
+fn paged_experts_refused_for_every_indexed_routed_dtype() {
+    use crate::pipeline::check_moe_decode_supported;
+
+    // Every one of these reaches the indexed kernels via the same null table.
+    for dtype in [MQ4G256, MQ6G256, MQ2G256Lloyd, Oq4G256, Oq8G256] {
+        let dtypes = MoeDtypes {
+            router: Q8_0,
+            shared_gate: Q8_0,
+            shared_expert_gate: Q8_0,
+            shared_expert_up: Q8_0,
+            experts_all_gate_up_mq4: dtype == MQ4G256,
+            routed_gate_up: dtype,
+            routed_down: dtype,
+            has_paro_shared: false,
+        };
+        let res = MoeResolution::resolve(&dtypes, 8);
+        assert!(
+            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ false).is_err(),
+            "paged {dtype:?} must be refused — the expert ptr table is never populated"
+        );
+        // Resident is the supported configuration and must stay admitted, so the
+        // refusal cannot be read as "paged models are simply unsupported".
+        assert!(
+            check_moe_decode_supported(res.use_gpu_topk, 8, 64, /*resident=*/ true).is_ok(),
+            "resident {dtype:?} must remain admitted"
+        );
+    }
 }
 
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
