@@ -116,8 +116,31 @@ into full investigations here.
   3.93 -> 2.40. At these widths the sessions are serialising rather than sharing a
   pass over weights, which is precisely the property the v2 module-major design
   exists to fix — and it is now measurable on the target model instead of blocked.
-- Next: port the fused grouped-MoE prefill AND decode paths off Q8 to kvarn. Until
-  then `serial` + kvarn caps usable concurrency at 3.
+- **Port target localized 2026-08-10 — ONE validator, not two paths.** Correcting
+  the previous line: the fused decode does not carry its own copy of the check, it
+  reuses the prefill contract, which is why the DECODE failure said "prefix" and
+  matched the prefill message verbatim.
+  - `validate_grouped_moe_prefill_session_batch_state_contract`
+    (`qwen35/prefill_batch.rs:1061`) is the single enforcement site:
+    ```rust
+    if !signature.kv_quantized || !signature.kv_quant_q8 {
+        return Err("... must use Q8 KV state for the MQ4 control path")
+    }
+    ```
+    kvarn sets `quant_kvarn`, never `quant_q8`, so it fails here. Note kvarn is
+    NOT in the adjacent asym/fwht rejection list — it is excluded only by the
+    positive Q8 test.
+  - The fused entry point is named
+    `forward_prefill_grouped_moe_session_batch_prefix_q8_kv`
+    (`prefill_batch.rs:2907`), and a sibling error reads "first MoE target is
+    plain Q8 KV". Q8-only was a deliberate first-target scope with a named
+    extension point, not an accident — so the port is generalising a contract
+    that anticipated this, not undoing a mistake.
+  - Every other caller of the validator is a test in `qwen35/mod.rs` (~4856-4951),
+    including one asserting the fp32 rejection, so those pin the current contract
+    and will need updating with it.
+- Next: extend that validator (and the `..._q8_kv` fused path it guards) to accept
+  kvarn. Until then `serial` + kvarn caps usable concurrency at 3.
 - Scope: blocks multi-stream measurement on the target model
 - Confidence: High (explicit runtime error naming the requirement)
 
