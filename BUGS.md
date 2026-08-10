@@ -121,10 +121,38 @@ into full investigations here.
 - Related: `AGENTS.local.md` records a gfx1103 hazard of exactly this shape
   (page-fault → MES hang → full reset). A memory note claiming that hazard was
   nullified should be treated as suspect until re-checked.
-- Next: bisect whether the wedge needs the MoE prefill at all (try a paged load +
-  a 1-token generate with a trivial prompt), and whether it reproduces without
-  `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`. Both are ~10 min runs, but each one costs a
-  GPU reset, so they want supervision.
+- **BISECTED 2026-08-10: the wedge REQUIRES `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`.**
+  Same artifact, same paged config, flag dropped: **no wedge**. The authoritative
+  check is the driver's own counter — `dmesg | grep -c 'GPU reset(.*) succeeded'`
+  was **36 before and 36 after**, versus a fresh reset on every flagged run.
+  - flag ON:  load 8.9 s, generate spins 569–1846 s at `cpu_frac` 1.00, 0 tokens,
+    GPU reset.
+  - flag OFF: load 8.8 s, generate exits in **0.1 s**, 0 tokens, **no reset**.
+  So the fault is specific to the **indexed OQ routed path**, not to paged
+  residency in general and not to Opus weights in general.
+- **This resurrects the possibility I was careful not to rule out.** When the
+  loader repack bug was fixed, I recorded that it did NOT show the `*_k8_indexed*`
+  kernels to be numerically correct, because the tiny fixture is top-2 and never
+  executes them. The 35B is **top-8 and does** — and it wedges the device. Those
+  kernels are now the prime suspect rather than an exonerated one.
+- **Refinement on the stack:** the gdb frame shows where the process NOTICED the
+  dead GPU (the first `hipModuleLoad` after the fault, in `deinterleave_f32` under
+  `run_attend`), not where it faulted. The fault is upstream, in whatever the
+  indexed path dispatched before it. Do not read `deinterleave_f32` as the culprit.
+- **Separate defect found by the flag-off run:** the refusal works, and then kills
+  the daemon.
+  ```
+  thread 'main' panicked at crates/hipfire-serving-core/src/generate.rs:2979:18:
+  called `Result::unwrap()` on an `Err` value:
+    "unsupported moe.decode-routed-dtype-unsupported-no-fallback"
+  ```
+  That is the guard added at `qwen35/moe_decode.rs` firing exactly as intended —
+  paged + non-indexable + no resident experts — but it reaches an `.unwrap()`, so
+  a legitimate "this configuration is unsupported" becomes a **process panic**
+  instead of an error frame to the client. The client sees the socket close.
+  This is a concrete, high-impact instance of the `[Low]` opportunistic-unwrap
+  entry below; there are 9 `unwrap()`s in the surrounding region, so fixing it is
+  a signature/caller change rather than a one-line edit. **Not** attempted here.
 - Scope: Stability (wedges the device), blocks M5 on this box
 - Confidence: High (kernel reset log + userspace stack + paired A/B)
 
