@@ -1377,6 +1377,68 @@ impl Gpu {
             ],
         )
     }
+    /// Routed batched KVarN K-window append: scatter each row's K into its own
+    /// session's f32 recent window at `positions[b] % group`. The V half of a
+    /// KVarN write is plain Q8_0, so callers pair this with
+    /// [`Gpu::kv_cache_write_q8_0_routed_batched`].
+    ///
+    /// This is only the per-token half. When a session's block completes, the
+    /// window must be gathered and quantized into the 4-bit records via
+    /// `kvarn_gather_k_tiles` + `kvarn_quantize_tile` — a per-session event that
+    /// fires once per `group` tokens, which is why it is not routed.
+    ///
+    /// CALLER CONTRACT: no session may cross more than one block boundary in a
+    /// single call. The window holds exactly `group` tokens, so a session writing
+    /// more than that in one launch would overwrite tokens the flush has not yet
+    /// quantized — silently, since nothing reads them again until attention.
+    /// Split the row range at block boundaries, as `kvarn_attend` does with its
+    /// `take`-chunked loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_kvarn_window_routed_batched(
+        &mut self,
+        win_ptrs: &GpuTensor,
+        src: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        group: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_kvarn_window_routed_batched",
+            kernels::KV_CACHE_WRITE_KVARN_WINDOW_ROUTED_BATCHED_SRC,
+            "kv_cache_write_kvarn_window_routed_batched",
+        )?;
+
+        let win_ptrs_ptr = win_ptrs.buf.as_ptr();
+        let src_ptr = src.buf.as_ptr();
+        let row_session_indices_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let grp = group as i32;
+        let bs = batch_size as i32;
+
+        const BLOCK: usize = 256;
+        let kv_dim = n_kv_heads * head_dim;
+        let grid_x = kv_dim.div_ceil(BLOCK) as u32;
+        self.launch_kernargs(
+            "kv_cache_write_kvarn_window_routed_batched",
+            [grid_x, batch_size as u32, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            &kernargs![
+                ptr win_ptrs_ptr, ptr src_ptr, ptr row_session_indices_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nkv, i32 hd, i32 grp, i32 bs
+            ],
+        )
+    }
     /// KVarN tile quantizer: variance-normalize (Sinkhorn) + 4-bit affine + pack
     /// to the on-device KVarN record. `tiles` = [n_tiles, r_dim*c_dim] f32; `recs`
     /// = [n_tiles, record_bytes] (kvarn_record_bytes(r,c)). c_dim must be even.
