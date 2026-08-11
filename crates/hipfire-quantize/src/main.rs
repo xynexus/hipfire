@@ -206,9 +206,22 @@ fn routed_expert_tensor_identity(name: &str) -> Option<(usize, usize, RoutedExpe
     Some((layer, expert, role))
 }
 
+/// PRECISION of a stored tensor, or `None` if it is quantized.
+///
+/// The lossless BF16 recodings count as BF16, because that is what they are:
+/// `Bf16Huff` is documented as "losslessly the same weights as BF16" and
+/// `Bf16Lut3` likewise codes only the exponent. They are a compression of the
+/// bytes, not a reduction of the values.
+///
+/// Getting this wrong is expensive and silent until the very end. This gate
+/// guards the calibration contract that undercovered experts stay unquantized;
+/// `--bf16-codec huff` is the DEFAULT, so every preserved expert arrives here as
+/// `Bf16Huff` and a BF16-only match rejects the whole artifact after the full
+/// quantize has already run — on Qwen3.5-122B-A10B that was ~7 hours of work
+/// thrown away at the write step.
 fn quant_type_precision_name(quant_type: QuantType) -> Option<&'static str> {
     match quant_type {
-        QuantType::BF16 => Some("BF16"),
+        QuantType::BF16 | QuantType::Bf16Lut3 | QuantType::Bf16Huff => Some("BF16"),
         QuantType::F16 => Some("F16"),
         _ => None,
     }

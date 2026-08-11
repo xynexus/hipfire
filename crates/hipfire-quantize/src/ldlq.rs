@@ -1034,6 +1034,7 @@ pub fn oqplus_compact_ldlq_pack(
     let n_out = ((w8_frac as f64 * 256.0).round() as usize).clamp(1, 255);
     let block_bytes = 130 + 2 * n_out; // [f16][128 nibbles][n_out×(u8 idx, i8 val)]
     let mut out = vec![0u8; m * nb * block_bytes];
+    let intra = hipfire_env::LDLQ_INTRA_BLOCK.flag();
 
     for blk in 0..nb {
         let c0 = blk * 256;
@@ -1062,20 +1063,41 @@ pub fn oqplus_compact_ldlq_pack(
                 // Quantize each position to its tier; nibbles store the int4 clamp
                 // (outlier slots overridden by the sparse table on load), err uses
                 // the ACTUAL tiered value.
-                for i in 0..128 {
-                    let q4lo = (grp[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
-                    let q4hi = (grp[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
-                    block[2 + i] = ((q4lo as u8) & 0xf) | (((q4hi as u8) & 0xf) << 4);
-                }
+                //
+                // Under HIPFIRE_LDLQ_INTRA_BLOCK each column's error is also fed
+                // back into the columns still to be quantized WITHIN this block,
+                // which is what standard GPTQ does. Without it every column is
+                // quantized from the same block-entry residual and feedback only
+                // reaches later blocks, so a single-block tensor degenerates to
+                // RTN. Feedback runs strictly forward (j > i), so grp[i] is final
+                // once column i is quantized — the outlier table below still reads
+                // exactly the value each outlier was quantized from. The joint
+                // (scale, outlier set) selection stays on the block-entry residual
+                // either way, so only the rounding moves.
+                let mut q4 = [0i8; 256];
                 for i in 0..256 {
                     let lim = if is_w8[i] { 127.0 } else { 7.0 };
                     let q = (grp[i] * inv).round().clamp(-lim, lim);
+                    q4[i] = (grp[i] * inv).round().clamp(-7.0, 7.0) as i8;
                     let u = l[(c0 + i, c0 + i)];
-                    err[i] = if u > 0.0 {
+                    let e = if u > 0.0 {
                         (grp[i] as f64 - (q * scale) as f64) / u
                     } else {
                         0.0
                     };
+                    err[i] = e;
+                    if intra && e != 0.0 {
+                        for j in (i + 1)..256 {
+                            let usf = l[(c0 + j, c0 + i)];
+                            if usf != 0.0 {
+                                grp[j] -= (e * usf) as f32;
+                            }
+                        }
+                    }
+                }
+                for i in 0..128 {
+                    block[2 + i] =
+                        ((q4[2 * i] as u8) & 0xf) | (((q4[2 * i + 1] as u8) & 0xf) << 4);
                 }
                 let tbl = 130;
                 for (s, &pos) in idx[..n_out].iter().enumerate() {

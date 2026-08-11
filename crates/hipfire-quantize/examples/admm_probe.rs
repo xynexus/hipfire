@@ -23,6 +23,15 @@
 //!
 //! Run: cargo run --release -p hipfire-quantize --example admm_probe
 
+// The `ADMM_PROBE_*` knobs below are read with `std::env::var`, which the
+// env-registry clippy gate disallows in this crate. Example-scoped benchmark
+// knobs take this exemption -- see the ~174 `BENCH_*` entries in
+// `env_docs.rs` sourced from other crates' `examples/`. They are still picked
+// up by `cargo run -p hipfire-cli -- gen-env-docs`, which is a separate scanner
+// from the lint: adding or renaming one here makes `no-gpu-ci` fail on stale
+// env docs until that is re-run.
+#![allow(clippy::disallowed_methods)]
+
 use hipfire_quantize::codecs::symmetric_clipsearch;
 use hipfire_quantize::ldlq::inv_cholesky_lower_rotated_fast;
 
@@ -301,52 +310,268 @@ fn admm(
     out
 }
 
-fn main() {
-    let m: usize = std::env::args()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16);
-    let k: usize = std::env::args()
-        .nth(2)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
-    let n: usize = std::env::args()
-        .nth(3)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024);
-    assert_eq!(k % GROUP, 0, "k must be a multiple of {GROUP}");
+/// P1: load a REAL weight tensor and a REAL pooled Hessian rather than
+/// synthetic data. Returns `None` (so `main` falls back to synthetic) unless
+/// `ADMM_PROBE_CALIB` is set.
+///
+/// With `ADMM_PROBE_CALIB` set but `ADMM_PROBE_TENSOR` unset, this LISTS the
+/// Hessians in the artifact and exits. Guessing a donor name is precisely how
+/// the earlier gate runs ended up measuring nothing, so the names come from the
+/// artifact rather than from an assumption about how they are spelled.
+fn load_real() -> Option<(Vec<f32>, Vec<f64>, usize, usize)> {
+    use hipfire_quantize::hessian_io::HessianSidecar;
+    use hipfire_quantize::hfa::HfaArchive;
+    use std::path::Path;
 
-    let mut rng = Lcg(0x9E3779B97F4A7C15);
-    let w: Vec<f32> = (0..m * k).map(|_| rng.next_gauss()).collect();
+    let calib = std::env::var("ADMM_PROBE_CALIB").ok()?;
+    let sc = HessianSidecar::open(Path::new(&calib)).expect("open calib artifact");
 
-    // H = XᵀX from real-shaped activations, so it is PSD and anisotropic —
-    // a diagonal or identity H would make the sweep and ADMM trivially agree
-    // and prove nothing.
-    let x: Vec<f32> = (0..n * k)
-        .map(|i| {
-            let ch = i % k;
-            // Per-channel scale spread: a few channels dominate, as in real
-            // activations. This is what error feedback exists to exploit.
-            let s = 1.0 + 6.0 * ((ch % 17) as f32 / 17.0).powi(3);
-            rng.next_gauss() * s
-        })
+    let Ok(wname) = std::env::var("ADMM_PROBE_TENSOR") else {
+        let mut rows: Vec<(String, usize)> =
+            sc.tensors().map(|t| (t.name.to_string(), t.k)).collect();
+        rows.sort();
+        println!("{} Hessians in {calib}:", rows.len());
+        for (name, k) in rows.iter().take(40) {
+            println!("  k={k:<6} {name}");
+        }
+        std::process::exit(0);
+    };
+    let hname = std::env::var("ADMM_PROBE_HESSIAN").expect("ADMM_PROBE_HESSIAN unset");
+    let hfa = std::env::var("ADMM_PROBE_HFA").expect("ADMM_PROBE_HFA unset");
+
+    let href = sc
+        .get(&hname, 0)
+        .unwrap_or_else(|| panic!("no Hessian named {hname}"));
+    let k = href.k;
+    let h: Vec<f64> = href.iter_f64().collect();
+    assert_eq!(h.len(), k * k, "Hessian payload is not K*K");
+
+    let ar = HfaArchive::open(Path::new(&hfa)).expect("open .hfa");
+    let idx = ar.tensor_index().expect("hfa tensor index");
+    // MoE checkpoints often store experts STACKED, so the quantizer-side name
+    // need not exist verbatim in the archive. On a miss, show the neighbouring
+    // names instead of just failing -- that is the difference between a dead
+    // end and knowing what to ask for.
+    let rel = idx.get(&wname).unwrap_or_else(|| {
+        let stem: String = wname.split(".mlp.").next().unwrap_or(&wname).to_string();
+        let mut near: Vec<&String> = idx.keys().filter(|n| n.starts_with(&stem)).collect();
+        near.sort();
+        eprintln!("no tensor named {wname}\nnames under {stem}:");
+        for n in near.iter().take(25) {
+            eprintln!("  {n}");
+        }
+        std::process::exit(2);
+    });
+    let (bytes, dtype, shape) = ar.tensor_bytes(rel, &wname).expect("read tensor");
+    assert!(
+        dtype.eq_ignore_ascii_case("BF16"),
+        "expected BF16 weights, got {dtype}"
+    );
+    // Routed experts are stored STACKED as [n_experts, a, b]. Take one expert so
+    // the probe sees the same 2-D tensor the packer does, and widen only that
+    // expert's bytes -- the whole stack is ~3 GB.
+    let (slice, shape) = if shape.len() == 3 {
+        let e: usize = std::env::var("ADMM_PROBE_EXPERT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        assert!(e < shape[0], "expert {e} out of range (n={})", shape[0]);
+        let per = shape[1] * shape[2];
+        (
+            &bytes[e * per * 2..(e + 1) * per * 2],
+            vec![shape[1], shape[2]],
+        )
+    } else {
+        assert_eq!(shape.len(), 2, "expected a 2-D weight, got {shape:?}");
+        (&bytes[..], shape)
+    };
+    // BF16 -> f32: the two stored bytes ARE the high half of the f32.
+    let vals: Vec<f32> = slice
+        .chunks_exact(2)
+        .map(|c| f32::from_bits((((c[1] as u32) << 8) | c[0] as u32) << 16))
         .collect();
-    let mut h = vec![0.0f64; k * k];
-    for row in 0..n {
-        let xr = &x[row * k..row * k + k];
-        for i in 0..k {
-            let xi = xr[i] as f64;
-            if xi == 0.0 {
-                continue;
-            }
-            for j in 0..k {
-                h[i * k + j] += xi * xr[j] as f64;
+
+    // Orient to row-major m x k with k matching the Hessian dimension. A
+    // mis-oriented weight still solves and still prints a plausible loss, so
+    // this is asserted rather than assumed.
+    let (m, w) = if shape[1] == k {
+        (shape[0], vals)
+    } else if shape[0] == k {
+        let (rows, cols) = (shape[0], shape[1]);
+        let mut t = vec![0.0f32; vals.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                t[c * rows + r] = vals[r * cols + c];
             }
         }
+        (cols, t)
+    } else {
+        panic!("weight shape {shape:?} has no dimension matching Hessian k={k}");
+    };
+    println!("REAL: W={wname} {shape:?} -> m={m} k={k}  H={hname}");
+    Some((w, h, m, k))
+}
+
+/// P2 gate: how close is a REAL Hessian to a Kronecker product A (x) B?
+///
+/// Nearest-Kronecker-product is a rank-1 problem on the rearrangement R(H)
+/// (Van Loan/Pitsianis), so the answer is exactly sqrt(1 - sigma1^2/||R||_F^2)
+/// -- no fitting loop, no hyperparameter to get wrong. That matters here: ADMM
+/// looked good until its one knob was tuned on real data, and this gate has no
+/// knob to hide behind.
+fn kron_report(h: &[f64], k: usize, spec: &str) {
+    let frob2: f64 = h.iter().map(|v| v * v).sum();
+    println!("\nKronecker reconstruction of the REAL Hessian (k={k})");
+    println!("  {:<14} {:>10}  {:>10}", "k1 x k2", "rel err", "storage");
+    for tok in spec.split(',') {
+        let Ok(k1) = tok.trim().parse::<usize>() else {
+            continue;
+        };
+        if k1 == 0 || k % k1 != 0 {
+            println!("  k1={k1}: does not divide k={k}, skipped");
+            continue;
+        }
+        let k2 = k / k1;
+        let (rows, cols) = (k1 * k1, k2 * k2);
+        // R[(i1*k1+j1)][(i2*k2+j2)] = H[(i1*k2+i2)][(j1*k2+j2)]
+        let mut r = vec![0.0f64; rows * cols];
+        for i1 in 0..k1 {
+            for j1 in 0..k1 {
+                for i2 in 0..k2 {
+                    for j2 in 0..k2 {
+                        r[(i1 * k1 + j1) * cols + (i2 * k2 + j2)] =
+                            h[(i1 * k2 + i2) * k + (j1 * k2 + j2)];
+                    }
+                }
+            }
+        }
+        // Top singular value by power iteration on R^T R.
+        let mut v = vec![1.0f64 / (cols as f64).sqrt(); cols];
+        let mut u = vec![0.0f64; rows];
+        let mut sigma = 0.0f64;
+        for _ in 0..100 {
+            for a in 0..rows {
+                let row = &r[a * cols..a * cols + cols];
+                u[a] = row.iter().zip(v.iter()).map(|(x, y)| x * y).sum();
+            }
+            let nu: f64 = u.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if nu == 0.0 {
+                break;
+            }
+            for x in u.iter_mut() {
+                *x /= nu;
+            }
+            v.iter_mut().for_each(|x| *x = 0.0);
+            for a in 0..rows {
+                let ua = u[a];
+                if ua == 0.0 {
+                    continue;
+                }
+                let row = &r[a * cols..a * cols + cols];
+                for b in 0..cols {
+                    v[b] += ua * row[b];
+                }
+            }
+            sigma = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if sigma == 0.0 {
+                break;
+            }
+            for x in v.iter_mut() {
+                *x /= sigma;
+            }
+        }
+        let rel = (1.0 - (sigma * sigma / frob2)).max(0.0).sqrt();
+        let ratio = (k * k) as f64 / (k1 * k1 + k2 * k2) as f64;
+        println!(
+            "  {:<14} {:>9.2}%  {:>9.0}x",
+            format!("{k1} x {k2}"),
+            100.0 * rel,
+            ratio
+        );
     }
+}
+
+fn main() {
+    let (w, h, m, k, n) = match load_real() {
+        Some((w, h, m, k)) => (w, h, m, k, 0),
+        None => {
+            let m: usize = std::env::args()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16);
+            let k: usize = std::env::args()
+                .nth(2)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256);
+            let n: usize = std::env::args()
+                .nth(3)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024);
+
+            let mut rng = Lcg(0x9E3779B97F4A7C15);
+            let w: Vec<f32> = (0..m * k).map(|_| rng.next_gauss()).collect();
+
+            // H = XᵀX from real-shaped activations, so it is PSD and anisotropic —
+            // a diagonal or identity H would make the sweep and ADMM trivially agree
+            // and prove nothing.
+            let x: Vec<f32> = (0..n * k)
+                .map(|i| {
+                    let ch = i % k;
+                    // Per-channel scale spread: a few channels dominate, as in real
+                    // activations. This is what error feedback exists to exploit.
+                    let s = 1.0 + 6.0 * ((ch % 17) as f32 / 17.0).powi(3);
+                    rng.next_gauss() * s
+                })
+                .collect();
+            let mut h = vec![0.0f64; k * k];
+            for row in 0..n {
+                let xr = &x[row * k..row * k + k];
+                for i in 0..k {
+                    let xi = xr[i] as f64;
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..k {
+                        h[i * k + j] += xi * xr[j] as f64;
+                    }
+                }
+            }
+            (w, h, m, k, n)
+        }
+    };
+    assert_eq!(k % GROUP, 0, "k must be a multiple of {GROUP}");
     let damp = 0.01 * (0..k).map(|i| h[i * k + i]).sum::<f64>() / k as f64;
 
     println!("shape m={m} k={k} n={n}  damp={damp:.4}\n");
+
+    // P2 gate runs on H alone and answers a different question than the packers,
+    // so it exits rather than falling through into the ADMM sweep.
+    if let Ok(spec) = std::env::var("ADMM_PROBE_KRON") {
+        kron_report(&h, k, &spec);
+        return;
+    }
+
+    // Cost split: how much of an LDLQ tensor is the Cholesky (which is
+    // per-tensor ONLY because AWQ rebases H per tensor -- share the rebasing and
+    // one factorization could serve all experts in a layer) versus the column
+    // sweep (which is irreducibly per-tensor). Run at k=3072 and k=4096 to also
+    // check the 122B -> 397B extrapolation instead of assuming it.
+    if std::env::var("ADMM_PROBE_TIMING").is_ok() {
+        let t = std::time::Instant::now();
+        let l = inv_cholesky_lower_rotated_fast(&h, k, damp).expect("cholesky");
+        let dt_chol = t.elapsed().as_secs_f64();
+        std::hint::black_box(&l);
+        let t = std::time::Instant::now();
+        let q = ldlq_sweep(&w, &h, m, k, damp).expect("sweep");
+        let dt_total = t.elapsed().as_secs_f64();
+        std::hint::black_box(&q);
+        let dt_sweep = (dt_total - dt_chol).max(0.0);
+        println!("TIMING m={m} k={k}");
+        println!("  cholesky        {dt_chol:>9.3}s   {:>5.1}%", 100.0 * dt_chol / dt_total);
+        println!("  sweep           {dt_sweep:>9.3}s   {:>5.1}%", 100.0 * dt_sweep / dt_total);
+        println!("  total per tensor{dt_total:>9.3}s");
+        return;
+    }
 
     let t = std::time::Instant::now();
     let q_rtn = rtn(&w, m, k);
@@ -377,15 +602,23 @@ fn main() {
     // rho is swept relative to the Hessian's OWN scale (damp = 0.01·mean diag,
     // so mean diag = 100·damp). Too small and the w-update ignores consensus and
     // drifts off the grid; too large and it never moves off the warm start.
-    let sweep: Vec<(usize, usize, f64)> = vec![
-        (15, 16, 1.0),
-        (15, 16, 10.0),
-        (15, 16, 100.0),
-        (15, 16, 300.0),
-        (15, 16, 1000.0),
-        (40, 16, 100.0),
-        (40, 16, 300.0),
-    ];
+    // On REAL data (122B L5 expert 3, k=3072) rho=1*lambda does not merely
+    // converge slowly, it explodes: proxy loss 1.87e9, i.e. +2.5e11% vs RTN,
+    // after 1988 s. P0's synthetic run showed only +74.8% for the same setting,
+    // so the low-rho end is far more dangerous on real curvature than the
+    // synthetic harness implied. rho=10*lambda is in that same band and is
+    // dropped with it -- each config costs ~33 min single-core at this size, so
+    // the sweep spends its budget where an answer is possible.
+    // Override with ADMM_PROBE_RHOS="10,30" (multiples of damping). Real-data
+    // measurements so far: 1λ explodes (+2.5e11%), 100λ = −11.0%, 300λ = +12.8%
+    // (worse than RTN). The loss therefore has a minimum BELOW 100λ, which the
+    // synthetic "works at 100–1000λ" guidance pointed away from -- so the band
+    // has to be reachable without editing this list.
+    let rhos: Vec<f64> = std::env::var("ADMM_PROBE_RHOS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![100.0, 300.0, 1000.0]);
+    let sweep: Vec<(usize, usize, f64)> = rhos.into_iter().map(|r| (15, 16, r)).collect();
     let t = std::time::Instant::now();
     let q_intra = ldlq_sweep_intra(&w, &h, m, k, damp).expect("cholesky");
     let l_intra = proxy_loss(&w, &q_intra, &h, m, k);
