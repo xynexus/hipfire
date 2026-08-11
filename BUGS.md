@@ -67,7 +67,56 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
-## [Medium] No available Qwen3.5 artifact can exercise the fused DENSE batch path — all VL-wrap
+## [RESOLVED 2026-08-11] Fused DENSE batch path was unreachable — a LUT3 lm_head, not the VL wrapper
+
+**The VL-wrapper diagnosis below was WRONG.** `is_qwen35_dense_arch_id` was true
+all along — there is no separate Qwen3.5-VL arch id, so a VL text tower is still
+arch 5. The real gate, obtained by logging the refusal instead of guessing:
+
+    fused dense declined: unsupported weights: does not support lm_head
+                          (unsupported weight dtype; dtype Bf16L3)
+
+The lm_head is emitted by the bf16 codec as LUT3 whenever it is gather-shaped and
+wins on size — the DEFAULT for a tied-embedding model — and `Bf16L3` was not in
+the fused body's accepted dtype list. So "fused dense" was unreachable for most
+dense artifacts, independent of KV mode, AWQ, or VL.
+
+Fixed by ADDING SUPPORT rather than disabling the codec: `gemm_bf16l3_xf32` is
+the batched sibling of the `gemv_bf16l3_xf32` the serial path already uses, so the
+weights stay packed and no rotation is needed (LUT3 is a lossless bf16 recoding,
+not a quantization — no awq_scale or FWHT basis to undo). Verified: the fused
+dense path now runs with a packed LUT3 lm_head and no env override, 1.11x launches
+at width 4 versus 4.00x before.
+
+Three wrong hypotheses preceded this (AWQ pre-scaling, weight dtype of the BODY
+weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
+`HIPFIRE_DECODE_BACKEND_TRACE=1` now prints the named refusal, because the only
+other symptom is per-row launch counts and narrowing that means guessing at one
+predicate at a time.
+
+## [Medium] KVarN dense arm diverges from serial far more than the Q8 control
+
+Found 2026-08-11 once the fused dense path was reachable. Same model
+(`Qwen3.5-0.8B-Base--oq8`), same fused dense backend, 48-token greedy, fused vs
+serial:
+
+| KV | prompts matching serial |
+|---|---|
+| q8 (control) | 3/4 |
+| **kvarn (ported arm)** | **0/4** |
+
+One kvarn divergence starts at the FIRST token — serial answers "The capital of
+France is **Paris**." while fused emits a completely different reasoning-style
+response. That is not the late near-tie signature the grouped-MoE arm showed,
+where kvarn and Q8 diverged at byte-identical positions.
+
+So the dense KVarN arm is NOT yet at parity with its baseline, unlike the
+grouped-MoE arm which is. Suspect the dense path's segment/flush wiring or the
+`kv_window_layers` sizing rather than the shared kernels, since those are
+identical between the two arms and the MoE arm is clean. Do not enable dense
+KVarN for production on this evidence.
+
+## [Superseded] No available Qwen3.5 artifact can exercise the fused DENSE batch path — all VL-wrap
 
 Found 2026-08-11 while trying to verify the KVarN dense port. Three non-AWQ dense
 artifacts were quantized specifically for this and none reaches the fused dense

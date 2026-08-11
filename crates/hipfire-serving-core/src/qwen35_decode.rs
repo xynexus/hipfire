@@ -165,12 +165,15 @@ pub fn validate_qwen35_fused_dense_decode_model_capability(
         .as_deref()
         .ok_or_else(|| "qwen35 fused dense decode requires known KV mode".to_string())?;
     // FP32 or plain Q8 KV. The decode chunk reuses `forward_prefill_dense_session_batch`,
-    // which now branches its per-layer KV write/attention on Q8 (the quant-dense
-    // prefill port). Asym/KVarN/turbo KV modes have no fused kernel yet, so those
-    // fall back to serial_reference here.
-    if !matches!(kv_mode, "fp32" | "f32" | "q8" | "int8") {
+    // which branches its per-layer KV write/attention on Q8 (the quant-dense
+    // prefill port). KVarN joined that list once the dense body gained its own
+    // routed window-write + flush + routed-attention arms; asym/turbo still have
+    // no fused kernel and fall back to serial_reference here.
+    let kvarn_ok = kv_mode.starts_with("kvarn") && qwen35::qwen35_kvarn_fused_batch_enabled();
+    if !matches!(kv_mode, "fp32" | "f32" | "q8" | "int8") && !kvarn_ok {
         return Err(format!(
-            "qwen35 fused dense decode requires FP32 or plain Q8 KV state; loaded kv_mode={kv_mode}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+            "qwen35 fused dense decode requires FP32, plain Q8{} KV state; loaded kv_mode={kv_mode}; use HIPFIRE_QWEN35_DECODE_BATCH=serial",
+            if qwen35::qwen35_kvarn_fused_batch_enabled() { " or KVarN" } else { "" },
         ));
     }
     let state_quant = m.q35_state_quant.ok_or_else(|| {
@@ -398,10 +401,22 @@ pub fn run_generate_batch_decode_step_qwen35(
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
         && is_qwen35_dense_arch_id(m.arch_id)
         && envelope.session_count >= 2
-        && validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count).is_ok()
-        && validate_qwen35_fused_dense_decode_resident_sessions(m, envelope).is_ok()
     {
-        backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked;
+        // Report WHY a fused-eligible batch fell back. Without this the only
+        // symptom is per-row launch counts, and narrowing it means guessing at
+        // one predicate at a time — which cost three wrong hypotheses (AWQ
+        // pre-scaling, weight dtype, the VL wrapper) before the real gate (a KV
+        // mode allowlist) turned up.
+        match validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)
+            .and_then(|()| validate_qwen35_fused_dense_decode_resident_sessions(m, envelope))
+        {
+            Ok(()) => backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
+            Err(reason) => {
+                if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE").ok().as_deref() == Some("1") {
+                    eprintln!("  [decode] fused dense declined: {reason}");
+                }
+            }
+        }
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
         && is_qwen35_moe_arch_id(m.arch_id)
