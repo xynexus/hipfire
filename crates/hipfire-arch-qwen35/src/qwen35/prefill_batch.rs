@@ -1309,10 +1309,14 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
     Ok(())
 }
 
+/// `allow_kvarn` widens the KV requirement from "plain Q8 or FP32" to also admit
+/// KVarN, exactly as the grouped-MoE contract does. Explicit parameter rather
+/// than an env read so the contract stays pure and both sides are testable.
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
     config: &Qwen35Config,
     signatures: &[DensePrefillSessionBatchStateSignature],
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
+    allow_kvarn: bool,
 ) -> Result<(), String> {
     if config.num_experts != 0 || config.has_shared_expert {
         return Err(
@@ -1339,14 +1343,16 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
         // KV and any other quantized-but-not-plain-Q8 state stay on
         // serial_reference (not fused). (Row uniformity is already enforced by
         // `validate_dense_prefill_session_batch_state_signatures`.)
+        let kvarn_ok = allow_kvarn && signature.kv_quant_kvarn;
         if signature.kv_quant_asym2
             || signature.kv_quant_asym3
             || signature.kv_quant_asym4
             || signature.kv_quant_fwht
-            || (signature.kv_quantized && !signature.kv_quant_q8)
+            || (signature.kv_quantized && !(signature.kv_quant_q8 || kvarn_ok))
         {
             return Err(format!(
-                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8 or FP32 KV is fused"
+                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8{} or FP32 KV is fused",
+                if allow_kvarn { ", KVarN," } else { "" },
             ));
         }
         if signature.dn_quant != StateQuant::FP32 {
@@ -2486,6 +2492,10 @@ fn forward_dense_session_batch_layers_full_precision(
     // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
     // attention use the Q8 path. false = full-precision F32 KV.
     kv_q8: bool,
+    // `Some` selects the KVarN arms ahead of kv_q8/f32. Same context the
+    // grouped-MoE path uses — the routed window write, flush executor and
+    // segment planner are FFN-agnostic, so dense reuses them unchanged.
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2850,7 +2860,56 @@ fn forward_dense_session_batch_layers_full_precision(
                     row_count,
                     0,
                 )?;
-                if kv_q8 {
+                if let Some(kvarn) = kvarn {
+                    // Same segment-then-flush shape as the grouped-MoE path: the
+                    // window physically holds `group` tokens, so a run of rows
+                    // that fills one must be drained before the next run wraps it.
+                    let mut seg_start = 0usize;
+                    for (seg_idx, &split) in kvarn.splits.iter().enumerate() {
+                        let seg_rows = split.saturating_sub(seg_start);
+                        if seg_rows > 0 {
+                            prefill_session_batch_write_kvarn_kv_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_k_batch,
+                                &pbs.fa_v_batch,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kvarn.group,
+                                seg_start,
+                                seg_rows,
+                                row_count,
+                            )?;
+                        }
+                        if let Some(flushes) = kvarn.flushes.get(seg_idx) {
+                            grouped_moe_prefill_session_batch_kvarn_flush_layer(
+                                gpu,
+                                kvarn,
+                                layer_idx,
+                                flushes,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                        }
+                        seg_start = split;
+                    }
+                    prefill_session_batch_attention_kvarn_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else if kv_q8 {
                     // Plain-Q8 KV: the routed write/attention helpers are shared
                     // with the grouped-MoE fused path — they are FFN-agnostic and
                     // operate on Q8_0 (inline-scale) KV buffers via the same
@@ -3040,6 +3099,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
 ) -> HipResult<()> {
     forward_dense_session_batch_layers_full_precision(
         gpu,
@@ -3058,6 +3118,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         dense_capture,
         post_layer_capture,
         kv_q8,
+        kvarn,
     )
 }
 
@@ -3136,13 +3197,21 @@ fn forward_prefill_dense_session_batch_impl(
         config,
         &contract_signatures,
         &execution_plan,
+        crate::qwen35::qwen35_kvarn_fused_batch_enabled(),
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
-    let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len(), 0);
+    // Uniform rows (state-signature contract), so row 0 decides for the batch.
+    let kvarn_batch = qwen35_kvarn_fused_batch_enabled()
+        && contract_signatures.first().is_some_and(|s| s.kv_quant_kvarn);
+    let pointer_table_plan = dense_prefill_session_batch_pointer_table_plan(
+        &execution_plan,
+        route_shape,
+        rows.len(),
+        if kvarn_batch { route_shape.kv_k_layers } else { 0 },
+    );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
@@ -3162,7 +3231,9 @@ fn forward_prefill_dense_session_batch_impl(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
-                k_window_gpu: &[],
+                // Empty for every mode except KVarN; the table is only built
+                // when the shape says KVarN, so passing it is unconditional.
+                k_window_gpu: &row.kv_cache.k_window,
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
@@ -3178,7 +3249,10 @@ fn forward_prefill_dense_session_batch_impl(
     let host_pointer_tables =
         dense_prefill_session_batch_host_pointer_tables(&pointer_table_plan, &routes)
             .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-    drop(routes);
+    // `routes` used to be dropped here, purely as tidiness once the host tables
+    // were built. The KVarN flush context borrows it (for the per-session
+    // records/window tensors), so it now lives to end of scope. Nothing between
+    // here and there needs `rows` mutably — the compiler enforces that.
     let device_pointer_tables = upload_dense_prefill_session_batch_pointer_tables(
         gpu,
         pointer_table_plan.shape,
@@ -3193,6 +3267,39 @@ fn forward_prefill_dense_session_batch_impl(
     // Row signatures are uniform (state-signature contract), so row 0's KV quant
     // decides the per-layer KV write/attention path for the whole batch.
     let kv_q8 = signatures.first().map(|s| s.kv_quant_q8).unwrap_or(false);
+    // Same construction as the grouped-MoE path: routes for the records/window
+    // tensors, gather scratch, and the row-shaped segment/flush plan.
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let kvarn_state = if kvarn_batch {
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(
+            &pointer_table_plan.prefix_rows,
+            group,
+        );
+        // Not `?`: an early return would skip the pointer-table free below.
+        let tiles = match gpu.alloc_tensor(
+            &[config.n_kv_heads * config.head_dim * group],
+            hipfire_rdna::DType::F32,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                device_pointer_tables.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+        Some((splits, flushes, tiles))
+    } else {
+        None
+    };
+    let kvarn_ctx = kvarn_state
+        .as_ref()
+        .map(|(splits, flushes, tiles)| KvarnBatchFlushContext {
+            routes: &routes,
+            tiles,
+            group,
+            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            splits,
+            flushes,
+        });
     let result = forward_prefill_dense_session_batch_prefix_full_precision(
         gpu,
         weights,
@@ -3207,7 +3314,12 @@ fn forward_prefill_dense_session_batch_impl(
         finalize_logits,
         dense_capture,
         post_layer_capture,
+        kvarn_ctx.as_ref(),
     );
+    drop(kvarn_ctx);
+    if let Some((_, _, tiles)) = kvarn_state {
+        let _ = gpu.free_tensor(tiles);
+    }
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
 }
@@ -3331,6 +3443,9 @@ pub(crate) fn forward_streamed_dense_layer_batch(
         dense_capture,
         None,
         false,
+        // Streamed calibration runs FP32 KV, never KVarN — one-layer view, no
+        // session batch behind it. Mirrors the grouped-MoE streamed path.
+        None,
     )
 }
 

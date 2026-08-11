@@ -4821,6 +4821,7 @@ mod tests {
             &config,
             &signatures,
             &plan,
+            false,
         )
         .expect("dense FP32-state prefix should be eligible");
     }
@@ -4861,6 +4862,7 @@ mod tests {
             &moe_config,
             &[fp32_sig, fp32_sig],
             &plan,
+            false,
         )
         .unwrap_err();
         assert!(moe_err.contains("dense Qwen35 only"));
@@ -4874,6 +4876,7 @@ mod tests {
                 &test_qwen35_config_with_layers(vec![LayerType::LinearAttention]),
                 &[compacted, compacted],
                 &plan,
+                false,
             )
             .unwrap_err();
         assert!(compact_err.contains("compacted KV offset"));
