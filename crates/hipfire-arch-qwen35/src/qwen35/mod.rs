@@ -1848,20 +1848,52 @@ fn moe_decode_dispatch_flags_for_dtypes(
 /// garbage. Both sites now read this.
 pub(crate) const INDEXED_MOE_K_TOP: usize = 8;
 
-/// `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=1` admits KVarN KV to the fused grouped-MoE
-/// session batch, which otherwise hard-requires Q8.
+/// Admits KVarN KV to the fused grouped-MoE session batch, which used to
+/// hard-require Q8.
 ///
-/// Default OFF while the path is being brought up. The whole point of the port is
-/// that KVarN becomes the batchable mode, so this gate is temporary — but it
-/// stays until a real model run shows parity against the Q8 baseline, because the
-/// failure mode here is a corrupted K window rather than an error, and a wrong
-/// default would miscompute every batched request silently.
+/// **Default ON since 2026-08-11**; `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0` (or
+/// `off`) is the kill switch. Opt-out rather than opt-in mirrors
+/// `HIPFIRE_FORWARD_LOWERED`.
+///
+/// This is what makes batched MoE decode reachable at all. Q8 is on
+/// `DEPRECATED_KV_MODES`, so while this defaulted off there was no supported KV
+/// mode that could fuse: below 4 sessions the auto path is serial by policy, and
+/// at 4+ it errored. Batching was effectively dead for every default deployment.
+///
+/// It defaulted off through bring-up because the failure mode is a corrupted K
+/// window — plausible output, no error. Flipped only after the checks that could
+/// have caught that all came back clean on `Qwen3.6-35B-A3B--oq4`:
+///
+/// - the routed window kernel is exact and touches nothing else, including under
+///   segmented writes (`parity_kvarn_window_routed`);
+/// - the block-flush path is actually exercised — 163-token generations cross the
+///   128-token boundary, so gather+quantize runs rather than being skipped;
+/// - fused-vs-serial divergence lands at byte-identical positions under KVarN and
+///   under Q8 (580 / 17 / 31 chars on 3 of 4 prompts), so the difference belongs
+///   to the shared fused machinery, not to this K format;
+/// - sessions are independent: a probe's output is byte-identical whether batched
+///   with one set of companions or a completely different set. No state leaks
+///   across rows.
+///
+/// What is still NOT established is absolute numerical correctness, because no
+/// logit-level oracle exists in this tree (`HIPFIRE_FORWARD_ORACLE` is advertised
+/// in `superop.rs` and implemented nowhere). The claim this default rests on is
+/// equivalence to the shipped Q8 path, not perfection.
+///
+/// **The kill switch does not restore working batching — it restores the pre-port
+/// FAILURE.** Verified: with `=0` and KVarN KV (the default mode), batch >= 4
+/// requests die with "must use Q8 KV state for the MQ4 control path" instead of
+/// degrading to `SerialReference` the way batch 1-3 does. That is the
+/// refuse-at-execution-instead-of-selection defect filed in BUGS.md, and it is
+/// what makes this switch sharp: setting it to 0 without also moving off KVarN
+/// turns working batching into failing requests. Fixing that fallback is what
+/// would make this a safe escape hatch.
 pub fn qwen35_kvarn_fused_batch_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HIPFIRE_QWEN35_KVARN_FUSED_BATCH")
             .ok()
             .as_deref(),
-        Some("1") | Some("on")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
