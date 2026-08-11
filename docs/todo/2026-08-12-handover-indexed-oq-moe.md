@@ -14,8 +14,8 @@ down side. Per-expert rotation is now wired through every dispatch site, and
 verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
 from **0.244 to 0.999999**, with no layer below 0.9994 across all 40, and KLD
 went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
-within 3.8% of the CPU fallback it has to match. The flag is still off by
-default; flipping it is now a decision, not a blocker.
+within 3.8% of the CPU fallback it has to match. **The flag is now ON by
+default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=0` (or `off`) falls back.
 
 ## The bug, in one paragraph
 

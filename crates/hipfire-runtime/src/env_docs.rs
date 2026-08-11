@@ -4078,11 +4078,11 @@ pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1595",
 };
 
-/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Interprets "HIPFIRE_QWEN35_MOE_OQ_INDEXED" from environment to select behavior
+/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Runtime variable controlling qwen35 moe oq indexed in hipfire
 pub const ENV_HIPFIRE_QWEN35_MOE_OQ_INDEXED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_OQ_INDEXED",
-    description: "Interprets \"HIPFIRE_QWEN35_MOE_OQ_INDEXED\" from environment to select behavior",
-    source: "crates/hipfire-dispatch/src/families/moe.rs:64",
+    description: "Runtime variable controlling qwen35 moe oq indexed in hipfire",
+    source: "crates/hipfire-dispatch/src/families/moe.rs:76",
 };
 
 /// `HIPFIRE_QWEN35_PAGED_EXPERTS` — Interprets "HIPFIRE_QWEN35_PAGED_EXPERTS" from environment to select behavior

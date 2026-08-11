@@ -1846,8 +1846,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
 }
 
 fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
-    // HIPFIRE_QWEN35_MOE_OQ_INDEXED re-enables the experimental indexed routed
-    // OQ decode kernels. One shared parse — this must agree with the loader's
+    // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
+    // falls back. One shared parse — this must agree with the loader's
     // MoE-block repack or the dispatch runs against un-repacked weights.
     hipfire_dispatch::families::moe::oq_indexed_decode_enabled()
 }
