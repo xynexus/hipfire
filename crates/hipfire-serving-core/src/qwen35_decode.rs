@@ -260,6 +260,108 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
 
 /// Confirm every session named in the decode request is actually resident
 /// before stepping the batch.
+/// `HIPFIRE_KVARN_DUMP=<path>` — dump session 0's KVarN K state once, at the
+/// first decode step, i.e. immediately after prefill has populated it.
+///
+/// Text-level fused-vs-serial A/B ran out of resolution on the dense KVarN
+/// divergence: six hypotheses, one GPU run each, and the surviving ones all need
+/// the actual K values. Dumping the window and the block records at a point BOTH
+/// prefill backends reach identically turns "which of N guesses" into one diff.
+///
+/// Writes `<path>` as: u32 layer, u32 n_full_blocks, u32 window_elems,
+/// u32 record_elems, then the f32 window, then the record bytes as f32-typed.
+/// Compare two runs that differ only in the prefill backend.
+pub fn maybe_dump_kvarn_state(
+    m: &LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+) {
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("HIPFIRE_KVARN_DUMP") else {
+        return;
+    };
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(session) = envelope.sessions.first() else {
+        return;
+    };
+    let Some(state) = m.q35_registry.sessions.get(&session.session_id) else {
+        return;
+    };
+    let kv = state.kv_cache();
+    if !kv.quant_kvarn {
+        eprintln!("[kvarn-dump] session KV is not kvarn; nothing to dump");
+        return;
+    }
+    // First layer whose window is actually POPULATED. Selecting on `numel() > 0`
+    // is not enough: a hybrid model keeps full-size placeholder buffers for its
+    // LinearAttention layers, so that picks layer 0, dumps all zeros, and two
+    // runs compare "identical" while proving nothing. Read the contents.
+    // `HIPFIRE_KVARN_DUMP_LAYER` overrides.
+    let forced = std::env::var("HIPFIRE_KVARN_DUMP_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut layer = usize::MAX;
+    if let Some(l) = forced {
+        layer = l;
+    } else {
+        for (idx, w) in kv.k_window.iter().enumerate() {
+            if w.numel() == 0 {
+                continue;
+            }
+            if let Ok(vals) = gpu.download_f32(w) {
+                if vals.iter().any(|v| *v != 0.0) {
+                    layer = idx;
+                    break;
+                }
+            }
+        }
+    }
+    if layer == usize::MAX || layer >= kv.k_window.len() {
+        eprintln!(
+            "[kvarn-dump] no populated KVarN window found across {} layers",
+            kv.k_window.len()
+        );
+        return;
+    }
+    let window = match gpu.download_f32(&kv.k_window[layer]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[kvarn-dump] window readback failed: {}", e.message);
+            return;
+        }
+    };
+    let records = match gpu.download_f32(&kv.k_gpu[layer]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[kvarn-dump] records readback failed: {}", e.message);
+            return;
+        }
+    };
+    let pos = state.cursor.seq_pos;
+    let mut out = Vec::with_capacity(16 + (window.len() + records.len()) * 4);
+    out.extend_from_slice(&(layer as u32).to_le_bytes());
+    out.extend_from_slice(&(pos as u32).to_le_bytes());
+    out.extend_from_slice(&(window.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for v in &window {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &records {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    match std::fs::File::create(&path).and_then(|mut f| f.write_all(&out)) {
+        Ok(()) => eprintln!(
+            "[kvarn-dump] layer={layer} seq_pos={pos} window={} records={} -> {path}",
+            window.len(),
+            records.len()
+        ),
+        Err(e) => eprintln!("[kvarn-dump] write failed: {e}"),
+    }
+}
+
 pub fn validate_qwen35_decode_resident_sessions(
     m: &LoadedModel,
     envelope: &GenerateBatchDecodeEnvelope,
@@ -450,6 +552,8 @@ pub fn run_generate_batch_decode_step_qwen35(
             gpu.arch.as_str(),
         )?;
     }
+    // Post-prefill KV snapshot, before this step mutates anything.
+    maybe_dump_kvarn_state(m, gpu, envelope);
     let im_end = {
         let tokenizer = m
             .tokenizer

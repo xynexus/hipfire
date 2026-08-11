@@ -2871,6 +2871,36 @@ fn forward_dense_session_batch_layers_full_precision(
                     0,
                 )?;
                 if let Some(kvarn) = kvarn {
+                    // KVarN stores K in the FWHT-rotated basis at head_dim 256 —
+                    // `prefill_chunk.rs` rotates K and Q in place before its
+                    // write, and the routed path must match or the cache ends up
+                    // in a different basis than every reader expects. Measured
+                    // cost of omitting it: max |delta| 11.59 on the K window vs
+                    // 0.081 once both sides agree (a 143x error), with EVERY
+                    // prefilled token wrong.
+                    //
+                    // Once per layer, before the segment loop: it rewrites the
+                    // whole fa_k/fa_q batch, so doing it per segment would rotate
+                    // earlier segments repeatedly.
+                    static BATCH_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *BATCH_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            row_count,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            row_count,
+                        )?;
+                    }
                     // Same segment-then-flush shape as the grouped-MoE path: the
                     // window physically holds `group` tokens, so a run of rows
                     // that fills one must be drained before the next run wraps it.
@@ -4279,6 +4309,36 @@ fn forward_grouped_moe_session_batch_layers(
                     0,
                 )?;
                 if let Some(kvarn) = kvarn {
+                    // KVarN stores K in the FWHT-rotated basis at head_dim 256 —
+                    // `prefill_chunk.rs` rotates K and Q in place before its
+                    // write, and the routed path must match or the cache ends up
+                    // in a different basis than every reader expects. Measured
+                    // cost of omitting it: max |delta| 11.59 on the K window vs
+                    // 0.081 once both sides agree (a 143x error), with EVERY
+                    // prefilled token wrong.
+                    //
+                    // Once per layer, before the segment loop: it rewrites the
+                    // whole fa_k/fa_q batch, so doing it per segment would rotate
+                    // earlier segments repeatedly.
+                    static BATCH_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *BATCH_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            row_count,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            row_count,
+                        )?;
+                    }
                     // Segment-wise: write a run of rows, then drain any window
                     // that just filled, before the next run can wrap it. The
                     // split points come from the tested planner — computing them

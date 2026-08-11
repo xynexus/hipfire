@@ -94,7 +94,49 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
-## [Medium] KVarN dense arm diverges from serial far more than the Q8 control
+## [FIXED 2026-08-11] Routed KVarN prefill wrote K in the WRONG BASIS — both arms
+
+Root-caused numerically after text-level A/B ran out of resolution. `HIPFIRE_KVARN_DUMP`
+dumps a session's KVarN window + records at the first decode step — a point both
+prefill backends reach identically — so fused and serial can be diffed directly.
+
+`prefill_chunk.rs` rotates K and Q in place (FWHT, `rotate_x_mq_batched`) at
+`head_dim == 256` before the KVarN write. `prefill_batch.rs` — the routed/fused
+path — did not. The cache therefore ended up in a different basis than every
+reader expects. Measured on `Qwen3.5-0.8B-Base--oq8`, layer 3, identical prompts:
+
+| config | max abs delta on the K window |
+|---|---|
+| before the fix | **11.59** — every prefilled token wrong |
+| rotation disabled on both sides | 0.081 (noise floor) |
+| **after the fix** | **0.070** — at the noise floor |
+
+The slot routing was always correct (exactly slots 0..seq_pos-1 differed); only
+the values were wrong, which is the signature of a basis mismatch rather than a
+plumbing bug.
+
+**This affected the grouped-MoE arm too**, which had been called verified. Its
+text parity matched the Q8 control's divergence positions, which looked like
+evidence and was not — both arms shared the same missing rotation, and text
+agreement at 4-bit K is too coarse to see it.
+
+Two harness traps found on the way to this, both of which produced confident
+wrong answers first:
+- the dump initially selected the first layer with `numel() > 0`, which on a
+  hybrid model is a LinearAttention **placeholder**. Both dumps came back all
+  zeros and compared "IDENTICAL". A silent probe is not evidence.
+- the dump takes `envelope.sessions.first()`, which is not deterministic across
+  runs. With four distinct prompts the two dumps were of DIFFERENT sessions
+  (`seq_pos` 19 vs 20). That confound is what made an earlier
+  `HIPFIRE_KVARN_ROTATE=0` test appear to exonerate the rotation. Fixed by
+  prefilling four IDENTICAL prompts.
+
+Residual: dense text parity is 3/4 diverging vs the Q8 control's 1/4. With the K
+state now at the noise floor this is consistent with 4-bit K sitting closer to
+near-ties than 8-bit and flipping greedy decisions more often, but it has not been
+proven, and the decode arm has not been separately verified.
+
+## [Superseded by the above] KVarN dense arm diverges from serial far more than the Q8 control
 
 Found 2026-08-11 once the fused dense path was reachable. Same model
 (`Qwen3.5-0.8B-Base--oq8`), same fused dense backend, 48-token greedy, fused vs
