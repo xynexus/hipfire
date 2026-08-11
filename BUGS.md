@@ -293,6 +293,16 @@ kvarn port, or land both together.
   `generate_batch_prefill ... failed to create checkpoint`. Since the MoE
   amortization knee is at `n_exp/k` = 512/8 = 64, the capacity argument cannot be
   evaluated on this box at 35B-A3B.
+- **RESOLVED 2026-08-11 by the KVarN port; the fallback defect now matters MORE.**
+  `qwen35_kvarn_fused_batch_enabled()` defaults ON as of this date, so KVarN — the
+  supported mode — reaches the fused path and batched MoE decode is live again.
+  But the refuse-at-execution defect above is now the kill switch's sharp edge:
+  verified that `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0` with KVarN KV makes batch >= 4
+  requests FAIL rather than fall back to `SerialReference`. Anyone reaching for the
+  kill switch during an incident would trade a suspected numerical issue for hard
+  request failures. Wiring the capability predicate into backend *selection* (so a
+  refusal degrades instead of erroring) is what makes the switch safe, and is now
+  the highest-value follow-up in this entry.
 - **Consequence worth stating plainly: batched MoE decode is presently
   unreachable.** q8 is on `DEPRECATED_KV_MODES` (`serving-core/src/load.rs:533`)
   and the fused path requires q8, so on every supported KV mode there is no batch
