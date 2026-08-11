@@ -1318,6 +1318,26 @@ pub fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
             qwen35::validate_paged_moe_decode_expert_cache(weights, config)?;
         }
     }
+    // KVarN reaches the fused body only while the gate allows it. Hoisting that
+    // to selection time is what makes the gate's kill switch safe: with the check
+    // living only inside the fused body, turning the gate off made batch >= 4
+    // requests FAIL ("must use Q8 KV state ...") instead of degrading to
+    // SerialReference the way batch 1-3 already does.
+    //
+    // Deliberately narrow. It rejects exactly the case that regressed — KVarN
+    // with the gate off — and leaves every other mode's routing untouched, so
+    // this cannot change which backend a Q8 or `auto` deployment selects.
+    if m.q35_kv_mode
+        .as_deref()
+        .is_some_and(|mode| mode.starts_with("kvarn"))
+        && !qwen35::qwen35_kvarn_fused_batch_enabled()
+    {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch is disabled for KVarN KV \
+             (HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0); routing to SerialReference"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
