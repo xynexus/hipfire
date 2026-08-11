@@ -67,6 +67,36 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [High] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
+
+Found 2026-08-11 while auditing the KV deprecation. The deprecation added in this
+branch refuses `q8`/`asym3`/etc **by name**, but the default path never presents a
+name it recognises:
+
+- `default_kv_cache()` returns `"auto"` (`hipfire-config/src/lib.rs:104`), and it
+  is the `#[serde(default)]` for the config field (`:310`). `routes/chat.rs:3250`,
+  `:3297` and `hipfire-cli/src/commands/chat.rs:333` also send it literally.
+- `"auto"` is not in `DEPRECATED_KV_MODES`, so `reject_deprecated_kv_mode`
+  (`serving-core/src/load.rs:537`) passes it.
+- It then matches `"q8" | "int8" | "auto" | ""` (`load.rs:2745`) and builds a **Q8**
+  cache — or `new_gpu_asym3_capped` at `head_dim == 256` (`load.rs:2491`,
+  `:3634`, `session.rs:1717`). Five construction sites resolve `auto` to a
+  deprecated mode.
+
+So an operator who sets nothing gets exactly the mode the gate exists to refuse,
+with no warning. An operator who names it explicitly is refused. Note the empty
+string is NOT affected: `load.rs:773` normalises `""` to `fp32` *before* the gate,
+so this is specific to the literal `"auto"` — which is the default.
+
+**The fix is coupled to the kvarn port and should not be applied alone.** Pointing
+`auto` at kvarn is the obvious correction and matches the stated intent (kvarn is
+the default; asym/q8 deprecated), but the fused grouped-MoE prefill and decode
+paths **hard-require Q8** (see the entry below). Today `auto -> q8` is the only
+reason batched MoE decode is reachable at all; switching `auto` to kvarn would
+silently disable fusion for every default deployment — trading a naming
+inconsistency for a ~2x throughput regression at width 16. Sequence it after the
+kvarn port, or land both together.
+
 ## [High] Grouped-MoE fused prefill-session batch requires Q8 KV — blocks batching on kvarn
 - Category: Capacity / KV-mode coupling — the first real dependent the KV
   deprecation surfaced
