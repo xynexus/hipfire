@@ -1112,6 +1112,11 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Per-EXPERT AWQ rotate for the indexed MoE path: one rotated basis per
+/// (token, krank), each divided by ITS expert's awq_scale. See the kernel
+/// preamble for why a single shared rotation is wrong for routed experts.
+pub const ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rotate_x_mq_awq_indexed_batched.hip");
 /// GPU side of the shared EmbeddingGemma Opus projection boundary. Packs
 /// AWQ/FWHT/Q8 activations directly into the AIE whole-array input layout and
 /// deblocks the physical f32 output into one to three row-major GPU tensors.

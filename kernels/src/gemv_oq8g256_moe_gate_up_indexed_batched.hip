@@ -14,7 +14,7 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [N × K_TOP]
-    const float* __restrict__ x,                         // [N × K]
+    const float* __restrict__ x,                         // [N × K_TOP × K]
     float* __restrict__ y_gate,                          // [N × K_TOP × MI]
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
     int M, int K, int K_TOP
@@ -28,7 +28,9 @@ extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed_batched(
     const int expert_id = topk_indices[bid * K_TOP + krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
-    const float* __restrict__ x_row = x + (long long)bid * K;
+    // Per-expert rotated basis: slot (bid, krank), matching
+    // rotate_x_mq_awq_indexed_batched's [N x K_TOP x K] output.
+    const float* __restrict__ x_row = x + ((long long)bid * K_TOP + krank) * K;
 
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * OQ8_BLK;

@@ -33,7 +33,8 @@ extern "C" __global__ void gemv_oq4g256_moe_gate_up_k8_indexed_batched(
     const int expert_id = topk_indices[bid * K_TOP + krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
-    const float* __restrict__ x_row = x + (long long)bid * K;
+    // Per-expert rotated basis: slot (bid, krank).
+    const float* __restrict__ x_row = x + ((long long)bid * K_TOP + krank) * K;
 
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * OQ4_BLK;

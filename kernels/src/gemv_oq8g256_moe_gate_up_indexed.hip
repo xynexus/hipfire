@@ -11,6 +11,13 @@
 // w = sc * (int8) (symmetric). W8A16 at decode: int8 weight x f32 activation.
 //
 // Grid (M, K_TOP=8, 1), block = 32 threads (8 int8 / lane).
+//
+// `x` is [K_TOP x K] — one rotated basis PER EXPERT, not a single shared row.
+// Routed experts are AWQ-pre-scaled with DIFFERENT per-channel vectors, so each
+// needs x/s_e, and the divide cannot be hoisted (it must precede the FWHT, and
+// the FWHT mixes channels). `rotate_x_mq_awq_indexed_batched` produces this
+// buffer. Sharing one row across kranks — the old contract — silently computed
+// (W·s)·x for every expert whose scale differed from the representative's.
 
 #define OQ8_BLK 260
 
@@ -31,6 +38,8 @@ extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed(
     const int expert_id = topk_indices[krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    // Per-expert rotated basis: slot krank.
+    const float* __restrict__ x_row = x + (long long)krank * K;
 
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * OQ8_BLK;
@@ -45,7 +54,7 @@ extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed(
         float gsum = 0.0f;
         #pragma unroll
         for (int n = 0; n < 8; n++) {
-            gsum += (float)w8[n] * x[base + n];
+            gsum += (float)w8[n] * x_row[base + n];
         }
         acc += sc * gsum;
     }

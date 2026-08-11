@@ -20,6 +20,62 @@ impl EnvVarDoc {
     }
 }
 
+/// `ADMM_PROBE_CALIB` — Runtime variable controlling admm probe calib in hipfire
+pub const ENV_ADMM_PROBE_CALIB: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_CALIB",
+    description: "Runtime variable controlling admm probe calib in hipfire",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:326",
+};
+
+/// `ADMM_PROBE_EXPERT` — Runtime variable controlling admm probe expert in hipfire
+pub const ENV_ADMM_PROBE_EXPERT: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_EXPERT",
+    description: "Runtime variable controlling admm probe expert in hipfire",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:374",
+};
+
+/// `ADMM_PROBE_HESSIAN` — Runtime variable controlling admm probe hessian in hipfire
+pub const ENV_ADMM_PROBE_HESSIAN: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_HESSIAN",
+    description: "Runtime variable controlling admm probe hessian in hipfire",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:339",
+};
+
+/// `ADMM_PROBE_HFA` — Runtime variable controlling admm probe hfa in hipfire
+pub const ENV_ADMM_PROBE_HFA: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_HFA",
+    description: "Runtime variable controlling admm probe hfa in hipfire",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:340",
+};
+
+/// `ADMM_PROBE_KRON` — P2 gate runs on H alone and answers a different question than the packers,
+pub const ENV_ADMM_PROBE_KRON: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_KRON",
+    description: "P2 gate runs on H alone and answers a different question than the packers,",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:549",
+};
+
+/// `ADMM_PROBE_RHOS` — Override with ADMM_PROBE_RHOS="10,30" (multiples of damping). Real-data
+pub const ENV_ADMM_PROBE_RHOS: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_RHOS",
+    description: "Override with ADMM_PROBE_RHOS=\"10,30\" (multiples of damping). Real-data",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:617",
+};
+
+/// `ADMM_PROBE_TENSOR` — Runtime variable controlling admm probe tensor in hipfire
+pub const ENV_ADMM_PROBE_TENSOR: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_TENSOR",
+    description: "Runtime variable controlling admm probe tensor in hipfire",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:329",
+};
+
+/// `ADMM_PROBE_TIMING` — per-tensor ONLY because AWQ rebases H per tensor -- share the rebasing and
+pub const ENV_ADMM_PROBE_TIMING: EnvVarDoc = EnvVarDoc {
+    name: "ADMM_PROBE_TIMING",
+    description: "per-tensor ONLY because AWQ rebases H per tensor -- share the rebasing and",
+    source: "crates/hipfire-quantize/examples/admm_probe.rs:559",
+};
+
 /// `BENCH_BATCH` — Runtime variable controlling bench batch in hipfire
 pub const ENV_BENCH_BATCH: EnvVarDoc = EnvVarDoc {
     name: "BENCH_BATCH",
@@ -2056,14 +2112,14 @@ pub const ENV_HIPFIRE_GPU_CHOLESKY: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4226",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4292",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
 pub const ENV_HIPFIRE_GPU_SLAB_MIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_MIB",
     description: "Parses \"HIPFIRE_GPU_SLAB_MIB\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2448",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:2452",
 };
 
 /// `HIPFIRE_GPU_TOPK` — HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU
@@ -2280,7 +2336,7 @@ pub const ENV_HIPFIRE_KLD_FP32_GQA4_ATTN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KLD_PHASE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_PHASE_TIMING",
     description: "HIPFIRE_KLD_PHASE_TIMING=1 splits the per-chunk cost into body / head /",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3278",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3344",
 };
 
 /// `HIPFIRE_KLD_SCORING_MODE` — Runtime variable controlling kld scoring mode in hipfire
@@ -3933,7 +3989,7 @@ pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_BF16_HEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_BF16_HEAD",
     description: "HIPFIRE_QWEN35_BF16_HEAD=1 forces the plain-BF16 head back for",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4445",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4511",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH` — Defaults to auto when unset
@@ -3984,7 +4040,7 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
     description:
         "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4576",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:4642",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values
@@ -5442,6 +5498,14 @@ pub const ENV_USE_SAMPLE: EnvVarDoc = EnvVarDoc {
 
 /// All documented environment variables in deterministic order.
 pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
+    ENV_ADMM_PROBE_CALIB,
+    ENV_ADMM_PROBE_EXPERT,
+    ENV_ADMM_PROBE_HESSIAN,
+    ENV_ADMM_PROBE_HFA,
+    ENV_ADMM_PROBE_KRON,
+    ENV_ADMM_PROBE_RHOS,
+    ENV_ADMM_PROBE_TENSOR,
+    ENV_ADMM_PROBE_TIMING,
     ENV_BENCH_BATCH,
     ENV_BENCH_DRAFT_K,
     ENV_BENCH_DRAFT_LAYERS,
