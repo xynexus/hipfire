@@ -104,6 +104,7 @@ pub fn validate_qwen35_fused_dense_decode_session_signatures(
         config,
         signatures,
         &execution_plan,
+        qwen35::qwen35_kvarn_fused_batch_enabled(),
     )
 }
 
