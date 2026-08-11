@@ -801,6 +801,16 @@ pub struct KvarnBatchFlushContext<'a> {
     pub group: usize,
     /// K code width; 4 unless `HIPFIRE_KVARN_BITS` says otherwise.
     pub bits: usize,
+    /// Segment end offsets from
+    /// [`grouped_moe_prefill_session_batch_kvarn_block_flushes`]. Segment `i`
+    /// covers rows `[splits[i-1], splits[i])`; the last entry is the row count.
+    pub splits: &'a [usize],
+    /// `flushes[i]` runs after segment `i` is written. Same length as `splits`.
+    ///
+    /// Precomputed rather than derived in the layer body because the row slots
+    /// live in the pointer-table plan, which the layer function does not get —
+    /// and because the boundary arithmetic is unit-tested where it is computed.
+    pub flushes: &'a [Vec<KvarnBlockFlush>],
 }
 
 /// Gather + quantize each completed block into its session's records, for one
@@ -3262,6 +3272,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         None,
         None,
         true,
+        None,
         delta_f16,
     )
 }
@@ -3356,6 +3367,7 @@ pub(crate) fn forward_streamed_grouped_moe_layer_batch(
         capture,
         dense_capture,
         false,
+        None,
         false,
     )
 }
@@ -3456,6 +3468,10 @@ fn forward_grouped_moe_session_batch_layers(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     kv_q8: bool,
+    // `Some` selects the KVarN KV arms over `kv_q8`/f32. Carries what the
+    // pointer tables cannot: the per-session records/window tensors, gather
+    // scratch, and the precomputed segment/flush plan.
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
     delta_f16: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
@@ -4124,7 +4140,60 @@ fn forward_grouped_moe_session_batch_layers(
                     row_count,
                     0,
                 )?;
-                if kv_q8 {
+                if let Some(kvarn) = kvarn {
+                    // Segment-wise: write a run of rows, then drain any window
+                    // that just filled, before the next run can wrap it. The
+                    // split points come from the tested planner — computing them
+                    // here would put the one piece of arithmetic whose failure is
+                    // silent in the one place it cannot be unit-tested.
+                    let mut seg_start = 0usize;
+                    for (seg_idx, &split) in kvarn.splits.iter().enumerate() {
+                        let seg_rows = split.saturating_sub(seg_start);
+                        if seg_rows > 0 {
+                            prefill_session_batch_write_kvarn_kv_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_k_batch,
+                                &pbs.fa_v_batch,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kvarn.group,
+                                seg_start,
+                                seg_rows,
+                                row_count,
+                            )?;
+                        }
+                        if let Some(flushes) = kvarn.flushes.get(seg_idx) {
+                            grouped_moe_prefill_session_batch_kvarn_flush_layer(
+                                gpu,
+                                kvarn,
+                                layer_idx,
+                                flushes,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                        }
+                        seg_start = split;
+                    }
+                    // Attention reads records + window together, so it runs once
+                    // over the whole batch after every segment has landed.
+                    prefill_session_batch_attention_kvarn_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else if kv_q8 {
                     prefill_session_batch_write_q8_kv_layer(
                         gpu,
                         device_tables,
