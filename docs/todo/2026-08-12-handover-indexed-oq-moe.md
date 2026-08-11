@@ -20,7 +20,22 @@ anyone turns it on before that plumbing lands — see "Landmine" below.
   necessary but NOT sufficient; the commit message says so explicitly.
 - `0d1ea653d docs(quant-formats): reimplementation-grade KVarN spec`
 
-Nothing else from this session is pushed.
+Everything else from this session is on the WIP branch
+**`origin/wip/indexed-oq-per-expert-awq`** (branched from
+`feat/hfa-calibrate-source`, NOT from master — `ldlq.rs` and friends differ
+between them, so a master-based branch would conflict):
+
+- `35893d958 wip(qwen35): per-expert AWQ rotation for indexed OQ MoE — 3 of 5 steps`
+- `3a69a20c2 wip(quantize): close the ADMM/Kronecker investigation — all levers negative`
+
+Neither is proposed for master; see "Landmine" for why the serving one must not
+land as-is. Start from that branch, not from a dirty tree.
+
+Still uncommitted and deliberately so: `.agents/scheduled_tasks.lock` (session
+state), `P1-correction.md` and `opus-improvements-conversation-extract.md`
+(pre-existing, not from this session), and `docs/quant-formats/kvarn.md` — its
+content is already on master via `0d1ea653d`, so re-adding it would only create a
+merge conflict.
 
 ## The bug, in one paragraph
 
@@ -40,7 +55,7 @@ flag on; per-block residual divergence at **layer 0** (cosine 0.244, norm 16x �
 a scale error from the first layer, not accumulated drift); decode output
 degenerating to `"The capital of France 是斯"`.
 
-## What is landed and verified (uncommitted, in the working tree)
+## What is landed and verified (on `wip/indexed-oq-per-expert-awq`, commit `35893d958`)
 
 1. **`kernels/src/rotate_x_mq_awq_indexed_batched.hip`** + wrapper in
    `dispatch/rope.rs` + `kernels.rs` const. Reads `topk_indices` on-device,
