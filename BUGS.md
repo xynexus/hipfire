@@ -132,12 +132,27 @@ Three things this rules out:
   executor are the same code the grouped-MoE arm uses, and that arm matches its
   Q8 baseline at byte-identical divergence positions.
 
-What is left is the dense-specific wiring in
-`forward_prefill_dense_session_batch_impl` — the `kv_window_layers` sizing, the
-context construction, or the segment walk as the dense layer body drives it.
-Switching prefill to serial repairs the worst divergence, which is where to look
-first. The residual 3/4 under serial prefill still exceeds the Q8 control's 1/4,
-so the dense decode arm is likely also off, less severely.
+**Ruled out so far (each by measurement, none by argument):**
+
+| hypothesis | how it died |
+|---|---|
+| cross-session contamination | independence test PASSES — probe byte-identical (755 ch) across different companions |
+| the block flush | 48-token generations never reach position 127; gather+quantize never fires |
+| the shared kernels | routed write / attention / flush are the SAME code the grouped-MoE arm uses, and that arm matches its Q8 baseline |
+| a dense-vs-MoE difference in the layer body | the two `if let Some(kvarn)` arms diff by COMMENTS ONLY — functionally identical |
+| a second, unported KV write site in the dense body | both layer functions have exactly one write + one attention per KV mode |
+| the KVarN FWHT rotation | `prefill_chunk.rs` rotates K/Q at `head_dim == 256` and `prefill_batch.rs` does not — but disabling it on BOTH sides (`HIPFIRE_KVARN_ROTATE=0`) leaves the divergence at 4/4 |
+
+The rotation asymmetry is real and worth fixing on its own — the routed batch path
+has no KVarN rotation while the chunked path does, and both test models are
+head_dim 256 (record size 17664 B). It is simply not what causes this.
+
+**Root cause NOT found.** Text-level A/B has run out of resolution: every
+remaining hypothesis needs to see the actual K values. The next step is numerical,
+not another parity run — dump a session's KVarN window and records after a fused
+prefill and after a serial prefill of the same tokens and diff them. That
+localizes it to the write, the records, or the read in one experiment instead of
+one guess per run.
 
 ## [Superseded] No available Qwen3.5 artifact can exercise the fused DENSE batch path — all VL-wrap
 
