@@ -171,6 +171,40 @@ into full investigations here.
     client checking status codes sees success. That alone is worth fixing
     independently of the port — it is how this failure hid inside a sweep harness
     that counted 200s as successes.
+- **RESOLVED 2026-08-11 — batching DOES scale (2.08x at width 16); the flat curve
+  was four caps, not one defect.** Measured with Q8 KV, loopback bind, raised
+  `BATCH_MAX`, `auto` prefill; prefill and decode separated by differencing
+  `max_tokens=1` against `max_tokens=64` in one daemon lifetime:
+
+  | width | prefill | decode step | decode tok/s | vs w1 |
+  |---|---|---|---|---|
+  | 1 | 0.93 s | 11.3 ms | 88.6 | 1.00x |
+  | 8 | 3.45 s | 52.2 ms | 153.3 | 1.73x |
+  | 16 | 7.05 s | 87.3 ms | 183.3 | **2.07x** |
+
+  End-to-end at width 16 is 16.5 tok/s vs 7.9 at width 1. The caps, each of which
+  flattens the curve on its own:
+  - `max_in_flight_text = 4` in `RatePolicy::default()` — a CONCURRENCY cap, and
+    the actual source of the HTTP 429 above (not the per-minute bucket). Binding
+    `--host 127.0.0.1` selects `loopback_default()` where it is 0 = unlimited.
+  - `BATCH_MAX_DEFAULT = 8` (`hipfire-server/src/batch_runner.rs:421`) — the
+    envelope never exceeds 8 rows however many sessions are waiting.
+  - the `n >= 4` decode latency gate (above).
+  - `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial`, which was a harness carryover:
+    16 sequential prefills are 73% of wall time at width 16. **Under Q8, `auto`
+    prefill works** (14.80 s -> 7.05 s at width 16), so the earlier note in this
+    entry that "`auto` does NOT work — only `serial` does" holds for kvarn only.
+- **Single-stream MoE decode is launch-bound on gfx1103.** A width-1 decode step
+  issues **1322 launches in 11.3 ms** — ~8.5 us each, essentially ROCm's launch
+  overhead. At width 16 the same 1322 launches take 87.3 ms (66 us each), i.e. it
+  has crossed into real work. This is why batching amortizes ~2x when the
+  expert-byte curve predicts only ~1.14x at that width, and it is an argument for
+  grouping modules into FEWER launches.
+- **Width 64 is not reachable on nix1.** Raising `BATCH_MAX` to 64 yields an
+  achieved width near 18; batch 64 collapses to 2.22 tok/s with 20/64 sessions and
+  `generate_batch_prefill ... failed to create checkpoint`. Since the MoE
+  amortization knee is at `n_exp/k` = 512/8 = 64, the capacity argument cannot be
+  evaluated on this box at 35B-A3B.
 - **Consequence worth stating plainly: batched MoE decode is presently
   unreachable.** q8 is on `DEPRECATED_KV_MODES` (`serving-core/src/load.rs:533`)
   and the fused path requires q8, so on every supported KV mode there is no batch

@@ -864,6 +864,56 @@ work: the open question is no longer "why doesn't batching help" but "can we rea
 N=64 at all on this box" — which is M7's exit criterion, and which §0.4 already
 says should be *reported* rather than tuned around if VRAM cannot hold it.
 
+**RESOLVED 2026-08-11 — aggregate throughput DOES scale; four caps were hiding
+it.** Sweeping properly (Q8 KV, loopback bind, `HIPFIRE_SERVER_PREFILL_BATCH_MAX`
+raised, `auto` prefill), one daemon lifetime, prefill and decode separated by
+running each width at `max_tokens=1` and `max_tokens=64` and subtracting:
+
+| width | prefill (t@1tok) | decode step | decode tok/s | vs width 1 |
+|---|---|---|---|---|
+| 1 | 0.93 s | 11.3 ms | 88.6 | 1.00x |
+| 4 | 1.72 s | 33.1 ms | 120.7 | 1.36x |
+| 8 | 3.45 s | 52.2 ms | 153.3 | 1.73x |
+| 16 | 7.05 s | 87.3 ms | 183.3 | **2.07x** |
+
+End-to-end at width 16: 12.55 s for ~207 tokens = **16.5 tok/s aggregate vs 7.9 at
+width 1, 2.08x**. Sixteen rows cost 7.7x the time of one row. Both halves
+amortize — decode 2.07x, and prefill 2.1x once `auto` is allowed (14.80 s -> 7.05 s
+at width 16; the earlier BUGS.md note that "`auto` does NOT work, only `serial`"
+was measured under kvarn and does not hold under Q8).
+
+The four caps, each of which independently flattens the curve:
+
+| cap | value | effect |
+|---|---|---|
+| `qwen35_grouped_moe_decode_auto_latency_gate_passed` | `n >= 4` | below 4, fused decode is refused by policy |
+| `RatePolicy::default().max_in_flight_text` | `4` | non-loopback bind caps CONCURRENCY at 4 — this is what returned 429, not a rate bucket; `loopback_default()` sets 0 = unlimited |
+| `BATCH_MAX_DEFAULT` (`batch_runner.rs:421`) | `8` | envelope never exceeds 8 rows regardless of demand |
+| `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial` | harness | 16 sequential prefills = 73% of wall time at width 16 |
+
+**Why 2.08x and not 16x — and why that is the plan's own answer.** §0.4 predicts
+weight-byte savings of only ~1.05x at 8 slots and ~1.14x at 16, because distinct
+experts touched grows nearly linearly with batch until N approaches `n_exp/k` =
+512/8 = 64. Measured amortization is *well ahead* of that (1.73x and 2.07x), and
+the reason is visible in the launch trace: **a width-1 decode step issues 1322
+launches in 11.3 ms — ~8.5 us each, i.e. it is launch-bound, not
+bandwidth-bound.** Batching amortizes those 1322 launches across N rows, which
+pays far better at small N than sharing expert bytes does. At width 16 the step is
+87.3 ms for the same 1322 launches (66 us each), so it has crossed into real work.
+
+That sharpens F3 rather than contradicting it: launch overhead dominates
+single-stream MoE decode on gfx1103, so the coalescing policy F3 demands is worth
+more than its own arithmetic suggested — and it is an argument for grouping
+modules into fewer launches, not more.
+
+**The ceiling, and it is capacity not scheduling.** Raising `BATCH_MAX` to 64 does
+not produce width 64: achieved width tops out near 18 and batch 64 collapses to
+2.22 tok/s with 20/64 sessions surviving and
+`generate_batch_prefill ... failed to create checkpoint`. So N=64 — the width at
+which §0.4's curve finally pays 1.58x on expert bytes alone — is **not reachable on
+nix1**. Per §0.4's own instruction that is to be reported, not tuned around: the
+capacity half of the thesis cannot be evaluated on this box at 35B-A3B.
+
 **The two blockers, both now named.**
 
 1. **kvarn cannot use the fused path.** At batch >= 4 with the recommended KV mode
