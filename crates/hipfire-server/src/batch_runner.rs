@@ -418,7 +418,28 @@ impl BatchTelemetry {
 
 /// Default max sessions fused into one batch when `HIPFIRE_SERVER_PREFILL_BATCH_MAX`
 /// is unset.
-const BATCH_MAX_DEFAULT: usize = 8;
+///
+/// **16 since 2026-08-11, measured** (was 8). This is a hard cap on envelope
+/// width, so at 8 a deployment with 16 concurrent sessions got two half-width
+/// batches and left throughput on the table. Aggregate tok/s on
+/// `Qwen3.6-35B-A3B--oq4`, gfx1103, one daemon lifetime per row, KVarN KV:
+///
+/// | concurrent | aggregate | achieved width |
+/// |---|---|---|
+/// | 1 | 7.88 | 1 |
+/// | 8 | 9.80 | 8 |
+/// | **16** | **10.25** | **16** |
+/// | 32 | 9.96 | ~18 (capped by session residency, not by this) |
+/// | 64 | 2.22 | collapses — 20/64 sessions survive |
+///
+/// 16 is the measured optimum and also where achieved width stops tracking
+/// demand: past it the limit is session residency, and at 64 the batch collapses
+/// outright. Raising this further would only widen envelopes the runtime cannot
+/// fill, so the default stops here rather than at the largest value that "works".
+///
+/// Raising the cap does not itself allocate: the sessions are already resident,
+/// this only governs how many of them fuse into one step.
+const BATCH_MAX_DEFAULT: usize = 16;
 
 /// Spawn the continuous-batching runner. Call once at serve startup when
 /// `HIPFIRE_SERVER_PREFILL_BATCH` is enabled. The runner owns `state.engine`

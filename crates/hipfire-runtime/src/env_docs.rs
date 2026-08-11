@@ -304,7 +304,7 @@ pub const ENV_HIPFIRE_BATCHES_STATE_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BATCH_RUNNER_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BATCH_RUNNER_DEBUG",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-server/src/batch_runner.rs:1125",
+    source: "crates/hipfire-server/src/batch_runner.rs:1146",
 };
 
 /// `HIPFIRE_BATCH_WIDTH_TRACE` — as N one-row steps (never coalesced) looks identical from outside
@@ -4846,14 +4846,14 @@ pub const ENV_HIPFIRE_SERVER_PREEMPT_MIN_QUANTUM: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SERVER_PREFILL_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_PREFILL_BATCH_MAX",
     description: "Runtime variable controlling server prefill batch max in hipfire",
-    source: "crates/hipfire-server/src/batch_runner.rs:440",
+    source: "crates/hipfire-server/src/batch_runner.rs:461",
 };
 
 /// `HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS` — Parses "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS" with fallback defaults
 pub const ENV_HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS",
     description: "Parses \"HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS\" with fallback defaults",
-    source: "crates/hipfire-server/src/batch_runner.rs:451",
+    source: "crates/hipfire-server/src/batch_runner.rs:472",
 };
 
 /// `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling server resident state budget mb in hipfire
