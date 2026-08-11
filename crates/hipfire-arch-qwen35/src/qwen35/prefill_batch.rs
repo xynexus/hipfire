@@ -1039,6 +1039,23 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        // LUT3-packed bf16 lm_head, decoded in-kernel. `gemm_bf16l3_xf32` is the
+        // batched sibling of the `gemv_bf16l3_xf32` the serial path uses, so the
+        // weights stay packed — no rotation (LUT3 is a lossless bf16 recoding,
+        // not a quantization, so there is no awq_scale or FWHT basis to undo).
+        //
+        // Without this arm a LUT3 lm_head took the whole fused dense batch out:
+        // the tensor is emitted by the bf16 codec whenever it is gather-shaped
+        // and wins on size, which is the DEFAULT for a tied-embedding model, so
+        // "fused dense" was unreachable for most dense artifacts.
+        DType::Bf16L3 => gpu.gemm_bf16l3_xf32(
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             &weights.output.buf,
             &normed_rows,
@@ -1480,6 +1497,7 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
             | DType::F16
             | DType::BF16
             | DType::Raw
+            | DType::Bf16L3
             | DType::Q8_0
             | DType::MQ4G256
             | DType::Oq8G256
