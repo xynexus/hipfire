@@ -606,7 +606,7 @@ pub const ENV_HIPFIRE_DEBUG_VAE_STAGES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DECODE_BACKEND_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DECODE_BACKEND_TRACE",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:517",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:525",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN` — main model's final_norm_and_head head-HC reduction. Without
@@ -2332,10 +2332,10 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/kv.rs:1195",
 };
 
-/// `HIPFIRE_KVARN_DUMP` — Runtime variable controlling KVarn dump in hipfire
+/// `HIPFIRE_KVARN_DUMP` — exercises the decode-side KV write, which is otherwise unverified
 pub const ENV_HIPFIRE_KVARN_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_DUMP",
-    description: "Runtime variable controlling KVarn dump in hipfire",
+    description: "exercises the decode-side KV write, which is otherwise unverified",
     source: "crates/hipfire-serving-core/src/qwen35_decode.rs:280",
 };
 
@@ -2343,7 +2343,14 @@ pub const ENV_HIPFIRE_KVARN_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_DUMP_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_DUMP_LAYER",
     description: "is not enough: a hybrid model keeps full-size placeholder buffers for its",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:303",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:311",
+};
+
+/// `HIPFIRE_KVARN_DUMP_STEP` — exercises the decode-side KV write, which is otherwise unverified
+pub const ENV_HIPFIRE_KVARN_DUMP_STEP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVARN_DUMP_STEP",
+    description: "exercises the decode-side KV write, which is otherwise unverified",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:286",
 };
 
 /// `HIPFIRE_KVARN_ROTATE` — Enabled by default; set to 0 to disable
@@ -4031,14 +4038,14 @@ pub const ENV_HIPFIRE_QWEN35_BF16_HEAD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH",
     description: "Defaults to auto when unset",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:485",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:493",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH_MAX` — Runtime variable controlling qwen35 decode batch max in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH_MAX",
     description: "Runtime variable controlling qwen35 decode batch max in hipfire",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:623",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:631",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` — Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior
@@ -4046,14 +4053,14 @@ pub const ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY",
     description:
         "Interprets \"HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:699",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:707",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` — Runtime variable controlling qwen35 decode native multirow in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW",
     description: "Runtime variable controlling qwen35 decode native multirow in hipfire",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:649",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:657",
 };
 
 /// `HIPFIRE_QWEN35_EXPERT_CACHE_BYTES` — Runtime variable controlling qwen35 expert cache bytes in hipfire
@@ -5880,6 +5887,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KVARN_BITS,
     ENV_HIPFIRE_KVARN_DUMP,
     ENV_HIPFIRE_KVARN_DUMP_LAYER,
+    ENV_HIPFIRE_KVARN_DUMP_STEP,
     ENV_HIPFIRE_KVARN_ROTATE,
     ENV_HIPFIRE_KVARN_SIM,
     ENV_HIPFIRE_KVNOISE,

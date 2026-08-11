@@ -280,8 +280,16 @@ pub fn maybe_dump_kvarn_state(
     let Ok(path) = std::env::var("HIPFIRE_KVARN_DUMP") else {
         return;
     };
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // `HIPFIRE_KVARN_DUMP_STEP=N` dumps at the Nth decode step instead of the
+    // first. Step 1 captures the state after PREFILL only; a later step is what
+    // exercises the decode-side KV write, which is otherwise unverified.
+    let want_step: u64 = std::env::var("HIPFIRE_KVARN_DUMP_STEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let step = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if step != want_step {
         return;
     }
     let Some(session) = envelope.sessions.first() else {
