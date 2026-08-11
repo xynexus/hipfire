@@ -5616,6 +5616,98 @@ mod tests {
         assert!(tables.kv_win_ptrs.is_empty());
     }
 
+    fn kvarn_row(session_index: usize, position: usize) -> DensePrefillSessionBatchPrefixRowSlot {
+        DensePrefillSessionBatchPrefixRowSlot {
+            round_index: 0,
+            round_row_index: 0,
+            session_index,
+            token_index: 0,
+            token: 1,
+            position,
+        }
+    }
+
+    /// No completed block → one segment covering everything, nothing to flush.
+    #[test]
+    fn kvarn_block_flushes_are_empty_when_no_block_completes() {
+        let rows = vec![
+            kvarn_row(0, 0),
+            kvarn_row(1, 5),
+            kvarn_row(0, 1),
+            kvarn_row(1, 6),
+        ];
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, 128);
+        assert_eq!(splits, vec![4]);
+        assert_eq!(flushes.len(), 1);
+        assert!(flushes[0].is_empty());
+    }
+
+    /// A row landing on the last slot of a block must cut the launch right after
+    /// itself, so the window is drained before that session writes slot 0 again.
+    #[test]
+    fn kvarn_block_flush_splits_immediately_after_a_completing_row() {
+        let group = 128;
+        let rows = vec![
+            kvarn_row(0, 126),
+            kvarn_row(1, 10),
+            kvarn_row(0, 127), // completes session 0 block 0
+            kvarn_row(0, 128), // would land in slot 0 — must be in a later segment
+            kvarn_row(1, 11),
+        ];
+        let (splits, flushes) =
+            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        assert_eq!(splits, vec![3, 5]);
+        assert_eq!(
+            flushes[0],
+            vec![KvarnBlockFlush {
+                session_index: 0,
+                block_index: 0
+            }]
+        );
+        assert!(flushes[1].is_empty());
+        // The wrapping row is strictly after the split that drains the window.
+        assert!(splits[0] <= 3, "row at position 128 must not share a segment");
+    }
+
+    /// Block index is the session's own ordinal, not a row ordinal — the flush
+    /// writes `records[block_index]`, so an off-by-one here silently quantizes
+    /// into the wrong block and corrupts history rather than failing.
+    #[test]
+    fn kvarn_block_flush_reports_the_session_block_ordinal() {
+        let group = 128;
+        let rows = vec![
+            kvarn_row(2, 255),  // session 2, block 1
+            kvarn_row(1, 1023), // session 1, block 7
+        ];
+        let (splits, flushes) =
+            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        assert_eq!(splits, vec![1, 2]);
+        assert_eq!(flushes[0][0].block_index, 1);
+        assert_eq!(flushes[0][0].session_index, 2);
+        assert_eq!(flushes[1][0].block_index, 7);
+        assert_eq!(flushes[1][0].session_index, 1);
+    }
+
+    /// Every row must belong to exactly one segment, for any group size — this
+    /// is the property that makes the split list safe to drive a write loop.
+    #[test]
+    fn kvarn_block_flush_segments_partition_every_row() {
+        for group in [4usize, 8, 128] {
+            let rows: Vec<_> = (0..40)
+                .map(|i| kvarn_row(i % 3, (i / 3) + (i % 3) * 7))
+                .collect();
+            let (splits, flushes) =
+                grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+            assert_eq!(splits.len(), flushes.len(), "group={group}");
+            assert_eq!(*splits.last().unwrap(), rows.len(), "group={group}");
+            let mut prev = 0usize;
+            for &s in &splits {
+                assert!(s > prev, "group={group}: split {s} must advance past {prev}");
+                prev = s;
+            }
+        }
+    }
+
     #[test]
     fn dense_session_prefill_pointer_table_indices_are_deterministic() {
         let shape = DensePrefillSessionBatchPointerTableShape {

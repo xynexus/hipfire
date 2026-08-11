@@ -647,6 +647,172 @@ pub fn prefill_session_batch_attention_q8_layer(
 /// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
 /// f16 state, which is why the caller selects this by `DeltaNetState::quant`
 /// rather than by model. No scales: f16 carries a per-element exponent.
+/// KVarN companion to [`prefill_session_batch_write_q8_kv_layer`].
+///
+/// KVarN splits K across two buffers: 4-bit variance-normalized records for every
+/// COMPLETE `group`-token block, plus an f32 recent window holding the trailing
+/// partial block. V stays plain Q8_0, so the V half is literally the same call
+/// the Q8 path makes.
+///
+/// This writes only the per-token half. When a session's block completes, the
+/// window must be gathered and quantized into its records — a per-session event
+/// that fires once per `group` tokens and needs the route's `GpuTensor`s rather
+/// than the raw pointer tables, so it lives in the caller. See
+/// [`grouped_moe_prefill_session_batch_kvarn_block_flushes`].
+///
+/// CALLER CONTRACT (inherited from the kernel): no session may advance across
+/// more than one block boundary in a single call, because the window physically
+/// holds `group` tokens. Split the row range at boundaries — the flush planner
+/// below computes exactly where.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_session_batch_write_kvarn_kv_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    k_src: &GpuTensor,
+    v_src: &GpuTensor,
+    n_kv_heads: usize,
+    head_dim: usize,
+    group: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed KVarN KV write layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    // K -> per-session f32 recent window at `pos % group`.
+    gpu.kv_cache_write_kvarn_window_routed_batched(
+        &device_tables.kv_win_ptrs,
+        k_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_kv_heads,
+        head_dim,
+        group,
+        row_count,
+    )?;
+    // V -> plain Q8_0, identical to the Q8 path.
+    gpu.kv_cache_write_q8_0_routed_batched(
+        &device_tables.kv_v_ptrs,
+        v_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_v_layers,
+        kv_layer_index,
+        n_kv_heads,
+        head_dim,
+        row_count,
+    )
+}
+
+/// KVarN companion to [`prefill_session_batch_attention_q8_layer`].
+///
+/// Takes three pointer tables where the Q8/F32 arms take two: records, window,
+/// and V. Each row's `n_full_blocks` is derived inside the kernel from its own
+/// `positions[row]`, so rows at different sequence lengths coexist in one launch
+/// — which is the whole reason this path can batch sessions at all.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_session_batch_attention_kvarn_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    q_batch: &GpuTensor,
+    out_batch: &GpuTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    max_ctx_len: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed KVarN attention layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.attention_kvarn_routed_batched(
+        q_batch,
+        &device_tables.kv_k_ptrs,
+        &device_tables.kv_win_ptrs,
+        &device_tables.kv_v_ptrs,
+        out_batch,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        max_ctx_len,
+        row_count,
+    )
+}
+
+/// One session's completed KVarN block, ready to gather+quantize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvarnBlockFlush {
+    pub session_index: usize,
+    /// Block ordinal within the session — `records[block_index]` is the target.
+    pub block_index: usize,
+}
+
+/// Which sessions complete a KVarN block over `rows`, and where the row range
+/// must be split so no session crosses more than one boundary per launch.
+///
+/// Returns `(split_points, flushes)`. `split_points` are row indices at which the
+/// caller must stop, run the flushes accumulated so far, and resume; the last
+/// entry is always `rows.len()`. A session that writes `group` or more rows in
+/// one launch would wrap its own window and silently destroy tokens the flush had
+/// not yet quantized, which is why this is computed rather than assumed.
+///
+/// Pure — no GPU, so it is unit-testable against the boundary arithmetic that is
+/// otherwise only observable as corrupted attention.
+pub fn grouped_moe_prefill_session_batch_kvarn_block_flushes(
+    rows: &[DensePrefillSessionBatchPrefixRowSlot],
+    group: usize,
+) -> (Vec<usize>, Vec<Vec<KvarnBlockFlush>>) {
+    assert!(group > 0, "KVarN block group must be non-zero");
+    let mut splits = Vec::new();
+    let mut flushes: Vec<Vec<KvarnBlockFlush>> = Vec::new();
+
+    // Cut after EVERY row that completes a block. Batching adjacent completions
+    // from different sessions into one segment would also be correct, but only
+    // if no session recurs within the merged span — and getting that wrong
+    // corrupts a window with no observable symptom until attention reads it.
+    // Completions are rare (one per `group` tokens per session), so the extra
+    // segments cost far less than the reasoning does.
+    for (idx, row) in rows.iter().enumerate() {
+        if row.position % group == group - 1 {
+            splits.push(idx + 1);
+            flushes.push(vec![KvarnBlockFlush {
+                session_index: row.session_index,
+                block_index: row.position / group,
+            }]);
+        }
+    }
+    // Trailing segment: the rows after the last completion still have to be
+    // written, and they flush nothing.
+    if splits.last() != Some(&rows.len()) {
+        splits.push(rows.len());
+        flushes.push(Vec::new());
+    }
+    (splits, flushes)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
