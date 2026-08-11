@@ -241,6 +241,45 @@ kvarn port, or land both together.
   size that fuses — below 4 it is policy-serial, at 4+ it errors. The kvarn port is
   therefore not an optimization; it is a prerequisite for measuring the v2 plan's
   central amortization claim at all.
+- **Port RE-SIZED 2026-08-11 — the 2026-08-10 sizing below was materially wrong.**
+  It said the port was "(1) add a kvarn dispatch arm using the existing
+  `attention_kvarn_routed_batched`, (2) widen the validator". Step 1 is real but
+  incomplete, and it omits the entire write half:
+  - **`attention_kvarn_routed_batched` is READ-ONLY.** Its doc is explicit — "K
+    dequant is in place", "Mirrors `attention_q8_0_routed_batched`". It does not
+    write KV (`hipfire-rdna/src/dispatch/attention.rs:1169`).
+  - **It needs THREE pointer tables, not two:** `rec_ptrs` (4-bit K block
+    records), `win_ptrs` (f32 recent window), `v_ptrs` (Q8_0 V). The f32/q8 arms
+    take `kv_k_ptrs`/`kv_v_ptrs`. So
+    `DensePrefillSessionBatch{Host,Device}PointerTables` and
+    `...PointerTableShape` each need a third table plumbed through
+    `validate_shape` and every construction site (19 refs, 2 files — contained).
+  - **There is no routed kvarn write, at all.** In kvarn the write is fused into
+    `kvarn_attend` (`hipfire-rdna/src/dispatch/kv.rs:1609`), which is
+    single-session by construction: it takes `records`/`window`/`v_cache` as bare
+    tensors with one scalar `start_pos`, and appends K via a HOST-side loop of
+    `memcpy_dtod_at_auto` at 128-token block boundaries. Routed rows have per-row
+    sessions and per-row positions, so none of that transfers. `kernels/src/`
+    has `kv_cache_write_{f32,q8_0}_routed_batched.hip` and no kvarn equivalent.
+
+  **Two ways to close the write gap, and they differ by ~an order of magnitude:**
+
+  | option | cost | captures |
+  |---|---|---|
+  | A: new routed kvarn K-write kernel | a new HIP kernel (quantize + append routed by `row_session_indices`/`row_positions`) | everything |
+  | B: keep the write per-session (loop the existing single-session append), route only ATTENTION | plumbing + a loop | nearly everything — see below |
+
+  **Recommend B first.** The measurement that decode is *launch-bound* (a width-1
+  step is 1322 launches in 11.3 ms, ~8.5 us each) also bounds what B costs: at
+  width 16 a per-session write loop is 16 sessions x 10 attention layers = ~160
+  copy ops per step against an 87 ms step — order 1.5%. Attention is the part that
+  actually amortizes, and B routes it. A is the right end state but should be
+  justified by a measurement of B's residual, not assumed.
+
+  Ordering is unchanged and still load-bearing: **widen
+  `validate_grouped_moe_prefill_session_batch_state_contract` LAST.** Widening it
+  before a kvarn read/write path exists routes kvarn KV into the Q8 kernel, which
+  is silent corruption rather than an error.
 - **Port sized 2026-08-10 — and relaxing the validator ALONE would be a
   correctness bug.** `prefill_batch.rs` dispatches exactly two attention kernels:
   ```
