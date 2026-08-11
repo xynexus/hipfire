@@ -2460,6 +2460,35 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
     hipfire_runtime::quant::dtype_for_quant_type(qt, k)
 }
 
+/// Explain an unpageable routed-expert quant type at the point of rejection.
+///
+/// Quant type 16 is BF16, which appears in an otherwise-quantized artifact when
+/// calibration ran with `--expert-coverage-policy preserve-undercovered`: experts
+/// the corpus barely activated are kept at source precision. The 122B carries 644
+/// such experts, and they are what stops it paging.
+fn paged_moe_quant_hint(qt: u8) -> &'static str {
+    match qt {
+        16 => {
+            " (BF16 — this artifact was quantized with \
+             --expert-coverage-policy preserve-undercovered, which keeps \
+             undercovered routed experts at source precision. The paged MoE \
+             decode kernel handles only OQ routed dtypes, so such an artifact \
+             cannot be paged; requantize so every routed expert is OQ, or load \
+             it fully resident)"
+        }
+        _ => "",
+    }
+}
+
+/// Routed-expert dtype for the paged MoE path.
+///
+/// Deliberately NARROWER than the resident path. Mapping BF16 (16) to F16 here
+/// was tried and reverted: the model then loads fine (12288 modules, 9.3 GB
+/// resident, 6.2 of 71.9 GiB streamed) and panics on the first decode with
+/// `moe.decode-routed-dtype-unsupported-no-fallback`, because the paged MoE
+/// decode kernel accepts only OQ routed dtypes. Widening this map turns a clear
+/// load-time rejection into a mid-generation panic, so it stays narrow until the
+/// kernel gains an F16 routed path.
 pub(super) fn paged_moe_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
     hipfire_runtime::quant::oq_gpu_dtype_for_quant_type(qt).or_else(|| slab_dtype_for_quant(qt, k))
 }
@@ -6317,6 +6346,28 @@ fn load_moe_expert(
         _ => return load_weight_tensor(hfq, gpu, slabs, name, m, k),
     };
     let buf = gpu.upload_raw(&blocks, &[blocks.len()])?;
+    // The MoE-block repack must carry the AWQ sidecar exactly as
+    // `load_weight_tensor` does. `--ldlq` pre-scales routed-expert weights at
+    // quantize time (the artifact stores W·s), so the forward has to divide x
+    // by s — and `rotate_x_mq_for` decides that purely from
+    // `awq_scale.is_some()`, falling back to the non-AWQ rotation otherwise.
+    //
+    // Hardcoding `None` here therefore computed (W·s)·x instead of W·x on EVERY
+    // routed expert, silently: the fallback exists so pre-AWQ artifacts stay
+    // byte-identical, so nothing errors. This is the same failure documented on
+    // `load_awq_scale_for` for MQ4 (KLD 0.6721 → 13.4893), reintroduced for OQ
+    // by this repack path. Measured here on a 35B-A3B oq4.25++ carrying 20476
+    // expert sidecars: KLD 0.030367 → 5.108296 (ppl 7.46 → 1171.67), with the
+    // per-block residual trace diverging at LAYER 0 (cosine 0.244, norm 16x) —
+    // a scale error from the first layer, not accumulated drift.
+    //
+    // Both Oq4G256 and Oq8G256 declare `supports_awq_sidecar()`. Artifacts
+    // without sidecars (real W8A8 Oq8) return None and keep the old behaviour.
+    let awq_scale = if dtype.supports_awq_sidecar() {
+        load_awq_scale_for(hfq, gpu, name, k)
+    } else {
+        None
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: dtype,
@@ -6324,7 +6375,7 @@ fn load_moe_expert(
         k,
         row_stride: 0,
         paro: None,
-        awq_scale: None,
+        awq_scale,
     })
 }
 
@@ -6480,8 +6531,9 @@ fn load_moe_ffn_paged(
                 HipError::new(
                     0,
                     &format!(
-                        "paged MoE expert {expert} gate_up has unsupported quant type {}",
-                        gate_up.quant_type
+                        "paged MoE expert {expert} gate_up has unsupported quant type {}{}",
+                        gate_up.quant_type,
+                        paged_moe_quant_hint(gate_up.quant_type)
                     ),
                 )
             })?,
@@ -6491,8 +6543,9 @@ fn load_moe_ffn_paged(
                 HipError::new(
                     0,
                     &format!(
-                        "paged MoE expert {expert} down has unsupported quant type {}",
-                        down.quant_type
+                        "paged MoE expert {expert} down has unsupported quant type {}{}",
+                        down.quant_type,
+                        paged_moe_quant_hint(down.quant_type)
                     ),
                 )
             },
