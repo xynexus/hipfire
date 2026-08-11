@@ -5708,6 +5708,37 @@ mod tests {
         }
     }
 
+    /// Walk the splits exactly as the layer body does and assert the segments
+    /// tile `[0, rows)` — contiguous, non-overlapping, nothing dropped. The loop
+    /// writes `[seg_start, split)` per segment, so a gap silently skips a K row
+    /// (attention then reads a stale window slot) and an overlap rewrites one.
+    #[test]
+    fn kvarn_segment_walk_tiles_the_batch_exactly() {
+        for group in [4usize, 16, 128] {
+            let rows: Vec<_> = (0..37)
+                .map(|i| kvarn_row(i % 4, (i / 4) + (i % 4) * 5))
+                .collect();
+            let (splits, flushes) =
+                grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+            assert_eq!(splits.len(), flushes.len());
+
+            let mut covered = vec![0usize; rows.len()];
+            let mut seg_start = 0usize;
+            for &split in &splits {
+                assert!(split >= seg_start, "group={group}: splits must not regress");
+                for slot in covered.iter_mut().take(split).skip(seg_start) {
+                    *slot += 1;
+                }
+                seg_start = split;
+            }
+            assert_eq!(seg_start, rows.len(), "group={group}: last split must end the batch");
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "group={group}: every row must be written exactly once, got {covered:?}"
+            );
+        }
+    }
+
     #[test]
     fn dense_session_prefill_pointer_table_indices_are_deterministic() {
         let shape = DensePrefillSessionBatchPointerTableShape {
