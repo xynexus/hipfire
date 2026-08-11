@@ -218,13 +218,23 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
     if m.q35_scratch.is_none() {
         return Err("qwen35 grouped-MoE decode requires single-GPU qwen35 scratch".to_string());
     }
+    // The KV flags must reflect the LOADED model, not a convenient constant.
+    // Hardcoding `kv_quant_q8: true` made this probe's KV test vacuous: it passed
+    // for every mode, so an ineligible KV mode was not caught at selection time
+    // and instead failed inside the decode advance — which is why turning the
+    // KVarN gate off produced hard request failures rather than a fall back to
+    // SerialReference.
+    let kvarn_kv = m
+        .q35_kv_mode
+        .as_deref()
+        .is_some_and(|mode| mode.starts_with("kvarn"));
     let signatures = vec![
         qwen35::DensePrefillSessionBatchStateSignature {
             kv_physical_cap: 128,
             kv_compact_offset: 0,
             kv_quantized: true,
-            kv_quant_q8: true,
-            kv_quant_kvarn: false,
+            kv_quant_q8: !kvarn_kv,
+            kv_quant_kvarn: kvarn_kv,
             kv_quant_asym2: false,
             kv_quant_asym3: false,
             kv_quant_asym4: false,
