@@ -3250,7 +3250,10 @@ pub(crate) fn forward_prefill_dense_session_batch_with_capture(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
+/// Renamed from `..._prefix_q8_kv`: the path now also carries KVarN, and a name
+/// asserting Q8 is the same class of stale label that made the lowered-forward
+/// doc comments misleading. `kvarn` being `Some` selects the KVarN arms.
+fn forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -3260,6 +3263,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
     delta_f16: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
@@ -3279,7 +3283,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         None,
         None,
         true,
-        None,
+        kvarn,
         delta_f16,
     )
 }
@@ -3374,6 +3378,8 @@ pub(crate) fn forward_streamed_grouped_moe_layer_batch(
         capture,
         dense_capture,
         false,
+        // Streamed calibration runs FP32 KV, never KVarN — it is a one-layer
+        // view with no session batch behind it.
         None,
         false,
     )
@@ -4525,7 +4531,43 @@ pub fn forward_prefill_grouped_moe_session_batch(
             ));
         }
     }
-    let result = forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
+    // KVarN needs three things the pointer tables cannot carry: the routes (for
+    // records/window tensors), gather scratch, and the segment/flush plan. Build
+    // them once for the whole batch — the plan is row-shaped, not layer-shaped.
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let kvarn_state = if kvarn_batch {
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(
+            &pointer_table_plan.prefix_rows,
+            group,
+        );
+        // Not `?`: an early return here would skip the pointer-table free below
+        // and leak it. Mirrors the row bounds check above, which frees first.
+        let tiles = match gpu.alloc_tensor(
+            &[config.n_kv_heads * config.head_dim * group],
+            hipfire_rdna::DType::F32,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                device_pointer_tables.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+        Some((splits, flushes, tiles))
+    } else {
+        None
+    };
+    let kvarn_ctx = kvarn_state
+        .as_ref()
+        .map(|(splits, flushes, tiles)| KvarnBatchFlushContext {
+            routes: &routes,
+            tiles,
+            group,
+            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            splits,
+            flushes,
+        });
+
+    let result = forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
         gpu,
         weights,
         config,
@@ -4535,8 +4577,13 @@ pub fn forward_prefill_grouped_moe_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
+        kvarn_ctx.as_ref(),
         delta_f16,
     );
+    drop(kvarn_ctx);
+    if let Some((_, _, tiles)) = kvarn_state {
+        let _ = gpu.free_tensor(tiles);
+    }
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
 }
