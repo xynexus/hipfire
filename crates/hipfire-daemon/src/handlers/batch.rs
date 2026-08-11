@@ -181,6 +181,17 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
 pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     match validate_generate_batch_decode(&msg) {
         Ok(envelope) => {
+            // How wide each fused decode step actually is. Without this, a flat
+            // aggregate-throughput curve is unattributable: N sessions arriving
+            // as N one-row steps (never coalesced) looks identical from outside
+            // to N sessions in one step that fails to amortise the weight pass.
+            // Those are opposite defects.
+            if std::env::var("HIPFIRE_BATCH_WIDTH_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "  [batch] decode_step rows={}",
+                    envelope.sessions.len()
+                );
+            }
             let target_worker_id = message_worker_id(&msg);
             match activate_model_worker(
                 &target_worker_id,

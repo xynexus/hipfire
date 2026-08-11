@@ -809,15 +809,28 @@ and that module-major execution exists to remove. Until now that claim rested on
 the architecture of `batch_runner.rs`; it now has a measurement on the target
 model.
 
-Read it carefully, though — it is not yet evidence FOR the amortization curve:
-- widths 2-3 are far below the N where §0.4 predicts sharing pays (the curve only
-  bends past ~`n_exp / k` token-slots), so this measures the pathology, not the
-  remedy;
-- it runs the `serial` prefill backend, not the fused one, so some of the
-  flatness may be prefill serialisation rather than decode;
-- batch >= 4 is still blocked on the fused grouped-MoE path hard-requiring Q8 KV
-  (see BUGS.md), so 16/64/128 — the widths §0.4's table actually argues about —
-  remain unmeasured.
+**CONFIRMED 2026-08-10 — the batch coalesces and the fused step does not
+amortise.** The flat curve above had three candidate explanations; two are now
+falsified and the third is measured:
+
+| candidate | verdict |
+|---|---|
+| prefill serialisation (`serial` backend) | **no** — repeated at 128-token generations, decode-dominated; still flat (14.55 / 14.66 / 14.74 tok/s at batch 1/2/3) |
+| the 10 ms coalescing gather window | **no** — `HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS=500` changed nothing (13.63 / 14.19 / 14.37) |
+| sessions never coalescing | **no** — `HIPFIRE_BATCH_WIDTH_TRACE=1` shows `48 decode_step rows=3`, i.e. every step is full width |
+
+So three sessions *are* fused into each decode step, and wall time is still exactly
+linear in batch (7.0 / 14.0 / 20.9 s). **A width-3 fused decode step costs ~3x a
+width-1 step: the rows share a step but not a pass over the weights.** That is
+precisely the deficiency §0 asserts and §0.4's amortization curve is meant to
+remove — previously argued from the structure of `batch_runner.rs`, now measured
+on the target model.
+
+Still not evidence FOR the curve: widths 2-3 sit far below the N where sharing is
+predicted to pay (past ~`n_exp / k` token-slots), and batch >= 4 remains blocked on
+the fused grouped-MoE path hard-requiring Q8 KV (see BUGS.md), so 16/64/128 —
+the widths §0.4 actually argues about — are still unmeasured. What is established
+is the *pathology*, at the exact place the design targets it.
 
 **Where the 72 ms actually goes is the open question.** 3B active params at oq4
 is ~1.5 GB/token, i.e. ~15 ms at gfx1103's ~100 GB/s — so warm decode is running
