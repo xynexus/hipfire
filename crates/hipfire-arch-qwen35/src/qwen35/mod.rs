@@ -1858,6 +1858,23 @@ fn moe_decode_dispatch_flags_for_dtypes(
 /// garbage. Both sites now read this.
 pub(crate) const INDEXED_MOE_K_TOP: usize = 8;
 
+/// `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=1` admits KVarN KV to the fused grouped-MoE
+/// session batch, which otherwise hard-requires Q8.
+///
+/// Default OFF while the path is being brought up. The whole point of the port is
+/// that KVarN becomes the batchable mode, so this gate is temporary — but it
+/// stays until a real model run shows parity against the Q8 baseline, because the
+/// failure mode here is a corrupted K window rather than an error, and a wrong
+/// default would miscompute every batched request silently.
+pub fn qwen35_kvarn_fused_batch_enabled() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_QWEN35_KVARN_FUSED_BATCH")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("on")
+    )
+}
+
 pub(crate) fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
     // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
     // falls back. One shared parse — this must agree with the loader's
@@ -4878,6 +4895,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .expect("A3B MQ4 control path uses grouped MoE with Q8 state");
 
@@ -4890,8 +4908,54 @@ mod tests {
             &[fp32_sig, fp32_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .expect("grouped MoE uses its routed FP32 DeltaNet branch when sessions require it");
+
+        // KVarN is admitted ONLY when the caller opts in. Both directions matter:
+        // rejecting it while the port is gated off is what keeps KVarN KV out of
+        // the Q8 kernel, and that mis-route is silent corruption rather than an
+        // error, so it is asserted rather than assumed.
+        let kvarn_sig = DensePrefillSessionBatchStateSignature {
+            kv_quant_q8: false,
+            kv_quant_kvarn: true,
+            ..q8_sig
+        };
+        let err = validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[kvarn_sig, kvarn_sig],
+            &plan,
+            "gfx1151",
+            false,
+        )
+        .expect_err("KVarN must be refused while the fused KVarN batch is gated off");
+        assert!(err.contains("must use Q8"), "unexpected error: {err}");
+
+        validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[kvarn_sig, kvarn_sig],
+            &plan,
+            "gfx1151",
+            true,
+        )
+        .expect("KVarN is admitted once the caller opts in");
+
+        // Opting in must not smuggle in the modes that were never supported —
+        // the asym/fwht rejection is independent of the KVarN widening.
+        let asym_sig = DensePrefillSessionBatchStateSignature {
+            kv_quant_q8: false,
+            kv_quant_kvarn: false,
+            kv_quant_asym3: true,
+            ..q8_sig
+        };
+        validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[asym_sig, asym_sig],
+            &plan,
+            "gfx1151",
+            true,
+        )
+        .expect_err("allow_kvarn must not admit asym3");
     }
 
     #[test]
@@ -4933,6 +4997,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(dense_err.contains("requires Qwen35 MoE/A3B weights"));
@@ -4949,6 +5014,7 @@ mod tests {
             &[fp32_kv, fp32_kv],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(fp32_err.contains("must use Q8 KV state"));
@@ -4966,6 +5032,7 @@ mod tests {
             &[asym_kv, asym_kv],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(asym_err.contains("unsupported KV quantization flags"));
@@ -4975,6 +5042,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx942",
+            false,
         )
         .unwrap_err();
         assert!(arch_err.contains("requires an RDNA grouped-MoE target"));

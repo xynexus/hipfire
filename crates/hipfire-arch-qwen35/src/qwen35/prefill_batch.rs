@@ -1359,11 +1359,16 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
     Ok(())
 }
 
+/// `allow_kvarn` widens the KV requirement from Q8-only to "Q8 or KVarN". It is
+/// an explicit parameter rather than an env read so the contract stays pure and
+/// both sides of it are unit-testable; the caller supplies
+/// `qwen35_kvarn_fused_batch_enabled()`.
 pub fn validate_grouped_moe_prefill_session_batch_state_contract(
     config: &Qwen35Config,
     signatures: &[DensePrefillSessionBatchStateSignature],
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     arch: &str,
+    allow_kvarn: bool,
 ) -> Result<(), String> {
     if config.num_experts == 0 || !config.has_shared_expert {
         return Err(
@@ -1398,9 +1403,11 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
                 signature.kv_compact_offset,
             ));
         }
-        if !signature.kv_quantized || !signature.kv_quant_q8 {
+        let kvarn_ok = allow_kvarn && signature.kv_quant_kvarn;
+        if !signature.kv_quantized || !(signature.kv_quant_q8 || kvarn_ok) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} must use Q8 KV state for the MQ4 control path"
+                "grouped MoE session fused prefix row {idx} must use Q8{} KV state for the MQ4 control path",
+                if allow_kvarn { " or KVarN" } else { "" },
             ));
         }
         if signature.kv_quant_asym2
@@ -4428,13 +4435,18 @@ pub fn forward_prefill_grouped_moe_session_batch(
             dn_quant: row.dn_state.quant,
         })
         .collect();
+    let kvarn_fused = qwen35_kvarn_fused_batch_enabled();
     validate_grouped_moe_prefill_session_batch_state_contract(
         config,
         &signatures,
         &execution_plan,
         gpu.arch.as_str(),
+        kvarn_fused,
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    // Every row shares one KV layout (the contract above guarantees it), so one
+    // row's flag decides the batch.
+    let kvarn_batch = kvarn_fused && signatures.iter().all(|s| s.kv_quant_kvarn);
     // Signature validation guarantees one state layout for every row. Select
     // the already-implemented routed recurrence branch once for the batch.
     // FP16 state is half the stride of FP32, so the routed kernel and the state
@@ -4446,7 +4458,14 @@ pub fn forward_prefill_grouped_moe_session_batch(
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len(), 0);
+        dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            rows.len(),
+            // KVarN needs a window pointer per layer per session; every other
+            // mode keeps one K buffer and wants the table absent.
+            if kvarn_batch { route_shape.kv_k_layers } else { 0 },
+        );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
