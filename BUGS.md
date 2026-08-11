@@ -67,7 +67,7 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
-## [Medium] Fused grouped-MoE batch diverges substantially from serial decode — pre-existing, both KV modes
+## [Low] Fused grouped-MoE batch diverges from serial decode — systematic, NOT contamination
 
 Found 2026-08-11 while validating the KVarN port, using the shipped Q8 path as a
 control. Same model, same KV mode, same greedy decode, same prompts; the only
@@ -100,6 +100,30 @@ Next step if pursued: a logit-level comparison rather than text. Note
 `HIPFIRE_FORWARD_ORACLE`, which `superop.rs:39` advertises for exactly this
 ("available for dual-run diffing"), is **not implemented** — the name appears in
 that doc comment and nowhere else in the tree.
+
+**DOWNGRADED 2026-08-11 (Medium -> Low): sessions are independent.** The test that
+separates "different but valid" from "rows contaminate each other" is whether a
+session's output depends on WHO ELSE is in the batch. Same probe prompt, greedy,
+one daemon lifetime, batch 4 both times, only the other three rows changed:
+
+| KV | probe alone | probe + companions X | probe + companions Y | X vs Y |
+|---|---|---|---|---|
+| kvarn | 776 chars | 762 | 762 | **byte-identical (762)** |
+| q8 | 784 chars | 769 | 769 | **byte-identical (769)** |
+
+Under both KV modes the probe's output is unchanged by its batch companions. So
+the fused path does not leak state across rows, and it is deterministic: the
+serial-vs-fused difference is the same 17-character divergence point regardless
+of KV format AND regardless of batch content.
+
+That makes this a systematic difference between two implementations of the same
+math — reduction order and precision in the routed batched kernels versus the
+per-session ones — rather than corruption or nondeterminism. Greedy decoding
+turns one near-tie into a different continuation, which is why a benign numeric
+difference presents as 1.7% common prefix.
+
+Still worth a logit-level check if the fused path is ever leaned on for
+throughput, but it is not a correctness blocker and it is not new.
 
 ## [High] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
 
