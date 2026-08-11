@@ -131,10 +131,24 @@ wrong answers first:
   `HIPFIRE_KVARN_ROTATE=0` test appear to exonerate the rotation. Fixed by
   prefilling four IDENTICAL prompts.
 
-Residual: dense text parity is 3/4 diverging vs the Q8 control's 1/4. With the K
-state now at the noise floor this is consistent with 4-bit K sitting closer to
-near-ties than 8-bit and flipping greedy decisions more often, but it has not been
-proven, and the decode arm has not been separately verified.
+**All three write paths re-verified numerically after the fix** — the earlier
+text-based verification is superseded:
+
+| path | max abs delta vs serial | slots affected |
+|---|---|---|
+| grouped-MoE prefill (35B-A3B--oq4) | **0.0044** | 0..24, all prefilled |
+| dense prefill (0.8B-Base--oq8) | **0.070** | 0..18, all prefilled |
+| dense DECODE, 19 steps | **0.083** | **19..37 only** — prefill slots 0..18 identical |
+
+The decode row is the tidiest evidence in the set: with both runs sharing one
+fused prefill, slots 0..18 come back bit-identical and only the decode-written
+slots differ, and then only at the noise floor. Right slots, right values.
+
+Residual: dense text parity is 3/4 diverging vs the Q8 control's 1/4. With K at
+the noise floor on every path, this is consistent with 4-bit K sitting closer to
+near-ties than 8-bit and flipping greedy decisions more often. Consistent, not
+proven — text is the wrong instrument for the question, which is what this whole
+investigation demonstrated.
 
 ## [Superseded by the above] KVarN dense arm diverges from serial far more than the Q8 control
 
