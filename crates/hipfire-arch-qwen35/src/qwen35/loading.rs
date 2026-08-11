@@ -3752,6 +3752,8 @@ pub fn collect_calibration_artifacts_job_with_residual_probe(
                     &plan,
                     expected_dense_prefill_session_state_route_shape(config),
                     inputs.len(),
+                    // Calibration streams FP32 KV, never KVarN.
+                    0,
                 );
                 if !resident_calibration_rows_match_frozen_schedule(
                     batch.sequence_start,
