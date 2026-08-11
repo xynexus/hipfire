@@ -300,9 +300,26 @@ kvarn port, or land both together.
   verified that `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0` with KVarN KV makes batch >= 4
   requests FAIL rather than fall back to `SerialReference`. Anyone reaching for the
   kill switch during an incident would trade a suspected numerical issue for hard
-  request failures. Wiring the capability predicate into backend *selection* (so a
-  refusal degrades instead of erroring) is what makes the switch safe, and is now
-  the highest-value follow-up in this entry.
+  request failures.
+- **FIXED 2026-08-11 — the refusal now happens at SELECTION, on both paths.** Two
+  separate holes, and the second was the interesting one:
+  - prefill: `validate_qwen35_fused_grouped_moe_prefill_model_capability`
+    (`serving-core/src/session.rs`) never looked at the KV mode, so selection
+    could not see the incompatibility. Added a narrow check that rejects exactly
+    KVarN-with-the-gate-off and leaves every other mode's routing untouched.
+  - decode: `validate_qwen35_grouped_moe_decode_model_capability` built a
+    SYNTHETIC probe signature with `kv_quant_q8: true` hardcoded, which made its
+    KV test vacuous — it passed for every mode, including modes the body would
+    then reject. The probe now derives its flags from `m.q35_kv_mode`. A
+    capability probe that asserts the capability it is meant to test is worse than
+    no probe: it reports "supported" for a configuration that fails on the next
+    call.
+
+  Verified end to end. With `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0` and KVarN KV,
+  batch 4 now SUCCEEDS and its output is byte-identical to serial on 4/4 prompts
+  (i.e. it really did route to `SerialReference`); with the gate at its default it
+  diverges on 2/4, the fused signature. The divergence profile doubles as a
+  backend detector, which is how selection was confirmed rather than assumed.
 - **Consequence worth stating plainly: batched MoE decode is presently
   unreachable.** q8 is on `DEPRECATED_KV_MODES` (`serving-core/src/load.rs:533`)
   and the fused path requires q8, so on every supported KV mode there is no batch

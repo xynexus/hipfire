@@ -473,7 +473,7 @@ pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1467",
+    source: "crates/hipfire-serving-core/src/session.rs:1487",
 };
 
 /// `HIPFIRE_DAEMON_SCHED_DEBUG` — order does NOT report what the daemon actually chose. This trace is the
@@ -4010,14 +4010,14 @@ pub const ENV_HIPFIRE_QWEN35_BF16_HEAD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH",
     description: "Defaults to auto when unset",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:369",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:379",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH_MAX` — Runtime variable controlling qwen35 decode batch max in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH_MAX",
     description: "Runtime variable controlling qwen35 decode batch max in hipfire",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:493",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:503",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` — Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior
@@ -4025,14 +4025,14 @@ pub const ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY",
     description:
         "Interprets \"HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:569",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:579",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` — Runtime variable controlling qwen35 decode native multirow in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW",
     description: "Runtime variable controlling qwen35 decode native multirow in hipfire",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:519",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:529",
 };
 
 /// `HIPFIRE_QWEN35_EXPERT_CACHE_BYTES` — Runtime variable controlling qwen35 expert cache bytes in hipfire
@@ -4832,7 +4832,7 @@ pub const ENV_HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling server resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1468",
+    source: "crates/hipfire-serving-core/src/session.rs:1488",
 };
 
 /// `HIPFIRE_SMOKE_KV` — Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
