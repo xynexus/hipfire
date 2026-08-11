@@ -1854,6 +1854,8 @@ fn paro_load_moe_ffn(
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
     let expert_down_dtypes = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) =
+        build_expert_awq_ptr_tables(gpu, &experts)?;
 
     Ok(MoeFfnWeights {
         router,
@@ -1862,6 +1864,8 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         layer_idx,
         expert_shape: None,
         expert_gate_up_dtype,
@@ -2458,6 +2462,39 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
     // Canonical map lives in hipfire_runtime::quant (shared across all arch
     // loaders). Thin alias retained for the slab-planning call sites.
     hipfire_runtime::quant::dtype_for_quant_type(qt, k)
+}
+
+/// Build the per-expert AWQ scale pointer tables consumed by
+/// `rotate_x_mq_awq_indexed_batched`, mirroring `expert_gate_up_ptrs`.
+///
+/// Returns `(None, None)` when NO routed expert carries a sidecar — the plain
+/// rotation is then already correct, so callers keep the cheaper path and stay
+/// byte-identical to before. A per-expert 0 entry means "this expert has no
+/// sidecar" and the kernel falls back to the plain rotation for that slot,
+/// which is what mixed artifacts need.
+fn build_expert_awq_ptr_tables(
+    gpu: &mut Gpu,
+    experts: &[ExpertWeights],
+) -> HipResult<(Option<GpuTensor>, Option<GpuTensor>)> {
+    if experts.is_empty()
+        || !experts
+            .iter()
+            .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some())
+    {
+        return Ok((None, None));
+    }
+    let mut build = |sel: &dyn Fn(&ExpertWeights) -> Option<&GpuTensor>| -> HipResult<GpuTensor> {
+        let bytes: Vec<u8> = experts
+            .iter()
+            .flat_map(|e| sel(e).map_or(0u64, |t| t.buf.as_ptr() as u64).to_ne_bytes())
+            .collect();
+        let t = gpu.alloc_tensor(&[2 * experts.len()], DType::F32)?;
+        gpu.hip.memcpy_htod(&t.buf, &bytes)?;
+        Ok(t)
+    };
+    let gu = build(&|e: &ExpertWeights| e.gate_up.awq_scale.as_ref())?;
+    let dn = build(&|e: &ExpertWeights| e.down.awq_scale.as_ref())?;
+    Ok((Some(gu), Some(dn)))
 }
 
 /// Explain an unpageable routed-expert quant type at the point of rejection.
@@ -6301,10 +6338,9 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-        .ok()
-        .as_deref()
-        == Some("1");
+    // Shared parse — see `oq_indexed_decode_enabled`. The repack below and the
+    // dispatch predicate must never disagree on what enables this path.
+    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_enabled();
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6447,6 +6483,8 @@ fn load_moe_ffn(
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
     let expert_down_dtypes = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) =
+        build_expert_awq_ptr_tables(gpu, &experts)?;
 
     Ok(MoeFfnWeights {
         router,
@@ -6455,6 +6493,8 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -6558,6 +6598,24 @@ fn load_moe_ffn_paged(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &zero_ptrs)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &zero_ptrs)?;
 
+    // Paged mode: `experts` is empty (the pager owns the buffers), so there are
+    // no WeightTensors to read `awq_scale` from and no per-expert AWQ tables.
+    // `None` selects the plain rotation, which is correct ONLY while paged
+    // artifacts carry no routed-expert AWQ sidecars — true of the 122B today
+    // (it has zero). If that changes, the AWQ divide would be silently dropped
+    // for paged experts, so this warns rather than degrading quietly.
+    if hfq
+        .find_tensor_info(&format!("{p}.mlp.experts.0.gate_up_proj.awq_scale.weight"))
+        .is_some()
+    {
+        eprintln!(
+            "warning: paged MoE layer {p} has routed-expert AWQ sidecars, which the \
+             paged path cannot apply (experts are not resident). Expect degraded \
+             quality; load fully resident for AWQ-scaled routed experts."
+        );
+    }
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) = (None, None);
+
     Ok(MoeFfnWeights {
         router,
         experts: Vec::new(),
@@ -6565,6 +6623,8 @@ fn load_moe_ffn_paged(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         layer_idx,
         expert_shape: Some(hipfire_runtime::weight_pager::ExpertShape {
             gate_up_m: 2 * mi,

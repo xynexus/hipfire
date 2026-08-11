@@ -153,6 +153,72 @@ impl Gpu {
     }
     /// Phase A Stage A — F2 batched AWQ variant of `rotate_x_mq`.
     /// Grid.y is the batch dim — processes [N × K] x/x_rot.
+    /// Per-EXPERT AWQ rotate: expands `x` [n_tokens x k] into `x_rot`
+    /// [n_tokens x k_top x k], each slot divided by the awq_scale of the expert
+    /// `topk_indices` selects for it.
+    ///
+    /// `expert_awq_ptrs` is a device table of `n_exp` u64 pointers to [k] f32
+    /// vectors (0 for experts without a sidecar → plain rotation for that slot,
+    /// byte-identical to `rotate_x_mq_batched`). Built exactly like
+    /// `expert_gate_up_ptrs`. `None` — no expert at this layer has a sidecar —
+    /// gives every slot the plain rotation, so this is also the plain per-slot
+    /// expander: the indexed gate_up GEMVs read `x` per slot whether or not AWQ
+    /// is in play, so callers need this kernel either way and never a branch.
+    ///
+    /// The indexed MoE path previously shared ONE rotation across all routed
+    /// experts, which is only correct when they share an AWQ scale — measured
+    /// false on a 35B-A3B oq4.25++. See the kernel preamble.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate_x_mq_awq_indexed_batched(
+        &mut self,
+        x: &GpuTensor,
+        expert_awq_ptrs: Option<&GpuTensor>,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        k_top: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rotate_x_mq_awq_indexed_batched",
+            kernels::ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC,
+            "rotate_x_mq_awq_indexed_batched",
+        )?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let slots = (n_tokens * k_top) as u32;
+        let xp = x.buf.as_ptr();
+        let ap = expert_awq_ptrs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let ip = topk_indices.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let ktv = k_top as i32;
+        let bytes = (k * 4 * 2 + 2 * 256 * 4) * n_tokens * k_top;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            "rotate_x_mq_awq_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "rotate_x_mq_awq_indexed_batched",
+            [n_groups, slots, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr ap, ptr ip, ptr xrp, ptr s1, ptr s2, i32 kv, i32 ktv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        // The rotated buffer is written in place; drop any cached view of it,
+        // matching `rotate_x_mq_awq_batched`.
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     pub fn rotate_x_mq_awq_batched(
         &mut self,
         x: &GpuTensor,

@@ -87,8 +87,17 @@ fn main() {
         .upload_raw(&vec![0u8; k_top * mi * 4], &[k_top, mi])
         .unwrap();
 
-    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr_tensor, &topk_tensor, &xd, &y_gate, &y_up, m, k)
-        .unwrap();
+    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
+        &ptr_tensor,
+        &topk_tensor,
+        &xd,
+        &y_gate,
+        &y_up,
+        m,
+        k,
+        false,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
     let yg = gpu.download_f32(&y_gate).unwrap();
     let yu = gpu.download_f32(&y_up).unwrap();

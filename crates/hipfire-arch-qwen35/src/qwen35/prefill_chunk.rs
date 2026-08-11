@@ -1230,30 +1230,55 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         n,
                     )?;
                 }
-                // Opus Quant routed experts (indexed Path 1; no grouped-WMMA kernel).
-                // x_rot_batch is FWHT-rotated above like the MQ path.
-                DType::Oq4G256 => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    topk_indices,
-                    &pbs.x_rot_batch,
-                    gate_batch,
-                    up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )?,
-                DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    topk_indices,
-                    &pbs.x_rot_batch,
-                    gate_batch,
-                    up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )?,
+                // Opus Quant routed experts (indexed Path 1; no grouped-WMMA
+                // kernel). These read x PER SLOT, not the shared
+                // `x_rot_batch`: routed experts carry DIFFERENT AWQ scales
+                // (each sees a different token subset, hence a different
+                // imatrix), and the divide must precede the FWHT, so one
+                // rotation cannot serve them all. Expand x_norm_batch into
+                // [N × K_TOP × dim], each slot divided by its own expert's
+                // scale. See `rotate_x_mq_awq_indexed_batched`; with no
+                // sidecars (paged mode included) this is the plain rotation
+                // replicated per slot, which the kernels still require.
+                dt @ (DType::Oq4G256 | DType::Oq8G256) => {
+                    let x_rot_slots = pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
+                    gpu.rotate_x_mq_awq_indexed_batched(
+                        &pbs.x_norm_batch,
+                        ffn.expert_gate_up_awq_ptrs.as_ref(),
+                        topk_indices,
+                        x_rot_slots,
+                        gate_up_k,
+                        k_top,
+                        n,
+                    )?;
+                    if dt == DType::Oq4G256 {
+                        gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                            &ffn.expert_gate_up_ptrs,
+                            topk_indices,
+                            x_rot_slots,
+                            gate_batch,
+                            up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true, // x_rot_slots is [N x K_TOP x dim]
+                        )?;
+                    } else {
+                        gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                            &ffn.expert_gate_up_ptrs,
+                            topk_indices,
+                            x_rot_slots,
+                            gate_batch,
+                            up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true, // x_rot_slots is [N x K_TOP x dim]
+                        )?;
+                    }
+                }
                 other => panic!(
                     "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                              experts[0].gate_up dtype {other:?} — admit predicate should \
@@ -1315,6 +1340,21 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             gpu.silu_mul_f32(gate_batch, up_batch, rot_batch)?;
         } else if ffn.experts.is_empty() {
             gpu.fused_silu_mul_rotate_mq_batched(gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+        } else if let Some(down_awq) = ffn.expert_down_awq_ptrs.as_ref() {
+            // Per-expert AWQ on the down input. `experts[0].down` is NOT
+            // representative: routed experts carry different scales for the
+            // same reason they do on the gate_up side. `rot_batch` is already
+            // one row per (token, krank), so only the scale lookup changes —
+            // select it on device from topk_indices.
+            gpu.fused_silu_mul_rotate_mq_awq_indexed(
+                gate_batch,
+                up_batch,
+                Some(down_awq),
+                topk_indices,
+                rot_batch,
+                mi,
+                n * k_top,
+            )?;
         } else {
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
@@ -1766,10 +1806,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         gate_batch,
         up_batch,
         rot_batch,
         down_expanded,
+        x_rot_expanded: pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch"),
         expert_token_counts: &grouped_scratch.expert_token_counts,
         expert_offsets: &grouped_scratch.expert_offsets,
         sorted_slot_index: &grouped_scratch.sorted_slot_index,

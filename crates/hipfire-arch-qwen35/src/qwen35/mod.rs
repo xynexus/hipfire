@@ -534,6 +534,13 @@ pub struct Qwen35Scratch {
     // non-deterministic wavefront-order-dependent FP rounding under hipGraph
     // replay (task #100).
     pub moe_down_expanded: Option<GpuTensor>,
+    // Per-slot rotated gate_up input — [k × dim] f32, the mirror of
+    // `moe_down_expanded` on the input side. The indexed OQ gate_up GEMVs read
+    // one rotated basis PER (token, krank) because routed experts carry
+    // different AWQ scales; `moe_x_rot` holds only the shared single-basis
+    // rotation and cannot serve them. Written by
+    // `rotate_x_mq_awq_indexed_batched`.
+    pub moe_x_rot_expanded: Option<GpuTensor>,
     // Mixed paged-expert decode uses one tile-sized bucket at a time so the
     // launch dtype matches that expert's pointer layout. Persistent scratch
     // keeps the decode path allocation-free and works for K=8 and K=10.
@@ -692,6 +699,7 @@ impl Qwen35Scratch {
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            moe_x_rot_expanded: None,
             moe_bucket_sorted: None,
             moe_bucket_inverse: None,
             moe_bucket_tile_ids: None,
@@ -729,6 +737,7 @@ impl Qwen35Scratch {
                 s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Atomic-free decode MoE down output: [k × dim].
                 s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
+                s.moe_x_rot_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
                 s.moe_bucket_sorted = Some(gpu.alloc_tensor(&[16 * 4], DType::Raw)?);
                 s.moe_bucket_inverse = Some(gpu.alloc_tensor(&[k * 4], DType::Raw)?);
                 s.moe_bucket_tile_ids = Some(gpu.alloc_tensor(&[4], DType::Raw)?);
@@ -811,6 +820,7 @@ impl Qwen35Scratch {
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
+            self.moe_x_rot_expanded,
             self.moe_bucket_sorted,
             self.moe_bucket_inverse,
             self.moe_bucket_tile_ids,
@@ -1836,14 +1846,10 @@ fn moe_decode_dispatch_flags_for_dtypes(
 }
 
 fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
-    // HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 re-enables the experimental indexed
-    // routed OQ decode kernels while debugging their finite-KLD failure.
-    matches!(
-        std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("on")
-    )
+    // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
+    // falls back. One shared parse — this must agree with the loader's
+    // MoE-block repack or the dispatch runs against un-repacked weights.
+    hipfire_dispatch::families::moe::oq_indexed_decode_enabled()
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {

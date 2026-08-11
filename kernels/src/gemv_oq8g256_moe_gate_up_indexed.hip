@@ -11,6 +11,14 @@
 // w = sc * (int8) (symmetric). W8A16 at decode: int8 weight x f32 activation.
 //
 // Grid (M, K_TOP=8, 1), block = 32 threads (8 int8 / lane).
+//
+// `x_per_slot` selects the activation layout. 1: `x` is [K_TOP x K] — one
+// rotated basis PER EXPERT. Routed experts are AWQ-pre-scaled with DIFFERENT
+// per-channel vectors, so each needs x/s_e, and the divide cannot be hoisted
+// (it must precede the FWHT, and the FWHT mixes channels);
+// `rotate_x_mq_awq_indexed_batched` produces that buffer. 0: `x` is a single
+// shared [K] row, which is correct only when the routed experts at this layer
+// share a scale (or carry none) — callers without per-expert AWQ tables.
 
 #define OQ8_BLK 260
 
@@ -18,10 +26,11 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [k_top]
-    const float* __restrict__ x,                         // [K]
+    const float* __restrict__ x,                         // [K] or [K_TOP × K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+    int M, int K,
+    int x_per_slot                                       // see preamble
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -31,6 +40,7 @@ extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed(
     const int expert_id = topk_indices[krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x_row = x + (long long)(x_per_slot ? krank : 0) * K;
 
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * OQ8_BLK;
@@ -45,7 +55,7 @@ extern "C" __global__ void gemv_oq8g256_moe_gate_up_k8_indexed(
         float gsum = 0.0f;
         #pragma unroll
         for (int n = 0; n < 8; n++) {
-            gsum += (float)w8[n] * x[base + n];
+            gsum += (float)w8[n] * x_row[base + n];
         }
         acc += sc * gsum;
     }
