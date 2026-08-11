@@ -80,6 +80,7 @@ fn fp32_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignatu
         kv_compact_offset: 0,
         kv_quantized: false,
         kv_quant_q8: false,
+        kv_quant_kvarn: false,
         kv_quant_asym2: false,
         kv_quant_asym3: false,
         kv_quant_asym4: false,
@@ -92,6 +93,7 @@ fn q8_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignature
     qwen35::DensePrefillSessionBatchStateSignature {
         kv_quantized: true,
         kv_quant_q8: true,
+        kv_quant_kvarn: false,
         dn_quant: qwen35::StateQuant::FP32,
         ..fp32_decode_state_signature()
     }
