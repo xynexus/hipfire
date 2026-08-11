@@ -114,10 +114,18 @@ fn main() {
         .upload_raw(&win_ptr_bytes, &[windows.len() * 2])
         .unwrap(); // u64 = 2 u32 elems
 
-    gpu.kv_cache_write_kvarn_window_routed_batched(
-        &winp, &kd, &rsid, &posd, 1, 0, N_KV_HEADS, HEAD_DIM, GROUP, n_rows,
-    )
-    .unwrap();
+    // Write in SEGMENTS, not one launch — this is how the flush loop drives it,
+    // and it exercises `row_offset`. Segment boundaries are deliberately uneven
+    // and the buffers passed are always the FULL batch, so an off-by-one in the
+    // absolute row indexing shows up as a wrong-slot or wrong-session write
+    // rather than silently working.
+    let segments: [(usize, usize); 3] = [(0, 2), (2, 5), (7, n_rows - 7)];
+    for (off, cnt) in segments {
+        gpu.kv_cache_write_kvarn_window_routed_batched(
+            &winp, &kd, &rsid, &posd, 1, 0, N_KV_HEADS, HEAD_DIM, GROUP, off, cnt,
+        )
+        .unwrap();
+    }
     gpu.device_synchronize().unwrap();
 
     let mut bad_written = 0usize;

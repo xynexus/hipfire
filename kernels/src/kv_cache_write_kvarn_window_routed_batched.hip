@@ -30,7 +30,13 @@
 // flush has not yet quantized. Callers split the row range at block boundaries
 // (mirrors the `take`-chunked loop in `kvarn_attend`).
 //
-// Grid: [ceil(kv_dim / 256), batch_size, 1]; block [256, 1, 1].
+// `row_offset` exists to serve that contract without slicing buffers: a caller
+// walking segments passes the SAME full-batch `src`/`row_session_indices`/
+// `positions` every time and moves the window of rows it writes. Row indices are
+// therefore absolute (`row_offset + blockIdx.y`), so the row tables stay aligned
+// with `src` and nothing has to build offset views per segment.
+//
+// Grid: [ceil(kv_dim / 256), row_count, 1]; block [256, 1, 1].
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -38,18 +44,20 @@
 __launch_bounds__(256)
 extern "C" __global__ void kv_cache_write_kvarn_window_routed_batched(
     const uint64_t* __restrict__ win_ptrs,       // [num_sessions * ptr_layer_stride]
-    const float* __restrict__ src,               // [batch_size * kv_dim] token-major
-    const int* __restrict__ row_session_indices, // [batch_size]
-    const int* __restrict__ positions,           // [batch_size] absolute positions
+    const float* __restrict__ src,               // [total_rows * kv_dim] token-major
+    const int* __restrict__ row_session_indices, // [total_rows]
+    const int* __restrict__ positions,           // [total_rows] absolute positions
     int ptr_layer_stride,
     int layer_index,
     int n_kv_heads,
     int head_dim,
     int group,
-    int batch_size
+    int row_offset,                              // first row of this segment
+    int row_count                                // rows in this segment
 ) {
-    const int b = blockIdx.y;
-    if (b >= batch_size) return;
+    if ((int)blockIdx.y >= row_count) return;
+    // Absolute row index: src and the row tables are always the FULL batch.
+    const int b = row_offset + (int)blockIdx.y;
 
     const int kv_dim = n_kv_heads * head_dim;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

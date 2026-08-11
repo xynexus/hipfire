@@ -1392,7 +1392,14 @@ impl Gpu {
     /// more than that in one launch would overwrite tokens the flush has not yet
     /// quantized — silently, since nothing reads them again until attention.
     /// Split the row range at block boundaries, as `kvarn_attend` does with its
-    /// `take`-chunked loop.
+    /// `take`-chunked loop;
+    /// `grouped_moe_prefill_session_batch_kvarn_block_flushes` computes where.
+    ///
+    /// `row_offset`/`row_count` select that segment. `src`, `row_session_indices`
+    /// and `positions` are always the FULL batch and row indices are absolute, so
+    /// a segment loop re-passes the same buffers and only moves the window — no
+    /// per-segment tensor views, and the row tables cannot drift out of step with
+    /// `src`.
     #[allow(clippy::too_many_arguments)]
     pub fn kv_cache_write_kvarn_window_routed_batched(
         &mut self,
@@ -1405,7 +1412,8 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         group: usize,
-        batch_size: usize,
+        row_offset: usize,
+        row_count: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1423,19 +1431,20 @@ impl Gpu {
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
         let grp = group as i32;
-        let bs = batch_size as i32;
+        let roff = row_offset as i32;
+        let rcnt = row_count as i32;
 
         const BLOCK: usize = 256;
         let kv_dim = n_kv_heads * head_dim;
         let grid_x = kv_dim.div_ceil(BLOCK) as u32;
         self.launch_kernargs(
             "kv_cache_write_kvarn_window_routed_batched",
-            [grid_x, batch_size as u32, 1],
+            [grid_x, row_count as u32, 1],
             [BLOCK as u32, 1, 1],
             0,
             &kernargs![
                 ptr win_ptrs_ptr, ptr src_ptr, ptr row_session_indices_ptr, ptr pos_ptr,
-                i32 ptr_stride, i32 layer, i32 nkv, i32 hd, i32 grp, i32 bs
+                i32 ptr_stride, i32 layer, i32 nkv, i32 hd, i32 grp, i32 roff, i32 rcnt
             ],
         )
     }
