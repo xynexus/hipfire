@@ -67,6 +67,42 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [Medium] No available Qwen3.5 artifact can exercise the fused DENSE batch path — all VL-wrap
+
+Found 2026-08-11 while trying to verify the KVarN dense port. Three non-AWQ dense
+artifacts were quantized specifically for this and none reaches the fused dense
+backend:
+
+| artifact | source | result |
+|---|---|---|
+| `Qwen3.5-0.8B--oq4.hfq` | HF snapshot | serial (4.00x launches at width 4) |
+| `Qwen3.5-0.8B--oq8.hfq` | HF snapshot | serial |
+| `Qwen3.5-0.8B-Base--oq8.hfq` | `.hfa`, quantizer reports `Architecture: qwen3_5 (id=5)` | serial |
+
+Every one logs `qwen3.5-vl text wrapper: mrope_interleaved=true` at load, so the
+runtime wraps it as VL regardless of the arch the QUANTIZER reports, and
+`is_qwen35_dense_arch_id(m.arch_id)` is false — the first term of the fused dense
+decode selection. Note the quantizer and the runtime disagree about the
+architecture of the same file, which is worth a look on its own.
+
+**Not a KVarN problem.** The Q8 control on the same model is also 4.00x serial,
+i.e. the path is refused in the mode it was built for. Two earlier hypotheses were
+tested and killed the same way: AWQ pre-scaling (removed, still serial) and an
+unaccepted weight dtype (`oq8` maps to the accepted `Oq8G256`, still serial).
+
+Consequences:
+- the KVarN **dense** arm is code-complete but unexercised; the grouped-MoE arm is
+  the verified one.
+- `docs/plans/2026-08-09-v2-daemon-module-major-multistream.md` names
+  `qwen3.5-0.8b--oq4++.hfq` as the first-demonstration interactive model and calls
+  it "arch 5 (dense)". It is not — it VL-wraps too. M3's demonstration needs a
+  different model, and "dense is correct here: it isolates the scheduling claim
+  from the MoE claim" does not hold with this artifact.
+
+To verify either, a genuinely non-VL dense model is needed. Every Qwen3.5 variant
+on hand (`0.8B`, `0.8B-Base`) carries the mrope/VL metadata that triggers the
+wrapper.
+
 ## [Low] Fused grouped-MoE batch diverges from serial decode — systematic, NOT contamination
 
 Found 2026-08-11 while validating the KVarN port, using the shipped Q8 path as a

@@ -1302,8 +1302,17 @@ this box regardless of scheduling.**
 **It lands at the end of M3**, before any module splitting, because the top-priority goal
 is latency and latency is provable with super-op suspension alone.
 
-- **Interactive:** `~/.hipfire/models/qwen3.5-0.8b--oq4++.hfq` — on disk, arch 5 (dense).
-  Dense is *correct* here: it isolates the scheduling claim from the MoE claim.
+- **Interactive:** ~~`~/.hipfire/models/qwen3.5-0.8b--oq4++.hfq` — on disk, arch 5
+  (dense)~~ **INVALID, corrected 2026-08-11.** That artifact loads through the
+  qwen3.5-VL text wrapper (`qwen3.5-vl text wrapper: mrope_interleaved=true` at
+  load), so `is_qwen35_dense_arch_id` is false and it never reaches a fused dense
+  backend. Verified by launch counts: width-4 decode issues 4.00x the launches of
+  width 1, i.e. a per-row loop. Re-quantizing without AWQ does not help, and
+  neither does the `-Base` variant — the quantizer reports
+  `Architecture: qwen3_5 (id=5)` for it while the runtime still VL-wraps it (see
+  BUGS.md). The reasoning below — "dense is correct here: it isolates the
+  scheduling claim from the MoE claim" — still stands, but it needs a model that
+  is actually dense at runtime, and no Qwen3.5 variant on hand is.
 - **Bulk:** the same artifact as a second resident worker driving a LoRA session, so VRAM
   is not the confound.
 - **MoE artifact for M4–M7:** built 2026-08-09 from
