@@ -114,6 +114,7 @@ pub fn validate_qwen35_grouped_moe_decode_session_signatures(
     signatures: &[qwen35::DensePrefillSessionBatchStateSignature],
     session_count: usize,
     arch: &str,
+    allow_kvarn: bool,
 ) -> Result<(), String> {
     let execution_plan = qwen35::DensePrefillSessionBatchExecutionPlan {
         rounds: Vec::new(),
@@ -130,6 +131,7 @@ pub fn validate_qwen35_grouped_moe_decode_session_signatures(
         signatures,
         &execution_plan,
         arch,
+        allow_kvarn,
     )
 }
 
@@ -231,7 +233,13 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
         };
         session_count
     ];
-    validate_qwen35_grouped_moe_decode_session_signatures(config, &signatures, session_count, arch)
+    validate_qwen35_grouped_moe_decode_session_signatures(
+        config,
+        &signatures,
+        session_count,
+        arch,
+        qwen35::qwen35_kvarn_fused_batch_enabled(),
+    )
         .map_err(|e| format!("qwen35 grouped-MoE decode unsupported model contract: {e}"))?;
     Ok(())
 }
