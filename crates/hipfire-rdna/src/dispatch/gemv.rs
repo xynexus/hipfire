@@ -3884,6 +3884,14 @@ impl Gpu {
     // signed, no zero-point — see kernels/src/gemv_oq4g256_moe_*).
 
     /// OQ4 decode gate_up (batch=1). Grid (M, K_TOP=8, 1), wave32.
+    ///
+    /// `x_per_slot`: `false` — `x` is one shared `[k]` row. `true` — `x` is
+    /// `[k_top × k]`, one rotated basis per krank, as
+    /// [`Self::rotate_x_mq_awq_indexed_batched`] writes. Pass `true` whenever
+    /// the routed experts carry per-expert AWQ scales: they do NOT share one
+    /// (measured on a 35B-A3B oq4.25++), and the divide cannot be folded into
+    /// this GEMV because it must precede the FWHT.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -3893,6 +3901,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -3907,16 +3916,21 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let xps = i32::from(x_per_slot);
         self.launch_kernargs(
             "gemv_oq4g256_moe_gate_up_k8_indexed",
             [m as u32, 8, 1],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val],
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 xps],
         )
     }
 
     /// OQ4 batched gate_up. Grid (M, K_TOP, N), wave32.
+    ///
+    /// `x_per_slot`: `false` — `x` is `[batch_size × k]`. `true` — `x` is
+    /// `[batch_size × k_top × k]`. See
+    /// [`Self::gemv_oq4g256_moe_gate_up_k8_indexed`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4g256_moe_gate_up_k8_indexed_batched(
         &mut self,
@@ -3929,6 +3943,7 @@ impl Gpu {
         k: usize,
         k_top: usize,
         batch_size: usize,
+        x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -3944,12 +3959,13 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let xps = i32::from(x_per_slot);
         self.launch_kernargs(
             "gemv_oq4g256_moe_gate_up_k8_indexed_batched",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 kt_val],
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 kt_val, i32 xps],
         )
     }
 
@@ -3994,6 +4010,9 @@ impl Gpu {
     // load. 260 B blocks [f32 scale | 256 int8]. Mirrors the OQ4 methods.
 
     /// OQ8 decode gate_up (batch=1). Grid (M, K_TOP=8, 1), wave32.
+    ///
+    /// `x_per_slot`: see [`Self::gemv_oq4g256_moe_gate_up_k8_indexed`].
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq8g256_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -4003,6 +4022,7 @@ impl Gpu {
         y_up: &GpuTensor,
         m: usize,
         k: usize,
+        x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -4017,16 +4037,19 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let xps = i32::from(x_per_slot);
         self.launch_kernargs(
             "gemv_oq8g256_moe_gate_up_k8_indexed",
             [m as u32, 8, 1],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val],
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 xps],
         )
     }
 
     /// OQ8 batched gate_up. Grid (M, K_TOP, N), wave32.
+    ///
+    /// `x_per_slot`: see [`Self::gemv_oq4g256_moe_gate_up_k8_indexed_batched`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq8g256_moe_gate_up_k8_indexed_batched(
         &mut self,
@@ -4039,6 +4062,7 @@ impl Gpu {
         k: usize,
         k_top: usize,
         batch_size: usize,
+        x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -4054,12 +4078,13 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let xps = i32::from(x_per_slot);
         self.launch_kernargs(
             "gemv_oq8g256_moe_gate_up_k8_indexed_batched",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 kt_val],
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 kt_val, i32 xps],
         )
     }
 

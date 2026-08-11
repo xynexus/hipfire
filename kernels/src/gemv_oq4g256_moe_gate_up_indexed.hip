@@ -28,10 +28,16 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq4g256_moe_gate_up_k8_indexed(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
     const int* __restrict__ topk_indices,                // [k_top]
-    const float* __restrict__ x,                         // [K]
+    const float* __restrict__ x,                         // [K] or [K_TOP × K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+    int M, int K,
+    // 0: `x` is one shared [K] row for all kranks. 1: `x` is [K_TOP × K], one
+    // rotated basis per krank — required when routed experts carry DIFFERENT
+    // AWQ scales, because each then needs its own x/s_e and the divide cannot
+    // be hoisted (it must precede the FWHT, which mixes channels).
+    // `rotate_x_mq_awq_indexed_batched` produces the per-slot buffer.
+    int x_per_slot
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -42,9 +48,7 @@ extern "C" __global__ void gemv_oq4g256_moe_gate_up_k8_indexed(
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 
-    // Per-expert rotated basis: slot krank. `x` is [K_TOP x K] — routed
-    // experts carry DIFFERENT AWQ scales, so each needs its own x/s_e.
-    const float* __restrict__ x_row = x + (long long)krank * K;
+    const float* __restrict__ x_row = x + (long long)(x_per_slot ? krank : 0) * K;
     const int groups_per_row = K / 256;
     const char* row_ptr = A + (long long)row * groups_per_row * OQ4_BLK;
     const int boff = tid * 4;

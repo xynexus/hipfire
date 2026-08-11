@@ -50,6 +50,24 @@ pub struct MoeDtypes {
     pub has_paro_shared: bool, // ffn.paro_shared.is_some()
 }
 
+/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — the single parse of the flag that gates
+/// the experimental indexed routed-OQ path.
+///
+/// It MUST stay single. Three sites used to parse it independently and two
+/// spellings disagreed: the loader's MoE-block repack and this resolver
+/// accepted only `"1"`, while qwen35's dispatch predicate also accepted
+/// `"on"`. `=on` therefore enabled the indexed dispatch against weights that
+/// were never repacked for it — guaranteed garbage, from a value that looks
+/// like it should work.
+pub fn oq_indexed_decode_enabled() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("on")
+    )
+}
+
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
 /// routing-config logic, relocated from `moe_ffn_decode_impl` into one typed,
 /// testable place (review finding #1). Pure function of `MoeDtypes` + k.
@@ -71,11 +89,7 @@ pub struct MoeResolution {
 
 impl MoeResolution {
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
-        let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-            .ok()
-            .as_deref()
-            == Some("1");
-        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode)
+        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode_enabled())
     }
 
     pub fn resolve_with_oq_indexed(d: &MoeDtypes, k: usize, oq_indexed_decode: bool) -> Self {
@@ -188,6 +202,15 @@ pub struct MoeParams<'a> {
     // routed expert pointer tables + dims
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert AWQ scale pointer tables, same shape and construction as the
+    /// weight pointer tables above. Routed experts do NOT share one AWQ scale
+    /// (each sees a different token subset, so a different imatrix), and the
+    /// divide must precede the FWHT, so the rotation is per (token, krank).
+    /// `None` when no expert at this layer carries a sidecar — the rotation is
+    /// then plain, but still per-slot, because the indexed OQ GEMVs read `x`
+    /// per slot either way.
+    pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
+    pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
@@ -224,6 +247,10 @@ pub struct MoeParams<'a> {
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
+    /// `[k × hidden]` f32 — per-slot rotated gate_up input, the input-side
+    /// mirror of `down_expanded`. Written by
+    /// `rotate_x_mq_awq_indexed_batched`; see `expert_gate_up_awq_ptrs`.
+    pub x_rot_expanded: &'a GpuTensor,
 }
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────
@@ -407,12 +434,19 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert AWQ scale pointer tables — see [`MoeParams`]'s fields of the
+    /// same name.
+    pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
+    pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
     // intermediate buffers
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,
     pub rot_batch: &'a GpuTensor,
     // Path 1 expanded-down scratch
     pub down_expanded: &'a GpuTensor,
+    /// `[N × k_top × gate_up_k]` f32 — per-slot rotated gate_up input, the
+    /// input-side mirror of `down_expanded`.
+    pub x_rot_expanded: &'a GpuTensor,
     // Path 2 scatter scratch (model-owned)
     pub expert_token_counts: &'a GpuTensor,
     pub expert_offsets: &'a GpuTensor,

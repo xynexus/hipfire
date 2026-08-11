@@ -1127,6 +1127,13 @@ pub const OPUS_NPU_IO_SRC: &str = include_str!("../../../kernels/src/opus_npu_io
 /// signs1 gather and FWHT.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
+/// Per-EXPERT AWQ variant of the above, for the indexed MoE down_proj stage:
+/// each (token, krank) slot divides by ITS expert's awq_scale, selected on
+/// device from `topk_indices`. The down-side mirror of
+/// [`ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC`] — see that kernel's preamble for why
+/// one shared scale is wrong for routed experts.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.

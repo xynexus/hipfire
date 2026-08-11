@@ -160,7 +160,10 @@ impl Gpu {
     /// `expert_awq_ptrs` is a device table of `n_exp` u64 pointers to [k] f32
     /// vectors (0 for experts without a sidecar → plain rotation for that slot,
     /// byte-identical to `rotate_x_mq_batched`). Built exactly like
-    /// `expert_gate_up_ptrs`.
+    /// `expert_gate_up_ptrs`. `None` — no expert at this layer has a sidecar —
+    /// gives every slot the plain rotation, so this is also the plain per-slot
+    /// expander: the indexed gate_up GEMVs read `x` per slot whether or not AWQ
+    /// is in play, so callers need this kernel either way and never a branch.
     ///
     /// The indexed MoE path previously shared ONE rotation across all routed
     /// experts, which is only correct when they share an AWQ scale — measured
@@ -169,7 +172,7 @@ impl Gpu {
     pub fn rotate_x_mq_awq_indexed_batched(
         &mut self,
         x: &GpuTensor,
-        expert_awq_ptrs: &GpuTensor,
+        expert_awq_ptrs: Option<&GpuTensor>,
         topk_indices: &GpuTensor,
         x_rot: &GpuTensor,
         k: usize,
@@ -188,7 +191,7 @@ impl Gpu {
         let n_groups = (k / 256) as u32;
         let slots = (n_tokens * k_top) as u32;
         let xp = x.buf.as_ptr();
-        let ap = expert_awq_ptrs.buf.as_ptr();
+        let ap = expert_awq_ptrs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
         let ip = topk_indices.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
         let kv = k as i32;

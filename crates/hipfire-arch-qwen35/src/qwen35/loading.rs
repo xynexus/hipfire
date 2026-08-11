@@ -6338,10 +6338,9 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-        .ok()
-        .as_deref()
-        == Some("1");
+    // Shared parse — see `oq_indexed_decode_enabled`. The repack below and the
+    // dispatch predicate must never disagree on what enables this path.
+    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_enabled();
     if !oq_indexed_decode
         && matches!(
             qt,

@@ -36,7 +36,11 @@ const OQ8_BLK: usize = 260;
 const GROUP: usize = 256;
 
 fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 { a } else { gcd(b, a % b) }
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 fn lcg(seed: u32, n: usize) -> Vec<u32> {
@@ -56,7 +60,11 @@ fn lcg_i8(seed: u32, n: usize) -> Vec<i8> {
         .into_iter()
         .map(|s| {
             let v = (((s >> 11) & 0x7f) as i8).min(127);
-            if s & 1 == 0 { v } else { -v }
+            if s & 1 == 0 {
+                v
+            } else {
+                -v
+            }
         })
         .collect()
 }
@@ -73,7 +81,11 @@ fn main() {
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
     let k: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(768);
     let n_exp: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(4);
-    assert_eq!(m % 2, 0, "M must be even — the kernel splits rows into gate|up");
+    assert_eq!(
+        m % 2,
+        0,
+        "M must be even — the kernel splits rows into gate|up"
+    );
     assert_eq!(k % GROUP, 0, "K must be a multiple of {GROUP}");
     assert!(n_exp > 0);
     let ng = k / GROUP;
@@ -95,7 +107,9 @@ fn main() {
     // Stride coprime with n_exp so every expert is actually selected; a shared
     // factor silently visits only a subgroup and leaves arms untested.
     let stride = (1..n_exp.max(2)).find(|s| gcd(*s, n_exp) == 1).unwrap_or(1);
-    let topk: Vec<i32> = (0..K_TOP).map(|j| ((j * stride + 1) % n_exp) as i32).collect();
+    let topk: Vec<i32> = (0..K_TOP)
+        .map(|j| ((j * stride + 1) % n_exp) as i32)
+        .collect();
 
     // ── indexed layout: interleaved 260 B blocks, one blob per expert ────────
     let mut blobs = Vec::with_capacity(n_exp);
@@ -122,7 +136,10 @@ fn main() {
     gpu.hip.memcpy_htod(&ptr_tbl.buf, &ptr_bytes).unwrap();
     let topk_d = gpu
         .upload_raw(
-            &topk.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>(),
+            &topk
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<u8>>(),
             &[K_TOP],
         )
         .unwrap();
@@ -130,9 +147,13 @@ fn main() {
     // ── non-batched: x is [K_TOP x K], a DIFFERENT basis per krank ──────────
     let x: Vec<f32> = lcg_unit(3, K_TOP * k);
     let xd = gpu.upload_raw(&f32b(&x), &[K_TOP * k]).unwrap();
-    let ygate = gpu.upload_raw(&vec![0u8; K_TOP * mi * 4], &[K_TOP * mi]).unwrap();
-    let yup = gpu.upload_raw(&vec![0u8; K_TOP * mi * 4], &[K_TOP * mi]).unwrap();
-    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr_tbl, &topk_d, &xd, &ygate, &yup, m, k)
+    let ygate = gpu
+        .upload_raw(&vec![0u8; K_TOP * mi * 4], &[K_TOP * mi])
+        .unwrap();
+    let yup = gpu
+        .upload_raw(&vec![0u8; K_TOP * mi * 4], &[K_TOP * mi])
+        .unwrap();
+    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr_tbl, &topk_d, &xd, &ygate, &yup, m, k, true)
         .unwrap();
     gpu.device_synchronize().unwrap();
     let idx_gate = gpu.download_f32(&ygate).unwrap();
@@ -171,7 +192,8 @@ fn main() {
             .upload_raw(&f32b(&x[krank * k..krank * k + k]), &[1, k])
             .unwrap();
         let yd = gpu.upload_raw(&vec![0u8; m * 4], &[m]).unwrap();
-        gpu.gemv_oq8_grouped(&wd, &sd, &xslot, &yd, m, k, GROUP).unwrap();
+        gpu.gemv_oq8_grouped(&wd, &sd, &xslot, &yd, m, k, GROUP)
+            .unwrap();
         gpu.device_synchronize().unwrap();
         let grouped = gpu.download_f32(&yd).unwrap();
 
@@ -228,7 +250,10 @@ fn main() {
     let xbd = gpu.upload_raw(&f32b(&xb), &[batch * K_TOP * k]).unwrap();
     let tkbd = gpu
         .upload_raw(
-            &topk_b.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>(),
+            &topk_b
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<u8>>(),
             &[batch * K_TOP],
         )
         .unwrap();
@@ -239,7 +264,7 @@ fn main() {
         .upload_raw(&vec![0u8; batch * K_TOP * mi * 4], &[batch * K_TOP * mi])
         .unwrap();
     gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-        &ptr_tbl, &tkbd, &xbd, &ygb, &yub, m, k, K_TOP, batch,
+        &ptr_tbl, &tkbd, &xbd, &ygb, &yub, m, k, K_TOP, batch, true,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();

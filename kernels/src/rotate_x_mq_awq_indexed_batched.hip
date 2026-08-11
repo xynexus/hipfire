@@ -31,7 +31,11 @@
 //
 // A null awq pointer means that expert carries no sidecar; the slot then gets
 // the plain rotation, matching `rotate_x_mq_batched` byte-for-byte so mixed
-// artifacts (some experts AWQ-scaled, some not) stay correct.
+// artifacts (some experts AWQ-scaled, some not) stay correct. A null TABLE
+// (expert_awq_ptrs itself) means no expert at this layer has one: every slot
+// takes the plain rotation, so this kernel is also the per-slot expander for
+// non-AWQ artifacts and callers need no second code path. The expansion is
+// required regardless of AWQ — the indexed gate_up GEMVs read x per slot.
 
 extern "C" __launch_bounds__(32, 16)
 __global__ void rotate_x_mq_awq_indexed_batched(
@@ -51,14 +55,15 @@ __global__ void rotate_x_mq_awq_indexed_batched(
 
     const int slot = blockIdx.y;          // token * K_TOP + krank
     const int token = slot / K_TOP;
-    const int expert_id = topk_indices[slot];
 
     // Input is shared across kranks (every routed expert consumes the same
     // post-rmsnorm x); only the scale and the destination differ.
     const float* __restrict__ x_in_b = x_in + (long long)token * K;
     float* __restrict__ x_out_b = x_out + (long long)slot * K;
     const float* __restrict__ awq =
-        reinterpret_cast<const float*>(expert_awq_ptrs[expert_id]);
+        expert_awq_ptrs == nullptr
+            ? nullptr
+            : reinterpret_cast<const float*>(expert_awq_ptrs[topk_indices[slot]]);
 
     int d0 = tid * 8;
     int base = group * 256 + d0;

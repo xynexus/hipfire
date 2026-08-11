@@ -1,41 +1,19 @@
 # Handover — indexed OQ MoE decode, and the 122B serving path
 
-Written 2026-08-12 at the end of a long session. Read this first, then
-`docs/todo/2026-08-11-122b-paged-serving.md` for the full investigation trail
-(including the dead ends, which are worth not re-walking).
+Written 2026-08-12. Updated the same day after steps 5 and 6 landed. Read this
+first, then `docs/todo/2026-08-11-122b-paged-serving.md` for the full
+investigation trail (including the dead ends, which are worth not re-walking).
 
 ## One-paragraph state
 
-The `HIPFIRE_QWEN35_MOE_OQ_INDEXED` finite-KLD failure is **root-caused**:
-routed experts carry DIFFERENT per-channel AWQ scales, but the indexed MoE path
-rotates the activation once per layer with the SHARED expert's scale and hands
-that one buffer to all of them. The fix (per-expert rotation) is **60% landed
-and each landed piece is verified**; what remains is mechanical scratch-buffer
-plumbing in two forward paths. The flag stays OFF, and there is a landmine if
-anyone turns it on before that plumbing lands — see "Landmine" below.
-
-## On origin/master
-
-- `0dd015f24 fix(qwen35): carry the AWQ sidecar through the MoE-block repack` —
-  necessary but NOT sufficient; the commit message says so explicitly.
-- `0d1ea653d docs(quant-formats): reimplementation-grade KVarN spec`
-
-Everything else from this session is on the WIP branch
-**`origin/wip/indexed-oq-per-expert-awq`** (branched from
-`feat/hfa-calibrate-source`, NOT from master — `ldlq.rs` and friends differ
-between them, so a master-based branch would conflict):
-
-- `35893d958 wip(qwen35): per-expert AWQ rotation for indexed OQ MoE — 3 of 5 steps`
-- `3a69a20c2 wip(quantize): close the ADMM/Kronecker investigation — all levers negative`
-
-Neither is proposed for master; see "Landmine" for why the serving one must not
-land as-is. Start from that branch, not from a dirty tree.
-
-Still uncommitted and deliberately so: `.agents/scheduled_tasks.lock` (session
-state), `P1-correction.md` and `opus-improvements-conversation-extract.md`
-(pre-existing, not from this session), and `docs/quant-formats/kvarn.md` — its
-content is already on master via `0d1ea653d`, so re-adding it would only create a
-merge conflict.
+The `HIPFIRE_QWEN35_MOE_OQ_INDEXED` finite-KLD failure is **root-caused and
+fixed**: routed experts carry DIFFERENT per-channel AWQ scales, but the indexed
+MoE path rotated the activation once per layer with one representative's scale
+and handed that single buffer to all of them — on BOTH the gate_up side and the
+down side. Per-expert rotation is now wired through every dispatch site, and
+verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
+from **0.244 to 0.999999**, with no layer below 0.9994 across all 40. The flag is
+still off by default pending the KLD number below.
 
 ## The bug, in one paragraph
 
@@ -43,76 +21,101 @@ merge conflict.
 `W·s`, so the forward must compute `(W·s)·(x/s) = W·x`. The divide must precede
 the FWHT (the FWHT mixes channels, so `FWHT(x/s) != FWHT(x)/s`), which means it
 cannot be folded into the GEMV — every expert needs its own rotated buffer. The
-indexed path instead builds ONE `pbs.x_rot_batch` per layer
-(`prefill_chunk.rs:148`) using the shared expert's scale, and feeds it to every
-routed expert. Measured on the 35B-A3B oq4.25++: expert0/expert1/expert7/shared
-AWQ payloads all differ (control: the same tensor extracted twice hashes
+indexed path instead built ONE rotation per layer and fed it to every routed
+expert. Measured on the 35B-A3B oq4.25++: expert0/expert1/expert7/shared AWQ
+payloads all differ (control: the same tensor extracted twice hashes
 identically). Routing is exactly why they differ — each expert sees a different
 token subset, hence a different imatrix, hence a different `s`.
 
-Symptoms this explains: KLD 0.030367 -> 5.108296 (ppl 7.46 -> 1171.67) with the
-flag on; per-block residual divergence at **layer 0** (cosine 0.244, norm 16x —
-a scale error from the first layer, not accumulated drift); decode output
-degenerating to `"The capital of France 是斯"`.
+The same argument applies to `down_proj` and was missed for longer, because the
+comment there claimed all experts "share the same input residual basis". They do
+not: down_proj's input is each expert's OWN hidden state.
 
-## What is landed and verified (on `wip/indexed-oq-per-expert-awq`, commit `35893d958`)
+## What is landed
+
+Steps 1–4 (commit `35893d958`), unchanged:
 
 1. **`kernels/src/rotate_x_mq_awq_indexed_batched.hip`** + wrapper in
-   `dispatch/rope.rs` + `kernels.rs` const. Reads `topk_indices` on-device,
-   selects each slot's AWQ vector from a pointer table, expands
-   `[N x K] -> [N x K_TOP x K]`. A null pointer falls back to the plain rotation
-   so mixed artifacts stay correct.
-   Verified by `parity_rotate_x_mq_awq_indexed`: **bit-exact (0.00000000)** vs
-   the trusted `rotate_x_mq_awq_batched` driven one slot at a time, three
-   configs, null arm asserted to be exercised.
-
+   `dispatch/rope.rs`. Reads `topk_indices` on-device, selects each slot's AWQ
+   vector from a pointer table, expands `[N x K] -> [N x K_TOP x K]`.
 2. **Per-expert AWQ pointer tables** — `expert_gate_up_awq_ptrs` /
-   `expert_down_awq_ptrs` on `MoeFfnWeights` (layout.rs), built by
-   `build_expert_awq_ptr_tables` in loading.rs exactly like
-   `expert_gate_up_ptrs`. All four construction sites updated. `None` when no
-   expert has a sidecar, so non-AWQ artifacts keep the cheaper path
-   byte-identically. Paged mode passes `None` and WARNS if the artifact has
-   expert sidecars — it does not degrade silently.
+   `expert_down_awq_ptrs` on `MoeFfnWeights`, built by
+   `build_expert_awq_ptr_tables`. `None` when no expert has a sidecar.
+3. All four indexed OQ gate_up kernels can index x per slot — **now via an
+   explicit `x_per_slot` parameter**, see the correction below.
+4. **`hfq extract` offset bug fixed** (`bin/hfq.rs`).
 
-3. **All four indexed gate_up kernels index x PER SLOT** (oq4/oq8 x
-   batched/non-batched): `x` is now `[K_TOP x K]` / `[N x K_TOP x K]`.
-   `parity_gemv_oq8_moe_indexed` was rewritten to feed a DIFFERENT x per slot —
-   a shared-x kernel can no longer pass it — and passes on three shapes.
+Steps 5–6, this session:
 
-4. **`hfq extract` offset bug fixed** (`bin/hfq.rs`): it copied `hfqm_modules`,
-   a table of absolute byte ranges into the SOURCE file, so every extract was
-   unreadable (`invalid range ... for file_len`). Now dropped, with a log line.
-   This is what made an earlier AWQ comparison look invalid.
+5. **Per-slot x wired through every dispatch site**, with a `[N x K_TOP x dim]`
+   f32 scratch (`moe_x_rot_expanded{,_batch}`) alongside the existing
+   `moe_down_expanded` — same shape, same alloc/free path, so it is the
+   input-side mirror of a buffer that already existed.
+6. **New down-side kernel** `fused_silu_mul_mq_rotate_awq_indexed.hip` + wrapper
+   `Gpu::fused_silu_mul_rotate_mq_awq_indexed`. `rot_batch` is already one row
+   per (token, krank), so only the scale lookup changes — the kernel is the
+   existing AWQ silu_mul+rotate with a per-slot pointer select.
+7. **Null-table support.** Both indexed rotate kernels accept a null pointer
+   TABLE (`Option<&GpuTensor>` in Rust), meaning no expert at this layer has a
+   sidecar. Every slot then takes the plain rotation. This matters because the
+   expansion is required *regardless of AWQ* — the GEMVs read x per slot either
+   way — so a null table lets one code path serve AWQ and non-AWQ artifacts
+   without a branch at the call site.
+8. **One parse of the env flag.** `hipfire_dispatch::families::moe::
+   oq_indexed_decode_enabled()` is now the only reader. See "Corrections".
 
-## What remains
+### Verification
 
-5. **Scratch buffer + rotation call, in BOTH forward paths.** Allocate
-   `[N x K_TOP x dim]` f32, call `rotate_x_mq_awq_indexed_batched`, pass it to
-   the indexed gate_up instead of `pbs.x_rot_batch`.
-   - `prefill_chunk.rs` — the indexed gate_up dispatch is around line 1246
-     (`DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(...)`),
-     currently passing `&pbs.x_rot_batch`.
-   - `moe_decode.rs` — around line 1160, `let xr = x_rot_local.expect(...)`.
-   - The scratch lives in three structs, each with its own alloc and free path:
-     `qwen35/mod.rs:525` (decode), `prefill_batch.rs:93` (prefill),
-     `mtp_head.rs:350` (MTP). This is the mechanical-but-wide part.
-   - The DOWN side already has the right buffer shape (`rot_batch` is
-     `[N x K_TOP x mi]`); it needs the AWQ-aware rotation, not a new buffer.
+- `parity_rotate_x_mq_awq_indexed` — **bit-exact (0.00000000)** vs
+  `rotate_x_mq_awq_batched` driven one slot at a time, plus a null-TABLE arm
+  asserted **exactly** equal to `rotate_x_mq_batched`.
+- `parity_silu_mul_rotate_awq_indexed` (new) — the down-side mirror, same
+  structure, also **bit-exact** with both null arms covered.
+- `parity_gemv_oq8_moe_indexed` — passes under the per-slot contract.
+- **Per-layer steer trace, flag off vs flag on, 35B-A3B oq4.25++**: worst cosine
+  across 40 layers **0.999423** (at L37, ordinary quant drift). Layer 0 is
+  **0.999999**, previously 0.244. That is the decisive result: the layer-0 scale
+  error is gone.
+- `./tests/no-gpu-ci.sh` rc=0.
 
-6. **Verify.** Re-run the steer trace (below) and confirm layer-0 cosine goes to
-   ~1.0, then re-run the KLD and confirm it returns to ~0.0304.
+## Corrections to the previous handover
 
-## Landmine
+Two things the earlier version of this document got wrong. Both mattered.
 
-The kernels now expect a per-slot `x`, but the call sites still pass the shared
-`pbs.x_rot_batch`. That path is unreachable today because the flag gates it off.
-**Anyone setting `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` before step 5 lands gets
-garbage from the NEW contract.** Finish step 5, or revert item 3, before
-enabling. (Related, and worth fixing whenever: `loading.rs` gates the MoE-block
-repack on `env == "1"` while `qwen35_moe_oq_indexed_decode_enabled()` accepts
-`"1" | "on"`, so `=on` enables dispatch without the repack — guaranteed garbage.)
+**1. The blast radius was five dispatch sites across three archs, not two.**
+The previous handover said the remaining work was "mechanical scratch-buffer
+plumbing in two forward paths" (`prefill_chunk.rs`, `moe_decode.rs`). In fact the
+four OQ gate_up kernels are called from **18 sites in 5 files**:
+`qwen35/moe_decode.rs`, `qwen35/prefill_chunk.rs`, **`hipfire-dispatch/src/
+pipeline/mod.rs`** (the LIVE qwen35 serving path — `moe_family().run()`, which
+both qwen35 paths delegate to by default), **`arch-minimax/src/forward.rs`** (6
+sites), and **`arch-lfm2moe/src/forward.rs`** (2 sites).
 
-## Tools built this session (use these, they save hours)
+Step 3 changed those kernels' x contract *unconditionally* while updating none of
+those call sites. minimax and lfm2moe are **not gated by
+`HIPFIRE_QWEN35_MOE_OQ_INDEXED`** — so the branch shipped a live out-of-bounds
+read (`x + krank*K` on a `[K]` buffer) on both archs, not the dormant
+flag-gated landmine the handover described.
+
+**2. The fix for that is an explicit layout parameter, not a silent contract
+change.** The four kernels now take `int x_per_slot`: `0` = shared `[N x K]`
+(what minimax/lfm2moe pass — byte-identical to their pre-`35893d958`
+behavior), `1` = per-slot `[N x K_TOP x K]`. Making the correct layout opt-in
+rather than mandatory is what let the two archs I cannot test here be restored
+exactly instead of being "fixed" speculatively.
+
+## Known gaps
+
+- **minimax and lfm2moe still share one rotation across routed experts.** That
+  is their status quo, and it is only wrong if their artifacts carry per-expert
+  AWQ sidecars — neither loader builds a per-expert AWQ table today, so there is
+  nothing to select. If either grows AWQ-scaled routed experts, they need the
+  same treatment: build the pointer tables, allocate the per-slot scratch, pass
+  `x_per_slot = true`. The call sites carry a comment saying so.
+- **Paged mode passes a null AWQ table and warns** if the artifact has expert
+  sidecars. The 122B has none today.
+
+## Tools (use these, they save hours)
 
 **Per-layer divergence trace** — the oracle is the same model with the flag off;
 no external reference needed. `steer_capture` is PREFILL-only and needs `pp==1`.
@@ -130,6 +133,7 @@ layer, and the first divergent layer localises the fault in one shot.
 
 **Parity harnesses** (`cargo run --release -p hipfire-rdna --example ...`):
 - `parity_rotate_x_mq_awq_indexed`
+- `parity_silu_mul_rotate_awq_indexed`
 - `parity_gemv_oq8_moe_indexed`
 - `parity_moe_down_combine_oq8_indexed`
 
@@ -139,12 +143,16 @@ the kernel under test), because oracle-vs-candidate alone cannot distinguish
 
 ## Traps that cost time here
 
-- **`hfq list` panics on `hfq extract` output** — fixed, but if you see
-  `invalid range ... for file_len`, that is this.
-- **Adding/renaming any `ADMM_PROBE_*` or other env var makes `no-gpu-ci` fail**
-  on stale env docs. Fix: `cargo run -q -p hipfire-cli -- gen-env-docs`.
-  Note `docs/env-vars.md` is gitignored but `env_docs.rs` is tracked; committing
-  from a clean worktree off master will NOT carry your local regeneration.
+- **The daemon SELF-LOCKS.** Never wrap `hipfire-daemon` in `hipfire lock run` —
+  it deadlocks and the error names your own wrapper label as the blocker. Same
+  trap as `hipfire eval` and `coexistence calibrate`. Run it directly.
+- **`cargo fmt -- --check <files>` checks whole crates**, not the files listed,
+  so it reports pre-existing diffs in code you never touched. Use `rustfmt` on
+  the specific files.
+- **Env-doc staleness fires on pure line-number churn.** Any edit that shifts a
+  line containing an env read makes `no-gpu-ci` fail. Fix:
+  `cargo run -q -p hipfire-cli -- gen-env-docs`. `docs/env-vars.md` is gitignored
+  but `env_docs.rs` is tracked, so the regeneration must be committed.
 - **Test coverage that isn't.** A parity test picked its expert index with a
   stride sharing a factor with `n_exp`, so it only ever visited two experts and
   never exercised the null-sidecar arm — while printing PASS. It now picks a
@@ -163,7 +171,7 @@ targeted the minority cost and was capped at 1.27x before it began. The 397B
 quantize is 33-42 h with no speedup available. Source is staged byte-exact at
 `~/.hipfire/models/models--Qwen--Qwen3.5-397B-A17B.hfa`.
 
-Worth settling first: **the 122B artifact still cannot be served on this box**
-(paged experts load it in 9.32 GB, but decode needs the indexed path this
-handover is about). Producing a 397B the same way would produce another artifact
-this machine cannot run.
+The blocker named here — "the 122B artifact cannot be served on this box because
+decode needs the indexed path" — is now **removed on the qwen35 side**: the
+indexed path is correct. What remains before a 122B serving claim is running it,
+not fixing it.
