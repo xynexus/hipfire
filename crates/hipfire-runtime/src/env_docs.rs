@@ -307,6 +307,13 @@ pub const ENV_HIPFIRE_BATCH_RUNNER_DEBUG: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-server/src/batch_runner.rs:1125",
 };
 
+/// `HIPFIRE_BATCH_WIDTH_TRACE` — as N one-row steps (never coalesced) looks identical from outside
+pub const ENV_HIPFIRE_BATCH_WIDTH_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_BATCH_WIDTH_TRACE",
+    description: "as N one-row steps (never coalesced) looks identical from outside",
+    source: "crates/hipfire-daemon/src/handlers/batch.rs:189",
+};
+
 /// `HIPFIRE_BENCH_QWEN35_SPEED_BIN` — Runtime variable controlling bench qwen35 speed bin in hipfire
 pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BENCH_QWEN35_SPEED_BIN",
@@ -5553,6 +5560,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_BASELINE_ARCH,
     ENV_HIPFIRE_BATCHES_STATE_MAX,
     ENV_HIPFIRE_BATCH_RUNNER_DEBUG,
+    ENV_HIPFIRE_BATCH_WIDTH_TRACE,
     ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN,
     ENV_HIPFIRE_BENCH_SKIP_PARITY,
     ENV_HIPFIRE_BF16L3_RESIDENT,
