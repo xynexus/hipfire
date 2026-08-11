@@ -4483,7 +4483,10 @@ pub fn forward_prefill_grouped_moe_session_batch(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
-                k_window_gpu: &[],
+                // Empty for every KV mode except KVarN, where it holds the
+                // per-layer f32 recent windows. Passing it unconditionally is
+                // safe: the table is only built when the shape says KVarN.
+                k_window_gpu: &row.kv_cache.k_window,
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
