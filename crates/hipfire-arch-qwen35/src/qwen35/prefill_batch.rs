@@ -668,7 +668,9 @@ pub fn prefill_session_batch_write_kvarn_kv_layer(
     n_kv_heads: usize,
     head_dim: usize,
     group: usize,
+    row_offset: usize,
     row_count: usize,
+    total_rows: usize,
 ) -> HipResult<()> {
     if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
         return Err(hip_bridge::HipError::new(
@@ -679,7 +681,16 @@ pub fn prefill_session_batch_write_kvarn_kv_layer(
             ),
         ));
     }
-    // K -> per-session f32 recent window at `pos % group`.
+    if row_offset + row_count > total_rows {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill KVarN segment rows [{row_offset}, {}) exceed batch of {total_rows}",
+                row_offset + row_count,
+            ),
+        ));
+    }
+    // K -> per-session f32 recent window at `pos % group`, for this segment only.
     gpu.kv_cache_write_kvarn_window_routed_batched(
         &device_tables.kv_win_ptrs,
         k_src,
@@ -690,20 +701,29 @@ pub fn prefill_session_batch_write_kvarn_kv_layer(
         n_kv_heads,
         head_dim,
         group,
+        row_offset,
         row_count,
     )?;
-    // V -> plain Q8_0, identical to the Q8 path.
-    gpu.kv_cache_write_q8_0_routed_batched(
-        &device_tables.kv_v_ptrs,
-        v_src,
-        &device_tables.row_session_indices,
-        &device_tables.row_positions,
-        route_shape.kv_v_layers,
-        kv_layer_index,
-        n_kv_heads,
-        head_dim,
-        row_count,
-    )
+    // V -> plain Q8_0. Note this kernel has no row_offset: V is a flat
+    // position-addressed store with no wrapping window, so it is safe to write
+    // the whole batch once. The caller therefore issues the V write on the FIRST
+    // segment only — passing `row_offset == 0` — rather than once per segment,
+    // which would rewrite the same rows repeatedly (harmless but wasteful) and
+    // obscure that only K is segmented.
+    if row_offset == 0 {
+        gpu.kv_cache_write_q8_0_routed_batched(
+            &device_tables.kv_v_ptrs,
+            v_src,
+            &device_tables.row_session_indices,
+            &device_tables.row_positions,
+            route_shape.kv_v_layers,
+            kv_layer_index,
+            n_kv_heads,
+            head_dim,
+            total_rows,
+        )?;
+    }
+    Ok(())
 }
 
 /// KVarN companion to [`prefill_session_batch_attention_q8_layer`].
