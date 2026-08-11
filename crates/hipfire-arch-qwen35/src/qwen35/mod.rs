@@ -4709,7 +4709,7 @@ mod tests {
             dn_scale_layers: 0,
             dn_conv_layers: 0,
         };
-        let tables = dense_prefill_session_batch_pointer_table_plan(&ragged, route_shape, 3);
+        let tables = dense_prefill_session_batch_pointer_table_plan(&ragged, route_shape, 3, 0);
         assert_eq!(
             tables
                 .prefix_rows
@@ -5002,7 +5002,7 @@ mod tests {
         .expect("valid dense session execution plan");
 
         assert_eq!(
-            dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3),
+            dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3, 0),
             DensePrefillSessionBatchPointerTableShape {
                 sessions: 3,
                 multi_state_prefix_rounds: 2,
@@ -5010,6 +5010,7 @@ mod tests {
                 max_rows_per_round: 3,
                 kv_k_ptrs: 12,
                 kv_v_ptrs: 12,
+                kv_win_ptrs: 0,
                 dn_s_ptrs: 6,
                 dn_scale_ptrs: 6,
                 dn_conv_ptrs: 6,
@@ -5049,7 +5050,7 @@ mod tests {
             8,
         )
         .expect("valid dense session execution plan");
-        let tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 3);
+        let tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 3, 0);
 
         assert_eq!(tables.kv_layer_slots.len(), 12);
         assert_eq!(
@@ -5141,7 +5142,7 @@ mod tests {
             8,
         )
         .expect("valid dense session execution plan");
-        let mut tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 2);
+        let mut tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 2, 0);
 
         tables.session_last_row_indices[0] = 1;
         let err = dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap_err();
@@ -5176,7 +5177,7 @@ mod tests {
         )
         .expect("valid dense session execution plan");
         let table_plan =
-            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
 
         let s0_k = vec![
             fake_tensor(0x1000),
@@ -5217,6 +5218,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s0_k,
                     v_gpu: &s0_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5232,6 +5234,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s1_k,
                     v_gpu: &s1_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5288,7 +5291,7 @@ mod tests {
         )
         .expect("valid dense session execution plan");
         let table_plan =
-            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
 
         let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
         let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
@@ -5308,6 +5311,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s0_k,
                     v_gpu: &s0_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5323,6 +5327,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s1_k,
                     v_gpu: &s1_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5341,6 +5346,276 @@ mod tests {
         assert!(err.contains("DeltaNet scale slot references missing layer 0"));
     }
 
+    /// A KVarN route that forgets its windows must fail loudly at table build.
+    ///
+    /// This is why the builder gates on `shape.kv_win_ptrs != 0` rather than on
+    /// `k_window_gpu` being non-empty: gating on the slice would silently emit a
+    /// SHORT table, and `kv_cache_write_kvarn_window_routed_batched` indexes it
+    /// as `session * ptr_layer_stride + layer` with no bound to check against —
+    /// so a short table is an out-of-bounds device read, not an error.
+    #[test]
+    fn dense_session_prefill_host_pointer_tables_reject_missing_kvarn_window_route() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        // kv_window_layers = n_layers → KVarN.
+        let table_plan = dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            2,
+            config.n_layers,
+        );
+
+        let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let s0_dn_s = vec![fake_tensor(0x3000)];
+        let s0_dn_sc = vec![fake_tensor(0x4000)];
+        let s0_dn_conv = vec![fake_tensor(0x5000)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let s1_v = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let s1_w = vec![fake_tensor(0xE000), fake_tensor(0xE001)];
+        let s1_dn_s = vec![fake_tensor(0x9000)];
+        let s1_dn_sc = vec![fake_tensor(0xA000)];
+        let s1_dn_conv = vec![fake_tensor(0xB000)];
+        let s1_logits = fake_tensor(0xC000);
+
+        // Session 1 is complete; only session 0 is missing its windows, so the
+        // error must name the window slot rather than the session count.
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &s0_dn_sc,
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    k_window_gpu: &s1_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let err =
+            dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes).unwrap_err();
+        assert!(
+            err.contains("KVarN K-window slot references missing layer 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The window table must be session-major and layer-ordered exactly like
+    /// `kv_k_ptrs`, because both are indexed by the same
+    /// `session * ptr_layer_stride + layer_index` expression in the kernels.
+    /// A transposed table reads a real pointer belonging to the wrong layer,
+    /// which produces plausible attention rather than a fault.
+    #[test]
+    fn dense_session_prefill_kvarn_window_table_is_session_major_like_k() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan = dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            2,
+            config.n_layers,
+        );
+
+        let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let s0_w = vec![fake_tensor(0xD000), fake_tensor(0xD001)];
+        let s0_dn_s = vec![fake_tensor(0x3000)];
+        let s0_dn_sc = vec![fake_tensor(0x4000)];
+        let s0_dn_conv = vec![fake_tensor(0x5000)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let s1_v = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let s1_w = vec![fake_tensor(0xE000), fake_tensor(0xE001)];
+        let s1_dn_s = vec![fake_tensor(0x9000)];
+        let s1_dn_sc = vec![fake_tensor(0xA000)];
+        let s1_dn_conv = vec![fake_tensor(0xB000)];
+        let s1_logits = fake_tensor(0xC000);
+
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    k_window_gpu: &s0_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &s0_dn_sc,
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    k_window_gpu: &s1_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let tables = dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes)
+            .expect("KVarN window table builds when windows are supplied");
+        assert_eq!(tables.kv_win_ptrs.len(), tables.kv_k_ptrs.len());
+        assert_eq!(
+            tables.kv_win_ptrs,
+            vec![0xD000u64, 0xD001, 0xE000, 0xE001],
+            "window table must be session-major, layer-ordered, like kv_k_ptrs"
+        );
+    }
+
+    /// Non-KVarN modes keep the table absent, not zero-filled — a zero-filled
+    /// table would be a null-pointer deref if anything ever dispatched against
+    /// it, whereas an empty one fails the shape check first.
+    #[test]
+    fn dense_session_prefill_non_kvarn_leaves_the_window_table_empty() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan =
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
+        assert_eq!(table_plan.shape.kv_win_ptrs, 0);
+
+        let k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let dn_s = vec![fake_tensor(0x3000)];
+        let dn_sc = vec![fake_tensor(0x4000)];
+        let dn_conv = vec![fake_tensor(0x5000)];
+        let logits = fake_tensor(0x6000);
+        let k1 = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let v1 = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let dn_s1 = vec![fake_tensor(0x9000)];
+        let dn_sc1 = vec![fake_tensor(0xA000)];
+        let dn_conv1 = vec![fake_tensor(0xB000)];
+        let logits1 = fake_tensor(0xC000);
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &k,
+                    v_gpu: &v,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &dn_s,
+                    s_scales: &dn_sc,
+                    conv_states: &dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &k1,
+                    v_gpu: &v1,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &dn_s1,
+                    s_scales: &dn_sc1,
+                    conv_states: &dn_conv1,
+                    quant: StateQuant::FP32,
+                },
+                logits: &logits1,
+            },
+        ];
+
+        let tables = dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes)
+            .expect("non-KVarN table builds");
+        assert!(tables.kv_win_ptrs.is_empty());
+    }
+
     #[test]
     fn dense_session_prefill_pointer_table_indices_are_deterministic() {
         let shape = DensePrefillSessionBatchPointerTableShape {
@@ -5350,6 +5625,7 @@ mod tests {
             max_rows_per_round: 3,
             kv_k_ptrs: 12,
             kv_v_ptrs: 12,
+            kv_win_ptrs: 0,
             dn_s_ptrs: 6,
             dn_scale_ptrs: 6,
             dn_conv_ptrs: 6,
