@@ -111,10 +111,33 @@ response. That is not the late near-tie signature the grouped-MoE arm showed,
 where kvarn and Q8 diverged at byte-identical positions.
 
 So the dense KVarN arm is NOT yet at parity with its baseline, unlike the
-grouped-MoE arm which is. Suspect the dense path's segment/flush wiring or the
-`kv_window_layers` sizing rather than the shared kernels, since those are
-identical between the two arms and the MoE arm is clean. Do not enable dense
-KVarN for production on this evidence.
+grouped-MoE arm which is. Do not enable dense KVarN for production on this
+evidence.
+
+**Narrowed 2026-08-11 — the PREFILL arm is implicated, and it is not the flush.**
+
+| config | prompts diverging from serial |
+|---|---|
+| kvarn, fused prefill + fused decode | 4/4, one from the FIRST token |
+| kvarn, **serial** prefill + fused decode | 3/4 — the token-0 case is FIXED |
+| q8, fused prefill + fused decode (control) | 1/4 |
+
+Three things this rules out:
+- **Not cross-session contamination.** The independence test passes: the probe's
+  output is byte-identical (755 chars) whether batched with one set of companions
+  or a completely different set. State does not leak across rows.
+- **Not the block flush.** These are 48-token generations from short prompts, so
+  no session reaches position 127 and gather+quantize never fires.
+- **Not the shared kernels.** The routed window write, routed attention and flush
+  executor are the same code the grouped-MoE arm uses, and that arm matches its
+  Q8 baseline at byte-identical divergence positions.
+
+What is left is the dense-specific wiring in
+`forward_prefill_dense_session_batch_impl` — the `kv_window_layers` sizing, the
+context construction, or the segment walk as the dense layer body drives it.
+Switching prefill to serial repairs the worst divergence, which is where to look
+first. The residual 3/4 under serial prefill still exceeds the Q8 control's 1/4,
+so the dense decode arm is likely also off, less severely.
 
 ## [Superseded] No available Qwen3.5 artifact can exercise the fused DENSE batch path — all VL-wrap
 
