@@ -67,6 +67,40 @@ into full investigations here.
   `weight_gemv_swiglu_residual` for having no tap; that was wrong — its generic
   tail does reach `weight_gemv`, which is where the dtype gate then dropped it)
 
+## [Medium] Fused grouped-MoE batch diverges substantially from serial decode — pre-existing, both KV modes
+
+Found 2026-08-11 while validating the KVarN port, using the shipped Q8 path as a
+control. Same model, same KV mode, same greedy decode, same prompts; the only
+variable is serial (batch 1) vs fused (batch 4). Longest common prefix of the
+outputs, 200-token generations on `Qwen3.6-35B-A3B--oq4`:
+
+| prompt | kvarn | q8 (shipped) |
+|---|---|---|
+| bicycle derailleur | 580 chars | **580** |
+| water cycle | 17 | **17** |
+| printing press | 959 | 1143 (exact) |
+| refrigerator | 31 | **31** |
+
+**Three of four diverge at the byte-identical position under two different K
+formats** (4-bit var-norm records vs Q8). That rules out KV quantization as the
+cause and localizes it to the shared fused machinery — the routed batched
+attention/MoE kernels or their reduction order — not to either KV path.
+
+Two prompts diverge after ~17 and ~31 characters, i.e. the fused and serial
+outputs are essentially different texts. Greedy decoding does amplify a near-tie
+into a different continuation, and every output stays coherent, so this is not
+obviously corruption. But a 1.7% common prefix is a large effect to attribute to
+rounding, and it is worth deciding which it is before leaning harder on the fused
+path for throughput.
+
+Not caused by the KVarN port: the control run is on the shipped Q8 path with the
+port gated off. Filed separately so it is not mistaken for KVarN fallout.
+
+Next step if pursued: a logit-level comparison rather than text. Note
+`HIPFIRE_FORWARD_ORACLE`, which `superop.rs:39` advertises for exactly this
+("available for dual-run diffing"), is **not implemented** — the name appears in
+that doc comment and nowhere else in the tree.
+
 ## [High] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
 
 Found 2026-08-11 while auditing the KV deprecation. The deprecation added in this
