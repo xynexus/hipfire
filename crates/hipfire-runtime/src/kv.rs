@@ -1185,7 +1185,7 @@ impl KvCache {
 
     /// Create KVarN KV cache: K stored as variance-normalized 4-bit block
     /// records (`[head_dim × GROUP]` tiles, one per kv-head per 128-token
-    /// block) plus an fp16 recent-window ring for the trailing partial block;
+    /// block) plus an f32 recent-window ring for the trailing partial block;
     /// V at Q8_0 (identical layout to asym4's V). Back-compat wrapper:
     /// `physical_cap == max_seq_len`. See [`new_gpu_kvarn_capped`].
     /// KVarN K bits from `HIPFIRE_KVARN_BITS` (default 4). Valid: 2, 4, 8. 4-bit
@@ -1271,7 +1271,7 @@ impl KvCache {
         let k_bph = rec_bytes / n_kv_heads.max(1); // informational; record is per-head already
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + fp16 window + V Q8 {v_bph}B/head)",
+            "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + f32 window + V Q8 {v_bph}B/head)",
             group,
         );
         let _ = k_bph;
@@ -1375,7 +1375,7 @@ impl KvCache {
         }
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + fp16 window + V Q8)",
+            "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + f32 window + V Q8)",
             is_kv_layer.len()
         );
         Ok(Self {
