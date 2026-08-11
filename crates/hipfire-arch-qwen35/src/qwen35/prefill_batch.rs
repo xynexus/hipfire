@@ -783,6 +783,83 @@ pub fn prefill_session_batch_attention_kvarn_layer(
     )
 }
 
+/// What the KVarN block flush needs and a pointer table cannot carry.
+///
+/// `forward_grouped_moe_session_batch_layers` is handed raw device pointer
+/// tables, which is enough to WRITE the window but not to flush it: gathering and
+/// quantizing a completed block needs the actual `records` / `window` tensors and
+/// a scratch buffer. This carries them alongside, so the flush stays where the
+/// write is instead of forcing the layer loop up into the caller.
+pub struct KvarnBatchFlushContext<'a> {
+    /// Per-session routes, indexed by `session_index` — the same slice the
+    /// pointer tables were built from, so the two cannot disagree about which
+    /// session is which.
+    pub routes: &'a [DensePrefillSessionStateRoute<'a>],
+    /// Reusable gather scratch, `[n_kv_heads * head_dim * group]` f32.
+    pub tiles: &'a GpuTensor,
+    /// Tokens per KVarN block (`KvCache::KVARN_GROUP`).
+    pub group: usize,
+    /// K code width; 4 unless `HIPFIRE_KVARN_BITS` says otherwise.
+    pub bits: usize,
+}
+
+/// Gather + quantize each completed block into its session's records, for one
+/// layer. Mirrors the flush half of `Gpu::kvarn_attend`, but per-session, because
+/// in a routed batch different sessions complete blocks at different rows.
+pub fn grouped_moe_prefill_session_batch_kvarn_flush_layer(
+    gpu: &mut Gpu,
+    ctx: &KvarnBatchFlushContext<'_>,
+    layer_index: usize,
+    flushes: &[KvarnBlockFlush],
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> HipResult<()> {
+    if flushes.is_empty() {
+        return Ok(());
+    }
+    let rec_bytes = hipfire_runtime::kv::KvCache::kvarn_k_record_bytes_bits(head_dim, ctx.bits);
+    // A record is always a multiple of 4 bytes, so the F32-typed records buffer
+    // is addressable in whole elements (same assumption kvarn_attend makes).
+    let tile_elems = n_kv_heads * rec_bytes / 4;
+    for flush in flushes {
+        let route = ctx.routes.get(flush.session_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KVarN flush references missing session {}",
+                    flush.session_index
+                ),
+            )
+        })?;
+        let window = route.kv.k_window_gpu.get(layer_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("KVarN flush session {} has no window for layer {layer_index}", flush.session_index),
+            )
+        })?;
+        let records = route.kv.k_gpu.get(layer_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("KVarN flush session {} has no records for layer {layer_index}", flush.session_index),
+            )
+        })?;
+        // window [group, kv_dim] token-major -> tiles [n_kv_heads, head_dim*group]
+        // channel-major, which is the orientation the record format wants.
+        gpu.kvarn_gather_k_tiles(window, ctx.tiles, 1, n_kv_heads, head_dim, ctx.group)?;
+        let rec_view = records.sub_offset(flush.block_index * tile_elems, tile_elems);
+        gpu.kvarn_quantize_tile(
+            ctx.tiles,
+            &rec_view,
+            n_kv_heads,
+            head_dim,
+            ctx.group,
+            rec_bytes,
+            ctx.bits,
+        )?;
+    }
+    Ok(())
+}
+
 /// One session's completed KVarN block, ready to gather+quantize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvarnBlockFlush {
