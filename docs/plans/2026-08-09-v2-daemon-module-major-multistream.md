@@ -809,28 +809,78 @@ and that module-major execution exists to remove. Until now that claim rested on
 the architecture of `batch_runner.rs`; it now has a measurement on the target
 model.
 
-**CONFIRMED 2026-08-10 — the batch coalesces and the fused step does not
-amortise.** The flat curve above had three candidate explanations; two are now
-falsified and the third is measured:
+**CORRECTED 2026-08-11 — the earlier reading of this table was wrong, and the
+correction matters.** On 2026-08-10 this section concluded "the batch coalesces
+and the fused step does not amortise." The first half is right; the second was
+never measured, because **at batch 1-3 the fused path does not run at all**:
+
+```rust
+pub fn qwen35_grouped_moe_decode_auto_latency_gate_passed(session_count: usize) -> bool {
+    session_count >= 4          // crates/hipfire-generate/src/lib.rs:1522
+}
+```
+
+`auto` deliberately refuses to fuse below four sessions and selects
+`SerialReference` — a per-session loop. So the flat curve at batch 1-3 is
+*designed behaviour*, not the amortization defect it was filed as. Confirmed
+structurally: `HIPFIRE_LAUNCH_TRACE=1` at width 3 shows **exactly 3.00x the
+launches of width 1, with every grid dimension unchanged** (`rmsnorm
+grid=[1,1,1]`, `moe_gate_up grid=[1024,8,1]` at both widths) — 1322 launches per
+row, three times over. The envelope carries 3 rows; the execution is a loop. That
+is what `SerialReference` is defined to do.
+
+What the three falsified candidates below still establish is that coalescing
+itself works — the sessions really do arrive in one envelope. They were answering
+the wrong question.
 
 | candidate | verdict |
 |---|---|
 | prefill serialisation (`serial` backend) | **no** — repeated at 128-token generations, decode-dominated; still flat (14.55 / 14.66 / 14.74 tok/s at batch 1/2/3) |
 | the 10 ms coalescing gather window | **no** — `HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS=500` changed nothing (13.63 / 14.19 / 14.37) |
-| sessions never coalescing | **no** — `HIPFIRE_BATCH_WIDTH_TRACE=1` shows `48 decode_step rows=3`, i.e. every step is full width |
+| sessions never coalescing | **no** — `HIPFIRE_BATCH_WIDTH_TRACE=1` shows `48 decode_step rows=3`, every step full width |
 
-So three sessions *are* fused into each decode step, and wall time is still exactly
-linear in batch (7.0 / 14.0 / 20.9 s). **A width-3 fused decode step costs ~3x a
-width-1 step: the rows share a step but not a pass over the weights.** That is
-precisely the deficiency §0 asserts and §0.4's amortization curve is meant to
-remove — previously argued from the structure of `batch_runner.rs`, now measured
-on the target model.
+**What fusion actually delivers, measured where it can run.** Q8 KV is the only
+configuration in which the fused grouped-MoE decode executes (see the blocker
+below), via `HIPFIRE_KV_ALLOW_DEPRECATED=1`. One daemon lifetime, 64-token
+generations, `decode_step rows=4` confirmed on 32 consecutive steps:
 
-Still not evidence FOR the curve: widths 2-3 sit far below the N where sharing is
-predicted to pay (past ~`n_exp / k` token-slots), and batch >= 4 remains blocked on
-the fused grouped-MoE path hard-requiring Q8 KV (see BUGS.md), so 16/64/128 —
-the widths §0.4 actually argues about — are still unmeasured. What is established
-is the *pathology*, at the exact place the design targets it.
+| batch | aggregate tok/s | per-stream | vs batch 1 |
+|---|---|---|---|
+| 1 | 7.92 | 7.92 | — |
+| 4 (genuinely fused) | 8.80 | 2.20 | **1.11x** |
+| 8 | — | — | invalid: HTTP 429 from the `requests_per_minute` bucket in `api_auth.rs`, not a batching limit |
+
+**Four rows buy 11%.** Read against §0.4 that is not a defect — it is roughly what
+the curve predicts. The amortization table puts the knee near `n_exp / k` =
+512/8 = **64** token-slots; at 4 slots it predicts only a few percent of weight-byte
+saving, so 1.11x is if anything slightly ahead of theory. The honest conclusion is
+therefore *not* "fusion is broken" but:
+
+> every batch width reachable today sits far below the amortization knee, and both
+> routes to a wider one are blocked.
+
+That is evidence FOR the plan's premise, not against it, and it relocates the
+work: the open question is no longer "why doesn't batching help" but "can we reach
+N=64 at all on this box" — which is M7's exit criterion, and which §0.4 already
+says should be *reported* rather than tuned around if VRAM cannot hold it.
+
+**The two blockers, both now named.**
+
+1. **kvarn cannot use the fused path.** At batch >= 4 with the recommended KV mode
+   the request does not fall back — it dies:
+   `"grouped MoE session fused prefix row 0 must use Q8 KV state for the MQ4
+   control path"` (`crates/hipfire-arch-qwen35/src/qwen35/prefill_batch.rs:1102`).
+   The refusal is asserted at **execution**, after the backend was already
+   selected, which is exactly the anti-pattern this plan's Tier-1 prerequisite
+   list forbids ("a named capability predicate wired into *selection*, never an
+   assertion inside a kernel"). Since q8 is now deprecated at load, the fused
+   grouped-MoE decode is **unreachable on every supported KV mode** — batched MoE
+   decode is effectively dead until the kvarn port lands. This raises that port
+   from an optimization to a prerequisite for measuring §0.4 at all.
+2. **The rate limiter caps the sweep** before VRAM does. Widths >= 8 need
+   `requests_per_minute` raised in the server config; that is a harness fix, not a
+   finding, but it must happen before any N=16/64/128 number is quotable.
+
 
 **Where the 72 ms actually goes is the open question.** 3B active params at oq4
 is ~1.5 GB/token, i.e. ~15 ms at gfx1103's ~100 GB/s — so warm decode is running

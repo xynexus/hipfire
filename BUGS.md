@@ -113,9 +113,9 @@ into full investigations here.
   therefore both the fused prefill AND the fused decode path.
 - **Throughput result worth noting on its own: batching buys nothing here yet.**
   Aggregate is FLAT from batch 2 to 3 (7.86 -> 7.19 tok/s) while per-stream falls
-  3.93 -> 2.40. At these widths the sessions are serialising rather than sharing a
-  pass over weights, which is precisely the property the v2 module-major design
-  exists to fix — and it is now measurable on the target model instead of blocked.
+  3.93 -> 2.40. ~~At these widths the sessions are serialising rather than sharing a
+  pass over weights~~ — **RETRACTED 2026-08-11, see below: at batch 1-3 the fused
+  path is not selected at all, so this measured the serial fallback, not fusion.**
 - **Port target localized 2026-08-10 — ONE validator, not two paths.** Correcting
   the previous line: the fused decode does not carry its own copy of the check, it
   reuses the prefill contract, which is why the DECODE failure said "prefix" and
@@ -139,6 +139,44 @@ into full investigations here.
   - Every other caller of the validator is a test in `qwen35/mod.rs` (~4856-4951),
     including one asserting the fp32 rejection, so those pin the current contract
     and will need updating with it.
+- **Measured 2026-08-11 — the flat curve below batch 4 was POLICY, and fusion
+  itself gives 1.11x.** Three separate corrections, all from direct measurement:
+  - `qwen35_grouped_moe_decode_auto_latency_gate_passed` is `session_count >= 4`
+    (`hipfire-generate/src/lib.rs:1522`). Below that, `auto` selects
+    `SerialReference` deliberately. `HIPFIRE_LAUNCH_TRACE=1` confirms it
+    structurally: width 3 issues **exactly 3.00x the launches of width 1 with every
+    grid dimension unchanged** (1322 launches per row, three times). So every
+    batch 1/2/3 throughput number ever quoted in this entry measured the serial
+    fallback. The flatness was designed, not broken.
+  - **Where fusion does run, 4 rows buy 11%.** Under Q8 KV via
+    `HIPFIRE_KV_ALLOW_DEPRECATED=1`, one daemon lifetime, `decode_step rows=4`
+    confirmed on 32 steps: batch 1 = 7.92 tok/s aggregate, batch 4 = 8.80
+    (**1.11x**), per-stream 7.92 -> 2.20. That is roughly what the amortization
+    curve predicts at 4 slots — its knee is near `n_exp/k` = 512/8 = **64** — so it
+    is NOT evidence the fused kernel is broken. It means no reachable batch width
+    is anywhere near the knee.
+  - **Batch 8+ is currently unmeasurable for an unrelated reason:** HTTP 429 from
+    the `requests_per_minute` bucket in `hipfire-server/src/api_auth.rs`, not from
+    anything in the batching path. Raise it in the server config before quoting any
+    N >= 8 number.
+- **[Independent, same repro] The refusal fires at EXECUTION, not selection, and
+  takes the request down instead of falling back.** At batch >= 4 with kvarn the
+  auto path sets `FusedGroupedMoeLayerChunked` — the selection-time capability
+  validator does not test KV mode — and the Q8 requirement is then asserted deep in
+  the decode advance, returning an error to the client rather than degrading to
+  `SerialReference` as batch 1-3 does. Two defects in one:
+  - the capability predicate is not wired into *backend selection*, which is the
+    exact anti-pattern the v2 plan lists as a Tier-1 prerequisite;
+  - the error is delivered as **HTTP 200 with an `{"error": ...}` body**, so any
+    client checking status codes sees success. That alone is worth fixing
+    independently of the port — it is how this failure hid inside a sweep harness
+    that counted 200s as successes.
+- **Consequence worth stating plainly: batched MoE decode is presently
+  unreachable.** q8 is on `DEPRECATED_KV_MODES` (`serving-core/src/load.rs:533`)
+  and the fused path requires q8, so on every supported KV mode there is no batch
+  size that fuses — below 4 it is policy-serial, at 4+ it errors. The kvarn port is
+  therefore not an optimization; it is a prerequisite for measuring the v2 plan's
+  central amortization claim at all.
 - **Port sized 2026-08-10 — and relaxing the validator ALONE would be a
   correctness bug.** `prefill_batch.rs` dispatches exactly two attention kernels:
   ```
