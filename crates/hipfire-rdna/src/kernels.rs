@@ -3315,6 +3315,14 @@ pub const KV_CACHE_WRITE_F32_ROUTED_BATCHED_SRC: &str =
 pub const KV_CACHE_WRITE_Q8_0_ROUTED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_routed_batched.hip");
 
+/// Routed batched KVarN K-window append: scatter `batch_size` K rows into the
+/// per-session f32 recent window at `positions[b] % group`. The block-complete
+/// flush (gather + quantize into 4-bit records) stays a per-session event on the
+/// existing `kvarn_gather_k_tiles` / `kvarn_quantize_tile` pair, because it fires
+/// once per `group` tokens rather than once per row.
+pub const KV_CACHE_WRITE_KVARN_WINDOW_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_kvarn_window_routed_batched.hip");
+
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
 /// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).
 ///
