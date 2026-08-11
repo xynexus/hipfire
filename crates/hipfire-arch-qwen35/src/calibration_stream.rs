@@ -1426,7 +1426,7 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
         }
         let route_shape = expected_dense_prefill_session_state_route_shape(&self.config);
         let pointer_plan =
-            dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, inputs.len());
+            dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, inputs.len(), 0);
         let (flat_tokens, positions) =
             dense_prefill_session_batch_prefix_tokens_positions(&pointer_plan)
                 .map_err(CalibError::InvalidOptions)?;
@@ -1459,6 +1459,7 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
                     kv: DensePrefillSessionKvStateRoute {
                         k_gpu: &state.kv.k_gpu,
                         v_gpu: &state.kv.v_gpu,
+                        k_window_gpu: &[],
                         physical_cap: state.kv.physical_cap,
                         compact_offset: state.kv.compact_offset,
                     },

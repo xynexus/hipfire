@@ -226,6 +226,15 @@ pub struct DensePrefillSessionBatchStateSignature {
 pub struct DensePrefillSessionKvStateRoute<'a> {
     pub k_gpu: &'a [GpuTensor],
     pub v_gpu: &'a [GpuTensor],
+    /// KVarN only: the per-layer f32 recent windows holding each session's
+    /// trailing partial 128-token K block. Empty for every other KV mode, which
+    /// keeps one K buffer per layer and needs no second table.
+    ///
+    /// Empty-means-absent mirrors `DensePrefillSessionDeltaStateRoute::s_scales`
+    /// rather than introducing an `Option`, so the pointer-table builder can gate
+    /// on the shape field being non-zero exactly as it already does for
+    /// `dn_scale_ptrs`.
+    pub k_window_gpu: &'a [GpuTensor],
     pub physical_cap: usize,
     pub compact_offset: usize,
 }
@@ -260,6 +269,9 @@ pub struct DensePrefillSessionBatchPointerTableShape {
     pub max_rows_per_round: usize,
     pub kv_k_ptrs: usize,
     pub kv_v_ptrs: usize,
+    /// KVarN only; 0 for every other KV mode. See
+    /// `DensePrefillSessionKvStateRoute::k_window_gpu`.
+    pub kv_win_ptrs: usize,
     pub dn_s_ptrs: usize,
     pub dn_scale_ptrs: usize,
     pub dn_conv_ptrs: usize,
@@ -316,6 +328,8 @@ pub struct DensePrefillSessionBatchPointerTablePlan {
 pub struct DensePrefillSessionBatchHostPointerTables {
     pub kv_k_ptrs: Vec<u64>,
     pub kv_v_ptrs: Vec<u64>,
+    /// KVarN only; empty for every other KV mode.
+    pub kv_win_ptrs: Vec<u64>,
     pub dn_s_ptrs: Vec<u64>,
     pub dn_scale_ptrs: Vec<u64>,
     pub dn_conv_ptrs: Vec<u64>,
@@ -329,6 +343,8 @@ pub struct DensePrefillSessionBatchHostPointerTables {
 pub struct DensePrefillSessionBatchDevicePointerTables {
     pub kv_k_ptrs: GpuTensor,
     pub kv_v_ptrs: GpuTensor,
+    /// KVarN only. Zero-length when the KV mode keeps one K buffer per layer.
+    pub kv_win_ptrs: GpuTensor,
     pub dn_s_ptrs: GpuTensor,
     pub dn_scale_ptrs: GpuTensor,
     pub dn_conv_ptrs: GpuTensor,
@@ -346,6 +362,7 @@ impl DensePrefillSessionBatchHostPointerTables {
     ) -> Result<(), String> {
         let checks = [
             ("kv_k_ptrs", self.kv_k_ptrs.len(), shape.kv_k_ptrs),
+            ("kv_win_ptrs", self.kv_win_ptrs.len(), shape.kv_win_ptrs),
             ("kv_v_ptrs", self.kv_v_ptrs.len(), shape.kv_v_ptrs),
             ("dn_s_ptrs", self.dn_s_ptrs.len(), shape.dn_s_ptrs),
             (
@@ -387,6 +404,7 @@ impl DensePrefillSessionBatchDevicePointerTables {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.kv_k_ptrs);
         let _ = gpu.free_tensor(self.kv_v_ptrs);
+        let _ = gpu.free_tensor(self.kv_win_ptrs);
         let _ = gpu.free_tensor(self.dn_s_ptrs);
         let _ = gpu.free_tensor(self.dn_scale_ptrs);
         let _ = gpu.free_tensor(self.dn_conv_ptrs);
@@ -435,6 +453,7 @@ pub fn upload_dense_prefill_session_batch_pointer_tables(
     Ok(DensePrefillSessionBatchDevicePointerTables {
         kv_k_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_k_ptrs)?,
         kv_v_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_v_ptrs)?,
+        kv_win_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_win_ptrs)?,
         dn_s_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_s_ptrs)?,
         dn_scale_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_scale_ptrs)?,
         dn_conv_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_conv_ptrs)?,
@@ -1413,13 +1432,21 @@ impl DensePrefillSessionBatchPointerTableShape {
     }
 }
 
+/// `kv_window_layers`: 0 for every KV mode except KVarN, which carries a second
+/// per-layer K buffer (the f32 recent window). See
+/// [`dense_prefill_session_batch_pointer_table_shape`].
 pub fn dense_prefill_session_batch_pointer_table_plan(
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     route_shape: DensePrefillSessionStateRouteShape,
     sessions: usize,
+    kv_window_layers: usize,
 ) -> DensePrefillSessionBatchPointerTablePlan {
-    let shape =
-        dense_prefill_session_batch_pointer_table_shape(execution_plan, route_shape, sessions);
+    let shape = dense_prefill_session_batch_pointer_table_shape(
+        execution_plan,
+        route_shape,
+        sessions,
+        kv_window_layers,
+    );
     let mut kv_layer_slots = Vec::with_capacity(shape.kv_k_ptrs);
     for session_index in 0..sessions {
         for layer_index in 0..route_shape.kv_k_layers {
@@ -1483,6 +1510,7 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
     }
     let mut kv_k_ptrs = Vec::with_capacity(plan.shape.kv_k_ptrs);
     let mut kv_v_ptrs = Vec::with_capacity(plan.shape.kv_v_ptrs);
+    let mut kv_win_ptrs = Vec::with_capacity(plan.shape.kv_win_ptrs);
     for slot in &plan.kv_layer_slots {
         let route = routes.get(slot.session_index).ok_or_else(|| {
             format!(
@@ -1504,6 +1532,20 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
         })?;
         kv_k_ptrs.push(k.buf.as_ptr() as u64);
         kv_v_ptrs.push(v.buf.as_ptr() as u64);
+        // KVarN carries a second K buffer per layer (the f32 recent window).
+        // Gated on the shape rather than on the slice being non-empty, so a
+        // route that forgets to supply windows fails the shape check loudly
+        // instead of silently producing a short table the kernel would index
+        // past.
+        if plan.shape.kv_win_ptrs != 0 {
+            let win = route.kv.k_window_gpu.get(slot.layer_index).ok_or_else(|| {
+                format!(
+                    "dense session prefill KVarN K-window slot references missing layer {}",
+                    slot.layer_index,
+                )
+            })?;
+            kv_win_ptrs.push(win.buf.as_ptr() as u64);
+        }
     }
 
     let mut dn_s_ptrs = Vec::with_capacity(plan.shape.dn_s_ptrs);
@@ -1580,6 +1622,7 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
     let tables = DensePrefillSessionBatchHostPointerTables {
         kv_k_ptrs,
         kv_v_ptrs,
+        kv_win_ptrs,
         dn_s_ptrs,
         dn_scale_ptrs,
         dn_conv_ptrs,
@@ -1762,10 +1805,18 @@ pub fn validate_dense_prefill_session_state_route_shapes_for_config(
     Ok(())
 }
 
+/// `kv_window_layers` is the KVarN f32 recent-window count per session — 0 for
+/// every other KV mode, `n_layers` under KVarN. It is a parameter rather than a
+/// `DensePrefillSessionStateRouteShape` field on purpose: that shape is compared
+/// against a model-derived expectation by
+/// `validate_dense_prefill_session_state_route_shapes_for_config`, which reads
+/// only `Qwen35Config` and so cannot know the KV mode. Threading it here costs 2
+/// call sites instead of 12.
 pub fn dense_prefill_session_batch_pointer_table_shape(
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     route_shape: DensePrefillSessionStateRouteShape,
     sessions: usize,
+    kv_window_layers: usize,
 ) -> DensePrefillSessionBatchPointerTableShape {
     DensePrefillSessionBatchPointerTableShape {
         sessions,
@@ -1774,6 +1825,7 @@ pub fn dense_prefill_session_batch_pointer_table_shape(
         max_rows_per_round: execution_plan.max_rows_per_round,
         kv_k_ptrs: sessions * route_shape.kv_k_layers,
         kv_v_ptrs: sessions * route_shape.kv_v_layers,
+        kv_win_ptrs: sessions * kv_window_layers,
         dn_s_ptrs: sessions * route_shape.dn_s_layers,
         dn_scale_ptrs: sessions * route_shape.dn_scale_layers,
         dn_conv_ptrs: sessions * route_shape.dn_conv_layers,
@@ -2797,7 +2849,7 @@ fn forward_prefill_dense_session_batch_impl(
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len(), 0);
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
@@ -2817,6 +2869,7 @@ fn forward_prefill_dense_session_batch_impl(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
+                k_window_gpu: &[],
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
@@ -4047,7 +4100,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len(), 0);
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
@@ -4067,6 +4120,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
+                k_window_gpu: &[],
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
