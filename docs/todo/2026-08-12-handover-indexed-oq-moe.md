@@ -12,8 +12,10 @@ MoE path rotated the activation once per layer with one representative's scale
 and handed that single buffer to all of them — on BOTH the gate_up side and the
 down side. Per-expert rotation is now wired through every dispatch site, and
 verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
-from **0.244 to 0.999999**, with no layer below 0.9994 across all 40. The flag is
-still off by default pending the KLD number below.
+from **0.244 to 0.999999**, with no layer below 0.9994 across all 40, and KLD
+went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
+within 3.8% of the CPU fallback it has to match. The flag is still off by
+default; flipping it is now a decision, not a blocker.
 
 ## The bug, in one paragraph
 
@@ -76,6 +78,27 @@ Steps 5–6, this session:
   across 40 layers **0.999423** (at L37, ordinary quant drift). Layer 0 is
   **0.999999**, previously 0.244. That is the decisive result: the layer-0 scale
   error is gone.
+- **End-to-end KLD**, `moe-a-nointra.hfq` vs `moe-bf16.kldref.hfq`, 8 chunks of
+  `benchmarks/calib/calib-1m.txt` at n_ctx 2048. The flag-off arm reproduces
+  `0.030367` / ppl `7.462` to every printed digit, which is what confirms this
+  is the same corpus the original numbers came from:
+
+  | | mean_kld | p99_kld | ppl |
+  |---|---|---|---|
+  | flag OFF (CPU fallback) | 0.030367 | 0.038574 | 7.4622 |
+  | flag ON (indexed OQ), before | 5.108296 | — | 1171.67 |
+  | **flag ON (indexed OQ), after** | **0.031515** | 0.039192 | **7.4643** |
+
+  **162x better**, and within 3.8% KLD / 0.03% ppl of the fallback. The residual
+  3.8% is expected, not a leftover bug: the indexed path is not bit-identical to
+  the CPU fallback (different accumulation order and expert-GEMV shape), so a
+  small delta is the floor. A scale error cannot hide at that magnitude — the
+  one this fixes showed up as 168x.
+
+  Caveat on the absolute number: `calib-1m.txt` is a calibration corpus, so this
+  is train-on-test and NOT a quality claim. It is a valid OFF-vs-ON A/B, which is
+  the only question being asked here, because the bias applies to both arms
+  equally. Do not quote 0.0315 as this artifact's quality.
 - `./tests/no-gpu-ci.sh` rc=0.
 
 ## Corrections to the previous handover
