@@ -200,8 +200,10 @@ env_vars! {
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
         "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
          Storage only; arithmetic stays FP32; no scales, no stochastic rounding, \
-         so spec-decode rollback stays lossless. Opt-in until a teacher-forced \
-         FP32-vs-FP16 KLD comparison covers more than one model.";
+         so spec-decode rollback stays lossless. DEFAULT since 2026-08-12; set \
+         `0` to opt out back to FP32, which remains the numerical oracle. Made \
+         default on capacity grounds: FP32 state bounds concurrency (60 MiB per \
+         session on a 35B-A3B, ~9x its KV) and OOMs at width 64.";
 
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,

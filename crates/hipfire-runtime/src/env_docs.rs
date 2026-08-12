@@ -1349,13 +1349,13 @@ pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DN_STATE_EF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_EF",
     description: "HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:196",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:205",
 };
 
-/// `HIPFIRE_DN_STATE_FP16` — Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32; no scales, no stochastic rounding, so spec-decode rollback stays lossless. Opt-in until a teacher-forced FP32-vs-FP16 KLD comparison covers more than one model.
+/// `HIPFIRE_DN_STATE_FP16` — Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32; no scales, no stochastic rounding, so spec-decode rollback stays lossless. DEFAULT since 2026-08-12; set `0` to opt out back to FP32, which remains the numerical oracle. Made default on capacity grounds: FP32 state bounds concurrency (60 MiB per session on a 35B-A3B, ~9x its KV) and OOMs at width 64.
 pub const ENV_HIPFIRE_DN_STATE_FP16: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_FP16",
-    description: "Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32; no scales, no stochastic rounding, so spec-decode rollback stays lossless. Opt-in until a teacher-forced FP32-vs-FP16 KLD comparison covers more than one model.",
+    description: "Store DeltaNet recurrent state as FP16, halving per-sequence state. Storage only; arithmetic stays FP32; no scales, no stochastic rounding, so spec-decode rollback stays lossless. DEFAULT since 2026-08-12; set `0` to opt out back to FP32, which remains the numerical oracle. Made default on capacity grounds: FP32 state bounds concurrency (60 MiB per session on a 35B-A3B, ~9x its KV) and OOMs at width 64.",
     source: "crates/hipfire-env/src/lib.rs",
 };
 
