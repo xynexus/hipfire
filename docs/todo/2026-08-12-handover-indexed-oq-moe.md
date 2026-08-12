@@ -14,8 +14,49 @@ down side. Per-expert rotation is now wired through every dispatch site, and
 verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
 from **0.244 to 0.999999**, with no layer below 0.9994 across all 40, and KLD
 went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
-within 3.8% of the CPU fallback it has to match. **The flag is now ON by
-default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=0` (or `off`) falls back.
+within 3.8% of the CPU fallback it has to match. **The flag stays OFF by
+default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` opts in.
+
+⚠️ **It was flipped ON and reverted the same day.** `tests/tiny-quant-gate.sh`
+turns seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,
+and the five calib variants) with the flag on; with it off they route to the CPU
+fallback and are finite, which is why the breakage stayed invisible while the
+path was opt-in. The 35B numbers above are real and were not enough — the tiny
+fixture is a shape the big model never exercises.
+
+**ROOT CAUSE CONFIRMED — the down-side rotate launches an empty grid.** Both
+FWHT rotates compute `n_groups = K / 256` and use it as `grid.x`. The arch-6 toy
+MoE preset (`crates/hipfire-arch-qwen35-spec/src/lib.rs`, `moe_preset`) is:
+
+| | value | `n_groups = K/256` | result |
+|---|---|---|---|
+| gate_up rotate | `K = hidden = 256` | 1 | fine |
+| **down rotate** | `K = moe_inter = 128` | **0** | **grid.x = 0 — never runs** |
+
+So `fused_silu_mul_mq_rotate_awq_indexed` is dispatched, launches zero blocks,
+returns success, and `rot_batch` keeps whatever was already in it. The down GEMV
+then consumes uninitialised memory → non-finite. The kernels' own
+`if (group >= groups_total) return` guard is irrelevant: the grid is empty, so
+the body never executes. **No error is raised anywhere** — that silence is the
+real defect, and it is not new to the indexed path: the pre-existing
+`fused_silu_mul_rotate_mq{,_awq}_batched` family computes `n_groups` the same
+way and would behave identically if a caller ever reached it with `K < 256`.
+The indexed OQ path is simply the first one to do so, because everything else on
+this fixture routes to the CPU fallback (`use_gpu_topk` requires `k_top == 8`
+and the toy preset is `experts_per_tok: 2`).
+
+Fix shape, cheapest first:
+
+1. **Guard admission**: refuse the indexed OQ path unless `moe_intermediate % 256
+   == 0 && dim % 256 == 0`. Keeps the toy fixture on the CPU fallback — the
+   behaviour that was already finite — and costs the 35B nothing. One predicate.
+2. **Make the silence loud**: have the rotate wrappers reject `k % 256 != 0`
+   rather than launching an empty grid. Do this together with (1), or the loud
+   failure just moves the crash earlier.
+3. Only if a sub-256 `mi` ever needs the fast path: a tail-handling kernel. Not
+   needed by any shipping model.
+**Do not flip this again until `./tests/tiny-affected-gate.sh --base
+origin/master --require-coverage` is green on the MoE OQ cells.**
 
 ## The bug, in one paragraph
 

@@ -4,7 +4,12 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage: benchmarks/calib/zaya-ragged-slice-parity.sh \
-  --model FILE --output-dir DIR --artifact-stem MODEL_NAME [options]
+  --model DIR --output-dir DIR --artifact-stem MODEL_NAME [options]
+
+--model is a Hugging Face SNAPSHOT DIRECTORY (one holding config.json) or a
+cache root (one holding snapshots/). Streamed calibration reads the raw
+checkpoint, not a packed container, so an .hfq artifact is NOT a valid source
+however convenient it looks sitting next to one.
 
 Run one ZAYA streamed calibration job at two slice widths over a RAGGED corpus
 and compare the two artifacts. Catches capture bugs that only appear when a
@@ -31,7 +36,22 @@ Options:
                          (default: target/release/hipfire-coexistence)
   --atol F32             Absolute comparison tolerance (default: 1e-5)
   --rtol F32             Relative comparison tolerance (default: 5e-3)
+  --max-mismatch-fraction F
+                         Share of compared values allowed to differ
+                         (default: 0.001). See VERDICT below.
   -h, --help             Show this help
+
+VERDICT: the run passes when no expert tensor differs, no value is non-finite,
+no tensor is missing or structurally wrong, and the share of differing values
+is within --max-mismatch-fraction. It deliberately does NOT pass/fail on the
+comparator's own exit status. Two slice widths sum the same rows in a different
+order, so a bf16 Hessian off-diagonal that nearly cancels differs by a few ULPs
+on a near-zero value: negligible absolutely, huge relatively (measured on
+ZAYA1-8B: abs 0.125 at rel 1.9). No atol/rtol separates that from corruption.
+Density does -- reassociation is a sparse scatter in dense Hessians only, while
+a stride defect rewrites whole rows and corrupts nearly every value, including
+the imatrix. Tolerances stay tight so the comparator remains a sensitive
+detector; the fraction and the structural invariants are the verdict.
 
 The output directory must be absent or empty. Existing evidence is never
 overwritten. A parity mismatch is recorded in evidence.json and exits 4.
@@ -59,6 +79,7 @@ SLICE_WIDTH=4
 COEXISTENCE="$ROOT/target/release/hipfire-coexistence"
 ATOL=1e-5
 RTOL=5e-3
+MAX_MISMATCH_FRACTION=0.001
 
 while (($#)); do
     case "$1" in
@@ -72,6 +93,7 @@ while (($#)); do
         --coexistence) COEXISTENCE=${2:?missing value for --coexistence}; shift 2 ;;
         --atol) ATOL=${2:?missing value for --atol}; shift 2 ;;
         --rtol) RTOL=${2:?missing value for --rtol}; shift 2 ;;
+        --max-mismatch-fraction) MAX_MISMATCH_FRACTION=${2:?missing value for --max-mismatch-fraction}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -80,7 +102,21 @@ done
 [[ -n $MODEL ]] || { printf 'error: --model is required\n' >&2; exit 2; }
 [[ -n $OUTPUT_DIR ]] || { printf 'error: --output-dir is required\n' >&2; exit 2; }
 [[ -n $ARTIFACT_STEM ]] || { printf 'error: --artifact-stem is required\n' >&2; exit 2; }
-[[ -f $MODEL ]] || { printf 'error: model not found: %s\n' "$MODEL" >&2; exit 2; }
+# Mirror resolve_hf_snapshot() so a wrong source fails here in milliseconds
+# instead of after the run has taken the GPU lock and started loading.
+if [[ ! -d $MODEL ]]; then
+    if [[ $MODEL == *.hfq ]]; then
+        printf 'error: --model must be a Hugging Face snapshot directory, not an .hfq: %s\n' \
+            "$MODEL" >&2
+    else
+        printf 'error: model directory not found: %s\n' "$MODEL" >&2
+    fi
+    exit 2
+fi
+if [[ ! -f $MODEL/config.json && ! -d $MODEL/snapshots ]]; then
+    printf 'error: %s is neither a Hugging Face snapshot nor a cache root\n' "$MODEL" >&2
+    exit 2
+fi
 [[ -x $COEXISTENCE ]] || { printf 'error: executable not found: %s\n' "$COEXISTENCE" >&2; exit 2; }
 for command in jq sha256sum; do
     command -v "$command" >/dev/null || { printf 'error: %s is required\n' "$command" >&2; exit 2; }
@@ -199,17 +235,51 @@ set +e
 comparison_status=${PIPESTATUS[0]}
 set -e
 
-# Structural check the tolerance cannot make: per-expert captures stage exactly
-# one row (n = 1), so their row stride is the width by construction and they are
-# immune to a slice-width defect. A mismatched expert tensor therefore is not
-# float reassociation -- it means something broke that tolerance would excuse.
+# Per-value tolerance CANNOT be the verdict here, and this is the subtle part of
+# the whole job. Two slice widths sum the same rows in a different order, so a
+# bf16-stored Hessian off-diagonal that nearly cancels lands a few ULPs apart on
+# a near-zero value -- tiny absolute, enormous relative. Measured on ZAYA1-8B:
+# max_abs_error 0.125 at max_rel_error 1.9. No fixed atol/rtol separates that
+# from real corruption, and loosening rtol past 1.0 would excuse anything.
+#
+# What DOES separate them is density and location. Reassociation is a sparse
+# scatter confined to dense Hessians. The stride defect this job exists to catch
+# reads whole rows from stale scratch, so it corrupts essentially every value of
+# every affected tensor -- percent-scale, not 0.001%-scale, and it reaches the
+# imatrix too. So gate on the mismatch FRACTION plus the structural invariants,
+# and keep the tolerance tight so it stays a sensitive detector rather than a
+# verdict.
 EXPERT_MISMATCHES=$(jq '[.tensor_mismatches[]? | select(.name | test("expert"; "i"))] | length' "$COMPARISON")
-if [[ $EXPERT_MISMATCHES != 0 ]]; then
-    printf '%s expert tensors mismatched (%s) -- not reassociation\n' \
-        "$(date --iso-8601=seconds)" "$EXPERT_MISMATCHES" | tee -a "$LOG"
+NON_FINITE=$(jq '.non_finite_values // 0' "$COMPARISON")
+STRUCTURAL=$(jq '((.structural_errors//[])|length) + ((.missing_from_reference//[])|length) + ((.missing_from_candidate//[])|length)' "$COMPARISON")
+MISMATCH_FRACTION=$(jq 'if (.compared_values // 0) > 0 then (.mismatched_values / .compared_values) else 1 end' "$COMPARISON")
+FRACTION_OK=$(jq -n --argjson f "$MISMATCH_FRACTION" --argjson b "$MAX_MISMATCH_FRACTION" 'if $f <= $b then 1 else 0 end')
+
+for check in "expert tensors mismatched:$EXPERT_MISMATCHES" "non-finite values:$NON_FINITE" \
+             "structural errors:$STRUCTURAL"; do
+    if [[ ${check#*:} != 0 ]]; then
+        printf '%s FAIL %s = %s (not reassociation)\n' \
+            "$(date --iso-8601=seconds)" "${check%%:*}" "${check#*:}" | tee -a "$LOG"
+    fi
+done
+if [[ $FRACTION_OK != 1 ]]; then
+    printf '%s FAIL mismatch fraction %s exceeds budget %s\n' \
+        "$(date --iso-8601=seconds)" "$MISMATCH_FRACTION" "$MAX_MISMATCH_FRACTION" | tee -a "$LOG"
 fi
 
-MODEL_SHA256=$(sha256sum "$MODEL" | awk '{print $1}')
+# The model is a directory, so hash what identifies the weights rather than the
+# weights themselves: the safetensors index names every shard and its offsets.
+# config.json is the fallback for a checkpoint stored as a single shard.
+MODEL_FINGERPRINT_FILE=$(
+    find "$MODEL" -maxdepth 3 \( -name 'model.safetensors.index.json' -o -name 'config.json' \) \
+        -print 2>/dev/null | sort | head -1
+)
+if [[ -n $MODEL_FINGERPRINT_FILE ]]; then
+    MODEL_SHA256=$(sha256sum "$MODEL_FINGERPRINT_FILE" | awk '{print $1}')
+else
+    MODEL_FINGERPRINT_FILE=
+    MODEL_SHA256=
+fi
 CORPUS_SHA256=$(sha256sum "$CORPUS" | awk '{print $1}')
 REFERENCE_SHA256=$(sha256sum "$REFERENCE_CALIB" | awk '{print $1}')
 CANDIDATE_SHA256=$(sha256sum "$CANDIDATE_CALIB" | awk '{print $1}')
@@ -220,7 +290,7 @@ if [[ -n $(git -C "$ROOT" status --porcelain 2>/dev/null) ]]; then
 else
     GIT_DIRTY=false
 fi
-if ((comparison_status == 0)) && [[ $EXPERT_MISMATCHES == 0 ]]; then
+if [[ $EXPERT_MISMATCHES == 0 && $NON_FINITE == 0 && $STRUCTURAL == 0 && $FRACTION_OK == 1 ]]; then
     STATUS=pass
 else
     STATUS=fail
@@ -231,6 +301,7 @@ jq -n \
     --arg generated_at "$(date --iso-8601=seconds)" \
     --arg model "$MODEL" \
     --arg model_sha256 "$MODEL_SHA256" \
+    --arg model_fingerprint "$MODEL_FINGERPRINT_FILE" \
     --arg corpus "$CORPUS" \
     --arg corpus_sha256 "$CORPUS_SHA256" \
     --argjson corpus_generated "$GENERATED_CORPUS" \
@@ -244,6 +315,10 @@ jq -n \
     --argjson git_dirty "$GIT_DIRTY" \
     --argjson comparison_status "$comparison_status" \
     --argjson expert_mismatches "$EXPERT_MISMATCHES" \
+    --argjson non_finite "$NON_FINITE" \
+    --argjson structural "$STRUCTURAL" \
+    --argjson mismatch_fraction "$MISMATCH_FRACTION" \
+    --argjson max_mismatch_fraction "$MAX_MISMATCH_FRACTION" \
     --argjson sequences "$SEQUENCES" \
     --argjson context "$CONTEXT" \
     --argjson slice_width "$SLICE_WIDTH" \
@@ -256,7 +331,11 @@ jq -n \
         generated_at: $generated_at,
         mechanism: "layer_streamed_slice_width_1_vs_n_over_ragged_corpus",
         inputs: {
-            model: {path: $model, sha256: $model_sha256},
+            model: {
+                path: $model,
+                fingerprint_file: (if $model_fingerprint == "" then null else $model_fingerprint end),
+                sha256: (if $model_sha256 == "" then null else $model_sha256 end)
+            },
             corpus: {path: $corpus, sha256: $corpus_sha256, generated: $corpus_generated}
         },
         geometry: {
@@ -279,6 +358,10 @@ jq -n \
         comparison: {
             calibration_exit_status: $comparison_status,
             expert_tensor_mismatches: $expert_mismatches,
+            non_finite_values: $non_finite,
+            structural_errors: $structural,
+            mismatch_fraction: $mismatch_fraction,
+            max_mismatch_fraction: $max_mismatch_fraction,
             calibration: $comparison[0]
         }
     }' >"$OUTPUT_DIR/evidence.json.tmp"

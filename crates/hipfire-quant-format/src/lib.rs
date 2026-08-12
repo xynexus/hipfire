@@ -152,7 +152,21 @@ pub enum QuantType {
     /// Opaque component bytes carried inside an HFQM bundle. This is not a
     /// weight encoding and must never be routed to a numeric kernel. The
     /// component manifest supplies the source format, byte length, and digest;
-    /// the HFQM entry shape is `[n_bytes]` and `group_size` is zero.
+    /// the HFQM entry shape is `[n_bytes]` and `group_size` is zero. Seen on
+    /// `__segment/<n>` tensors (names shaped
+    /// `__hipfire_component/<role>/<idx>/__segment/<n>`); arch loaders never
+    /// resolve these by name, so the bytes pass through verbatim — 1 B/element,
+    /// no block geometry, no dequant.
+    ///
+    /// **A read-compat shim, not a blessed encoding.** New components MUST NOT
+    /// emit qt=44. A component's *structured config* (e.g. a triattn sidecar's
+    /// `TRIA` geometry — `rope_theta`, `partial_rotary_factor`, head/band
+    /// counts, version) belongs in the container's **metadata JSON** as typed
+    /// keys, and its *numeric arrays* (e.g. triattn centers) belong as **typed
+    /// tensors** (`F16`/`BF16`/`F32`). Flattening a self-describing,
+    /// model-matched asset into an opaque blob discards its schema and its
+    /// provenance — see `hipfire_runtime::triattn` and the `~/.hipfire/triattn`
+    /// sidecar registry.
     OpaqueBytes = 44,
     /// Non-rotated (plain-basis) Opus W8 storage used by DFLASH/NPU artifacts.
     /// Per G256 block: `[f16 scale][256 signed int8]` = 258 bytes. Unlike
@@ -488,6 +502,7 @@ mod tests {
             (QuantType::MQ4G256Lloyd, 160),
             (QuantType::Oq4G256, 130),
             (QuantType::Oq3G256, 98),
+            (QuantType::Oq2G256, 66),
             (QuantType::Oq6G256, 194),
             (QuantType::Oq8G256, 258),
             (QuantType::Oq8G256RowPadded, 258),

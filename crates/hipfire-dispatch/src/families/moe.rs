@@ -51,26 +51,35 @@ pub struct MoeDtypes {
 }
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — the single parse of the switch controlling
-/// the indexed routed-OQ path. **ON by default**; set `0`/`off` to fall back to
-/// the CPU-top-K path.
+/// the indexed routed-OQ path. **OFF by default**; set `1`/`on` to opt in.
 ///
-/// It was off by default while its per-expert AWQ rotation was wrong (routed
-/// experts do not share an AWQ scale, so one rotation for all of them was a
-/// scale error from layer 0 — KLD 5.108296, ppl 1171.67). Fixed 2026-08-12:
-/// KLD 0.031515 / ppl 7.4643 against 0.030367 / 7.4622 for the fallback it
-/// replaces, with layer-0 residual cosine 0.999999. The remaining 3.8% is the
-/// expected non-bit-identity of a different accumulation order, so the indexed
-/// path is now the better default: same quality, and it is the only path that
-/// can serve a paged-expert artifact at all.
+/// The per-expert AWQ rotation this path needs was wrong until 2026-08-12 (routed
+/// experts do not share an AWQ scale, so one rotation for all of them was a scale
+/// error from layer 0 — KLD 5.108296, ppl 1171.67). Fixing it took the 35B-A3B
+/// oq4.25++ to KLD 0.031515 / ppl 7.4643, against 0.030367 / 7.4622 for the
+/// fallback, with layer-0 residual cosine 0.999999.
+///
+/// **That was enough to make it correct on that model and NOT enough to make it
+/// the default.** It was flipped on the strength of those numbers and reverted
+/// the same day: `tests/tiny-quant-gate.sh` turned seven `qwen3_5_moe` OQ cells
+/// from finite to **non-finite KLD** (oq4, oq8, and the five calib variants).
+/// With the flag off those cells route to the CPU fallback and are finite, which
+/// is exactly why the breakage was invisible while it was opt-in. The tiny MoE
+/// fixture is far smaller than the 35B, so the suspect is a shape the big model
+/// never exercises — the FWHT rotates need `K % 256 == 0` and launch a zero-sized
+/// grid otherwise, leaving the destination buffer untouched.
+///
+/// Before flipping this again: `./tests/tiny-affected-gate.sh --base origin/master
+/// --require-coverage` must be green on the MoE OQ cells. One model's KLD is not
+/// a substitute for the fixture tier — that is the mistake this comment exists to
+/// stop repeating.
 ///
 /// This parse MUST stay single. Three sites used to read it independently and
 /// two spellings disagreed: the loader's MoE-block repack and this resolver
 /// accepted only `"1"`, while qwen35's dispatch predicate also accepted `"on"`.
 /// `=on` therefore enabled the indexed dispatch against weights that were never
 /// repacked for it — guaranteed garbage, from a value that looks like it should
-/// work. The same hazard now runs the other way (a disable that only half
-/// applies would be just as broken), which is why the off-switch is parsed here
-/// too and nowhere else.
+/// work.
 pub fn oq_indexed_decode_enabled() -> bool {
     oq_indexed_decode_enabled_from(
         std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
@@ -80,10 +89,10 @@ pub fn oq_indexed_decode_enabled() -> bool {
 }
 
 /// The parse itself, split out so it is testable without touching process-global
-/// env (which races under a parallel test runner). The default INVERTED on
-/// 2026-08-12 — unset now means enabled — so it is worth a direct assertion.
+/// env (which races under a parallel test runner). The default was inverted and
+/// re-reverted on 2026-08-12, so it carries a direct assertion either way.
 pub fn oq_indexed_decode_enabled_from(v: Option<&str>) -> bool {
-    !matches!(v, Some("0") | Some("off"))
+    matches!(v, Some("1") | Some("on"))
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
