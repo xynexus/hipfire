@@ -177,6 +177,39 @@ impl Qwen35Tiny {
         }
     }
 
+    /// ~11M params: the arch-6 MoE shaped so the INDEXED routed-expert decode
+    /// path is actually admitted. [`Self::moe_preset`] never reaches it and
+    /// cannot be changed to — two independent gates exclude it, and both have
+    /// to be cleared at once:
+    ///
+    /// - `use_gpu_topk` requires `k_top == 8`; `moe_preset` is top-2.
+    /// - the indexed path's FWHT rotates are G256 on both sides, so `hidden`
+    ///   AND `moe_inter` must be positive multiples of 256; `moe_preset` is
+    ///   `moe_inter = 128`, which is the shape that launched a zero-sized grid
+    ///   and turned seven OQ cells non-finite on 2026-08-12.
+    ///
+    /// `moe_preset` deliberately keeps both exclusions: it is the regression
+    /// cover for the ADMISSION guard (`oq_indexed_decode_active`), i.e. that an
+    /// inadmissible shape still routes to the CPU fallback instead of erroring.
+    /// This preset is the cover for the path itself.
+    ///
+    /// 16 experts rather than 8 so top-8 is a real selection — with 8-of-8 every
+    /// slot is always live, and a kernel that ignored `topk_indices` entirely
+    /// could still score clean. Two layers (one linear-attn, one full) keep the
+    /// cost near `moe_preset` despite 6x the expert width; attention coverage is
+    /// already `moe_preset`'s job.
+    fn moe_indexed_preset() -> Self {
+        Self {
+            experts: 16,
+            experts_per_tok: 8,
+            moe_inter: 768,
+            shared_inter: 128,
+            layers: 2,
+            full_attn_interval: 2,
+            ..Self::preset()
+        }
+    }
+
     fn vl_preset() -> Self {
         Self::preset()
     }
@@ -627,6 +660,23 @@ impl ToyModel for Qwen35MoeSpec {
             tensors: m.manifest(),
         }
     }
+
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["moe", "indexed"]
+    }
+
+    fn fixture_named(&self, name: &str, _seed: u64) -> Option<ToyFixture> {
+        let m = match name {
+            "default" | "moe" => Qwen35Tiny::moe_preset(),
+            "indexed" => Qwen35Tiny::moe_indexed_preset(),
+            _ => return None,
+        };
+        Some(ToyFixture {
+            config_json: serde_json::to_string_pretty(&m.config_json())
+                .expect("serialize qwen3.5 moe toy config"),
+            tensors: m.manifest(),
+        })
+    }
 }
 
 // Qwen3.5 dense + MoE are served through the server-side continuous-batching
@@ -683,6 +733,34 @@ mod tests {
             .base
             .sidecar_config_keys("vl")
             .contains(&"vision_config"));
+    }
+
+    /// The indexed fixture exists ONLY to reach the indexed routed-expert decode,
+    /// and three independent conditions gate that. Any one of them drifting turns
+    /// the `qwen3_5_moe_indexed` tiny-quant family into a silent duplicate of
+    /// `qwen3_5_moe` — still green, covering nothing. Assert all three here, where
+    /// the shape is defined, rather than trusting a KLD number to notice.
+    #[test]
+    fn indexed_moe_fixture_clears_the_admission_gates() {
+        let m = Qwen35Tiny::moe_indexed_preset();
+        assert_eq!(m.experts_per_tok, 8, "use_gpu_topk requires k_top == 8");
+        assert_eq!(m.hidden % 256, 0, "gate_up FWHT rotate is G256 over hidden");
+        assert_eq!(
+            m.moe_inter % 256,
+            0,
+            "down FWHT rotate is G256 over moe_inter"
+        );
+        assert!(m.moe_inter >= 256 && m.hidden >= 256, "K/256 must be >= 1");
+        assert!(
+            m.experts > m.experts_per_tok,
+            "top-k of exactly n_exp makes every slot always-live, so a kernel \
+             ignoring topk_indices would still score clean"
+        );
+
+        // And the default MoE preset must keep FAILING them — it is the
+        // regression cover for the admission guard's fallback branch.
+        let d = Qwen35Tiny::moe_preset();
+        assert!(d.moe_inter % 256 != 0 || d.experts_per_tok != 8);
     }
 
     #[test]

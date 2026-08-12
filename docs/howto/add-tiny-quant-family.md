@@ -109,6 +109,7 @@ FamilyPlan {
     candidates: &["hfq4", "mq4", "mq3"],
     quant_flags: &[],            // e.g. &["--arch-id", "7"] for qwen2 (its model_type auto-detects to arch 1)
     calibrated: &[],             // qtip3-sim emits bf16; only families whose loader loads bf16 (qwen3.5) get a calibrated cell
+    probe_env: &[],              // env for the PROBE only (see below); quantize never sees it
 }
 ```
 
@@ -119,6 +120,27 @@ kernels need MQ4/MQ6 experts). Candidates = other loadable formats.
 If a specific format **GPU-faults on some arch** (minimax topk faults on gfx1151),
 exclude that *family* per-host with `HIPFIRE_TINYQUANT_FAMILIES=qwen2,gemma3,...`
 rather than dropping it from the matrix.
+
+### Covering an opt-in runtime path
+
+A path behind an env switch is invisible to this battery by default, and that is
+how the indexed routed-OQ decode reached production with only one model's KLD
+behind it. To cover one, add a family whose fixture SHAPE reaches the path and
+whose `probe_env` turns it on — `qwen3_5_moe_indexed` is the worked example: same
+arch 6, a `fixture_named("indexed", ..)` variant with top-8 routing and
+`moe_intermediate = 768`, and `probe_env: &[("HIPFIRE_QWEN35_MOE_OQ_INDEXED",
+"1")]`. All of it has to line up; miss one and you get a green row that scores
+the fallback under a name claiming otherwise.
+
+`probe_env` reaches `collect` and `kld` only, never `hipfire-quantize` — a
+serving-side switch must not change the artifact being scored.
+
+Two cheap checks are worth writing with it, because neither failure mode is
+visible in the KLD number: assert in the `-spec` crate that the fixture clears
+every admission gate (see `indexed_moe_fixture_clears_the_admission_gates`), and
+assert here that the plan still carries the switch. Then confirm coverage
+empirically once: run the probe on the same artifact with the switch 0 vs 1 and
+check the KLD actually MOVES. If it does not, the path is not being taken.
 
 ## Step 4 — no-GPU roundtrip (`tests/fixture-roundtrip-nogpu.sh`)
 

@@ -56,6 +56,11 @@ struct FamilyPlan {
     /// Calibrated cells: `(format, true)` quantizes from the HF dir with
     /// `HIPFIRE_QTIP_HESSIAN=<calib>` set, scored vs the anchor.
     calibrated: &'static [&'static str],
+    /// Env set on every PROBE invocation for this family (collect + kld), so a
+    /// family can cover an opt-in runtime path. Not applied to `hipfire-quantize`:
+    /// these are serving-side switches, and letting them reach the quantizer
+    /// would silently change the artifact the cell is supposed to score.
+    probe_env: &'static [(&'static str, &'static str)],
 }
 
 /// The validated matrix. Anchors/candidates are bounded by each arch loader's
@@ -73,6 +78,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["hfq4", "mq4", "mq3", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Historical arch_id 1 dense Qwen3/Qwen2 path. The supported fixture is
         // bias-free Qwen3 legacy; Qwen2 attention-bias artifacts must be routed
@@ -83,6 +89,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["hfq4", "mq4", "mq3", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         FamilyPlan {
             arch: "qwen2",
@@ -90,6 +97,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &["--arch-id", "7"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // dots.ocr coverage through the arch-8 loader. The fixture is a complete
         // Qwen2 text + Dots vision tower artifact; the tiny harness runs
@@ -103,6 +111,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["hfq4", "oq4", "oq8"],
             quant_flags: &["--include-vision", "--vision-quant", "hfq4"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // DeepSeek4 text-core coverage: Q/O-LoRA, Hyper-Connections,
         // score-routed MoE, shared experts, and native MQ2-Lloyd routed expert
@@ -114,6 +123,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["deepseek4-source-precision", "oq4", "oq8"],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // DeepSeek4 compressed-KV/indexer coverage: one tiny ratio-4 layer
         // exercises compressor streams, indexer projections, and mixed attention.
@@ -127,6 +137,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["deepseek4-source-precision", "oq4", "oq8"],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // DeepSeek4 MTP coverage: one main layer seeds `mtp_last_hidden`, then
         // the tiny probe returns logits from the draft MTP layer itself.
@@ -136,6 +147,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["deepseek4-source-precision"],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &[],
+            probe_env: &[],
         },
         FamilyPlan {
             arch: "gemma3",
@@ -143,6 +155,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Gemma3-VL multimodal coverage. The fixture is a complete multimodal
         // artifact (language_model + SigLIP + projector); the tiny harness
@@ -157,6 +170,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &["--include-vision", "--vision-quant", "q8f16"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Gemma 4 dense text coverage.
         FamilyPlan {
@@ -165,6 +179,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Gemma 4 PLE/KV-sharing coverage. The runtime intentionally routes
         // PLE and shared-KV layers through the reference forward path while the
@@ -175,6 +190,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Gemma 4 dense-MoE coverage. Routed experts run through the reference
         // path while the dense-only fixture uses the lowered path.
@@ -184,6 +200,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         FamilyPlan {
             arch: "minimax",
@@ -191,6 +208,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "mq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Hybrid Nemotron-H (arch 14): separate from pure Mamba2 so the tiny
         // matrix exercises Mamba, attention, and MLP block dispatch in one row.
@@ -200,6 +218,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         FamilyPlan {
             arch: "lfm2_moe",
@@ -207,6 +226,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["mq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Pure Mamba2 (arch 15): recurrent SSM state + State Spaces tensor
         // naming, loaded through the Mamba-capable Nemotron backend. Keep this
@@ -217,6 +237,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // ZAYA1 hybrid CCA + EDA/MoD MoE coverage through arch 16. The tiny
         // fixture uses q8f16 as the stable loader anchor and exercises routed
@@ -227,6 +248,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         FamilyPlan {
             arch: "qwen3_5",
@@ -236,6 +258,7 @@ fn families() -> &'static [FamilyPlan] {
             // qtip3-sim is the runtime format that consumes our HFQM Hessian
             // (LDLQ); emits bf16, which only the qwen3.5 loader accepts.
             calibrated: &["qtip3-sim", "oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // Qwen3.5-VL: composite text_config + vision_config artifact. The
         // tiny harness runs one synthetic vision forward and splices the visual
@@ -246,6 +269,7 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &["--include-vision", "--vision-quant", "hfq4"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
         },
         // MoE path coverage: 3D-stacked expert quant + per-expert decode loop +
         // 99-tensor collect (dense attn + router captured; routed experts are
@@ -262,6 +286,31 @@ fn families() -> &'static [FamilyPlan] {
             candidates: &["q8f16", "mq6", "mq4", "mq3", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[],
+        },
+        // The INDEXED routed-OQ decode path. Same arch 6, a fixture reshaped to
+        // clear the two gates that exclude `qwen3_5_moe` from it (top-8 routing;
+        // `hidden` and `moe_inter` both multiples of 256 for the G256 FWHT) plus
+        // the opt-in env switch. Without all three this is a duplicate of the
+        // row above — the path is unreachable and the cells score the CPU
+        // fallback.
+        //
+        // Why it exists: on 2026-08-12 this path was made correct on a 35B-A3B
+        // (KLD 5.108 -> 0.0315) and flipped on, and seven `qwen3_5_moe` OQ cells
+        // went non-finite because the toy `moe_inter = 128` made the down-side
+        // rotate launch a zero-sized grid. No fixture covered the path itself,
+        // so one model's KLD was the only evidence. This row is that coverage.
+        //
+        // OQ-only by design: the indexed path fires exclusively on Oq4G256 /
+        // Oq8G256 routed experts, and every other format is already covered by
+        // `qwen3_5_moe` at a sixth of the expert width.
+        FamilyPlan {
+            arch: "qwen3_5_moe_indexed",
+            anchor: "fp16",
+            candidates: &["oq4", "oq8"],
+            quant_flags: &[],
+            calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
+            probe_env: &[("HIPFIRE_QWEN35_MOE_OQ_INDEXED", "1")],
         },
     ]
 }
@@ -427,9 +476,15 @@ fn run_quantize(
     Ok(())
 }
 
-fn run_kld(probe: &Path, arch: &str, anchor: &Path, cand: &Path) -> Result<KldCell, String> {
-    let out = Command::new(probe)
-        .arg("kld")
+fn run_kld(
+    probe: &Path,
+    arch: &str,
+    anchor: &Path,
+    cand: &Path,
+    probe_env: &[(&str, &str)],
+) -> Result<KldCell, String> {
+    let mut cmd = Command::new(probe);
+    cmd.arg("kld")
         .arg("--arch")
         .arg(arch)
         .arg("--ref")
@@ -442,9 +497,9 @@ fn run_kld(probe: &Path, arch: &str, anchor: &Path, cand: &Path) -> Result<KldCe
         .arg(KLD_WARMUP.to_string())
         // Disable the O_DIRECT slab loader (fails on the tiny file on some FS /
         // integrated GPUs; the mmap path handles every arch).
-        .env("HIPFIRE_GPU_SLAB_LOAD", "0")
-        .output()
-        .map_err(|e| format!("spawn probe kld: {e}"))?;
+        .env("HIPFIRE_GPU_SLAB_LOAD", "0");
+    cmd.envs(probe_env.iter().copied());
+    let out = cmd.output().map_err(|e| format!("spawn probe kld: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let tail: String = String::from_utf8_lossy(&out.stderr)
@@ -692,6 +747,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 .arg("--len")
                 .arg(KLD_LEN.to_string())
                 .env("HIPFIRE_GPU_SLAB_LOAD", "0")
+                .envs(plan.probe_env.iter().copied())
                 .output();
             match collect {
                 Ok(o) if o.status.success() => {
@@ -774,7 +830,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 );
                 continue;
             }
-            match run_kld(&probe, fam, &anchor, &cand) {
+            match run_kld(&probe, fam, &anchor, &cand, plan.probe_env) {
                 Ok(cell) => {
                     let base = baselines
                         .get(&(gpu_arch.clone(), fam.to_string(), fmt.to_string()))
@@ -855,7 +911,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 );
                 continue;
             }
-            match run_kld(&probe, fam, &anchor, &cand) {
+            match run_kld(&probe, fam, &anchor, &cand, plan.probe_env) {
                 Ok(cell) => {
                     let key = format!("{fmt}-calib");
                     let base = baselines
@@ -911,11 +967,23 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
         .map(|(g, fam, fmt, _)| (g.as_str(), fam.as_str(), fmt.as_str()))
         .collect();
     let mut kept: Vec<String> = Vec::new();
+    // Hand-written commentary (the standing-failure triage, per-cell caveats) is
+    // preserved verbatim. It used to be dropped, so a subset `--record` silently
+    // deleted the notes explaining rows it did not even touch.
+    let mut comments: Vec<String> = Vec::new();
     let mut prior_tol: BTreeMap<(String, String, String), f64> = BTreeMap::new();
     if let Ok(body) = std::fs::read_to_string(&path) {
         for line in body.lines() {
             let t = line.trim();
-            if t.is_empty() || t.starts_with('#') {
+            if t.starts_with('#') {
+                if !t.starts_with("# tiny-quant KLD baselines")
+                    && !t.starts_with("# regenerate per GPU")
+                {
+                    comments.push(t.to_string());
+                }
+                continue;
+            }
+            if t.is_empty() {
                 continue;
             }
             let f: Vec<&str> = t.split_whitespace().collect();
@@ -942,6 +1010,10 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
     out.push_str(
         "# regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record\n",
     );
+    for c in &comments {
+        out.push_str(c);
+        out.push('\n');
+    }
     let mut all: Vec<String> = kept;
     for (g, fam, fmt, mean) in observed {
         let tol = prior_tol
@@ -961,6 +1033,32 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The env switch is half of what makes this family cover anything — the
+    /// fixture shape is admissible, but the path is still opt-in at runtime. Drop
+    /// the switch and the cells score the CPU fallback under a name that says
+    /// otherwise.
+    #[test]
+    fn indexed_moe_family_opts_into_the_indexed_path() {
+        let plan = families()
+            .iter()
+            .find(|p| p.arch == "qwen3_5_moe_indexed")
+            .expect("indexed MoE tiny-quant plan");
+        assert!(plan
+            .probe_env
+            .contains(&("HIPFIRE_QWEN35_MOE_OQ_INDEXED", "1")));
+        // OQ-only: the indexed path fires on Oq4G256/Oq8G256 routed experts and
+        // nothing else, so any other candidate here is pure duplicated cost.
+        for f in plan.candidates.iter().chain(plan.calibrated) {
+            assert!(f.starts_with("oq"), "{f} does not reach the indexed path");
+        }
+        // The baseline family must NOT carry the switch — it is the fallback arm.
+        let base = families()
+            .iter()
+            .find(|p| p.arch == "qwen3_5_moe")
+            .expect("MoE tiny-quant plan");
+        assert!(base.probe_env.is_empty());
+    }
 
     #[test]
     fn opus_cells_use_canonical_oq_tokens() {

@@ -208,3 +208,10 @@ gfx1151 qwen3_5_moe mq3 0.24754102 0.25
 gfx1151 qwen3_5_moe mq4 0.15463363 0.25
 gfx1151 qwen3_5_moe mq6 0.15463363 0.25
 gfx1151 qwen3_5_moe q8f16 0.14130644 0.25
+gfx1151 qwen3_5_moe_indexed oq4 0.06008204 0.25
+gfx1151 qwen3_5_moe_indexed oq4++-calib 0.04760109 0.25
+gfx1151 qwen3_5_moe_indexed oq4+-calib 0.05723667 0.25
+gfx1151 qwen3_5_moe_indexed oq4.25++-calib 0.03901826 0.25
+gfx1151 qwen3_5_moe_indexed oq8 0.00332723 0.25
+gfx1151 qwen3_5_moe_indexed oq8++-calib 0.00290585 0.25
+gfx1151 qwen3_5_moe_indexed oq8+-calib 0.00307532 0.25
