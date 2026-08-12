@@ -33,14 +33,32 @@ help=$($RUNNER --help)
 [[ $help == *'NO LOCK WRAPPER'* ]] || fail 'help omits the self-lock contract'
 [[ $help == *'KLDREF IS OFF'* ]] || fail 'help omits the kldref contract'
 
-model=$(mktemp "$TMP_DIR/model.XXXXXX.bf16.hfq")
+# Streamed calibration reads a raw HF checkpoint, so the model is a DIRECTORY
+# holding config.json -- not a packed .hfq.
+model="$TMP_DIR/snapshot"
+mkdir "$model"
+printf '{}\n' >"$model/config.json"
 
 expect_usage_error 'invalid stem' 'canonical path-safe model stem' \
     --model "$model" --output-dir "$TMP_DIR/stem" --artifact-stem '../ZAYA1-8B' \
     --coexistence /bin/true
 
-expect_usage_error 'missing model' 'model not found' \
-    --model "$TMP_DIR/absent.hfq" --output-dir "$TMP_DIR/absent-model" \
+expect_usage_error 'missing model' 'model directory not found' \
+    --model "$TMP_DIR/absent" --output-dir "$TMP_DIR/absent-model" \
+    --artifact-stem ZAYA1-8B --coexistence /bin/true
+
+# The mistake is easy to make because a .hfq of the same model sits right next
+# to the checkpoint. Reject it by name so the run fails in milliseconds instead
+# of after taking the GPU lock and loading.
+hfq=$(mktemp "$TMP_DIR/model.XXXXXX.bf16.hfq")
+expect_usage_error 'hfq as model' 'must be a Hugging Face snapshot directory, not an .hfq' \
+    --model "$hfq" --output-dir "$TMP_DIR/hfq-model" \
+    --artifact-stem ZAYA1-8B --coexistence /bin/true
+
+notsnapshot="$TMP_DIR/notsnapshot"
+mkdir "$notsnapshot"
+expect_usage_error 'directory without config.json' 'neither a Hugging Face snapshot nor a cache root' \
+    --model "$notsnapshot" --output-dir "$TMP_DIR/notsnap-out" \
     --artifact-stem ZAYA1-8B --coexistence /bin/true
 
 # The guards that keep the job from passing vacuously. A width of 1 makes every
