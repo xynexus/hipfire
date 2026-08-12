@@ -159,8 +159,40 @@ Cost, for the decision: one extra f32 register per lane and a second shuffle per
 tree level — 5 extra shuffles per dot product, on a kernel that is latency- rather
 than ALU-bound. Cheap, but not free, on the hot path.
 
-Modelled on CPU only so far, in the same harness whose all-f32 row reproduces the
-GPU kernel to ~5%. The kernel change is not written.
+**Two-product (Dekker/FMA) modelled too — it is strictly better in isolation and
+buys almost nothing end to end, because it hits the UPDATE floor.** `e = fma(a, b,
+-a*b)` recovers what each multiply discards, which compensation of the adds alone
+cannot reach:
+
+| configuration | 24 tok | 96 tok |
+|---|---|---|
+| only KV f32 | 2.530e-7 | 1.298e-6 |
+| only KV, Kahan | 1.271e-7 | 6.945e-7 |
+| **only KV, Dekker** | **9.582e-8** | **4.019e-7** |
+| all f32 + Kahan KV | 2.500e-7 | 1.127e-6 |
+| all f32 + Dekker KV | 2.009e-7 | 1.134e-6 |
+| `only UPDATE f32` (the floor) | 2.033e-7 | 1.062e-6 |
+
+Dekker cuts the isolated KV term by 62%/69% against plain f32 and beats Kahan by
+~40%. But in the FULL configuration it lands on the update term almost exactly —
+0.99x it at 24 tokens, 1.07x at 96 — and at 96 tokens it is even a hair WORSE
+than Kahan (1.134e-6 vs 1.127e-6). That inversion is not noise to be explained
+away: once the dot product is near-exact the remaining f32 errors dominate, the
+trajectory shifts, and in a recurrence a smaller error in one term does not
+monotonically reduce total divergence.
+
+**So the actionable conclusion changes.** Compensating the KV dot — by either
+method — takes the state error to the UPDATE floor and no further. The sequence
+that would actually matter is:
+1. compensate the KV dot (Kahan is enough; Dekker's extra accuracy is wasted
+   below the floor), AND
+2. compensate `s = alpha*s + k*delta` and its f32 tile store, which is what the
+   floor is made of.
+
+Doing (1) alone buys 20-35%. Neither alone approaches the f64 oracle's 12x.
+
+All CPU-modelled, in the harness whose all-f32 row reproduces the GPU kernel to
+~5%. No kernel change is written.
 
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
