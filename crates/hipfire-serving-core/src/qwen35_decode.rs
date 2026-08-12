@@ -348,6 +348,117 @@ pub fn maybe_dump_kvarn_state(
             return;
         }
     };
+    // DeltaNet state dynamic range vs FP16 limits. The FP16 state path is a
+    // plain `(_Float16)` cast with no scale and no clamp
+    // (kernels/src/gated_delta_net_f16.hip:115), so anything above 65504
+    // saturates to inf and anything below ~6.1e-5 goes subnormal. If the state
+    // lives near either edge, "FP16 costs more KLD on the bigger model" is a
+    // range problem, not a rounding one.
+    {
+        let dn = state.dn_state();
+        let mut gmax = 0.0f32;
+        let mut gmin_nz = f32::INFINITY;
+        let mut n_over = 0usize;
+        let mut n_sub = 0usize;
+        let mut n_tot = 0usize;
+        let mut n_nonfinite = 0usize;
+        // L2 and mean|S| let two runs be compared without shipping the buffers
+        // around: if FP16's norms drift further from FP32's as the sequence
+        // grows, the cost is COMPOUNDING per-step rounding, not a fixed
+        // storage error.
+        let mut l2 = 0.0f64;
+        let mut sum_abs = 0.0f64;
+        for (li, t) in dn.s_matrices.iter().enumerate() {
+            // Dtype-aware: `download_f32` reads numel*4 bytes with NO dtype
+            // check, so calling it on the FP16 state over-reads the allocation
+            // by 2x and faults in memcpy_dtoh. That crash is this probe's, not
+            // the FP16 path's — worth the comment because it looks exactly like
+            // the FP16 bug one would be hunting.
+            // Decide by BYTES PER ELEMENT, not by the dtype label: FP16 state is
+            // allocated as `DType::Raw` on purpose (state.rs — "there is no f16
+            // DType at this layer, and labelling it F32 would make every
+            // downstream size calculation wrong"), so matching on F16 never
+            // fires and the F32 path then over-reads.
+            let bpe = t.buf.size() / t.numel().max(1);
+            let v: Vec<f32> = match bpe {
+                2 => {
+                    let Ok(raw) = gpu.download_raw(t, t.numel() * 2) else {
+                        continue;
+                    };
+                    raw.chunks_exact(2)
+                        .map(|c| {
+                            let h = u16::from_le_bytes([c[0], c[1]]);
+                            let sign = ((h >> 15) & 1) as u32;
+                            let exp = ((h >> 10) & 0x1f) as u32;
+                            let man = (h & 0x3ff) as u32;
+                            let bits = if exp == 0 {
+                                if man == 0 {
+                                    sign << 31
+                                } else {
+                                    // subnormal: renormalise
+                                    let mut e = -1i32;
+                                    let mut m = man;
+                                    while m & 0x400 == 0 {
+                                        m <<= 1;
+                                        e -= 1;
+                                    }
+                                    let e = (e + 1 - 15 + 127) as u32;
+                                    (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
+                                }
+                            } else if exp == 0x1f {
+                                (sign << 31) | (0xff << 23) | (man << 13)
+                            } else {
+                                (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13)
+                            };
+                            f32::from_bits(bits)
+                        })
+                        .collect()
+                }
+                4 => match gpu.download_f32(t) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            for &x in &v {
+                if !x.is_finite() {
+                    n_nonfinite += 1;
+                    continue;
+                }
+                let a = x.abs();
+                n_tot += 1;
+                l2 += (a as f64) * (a as f64);
+                sum_abs += a as f64;
+                if a > gmax {
+                    gmax = a;
+                }
+                if a > 0.0 {
+                    if a < gmin_nz {
+                        gmin_nz = a;
+                    }
+                    if a < 6.104e-5 {
+                        n_sub += 1;
+                    }
+                }
+                if a > 65504.0 {
+                    n_over += 1;
+                }
+            }
+            if li >= 3 {
+                break; // first few layers are enough to characterise the range
+            }
+        }
+        eprintln!(
+            "[dn-range] pos={} layers=0..3 elems={n_tot} max|S|={gmax:.6e} \
+             min_nonzero|S|={:.6e} over_fp16_max={n_over} subnormal_in_fp16={n_sub} \
+             ({:.3}%) nonfinite={n_nonfinite} l2={:.9e} mean_abs={:.9e}",
+            state.cursor.seq_pos,
+            if gmin_nz.is_finite() { gmin_nz } else { 0.0 },
+            100.0 * n_sub as f64 / n_tot.max(1) as f64,
+            l2.sqrt(),
+            sum_abs / n_tot.max(1) as f64,
+        );
+    }
     let pos = state.cursor.seq_pos;
     let mut out = Vec::with_capacity(16 + (window.len() + records.len()) * 4);
     out.extend_from_slice(&(layer as u32).to_le_bytes());

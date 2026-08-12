@@ -94,6 +94,47 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
+## [Medium] FP16 DeltaNet state error COMPOUNDS with sequence length — no bug, but the framing understates it
+
+Investigated 2026-08-12 on the suspicion that a 45x KLD gap between the 2B and
+the 35B (5.65e-05 vs 2.57e-03, from `pr/deltanet-fp16-state`) was too dramatic for
+a storage-precision change. It is not a bug. Three candidate bugs were ruled out
+by measurement:
+
+- **Overflow.** `gated_delta_net_f16.hip:115` is a bare `(_Float16)` cast with no
+  scale and no clamp, so FP16's 65504 ceiling applies directly. Measured max|S| is
+  **16.2** on the 35B and **13.8** on the 0.8B — an order of magnitude of headroom.
+  `over_fp16_max=0`, `nonfinite=0` on both.
+- **Arithmetic silently done in FP16.** It is not: the kernel keeps
+  `__shared__ float S_tile`, widens on load (`(float)S_global[i]`), does every
+  update in f32, and narrows once on store. The "storage only, arithmetic stays
+  FP32" claim holds.
+- **A dtype/plumbing error.** None found.
+
+What IS true, and what the "storage only" framing understates: **the state is a
+recurrent accumulator that gets re-rounded to FP16 on every kernel invocation**,
+with round-to-nearest and no error feedback. That bias compounds. Measured on the
+35B, FP16-vs-FP32 relative divergence of the state's L2 norm:
+
+| decode steps | seq pos | L2 relative divergence |
+|---|---|---|
+| 2 | 26 | 2.49e-06 |
+| 40 | 64 | **3.22e-05** |
+
+**13x more error for 2.5x more tokens** — superlinear, not a fixed storage cost.
+So a KLD figure measured at one context length understates longer ones, and a
+model with more recurrent layers accumulates more of it. That is the mechanism
+behind "worse on the bigger model", together with the 35B carrying 2.6x more of
+its state in FP16's low-precision region (31.3% of elements subnormal in FP16 vs
+12.2% on the 0.8B; min |S| 3.1e-14 vs 3.9e-12, and FP16 flushes everything below
+~6e-8 — the FP16 runs bottom out at exactly 2.98e-8).
+
+Actionable: the doc notes "no scales, no stochastic rounding" as if both were
+neutral. For a compounding accumulator they are not. **Stochastic rounding or
+error feedback on the FP16 store would break the bias accumulation** and is the
+obvious lever if FP16 state is wanted at long context. Worth measuring before
+FP16 is proposed as a default again.
+
 ## [High] Session release LEAKS its KV and DeltaNet GPU buffers — and blocks sound CoW
 
 Found 2026-08-12 while implementing copy-on-write checkpoints. Sessions are
