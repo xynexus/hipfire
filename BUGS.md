@@ -129,10 +129,30 @@ it.** Concurrency on a hybrid model is therefore bounded by DeltaNet state, not 
 the KV cache — which is the opposite of where capacity planning usually looks, and
 the opposite of where this plan's own 0.4 analysis looks (expert bytes and KV).
 
+**FIXED for the collapse by `HIPFIRE_DN_STATE_FP16=1`, measured 2026-08-12.**
+FP16 state halves the 60 MiB to 30 MiB and that is enough to make 64 sessions fit:
+
+| width | FP32 state | FP16 state |
+|---|---|---|
+| 16 | 16/16, 5.66 tok/s | 16/16, 5.96 |
+| 32 | 32/32, 5.54 | 32/32, 6.25 |
+| **64** | **19/64, 2.55** | **64/64, 6.31** |
+
+Zero allocation failures at any width, and achieved decode widths now reach 44
+(against ~20 before). Throughput also becomes monotonic in width instead of
+collapsing.
+
+FP16 state is opt-in (`hipfire_env::DN_STATE_FP16.flag()`); it was briefly made
+default on 2026-08-09 and reverted the same day because surviving Q8 dispatch arms
+faulted on half-size state. Those kernels and callers have since been deleted, so
+that blocker is gone; what still holds the default is that the supporting evidence
+is one prompt on one model. This measurement is a second, independent reason to
+want it (capacity, not just accuracy) and should be weighed in that decision.
+
 Two consequences worth acting on:
 - the checkpoint clones DN state eagerly. If that clone can be made genuinely
-  copy-on-write, per-session cost roughly halves and the reachable width roughly
-  doubles for free.
+  copy-on-write, per-session cost roughly halves AGAIN and the reachable width
+  roughly doubles.
 - `rocm-smi --showmeminfo vram` is useless here: it reported 80-93 MiB of 256 MiB
   across the whole run, because that is the dedicated carve-out, not the 42 GiB
   GTT pool the allocator actually draws from. The allocator's own
