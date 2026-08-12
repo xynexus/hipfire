@@ -14,8 +14,20 @@ down side. Per-expert rotation is now wired through every dispatch site, and
 verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
 from **0.244 to 0.999999**, with no layer below 0.9994 across all 40, and KLD
 went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
-within 3.8% of the CPU fallback it has to match. **The flag is now ON by
-default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=0` (or `off`) falls back.
+within 3.8% of the CPU fallback it has to match. **The flag stays OFF by
+default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` opts in.
+
+⚠️ **It was flipped ON and reverted the same day.** `tests/tiny-quant-gate.sh`
+turns seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,
+and the five calib variants) with the flag on; with it off they route to the CPU
+fallback and are finite, which is why the breakage stayed invisible while the
+path was opt-in. The 35B numbers above are real and were not enough — the tiny
+fixture is far smaller, so the suspect is a shape the big model never exercises.
+Both FWHT rotates need `K % 256 == 0` and launch a zero-sized grid otherwise,
+leaving the destination buffer untouched; the down-side rotate takes `K = mi`
+(moe_intermediate), which on a toy fixture is the value most likely under 256.
+**Do not flip this again until `./tests/tiny-affected-gate.sh --base
+origin/master --require-coverage` is green on the MoE OQ cells.**
 
 ## The bug, in one paragraph
 

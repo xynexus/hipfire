@@ -864,18 +864,19 @@ fn moe_res_oq_routed_opted_out_falls_back_to_cpu() {
     assert!(r.needs_x_rot_local);
 }
 
-/// The default INVERTED on 2026-08-12 (per-expert AWQ rotation fixed), so unset
-/// now means enabled. Asserted against the pure parse rather than the env so it
-/// cannot race a parallel test runner.
+/// OFF unless explicitly opted in. The default was flipped ON and reverted the
+/// same day (2026-08-12) when the tiny MoE OQ cells went non-finite, so this
+/// asserts the opt-in shape directly. Tested against the pure parse rather than
+/// the env so it cannot race a parallel test runner.
 #[test]
-fn moe_oq_indexed_is_on_unless_explicitly_disabled() {
+fn moe_oq_indexed_is_off_unless_explicitly_enabled() {
     use crate::families::moe::oq_indexed_decode_enabled_from;
-    assert!(oq_indexed_decode_enabled_from(None));
-    assert!(oq_indexed_decode_enabled_from(Some("")));
-    assert!(oq_indexed_decode_enabled_from(Some("1")));
-    assert!(oq_indexed_decode_enabled_from(Some("on")));
+    assert!(!oq_indexed_decode_enabled_from(None));
+    assert!(!oq_indexed_decode_enabled_from(Some("")));
     assert!(!oq_indexed_decode_enabled_from(Some("0")));
     assert!(!oq_indexed_decode_enabled_from(Some("off")));
+    assert!(oq_indexed_decode_enabled_from(Some("1")));
+    assert!(oq_indexed_decode_enabled_from(Some("on")));
 }
 
 #[test]
