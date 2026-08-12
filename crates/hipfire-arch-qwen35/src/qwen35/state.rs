@@ -100,30 +100,38 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // `FromStr for bool`, which accepts ONLY "true"/"false", so `=1` parses as
     // Err and falls back silently. That cost a 24-minute KLD run which reported
     // "FP16" numbers identical to FP32 to the last digit because it had quietly
-    // run FP32 twice.
+    // run FP32 twice. `flag()` accepts 1/true/on/yes.
     //
-    // FP16 is the DEFAULT as of 2026-08-09, with FP32 as the opt-out. Evidence:
-    // on Qwen3.5-35B-A3B, +0.68% mean KLD (0.039176 vs 0.038913), ~40x smaller
-    // than the CI half-width; and on the low-redundancy 2B — where Q8 broke
-    // first — greedy decode tracked FP32 EXACTLY for 720 tokens with
-    // degeneration metrics unchanged (unique_ratio 0.3325 vs 0.3317, max_freq
-    // 0.0450 vs 0.0458), against Q8's recorded signature of 0.625 -> 0.555 and
-    // 0.055 -> 0.078.
+    // **FP32 is the DEFAULT and the numerical reference; FP16 is opt-in.** Both
+    // sides of the 2026-08-12 merge landed on that, by different routes, so the
+    // two measurement sets are kept rather than reconciled — they measure
+    // different things and disagreeing about which is "the" number is how a
+    // default gets moved on one prompt:
     //
-    // That evidence is one prompt on one model, which is why FP32 stays one
-    // flag away rather than being deleted: it is the oracle, and losing the
-    // ability to diff against it is how quantized state hid for months.
+    //   * Teacher-forced, same weights, only state precision differing: mean
+    //     KLD 5.65e-05 on the dense 2B, 2.57e-03 on Qwen3.5-35B-A3B oq4.25++.
+    //     The 35B figure is ~45x the 2B one — FP16 state costs MORE on the
+    //     larger MoE model. This is the reading that kept the default at FP32.
+    //   * End-to-end on the same 35B: +0.68% mean KLD (0.039176 vs 0.038913),
+    //     ~40x smaller than the CI half-width; and on the low-redundancy 2B —
+    //     where Q8 broke first — greedy decode tracked FP32 EXACTLY for 720
+    //     tokens with degeneration metrics unchanged (unique_ratio 0.3325 vs
+    //     0.3317, max_freq 0.0450 vs 0.0458), against Q8's recorded signature
+    //     of 0.625 -> 0.555 and 0.055 -> 0.078.
     //
-    // FP16 was made the default and REVERTED the same day (2026-08-09): the
-    // Q8 dispatch functions had never been deleted, only the `StateQuant`
-    // variants that selected them, so surviving `else` arms still reached
-    // them unconditionally and half-size FP16 state faulted with
-    //   Memory Fault ... kernel: gated_delta_net_q8
-    // The kernels, their dispatch entry points and every caller are now gone,
-    // so that blocker is cleared. FP16 stays opt-in until a teacher-forced
-    // FP32-vs-FP16 KLD run on more than one model says otherwise — the
-    // evidence above is one prompt on one model, which is not enough to move
-    // the default.
+    // Both are one prompt on one or two models. Moving the default wants a
+    // teacher-forced FP32-vs-FP16 KLD run across more than that.
+    //
+    // History worth not repeating: FP16 was made the default and REVERTED the
+    // same day (2026-08-09). The Q8 dispatch functions had never been deleted,
+    // only the `StateQuant` variants that selected them, so surviving `else`
+    // arms still reached them unconditionally and half-size FP16 state faulted
+    // with `Memory Fault ... kernel: gated_delta_net_q8`. This branch is what
+    // finishes that removal — the kernels, their dispatch entry points and
+    // every caller are gone — so the blocker is cleared and the opt-in is real.
+    //
+    // Keeping FP32 one flag away also keeps the oracle: losing the ability to
+    // diff against it is how quantized state hid for months.
     if hipfire_env::DN_STATE_FP16.flag() {
         StateQuant::FP16
     } else {
