@@ -129,11 +129,36 @@ its state in FP16's low-precision region (31.3% of elements subnormal in FP16 vs
 12.2% on the 0.8B; min |S| 3.1e-14 vs 3.9e-12, and FP16 flushes everything below
 ~6e-8 — the FP16 runs bottom out at exactly 2.98e-8).
 
-Actionable: the doc notes "no scales, no stochastic rounding" as if both were
-neutral. For a compounding accumulator they are not. **Stochastic rounding or
-error feedback on the FP16 store would break the bias accumulation** and is the
-obvious lever if FP16 state is wanted at long context. Worth measuring before
-FP16 is proposed as a default again.
+**Dithered (stochastic) rounding was tried and is WORSE — negative result, do not
+retry.** `HIPFIRE_DN_STATE_FP16_DITHER=1` narrows with a dither hashed from the
+value's own bits and the element index (a pure function of the input, so
+spec-decode snapshots still restore exactly what they saved — the property the Q8
+path's stochastic rounding broke). It runs in both the single-session and routed
+f16 state kernels. Measured, FP16-vs-FP32 L2 divergence of the state:
+
+| decode steps | seq pos | round-to-nearest | dithered |
+|---|---|---|---|
+| 2 | 26 | 2.49e-06 | 1.83e-05 |
+| 40 | 64 | 3.22e-05 | 5.34e-05 |
+| **120** | **144** | **5.05e-03** | **2.69e-02** |
+
+Worse at every measured length, and the gap widens with context. The two short
+points alone suggested the opposite (growth 12.9x vs 2.9x, fitting to N^2.8 vs
+N^1.2) — that fit was an artifact of extrapolating from two points, and the
+120-step run falsified it. The lesson is the measurement, not the model.
+
+So the compounding is NOT principally a rounding-BIAS artifact: the dither
+removes bias but injects up to 1 ULP of per-step noise, and the recurrence
+amplifies that noise faster than it amplifies the bias. The residual error is the
+mantissa itself — 10 bits is not enough for this accumulator over hundreds of
+steps, whatever the rounding mode.
+
+The flag is left in, defaulting OFF, with these numbers on it: the branch is
+uniform and free, and keeping it makes the negative result cheap to re-verify
+instead of cheap to re-attempt. What is still untried is error feedback (carry an
+FP32 residual, ~1.5x the FP16 size), which cancels rather than randomises the
+error — a different mechanism, and the only remaining lever short of keeping the
+state in FP32.
 
 ## [High] Session release LEAKS its KV and DeltaNet GPU buffers — and blocks sound CoW
 

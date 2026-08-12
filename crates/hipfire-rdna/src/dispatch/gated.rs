@@ -461,6 +461,14 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
+        // Same env as the single-session f16 path; read here so no caller changes.
+        static SR_ROUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sr = *SR_ROUTED.get_or_init(|| {
+            matches!(
+                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER").ok().as_deref(),
+                Some("1") | Some("on") | Some("true") | Some("yes")
+            )
+        }) as i32;
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -476,7 +484,7 @@ impl Gpu {
             0,
             &kernargs![
                 ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr rsp, ptr op,
-                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd
+                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd, i32 sr
             ],
         );
         if let Some(t) = timer {
@@ -493,9 +501,18 @@ impl Gpu {
     /// the bytes. Everything else — argument order, output layout, arithmetic
     /// precision — is identical, because only the storage format changes.
     ///
-    /// Unlike the Q8 state path this replaces, there is no scales tensor, no
-    /// `s_ef_residual` accumulator and no stochastic rounding, so it is
-    /// deterministic and a spec-decode snapshot restores exactly what it saved.
+    /// Unlike the Q8 state path this replaces, there is no scales tensor and no
+    /// `s_ef_residual` accumulator, so it is deterministic and a spec-decode
+    /// snapshot restores exactly what it saved.
+    ///
+    /// `HIPFIRE_DN_STATE_FP16_DITHER=1` (default off) narrows with a dither
+    /// instead of round-to-nearest, to break the bias that compounds across
+    /// decode steps — the state is re-narrowed once per call and a decode call
+    /// carries one token. The dither hashes the value's own bits with the
+    /// element index, NOT a counter or a carried RNG, so the store stays a pure
+    /// function of its input and the snapshot property above still holds. That
+    /// is the difference from the Q8 path's stochastic rounding, which was
+    /// removed precisely because it broke it.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_f16_batch_seq(
@@ -531,6 +548,15 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
+        // Read here rather than threading a flag through four call sites in
+        // three modules. Cached: this is on the per-layer decode path.
+        static SR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sr = *SR.get_or_init(|| {
+            matches!(
+                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER").ok().as_deref(),
+                Some("1") | Some("on") | Some("true") | Some("yes")
+            )
+        }) as i32;
 
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
@@ -546,7 +572,7 @@ impl Gpu {
             0,
             &kernargs![
                 ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op,
-                i32 nt, i32 nh, i32 hd
+                i32 nt, i32 nh, i32 hd, i32 sr
             ],
         );
         if let Some(t) = timer {
