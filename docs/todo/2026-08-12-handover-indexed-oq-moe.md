@@ -17,7 +17,8 @@ went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
 within 3.8% of the CPU fallback it has to match. **The flag stays OFF by
 default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` opts in.
 
-⚠️ **It was flipped ON and reverted the same day.** `tests/tiny-quant-gate.sh`
+⚠️ **It was flipped ON and reverted the same day.** (Root-caused and guarded
+since — see the ✅ items below. The flag stays off by choice now, not by defect.) `tests/tiny-quant-gate.sh`
 turns seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,
 and the five calib variants) with the flag on; with it off they route to the CPU
 fallback and are finite, which is why the breakage stayed invisible while the
@@ -45,18 +46,36 @@ The indexed OQ path is simply the first one to do so, because everything else on
 this fixture routes to the CPU fallback (`use_gpu_topk` requires `k_top == 8`
 and the toy preset is `experts_per_tok: 2`).
 
-Fix shape, cheapest first:
+Fix shape, cheapest first — **(1) and (2) are both landed:**
 
-1. **Guard admission**: refuse the indexed OQ path unless `moe_intermediate % 256
-   == 0 && dim % 256 == 0`. Keeps the toy fixture on the CPU fallback — the
-   behaviour that was already finite — and costs the 35B nothing. One predicate.
-2. **Make the silence loud**: have the rotate wrappers reject `k % 256 != 0`
-   rather than launching an empty grid. Do this together with (1), or the loud
-   failure just moves the crash earlier.
+1. ✅ **Guard admission** — `5c1023cae`'s successor, commit `7a151228f`.
+   `hipfire_dispatch::families::moe::oq_indexed_decode_active(hidden, mi)` is the
+   flag AND `hidden % 256 == 0 && mi % 256 == 0`, and it replaced every direct
+   read of `oq_indexed_decode_enabled()`: the live `pipeline/mod.rs` resolve,
+   qwen35's `moe_decode_dispatch_flags_for_dtypes`, the seven
+   `routed_oq_arch_combined` layout flags in `moe_decode.rs`/`prefill_chunk.rs`,
+   and the loader's MoE-block repack. The loader keys off the MODEL's
+   `(dim, moe_intermediate_size)`, not the tensor's `(m, k)` — per-tensor it
+   would repack gate_up (`k = dim`) and skip down (`k = mi`) inside one expert,
+   which is worse than the bug being fixed.
+2. ✅ **Make the silence loud** — `5c1023cae`. All 13 rotate wrappers go through
+   `dispatch::fwht_groups`, which errors on `k % 256 != 0` instead of launching
+   an empty grid.
 3. Only if a sub-256 `mi` ever needs the fast path: a tail-handling kernel. Not
    needed by any shipping model.
-**Do not flip this again until `./tests/tiny-affected-gate.sh --base
-origin/master --require-coverage` is green on the MoE OQ cells.**
+
+**Verified**: `tiny_quant` `qwen3_5_moe` OQ cells, `HIPFIRE_QWEN35_MOE_OQ_INDEXED`
+0 vs 1, all seven **bit-identical** (oq4 0.19407192, oq8 0.01994928, oq4+/oq4++
+0.19465974, oq4.25++ 0.19017793, oq8+/oq8++ 0.00567818). The flag is now inert on
+a shape it cannot serve, which is exactly what admission is supposed to mean —
+`mi = 128` keeps the fixture on the CPU fallback in both arms.
+
+**The flag is still OFF by default, deliberately.** The gate being green now
+proves the toy fixture is *excluded*, not that the indexed path is exercised —
+no fixture in the tier has a ≥256 `mi`. Flipping the default would still be
+resting on one model's KLD, which is the mistake this document exists to stop
+repeating. Opt in per run (`HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`) until a fixture
+with an admissible MoE shape covers it.
 
 ## The bug, in one paragraph
 
