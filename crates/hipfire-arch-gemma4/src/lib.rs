@@ -9,6 +9,7 @@
 //! and serving registration land only at their later frozen gates.
 
 pub mod arch;
+pub mod calibration_stream;
 pub mod config;
 pub mod forward;
 pub mod weights;

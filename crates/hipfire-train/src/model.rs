@@ -36,6 +36,9 @@ impl LayerWeights {
     fn as_block(&self) -> BlockWeights<'_> {
         BlockWeights {
             norm1: &self.norm1,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             wq: &self.wq,
             wk: &self.wk,
             wv: &self.wv,
@@ -57,7 +60,7 @@ pub struct LayerLora {
 }
 
 impl LayerLora {
-    fn as_block(&self) -> BlockLora<'_> {
+    pub fn as_block(&self) -> BlockLora<'_> {
         BlockLora {
             aq: &self.aq,
             bq: &self.bq,
@@ -138,6 +141,7 @@ impl LlamaModel {
             head_dim: cfg.head_dim,
             inter: cfg.intermediate_size,
             rope_base: cfg.rope_theta,
+            rotary_dim: 0,
             eps: cfg.rms_norm_eps,
             lora_scale: lora_alpha / r as f32,
             lora_rank: r,
@@ -282,6 +286,12 @@ pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
         let BlockActivations {
             xn1,
             rinv1,
+            q_pre,
+            k_pre,
+            rinv_q,
+            rinv_k,
+            attn_gate,
+            ctx_pre_gate,
             hq,
             hv,
             q_r,
@@ -300,6 +310,12 @@ pub fn free_model_acts(gpu: &mut Gpu, a: ModelActivations) -> HipResult<()> {
         for t in [
             xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
         ] {
+            gpu.free_tensor(t)?;
+        }
+        for t in [q_pre, k_pre, rinv_q, rinv_k, attn_gate, ctx_pre_gate]
+            .into_iter()
+            .flatten()
+        {
             gpu.free_tensor(t)?;
         }
     }
@@ -547,7 +563,12 @@ pub fn model_guided_adjoints(
     let mut d_x = d_x_last;
     for i in (0..model.layers.len()).rev() {
         let (lw, ll) = &model.layers[i];
-        let (d_in, _lora_g, a) = block_backward_capture(
+        // down_proj's output adjoint is the block's INCOMING d_x — its output is
+        // the block output pre-residual — so it has to be read before the
+        // backward consumes it. This is the same fact `down_guided_capture`
+        // relies on; without it down_proj is absent from the adjoint set.
+        let d_down = gpu.download_f32(&d_x)?;
+        let (d_in, _lora_g, mut a) = block_backward_capture(
             gpu,
             &d_x,
             &acts.layer_inputs[i],
@@ -556,6 +577,7 @@ pub fn model_guided_adjoints(
             &acts.layer_acts[i],
             &model.dims,
         )?;
+        a.d_down = d_down;
         adj.push(a);
         d_x = d_in;
     }
@@ -678,6 +700,411 @@ pub fn model_calib_down_backward(
         d_x = d_in;
     }
     Ok(loss_sum)
+}
+
+/// Mean squared OUTPUT gradient per linear, accumulated over calibration
+/// sequences — the `gamma` in the K-FAC factorization
+/// `dL ~= 1/2 tr(dW^T G dW H)` under the approximation `G ~= gamma*I`.
+///
+/// Why this is not already available: [`down_guided_capture`] computes exactly
+/// this quantity and then NORMALIZES it away (`w /= mean`) before handing the
+/// weights to `capture_weighted`. That is right for GuidedQuant, which wants
+/// which TOKENS matter within a layer and needs guided/plain Hessians on a
+/// comparable scale. But it discards the per-tensor MAGNITUDE, and the
+/// magnitude is the whole cross-tensor signal — it is what says o_proj matters
+/// more than k_proj.
+///
+/// Keyed by HFQ tensor name without `.weight`, matching the imatrix/hessian
+/// convention so the quantizer joins them the same way.
+#[derive(Debug, Default, Clone)]
+pub struct GammaAccum {
+    pub sum: std::collections::HashMap<String, f64>,
+    pub n: usize,
+}
+
+impl GammaAccum {
+    /// Mean over accumulated sequences.
+    pub fn finish(&self) -> std::collections::HashMap<String, f32> {
+        let d = self.n.max(1) as f64;
+        self.sum
+            .iter()
+            .map(|(k, v)| (k.clone(), (v / d) as f32))
+            .collect()
+    }
+}
+
+/// Forward+backward accumulating per-linear output-gradient energy for every
+/// projection, via [`block_backward_capture`].
+///
+/// The plain [`model_calib_down_backward`] path uses `block_backward` and can
+/// only see `down_proj`, because down_proj's output IS the block output
+/// pre-residual and its adjoint is `d_x` before the block consumes it. Every
+/// other projection's adjoint exists only inside the backward, which is what
+/// [`BlockAdjoints`] exposes.
+pub fn model_gamma_backward(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    targets: &[f32],
+    ignore_index: i32,
+    acc: &mut GammaAccum,
+) -> HipResult<f32> {
+    let (loss_sum, adjoints) = model_guided_adjoints(gpu, model, acts, targets, ignore_index)?;
+    let (seq, h) = (model.dims.seq, model.dims.h);
+    // q is n_heads*head_dim, k/v are n_kv*head_dim (GQA).
+    let qd = model.dims.n_heads * model.dims.head_dim;
+    let kvd = model.dims.n_kv * model.dims.head_dim;
+    let inter = model.dims.inter;
+
+    for (i, a) in adjoints.iter().enumerate() {
+        let p = format!("model.layers.{i}");
+        // (name, adjoint rows, per-row width). Mean over rows of the
+        // mean-over-channels square — the same statistic
+        // `calib_row_meansq_f32` forms, kept UNNORMALISED.
+        for (name, d, width) in [
+            (format!("{p}.self_attn.q_proj"), &a.d_q, qd),
+            (format!("{p}.self_attn.k_proj"), &a.d_k, kvd),
+            (format!("{p}.self_attn.v_proj"), &a.d_v, kvd),
+            (format!("{p}.self_attn.o_proj"), &a.d_attn, h),
+            (format!("{p}.mlp.gate_proj"), &a.d_gate, inter),
+            (format!("{p}.mlp.up_proj"), &a.d_up, inter),
+            (format!("{p}.mlp.down_proj"), &a.d_down, h),
+        ] {
+            if width == 0 || d.len() < seq * width {
+                continue;
+            }
+            let mut tot = 0.0f64;
+            for r in 0..seq {
+                let row = &d[r * width..(r + 1) * width];
+                let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                tot += ss / width as f64;
+            }
+            *acc.sum.entry(name).or_insert(0.0) += tot / seq.max(1) as f64;
+        }
+    }
+    acc.n += 1;
+    Ok(loss_sum)
+}
+
+/// Layer-STREAMED gamma capture: one layer resident at a time.
+///
+/// [`model_gamma_backward`] needs the whole model in f32 — ~5 GB for a 1B, but
+/// ~140 GB for a 35B against 128 GB of UMA, so it is a small-model instrument.
+/// Here each layer's weights are paged in, used, and dropped, so peak residency
+/// is the embedding table plus ONE layer plus the boundary activations
+/// (seq*h floats per layer, negligible). Depth becomes free.
+///
+/// Two passes over the layers, which is the standard gradient-checkpointing
+/// trade: the forward saves only each layer's INPUT, and the reverse walk
+/// recomputes that layer's internals from it rather than storing every
+/// activation for every layer. Costs one extra forward, saves O(depth) memory.
+///
+/// DENSE ONLY. `block_forward`/`block_backward_capture` are a pre-norm LLaMA
+/// block with no router or routed experts, so this cannot run a MoE — see
+/// docs/npu/scope-gamma-layer-streamed.md.
+#[allow(clippy::too_many_arguments)]
+pub fn model_gamma_streamed(
+    gpu: &mut Gpu,
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    cfg: &crate::config::LlamaConfig,
+    embed: &GpuTensor,
+    lm_head: Option<&GpuTensor>,
+    final_norm: &GpuTensor,
+    dims: &BlockDims,
+    token_ids: &[u32],
+    pos_host: &[f32],
+    targets: &[f32],
+    ignore_index: i32,
+    // 0 for a dense model. Routed-ness is still probed PER LAYER — hybrid
+    // models exist (BLS-Mini-Code-1.0 is dense at layer 0, routed above).
+    n_experts: usize,
+    top_k: usize,
+    acc: &mut GammaAccum,
+) -> Result<f32, String> {
+    use crate::loader::{
+        detect_prefix, free_llama_layer_fp32, free_moe_layer_fp32, layer_is_moe,
+        load_llama_layer_fp32_hfq_pfx, load_moe_layer_fp32,
+    };
+    let prefix = detect_prefix(hfq);
+    let (seq, h) = (dims.seq, dims.h);
+    let vocab = cfg.vocab_size;
+    let n_layers = cfg.num_hidden_layers;
+    let e = |r: hipfire_rdna::HipError| format!("{r}");
+
+    // Zero LoRA (rank 1, B = 0) so the block runs exactly at the base weights.
+    let r = dims.lora_rank.max(1);
+    let qd = dims.q_dim();
+    let kvd = dims.kv_dim();
+    let zl = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32).map_err(e);
+    let lora = LayerLora {
+        aq: zl(gpu, r * h)?,
+        bq: zl(gpu, qd * r)?,
+        av: zl(gpu, r * h)?,
+        bv: zl(gpu, kvd * r)?,
+    };
+
+    // Embedding lookup.
+    let mut x = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    for (t, &tok) in token_ids.iter().enumerate() {
+        // (src, src_off, src_stride, dst, dst_off, dst_stride, rows, cols, accumulate)
+        gpu.strided_copy_2d(embed, tok as usize * h, h, &x, t * h, h, 1, h, false)
+            .map_err(e)?;
+    }
+
+    // Forward, keeping only each layer's INPUT on the host.
+    let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        layer_inputs.push(gpu.download_f32(&x).map_err(e)?);
+        let lw = load_llama_layer_fp32_hfq_pfx(gpu, hfq, prefix, cfg, i, true)?;
+        let (x_out, acts) =
+            block_forward(gpu, &x, &block_of(&lw), &lora.as_block(), dims, pos_host, i)
+                .map_err(e)?;
+        crate::block::free_block_acts(gpu, acts).map_err(e)?;
+        gpu.free_tensor(x).map_err(e)?;
+        x = x_out;
+        free_llama_layer_fp32(gpu, lw)?;
+    }
+
+    // Head: final norm -> logits -> CE -> back to the last block's output.
+    let x_last = x;
+    let xn = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    let rinv = gpu.zeros(&[seq], DType::F32).map_err(e)?;
+    rmsnorm_forward(gpu, &x_last, final_norm, &xn, &rinv, seq, h, dims.eps).map_err(e)?;
+    let logits = gpu.zeros(&[seq * vocab], DType::F32).map_err(e)?;
+    let out_proj = lm_head.unwrap_or(embed);
+    linear_forward(gpu, &xn, out_proj, &logits, seq, h, vocab).map_err(e)?;
+
+    let tgt = gpu.upload_f32(targets, &[seq]).map_err(e)?;
+    let loss = gpu.zeros(&[seq], DType::F32).map_err(e)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32).map_err(e)?;
+    cross_entropy(
+        gpu,
+        &logits,
+        &tgt,
+        &loss,
+        &d_logits,
+        seq,
+        vocab,
+        ignore_index,
+    )
+    .map_err(e)?;
+    let loss_sum: f32 = gpu.download_f32(&loss).map_err(e)?.iter().sum();
+
+    let d_xf = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false).map_err(e)?;
+    let mut d_x = gpu.zeros(&[seq * h], DType::F32).map_err(e)?;
+    let dw_dummy = gpu.zeros(&[h], DType::F32).map_err(e)?;
+    rmsnorm_backward(
+        gpu, &d_xf, &x_last, final_norm, &rinv, &d_x, &dw_dummy, seq, h,
+    )
+    .map_err(e)?;
+
+    // Reverse walk: page the layer back in, recompute its internals from the
+    // saved input, capture the adjoints, drop it.
+    for i in (0..n_layers).rev() {
+        let moe = n_experts > 0 && layer_is_moe(hfq, prefix, i);
+        let lw = load_llama_layer_fp32_hfq_pfx(gpu, hfq, prefix, cfg, i, !moe)?;
+        let x_in = gpu.upload_f32(&layer_inputs[i], &[seq * h]).map_err(e)?;
+
+        let d_in = if moe {
+            let (ml, inter) = load_moe_layer_fp32(gpu, hfq, prefix, i, h, n_experts)?;
+            let mw = moe_weights_of(&ml);
+            let md = crate::ops::moe::MoeDims {
+                seq,
+                h,
+                inter,
+                n_experts,
+                top_k,
+            };
+            let (x_out, acts, macts) = crate::block::moe_block_forward(
+                gpu,
+                &x_in,
+                &block_of(&lw),
+                &mw,
+                &lora.as_block(),
+                dims,
+                &md,
+                pos_host,
+                i,
+            )
+            .map_err(e)?;
+            gpu.free_tensor(x_out).map_err(e)?;
+            let (d_in, adj, moe_adj) = crate::block::moe_block_backward_capture(
+                gpu,
+                &d_x,
+                &x_in,
+                &block_of(&lw),
+                &mw,
+                &lora.as_block(),
+                &acts,
+                &macts,
+                dims,
+                &md,
+            )
+            .map_err(e)?;
+            // Attention-side gamma is identical to the dense case. The MLP side
+            // comes from the experts rather than one down_proj, so `d_down` is
+            // left empty and `accumulate_gamma` is passed inter = 0 to skip the
+            // dense gate/up entries that do not exist on this layer.
+            accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, 0);
+            accumulate_gamma_moe(acc, i, &moe_adj, h, n_experts);
+            crate::block::free_block_acts(gpu, acts).map_err(e)?;
+            crate::ops::moe::free_moe_acts(gpu, macts).map_err(e)?;
+            drop(mw);
+            free_moe_layer_fp32(gpu, ml)?;
+            d_in
+        } else {
+            let (x_out, acts) = block_forward(
+                gpu,
+                &x_in,
+                &block_of(&lw),
+                &lora.as_block(),
+                dims,
+                pos_host,
+                i,
+            )
+            .map_err(e)?;
+            gpu.free_tensor(x_out).map_err(e)?;
+            let d_down = gpu.download_f32(&d_x).map_err(e)?;
+            let (d_in, _g, mut adj) = block_backward_capture(
+                gpu,
+                &d_x,
+                &x_in,
+                &block_of(&lw),
+                &lora.as_block(),
+                &acts,
+                dims,
+            )
+            .map_err(e)?;
+            adj.d_down = d_down;
+            accumulate_gamma(acc, i, &adj, seq, h, qd, kvd, dims.inter);
+            crate::block::free_block_acts(gpu, acts).map_err(e)?;
+            d_in
+        };
+
+        gpu.free_tensor(x_in).map_err(e)?;
+        gpu.free_tensor(d_x).map_err(e)?;
+        d_x = d_in;
+        free_llama_layer_fp32(gpu, lw)?;
+    }
+    acc.n += 1;
+    Ok(loss_sum)
+}
+
+/// `BlockWeights` borrowed from a streamed `LlamaLayerF32`, so the streamed walk
+/// needs no owned `LayerWeights` copy of a layer it is about to drop.
+pub fn block_of(l: &crate::loader::LlamaLayerF32) -> BlockWeights<'_> {
+    BlockWeights {
+        norm1: &l.input_layernorm,
+        q_norm: l.q_norm.as_ref(),
+        k_norm: l.k_norm.as_ref(),
+        attn_out_gate: l.attn_out_gate,
+        wq: &l.q_proj,
+        wk: &l.k_proj,
+        wv: &l.v_proj,
+        wo: &l.o_proj,
+        norm2: &l.post_attention_layernorm,
+        wgate: &l.gate_proj,
+        wup: &l.up_proj,
+        wdown: &l.down_proj,
+    }
+}
+
+/// `MoeWeights` borrowed from a streamed layer, so nothing is copied for a
+/// layer that is about to be dropped.
+pub fn moe_weights_of(l: &crate::loader::MoeLayerF32) -> crate::ops::moe::MoeWeights<'_> {
+    crate::ops::moe::MoeWeights {
+        router: &l.router,
+        experts: l
+            .experts
+            .iter()
+            .map(|(g, u, d)| crate::ops::moe::ExpertWeights {
+                wgate: g,
+                wup: u,
+                wdown: d,
+            })
+            .collect(),
+        shared: l.shared.as_ref().map(|s| crate::ops::moe::SharedExpert {
+            w_scalar_gate: &s.scalar_gate,
+            wgate: &s.gate,
+            wup: &s.up,
+            wdown: &s.down,
+            inter: s.inter,
+        }),
+    }
+}
+
+/// Fold one layer's adjoints into the accumulator. Shared with
+/// [`model_gamma_backward`] so the streamed and whole-model paths cannot drift.
+pub fn accumulate_gamma(
+    acc: &mut GammaAccum,
+    layer: usize,
+    a: &BlockAdjoints,
+    seq: usize,
+    h: usize,
+    qd: usize,
+    kvd: usize,
+    inter: usize,
+) {
+    let p = format!("model.layers.{layer}");
+    for (name, d, width) in [
+        (format!("{p}.self_attn.q_proj"), &a.d_q, qd),
+        (format!("{p}.self_attn.k_proj"), &a.d_k, kvd),
+        (format!("{p}.self_attn.v_proj"), &a.d_v, kvd),
+        (format!("{p}.self_attn.o_proj"), &a.d_attn, h),
+        (format!("{p}.mlp.gate_proj"), &a.d_gate, inter),
+        (format!("{p}.mlp.up_proj"), &a.d_up, inter),
+        (format!("{p}.mlp.down_proj"), &a.d_down, h),
+    ] {
+        if width == 0 || d.len() < seq * width {
+            continue;
+        }
+        let mut tot = 0.0f64;
+        for r in 0..seq {
+            let row = &d[r * width..(r + 1) * width];
+            let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            tot += ss / width as f64;
+        }
+        *acc.sum.entry(name).or_insert(0.0) += tot / seq.max(1) as f64;
+    }
+}
+
+/// Fold one MoE layer's per-expert adjoints into the accumulator.
+///
+/// Keys match the HFQ tensor naming a routed MoE artifact uses, so the table
+/// joins to weights exactly as the dense one does.
+///
+/// **Normalised by ROUTED tokens, not by sequence length.** An expert only sees
+/// the tokens the router sent it, so dividing by `seq` would report a rarely
+/// routed expert as insensitive when that is a routing fact, not a sensitivity
+/// fact — and the allocator would then under-promote precisely the experts that
+/// are sharp on the few tokens they serve. An expert that received nothing
+/// contributes nothing rather than a zero, so it does not drag its own mean
+/// down across calibration sequences.
+pub fn accumulate_gamma_moe(
+    acc: &mut GammaAccum,
+    layer: usize,
+    adj: &crate::ops::moe::MoeAdjoints,
+    h: usize,
+    n_experts: usize,
+) {
+    for e in 0..n_experts {
+        let d = &adj.d_expert_out[e];
+        let rows = d.len() / h.max(1);
+        if rows == 0 {
+            continue;
+        }
+        let mut tot = 0.0f64;
+        for r in 0..rows {
+            let row = &d[r * h..(r + 1) * h];
+            let ss: f64 = row.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            tot += ss / h as f64;
+        }
+        // The routed-expert down_proj is where the expert's error leaves for the
+        // residual stream, matching where the dense path takes d_down.
+        let name = format!("model.layers.{layer}.mlp.experts.{e}.down_proj");
+        *acc.sum.entry(name).or_insert(0.0) += tot / rows as f64;
+    }
 }
 
 /// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.

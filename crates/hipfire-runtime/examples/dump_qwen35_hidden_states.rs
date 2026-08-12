@@ -219,16 +219,20 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
 
     // -------- HiddenStateRingBuffer, overriding extract_layers to all layers --------
-    let mut hidden_rb = HiddenStateRingBuffer::new(
+    // new() derives the layer ids from dflash_extract_layer_ids, which spaces
+    // num_extract picks across 1..n_layers-3 — asking it for ALL layers makes
+    // the rounding collide and the constructor rejects the duplicate ids. The
+    // explicit-list constructor is the right one when the list is known.
+    let hidden_rb = HiddenStateRingBuffer::new_for_layers(
         &mut gpu,
         config.n_layers, // num_target_layers
-        config.n_layers, // num_extract == all
-        config.dim,      // hidden_dim
-        n_ctx,           // max_positions = exactly fits one chunk
-        1,               // max_batch = 1 (per-token forward)
+        (0..config.n_layers).collect(),
+        config.dim, // hidden_dim
+        n_ctx,      // max_positions = exactly fits one chunk
+        1,          // max_batch = 1 (per-token forward)
     )
     .expect("hidden rb");
-    hidden_rb.extract_layers = (0..config.n_layers).collect();
+    let mut hidden_rb = hidden_rb;
     eprintln!(
         "hidden_rb: {} layers x {} positions x {} hidden = {:.1} MB",
         hidden_rb.extract_layers.len(),
@@ -239,30 +243,41 @@ fn main() {
             / (1024.0 * 1024.0)
     );
 
-    // -------- per-token forward, head advances per call --------
+    // -------- ONE prefill over the whole sequence, capturing per layer --------
+    //
+    // This used to loop `forward_scratch_with_hidden` per token — the DECODE
+    // path, starting from a cold state at position 0. Generation never does
+    // that: it prefills the prompt and only then decodes, so decode-from-cold
+    // is not a supported entry and its states do not match prefill's. Measured
+    // on Qwen3.5-0.8B at one token, the old states disagreed with the prefill
+    // path from LAYER 0 onwards (cos 0.62), and putting the final state through
+    // the final norm and tied lm_head scored cos 0.786 against the logits
+    // `dump_logits_qwen35` produces from the same token — i.e. the reference
+    // this tool exists to provide was wrong, quietly, for every consumer.
+    //
+    // `forward_prefill_batch` takes the ring buffer directly, so the trusted
+    // path can do the capture itself in one call.
     let t0 = std::time::Instant::now();
-    for (pos, &tok) in tokens.iter().enumerate() {
-        qwen35::forward_scratch_with_hidden(
-            &mut gpu,
-            &weights,
-            &config,
-            tok,
-            pos,
-            &mut kv_cache,
-            &mut dn_state,
-            &scratch,
-            &mut hidden_rb,
-        )
-        .expect("forward_scratch_with_hidden");
-        if pos == 0 || (pos + 1) % 256 == 0 {
-            eprintln!(
-                "  pos {:4}/{}: {:.1}s elapsed",
-                pos + 1,
-                n_ctx,
-                t0.elapsed().as_secs_f64()
-            );
-        }
-    }
+    qwen35::forward_prefill_batch(
+        &mut gpu,
+        &weights,
+        &config,
+        &tokens,
+        0, // start_pos
+        &mut kv_cache,
+        &mut dn_state,
+        &scratch,
+        Some(&mut hidden_rb),
+        None, // per_token_hidden_out
+        None, // gdn_tape
+        None, // tree_verify
+    )
+    .expect("forward_prefill_batch");
+    // NOTE: do NOT call commit_staging_to_ring here. forward_prefill_batch
+    // already commits each chunk internally (prefill_batch.rs:5484) and
+    // advances the head by n; a second commit re-advances the head and writes
+    // empty staging over the captured data, yielding an all-zero dump that
+    // still looks structurally valid.
     eprintln!("forward complete in {:.1}s", t0.elapsed().as_secs_f64());
 
     // -------- download each layer's buffer + write HFHIDDEN file --------

@@ -19,6 +19,10 @@ pub struct RuntimeConfig {
     pub dflash_draft: Option<String>,
     pub dflash_mode: String,
     pub draft_f16: bool,
+    /// Explicit comparison oracle for plain-basis DFLASH Opus weights. Native
+    /// packed GPU execution is the production default; setting
+    /// HIPFIRE_DFLASH_OQ_ORACLE=f16 restores the former host expansion path.
+    pub dflash_oq_f16_oracle: bool,
     pub draft_gemm_dump: bool,
     pub draft_subphase: bool,
     pub ddtree_budget: usize,
@@ -73,6 +77,9 @@ impl RuntimeConfig {
             dflash_draft: std::env::var("HIPFIRE_DFLASH_DRAFT").ok(),
             dflash_mode: std::env::var("HIPFIRE_DFLASH_MODE").unwrap_or_else(|_| "off".to_string()),
             draft_f16: std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0"),
+            dflash_oq_f16_oracle: std::env::var("HIPFIRE_DFLASH_OQ_ORACLE")
+                .ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("f16")),
             draft_gemm_dump: std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1"),
             draft_subphase: std::env::var("HIPFIRE_DRAFT_SUBPHASE").ok().as_deref() == Some("1"),
             ddtree_budget: std::env::var("HIPFIRE_DDTREE_BUDGET")

@@ -152,7 +152,7 @@ pub struct DiffusionCalibEvalArgs {
 pub struct DiffusionQuantDiffArgs {
     /// Reference artifact (typically the bf16 / p0 source .hfq)
     pub reference: PathBuf,
-    /// Candidate artifact (typically the quantized .hfq, e.g. .oq8.hfq)
+    /// Candidate artifact (typically the quantized .hfq, e.g. --oq8.hfq)
     pub candidate: PathBuf,
     /// Print the N worst tensors by relative L2 error
     #[arg(long, default_value_t = 20)]
@@ -908,7 +908,10 @@ fn rewrite_output_token(output: &Path, requested_format: &str, token: &str) -> P
         return output.with_file_name(fname.replacen(requested_format, token, 1));
     }
     let newf = match fname.strip_suffix(".hfq") {
-        Some(stem) => format!("{stem}.{token}.hfq"),
+        // Already has a machine section (`--`): the token joins it with a dot.
+        Some(stem) if stem.contains("--") => format!("{stem}.{token}.hfq"),
+        // Bare model name: open the machine section with the `--` boundary.
+        Some(stem) => format!("{stem}--{token}.hfq"),
         None => format!("{fname}.{token}"),
     };
     output.with_file_name(newf)

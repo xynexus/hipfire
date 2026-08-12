@@ -16,6 +16,29 @@
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 
+__device__ __forceinline__ float asym2_quant_dim(
+    const unsigned char* k_head, int dim, float cnorm
+) {
+    const unsigned int packed = (unsigned int)k_head[4 + dim / 4];
+    const int index = (packed >> (2 * (dim & 3))) & 0x3;
+    return cnorm * TURBO_C2_256[index];
+}
+
+__device__ __forceinline__ float asym2_original_dim(
+    const unsigned char* k_head,
+    const float* cos_theta,
+    const float* sin_theta,
+    int dim,
+    float cnorm
+) {
+    const int band = dim / 2;
+    const float a = asym2_quant_dim(k_head, band * 2, cnorm);
+    const float b = asym2_quant_dim(k_head, band * 2 + 1, cnorm);
+    return (dim & 1) == 0
+        ? cos_theta[band] * a + sin_theta[band] * b
+        : -sin_theta[band] * a + cos_theta[band] * b;
+}
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void triattn_score_asym2(
     const unsigned char* __restrict__ k_cache,
@@ -27,6 +50,7 @@ __global__ void triattn_score_asym2(
     int n_kv_heads,
     int head_dim,
     int n_rot,
+    int rope_layout,
     float rope_theta,
     float p_q,
     int seq_len
@@ -40,7 +64,6 @@ __global__ void triattn_score_asym2(
     const int kv_h = h / kv_group;
     const int n_bands = head_dim / 2;
     const int n_rot_bands = n_rot / 2;
-    const int n_halves = head_dim / 128;
 
     const int k_bytes_per_head = 4 + head_dim / 4;
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
@@ -52,42 +75,13 @@ __global__ void triattn_score_asym2(
     float s_trig = 0.0f;
     float s_norm = 0.0f;
 
-    for (int half = 0; half < n_halves; half++) {
-        const int block_tid = half * 32 + tid;
-        const int byte_off  = 4 + half * 32 + tid;
-
-        const unsigned int packed = (unsigned int)k_head[byte_off];
-        const int i0 = (int)((packed     ) & 0x3);
-        const int i1 = (int)((packed >> 2) & 0x3);
-        const int i2 = (int)((packed >> 4) & 0x3);
-        const int i3 = (int)((packed >> 6) & 0x3);
-
-        const float v0 = cnorm * TURBO_C2_256[i0];
-        const float v1 = cnorm * TURBO_C2_256[i1];
-        const float v2 = cnorm * TURBO_C2_256[i2];
-        const float v3 = cnorm * TURBO_C2_256[i3];
-
-        const float cA = cos_theta[block_tid * 2 + 0];
-        const float sA = sin_theta[block_tid * 2 + 0];
-        const float cB = cos_theta[block_tid * 2 + 1];
-        const float sB = sin_theta[block_tid * 2 + 1];
-
-        // Inverse Givens per pair.
-        const float k0_re =  cA * v0 + sA * v1;
-        const float k0_im = -sA * v0 + cA * v1;
-        const float k1_re =  cB * v2 + sB * v3;
-        const float k1_im = -sB * v2 + cB * v3;
-
-        const float k0_mag = sqrtf(k0_re * k0_re + k0_im * k0_im);
-        const float k0_phase = atan2f(k0_im, k0_re);
-        const float k1_mag = sqrtf(k1_re * k1_re + k1_im * k1_im);
-        const float k1_phase = atan2f(k1_im, k1_re);
-
-        #pragma unroll
-        for (int sub = 0; sub < 2; sub++) {
-            const int f = block_tid * 2 + sub;
-            const float k_mag   = (sub == 0) ? k0_mag   : k1_mag;
-            const float k_phase = (sub == 0) ? k0_phase : k1_phase;
+    for (int f = tid; f < n_bands; f += 32) {
+            const int dim0 = rope_layout == 1 ? f : 2 * f;
+            const int dim1 = rope_layout == 1 ? f + n_bands : 2 * f + 1;
+            const float k_re = asym2_original_dim(k_head, cos_theta, sin_theta, dim0, cnorm);
+            const float k_im = asym2_original_dim(k_head, cos_theta, sin_theta, dim1, cnorm);
+            const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
+            const float k_phase = atan2f(k_im, k_re);
 
             const float* c = c_head + f * 3;
             const float c_re  = c[0];
@@ -108,7 +102,6 @@ __global__ void triattn_score_asym2(
             float r = (c_abs > 1e-20f) ? (c_mag / c_abs) : 0.0f;
             if (r > 1.0f) r = 1.0f;
             s_norm += (1.0f - r) * c_abs * k_mag;
-        }
     }
 
     for (int off = 16; off > 0; off >>= 1) {

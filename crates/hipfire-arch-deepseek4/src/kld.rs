@@ -12,7 +12,7 @@
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::decode_step;
 use hipfire_rdna::Gpu;
-use hipfire_runtime::kld_eval::ChunkScoredForward;
+use hipfire_runtime::kld_eval::{ChunkScoredForward, ScoredWindow};
 
 /// Teacher-force `chunk` through a FRESH per-call state (MLA / compressed-KV
 /// indexer + SWA + hyper-connection residuals), feeding one token per position
@@ -53,15 +53,25 @@ impl ChunkScoredForward for DeepseekV4KldForward<'_> {
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&ScoredWindow<'_>),
     ) -> Result<(), String> {
+        // A decode loop has one row at a time; emit one-row windows. The window
+        // is the unit of delivery, not a claim that this arch batches.
+        let vocab = self.config.vocab_size;
         forward_chunk_scored(
             gpu,
             self.weights,
             self.config,
             chunk,
             scoring_start,
-            |j, lg, next| at_scored(j, lg, next),
+            |j, lg, next| {
+                at_scored(&ScoredWindow {
+                    j0: j,
+                    logits: lg,
+                    vocab,
+                    nexts: &[next as u32],
+                })
+            },
         )
     }
 

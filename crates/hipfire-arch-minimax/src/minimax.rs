@@ -142,11 +142,21 @@ impl MiniMaxConfig {
 // Replicated from the qwen35 loader (those are crate-private). MiniMax HFQ
 // files carry RAW HF tensor names, so we look them up by exact name.
 
+/// Read a tensor's bytes, decoding any lossless bf16 recoding to plain bf16.
+///
+/// `--format bf16` applies `Bf16Huff` (qt=50) by default, and
+/// `HIPFIRE_BF16L3_RESIDENT` leaves `Bf16Lut3` (qt=49) packed, so a plain bf16
+/// artifact reaches this loader with a quant code none of the callers' match
+/// arms know. Decoding here rather than in each arm means the arms only ever
+/// see logical codes — a new caller cannot forget the case.
 fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("minimax: tensor not found in HFQ: {name}"))?;
-    Ok((info.quant_type, data))
+    use hipfire_runtime::hfq::LogicalReadError;
+    hfq.tensor_data_logical(name).map_err(|e| match e {
+        LogicalReadError::Missing => format!("minimax: tensor not found in HFQ: {name}"),
+        LogicalReadError::Decode(qt) => {
+            format!("minimax: failed to decode recoded tensor {name} (qt={qt})")
+        }
+    })
 }
 
 /// Load a 1D norm vector (F16/F32) → F32 GpuTensor. MiniMax-M2 uses STANDARD

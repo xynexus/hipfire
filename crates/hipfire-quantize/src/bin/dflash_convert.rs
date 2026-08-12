@@ -17,14 +17,14 @@
 //! into a hipfire `.hfq` file with a dflash metadata section.
 //!
 //! Usage:
-//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--bf16 | --f16 | --keep-f32]
+//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--format <token>]
 //!
 //! Reads a single-file safetensors dump (the z-lab/Qwen3.5-*-DFlash draft
 //! layout — no shards in practice at 1-4B params) and rewrites the tensors
 //! into the hipfire HFQ container. BF16 weights are preserved by default.
-//! `--f16` produces the compatibility artifact for older cards, while the
+//! `--format f16` produces the compatibility artifact for older cards, while the
 //! runtime can also convert a BF16 artifact to F16 when native BF16 WMMA is
-//! unavailable. Pass `--keep-f32` to expand weights to F32.
+//! unavailable. Pass `--format f32` to expand weights to F32.
 //! Per-layer norms (`input_layernorm`, `post_attention_layernorm`,
 //! `q_norm`, `k_norm`, `hidden_norm`, `norm`) are always F32.
 //!
@@ -53,6 +53,7 @@ use hipfire_primitives::conv::{
     f32_slice_to_bf16_bytes, f32_slice_to_f16_bytes, plain_dtype_to_f32 as to_f32,
 };
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+use hipfire_quant_format::QuantType;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -161,59 +162,71 @@ enum DraftFormat {
 }
 
 impl DraftFormat {
-    #[allow(clippy::too_many_arguments)]
-    fn from_flags(
-        use_f16: bool,
-        keep_f32: bool,
-        use_bf16: bool,
-        use_mq3: bool,
-        use_mq4: bool,
-        use_mq6: bool,
-        use_oq8: bool,
-        use_oq4: bool,
-        oq4_mixed_outliers: Option<usize>,
-    ) -> Result<Self, String> {
-        let selected = [
-            use_f16,
-            keep_f32,
-            use_bf16,
-            use_mq3,
-            use_mq4,
-            use_mq6,
-            use_oq8,
-            use_oq4,
-            oq4_mixed_outliers.is_some(),
-        ]
-        .into_iter()
-        .filter(|enabled| *enabled)
-        .count();
-        if selected > 1 {
-            return Err(
-                "--bf16, --f16, --keep-f32, --mq3, --mq4, --mq6, --oq8, --oq4, and --oq4.<bits> \
-                 are mutually exclusive"
-                    .to_string(),
-            );
+    fn from_token(token: Option<&str>) -> Result<Self, String> {
+        let Some(token) = token else {
+            return Ok(Self::Bf16);
+        };
+        match token {
+            "bf16" => Ok(Self::Bf16),
+            "f16" => Ok(Self::F16),
+            "f32" => Ok(Self::F32),
+            "mq3" => Ok(Self::Mq3),
+            "mq4" => Ok(Self::Mq4),
+            "mq6" => Ok(Self::Mq6),
+            "oq8+" => Ok(Self::Oq8),
+            "oq4+" => Ok(Self::Oq4),
+            mixed if mixed.starts_with("oq") && mixed.ends_with('+') => {
+                let bits = &mixed[2..mixed.len() - 1];
+                bits.parse::<f32>()
+                    .ok()
+                    .and_then(mixed_outliers_for_bits)
+                    .map(Self::Oq4Mixed)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid DFLASH format {mixed}: mixed Opus storage must be \
+                             oq<4.0625+n/16>+ for n in 1..=62 (for example oq4.25+)"
+                        )
+                    })
+            }
+            other => Err(format!(
+                "unsupported DFLASH format {other}; expected one of \
+                 bf16, f16, f32, mq3, mq4, mq6, oq4+, oq8+, or oq4.25+-style mixed Opus"
+            )),
         }
-        Ok(if use_f16 {
-            Self::F16
-        } else if keep_f32 {
-            Self::F32
-        } else if use_mq3 {
-            Self::Mq3
-        } else if use_mq4 {
-            Self::Mq4
-        } else if use_mq6 {
-            Self::Mq6
-        } else if use_oq8 {
-            Self::Oq8
-        } else if use_oq4 {
-            Self::Oq4
-        } else if let Some(n) = oq4_mixed_outliers {
-            Self::Oq4Mixed(n)
-        } else {
-            // No flag and explicit --bf16 intentionally resolve identically.
-            Self::Bf16
-        })
+    }
+
+    fn mixed_outliers(self) -> Option<usize> {
+        match self {
+            Self::Oq4Mixed(count) => Some(count),
+            _ => None,
+        }
+    }
+
+    fn is_plain_opus(self) -> bool {
+        matches!(self, Self::Oq8 | Self::Oq4 | Self::Oq4Mixed(_))
+    }
+
+    fn canonical_token(self) -> String {
+        match self {
+            Self::Bf16 => "bf16".to_string(),
+            Self::F16 => "f16".to_string(),
+            Self::F32 => "f32".to_string(),
+            Self::Mq3 => "mq3".to_string(),
+            Self::Mq4 => "mq4".to_string(),
+            Self::Mq6 => "mq6".to_string(),
+            Self::Oq8 => "oq8+".to_string(),
+            Self::Oq4 => "oq4+".to_string(),
+            Self::Oq4Mixed(count) => format!("oq{}+", 4.0625 + count as f64 / 16.0),
+        }
+    }
+
+    fn plain_opus_block_bytes(self) -> Option<usize> {
+        match self {
+            Self::Oq8 => Some(258),
+            Self::Oq4 => Some(130),
+            Self::Oq4Mixed(count) => Some(130 + 2 * count),
+            _ => None,
+        }
     }
 
     fn metadata_name(self) -> &'static str {
@@ -226,7 +239,7 @@ impl DraftFormat {
             Self::Mq6 => "mq6",
             Self::Oq8 => "oq8",
             // Base token; the mixed overlay count rides in the artifact filename
-            // per the canonical naming (e.g. `.oq4.25+.hfq`). The loader keys on
+            // per the canonical naming (e.g. `--oq4.25+.hfq`). The loader keys on
             // per-tensor QuantType, not this string.
             Self::Oq4 | Self::Oq4Mixed(_) => "oq4",
         }
@@ -279,11 +292,7 @@ mod config_tests {
 
     #[test]
     fn bf16_is_the_default_draft_format() {
-        assert_eq!(
-            DraftFormat::from_flags(false, false, false, false, false, false, false, false, None)
-                .unwrap(),
-            DraftFormat::Bf16
-        );
+        assert_eq!(DraftFormat::from_token(None).unwrap(), DraftFormat::Bf16);
         assert_eq!(DraftFormat::Bf16.metadata_name(), "bf16");
         assert_eq!(super::QuantType::BF16 as u8, 16);
     }
@@ -291,14 +300,28 @@ mod config_tests {
     #[test]
     fn f16_remains_an_explicit_compatibility_format() {
         assert_eq!(
-            DraftFormat::from_flags(true, false, false, false, false, false, false, false, None)
-                .unwrap(),
+            DraftFormat::from_token(Some("f16")).unwrap(),
             DraftFormat::F16
         );
-        assert!(DraftFormat::from_flags(
-            true, true, false, false, false, false, false, false, None
-        )
-        .is_err());
+        assert!(DraftFormat::from_token(Some("--f16")).is_err());
+    }
+
+    #[test]
+    fn canonical_opus_tokens_include_plus_and_exact_mixed_width() {
+        assert_eq!(
+            DraftFormat::from_token(Some("oq4+")).unwrap(),
+            DraftFormat::Oq4
+        );
+        assert_eq!(
+            DraftFormat::from_token(Some("oq8+")).unwrap(),
+            DraftFormat::Oq8
+        );
+        assert_eq!(
+            DraftFormat::from_token(Some("oq4.25+")).unwrap(),
+            DraftFormat::Oq4Mixed(3)
+        );
+        assert!(DraftFormat::from_token(Some("oq4")).is_err());
+        assert!(DraftFormat::from_token(Some("oq4.2+")).is_err());
     }
 }
 
@@ -500,86 +523,6 @@ fn clipsearch_plain(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
-/// Rank group positions by how much promoting them from int4 to int8 reduces
-/// squared error. The top `n_out` become the sparse overlay.
-fn mixed_overlay_indices_plain(group: &[f32; 256], scale: f32) -> [usize; 256] {
-    let inv = 1.0 / scale.max(1e-12);
-    let gain = |index: usize| -> f32 {
-        let value = group[index];
-        let q4 = (value * inv).round().clamp(-7.0, 7.0);
-        let q8 = (value * inv).round().clamp(-127.0, 127.0);
-        let e4 = value - q4 * scale;
-        let e8 = value - q8 * scale;
-        e4 * e4 - e8 * e8
-    };
-    let mut indices: [usize; 256] = core::array::from_fn(|i| i);
-    indices.sort_unstable_by(|&l, &r| {
-        gain(r)
-            .partial_cmp(&gain(l))
-            .unwrap_or(core::cmp::Ordering::Equal)
-    });
-    indices
-}
-
-/// SSE of the mixed encoding: outlier slots clamp to int8, the rest to int4.
-fn mixed_overlay_error_plain(
-    group: &[f32; 256],
-    scale: f32,
-    indices: &[usize; 256],
-    n_out: usize,
-) -> f32 {
-    let inv = 1.0 / scale.max(1e-12);
-    let mut is_w8 = [false; 256];
-    for &index in &indices[..n_out] {
-        is_w8[index] = true;
-    }
-    group
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| {
-            let limit = if is_w8[index] { 127.0 } else { 7.0 };
-            let q = (value * inv).round().clamp(-limit, limit);
-            let e = value - q * scale;
-            e * e
-        })
-        .sum()
-}
-
-/// Refit the scale knowing which slots will be int8 — a wider grid than the
-/// int4-only search, because outliers no longer force the scale up.
-fn refit_mixed_scale_plain(
-    group: &[f32; 256],
-    indices: &[usize; 256],
-    n_out: usize,
-    fallback: f32,
-) -> f32 {
-    const CLIP_GRID: [f32; 14] = [
-        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
-    ];
-    let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let mut best_scale = fallback.max(1e-12);
-    let mut best_error = mixed_overlay_error_plain(group, best_scale, indices, n_out);
-    for clip in CLIP_GRID {
-        let scale = (clip * amax / 7.0).max(1e-12);
-        let error = mixed_overlay_error_plain(group, scale, indices, n_out);
-        if error < best_error {
-            best_scale = scale;
-            best_error = error;
-        }
-    }
-    best_scale
-}
-
-/// Joint scale/overlay selection: clip-search, pick outliers, refit, repeat once.
-fn mixed_clipsearch_plain(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
-    let s0 = clipsearch_plain(group, 7.0);
-    let i0 = mixed_overlay_indices_plain(group, s0);
-    let s1 = refit_mixed_scale_plain(group, &i0, n_out, s0);
-    let i1 = mixed_overlay_indices_plain(group, s1);
-    let s2 = refit_mixed_scale_plain(group, &i1, n_out, s1);
-    (s2, i1)
-}
-
 /// Number of int8 overlay slots per 256-group for a requested mixed bit-width.
 ///
 /// Base cost is 4.0625 b/w (130 B/group = f16 scale + 128 nibbles); each overlay
@@ -695,7 +638,7 @@ fn quantize_oq4_mixed_plain(f32_data: &[f32], n_out: usize) -> Vec<u8> {
         let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
 
-        let (scale, idx) = mixed_clipsearch_plain(&group, n_out);
+        let (scale, idx) = hipfire_quantize::codecs::mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;
         let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);
@@ -777,40 +720,6 @@ fn dequant_oq8_plain(data: &[u8], n: usize) -> Vec<f32> {
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 const ARCH_ID_DFLASH_DRAFT: u32 = 20;
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-enum QuantType {
-    Q4F16G64 = 0,
-    F16 = 1,
-    F32 = 2,
-    MQ4G256 = 13,
-    MQ6G256 = 15,
-    BF16 = 16,
-    MQ3G256 = 17,
-    /// Non-rotated (plain-basis) symmetric signed INT8, per-256-group f16 scale.
-    /// On-disk block = [f16 scale][256 int8] = 258 B/group — same bytes as the
-    /// canonical `Oq8G256 = 35` but WITHOUT the FWHT rotation, so the AIE2 int8
-    /// W8A8/W8A16 projection kernel consumes it directly with no per-block
-    /// activation rotation. Distinct id (and `"rotated": false` in metadata) so a
-    /// rotated-OQ8 consumer can never mis-handle these bytes. NPU-only sidecar.
-    Oq8Plain = 45,
-    /// Non-rotated (plain-basis) MIXED Opus quant: int4 bulk + sparse int8
-    /// overlay. Block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)] =
-    /// 130 + 2·n_out B/group. At n_out=3 that is 136 B/group = 4.25 b/w.
-    /// Same layout as the canonical `OqPlusCompact = 36` but WITHOUT the FWHT
-    /// rotation (see `Oq8Plain`), so the AIE2 W4A8 projection kernel consumes it
-    /// with no per-block activation rotation. `n_out` is recoverable from the
-    /// block length, and metadata carries it explicitly. NPU-only sidecar.
-    Oq4MixedPlain = 46,
-    /// Non-rotated (plain-basis) PURE int4. Block = [f16 scale][128 nibbles] =
-    /// 130 B/group = 4.0625 b/w — the minimum-bandwidth weight format, and what
-    /// the AIE2 W4A8 projection kernel wants. Distinct from the canonical ROTATED
-    /// `Oq4G256 = 34` so a rotated consumer can never mis-handle these bytes.
-    /// NPU-only sidecar.
-    Oq4Plain = 47,
-}
 
 struct HfqTensor {
     name: String,
@@ -924,10 +833,12 @@ fn resolve_model_path(input: &str) -> String {
         if parts.len() == 2 {
             let org = parts[0];
             let name = parts[1];
-            let home = std::env::var("HOME").unwrap_or_default();
-            let cache_root = PathBuf::from(format!(
-                "{home}/.cache/huggingface/hub/models--{org}--{name}"
-            ));
+            let home = hipfire_env::home_dir().unwrap_or_default();
+            // Join rather than format: `home` is a PathBuf, and string-building
+            // a path breaks on any home directory that is not plain UTF-8.
+            let cache_root = home
+                .join(".cache/huggingface/hub")
+                .join(format!("models--{org}--{name}"));
             if let Some(snapshot) = resolve_hf_cache_root(&cache_root) {
                 return snapshot.to_string_lossy().into_owned();
             }
@@ -962,16 +873,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut input_dir: Option<String> = None;
     let mut output_path: Option<String> = None;
-    let mut use_bf16 = false;
-    let mut use_f16 = false;
-    let mut keep_f32 = false;
-    let mut use_mq4 = false;
-    let mut use_mq6 = false;
-    let mut use_mq3 = false;
-    let mut use_oq8 = false;
-    let mut use_oq4 = false;
-    // Some(n_out) when a mixed --oq4.<bits> format was requested.
-    let mut oq4_mixed_outliers: Option<usize> = None;
+    let mut format_token: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -984,71 +886,25 @@ fn main() {
                 output_path = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--keep-f32" => {
-                keep_f32 = true;
-                i += 1;
-            }
-            "--bf16" => {
-                use_bf16 = true;
-                i += 1;
-            }
-            "--f16" => {
-                use_f16 = true;
-                i += 1;
-            }
-            "--mq4" => {
-                use_mq4 = true;
-                i += 1;
-            }
-            "--mq6" => {
-                use_mq6 = true;
-                i += 1;
-            }
-            "--mq3" => {
-                use_mq3 = true;
-                i += 1;
-            }
-            "--oq8" => {
-                use_oq8 = true;
-                i += 1;
-            }
-            // PURE int4 (130 B/group, 4.0625 b/w). Matched before the
-            // "--oq4." prefix arm below so it is not shadowed by it.
-            "--oq4" => {
-                use_oq4 = true;
-                i += 1;
-            }
-            // Mixed-precision Opus quant, named by its exact storage width:
-            // bits = 4.0625 + n_out/16, so --oq4.25 => 3 int8 overlays/group.
-            // Accepts the whole canonical family (oq4.125 .. oq7.9375) rather
-            // than hard-coding one width.
-            other_fmt if other_fmt.starts_with("--oq4.") || other_fmt.starts_with("--oq5.") => {
-                let bits_text = &other_fmt[2..].trim_start_matches("oq");
-                match bits_text
-                    .parse::<f32>()
-                    .ok()
-                    .and_then(mixed_outliers_for_bits)
-                {
-                    Some(n) => {
-                        oq4_mixed_outliers = Some(n);
-                        i += 1;
-                    }
-                    None => {
-                        eprintln!(
-                            "invalid mixed format {other_fmt}: storage bits must be \
-                             4.0625 + n/16 for n in 1..=62 (e.g. --oq4.25 => 3 overlays)"
-                        );
-                        std::process::exit(1);
-                    }
+            "--format" => {
+                if format_token.is_some() {
+                    eprintln!("--format may be specified only once");
+                    std::process::exit(1);
                 }
+                format_token = args.get(i + 1).cloned();
+                if format_token.is_none() {
+                    eprintln!("--format requires a quant token");
+                    std::process::exit(1);
+                }
+                i += 2;
             }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> \
-                     [--bf16 | --f16 | --keep-f32 | --mq3 | --mq4 | --mq6 | --oq8 | --oq4 | --oq4.<bits>]"
+                     [--format <bf16|f16|f32|mq3|mq4|mq6|oq4+|oq8+|oq4.25+>]"
                 );
                 eprintln!(
-                    "  --oq4.<bits>  non-rotated mixed int4+int8 (e.g. --oq4.25 = 3 int8 \
+                    "  oq4.25+  non-rotated mixed int4+int8 (3 int8 \
                      overlays per 256-group, 136 B/group)"
                 );
                 std::process::exit(0);
@@ -1059,21 +915,11 @@ fn main() {
             }
         }
     }
-    let draft_format = DraftFormat::from_flags(
-        use_f16,
-        keep_f32,
-        use_bf16,
-        use_mq3,
-        use_mq4,
-        use_mq6,
-        use_oq8,
-        use_oq4,
-        oq4_mixed_outliers,
-    )
-    .unwrap_or_else(|error| {
+    let draft_format = DraftFormat::from_token(format_token.as_deref()).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
     });
+    let oq4_mixed_outliers = draft_format.mixed_outliers();
 
     let input_dir = input_dir.expect("--input required");
     let output_path = output_path.expect("--output required");
@@ -1207,7 +1053,7 @@ fn main() {
             // kernel reads codes directly and must NOT rotate activations. Explicit
             // so a rotated consumer (canonical Oq8G256=35 / OqPlusCompact=36) can
             // never mis-handle these bytes.
-            "rotated": if use_oq8 || use_oq4 || oq4_mixed_outliers.is_some() {
+            "rotated": if draft_format.is_plain_opus() {
                 serde_json::Value::Bool(false)
             } else {
                 serde_json::Value::Null
@@ -1223,6 +1069,25 @@ fn main() {
                 Some(n) => serde_json::Value::from(4.0625 + n as f64 / 16.0),
                 None => serde_json::Value::Null,
             },
+            "quant_token": draft_format.canonical_token(),
+            "group_size": if draft_format.is_plain_opus() {
+                serde_json::Value::from(256)
+            } else {
+                serde_json::Value::Null
+            },
+            "block_bytes": draft_format
+                .plain_opus_block_bytes()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            "clip_search_recipe": if draft_format.is_plain_opus() {
+                serde_json::Value::from("symmetric_grid_v1")
+            } else {
+                serde_json::Value::Null
+            },
+            "producer_fingerprint": format!(
+                "dflash_convert:{}:plain-opus-v1",
+                env!("CARGO_PKG_VERSION")
+            ),
         },
         "tokenizer": serde_json::Value::Null,
     });

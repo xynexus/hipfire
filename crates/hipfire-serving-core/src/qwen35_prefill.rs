@@ -13,7 +13,6 @@
 //! called from `main.rs` are `pub`.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_qwen35::qwen35;
@@ -49,6 +48,7 @@ use crate::session::{
     sequence_state_arena_active_logical_position, sequence_state_arena_checkpoint_session_state,
     sequence_state_arena_fork_session_state, sequence_state_arena_is_session_resident,
     sequence_state_arena_reset_active_session, sequence_state_arena_resident_session_count,
+    validate_qwen35_fused_dense_prefill_model_capability,
     validate_qwen35_fused_grouped_moe_prefill_model_capability, Qwen35RequestSessionState,
 };
 
@@ -528,7 +528,7 @@ pub fn qwen35_semantic_boundary_checkpoints(
 /// prefill work.
 pub fn run_prefix_hash_preflight_qwen35(
     m: &LoadedModel,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &PrefixHashPreflightEnvelope,
 ) -> Result<(), String> {
     if !is_qwen35_family_arch_id(m.arch_id) {
@@ -1747,7 +1747,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
 pub fn run_generate_batch_prefill_serial_qwen35(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
     pflash_active: bool,
 ) -> Result<(), String> {
@@ -1783,11 +1783,13 @@ pub fn run_generate_batch_prefill_serial_qwen35(
 
     let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope.session_count);
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
+    let fused_dense_supported = validate_qwen35_fused_dense_prefill_model_capability(m);
     let fused_grouped_moe_supported =
         validate_qwen35_fused_grouped_moe_prefill_model_capability(m, envelope.session_count);
     let backend = select_qwen35_prefill_batch_backend(
         plan,
         requested_backend.as_deref(),
+        fused_dense_supported,
         fused_grouped_moe_supported,
     )?;
     let started = serde_json::json!({

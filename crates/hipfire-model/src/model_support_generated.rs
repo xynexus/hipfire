@@ -135,6 +135,17 @@ pub const ARCH_ROWS: &[ArchRow] = &[
         },
     },
     ArchRow {
+        ids: &[25],
+        features: ArchFeatures {
+            label: "cohere2-moe",
+            prefill: FeatureSupport::None,
+            dflash: FeatureSupport::None,
+            mtp: FeatureSupport::None,
+            kv: "none",
+            vision: FeatureSupport::None,
+        },
+    },
+    ArchRow {
         ids: &[7],
         features: ArchFeatures {
             label: "qwen2",

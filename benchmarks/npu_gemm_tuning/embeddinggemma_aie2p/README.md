@@ -218,7 +218,7 @@ shared/zero-copy buffers or larger fused NPU regions; per-projection host copies
 must not be promoted as a production serving path. Raw rows are in
 `benchmarks/npu_gemm_tuning/results/embeddinggemma-aie2p-opus-mixed-hybrid-e2e.csv`.
 
-The generated `EmbeddingGemma-300M.oq4.5.hfq` is `323.7 MB`. Its three-document
+The generated `EmbeddingGemma-300M--oq4.5.hfq` is `323.7 MB`. Its three-document
 GPU-vs-BF16 mean cosine was `0.97441` (`0.97567`, `0.97435`, `0.97320`). This
 shows substantial vector drift despite exact NPU/GPU runtime parity; broader
 STS-B and selection evaluation answer different quality questions.

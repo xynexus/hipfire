@@ -1074,6 +1074,25 @@ impl Gpu {
         // path's bf16 gemv funnels here via gemm_bf16_x_bf16_wmma). Captures the
         // input activation before the compute. No-op when unarmed.
         self.maybe_capture_activation(a_bf16, x_f32, batch_size, k);
+        // N-heavy first for wide M. The m128 form gives each warp one 16x16
+        // output tile, so at a 256-column window its 16 column-blocks each
+        // re-read all of A; the N-heavy form keeps 4 accumulators and reuses
+        // each A fragment 4 times. Measured on gfx1151 against m128 (lower is
+        // faster): at N=256 lm_head 0.34x, ffn_gate 0.56x, dn_qkv 0.70x; at
+        // N=64, 0.39x / 0.25x / 0.18x. It LOSES below M~2048 (M=1024 shapes run
+        // 1.2x at N=256 and 2.0x at N=64), which is what the threshold encodes.
+        // Numerically identical to m128 — both match a CPU reference to the same
+        // digits (`bench_bf16l3_vs_bf16_gemm`).
+        if self.arch == "gfx1151"
+            && m >= 2048
+            && batch_size >= 16
+            && k % 16 == 0
+            && std::env::var("HIPFIRE_BF16_DENSE_NHEAVY").ok().as_deref() != Some("0")
+            && std::env::var("HIPFIRE_BF16_DENSE_M128").ok().as_deref() != Some("0")
+        {
+            return self
+                .gemm_bf16_x_bf16_wmma_gfx1151_nheavy(a_bf16, x_f32, y_f32, m, k, batch_size);
+        }
         if self.arch == "gfx1151"
             && m >= 128
             && batch_size >= 16
@@ -1185,6 +1204,195 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// LDS-staged, double-buffered, register-super-tiled bf16 GEMM (gfx1103 wave32)
+    /// — the DiT throughput kernel. Same contract as [`Self::gemm_bf16_tiled_wmma`]
+    /// (bf16 weight × f32 activation staged to bf16, F32 [B,M] output) and bit-exact
+    /// to it, but LDS-staged for far higher occupancy. Requires `k % 64 == 0`.
+    /// Parity: `parity_gemm_bf16_tiled_wmma_lds`.
+    pub fn gemm_bf16_tiled_wmma_lds(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "gemm_bf16_tiled_wmma_lds: weights BF16"
+        );
+        assert_eq!(
+            k % 64,
+            0,
+            "gemm_bf16_tiled_wmma_lds: K must be a multiple of 64"
+        );
+        self.ensure_kernel(
+            "gemm_bf16_tiled_wmma_lds",
+            kernels::GEMM_BF16_TILED_WMMA_LDS_SRC,
+            "gemm_bf16_tiled_wmma_lds",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(64) as u32; // BM = 64
+        let grid_b = batch_size.div_ceil(128) as u32; // BN = 128
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_tiled_wmma_lds", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16_tiled_wmma_lds",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Software-pipelined (prefetched) variant of [`Self::gemm_bf16_tiled_wmma`].
+    /// `entry` selects the tile/prefetch combo (`gemm_bf16_pf_{4x4_x,4x4_a,4x4_both,
+    /// 4x2_both,2x2_both}`); `mb`/`nb` must match the entry's tiling for the grid.
+    /// Bit-exact to the corresponding `gemm_bf16_tiled_wmma_<mb>x<nb>`; chases the
+    /// dependent-load stall the free-ALU probe exposed (plan §12c). `k % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_tiled_wmma_pf(
+        &mut self,
+        entry: &str,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "gemm_bf16_tiled_wmma_pf: weights BF16"
+        );
+        assert_eq!(
+            k % 32,
+            0,
+            "gemm_bf16_tiled_wmma_pf: K must be a multiple of 32"
+        );
+        self.ensure_kernel(entry, kernels::GEMM_BF16_TILED_WMMA_PF_SRC, entry)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_tiled_wmma_pf", bytes);
+        let result = self.launch_kernargs(
+            entry,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// DIAGNOSTIC-ONLY compute-headroom probe. Runs the register-tiled 4x4 bf16
+    /// GEMM with `entry` = `gemm_bf16_alu{0,64,128,256,512,1024,2048}`, i.e. the
+    /// production kernel plus N side FMAs per K-step. Sweeping `entry` and finding
+    /// the knee where wall-time rises measures how much unrelated VALU work the
+    /// compute-bound DiT GEMM absorbs for free — the budget for a codebook/trellis
+    /// weight decode (QTIP, LO-BCQ) or a correction branch. Affordable decode cost
+    /// = `NALU_free / 64` ops per weight element. Like `bench_iu_wmma_gfx1151`,
+    /// this is diagnostic-only and is intentionally not routed into any model path.
+    pub fn bench_bf16_alu_headroom(
+        &mut self,
+        entry: &str,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "bench_bf16_alu_headroom: weights BF16"
+        );
+        self.ensure_kernel(entry, kernels::BENCH_BF16_ALU_HEADROOM_SRC, entry)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let sink = 0i32; // never taken; blocks DCE of the side chain
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = batch_size.div_ceil(64) as u32;
+        self.launch_kernargs(
+            entry,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi, i32 sink],
+        )
+    }
+
+    /// EXPERIMENT (D1 free-ALU headroom): LDS bf16 GEMM + `extra` throwaway VALU
+    /// FMAs per WMMA. Sweep `extra`; the wall-time-rise knee is the free-compute
+    /// budget a QTIP/codebook decode or correction branch can hide in. Not production.
+    pub fn bench_bf16_lds_freealu(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        extra: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 64, 0, "bench_bf16_lds_freealu: K%64");
+        self.ensure_kernel(
+            "bench_bf16_lds_freealu",
+            kernels::BENCH_BF16_LDS_FREEALU_SRC,
+            "bench_bf16_lds_freealu",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let ei = extra as i32;
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = batch_size.div_ceil(128) as u32;
+        self.launch_kernargs(
+            "bench_bf16_lds_freealu",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi, i32 ei],
+        )
     }
 
     /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.

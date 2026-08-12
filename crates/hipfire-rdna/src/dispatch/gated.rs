@@ -254,288 +254,33 @@ impl Gpu {
         }
         result
     }
-    #[cfg(feature = "deltanet")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_q8_routed_batch_seq(
-        &mut self,
-        q: &GpuTensor,
-        k: &GpuTensor,
-        v: &GpuTensor,
-        gate: &GpuTensor,
-        beta: &GpuTensor,
-        state_ptrs: &GpuTensor,
-        scale_ptrs: &GpuTensor,
-        row_session_indices: &GpuTensor,
-        output: &GpuTensor,
-        ptr_layer_stride: usize,
-        delta_layer_index: usize,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-        n_sessions: usize,
-        seq_pos: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        Self::ensure_gdn_hd128(head_dim)?;
-        self.ensure_kernel(
-            "gated_delta_net_q8_routed_batch_seq",
-            kernels::GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC,
-            "gated_delta_net_q8_routed_batch_seq",
-        )?;
-        let qp = q.buf.as_ptr();
-        let kp = k.buf.as_ptr();
-        let vp = v.buf.as_ptr();
-        let gp = gate.buf.as_ptr();
-        let bp = beta.buf.as_ptr();
-        let spp = state_ptrs.buf.as_ptr();
-        let scpp = scale_ptrs.buf.as_ptr();
-        let rsp = row_session_indices.buf.as_ptr();
-        let op = output.buf.as_ptr();
-        let ptr_stride = ptr_layer_stride as i32;
-        let layer = delta_layer_index as i32;
-        let nt = n_tokens as i32;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-        let fr = super::gdn_requant_seed(seq_pos, delta_layer_index as u32);
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "gated_delta_net_q8_routed_batch_seq",
-            bytes,
-        );
-        let n_tiles = (128 / 4) as u32;
-        let result = self.launch_kernargs(
-            "gated_delta_net_q8_routed_batch_seq",
-            [n_heads as u32, n_tiles, n_sessions as u32],
-            [32, 1, 1],
-            0,
-            &kernargs![
-                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr scpp, ptr rsp, ptr op,
-                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd, i32 fr
-            ],
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-    /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.
-    ///
-    /// `seq_pos` is the absolute sequence position of the first token in this
-    /// block and `delta_layer` the DeltaNet layer index; together they seed the
-    /// stochastic-rounding RNG deterministically. See [`super::gdn_requant_seed`].
-    #[cfg(feature = "deltanet")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_q8(
-        &mut self,
-        q: &GpuTensor,
-        k: &GpuTensor,
-        v: &GpuTensor,
-        gate: &GpuTensor,
-        beta: &GpuTensor,
-        s_q8: &GpuTensor,
-        s_scales: &GpuTensor,
-        output: &GpuTensor,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-        seq_pos: u32,
-        delta_layer: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        Self::ensure_gdn_hd128(head_dim)?;
-        if self.gdn_q8_reg_gfx1151_enabled() {
-            return self.gated_delta_net_q8_reg_gfx1151(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                s_q8,
-                s_scales,
-                output,
-                n_tokens,
-                n_heads,
-                head_dim,
-                seq_pos,
-                delta_layer,
-            );
-        }
-        self.ensure_kernel(
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC,
-            "gated_delta_net_q8",
-        )?;
-        let qp = q.buf.as_ptr();
-        let kp = k.buf.as_ptr();
-        let vp = v.buf.as_ptr();
-        let gp = gate.buf.as_ptr();
-        let bp = beta.buf.as_ptr();
-        let sp = s_q8.buf.as_ptr();
-        let scp = s_scales.buf.as_ptr();
-        let op = output.buf.as_ptr();
-        let nt = n_tokens as i32;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-        let fr = super::gdn_requant_seed(seq_pos, delta_layer);
-        let ef_null: *const c_void = std::ptr::null();
-        let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path; per-token=1 for PARO)
-        let n_tiles = (128 / 4) as u32;
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
-        let result = self.launch_kernargs(
-            "gated_delta_net_q8",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &kernargs![
-                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr scp, ptr op,
-                i32 nt, i32 nh, i32 hd, i32 fr, ptr ef_null, i32 rqt
-            ],
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-    /// Batched sequential `gated_delta_net_q8` for prefill.
-    ///
-    /// Launches the single-token kernel N times with offset pointers into
-    /// [N × stride]-laid-out Q/K/V/gate/beta/output buffers. This preserves
-    /// bit-exact semantics with N × `gated_delta_net_q8(n_tokens=1)` calls
-    /// (i.e., dequant→update→requant per token, with stochastic rounding
-    /// applied each step) — critical for byte-exact quality gate compliance.
-    ///
-    /// Why not just call the kernel once with `n_tokens=N`? The existing
-    /// kernel dequants S_q8 once at start, runs N updates in FP32 inside
-    /// LDS, and requants once at end. That collapses N rounding steps into
-    /// one, producing numerically different output from sequential calls —
-    /// diverges from the decode-path baseline.
-    ///
-    /// Q/K/V/output are [N × n_heads × 128] row-major. The `head_dim`
-    /// argument is retained for call-site clarity and profiling, but this
-    /// wrapper rejects any value other than 128 before launching the kernel.
-    /// gate/beta are [N × n_heads] row-major.
-    /// S_q8 / s_scales are the shared state (advanced N steps).
-    ///
-    /// `seq_pos` is the absolute sequence position of `q_batch[0]`; the kernel
-    /// adds its intra-block token index to `frame`, so token `t` of this block
-    /// is seeded at absolute position `seq_pos + t`. `delta_layer` is the
-    /// DeltaNet layer index. See [`super::gdn_requant_seed`].
-    #[cfg(feature = "deltanet")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_q8_batch_seq(
-        &mut self,
-        q_batch: &GpuTensor,
-        k_batch: &GpuTensor,
-        v_batch: &GpuTensor,
-        gate_batch: &GpuTensor,
-        beta_batch: &GpuTensor,
-        s_q8: &GpuTensor,
-        s_scales: &GpuTensor,
-        output_batch: &GpuTensor,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-        seq_pos: u32,
-        delta_layer: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        Self::ensure_gdn_hd128(head_dim)?;
-        if self.gdn_q8_reg_gfx1151_enabled() {
-            return self.gated_delta_net_q8_reg_gfx1151(
-                q_batch,
-                k_batch,
-                v_batch,
-                gate_batch,
-                beta_batch,
-                s_q8,
-                s_scales,
-                output_batch,
-                n_tokens,
-                n_heads,
-                head_dim,
-                seq_pos,
-                delta_layer,
-            );
-        }
-        self.ensure_kernel(
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC,
-            "gated_delta_net_q8",
-        )?;
 
-        let n_tiles = (128 / 4) as u32;
-
-        let qp = q_batch.buf.as_ptr();
-        let kp = k_batch.buf.as_ptr();
-        let vp = v_batch.buf.as_ptr();
-        let gp = gate_batch.buf.as_ptr();
-        let bp = beta_batch.buf.as_ptr();
-        let sp = s_q8.buf.as_ptr();
-        let scp = s_scales.buf.as_ptr();
-        let op = output_batch.buf.as_ptr();
-        let nt = n_tokens as i32;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-        let fr = super::gdn_requant_seed(seq_pos, delta_layer);
-        let ef_null: *const c_void = std::ptr::null();
-        let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path)
-
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "gated_delta_net_q8_batch_seq",
-            bytes,
-        );
-        // Single launch — the kernel loops over n_tokens internally,
-        // keeping state in F32 LDS across all tokens. Q8 quantization
-        // happens once at the end instead of per-token, reducing noise
-        // accumulation. Not byte-exact with N×1 decode calls but
-        // strictly higher quality.
-        let result = self.launch_kernargs(
-            "gated_delta_net_q8",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &kernargs![
-                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr scp, ptr op,
-                i32 nt, i32 nh, i32 hd, i32 fr, ptr ef_null, i32 rqt
-            ],
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-    /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
-    /// S-tile persist-write so sibling tokens read the parent's post-update
-    /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
-    /// means "read pre-block initial state from `s_q8_init`".
+    /// FP32 tree-aware DeltaNet replay — the tree path for FP32 state.
     ///
-    /// Does NOT advance persistent `s_q8_init` / `s_scales_init` (those
-    /// are the pre-block snapshot, read-only). Caller runs linear replay
-    /// on the accepted spine post-acceptance to commit the trajectory.
+    /// DFS order, each token reading its parent's tape slot (or `s_init` at a
+    /// root, `parent_indices[t] < 0`), persist-writing its post-update tile so
+    /// children see the parent rather than the previous sibling. `s_init` is
+    /// READ-ONLY; the caller replays the accepted spine linearly afterwards to
+    /// advance the persistent state.
     ///
     /// Tape layout (caller responsibility):
-    /// - `s_tape_q8`:     `[n_tokens × n_heads × HD × HD]` i8 (scratch)
-    /// - `s_tape_scales`: `[n_tokens × n_heads × HD]` f32 (scratch)
-    /// - `parent_indices`: `[n_tokens]` i32 (host materialized by
-    ///   `ddtree::linearize_tree`; spine topology is [-1, 0, 1, 2, ...])
+    /// - `s_tape`:         `[n_tokens × n_heads × HD × HD]` f32 (scratch)
+    /// - `parent_indices`: `[n_tokens]` i32 (`ddtree::linearize_tree`; spine is
+    ///   `[-1, 0, 1, 2, ...]`)
+    ///
+    /// The tape is 4x the Q8 tape. [`Self::gated_delta_net_f16_tree_batch_seq`]
+    /// halves it when the tree is wide enough for that to matter.
     #[cfg(feature = "deltanet")]
-    pub fn gated_delta_net_q8_tree_batch_seq(
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_tree_batch_seq(
         &mut self,
         q_batch: &GpuTensor,
         k_batch: &GpuTensor,
         v_batch: &GpuTensor,
         gate_batch: &GpuTensor,
         beta_batch: &GpuTensor,
-        s_q8_init: &GpuTensor,
-        s_scales_init: &GpuTensor,
-        s_tape_q8: &GpuTensor,
-        s_tape_scales: &GpuTensor,
+        s_init: &GpuTensor,
+        s_tape: &GpuTensor,
         parent_indices: &GpuTensor,
         output_batch: &GpuTensor,
         n_tokens: usize,
@@ -545,9 +290,9 @@ impl Gpu {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
         self.ensure_kernel(
-            "gated_delta_net_q8_tree",
-            kernels::GATED_DELTA_NET_Q8_TREE_SRC,
-            "gated_delta_net_q8_tree",
+            "gated_delta_net_f32_tree",
+            kernels::GATED_DELTA_NET_F32_TREE_SRC,
+            "gated_delta_net_f32_tree",
         )?;
 
         let n_tiles = (128 / 4) as u32;
@@ -557,30 +302,28 @@ impl Gpu {
         let vp = v_batch.buf.as_ptr();
         let gp = gate_batch.buf.as_ptr();
         let bp = beta_batch.buf.as_ptr();
-        let sip = s_q8_init.buf.as_ptr();
-        let scip = s_scales_init.buf.as_ptr();
-        let stp = s_tape_q8.buf.as_ptr();
-        let stsp = s_tape_scales.buf.as_ptr();
+        let sip = s_init.buf.as_ptr();
+        let stp = s_tape.buf.as_ptr();
         let pp = parent_indices.buf.as_ptr();
         let op = output_batch.buf.as_ptr();
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
 
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
             "deltanet",
-            "gated_delta_net_q8_tree_batch_seq",
+            "gated_delta_net_f32_tree_batch_seq",
             bytes,
         );
         let result = self.launch_kernargs(
-            "gated_delta_net_q8_tree",
+            "gated_delta_net_f32_tree",
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
             &kernargs![
-                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr scip, ptr stp, ptr stsp,
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr stp,
                 ptr pp, ptr op, i32 nt, i32 nh, i32 hd
             ],
         );
@@ -589,18 +332,34 @@ impl Gpu {
         }
         result
     }
-    /// GDN recurrence with Q4-quantized S state.
+
+    /// FP16 tree-aware DeltaNet replay — the tree half of the f16 state path.
+    ///
+    /// Identical to [`Self::gated_delta_net_f32_tree_batch_seq`] except BOTH
+    /// `s_init` and the tape are `_Float16`, matching
+    /// [`Self::gated_delta_net_f16_batch_seq`]: under FP16 state the persistent
+    /// S matrix is itself f16. Storage f16, arithmetic FP32.
+    ///
+    /// Layout: `s_init` is `[n_heads × HD × HD]` f16 and `s_tape` is
+    /// `[n_tokens × n_heads × HD × HD]` f16 — HALF the bytes of the f32 entry
+    /// point in both cases, which the caller must size for.
+    ///
+    /// Costs one f16 rounding per tape round-trip, accumulating with tree DEPTH.
+    /// Not byte-exact against the linear FP32 kernel; against the f16 LINEAR
+    /// kernel on a spine it is exact.
     #[cfg(feature = "deltanet")]
-    pub fn gated_delta_net_q4(
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f16_tree_batch_seq(
         &mut self,
-        q: &GpuTensor,
-        k: &GpuTensor,
-        v: &GpuTensor,
-        gate: &GpuTensor,
-        beta: &GpuTensor,
-        s_q4: &GpuTensor,
-        s_scales: &GpuTensor,
-        output: &GpuTensor,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_init: &GpuTensor,
+        s_tape: &GpuTensor,
+        parent_indices: &GpuTensor,
+        output_batch: &GpuTensor,
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
@@ -608,46 +367,194 @@ impl Gpu {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
         self.ensure_kernel(
-            "gated_delta_net_q4",
-            kernels::GATED_DELTA_NET_Q4_SRC,
-            "gated_delta_net_q4",
+            "gated_delta_net_f16_tree",
+            kernels::GATED_DELTA_NET_F16_TREE_SRC,
+            "gated_delta_net_f16_tree",
         )?;
-        let func = &self.functions["gated_delta_net_q4"];
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut vp = v.buf.as_ptr();
-        let mut gp = gate.buf.as_ptr();
-        let mut bp = beta.buf.as_ptr();
-        let mut sp = s_q4.buf.as_ptr();
-        let mut scp = s_scales.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut scp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_heads as u32, 1, 1],
-                [128, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+
+        let n_tiles = (128 / 4) as u32;
+
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sip = s_init.buf.as_ptr();
+        let stp = s_tape.buf.as_ptr();
+        let pp = parent_indices.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f16_tree_batch_seq",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "gated_delta_net_f16_tree",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr stp,
+                ptr pp, ptr op, i32 nt, i32 nh, i32 hd
+            ],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
+
+    /// Routed FP16-state DeltaNet for independent sessions — the f16
+    /// counterpart of [`Self::gated_delta_net_f32_routed_batch_seq`], with the
+    /// same argument order.
+    ///
+    /// This is where f16 earns its keep. State is per-SEQUENCE, so its footprint
+    /// scales with concurrency, and this is the cross-session batched path: one
+    /// state per session behind `state_ptrs`, so halving each halves the whole
+    /// fleet's resident state.
+    ///
+    /// The pointers in `state_ptrs` must address **f16** buffers — half the f32
+    /// stride. Passing f32 state here reads every element at the wrong offset,
+    /// which is why the state's precision and this kernel are chosen together.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f16_routed_batch_seq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state_ptrs: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        output: &GpuTensor,
+        ptr_layer_stride: usize,
+        delta_layer_index: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_f16_routed_batch_seq",
+            kernels::GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC,
+            "gated_delta_net_f16_routed_batch_seq",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let spp = state_ptrs.buf.as_ptr();
+        let rsp = row_session_indices.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = delta_layer_index as i32;
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f16_routed_batch_seq",
+            bytes,
+        );
+        let n_tiles = (128 / 4) as u32;
+        let result = self.launch_kernargs(
+            "gated_delta_net_f16_routed_batch_seq",
+            [n_heads as u32, n_tiles, n_sessions as u32],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr rsp, ptr op,
+                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd
+            ],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Linear DeltaNet recurrence with the persistent S state stored as f16 —
+    /// the sanctioned half-precision state path.
+    ///
+    /// Drop-in for [`Self::gated_delta_net_f32_batch_seq`] with one difference
+    /// the caller must honour: `state` is `[n_heads × HD × HD]` **f16**, half
+    /// the bytes. Everything else — argument order, output layout, arithmetic
+    /// precision — is identical, because only the storage format changes.
+    ///
+    /// Unlike the Q8 state path this replaces, there is no scales tensor, no
+    /// `s_ef_residual` accumulator and no stochastic rounding, so it is
+    /// deterministic and a spec-decode snapshot restores exactly what it saved.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f16_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        state: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_f16",
+            kernels::GATED_DELTA_NET_F16_SRC,
+            "gated_delta_net_f16",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f16_batch_seq",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "gated_delta_net_f16",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op,
+                i32 nt, i32 nh, i32 hd
+            ],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Gated linear-recurrence scan forward (fp32). `g`,`u`,`h_out`: `[seq*D]`
     /// row-major (time-major: index `t*D+c`). `h[t]=g[t]*h[t-1]+(1-g[t])*u[t]`,
     /// `h[-1]=0`. One thread per channel `c`, sequential over time; no shared mem.

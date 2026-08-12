@@ -52,9 +52,18 @@ impl LlamaConfig {
         // (e.g. the DSpark drafter trainer, which never runs the target forward)
         // can load them as llama. Fused-inference correctness for qk-norm is a
         // separate concern handled by the arch crates, not this fp32 trainer.
-        if !matches!(model_type, "llama" | "qwen2" | "qwen3") {
+        // qwen3.5/3.6 hybrids share this geometry too — hidden/heads/head_dim
+        // mean the same thing there. What differs (linear_attn layers, the
+        // gated q_proj, routed experts) is per-LAYER and handled by
+        // `crate::hybrid`, which probes the artifact rather than this config.
+        // The dense paths in this crate would still be wrong on such a model,
+        // so they must not be pointed at one; the gate below is about geometry
+        // parsing, not about which walk is valid.
+        let hybrid = model_type.starts_with("qwen3_5") || model_type.starts_with("qwen3_next");
+        if !matches!(model_type, "llama" | "qwen2" | "qwen3") && !hybrid {
             return Err(format!(
-                "hipfire-train supports dense llama-family model_type (llama/qwen2/qwen3), got {model_type:?}"
+                "hipfire-train supports dense llama-family model_type \
+                 (llama/qwen2/qwen3) and qwen3.5/3.6 hybrids, got {model_type:?}"
             ));
         }
         // Phase 0 is the plain dense path: reject biases we don't model yet.

@@ -1,0 +1,32 @@
+[package]
+name = "hipfire-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reliable HuggingFace model fetch, verify, and repair. Offline tooling — never linked into the daemon, server, or runtime hot path."
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream",
+    "json",
+    "rustls-tls",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+futures-util = "0.3"
+sha2 = "0.10"
+# Non-LFS files carry a git blob SHA-1 as their `oid`; without this they could
+# only be length-checked.
+sha1 = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+# Chunk tables. See `chunks` for why this is cryptographic where the archive's
+# per-payload hash is not.
+blake3.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+# The fault-injection origin is hand-rolled on std::net; sha2 is needed to
+# compute the digests the tests promise.
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

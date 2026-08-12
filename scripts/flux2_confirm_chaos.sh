@@ -16,7 +16,7 @@ set -euo pipefail
 
 HIPFIRE="${HIPFIRE:-./target/release/hipfire}"
 REF="${REF:-/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq}"
-CAND="${CAND:-/srv/huggingface/FLUX.2-klein-base-4B.oq8.hfq}"
+CAND="${CAND:-/srv/huggingface/FLUX.2-klein-base-4B--oq8.hfq}"
 PROMPT_FILE="${PROMPT_FILE:-benchmarks/prompts/flux2_image_admission_object.txt}"
 SEED="${SEED:-7}"
 STEPS="${STEPS:-4}"

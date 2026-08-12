@@ -13,7 +13,7 @@ encoding.
 ```bash
 cargo run --release -p hipfire-quantize -- \
   --input /srv/huggingface/models--Qwen--Qwen3.5-9B/snapshots/<snapshot> \
-  --output ~/.hipfire/models/Qwen3.5-9B.oq4.hfq \
+  --output ~/.hipfire/models/Qwen3.5-9B--oq4.hfq \
   --format oq4
 ```
 
@@ -26,11 +26,11 @@ The output filename should use the canonical artifact convention:
 Examples:
 
 ```text
-Qwen3.5-9B.oq4.hfq
-Qwen3.5-9B.oq4+.hfq
-Qwen3.5-9B.oq4++.hfq
-Qwen3.5-9B.mq4l.hfq
-Qwen3.5-9B.mq4+.gfx1103.hfq
+Qwen3.5-9B--oq4.hfq
+Qwen3.5-9B--oq4+.hfq
+Qwen3.5-9B--oq4++.hfq
+Qwen3.5-9B--mq4l.hfq
+Qwen3.5-9B--mq4+.gfx1103.hfq
 ```
 
 ## Quant Token Taxonomy
@@ -52,8 +52,8 @@ Quant tokens describe weight encoding only:
   `mq4.5+` or `oq4.25++`.
 
 Do not use `+` for bundled runtime features or sidecars. Encode each feature as
-its own dot group before the quant token, for example `Qwen3.5-9B.mtp.vl.oq4.hfq`
-or `Gemma-4-8B.dflash.triattn.oq4++.gfx1151.hfq`.
+its own dot group before the quant token, for example `Qwen3.5-9B--mtp.vl.oq4.hfq`
+or `Gemma-4-8B--dflash.triattn.oq4++.gfx1151.hfq`.
 
 ## Public Quant Names
 
@@ -143,7 +143,7 @@ The compiled manifest and resident buffer contract are specified in
 ```bash
 cargo run --release -p hipfire-quantize -- \
   --input /srv/huggingface/models--Qwen--Qwen3-Embedding-0.6B/snapshots/<snapshot> \
-  --output ~/.hipfire/models/Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq \
+  --output ~/.hipfire/models/Qwen3-Embedding-0.6B--npu.oq8+.gfx1151.hfq \
   --format oq8+ \
   --npu-embedding \
   --imatrix <Qwen3-Embedding-0.6B.imatrix.gguf>
@@ -164,7 +164,7 @@ For a quality-gated `oq4+` artifact, provide activation calibration inputs:
 ```bash
 cargo run --release -p hipfire-quantize -- \
   --input <source-model> \
-  --output ~/.hipfire/models/<name>.oq4+.hfq \
+  --output ~/.hipfire/models/<name>--oq4+.hfq \
   --format oq4+ \
   --imatrix <model>.imatrix.gguf
 ```
@@ -369,7 +369,7 @@ matched-corpus candidate scoring and promotion evidence.
 ```bash
 cargo run --release -p hipfire-quantize -- \
   --input <source-model> \
-  --output ~/.hipfire/models/<name>.oq4.25++.hfq \
+  --output ~/.hipfire/models/<name>--oq4.25++.hfq \
   --format oq4.25++ \
   --awq \
   --ldlq \
@@ -383,7 +383,7 @@ go after `--`:
 python3 scripts/two_pass_quantize.py \
   --model /srv/huggingface/models--Qwen--Qwen3.5-397B-A17B \
   --calib ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq \
-  --output ~/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq \
+  --output ~/.hipfire/models/Qwen3.5-397B-A17B--oq4.25++.hfq \
   --format oq4.25++ \
   --batch-size 64 \
   --time-tile 32 \
@@ -442,7 +442,7 @@ against the identical teacher signal without reloading the reference model:
 ```bash
 source scripts/lib/kld_daemon.sh
 kld_build_ref \
-  ~/.hipfire/models/qwen3.5-35b-a3b.oq8.hfq \
+  ~/.hipfire/models/qwen3.5-35b-a3b--oq8.hfq \
   benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
   ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/heldout.oq8.kldref \
   32 q8 2048
@@ -458,7 +458,7 @@ python3 scripts/astrea.py expert-sweep-plan \
   --artifact-stem Qwen3.5-35B-A3B \
   --calibration-dataset benchmarks/calib/calib-1m.txt \
   --evaluation-dataset benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-  --reference-model ~/.hipfire/models/qwen3.5-35b-a3b.oq8.hfq \
+  --reference-model ~/.hipfire/models/qwen3.5-35b-a3b--oq8.hfq \
   --reference-kldref ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/heldout.oq8.kldref \
   --output-dir ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum \
   --evaluation-command-template \
@@ -631,5 +631,5 @@ After producing a portable OQ4 artifact, use `hipfire optimize` to pre-pack it
 for a specific GPU architecture (the `repack` alias is still accepted):
 
 ```bash
-hipfire optimize ~/.hipfire/models/Qwen3.5-9B.oq4++.hfq --arch gfx1103
+hipfire optimize ~/.hipfire/models/Qwen3.5-9B--oq4++.hfq --arch gfx1103
 ```

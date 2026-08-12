@@ -307,7 +307,13 @@ fn kill_holder(force: bool) -> anyhow::Result<()> {
 /// pid. Parameterized on `path` for tests.
 fn kill_holder_at(path: &std::path::Path, force: bool) -> anyhow::Result<()> {
     if matches!(hipfire_lock::probe(path), Ok(hipfire_lock::LockState::Free)) {
-        eprintln!("[gpu-lock] free — nothing to kill");
+        // Free flock but a record left behind: that is the state that wedges
+        // the daemon while `status` cheerfully reports "gpu is free".
+        if read_holder(path).is_some() && clear_stale_holder(path) {
+            eprintln!("[gpu-lock] free — cleared a stale holder record");
+        } else {
+            eprintln!("[gpu-lock] free — nothing to kill");
+        }
         return Ok(());
     }
     let Some(pid) = read_holder_pid(path) else {
@@ -317,9 +323,17 @@ fn kill_holder_at(path: &std::path::Path, force: bool) -> anyhow::Result<()> {
         return Ok(());
     };
     if !pid_alive(pid) {
-        eprintln!(
-            "[gpu-lock] recorded holder pid {pid} is already gone; the lock will free itself"
-        );
+        // The flock frees itself, but the RECORD does not — clear it here so
+        // the daemon's acquire path stops honouring a dead holder.
+        if clear_stale_holder(path) {
+            eprintln!(
+                "[gpu-lock] recorded holder pid {pid} is already gone; cleared the stale record"
+            );
+        } else {
+            eprintln!(
+                "[gpu-lock] recorded holder pid {pid} is already gone; the lock will free itself"
+            );
+        }
         return Ok(());
     }
     let holder = read_holder(path).unwrap_or_default();
@@ -507,6 +521,35 @@ fn status_line() -> String {
     }
 }
 
+/// Clear a STALE holder record — the line survives its writer.
+///
+/// `flock(2)` dies with the process that held it, but the lockfile's contents
+/// do not: a `lock run` holder that is killed leaves its `label ... holder=<pid>
+/// ... mode=run` line behind. `probe` then reports Free (the flock really is
+/// free) while every consumer that reads the LINE — notably the daemon's
+/// acquire path — still sees a holder and refuses to load. `release`, `release
+/// <label>` and `kill` all tested whether the lock was HELD, so none of them
+/// cleared it, and the only recovery was editing the file by hand.
+///
+/// Takes the flock NON-BLOCKING first: if anyone actually holds it we lose the
+/// race and leave their record strictly alone, so this can only ever remove a
+/// line whose writer is gone.
+fn clear_stale_holder(path: &std::path::Path) -> bool {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is owned by `file` and live for the duration of both calls.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false; // someone holds it now — the record is not stale
+    }
+    let cleared = file.set_len(0).is_ok();
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    cleared
+}
+
 fn read_holder(path: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let line = s.lines().next()?.trim().to_string();
@@ -673,6 +716,50 @@ mod tests {
         let path = temp_lock("kill-free");
         assert!(kill_holder_at(&path, false).is_ok());
         assert!(kill_holder_at(&path, true).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn kill_clears_a_stale_record_left_by_a_dead_holder() {
+        // The regression this exists for: `flock(2)` dies with its holder but
+        // the lockfile CONTENTS do not. probe() then says Free while the
+        // daemon's acquire path still reads the line and refuses to load, and
+        // release/kill both no-op'd because they tested "is it HELD".
+        let path = temp_lock("kill-stale-record");
+        {
+            let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+            assert!(guard.try_lock().unwrap());
+            guard
+                .write_holder("ghost host=h acquired_epoch=1 holder=2147483646 mode=run")
+                .unwrap();
+        } // guard dropped: flock released, record still on disk
+        assert!(matches!(
+            hipfire_lock::probe(&path),
+            Ok(hipfire_lock::LockState::Free)
+        ));
+        assert!(
+            read_holder(&path).is_some(),
+            "record should survive the flock"
+        );
+        assert!(kill_holder_at(&path, false).is_ok());
+        assert!(
+            read_holder(&path).is_none(),
+            "kill must clear a record whose writer is gone"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn clear_stale_holder_refuses_while_someone_holds_the_lock() {
+        // The safety property: a live holder's record is never touched, so this
+        // can only ever remove a line whose writer is gone.
+        let path = temp_lock("clear-live");
+        let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(guard.try_lock().unwrap());
+        guard.write_holder("live host=h holder=1 mode=run").unwrap();
+        assert!(!clear_stale_holder(&path), "must not clear a held lock");
+        assert!(read_holder(&path).is_some());
+        drop(guard);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

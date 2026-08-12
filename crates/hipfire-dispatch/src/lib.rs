@@ -23,6 +23,7 @@
 
 pub mod context;
 pub mod families;
+pub mod moe_telemetry;
 pub mod pipeline;
 pub mod resource;
 pub mod tables;

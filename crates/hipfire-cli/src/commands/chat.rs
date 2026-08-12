@@ -209,7 +209,12 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 
     let bin = find_daemon_bin_or_error()?;
 
-    let mut engine = DaemonEngine::spawn(&bin).await?;
+    // Share the machine's daemon when one is listening. Only one daemon may hold
+    // the `daemon.pid` flock, so spawning here used to fail outright whenever
+    // `hipfire serve` was already up; attaching also reuses whatever model that
+    // daemon has resident instead of loading a second copy. Falls back to
+    // spawning a private daemon when nothing is listening.
+    let mut engine = DaemonEngine::attach_or_spawn(&bin).await?;
 
     let model_path_str = model_path.to_string_lossy().into_owned();
     let load = engine.load(&model_path_str, load_params_from_config(&config));

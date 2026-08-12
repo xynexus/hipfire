@@ -548,6 +548,18 @@ fn load_norm_weight_raw(
                 f32::from_bits((bits as u32) << 16)
             })
             .collect(),
+        // A lossless recoding left packed by HIPFIRE_BF16L3_RESIDENT. Decode
+        // rather than panic — residency is global, so enabling it for a LUT3
+        // lm_head leaves every bf16 tensor here packed too.
+        qt @ (49 | 50) => {
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = hipfire_runtime::hfq::decode_bf16_packed(qt, &data, n)
+                .unwrap_or_else(|| panic!("dots-ocr: failed to decode recoded {name}"));
+            logical
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
         qt => panic!("dots-ocr: expected F16/F32/BF16 for norm {name}, got qt={qt}"),
     };
     assert_eq!(

@@ -1,0 +1,13 @@
+[package]
+name = "hipfire-hfq-tooling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline HFQ compose/decompose and sidecar packaging tooling"
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
+serde.workspace = true
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"

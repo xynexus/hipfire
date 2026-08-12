@@ -18,6 +18,10 @@ pub enum DType {
     F32,
     F16,
     BF16,
+    /// BF16L3: lossless 3-bit-LUT exponent coding, ~11.6 bits/element, decoded
+    /// in-kernel so the ratio applies to bandwidth. Byte length is NOT a stride
+    /// — see `hipfire_primitives::bf16_lut3` for the plane layout.
+    Bf16L3,
     Q4K,       // 144 bytes per 256 elements
     Q6K,       // 210 bytes per 256 elements
     Q8_0,      // 34 bytes per 32 elements
@@ -36,6 +40,11 @@ pub enum DType {
     Qtip3G256, // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
     // packed symbols). Decoded by gemv_qtip3g256 (computed 1MAD codebook, zero LDS); runtime
     // FWHT-rotates x like MQ3/MQ4. See kernels/src/gemv_qtip3g256.hip / qtip.rs.
+    Qtip3G256I3, // QTIP-3 with the 3INST codebook (100 bytes/group, identical layout to
+    // Qtip3G256). Only the computed state->value map differs: 3INST (excess kurtosis -0.111)
+    // vs 1MAD (-0.312), i.e. closer to the Gaussian the rotated weights follow. A separate
+    // DType because the codebook is part of the wire format -- decoding one as the other
+    // produces noise while every structural check passes. See gemv_qtip3g256i3.hip.
     Qtip4G256, // QTIP-4: FWHT-rotated trellis-coded 4-bit (132 bytes/group: f32 scale + 128 B
     // nibble-packed symbols). Same 1MAD codebook/12-bit trellis as Qtip3G256, decoded by
     // gemv_qtip4g256. See kernels/src/gemv_qtip4g256.hip / qtip::pack_qtip4_group.
@@ -59,6 +68,39 @@ pub enum DType {
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
     Oq8G256, // Opus Quant W8A8: symmetric signed-INT8, FWHT-rotated, per-group f32 scale (iu8 WMMA).
+    // Opus Quant W8A8, compact-resident: the on-disk OqPlusCompact (qt=36) blocks
+    // kept as-is on device instead of expanded to one int8 per weight at load.
+    //   [f16 scale | 128 packed signed-int4 | N_out * (u8 idx, i8 val)]
+    //   block_stride = 130 + 2*N_out, one block per (row, 256-group)
+    // FWHT-rotated like Oq8G256 and consumed by the same W8A8 math — the kernel
+    // decodes the nibbles and applies the overlay per tile — but the byte layout
+    // is block-structured with an in-block f16 scale rather than a flat int8
+    // plane plus a split f32 scale plane, so it must be a distinct dtype for the
+    // same reason the DflashOq*Plain variants are: a loader or GEMM that treated
+    // it as Oq8G256 would read 4-bit data as 8-bit and silently produce garbage.
+    // `block_stride` is not carried here — it is derivable as
+    // `bytes / (M * K/256)` at the call site.
+    OqCompactG256,
+    // Same block structure as OqCompactG256 at a 128-element group: header is
+    // `2 + 128/2` = 66 bytes rather than 130, and `block_stride` derives as
+    // `bytes / (M * K/128)`. Distinct dtype rather than a parameter because the
+    // group also selects the FWHT length (128-point, sign seeds 43/1043, the
+    // one MQ4G128 already uses) — reading it as G256 would rotate by the wrong
+    // transform. It exists for COVERAGE of models whose K is a multiple of 128
+    // but not 256, not to beat G=256 on size; see
+    // docs/experiments/2026-08-06-oq-compact-group-size.md.
+    OqCompactG128,
+    // DFLASH plain-basis Opus storage. These variants preserve the arch-20
+    // sidecar's original interleaved blocks on device:
+    //   Oq8Plain        [f16 scale | 256 i8]                       (258 B)
+    //   Oq4Plain        [f16 scale | 128 packed signed nibbles]    (130 B)
+    //   Oq4MixedPlain   Oq4Plain + (u8 position, i8 replacement)*N
+    // They are deliberately distinct from Oq{4,8}G256: those primary-model
+    // formats are FWHT-rotated and use split f32 scales. Treating these as the
+    // same dtype would silently rotate DFLASH activations into the wrong basis.
+    DflashOq8Plain,
+    DflashOq4Plain,
+    DflashOq4MixedPlain,
     // On-disk storage is [f16 scale][128 nibbles]/256-group (130 B/group, codec
     // `quantize_oq4g256`). The loader repacks to the kernel layout: packed nibbles
     // [M,K/2] followed by per-group f32 scales [M,K/256] in one buffer. The forward
@@ -95,6 +137,7 @@ impl DType {
             | DType::MQ8G256
             | DType::MQ3G256
             | DType::Qtip3G256
+            | DType::Qtip3G256I3
             | DType::Qtip4G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd
@@ -104,8 +147,21 @@ impl DType {
             | DType::MFP4G32
             | DType::ParoQ4G128
             | DType::Oq4G256
+            | DType::DflashOq8Plain
+            | DType::DflashOq4Plain
+            | DType::DflashOq4MixedPlain
             | DType::W8A8Ref
             | DType::Oq8G256
+            // OqCompactG256 is block-structured with a variable-width overlay
+            // table, so like Bf16L3 it has no per-element stride: a length is
+            // `M * (K/256) * (130 + 2*N_out)`, never `n * size()`.
+            | DType::OqCompactG256
+            | DType::OqCompactG128
+            // BF16L3's payload is planar with a variable escape plane, so
+            // there is no per-element stride at all — byte-level, like Raw.
+            // Anything computing a length as `n * size()` is wrong for it and
+            // must use the format's own layout.
+            | DType::Bf16L3
             | DType::Raw => 1, // byte-level
         }
     }
@@ -182,6 +238,18 @@ impl DType {
                 // int8); same AWQ contract — the forward divides x by the sidecar
                 // before FWHT+int8-quantize. (Real W8A8 Oq8 has no sidecar → no-op.)
                 | DType::Oq8G256
+                // QTIP-3 trellis: the pack applies W*s before the FWHT exactly as
+                // the Opus arms do, so the forward must divide x by the sidecar to
+                // complete (W*s).(x/s) = W.x. Without this arm the quantizer would
+                // emit awq_scale sidecars that nothing attaches — weights smoothed
+                // on one side only, which is worse than no AWQ at all.
+                | DType::Qtip3G256
+                // Same contract as Qtip3G256 — the 3INST codebook changes the
+                // decoded VALUES, not whether the weights were AWQ-smoothed.
+                // Omitting this arm left the sidecar unattached on qtip3+ I3
+                // artifacts: W*s served against un-divided x, which scored KLD
+                // 8.27 while the non-AWQ path scored 1.61.
+                | DType::Qtip3G256I3
         )
     }
 }

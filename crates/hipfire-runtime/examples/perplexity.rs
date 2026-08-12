@@ -264,7 +264,19 @@ fn main() {
     );
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("config");
+    // Dense LLaMA/Mistral (arch 0) and plain Qwen3/Qwen2 (1) run the
+    // runtime-hosted llama forward; everything else goes through qwen35. Without
+    // this the qwen35 loader ran unconditionally and a llama model died on
+    // `layers.0.self_attn.q_norm.weight`, a tensor it does not have.
+    let is_llama = matches!(hfq.arch_id, 0 | 1);
+    let qcfg = (!is_llama).then(|| qwen35::config_from_hfq(&hfq).expect("qwen35 config"));
+    let lcfg = is_llama.then(|| hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config"));
+    // The KV cache is arch-agnostic; only these three dims are needed to build it.
+    let (kv_layers, kv_heads, kv_head_dim) = match (&qcfg, &lcfg) {
+        (Some(c), _) => (c.n_layers, c.n_kv_heads, c.head_dim),
+        (_, Some(c)) => (c.n_layers, c.n_kv_heads, c.head_dim),
+        _ => unreachable!("exactly one config is built"),
+    };
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
 
@@ -292,120 +304,94 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
     eprintln!("Loading weights from {model_path}...");
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
+    let qweights = qcfg
+        .as_ref()
+        .map(|c| qwen35::load_weights(&mut hfq, c, &mut gpu).expect("load_weights"));
+    let lweights = lcfg.as_ref().map(|c| {
+        hipfire_runtime::hfq::load_weights_hfq(&hfq, c, &mut gpu).expect("llama load_weights")
+    });
 
     let kv_max = window.len() + 16;
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         // fp32 KV — the substrate for the KVarN sim (HIPFIRE_KVARN_SIM=1
         // degrades K in-place per GROUP; plain f32 is the lossless baseline).
-        "f32" | "fp16" => KvCache::new_gpu(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
+        "f32" | "fp16" => {
+            KvCache::new_gpu(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
+        "q8" => KvCache::new_gpu_q8(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap(),
+        "asym4" => {
+            KvCache::new_gpu_asym4(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
         "kvarn" => KvCache::new_gpu_kvarn(
             &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
+            kv_layers,
+            kv_heads,
+            kv_head_dim,
             kv_max,
             KvCache::kvarn_bits_from_env(),
         )
         .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
+        "asym3" => {
+            KvCache::new_gpu_asym3(&mut gpu, kv_layers, kv_heads, kv_head_dim, kv_max).unwrap()
+        }
         "asym2" => {
-            let is_kv_layer: Vec<bool> = config
+            let is_kv_layer: Vec<bool> = qcfg
+                .as_ref()
+                .expect("this KV mode needs qwen35 layer_types; not available for llama")
                 .layer_types
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_asym2_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_asym2_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht4" => {
-            let is_kv_layer: Vec<bool> = config
+            let is_kv_layer: Vec<bool> = qcfg
+                .as_ref()
+                .expect("this KV mode needs qwen35 layer_types; not available for llama")
                 .layer_types
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht4_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht4_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht3" => {
-            let is_kv_layer: Vec<bool> = config
+            let is_kv_layer: Vec<bool> = qcfg
+                .as_ref()
+                .expect("this KV mode needs qwen35 layer_types; not available for llama")
                 .layer_types
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht3_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         "fwht2" => {
-            let is_kv_layer: Vec<bool> = config
+            let is_kv_layer: Vec<bool> = qcfg
+                .as_ref()
+                .expect("this KV mode needs qwen35 layer_types; not available for llama")
                 .layer_types
                 .iter()
                 .map(|t| *t == qwen35::LayerType::FullAttention)
                 .collect();
-            KvCache::new_gpu_fwht2_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap()
+            KvCache::new_gpu_fwht2_filtered(&mut gpu, &is_kv_layer, kv_heads, kv_head_dim, kv_max)
+                .unwrap()
         }
         other => {
             panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)")
         }
     };
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
+    let mut dn_state = qcfg
+        .as_ref()
+        .map(|c| DeltaNetState::new(&mut gpu, c).unwrap());
+    let qscratch = qcfg
+        .as_ref()
+        .map(|c| Qwen35Scratch::new(&mut gpu, c, 64).unwrap());
+    let lscratch = lcfg
+        .as_ref()
+        .map(|c| hipfire_runtime::llama::ForwardScratch::new(&mut gpu, c).unwrap());
 
     let mut total_nll: f64 = 0.0;
     let mut scored: usize = 0;
@@ -419,17 +405,39 @@ fn main() {
     let mut kld_scored: usize = 0;
 
     for (pos, &tok) in window.iter().enumerate().take(window.len() - 1) {
-        qwen35::forward_scratch(
-            &mut gpu,
-            &weights,
-            &config,
-            tok,
-            pos,
-            &mut kv_cache,
-            &mut dn_state,
-            &scratch,
-        )
-        .expect("forward");
+        // Same shape either way: run the arch's decode step, then read the
+        // logits it left in its scratch. Everything downstream — NLL, KLD,
+        // --dump-ref — is arch-agnostic and untouched.
+        if is_llama {
+            let c = lcfg.as_ref().unwrap();
+            hipfire_runtime::llama::forward_scratch(
+                &mut gpu,
+                lweights.as_ref().unwrap(),
+                c,
+                tok,
+                pos,
+                &mut kv_cache,
+                lscratch.as_ref().unwrap(),
+                0.0, // greedy: the sampled token is discarded, only logits matter
+                1.0,
+                0,
+                0,
+                1.0,
+            )
+            .expect("llama forward");
+        } else {
+            qwen35::forward_scratch(
+                &mut gpu,
+                qweights.as_ref().unwrap(),
+                qcfg.as_ref().unwrap(),
+                tok,
+                pos,
+                &mut kv_cache,
+                dn_state.as_mut().unwrap(),
+                qscratch.as_ref().unwrap(),
+            )
+            .expect("forward");
+        }
 
         // KVarN KV sim (HIPFIRE_KVARN_SIM=1): when a GROUP of K finishes, degrade
         // those tokens' K in-place through Sinkhorn variance-norm + 4-bit + dequant
@@ -443,8 +451,8 @@ fn main() {
                 &kv_cache,
                 start,
                 KVARN_GROUP,
-                config.n_kv_heads,
-                config.head_dim,
+                kv_heads,
+                kv_head_dim,
             );
         }
 
@@ -452,7 +460,13 @@ fn main() {
             continue;
         }
 
-        let logits = gpu.download_f32(&scratch.logits).unwrap();
+        let logits = if is_llama {
+            gpu.download_f32(&lscratch.as_ref().unwrap().logits)
+                .unwrap()
+        } else {
+            gpu.download_f32(&qscratch.as_ref().unwrap().logits)
+                .unwrap()
+        };
         let target = window[pos + 1] as usize;
         // NLL via the shared hipfire_kld reduction: log_z is the same max-shifted
         // fp64 log-sum-exp the daemon's scorer uses, so `lz - logit[target]` is

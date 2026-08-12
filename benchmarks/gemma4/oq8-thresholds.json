@@ -3,7 +3,7 @@
   "scope": "Gemma 4 OQ8 full-model comparisons against the pinned Transformers BF16 oracle",
   "contract_revision": "The first valid exact-prompt OQ8 base-short measurement was adopted as the Phase 5 baseline by explicit plan revision after it was observed.",
   "candidate": {
-    "artifact": "Gemma-4-31B.oq8.hfq",
+    "artifact": "Gemma-4-31B--oq8.hfq",
     "quantization_hash": "705685e2d7993d57",
     "source_checkpoint": "google/gemma-4-31B",
     "source_revision": "02e15e4990e8c452f8543fb26beff15b1daf8f3d",

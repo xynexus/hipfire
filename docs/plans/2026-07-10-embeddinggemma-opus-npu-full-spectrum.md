@@ -179,16 +179,16 @@ crosses back to GPU.
 At minimum test these local artifacts under
 `~/.hipfire/models/embeddinggemma-300m/`:
 
-- `EmbeddingGemma-300M.oq4.hfq`
-- `EmbeddingGemma-300M.oq4+.hfq`
-- `EmbeddingGemma-300M.oq4++.hfq`
-- `EmbeddingGemma-300M.oq4.25.hfq`
-- `EmbeddingGemma-300M.oq4.25+.hfq`
-- `EmbeddingGemma-300M.oq4.25++.hfq`
-- `EmbeddingGemma-300M.oq4.5.hfq`
-- `EmbeddingGemma-300M.oq8.hfq`
-- `EmbeddingGemma-300M.oq8+.hfq`
-- `EmbeddingGemma-300M.oq8++.hfq`
+- `EmbeddingGemma-300M--oq4.hfq`
+- `EmbeddingGemma-300M--oq4+.hfq`
+- `EmbeddingGemma-300M--oq4++.hfq`
+- `EmbeddingGemma-300M--oq4.25.hfq`
+- `EmbeddingGemma-300M--oq4.25+.hfq`
+- `EmbeddingGemma-300M--oq4.25++.hfq`
+- `EmbeddingGemma-300M--oq4.5.hfq`
+- `EmbeddingGemma-300M--oq8.hfq`
+- `EmbeddingGemma-300M--oq8+.hfq`
+- `EmbeddingGemma-300M--oq8++.hfq`
 - joint-scale and Dense/tail promotion candidates already in that directory.
 
 Also generate/test at least one lower and one higher arbitrary mixed point, for
@@ -641,7 +641,7 @@ length. Its LDLQ path extends the logical Hessian with zero-covariance padded
 coordinates before the block FWHT. This removes the previous Q8 fallback for
 EmbeddingGemma's `[768,1152]` down projection across OQ4, OQ8, arbitrary mixed
 OQ, and their `+`/`++` recipes. A generated
-`EmbeddingGemma-300M.npu.oq4.hfq` therefore carries qt=34 for all 24 gate, up,
+`EmbeddingGemma-300M--npu.oq4.hfq` therefore carries qt=34 for all 24 gate, up,
 and down matrices; generated artifacts remain under `~/.hipfire`.
 
 That artifact selected the complete resident FFN in a real M=256 hybrid model
@@ -1933,10 +1933,10 @@ Locked M256 hardware checks now report `completed_resident_layer=true` for:
 
 | artifact | source family | BF16 cosine | hybrid input tok/s |
 |---|---|---:|---:|
-| `EmbeddingGemma-300M.npu.oq4.hfq` | native OQ4 | 0.92998326 | 265.0 |
-| `EmbeddingGemma-300M.npu.oq4.125.hfq` | compact mixed | 0.92795205 | 288.6 |
-| `EmbeddingGemma-300M.npu.oq6.5.hfq` | compact mixed | 0.95893502 | 270.0 |
-| `EmbeddingGemma-300M.npu.oq8+.hfq` | calibrated OQ8+ | 0.99834824 | 268.4 |
+| `EmbeddingGemma-300M--npu.oq4.hfq` | native OQ4 | 0.92998326 | 265.0 |
+| `EmbeddingGemma-300M--npu.oq4.125.hfq` | compact mixed | 0.92795205 | 288.6 |
+| `EmbeddingGemma-300M--npu.oq6.5.hfq` | compact mixed | 0.95893502 | 270.0 |
+| `EmbeddingGemma-300M--npu.oq8+.hfq` | calibrated OQ8+ | 0.99834824 | 268.4 |
 
 The established OQ8++ result remains the `++` proof at `0.99818283`. Existing
 non-`npu` OQ4+/OQ4++/OQ4.25++ artifacts keep their down projections in a
@@ -1950,9 +1950,9 @@ The canonical suffix artifacts were subsequently generated from BF16 with the
 unified `EmbeddingGemma-300M.calib.hfq` package. Both keep the Dense heads F16
 while quantizing all 168 backbone projections:
 
-- `EmbeddingGemma-300M.npu.oq4+.hfq` uses AWQ/clip-search calibration and
+- `EmbeddingGemma-300M--npu.oq4+.hfq` uses AWQ/clip-search calibration and
   reaches the completed resident layer at `0.97610980` BF16 cosine;
-- `EmbeddingGemma-300M.npu.oq4++.hfq` reports 168/168 successful LDLQ packs,
+- `EmbeddingGemma-300M--npu.oq4++.hfq` reports 168/168 successful LDLQ packs,
   reaches the completed resident layer, and measures `0.97711462` BF16 cosine.
 
 These close the `+`/`++` execution matrix but still fail the quality target.

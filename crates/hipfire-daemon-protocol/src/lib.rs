@@ -396,6 +396,19 @@ pub enum DaemonRequest {
     #[serde(alias = "list_workers")]
     WorkerStatus,
     ResourceStatus,
+    /// What the daemon's scheduler has actually done: totals, queue depth, and how
+    /// often priority changed the outcome. Distinct from `ResourceStatus`, which
+    /// reports memory rather than work.
+    SchedulerStatus,
+    /// Set the daemon's memory budgets at runtime and re-apply the ballast
+    /// reservation. Answers with the same payload as [`DaemonRequest::ResourceStatus`].
+    ///
+    /// These are the only startup settings that can be revised after exec: device
+    /// selection and the resource-lock settings are consumed before HIP init and
+    /// before the process takes its flocks, so they describe locks already held.
+    /// A caller attaching to a running daemon pushes budgets with this and accepts
+    /// the daemon's locks as given.
+    SetResourceBudget(SetResourceBudgetRequest),
     UnloadWorker,
     PflashLabels(PflashLabelsRequest),
     TrainDrafter,
@@ -403,9 +416,30 @@ pub enum DaemonRequest {
     /// mirrors `TrainDrafter`. Terminal event is the shared `train_done`
     /// ([`DaemonResponse::TrainDone`]).
     TrainLora,
+    /// Wire tag `calibrate`. Raw-JSON op (the daemon re-parses the message into
+    /// the same `CalibrateCommand` the CLI parses); mirrors `TrainLora`. Runs one
+    /// calibration layer per request and parks the `DaemonCalibration` session
+    /// keyed by `run_id` between turns. Non-terminal reply is `calibrate_progress`;
+    /// terminal is `calibrate_done` (or `calibrate_paused` at a
+    /// `--pause-after-layers` boundary). The caller re-enqueues until terminal.
+    Calibrate,
     Diag,
     BenchPrefill(BenchPrefillRequest),
     Profile,
+}
+
+/// Runtime memory-budget update. Every field is optional; an omitted field leaves
+/// that budget unchanged, so a caller can adjust one without restating the rest.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SetResourceBudgetRequest {
+    #[serde(default)]
+    pub system_memory_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub system_memory_headroom_bytes: Option<u64>,
+    #[serde(default)]
+    pub vram_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub vram_headroom_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +486,7 @@ pub enum DaemonResponse {
     },
     WorkerStatus(serde_json::Value),
     ResourceStatus(serde_json::Value),
+    SchedulerStatus(serde_json::Value),
     UnloadWorkerDone(serde_json::Value),
     GenerateBatchPrefillReady {
         #[serde(flatten)]

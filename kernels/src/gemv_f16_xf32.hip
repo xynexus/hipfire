@@ -26,21 +26,21 @@ extern "C" __global__ void gemv_f16_xf32(
     float*          __restrict__ y,   // [M] F32
     int M, int K
 ) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
     const int tid = threadIdx.x;
-
-    const _Float16* w_row = W + (size_t)row * K;
-
-    float sum = 0.0f;
-    // Each warp lane strides by 32 across the K dim.
-    for (int i = tid; i < K; i += 32) {
-        sum += (float)w_row[i] * x[i];
+    // Grid-strided over rows: a capped grid (e.g. min(M, 8192)) avoids dispatching
+    // one workgroup per row at huge M (lm_head, 262k rows) where the command
+    // processor dominates. Backward-compatible: grid=[M] ⇒ one row per block.
+    for (int row = blockIdx.x; row < M; row += gridDim.x) {
+        const _Float16* w_row = W + (size_t)row * K;
+        float sum = 0.0f;
+        // Each warp lane strides by 32 across the K dim.
+        for (int i = tid; i < K; i += 32) {
+            sum += (float)w_row[i] * x[i];
+        }
+        // Wave-shuffle reduction (wave32).
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down(sum, offset);
+        }
+        if (tid == 0) y[row] = sum;
     }
-
-    // Wave-shuffle reduction (wave32).
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down(sum, offset);
-    }
-    if (tid == 0) y[row] = sum;
 }

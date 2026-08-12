@@ -139,6 +139,7 @@ fn main() {
         n_kv_heads,
         head_dim,
         n_rot,
+        false,
         rope_theta,
         p_q,
         seq_len,
@@ -242,5 +243,63 @@ fn main() {
 
     assert!(r > 0.9999, "ranking correlation too low: {r}");
     assert!(max_rel < 5e-3, "max relative delta too high: {max_rel}");
-    eprintln!("✅ parity within tolerance");
+    eprintln!("✅ interleaved parity within tolerance");
+
+    // Gemma 4 and Qwen use HF rotate_half, where each complex band is
+    // `[f, f + head_dim/2]` rather than adjacent dimensions. Exercise the
+    // same packed Q8 reader with that convention as an independent parity
+    // case; this catches layout bugs that kernel compilation alone cannot.
+    gpu.triattn_score_q8(
+        &k_cache,
+        &centers_dev,
+        &scores_gpu,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_rot,
+        true,
+        rope_theta,
+        p_q,
+        seq_len,
+    )
+    .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let half_split_gpu = gpu.download_f32(&scores_gpu).unwrap();
+    let mut half_split_cpu = vec![0.0f32; n_heads * seq_len];
+    for h in 0..n_heads {
+        let h_kv = h / kv_group;
+        let base = h * centers.n_bands();
+        let c_slice = &centers.centers[base..base + centers.n_bands()];
+        for pos in 0..seq_len {
+            let pos_base = pos * bytes_per_pos + h_kv * blocks_per_head * 34;
+            let mut k_dequant = vec![0.0f32; head_dim];
+            for b in 0..blocks_per_head {
+                let blk = &k_cache_bytes[pos_base + b * 34..pos_base + (b + 1) * 34];
+                let scale = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for i in 0..32 {
+                    k_dequant[b * 32 + i] = scale * blk[2 + i] as i8 as f32;
+                }
+            }
+            let bands = triattn::kpost_per_band_with_convention(&k_dequant, true);
+            half_split_cpu[h * seq_len + pos] =
+                triattn::s_total(c_slice, &bands, p_q, |f| centers.omega(f));
+        }
+    }
+    let half_split_r = triattn::pearson(&half_split_cpu, &half_split_gpu);
+    let half_split_max_rel = half_split_cpu
+        .iter()
+        .zip(&half_split_gpu)
+        .map(|(&cpu, &gpu)| (cpu - gpu).abs() / cpu.abs().max(gpu.abs()).max(1e-6))
+        .fold(0.0f32, f32::max);
+    eprintln!("half-split Pearson r = {half_split_r:.6}");
+    eprintln!("half-split max rel = {half_split_max_rel:.2e}");
+    assert!(
+        half_split_r > 0.9999,
+        "half-split ranking correlation too low: {half_split_r}"
+    );
+    assert!(
+        half_split_max_rel < 5e-3,
+        "half-split max relative delta too high: {half_split_max_rel}"
+    );
+    eprintln!("✅ half-split parity within tolerance");
 }

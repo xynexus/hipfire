@@ -41,6 +41,7 @@ fn main() {
             polls += 1;
         }
         k.wait_inflight(f).expect("wait");
+        k.sync_output(&c1).expect("sync c1"); // async path: caller invalidates output
         let r1 = c0(&c1);
         println!("[1] submit/poll/wait: polls-before-done={polls}  C[0]={r1} (expect {expect})");
         assert_eq!(r1, expect, "async single-dispatch result wrong");
@@ -67,6 +68,8 @@ fn main() {
         assert_eq!((f2.tag(), f3.tag()), (101, 202), "tags not preserved");
         k.wait_inflight(f2).expect("wait c2");
         k.wait_inflight(f3).expect("wait c3");
+        k.sync_output(&c2).expect("sync c2");
+        k.sync_output(&c3).expect("sync c3");
         let (r2, r3) = (c0(&c2), c0(&c3));
         println!("    C2[0]={r2}  C3[0]={r3} (expect {expect} each)");
         assert!(

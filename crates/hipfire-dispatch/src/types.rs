@@ -111,12 +111,14 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 => RotationPlan::FwhtG256,
         // Opus W4A4: weights are offline FWHT-256-rotated; the pipeline rotates x
         // to match (RmsnormAutomatic → x_rot), then the Oq4 Gemv arm int4-quantizes
         // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
-        Oq4G256 | Oq8G256 => RotationPlan::FwhtG256,
+        Oq4G256 | Oq8G256 | OqCompactG256 => RotationPlan::FwhtG256,
+        // G=128 must use the 128-point FWHT (sign seeds 43/1043), like MQ4G128.
+        OqCompactG128 => RotationPlan::FwhtG128,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -131,10 +133,9 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256 => {
-            GemvVariant::Prerotated
-        }
+        MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256
+        | OqCompactG256 | OqCompactG128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -183,6 +184,13 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
 pub enum KernelKey {
     // GEMV plain
     GemvF32,
+    /// BF16 weight x F32 activation. See `gemv_bf16_xf32.hip`: bf16 has no
+    /// same-precision-activation entry on purpose — rounding x costs
+    /// rel rms 3.4e-4 and buys nothing, x being K elements against M x K.
+    GemvBf16,
+    /// BF16L3 weight x F32 activation. Lossless packed bf16 — see
+    /// `gemv_bf16l3_xf32.hip`. Requires K % 256 == 0.
+    GemvBf16L3,
     GemvF16,
     GemvQ8_0,
     GemvQ4K,
@@ -214,6 +222,8 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq3G256Prerotated,
     GemvQtip3G256Prerotated,
+    /// 3INST-codebook sibling of [`Self::GemvQtip3G256Prerotated`].
+    GemvQtip3G256I3Prerotated,
     GemvQtip4G256Prerotated,
     GemvMq2G256Prerotated,
     GemvMq6G256Prerotated,
@@ -225,6 +235,10 @@ pub enum KernelKey {
     // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
     // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
     GemvOq8G256Prerotated,
+    /// Compact-resident Opus W8A8: same math as [`Self::GemvOq8G256Prerotated`]
+    /// but the weight is on-disk OqPlusCompact blocks decoded in-kernel.
+    GemvOqCompactG256Prerotated,
+    GemvOqCompactG128Prerotated,
     // Opus Quant W4A16 decode — prerotated f32 activation × int4 grouped weight.
     // x arrives FWHT-rotated; launch dispatches the dense gemv_oq4_grouped (no
     // activation quant at B=1, mirroring the OQ8 prerotated arm).
@@ -236,6 +250,7 @@ pub enum KernelKey {
     GemvMq4G256Residual,
     GemvMq3G256Residual,
     GemvQtip3G256Residual,
+    GemvQtip3G256I3Residual,
     GemvQtip4G256Residual,
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
@@ -247,6 +262,7 @@ pub enum KernelKey {
     GemvMq4G256SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
     GemvQtip3G256SwiGLUResidual,
+    GemvQtip3G256I3SwiGLUResidual,
     GemvQtip4G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
@@ -554,6 +570,8 @@ impl KernelKey {
         use GemvVariant::*;
         match (dtype, variant) {
             (F32, Plain) => Ok(Self::GemvF32),
+            (BF16, Plain) => Ok(Self::GemvBf16),
+            (Bf16L3, Plain) => Ok(Self::GemvBf16L3),
             (F16, Plain) => Ok(Self::GemvF16),
             (Q8_0, Plain) => Ok(Self::GemvQ8_0),
             (Q4K, Plain) => Ok(Self::GemvQ4K),
@@ -595,6 +613,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             Qtip3G256 => Ok(Self::GemvQtip3G256Prerotated),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3Prerotated),
             Qtip4G256 => Ok(Self::GemvQtip4G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
@@ -604,6 +623,8 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
             Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
+            OqCompactG256 => Ok(Self::GemvOqCompactG256Prerotated),
+            OqCompactG128 => Ok(Self::GemvOqCompactG128Prerotated),
             Oq4G256 => Ok(Self::GemvOq4G256Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
@@ -642,6 +663,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
             Qtip3G256 => Ok(Self::GemvQtip3G256Residual),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3Residual),
             Qtip4G256 => Ok(Self::GemvQtip4G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
@@ -664,6 +686,7 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
             Qtip3G256 => Ok(Self::GemvQtip3G256SwiGLUResidual),
+            Qtip3G256I3 => Ok(Self::GemvQtip3G256I3SwiGLUResidual),
             Qtip4G256 => Ok(Self::GemvQtip4G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
@@ -681,7 +704,11 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            // Bf16L3 decodes with shifts, byte loads and a wave prefix sum —
+            // no ISA-specific intrinsics, so it runs anywhere BF16 does.
+            F32 | F16 | BF16 | Bf16L3 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => {
+                ArchPredicate::Always
+            }
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)
@@ -700,15 +727,19 @@ impl KernelKey {
             MQ3G256 => ArchPredicate::HasWmma,
             // QTIP-3/4 decode is pure integer hash + fp mul-add (no WMMA/dot/sdot
             // intrinsics), so the gemv_qtip{3,4}g256 kernels run on every arch.
-            Qtip3G256 | Qtip4G256 => ArchPredicate::Always,
+            Qtip3G256 | Qtip3G256I3 | Qtip4G256 => ArchPredicate::Always,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             // Opus Quant W4A4 / W8A8 (grouped, FWHT-rotated) — int activations +
             // int weights via iu4/iu8 grouped WMMA.
-            Oq4G256 | Oq8G256 => ArchPredicate::HasWmma,
+            // Compact-resident Opus rides the same iu8 WMMA core as Oq8G256;
+            // it only differs in how the weight bytes are decoded.
+            Oq4G256 | Oq8G256 | OqCompactG256 | OqCompactG128 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
-            Q8HFQ | Raw => ArchPredicate::Always,
+            Q8HFQ | DflashOq8Plain | DflashOq4Plain | DflashOq4MixedPlain | Raw => {
+                ArchPredicate::Always
+            }
         }
     }
 
@@ -761,6 +792,13 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ4G128
             | MQ3G256
             | Qtip3G256
+            // I3 weights are FWHT-rotated exactly like Qtip3G256 — only the
+            // codebook differs. Omitting it here made this return false, taking
+            // the no-rotation early return in weight_gemv/run_auto: activations
+            // unrotated AND the AWQ divide skipped, KLD 8.27. The sibling
+            // dtype_rotation_plan / dtype_post_rotation_variant already listed it,
+            // so the three were inconsistent.
+            | Qtip3G256I3
             | MQ2G256
             | MQ6G256
             | MQ8G256

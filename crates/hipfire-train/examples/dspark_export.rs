@@ -32,7 +32,7 @@
 //!
 //! Usage:
 //!   cargo run --release -p hipfire-train --example dspark_export -- \
-//!     --ckpt drafter.dsck --target Qwen3-8B.oq4.hfq \
+//!     --ckpt drafter.dsck --target Qwen3-8B--oq4.hfq \
 //!     --block 7 --target-layers 1,7,13,19,25 --markov-rank 256 \
 //!     --out Qwen3-8B-oq4.dspark.hfq
 

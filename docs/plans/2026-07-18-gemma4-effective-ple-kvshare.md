@@ -23,7 +23,7 @@ or attention_f32 / kvarn). RoPE theta matches because producer is same layer_typ
 still load wk/wv (present on all layers) — keep for now, skip-load later to save VRAM.
 
 ## PLE — new, self-contained. Confirmed math (transformers modeling_gemma4.py)
-Tensors (HF names; quantizer copies verbatim; all present in gemma-4-E2B.oq8.hfq):
+Tensors (HF names; quantizer copies verbatim; all present in gemma-4-E2B--oq8.hfq):
 - model.language_model.embed_tokens_per_layer.weight  [vocab 262144, num_layers*ple_dim 8960]
 - model.language_model.per_layer_model_projection.weight  [8960, hidden 1536]
 - model.language_model.per_layer_projection_norm.weight  [ple_dim 256]

@@ -15,6 +15,7 @@ hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
 libc.workspace = true
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt"] }
+# Union of both sides: master added fs/time, this branch needs net.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "time"] }
 tracing.workspace = true
 uuid.workspace = true

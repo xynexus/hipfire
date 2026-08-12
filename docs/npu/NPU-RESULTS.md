@@ -265,7 +265,7 @@ Stage 2 (single pre-attention dispatch per layer).
 ## Inference Integration — Qwen3.5-0.8B SwiGLU NPU Bench
 
 - **Date**: 2026-06-14
-- **Model**: `qwen3.5-0.8b.mq4.hfq` (MQ4 quantized, 0.50 GiB HFQ payload)
+- **Model**: `qwen3.5-0.8b--mq4.hfq` (MQ4 quantized, 0.50 GiB HFQ payload)
 - **xclbin**: `qwen35-swiglu-3584.xclbin` (hidden_size=3584, intermediate FFN dim)
 - **Activation**: `HIPFIRE_QWEN35_FFN_BF16=xdna1 HIPFIRE_QWEN35_FFN_BF16_LAYER=all`
 - **Path**: `forward_scratch_layers` → `weight_gemv_swiglu_residual_bf16_probe` → xdna1
@@ -967,10 +967,10 @@ Full 24-layer results are:
 
 | artifact | BF16 embedding cosine | ms | input tok/s | W | tok/J |
 |---|---:|---:|---:|---:|---:|
-| `.npu.oq8.hfq` | 0.99547863 | 864.929 | 296.0 | 21.05 | 14.1 |
-| `.npu.oq8+.hfq` | 0.99584466 | 855.854 | 299.1 | 20.04 | 14.9 |
-| `.npu.oq8++.hfq` | 0.99571574 | 838.997 | 305.1 | 21.05 | 14.5 |
-| `.npu.oq6.5.hfq` | 0.95821863 | 868.020 | 294.9 | 21.00 | 14.0 |
+| `--npu.oq8.hfq` | 0.99547863 | 864.929 | 296.0 | 21.05 | 14.1 |
+| `--npu.oq8+.hfq` | 0.99584466 | 855.854 | 299.1 | 20.04 | 14.9 |
+| `--npu.oq8++.hfq` | 0.99571574 | 838.997 | 305.1 | 21.05 | 14.5 |
+| `--npu.oq6.5.hfq` | 0.95821863 | 868.020 | 294.9 | 21.00 | 14.0 |
 
 OQ6.5 is arbitrary mixed-width execution evidence, not OQ8-level quality.
 The matrix validates generic dispatch and suffix handling but remains roughly
@@ -1647,7 +1647,7 @@ all global layers retain the existing full-attention path. A direct gfx1151
 hardware oracle at sequence 17/window 4 reached maximum absolute error
 1.5e-8 against the CPU reference.
 
-Real model checks used `EmbeddingGemma-300M.npu.oq8+.hfq` for the calibrated
+Real model checks used `EmbeddingGemma-300M--npu.oq8+.hfq` for the calibrated
 NPU projections and `EmbeddingGemma-300M.bf16.hfq` as the reference. At the
 first clipped length, 513 tokens, cosine was 0.99979591 with maximum absolute
 error 0.00254500; the hybrid path took 687.027 ms and 746.7 tokens/s. At the

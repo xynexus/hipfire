@@ -56,14 +56,29 @@ pub fn collect_calibration_artifacts(
         vec![".experts.".to_string()],
         output,
         &static_meta,
-        |gpu| {
-            let kldref = gpu_forward_calib(
-                gpu,
-                weights,
-                config,
-                tokens,
-                opts.kldref.then_some(opts.kldref_topk),
-            )?;
+        &[tokens],
+        |gpu, sequences| {
+            // Each sequence is an independent context: `gpu_forward_calib`
+            // sizes all of its state from `ids.len()`, so a fresh call IS the
+            // reset. The seam chose the split (see `calib_sequences`).
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            for (i, seq) in sequences.iter().enumerate() {
+                if sequences.len() > 1 {
+                    eprintln!(
+                        "  calib sequence {}/{} ({} tokens)",
+                        i + 1,
+                        sequences.len(),
+                        seq.len()
+                    );
+                }
+                kldref.extend(gpu_forward_calib(
+                    gpu,
+                    weights,
+                    config,
+                    seq,
+                    opts.kldref.then_some(opts.kldref_topk),
+                )?);
+            }
             let extra_tensors = kldref_extra(&kldref);
             let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
             if !kldref.is_empty() {

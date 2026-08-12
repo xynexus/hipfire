@@ -22,6 +22,35 @@
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 
+__device__ __forceinline__ float asym3_quant_dim(
+    const unsigned char* k_head, int dim, int head_dim, float cnorm
+) {
+    const int bit = dim * 3;
+    const int byte = bit / 8;
+    const int shift = bit & 7;
+    unsigned int packed = (unsigned int)k_head[4 + byte];
+    const int packed_bytes = (head_dim * 3) / 8;
+    if (byte + 1 < packed_bytes) packed |= (unsigned int)k_head[4 + byte + 1] << 8;
+    const int index = (packed >> shift) & 0x7;
+    return cnorm * TURBO_C3_256[index];
+}
+
+__device__ __forceinline__ float asym3_original_dim(
+    const unsigned char* k_head,
+    const float* cos_theta,
+    const float* sin_theta,
+    int dim,
+    int head_dim,
+    float cnorm
+) {
+    const int band = dim / 2;
+    const float a = asym3_quant_dim(k_head, band * 2, head_dim, cnorm);
+    const float b = asym3_quant_dim(k_head, band * 2 + 1, head_dim, cnorm);
+    return (dim & 1) == 0
+        ? cos_theta[band] * a + sin_theta[band] * b
+        : -sin_theta[band] * a + cos_theta[band] * b;
+}
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void triattn_score_asym3(
     const unsigned char* __restrict__ k_cache,
@@ -33,6 +62,7 @@ __global__ void triattn_score_asym3(
     int n_kv_heads,
     int head_dim,
     int n_rot,
+    int rope_layout,
     float rope_theta,
     float p_q,
     int seq_len
@@ -55,38 +85,20 @@ __global__ void triattn_score_asym3(
     // Shared per-head magnitude-restore factor.
     const float cnorm = *(const float*)k_head;
 
-    // This thread's 3 packed bytes → 8 quantized scalar values.
-    const unsigned char* base = k_head + 4 + tid * 3;
-    const unsigned int packed = (unsigned int)base[0]
-                              | ((unsigned int)base[1] << 8)
-                              | ((unsigned int)base[2] << 16);
-    float v[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const int idx = (packed >> (i * 3)) & 7;
-        v[i] = cnorm * TURBO_C3_256[idx];
-    }
-
-    // Inverse Givens per band pair. Forward was:
-    //   a' = a*cos(θ) - b*sin(θ);  b' = a*sin(θ) + b*cos(θ)
-    // So inverse (rotate by -θ):
-    //   a = a'*cos(θ) + b'*sin(θ);  b = -a'*sin(θ) + b'*cos(θ)
-    const int b0 = tid * 4;
     const float* c_head = centers + h * n_bands * 3;
 
     float s_trig = 0.0f;
     float s_norm = 0.0f;
 
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        const int f = b0 + j;
-        const float cb = cos_theta[f];
-        const float sb = sin_theta[f];
-
-        const float a_gv = v[j * 2 + 0];
-        const float b_gv = v[j * 2 + 1];
-        const float k_re =  cb * a_gv + sb * b_gv;
-        const float k_im = -sb * a_gv + cb * b_gv;
+    for (int f = tid; f < n_bands; f += 32) {
+        const int dim0 = rope_layout == 1 ? f : 2 * f;
+        const int dim1 = rope_layout == 1 ? f + n_bands : 2 * f + 1;
+        const float k_re = asym3_original_dim(
+            k_head, cos_theta, sin_theta, dim0, head_dim, cnorm
+        );
+        const float k_im = asym3_original_dim(
+            k_head, cos_theta, sin_theta, dim1, head_dim, cnorm
+        );
         const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
         const float k_phase = atan2f(k_im, k_re);
 

@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use clap::Args;
 use hipfire_arch_api::ArchId;
 use hipfire_config::LoadedConfig;
+use hipfire_hfq_tooling::{
+    ComposeManifest, HFQM_COMPOSE_FORMAT, HFQM_COMPOSE_FORMAT_V1, HFQM_COMPOSE_KEY,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::QuantType;
 use serde_json::{json, Value};
@@ -50,20 +53,307 @@ const SHAPE_FIELDS: &[(&str, &str)] = &[
 
 pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let path = resolve(&args.target, &loaded)?;
-    let hfq = HfqFile::open_index_only(&path)
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
+    let hfq = HfqFile::open_index_only(&path).map_err(|e| {
+        // An .hfa is an HFAR archive of a HuggingFace directory, not an HFQM
+        // container, so the raw "not an HFQM container at offset 0" leaks an
+        // internal detail and names no way forward.
+        if is_hfar_archive(&path) {
+            anyhow::anyhow!(
+                "{} is an HFAR archive, not an .hfq container. It holds a HuggingFace \
+                 source directory; restore it first with `hipfire-coexistence repack \
+                 --input {} --output <hf_dir>`.",
+                path.display(),
+                path.display(),
+            )
+        } else {
+            anyhow::anyhow!("failed to open {}: {e}", path.display())
+        }
+    })?;
 
     let meta: Value = serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| json!({}));
+    let components = component_summary(&meta)?;
+    // A calibration artefact carries arch 0 in its HFQM header and the real one
+    // in `source_arch_id`; trusting the header prints "arch: 0 (llama)" for a
+    // qwen35 calib, which is not merely uninformative but wrong.
+    let arch_id = calib_source_arch_id(&meta).unwrap_or(hfq.arch_id);
     let arch_name = hipfire_archs::registry()
-        .get(ArchId(hfq.arch_id as u16))
+        .get(ArchId(arch_id as u16))
         .map(|a| a.family);
 
     if args.json {
-        print_json(&args.target, &path, &hfq, &meta, arch_name);
+        print_json(
+            &args.target,
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            &components,
+        );
     } else {
-        print_human(&path, &hfq, &meta, arch_name, args.tensors);
+        print_human(
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            args.tensors,
+            &components,
+        );
     }
     Ok(())
+}
+
+/// True when the file begins with an HFAR archive magic (`repack.rs`).
+fn is_hfar_archive(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && (&magic == b"HFAR0002" || &magic == b"HFAR0001")
+}
+
+/// One captured projection, aggregated across layers.
+struct CalibProjection {
+    /// Projection path with the layer index and any expert index elided,
+    /// e.g. `mlp.experts.*.down_proj`.
+    name: String,
+    layers: std::collections::BTreeSet<u32>,
+    n_hessian: usize,
+    n_imatrix: usize,
+    /// K (input width) seen for this projection; a Hessian is K x K.
+    k: Option<u32>,
+    /// Token counts across every tensor of this projection, sorted. Collected
+    /// per BASE name so a tensor contributes once, not once per artifact kind.
+    tokens: Vec<u64>,
+    counted: std::collections::BTreeSet<String>,
+}
+
+/// Split a calibration tensor name into (projection, layer, artifact kind).
+/// `model.language_model.layers.7.mlp.experts.3.down_proj.hessian`
+///   -> ("mlp.experts.*.down_proj", Some(7), "hessian")
+fn split_calib_tensor(name: &str) -> (String, Option<u32>, &str) {
+    let (base, kind) = match name.rsplit_once('.') {
+        Some((b, k @ ("hessian" | "imatrix"))) => (b, k),
+        _ => (name, ""),
+    };
+    // Everything after `layers.<N>.` is the projection; before it is the model
+    // prefix, which varies by arch (`model.`, `model.language_model.`).
+    let (layer, proj) = match base.split_once(".layers.") {
+        Some((_, rest)) => match rest.split_once('.') {
+            Some((idx, proj)) => (idx.parse::<u32>().ok(), proj),
+            None => (None, rest),
+        },
+        None => (None, base),
+    };
+    // Collapse per-expert captures so a 512-expert MoE reports one row.
+    let mut out = String::with_capacity(proj.len());
+    let mut parts = proj.split('.').peekable();
+    while let Some(p) = parts.next() {
+        if p.parse::<u32>().is_ok() {
+            out.push('*');
+        } else {
+            out.push_str(p);
+        }
+        if parts.peek().is_some() {
+            out.push('.');
+        }
+    }
+    (out, layer, kind)
+}
+
+/// Aggregate the tensor index of a calibration artefact into per-projection
+/// coverage. This is what answers "is this calib complete" — the question that
+/// otherwise needs an ad-hoc script over `--json`.
+fn calib_projections(hfq: &HfqFile, meta: &Value) -> Vec<CalibProjection> {
+    use std::collections::BTreeMap;
+    let tokens_by_tensor = meta_get(meta, "per_tensor_tokens").and_then(|v| v.as_object());
+    let mut by_proj: BTreeMap<String, CalibProjection> = BTreeMap::new();
+    for t in hfq.tensors() {
+        let (proj, layer, kind) = split_calib_tensor(&t.name);
+        if kind.is_empty() {
+            continue;
+        }
+        let e = by_proj
+            .entry(proj.clone())
+            .or_insert_with(|| CalibProjection {
+                name: proj,
+                layers: Default::default(),
+                n_hessian: 0,
+                n_imatrix: 0,
+                k: None,
+                tokens: Vec::new(),
+                counted: Default::default(),
+            });
+        if let Some(l) = layer {
+            e.layers.insert(l);
+        }
+        match kind {
+            // A Hessian is [K, K]; the imatrix is [K], so take K from whichever
+            // is present without assuming both are.
+            "hessian" => {
+                e.n_hessian += 1;
+                e.k = e.k.or_else(|| t.shape.first().copied());
+            }
+            "imatrix" => {
+                e.n_imatrix += 1;
+                e.k = e.k.or_else(|| t.shape.first().copied());
+            }
+            _ => {}
+        }
+        // Token counts are keyed by base name and shared by both artifact
+        // kinds. Collect from whichever arrives first so an imatrix-only
+        // projection (routed MoE experts) still reports its coverage.
+        let base = t.name.trim_end_matches(&format!(".{kind}"));
+        if !e.counted.contains(base) {
+            if let Some(n) = tokens_by_tensor
+                .and_then(|m| m.get(base))
+                .and_then(|v| v.as_u64())
+            {
+                e.tokens.push(n);
+                e.counted.insert(base.to_string());
+            }
+        }
+    }
+    let mut out: Vec<CalibProjection> = by_proj.into_values().collect();
+    for p in &mut out {
+        p.tokens.sort_unstable();
+    }
+    out
+}
+
+fn print_calib_coverage(hfq: &HfqFile, meta: &Value) {
+    let projs = calib_projections(hfq, meta);
+    if projs.is_empty() {
+        return;
+    }
+    let all_layers: std::collections::BTreeSet<u32> = projs
+        .iter()
+        .flat_map(|p| p.layers.iter().copied())
+        .collect();
+    println!(
+        "\ncoverage: {} projections across {} layers",
+        projs.len(),
+        all_layers.len()
+    );
+    let w = projs
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    println!(
+        "  {:<w$}  {:>6}  {:>7}  {:>6}  {:>5}",
+        "projection",
+        "layers",
+        "H / I",
+        "K",
+        "tokens",
+        w = w
+    );
+    for p in &projs {
+        let tok = match (p.tokens.first(), p.tokens.last()) {
+            (Some(lo), Some(hi)) if lo == hi => format!("{lo}"),
+            (Some(lo), Some(hi)) => format!("{lo}-{hi}"),
+            _ => "-".to_string(),
+        };
+        // A non-layer capture (embeddings, a pooling head) has no layer index;
+        // printing 0 would read as "zero layers covered".
+        let layers = if p.layers.is_empty() {
+            "-".to_string()
+        } else {
+            p.layers.len().to_string()
+        };
+        println!(
+            "  {:<w$}  {:>6}  {:>3} /{:>3}  {:>6}  {:>5}",
+            p.name,
+            layers,
+            p.n_hessian,
+            p.n_imatrix,
+            p.k.map(|k| k.to_string()).unwrap_or_else(|| "-".into()),
+            tok,
+            w = w,
+        );
+    }
+
+    // Factual warnings only — no arch-specific rules about which projections a
+    // layer "should" have, since hybrid stacks legitimately differ per layer.
+    let mut warnings: Vec<String> = Vec::new();
+    for p in &projs {
+        if p.n_hessian > 0 && p.n_imatrix > 0 && p.n_hessian != p.n_imatrix {
+            warnings.push(format!(
+                "{}: {} hessians but {} imatrix tensors",
+                p.name, p.n_hessian, p.n_imatrix
+            ));
+        }
+        // The failure mode that cost a session: `--ldlq` does not fail on a
+        // missing Hessian, it logs `ldlq: skip <t>` and RTN-quantizes. For
+        // routed MoE experts this may be deliberate (a K x K Hessian per
+        // expert is enormous), so state it rather than calling it an error.
+        if p.n_hessian == 0 && p.n_imatrix > 0 {
+            warnings.push(format!(
+                "{}: imatrix only, no Hessian — `--ldlq` / `oq*++` will fall back to RTN here",
+                p.name
+            ));
+        }
+        if p.n_imatrix == 0 && p.n_hessian > 0 {
+            warnings.push(format!("{}: Hessian only, no imatrix", p.name));
+        }
+    }
+    // Layer profiles: a layer's captured projection set. A hybrid arch has a
+    // few; a profile covering one or two layers is worth a look.
+    let mut profile_of: std::collections::BTreeMap<u32, Vec<&str>> = Default::default();
+    for p in &projs {
+        for l in &p.layers {
+            profile_of.entry(*l).or_default().push(&p.name);
+        }
+    }
+    let mut profiles: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+    for (layer, mut kinds) in profile_of {
+        kinds.sort_unstable();
+        profiles.entry(kinds.join(",")).or_default().push(layer);
+    }
+    if profiles.len() > 1 {
+        println!("  {} layer profiles:", profiles.len());
+        for (_, layers) in &profiles {
+            println!("    {:>4} layers  e.g. layer {}", layers.len(), layers[0]);
+        }
+    }
+    // No "rare profile" warning: a hybrid stack legitimately has one (lfm2.5
+    // carries 2 dense FFN layers among 22 MoE ones), so it fires on healthy
+    // artefacts. The profile listing above already shows the shape.
+    let starved: Vec<&CalibProjection> = projs
+        .iter()
+        .filter(|p| {
+            p.tokens
+                .last()
+                .zip(p.tokens.first())
+                .is_some_and(|(hi, lo)| *hi > 0 && *lo * 10 < *hi)
+        })
+        .collect();
+    for p in starved {
+        warnings.push(format!(
+            "{}: token coverage spans {}-{} — some rows saw <10% of the best-covered row",
+            p.name,
+            p.tokens.first().copied().unwrap_or(0),
+            p.tokens.last().copied().unwrap_or(0),
+        ));
+    }
+    if !warnings.is_empty() {
+        println!("\nwarnings:");
+        for w in warnings {
+            println!("  ! {w}");
+        }
+    }
+}
+
+/// `source_arch_id` of a calibration artefact, whose HFQM header arch is 0.
+fn calib_source_arch_id(meta: &Value) -> Option<u32> {
+    if meta_get(meta, "artifact_kind").and_then(|v| v.as_str()) != Some("calibration") {
+        return None;
+    }
+    meta_get(meta, "source_arch_id")?.as_u64().map(|v| v as u32)
 }
 
 /// Resolve an argument to a concrete path: an existing file path wins, else it
@@ -79,7 +369,23 @@ fn resolve(arg: &str, loaded: &LoadedConfig) -> anyhow::Result<PathBuf> {
 
 /// Decode a quant-type byte to its canonical variant name, or a marker for an
 /// unknown/reserved id.
+/// Codes that are lossless BF16 recodings rather than value quantisations.
+/// A tensor still carrying one of these at inspect time was left packed
+/// (residency) rather than expanded at open.
+fn is_lossless_recoding_code(code: u8) -> bool {
+    QuantType::from_code(code).is_some_and(|qt| qt.is_lossless_recoding())
+}
+
+/// Calibration-only HFQM quant_type, deliberately outside the `QuantType`
+/// byte-contract: exact F32 Hessian diagonal + BF16 lower strict triangle.
+/// Kept in sync with `QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32`
+/// (`hipfire_runtime::calibration`), which is private to that module.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
 fn quant_name(code: u8) -> String {
+    if code == QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 {
+        return "HessianBf16TrilDiagF32".to_string();
+    }
     match QuantType::from_code(code) {
         Some(qt) => format!("{qt:?}"),
         None => format!("qt{code}?"),
@@ -168,23 +474,86 @@ fn module_kind_counts(hfq: &HfqFile) -> BTreeMap<String, usize> {
     counts
 }
 
+/// Decode the compose manifest using metadata/index bytes only. This remains
+/// cheap for model-sized bundles and makes corrupt manifests visible instead
+/// of silently presenting the artifact as an ordinary monolith.
+fn component_summary(meta: &Value) -> anyhow::Result<Vec<Value>> {
+    let Some(value) = meta.get(HFQM_COMPOSE_KEY) else {
+        return Ok(Vec::new());
+    };
+    let manifest: ComposeManifest = serde_json::from_value(value.clone())
+        .map_err(|error| anyhow::anyhow!("invalid {HFQM_COMPOSE_KEY} manifest: {error}"))?;
+    if manifest.format != HFQM_COMPOSE_FORMAT && manifest.format != HFQM_COMPOSE_FORMAT_V1 {
+        anyhow::bail!("unsupported compose manifest format {:?}", manifest.format);
+    }
+    Ok(manifest
+        .components
+        .into_iter()
+        .map(|component| {
+            let encoding = match component.source_format.as_str() {
+                "tria-v1" => "opaque-bytes",
+                "hfqm" => "hfqm-mapped-entries",
+                _ => "unknown",
+            };
+            json!({
+                "role": component.tag,
+                "filename": component.filename,
+                "source_format": component.source_format,
+                "original_arch_id": component.arch_id,
+                "encoding": encoding,
+                "byte_len": component.byte_len,
+                "sha256": component.sha256,
+                "entries": component.stored_entries.len(),
+            })
+        })
+        .collect())
+}
+
 fn print_human(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
     list_tensors: bool,
+    components: &[Value],
 ) {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     println!("artefact: {name}");
+    let calib = calib_source_arch_id(meta).is_some();
+    if calib {
+        println!("kind:     calibration (hessian + imatrix)");
+    }
     match arch_name {
-        Some(a) => println!("arch:     {} ({})", hfq.arch_id, a),
-        None => println!("arch:     {}", hfq.arch_id),
+        Some(a) if calib => println!("arch:     {arch_id} ({a}, from source_arch_id)"),
+        Some(a) => println!("arch:     {arch_id} ({a})"),
+        None => println!("arch:     {arch_id}"),
     }
     println!("format:   hfqm v{}", hfq.version);
+    // Comparable with a calib's `source fp`: that is this value, computed over
+    // the artefact the calib was captured from.
+    println!("fingerprint {}", hfq.index_fingerprint());
+    if calib {
+        for (key, label) in [
+            ("n_hessian", "hessians"),
+            ("n_imatrix", "imatrix"),
+            ("n_calib_tokens", "tokens"),
+            ("source_model", "source"),
+            ("source_fingerprint", "source fp"),
+            ("corpus", "corpus"),
+        ] {
+            if let Some(v) = meta_get(meta, key) {
+                println!("{label:9} {}", val_str(v));
+            }
+        }
+        if meta_get(meta, "source_fingerprint").is_none() {
+            println!("source fp (not recorded — artefact predates source fingerprinting)");
+        }
+        print_calib_coverage(hfq, meta);
+    }
 
     // Quant family / KV mode / sidecars.
     if let Some(v) = meta_get(meta, "quant_family") {
@@ -196,6 +565,23 @@ fn print_human(
     let sidecars = sidecar_tags(meta);
     if !sidecars.is_empty() {
         println!("sidecars: {}", sidecars.join(", "));
+    }
+    if !components.is_empty() {
+        println!("\ncomponents:");
+        for component in components {
+            println!(
+                "  {}: {} ({}, arch {}, {}, {}, sha256 {})",
+                component["role"].as_str().unwrap_or("?"),
+                component["filename"].as_str().unwrap_or("?"),
+                component["source_format"].as_str().unwrap_or("?"),
+                component["original_arch_id"],
+                component["encoding"].as_str().unwrap_or("?"),
+                fmt_bytes(component["byte_len"].as_u64().unwrap_or(0)),
+                component["sha256"]
+                    .as_str()
+                    .unwrap_or("legacy-v1-unavailable"),
+            );
+        }
     }
 
     // Model shape.
@@ -244,11 +630,97 @@ fn print_human(
     }
     println!("total: {total_tensors} tensors  {}", fmt_bytes(total_bytes));
 
+    // Lossless storage codecs.
+    //
+    // The histogram above is the LOGICAL view: `expand_bf16_index` rewrites a
+    // recoded entry's dtype and length at open, so a BF16L3-compressed tensor
+    // shows as plain `BF16` with its expanded size. Without this section the
+    // only way to tell a compressed artifact from an uncompressed one is to
+    // compare the file size against the total — which is exactly how it was
+    // missed while working on the BF16L3 lm_head.
+    let mut codecs: std::collections::BTreeMap<u8, (usize, u64, u64)> = Default::default();
+    for (i, t) in hfq.tensors().iter().enumerate() {
+        // Two ways a tensor is compressed on disk, and reporting only the first
+        // hides the biggest one.
+        //
+        //  1. Expanded at open. `expand_bf16_index` rewrote the entry to its
+        //     logical view and `stored_recoding` remembers the physical extent.
+        //  2. Left PACKED. A LUT3 head is resident by default, so its entry is
+        //     never rewritten — `stored_recoding` is None and `quant_type` is
+        //     still the codec. Its `data_size` is already the packed length.
+        //
+        // Case 2 is exactly the 379.74 MB embedding on a stock artifact, so
+        // omitting it reported "saved 55.73 KB" against a real 145 MB.
+        let (stored_qt, packed_len, logical_len) = match hfq.stored_recoding(i) {
+            Some((qt, packed)) => (qt, packed as u64, t.data_size as u64),
+            None if is_lossless_recoding_code(t.quant_type) => {
+                let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                (t.quant_type, t.data_size as u64, n * 2)
+            }
+            None => continue,
+        };
+        let e = codecs.entry(stored_qt).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += packed_len;
+        e.2 += logical_len;
+    }
+    if !codecs.is_empty() {
+        println!("\nlossless storage (compressed on disk, expanded or decoded in-kernel):");
+        let (mut tot_p, mut tot_l) = (0u64, 0u64);
+        for (qt, (n, packed, logical)) in &codecs {
+            println!(
+                "  {:<12}  {:>6} tensors  {:>10} on disk  from {:>10}  {:.3}x",
+                quant_name(*qt),
+                n,
+                fmt_bytes(*packed),
+                fmt_bytes(*logical),
+                *logical as f64 / (*packed).max(1) as f64,
+            );
+            tot_p += packed;
+            tot_l += logical;
+        }
+        if codecs.len() > 1 {
+            println!(
+                "  {:<12}  {:>6} tensors  {:>10} on disk  from {:>10}  {:.3}x",
+                "combined",
+                codecs.values().map(|v| v.0).sum::<usize>(),
+                fmt_bytes(tot_p),
+                fmt_bytes(tot_l),
+                tot_l as f64 / tot_p.max(1) as f64,
+            );
+        }
+        println!(
+            "  saved {} against the logical size",
+            fmt_bytes(tot_l - tot_p)
+        );
+    }
+
     if list_tensors {
         println!("\ntensors:");
-        for t in hfq.tensors() {
+        for (i, t) in hfq.tensors().iter().enumerate() {
+            // Annotate the stored codec: the dtype column is the logical view,
+            // so without this a compressed tensor is indistinguishable here.
+            let stored = match hfq.stored_recoding(i) {
+                Some((qt, packed)) => format!(
+                    "  [stored {} {}, {:.3}x]",
+                    quant_name(qt),
+                    fmt_bytes(packed as u64),
+                    t.data_size as f64 / (packed as f64).max(1.0)
+                ),
+                // Left packed rather than expanded — the dtype column already
+                // names the codec, so say so and give the ratio it is saving.
+                None if is_lossless_recoding_code(t.quant_type) => {
+                    let n: u64 = t.shape.iter().map(|&d| d as u64).product();
+                    format!(
+                        "  [packed in place, from {}, {:.3}x]",
+                        fmt_bytes(n * 2),
+                        (n * 2) as f64 / (t.data_size as f64).max(1.0)
+                    )
+                }
+                None => String::new(),
+            };
             println!(
-                "  {:60} {:<14} shape={:?} g={} {}",
+                "  {:60} {:<14} shape={:?} g={} {}{stored}",
                 t.name,
                 quant_name(t.quant_type),
                 t.shape,
@@ -266,7 +738,9 @@ fn print_json(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
+    components: &[Value],
 ) {
     let shape: serde_json::Map<String, Value> = SHAPE_FIELDS
         .iter()
@@ -291,7 +765,20 @@ fn print_json(
     let tensors: Vec<Value> = hfq
         .tensors()
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
+            // `quant_type` / `data_size` are the LOGICAL view. When the tensor
+            // is stored under a lossless recoding these report what it expands
+            // to, not what is on disk, so emit the stored form alongside rather
+            // than leaving a consumer to infer it from file size.
+            let (stored_type, stored_code, stored_size) = match hfq.stored_recoding(i) {
+                Some((qt, packed)) => (
+                    Value::from(quant_name(qt)),
+                    Value::from(qt),
+                    Value::from(packed),
+                ),
+                None => (Value::Null, Value::Null, Value::Null),
+            };
             json!({
                 "name": t.name,
                 "quant_code": t.quant_type,
@@ -299,6 +786,9 @@ fn print_json(
                 "shape": t.shape,
                 "group_size": t.group_size,
                 "data_size": t.data_size,
+                "stored_quant_type": stored_type,
+                "stored_quant_code": stored_code,
+                "stored_data_size": stored_size,
             })
         })
         .collect();
@@ -315,12 +805,18 @@ fn print_json(
     let out = json!({
         "target": target,
         "path": path.display().to_string(),
-        "arch_id": hfq.arch_id,
+        // For a calibration artefact this is `source_arch_id`; the raw HFQM
+        // header value (always 0 there) stays available as `header_arch_id`.
+        "arch_id": arch_id,
+        "header_arch_id": hfq.arch_id,
+        "artifact_kind": meta_get(meta, "artifact_kind").cloned().unwrap_or(Value::Null),
         "arch_name": arch_name,
         "hfqm_version": hfq.version,
+        "fingerprint": hfq.index_fingerprint(),
         "quant_family": meta_get(meta, "quant_family"),
         "kv_mode": meta_get(meta, "kv_mode"),
         "sidecars": sidecar_tags(meta),
+        "components": components,
         "shape": shape,
         "quant_histogram": histogram,
         "totals": { "tensors": total_tensors, "bytes": total_bytes },
@@ -329,4 +825,81 @@ fn print_json(
         "metadata": meta,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_component_summary_is_index_only_and_role_aware() {
+        let metadata = json!({
+            HFQM_COMPOSE_KEY: {
+                "format": HFQM_COMPOSE_FORMAT,
+                "components": [{
+                    "tag": "dflash",
+                    "filename": "Model.dflash.oq4+.hfq",
+                    "arch_id": 20,
+                    "tensors": ["fc.weight"],
+                    "metadata_json": "{}",
+                    "source_format": "hfqm",
+                    "byte_len": 1024,
+                    "sha256": "abc",
+                    "stored_entries": [{
+                        "stored_name": "__hipfire_component/dflash/1/fc.weight",
+                        "original_name": "fc.weight",
+                        "original_offset": 4096
+                    }]
+                }]
+            }
+        });
+        let components = component_summary(&metadata).unwrap();
+        assert_eq!(components[0]["role"], "dflash");
+        assert_eq!(components[0]["original_arch_id"], 20);
+        assert_eq!(components[0]["encoding"], "hfqm-mapped-entries");
+        assert_eq!(components[0]["byte_len"], 1024);
+        assert_eq!(components[0]["sha256"], "abc");
+    }
+
+    #[test]
+    fn calibration_arch_comes_from_source_not_the_zero_header() {
+        // A calib artefact's HFQM header carries arch 0; trusting it printed
+        // "arch: 0 (llama)" for a qwen35 calib.
+        let calib = json!({"artifact_kind": "calibration", "source_arch_id": 5});
+        assert_eq!(calib_source_arch_id(&calib), Some(5));
+        // A model artefact must keep using its own header arch.
+        assert_eq!(calib_source_arch_id(&json!({"source_arch_id": 5})), None);
+        assert_eq!(calib_source_arch_id(&json!({})), None);
+    }
+
+    #[test]
+    fn calib_tensor_names_split_into_projection_layer_and_kind() {
+        // Arch prefixes vary (`model.`, `model.language_model.`); the layer
+        // index and any expert index must both be elided so a 512-expert MoE
+        // reports one row instead of 512.
+        assert_eq!(
+            split_calib_tensor("model.language_model.layers.7.mlp.down_proj.hessian"),
+            ("mlp.down_proj".to_string(), Some(7), "hessian")
+        );
+        assert_eq!(
+            split_calib_tensor("model.layers.31.mlp.experts.418.down_proj.imatrix"),
+            ("mlp.experts.*.down_proj".to_string(), Some(31), "imatrix")
+        );
+        // A non-layer capture (embeddings, pooling head) has no layer index.
+        assert_eq!(
+            split_calib_tensor("model.embed_tokens.hessian"),
+            ("model.embed_tokens".to_string(), None, "hessian")
+        );
+        // A weight tensor in a model artefact carries neither suffix.
+        assert_eq!(
+            split_calib_tensor("model.layers.0.mlp.down_proj.weight").2,
+            ""
+        );
+    }
+
+    #[test]
+    fn hessian_quant_code_is_named_not_marked_unknown() {
+        assert_eq!(quant_name(130), "HessianBf16TrilDiagF32");
+        assert!(quant_name(200).ends_with('?'), "reserved codes stay marked");
+    }
 }

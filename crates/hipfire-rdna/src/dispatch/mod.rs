@@ -73,6 +73,7 @@ mod gemm_misc;
 mod gemm_qkv;
 mod gemv;
 mod kv;
+pub mod lmhead_twostage;
 mod mamba2;
 mod misc;
 mod moe;
@@ -137,28 +138,6 @@ pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 /// nothing about the seeds a kernel actually used.
 #[allow(dead_code)]
 static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
-
-/// Deterministic seed for the Q8 GatedDeltaNet stochastic-rounding RNG.
-///
-/// Must be a pure function of *where we are in the sequence*, never of *how
-/// many dispatches have happened* — two runs that reach the same sequence
-/// position must round identically regardless of how they got there
-/// (issue #17).
-///
-/// - `seq_pos` is the absolute sequence position of the **first** token in
-///   the block being processed. The batched kernel adds its intra-block token
-///   index `t` to `frame`, so `seq_pos + t` is that token's absolute position.
-/// - `delta_layer` is the DeltaNet (linear-attention) layer index. The kernels
-///   already mix head, state row, and lane into the RNG, but **not** the layer;
-///   without this term every LA layer would dither with an identical noise
-///   sequence at a given position (correlated dither across layers). Folding it
-///   in at `2^24` keeps the `frame + t` contract intact and stays collision-free
-///   for sequence positions below ~16.7M.
-#[cfg(feature = "deltanet")]
-#[inline]
-pub(crate) fn gdn_requant_seed(seq_pos: u32, delta_layer: u32) -> i32 {
-    seq_pos.wrapping_add(delta_layer.wrapping_mul(1 << 24)) as i32
-}
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
@@ -429,6 +408,11 @@ pub struct Gpu {
     pub mq_signs1_128: Option<GpuTensor>,
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>, // scratch for rotated x, sized to max K
+    /// Memoized cooperative grid (blocks) for the ZAYA decode megakernels, sized
+    /// once each to the device residency limit (occupancy/MP × MP count). See
+    /// `zaya_decode_megakernel_b` / `zaya_decode_megakernel_a`.
+    pub zaya_megakernel_grid: Option<u32>,
+    pub zaya_megakernel_a_grid: Option<u32>,
     // Opus Quant W4A4 persistent decode scratch (B=1). Hoisted out of the
     // per-projection dispatch so the forward issues ZERO hipMalloc/hipFree inside
     // the (future) hipGraph-captured region — per-call alloc would trip
@@ -447,7 +431,15 @@ pub struct Gpu {
     pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
-    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
+    pub oq8_xq_batch: Option<GpuTensor>, // int8 activation, N*K bytes (oq8 W8A8)
+    pub oq8_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
+    pub oq8_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
+    // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
+    // per (batch,G256) and reused by every output-row block in the projection.
+    // Capacity grows to the largest bounded chunk seen and is stream-reused.
+    pub dflash_oq_xq_batch: Option<GpuTensor>, // signed int8 activation, N*K bytes
+    pub dflash_oq_xs_batch: Option<GpuTensor>, // per-G256 f32 scales, N*K/256
+    pub paro_x_scratch: Option<GpuTensor>,     // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
@@ -841,6 +833,8 @@ impl Gpu {
             mq_signs1_128: None,
             mq_signs2_128: None,
             mq_x_rot: None,
+            zaya_megakernel_grid: None,
+            zaya_megakernel_a_grid: None,
             oq4_xq: None,
             oq4_xs: None,
             oq4_xr: None,
@@ -848,6 +842,11 @@ impl Gpu {
             oq4_xq_batch: None,
             oq4_xs_batch: None,
             oq4_ytmp_batch: None,
+            oq8_xq_batch: None,
+            oq8_xs_batch: None,
+            oq8_ytmp_batch: None,
+            dflash_oq_xq_batch: None,
+            dflash_oq_xs_batch: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
             mq_x_q8: None,
@@ -1497,6 +1496,10 @@ impl Gpu {
 
     /// Compile and load a kernel, caching the result.
     fn ensure_kernel(&mut self, module_name: &str, source: &str, func_name: &str) -> HipResult<()> {
+        // Universal dispatch chokepoint — every launch resolves its function
+        // here, cache-hit or not. See `kernel_trace`: off by default, one
+        // relaxed atomic load when off.
+        crate::kernel_trace::record(func_name);
         if self.functions.contains_key(func_name) {
             return Ok(());
         }
@@ -1938,6 +1941,18 @@ impl Gpu {
     /// In-place constant fill of an existing F32 tensor (sync htod).
     pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
         self.bind_thread()?;
+        // Zero fast-path: a device memset is capture-safe (no host→device copy on
+        // the legacy stream) and routes to the active stream under graph capture.
+        if value == 0.0 {
+            match self.active_stream.as_ref() {
+                Some(stream) => {
+                    self.hip
+                        .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?
+                }
+                None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
+            }
+            return Ok(());
+        }
         let data = vec![value; tensor.numel()];
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
@@ -2054,6 +2069,17 @@ impl Gpu {
     /// Host-upload counterpart of `alloc_owned` (F32).
     pub fn upload_owned_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<OwnedTensor> {
         let inner = self.upload_f32(data, shape)?;
+        Ok(OwnedTensor {
+            inner,
+            mailbox: Arc::clone(&self.free_mailbox),
+        })
+    }
+
+    /// Owning counterpart of [`Self::upload_raw`]. Needed wherever a raw upload
+    /// happens in a LOOP: `GpuTensor` has no `Drop`, so the non-owning form
+    /// retains every buffer for the life of the process.
+    pub fn upload_raw_owned(&mut self, data: &[u8], shape: &[usize]) -> HipResult<OwnedTensor> {
+        let inner = self.upload_raw(data, shape)?;
         Ok(OwnedTensor {
             inner,
             mailbox: Arc::clone(&self.free_mailbox),
@@ -2309,7 +2335,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let need_xq = n * (k / 2);
-        let need_xs = n * (k / 256);
+        // Scale slots follow the ACTIVATION group, which the W4A4 group-size
+        // experiment can set finer than the codec's 256 (see `oq4_act_group`).
+        let need_xs = n * (k / crate::dispatch::quant::oq4_act_group());
         let need_y = n * m_max;
         let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
             cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)
@@ -2322,6 +2350,34 @@ impl Gpu {
         }
         if grow(&self.oq4_ytmp_batch, need_y) {
             self.oq4_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
+        }
+        Ok(())
+    }
+
+    /// oq8 (W8A8) batched-prefill scratch. Same shape as the oq4 trio except the
+    /// quantized activation is a full byte per element (`n*k`, not `n*k/2`), and
+    /// the scale group is the oq8 codec's fixed 256.
+    pub fn ensure_oq8_scratch_batched(
+        &mut self,
+        n: usize,
+        k: usize,
+        m_max: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let need_xq = n * k;
+        let need_xs = n * (k / 256);
+        let need_y = n * m_max;
+        let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
+            cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)
+        };
+        if grow(&self.oq8_xq_batch, need_xq) {
+            self.oq8_xq_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if grow(&self.oq8_xs_batch, need_xs) {
+            self.oq8_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
+        if grow(&self.oq8_ytmp_batch, need_y) {
+            self.oq8_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
         }
         Ok(())
     }
@@ -3813,18 +3869,6 @@ impl Gpu {
     }
 
     #[cfg(feature = "deltanet")]
-    fn gdn_q8_reg_gfx1151_enabled(&self) -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| {
-            // HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state
-            // GDN Q8 probe. Default off after A3B pp256 prefill regressed
-            // 11.8ms -> 168.5ms total GDN time.
-            std::env::var("HIPFIRE_GDN_Q8_REG_GFX1151").as_deref() == Ok("1")
-        });
-        enabled && self.arch.starts_with("gfx1151")
-    }
-
-    #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     fn conv1d_silu_split_f32_n_gfx1151(
         &mut self,
@@ -4191,8 +4235,8 @@ impl Gpu {
                 kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string(),
             ),
             (
-                "gated_delta_net_q8_tree",
-                kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string(),
+                "gated_delta_net_f32_tree",
+                kernels::GATED_DELTA_NET_F32_TREE_SRC.to_string(),
             ),
             ("sigmoid_mul", kernels::SIGMOID_MUL_SRC.to_string()),
             ("topk_logits", kernels::TOPK_LOGITS_SRC.to_string()),
@@ -4437,12 +4481,6 @@ impl Gpu {
             kernels::EMBEDDING_F16_BATCHED_SRC.to_string(),
         ));
 
-        // DeltaNet kernels
-        specs.push((
-            "gated_delta_net_q8",
-            kernels::GATED_DELTA_NET_Q8_SRC.to_string(),
-        ));
-
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
@@ -4633,7 +4671,7 @@ impl Gpu {
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
-                "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
+                "gated_delta_net_f32_tree" => vec!["gated_delta_net_f32_tree"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
                 "topk_logits" => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],
@@ -4641,7 +4679,6 @@ impl Gpu {
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
                 "deinterleave" => vec!["deinterleave_f32"],
                 "repeat_interleave_qk" => vec!["repeat_interleave_qk_f32"],
-                "gated_delta_net_q8" => vec!["gated_delta_net_q8"],
                 // MQ4 GEMV module exports both the main GEMV and the standalone
                 // x rotation kernel used by the prerotated dispatch path.
                 "gemv_mq4g256" => vec!["gemv_mq4g256", "mq_rotate_x"],

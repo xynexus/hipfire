@@ -17,6 +17,8 @@ pub struct RatePolicy {
 }
 
 impl Default for RatePolicy {
+    /// Base policy for a server reachable from the network. Every effective
+    /// policy starts here and is narrowed by user/token overrides.
     fn default() -> Self {
         Self {
             requests_per_minute: 60.0,
@@ -33,6 +35,35 @@ impl Default for RatePolicy {
 }
 
 impl RatePolicy {
+    /// Base policy for a server bound to a loopback address, where the only
+    /// possible clients are processes on this machine and throttling them
+    /// mostly gets in the way. Selected by the caller from the BIND address
+    /// (see `hipfire-server`'s `is_loopback_host`), never from the request
+    /// principal: `AuthKind::AnonymousLocal` means "no credential presented",
+    /// which a REMOTE client also gets under `api_auth_mode = off/optional`
+    /// with `unsafe_allow_unauthenticated_remote`. Keying this off the
+    /// principal would hand these limits to anonymous internet traffic.
+    ///
+    /// Concurrency 0 means unlimited (the `limit > 0` guard in `reserve_at`).
+    /// Buckets have no such escape, so they get an unreachable rate rather
+    /// than 0 — and a finite one, because `f64::INFINITY` would surface as a
+    /// non-finite `limit` in the rate-limit response headers.
+    ///
+    /// Narrow any of it with `local_rate_policy` in the daemon config.
+    pub fn loopback_default() -> Self {
+        Self {
+            requests_per_minute: 1e9,
+            request_burst: 1e9,
+            text_tokens_per_minute: 1e9,
+            text_token_burst: 1e9,
+            max_in_flight_text: 0,
+            max_in_flight_images: 1,
+            megapixel_steps_per_minute: 80.0,
+            megapixel_step_burst: 40.0,
+            max_in_flight_training: 1,
+        }
+    }
+
     pub fn with_override(self, value: &RatePolicyOverride) -> Self {
         Self {
             requests_per_minute: value
@@ -170,12 +201,37 @@ struct LimiterInner {
     state: Mutex<LimiterState>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RateLimiter {
     inner: Arc<LimiterInner>,
+    /// Policy every effective policy is derived from, before user/token
+    /// overrides. Chosen once at construction — loopback binds pass
+    /// `RatePolicy::loopback_default()` narrowed by config.
+    base: RatePolicy,
+}
+
+impl Default for RateLimiter {
+    /// Network-safe base. Callers on a loopback bind want
+    /// [`RateLimiter::with_base`] instead.
+    fn default() -> Self {
+        Self::with_base(RatePolicy::default())
+    }
 }
 
 impl RateLimiter {
+    pub fn with_base(base: RatePolicy) -> Self {
+        Self {
+            inner: Arc::new(LimiterInner::default()),
+            base,
+        }
+    }
+
+    /// The un-overridden base policy, for callers that report effective
+    /// limits (admin console) and must not re-derive it from `default()`.
+    pub fn base(&self) -> RatePolicy {
+        self.base
+    }
+
     pub fn reserve_at(
         &self,
         now_secs: f64,
@@ -184,7 +240,7 @@ impl RateLimiter {
         token_override: &RatePolicyOverride,
         cost: ReservationCost,
     ) -> Result<RateReservation, RateLimitError> {
-        let user_policy = RatePolicy::default().with_override(user_override);
+        let user_policy = self.base.with_override(user_override);
         let token_policy = user_policy.stricter_token_policy(token_override);
         let owners = owner_policies(principal, user_policy, token_policy);
         let mut state = self.inner.state.lock().unwrap();
@@ -297,7 +353,7 @@ impl RateLimiter {
         user_override: &RatePolicyOverride,
         token_override: &RatePolicyOverride,
     ) -> RateLimitStatus {
-        let user_policy = RatePolicy::default().with_override(user_override);
+        let user_policy = self.base.with_override(user_override);
         let token_policy = user_policy.stricter_token_policy(token_override);
         let owners = owner_policies(principal, user_policy, token_policy);
         let state = self.inner.state.lock().unwrap();
@@ -565,6 +621,72 @@ mod tests {
         cost: ReservationCost,
     ) -> Result<RateReservation, RateLimitError> {
         limiter.reserve_at(now, principal, policy, &RatePolicyOverride::default(), cost)
+    }
+
+    /// `AuthKind::AnonymousLocal` means "no credential presented", NOT "client
+    /// is on this machine" — a REMOTE client gets it too under
+    /// `api_auth_mode = off/optional` with `unsafe_allow_unauthenticated_remote`.
+    /// So a limiter built with the network base must still throttle it. If
+    /// anyone ever re-keys the loopback policy off the principal instead of the
+    /// bind address, this fails.
+    #[test]
+    fn network_base_still_throttles_anonymous_local_principals() {
+        let limiter = RateLimiter::default();
+        let p = RequestPrincipal::anonymous_local();
+        let none = RatePolicyOverride::default();
+        let burst = RatePolicy::default().request_burst as usize;
+        for _ in 0..burst {
+            reserve(
+                &limiter,
+                0.0,
+                &p,
+                &none,
+                ReservationCost::request(WorkloadClass::Other),
+            )
+            .expect("requests within the burst are admitted")
+            .complete();
+        }
+        assert!(
+            reserve(
+                &limiter,
+                0.0,
+                &p,
+                &none,
+                ReservationCost::request(WorkloadClass::Other)
+            )
+            .is_err(),
+            "anonymous-local principal must not bypass the network base policy"
+        );
+    }
+
+    /// Regression guard: the permissive policy lives in `loopback_default()`,
+    /// never in `default()` — `default()` is what a public bind uses.
+    #[test]
+    fn network_default_stays_bounded() {
+        let policy = RatePolicy::default();
+        assert!(policy.requests_per_minute <= 1_000.0);
+        assert!(policy.text_tokens_per_minute <= 1_000_000.0);
+        assert!(
+            policy.max_in_flight_text > 0,
+            "0 means unlimited concurrency"
+        );
+    }
+
+    /// `local_rate_policy` narrows the loopback base field-wise; anything unset
+    /// keeps the loopback value rather than falling back to the network one.
+    #[test]
+    fn loopback_base_is_narrowed_field_wise_by_config() {
+        let base = RatePolicy::loopback_default();
+        assert_eq!(base.max_in_flight_text, 0, "unlimited unless configured");
+        let narrowed = base.with_override(&RatePolicyOverride {
+            max_in_flight_text: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(narrowed.max_in_flight_text, 2);
+        assert_eq!(
+            narrowed.requests_per_minute, base.requests_per_minute,
+            "unset fields keep the loopback base, not the network default"
+        );
     }
 
     #[test]

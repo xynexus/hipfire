@@ -578,32 +578,21 @@ fn parse_drafter_state_quant(mode: Option<&str>) -> Result<Option<qwen35::StateQ
     use qwen35::StateQuant;
     match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(None),
-        "q8" | "int8" => {
-            warn_deprecated_drafter_state_quant("q8");
-            Ok(Some(StateQuant::Q8))
-        }
         "fp32" | "f32" => Ok(Some(StateQuant::FP32)),
-        "q4" | "int4" => {
-            warn_deprecated_drafter_state_quant("q4");
-            Ok(Some(StateQuant::Q4))
-        }
-        other => Err(format!(
-            "HIPFIRE_PFLASH_DRAFTER_STATE={other:?} not in {{auto,fp32,q8,q4}}"
+        "fp16" | "f16" => Ok(Some(StateQuant::FP16)),
+        // Quantized drafter state was removed 2026-08-09 (silent corruption:
+        // long-decode attractors, a rounding seed leaking execution history,
+        // and an error-feedback buffer that broke rollback). Rejected loudly
+        // rather than silently mapped to FP32, so an operator carrying the old
+        // setting finds out instead of quietly getting different behaviour.
+        "q8" | "int8" | "q4" | "int4" => Err(format!(
+            "HIPFIRE_PFLASH_DRAFTER_STATE={:?} was removed — quantized DeltaNet \
+             state caused silent corruption. Use 'fp32' (default) or 'fp16'.",
+            mode.unwrap_or("")
         )),
-    }
-}
-
-/// One-shot deprecation warning for a quantized drafter DeltaNet state.
-#[cfg(feature = "deltanet")]
-fn warn_deprecated_drafter_state_quant(which: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warning: HIPFIRE_PFLASH_DRAFTER_STATE='{which}' is DEPRECATED — \
-             quantized DeltaNet recurrent state is disallowed by policy (see \
-             qwen35::deltanet_state_fp32_below). Use 'auto' (=FP32)."
-        );
+        other => Err(format!(
+            "HIPFIRE_PFLASH_DRAFTER_STATE={other:?} not in {{auto,fp32,fp16}}"
+        )),
     }
 }
 
@@ -1871,17 +1860,19 @@ mod tests {
         assert_eq!(parse_drafter_state_quant(Some("auto")).unwrap(), None);
         assert_eq!(parse_drafter_state_quant(Some("")).unwrap(), None);
         assert_eq!(
-            parse_drafter_state_quant(Some("q8")).unwrap(),
-            Some(StateQuant::Q8)
-        );
-        assert_eq!(
             parse_drafter_state_quant(Some("fp32")).unwrap(),
             Some(StateQuant::FP32)
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("q4")).unwrap(),
-            Some(StateQuant::Q4)
+            parse_drafter_state_quant(Some("fp16")).unwrap(),
+            Some(StateQuant::FP16)
         );
+        // Removed, and REJECTED rather than quietly mapped to FP32 — an operator
+        // carrying the old setting must learn it is gone instead of silently
+        // getting different numerics. That is the whole point of deleting Q8.
+        assert!(parse_drafter_state_quant(Some("q8")).is_err());
+        assert!(parse_drafter_state_quant(Some("int8")).is_err());
+        assert!(parse_drafter_state_quant(Some("q4")).is_err());
         assert!(parse_drafter_state_quant(Some("bad")).is_err());
     }
 

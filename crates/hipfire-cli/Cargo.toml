@@ -16,6 +16,7 @@ admin-ui-embed = ["hipfire-server/admin-ui-embed"]
 chat-ui-embed = ["hipfire-server/chat-ui-embed"]
 
 [dependencies]
+hipfire-env = { path = "../hipfire-env" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-build-info = { path = "../hipfire-build-info" }
@@ -32,6 +33,7 @@ hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-archs = { path = "../hipfire-archs" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-hfq-tooling = { path = "../hipfire-hfq-tooling" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
 regex.workspace = true

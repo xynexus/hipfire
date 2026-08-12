@@ -223,7 +223,7 @@ The DiT is GEMM-dominated, so the oq work applies with no new format:
   Distilled turbo has few steps, so the schedule is short and each step's
   precision choice matters more; this is a good stress test for the schedule.
 - **Artifact naming (AGENTS.md):** e.g.
-  `Krea-2-Turbo-24B.dit.oq4++.gfx1151.hfq` — `family` Krea, `version` 2, `turbo`
+  `Krea-2-Turbo-24B.dit--oq4++.gfx1151.hfq` — `family` Krea, `version` 2, `turbo`
   tag, `.dit` role/feature group before the quant token, `oq4++` for
   Hessian/LDLQ, arch sidecar. Confirm parameter count for the size field during
   conversion. VAE and text-encoder ship as their own `.hfq` sidecars.

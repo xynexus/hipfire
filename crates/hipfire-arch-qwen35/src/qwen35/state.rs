@@ -9,11 +9,23 @@ use super::*;
 
 /// Persistent state for DeltaNet layers across tokens.
 /// State quantization mode for DeltaNet S matrix.
+/// DeltaNet recurrent-state storage precision.
+///
+/// Q8 and Q4 were REMOVED 2026-08-09 — not gated, removed. Quantized recurrent
+/// state produced three separate silent failures: long-decode attractors on
+/// low-redundancy models, a stochastic-rounding seed that leaked execution
+/// history into target numerics (issue #17), and an `s_ef_residual` accumulator
+/// `DeltaNetSnapshot` never saved, breaking spec-decode losslessness (#22).
+/// Each degraded output rather than failing, which is why they persisted.
+///
+/// FP32 is the default and the numerical reference. FP16 is opt-in.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum StateQuant {
     FP32,
-    Q8,
-    Q4,
+    /// Half-precision storage, FP32 arithmetic. Halves per-sequence state; no
+    /// scales, no error-feedback buffer, no stochastic rounding, so it is
+    /// deterministic and spec-decode rollback is lossless.
+    FP16,
 }
 
 /// Redundancy proxy for DeltaNet recurrent-state precision:
@@ -56,17 +68,18 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// ~9.6 GB. FP16 halves it. A real codec only earns its complexity for
 /// high-concurrency serving of 27B-class models.
 ///
-/// # Known conflict
+/// # Formerly a known conflict
 ///
-/// The **tree** DeltaNet replay path is Q8-only — `gated_delta_net_q8_tree_batch_seq`
-/// is the sole tree kernel, with no FP32 variant — so DDTree spec-decode cannot
-/// run under this policy. DDTree is opt-in and off by default. Adding an FP32 (or
-/// FP16) tree kernel is the way to reconcile them; forcing Q8 state is not.
+/// The tree DeltaNet replay path used to be Q8-only, so DDTree spec-decode could
+/// not run under this policy. Resolved 2026-08-09:
+/// `gated_delta_net_{f32,f16}_tree_batch_seq` are the tree kernels now and the
+/// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
+/// Retained only so older references resolve; the redundancy threshold that
+/// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
+/// is now FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
+#[deprecated(note = "Q8 state was removed; precision is FP32 or opt-in FP16")]
 pub fn deltanet_state_fp32_below() -> usize {
-    std::env::var("HIPFIRE_DN_STATE_FP32_BELOW")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(usize::MAX)
+    usize::MAX
 }
 
 /// Default DeltaNet state precision, gated on redundancy (`head_dim × n_heads`)
@@ -81,17 +94,40 @@ pub fn deltanet_state_fp32_below() -> usize {
 ///
 /// The `HIPFIRE_QWEN35_STATE_QUANT` override referenced in earlier revisions of
 /// this comment does **not** exist — no code reads that variable.
-///
-/// NOTE: FP32 state is unsupported by the **tree** DeltaNet replay path
-/// (`gated_delta_net_q8_tree_batch_seq` is the only tree kernel; there is no FP32
-/// variant), so tree-based spec-decode cannot run under the never-Q8 policy.
-/// DDTree is opt-in and off by default. Use the non-tree MTP/DFlash draft paths.
-/// Reconcile by adding an FP32/FP16 tree kernel — not by enabling Q8 state.
 pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
-    if deltanet_state_redundancy(config) < deltanet_state_fp32_below() {
-        StateQuant::FP32
+    let _ = config;
+    // `.flag()`, NOT `.parse_or(false)`: `parse_or` goes through Rust's
+    // `FromStr for bool`, which accepts ONLY "true"/"false", so `=1` parses as
+    // Err and falls back silently. That cost a 24-minute KLD run which reported
+    // "FP16" numbers identical to FP32 to the last digit because it had quietly
+    // run FP32 twice.
+    //
+    // FP16 is the DEFAULT as of 2026-08-09, with FP32 as the opt-out. Evidence:
+    // on Qwen3.5-35B-A3B, +0.68% mean KLD (0.039176 vs 0.038913), ~40x smaller
+    // than the CI half-width; and on the low-redundancy 2B — where Q8 broke
+    // first — greedy decode tracked FP32 EXACTLY for 720 tokens with
+    // degeneration metrics unchanged (unique_ratio 0.3325 vs 0.3317, max_freq
+    // 0.0450 vs 0.0458), against Q8's recorded signature of 0.625 -> 0.555 and
+    // 0.055 -> 0.078.
+    //
+    // That evidence is one prompt on one model, which is why FP32 stays one
+    // flag away rather than being deleted: it is the oracle, and losing the
+    // ability to diff against it is how quantized state hid for months.
+    //
+    // FP16 was made the default and REVERTED the same day (2026-08-09): the
+    // Q8 dispatch functions had never been deleted, only the `StateQuant`
+    // variants that selected them, so surviving `else` arms still reached
+    // them unconditionally and half-size FP16 state faulted with
+    //   Memory Fault ... kernel: gated_delta_net_q8
+    // The kernels, their dispatch entry points and every caller are now gone,
+    // so that blocker is cleared. FP16 stays opt-in until a teacher-forced
+    // FP32-vs-FP16 KLD run on more than one model says otherwise — the
+    // evidence above is one prompt on one model, which is not enough to move
+    // the default.
+    if hipfire_env::DN_STATE_FP16.flag() {
+        StateQuant::FP16
     } else {
-        StateQuant::Q8
+        StateQuant::FP32
     }
 }
 
@@ -212,18 +248,24 @@ impl DeltaNetState {
                 //       s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 //   }
                 //
-                // NOTE: the Q8-only DDTree tree-replay path
-                // (`gated_delta_net_q8_tree_batch_seq`) cannot run while this is
-                // disabled. It will now fail LOUDLY here rather than silently
-                // producing a non-lossless spec-decode path.
-                StateQuant::Q8 | StateQuant::Q4 => {
-                    return Err(hip_bridge::HipError::new(
-                        0,
-                        "quantized DeltaNet state (Q8/Q4) is disabled by policy — \
-                         use FP32 (see qwen35::deltanet_state_fp32_below). The \
-                         reference allocation is preserved in-source for the \
-                         future DeltaNet-state codec.",
-                    ));
+                // DDTree tree-replay no longer depends on any of this: it runs
+                // on `gated_delta_net_{f32,f16}_tree_batch_seq`, picked from
+                // the state precision. The Q8 tree kernel is deleted.
+                StateQuant::FP16 => {
+                    // Half the bytes. Raw because this is f16 storage the
+                    // kernels widen on load — there is no f16 DType at this
+                    // layer, and labelling it F32 would make every downstream
+                    // size calculation wrong.
+                    let buf = gpu.hip.malloc(s_size * 2)?;
+                    gpu.hip.memset(&buf, 0, s_size * 2)?;
+                    s_matrices.push(GpuTensor {
+                        buf,
+                        shape: vec![s_size],
+                        dtype: DType::Raw,
+                    });
+                    // f16 needs no scales (per-element exponent); the vector
+                    // survives only because callers still index it.
+                    s_scales.push(gpu.zeros(&[n_heads], DType::F32)?);
                 }
             }
             if ef_enabled {
@@ -332,25 +374,15 @@ impl DeltaNetState {
                     s_matrices.push(g.zeros(&[s_size], DType::F32)?);
                     s_scales.push(g.zeros(&[n_heads], DType::F32)?);
                 }
-                StateQuant::Q8 => {
-                    let buf = g.hip.malloc(s_size)?;
-                    g.hip.memset(&buf, 0, s_size)?;
+                StateQuant::FP16 => {
+                    let buf = g.hip.malloc(s_size * 2)?;
+                    g.hip.memset(&buf, 0, s_size * 2)?;
                     s_matrices.push(GpuTensor {
                         buf,
                         shape: vec![s_size],
-                        dtype: DType::F32,
+                        dtype: DType::Raw,
                     });
-                    s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
-                }
-                StateQuant::Q4 => {
-                    let buf = g.hip.malloc(s_size / 2)?;
-                    g.hip.memset(&buf, 0, s_size / 2)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size / 2],
-                        dtype: DType::F32,
-                    });
-                    s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
+                    s_scales.push(g.zeros(&[n_heads], DType::F32)?);
                 }
             }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);

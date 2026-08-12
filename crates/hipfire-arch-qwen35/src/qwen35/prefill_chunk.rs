@@ -10,6 +10,39 @@
 use super::prefill_batch::*;
 use super::*;
 
+/// Activation precision for one oq4 prefill projection site (W4A4 experiments).
+///
+/// `HIPFIRE_OQ4_PREFILL_ACT_BITS_<SITE>` (QKV | GATEUP | O | DOWN) overrides the
+/// global `HIPFIRE_OQ4_PREFILL_ACT_BITS` for that site alone; with both unset the
+/// production routing is unchanged. Values: `4` (int4 activation), `8` (int8-MMQ),
+/// `16` (f16 activation); all four sites accept all three.
+///
+/// Note which sites are actually int4 by default at prefill batch sizes: **QKV
+/// and GATEUP both route to int8 MMQ at n>=64**, so only O and DOWN run int4.
+/// That means a global `=4` does NOT produce an all-int4 prefill — per-site `=4`
+/// on QKV/GATEUP is what forces those (plan §13i). A global `=8` gives a fully-A8
+/// prefill.
+///
+/// The per-site form started as a way to hold ONE projection at A16 while the
+/// rest ran A4 — an upper bound on what mixed precision at that site could buy,
+/// measurable before building anything. That sweep found `o_proj` to be the
+/// activation-sensitive site (plan §13c), and `8` is the real lever it pointed at.
+/// The site names are spelled out rather than interpolated so the env-doc
+/// scanner (and anyone grepping) can see them, and so the lookup does not
+/// allocate on the prefill path.
+pub(crate) fn oq4_act_bits(site: &str) -> Option<String> {
+    let per_site = match site {
+        "QKV" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_QKV"),
+        "GATEUP" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_GATEUP"),
+        "O" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_O"),
+        "DOWN" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_DOWN"),
+        other => panic!("oq4_act_bits: unknown site {other}"),
+    };
+    per_site
+        .ok()
+        .or_else(|| std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok())
+}
+
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -769,6 +802,24 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         // a second dtoh sync per MoE layer.
         let mut path2_m_total: usize = 0;
         let path2_shape = moe_grouped_path2_shape(n, k_top, n_exp);
+        // Same reasoning as the FA gate: when the grouped path is declined the
+        // only outward sign is a GEMV-dominated histogram — measured 1279
+        // dispatches/token on Qwen3.6-35B-A3B, with MoE routing at one dispatch
+        // per token per layer. Name the reason instead.
+        if !path2_eligible && hipfire_rdna::kernel_trace::enabled() {
+            eprintln!(
+                "[kernel-trace] MoE grouped GEMM declined: expert_gate_up={:?} arch={}                  use_path2={} mixed={} experts_empty={} buckets={} n={} k_top={} n_exp={}",
+                dtypes.expert_gate_up,
+                gpu.arch,
+                use_path2,
+                dtypes.routed_profile.is_mixed(),
+                ffn.experts.is_empty(),
+                routed_expert_buckets.is_some(),
+                n,
+                k_top,
+                n_exp
+            );
+        }
         if routed_expert_buckets.is_some() && !path2_eligible {
             return Err(HipError::new(
                 0,
@@ -1179,30 +1230,55 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         n,
                     )?;
                 }
-                // Opus Quant routed experts (indexed Path 1; no grouped-WMMA kernel).
-                // x_rot_batch is FWHT-rotated above like the MQ path.
-                DType::Oq4G256 => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    topk_indices,
-                    &pbs.x_rot_batch,
-                    gate_batch,
-                    up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )?,
-                DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    topk_indices,
-                    &pbs.x_rot_batch,
-                    gate_batch,
-                    up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )?,
+                // Opus Quant routed experts (indexed Path 1; no grouped-WMMA
+                // kernel). These read x PER SLOT, not the shared
+                // `x_rot_batch`: routed experts carry DIFFERENT AWQ scales
+                // (each sees a different token subset, hence a different
+                // imatrix), and the divide must precede the FWHT, so one
+                // rotation cannot serve them all. Expand x_norm_batch into
+                // [N × K_TOP × dim], each slot divided by its own expert's
+                // scale. See `rotate_x_mq_awq_indexed_batched`; with no
+                // sidecars (paged mode included) this is the plain rotation
+                // replicated per slot, which the kernels still require.
+                dt @ (DType::Oq4G256 | DType::Oq8G256) => {
+                    let x_rot_slots = pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
+                    gpu.rotate_x_mq_awq_indexed_batched(
+                        &pbs.x_norm_batch,
+                        ffn.expert_gate_up_awq_ptrs.as_ref(),
+                        topk_indices,
+                        x_rot_slots,
+                        gate_up_k,
+                        k_top,
+                        n,
+                    )?;
+                    if dt == DType::Oq4G256 {
+                        gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                            &ffn.expert_gate_up_ptrs,
+                            topk_indices,
+                            x_rot_slots,
+                            gate_batch,
+                            up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true, // x_rot_slots is [N x K_TOP x dim]
+                        )?;
+                    } else {
+                        gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                            &ffn.expert_gate_up_ptrs,
+                            topk_indices,
+                            x_rot_slots,
+                            gate_batch,
+                            up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true, // x_rot_slots is [N x K_TOP x dim]
+                        )?;
+                    }
+                }
                 other => panic!(
                     "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                              experts[0].gate_up dtype {other:?} — admit predicate should \
@@ -1264,6 +1340,21 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             gpu.silu_mul_f32(gate_batch, up_batch, rot_batch)?;
         } else if ffn.experts.is_empty() {
             gpu.fused_silu_mul_rotate_mq_batched(gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+        } else if let Some(down_awq) = ffn.expert_down_awq_ptrs.as_ref() {
+            // Per-expert AWQ on the down input. `experts[0].down` is NOT
+            // representative: routed experts carry different scales for the
+            // same reason they do on the gate_up side. `rot_batch` is already
+            // one row per (token, krank), so only the scale lookup changes —
+            // select it on device from topk_indices.
+            gpu.fused_silu_mul_rotate_mq_awq_indexed(
+                gate_batch,
+                up_batch,
+                Some(down_awq),
+                topk_indices,
+                rot_batch,
+                mi,
+                n * k_top,
+            )?;
         } else {
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
@@ -1715,10 +1806,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         gate_batch,
         up_batch,
         rot_batch,
         down_expanded,
+        x_rot_expanded: pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch"),
         expert_token_counts: &grouped_scratch.expert_token_counts,
         expert_offsets: &grouped_scratch.expert_offsets,
         sorted_slot_index: &grouped_scratch.sorted_slot_index,
@@ -2172,11 +2266,17 @@ pub(crate) fn forward_prefill_chunk(
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
     let q8_wmma_arch = gpu.arch_caps.has_wmma();
     let f16_prefill_wmma = qwen35_f16_prefill_wmma_enabled(gpu);
-    let fa_batched_ok = (!kv_cache.quantized
+    // Split the two halves so a failure can be NAMED. When FA layers fall back
+    // they go per-token through `run_fa_layer_body`, and the only outward sign
+    // is a GEMV-dominated kernel histogram — measured 43:1 against GEMM on
+    // Qwen3.5-0.8B--mq4. Which of the two conditions failed is what turns that
+    // into something actionable, and it is invisible from outside.
+    let fa_kv_ok = !kv_cache.quantized
         || kv_cache.quant_q8
         || kv_cache.quant_asym4
         || kv_cache.quant_asym3
-        || kv_cache.quant_asym2)
+        || kv_cache.quant_asym2;
+    let fa_batched_ok = fa_kv_ok
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) => {
                 is_batchable_la(l.wq.gpu_dtype, fa_arch)
@@ -2197,6 +2297,26 @@ pub(crate) fn forward_prefill_chunk(
             }
             _ => true, // LA layers don't gate this check
         });
+
+    // Reported under HIPFIRE_KERNEL_TRACE so it lands beside the histogram that
+    // motivates the question, and costs nothing otherwise.
+    if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
+        let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
+            LayerWeights::FullAttn(l) => {
+                (!is_batchable_la(l.wq.gpu_dtype, fa_arch)).then(|| format!("{:?}", l.wq.gpu_dtype))
+            }
+            _ => None,
+        });
+        eprintln!(
+            "[kernel-trace] FA layers take the PER-TOKEN fallback: kv_ok={fa_kv_ok}              (quantized={}, q8={}, asym4={}, asym3={}, asym2={}), first non-batchable              FA weight dtype={}",
+            kv_cache.quantized,
+            kv_cache.quant_q8,
+            kv_cache.quant_asym4,
+            kv_cache.quant_asym3,
+            kv_cache.quant_asym2,
+            bad_dtype.as_deref().unwrap_or("<none — weights all batchable>")
+        );
+    }
     // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
     // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
     // captured value would be stale on replay — the attention kernel would
@@ -2228,9 +2348,9 @@ pub(crate) fn forward_prefill_chunk(
     // tree_verify.pre_rope_k_capture[]. Increments alongside each
     // FullAttention layer iteration regardless of MoE/non-MoE variant.
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
-    let use_q8_gdn_per_token =
+    let use_gdn_per_token =
         force_q8_gdn_per_token || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled());
-    let q8_gdn_serial_frame_base = if use_q8_gdn_per_token
+    let q8_gdn_serial_frame_base = if use_gdn_per_token
         && q8_gdn_verify_serial_frames_enabled()
         && gdn_tape.is_some()
         && tree_verify.is_none()
@@ -2281,12 +2401,17 @@ pub(crate) fn forward_prefill_chunk(
                         // the int4 activation quantize (decode parity:
                         // rotate_x_mq[_awq] → quantize_act_oq4).
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
                 let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
                 let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let is_oq4 = matches!(layer.wqkv.gpu_dtype, DType::Oq4G256);
+                let is_oq8 = matches!(layer.wqkv.gpu_dtype, DType::Oq8G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 let is_f32 = matches!(layer.wqkv.gpu_dtype, DType::F32);
                 let is_f16 = matches!(layer.wqkv.gpu_dtype, DType::F16 | DType::BF16);
@@ -2590,6 +2715,23 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wqkv.k,
                         n,
                     )?;
+                } else if is_oq8 {
+                    // Opus W8A8: x_rot_batch is FWHT-rotated above (is_mq covers
+                    // Oq8G256 — types.rs maps it to RotationPlan::FwhtG256). No
+                    // fused oq8 PREFILL arm exists (FusedQkvzaOq8G256 resolves to
+                    // the decode GEMV), so run one grouped int8-WMMA GEMM per
+                    // projection. Each shares the same int8 activation quantize
+                    // via the batched scratch, so the redundancy is the quantize
+                    // launch, not a re-read of x.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+                    for (w, y) in [
+                        (&layer.wqkv, &pbs.dn_qkv_batch),
+                        (&layer.wz, &pbs.dn_z_batch),
+                        (&layer.w_beta, &pbs.dn_beta_batch),
+                        (&layer.w_alpha, &pbs.dn_alpha_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (is_mq).
                     // The FusedQkvzaOq4G256 run-arm int4-quantizes it once then
@@ -2857,29 +2999,25 @@ pub(crate) fn forward_prefill_chunk(
                 }
 
                 // Gated Delta Net — tree variant reads per-token S from
-                // s_tape[parent] (or pre-block s_q8_init at root); linear
+                // s_tape[parent] (or pre-block s_init at root); linear
                 // variant advances dn_state.s_matrices in place.
                 if let Some(parents) = tree_parents {
-                    if matches!(dn_state.quant, StateQuant::FP32) {
-                        return Err(hip_bridge::HipError::new(
-                            0,
-                            "FP32-state batched prefill does not support tree DeltaNet replay yet",
-                        ));
-                    }
-                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
-                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
+                    let tape = pbs.dn_s_tape.as_ref().expect(
+                        "tree-aware LA requires dn_s_tape scratch (check PrefillBatchScratch::new)",
+                    );
+                    let tree = match dn_state.quant {
+                        StateQuant::FP32 => Gpu::gated_delta_net_f32_tree_batch_seq,
+                        StateQuant::FP16 => Gpu::gated_delta_net_f16_tree_batch_seq,
+                    };
+                    tree(
+                        gpu,
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
+                        tape,
                         parents,
                         &pbs.dn_attn_out_batch,
                         n,
@@ -2899,49 +3037,42 @@ pub(crate) fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if use_q8_gdn_per_token {
+                } else if use_gdn_per_token {
+                    // FP16 only — the FP32 arm above is batched, and batched
+                    // vs per-token is identical there (no narrowing). f16
+                    // narrows once per launch, so per-token matters.
                     for step in 0..n {
-                        // #17: the Q8 requant seed is derived from the absolute
-                        // sequence position and the LA layer index, so the old
-                        // `debug_set_gdn_requant_frame` poke that synthesized a
-                        // serial-decode-matching frame here is no longer needed.
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
                         let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
                         let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
                         let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
-                        gpu.gated_delta_net_q8(
+                        gpu.gated_delta_net_f16_batch_seq(
                             &q,
                             &k,
                             &v,
                             &alpha,
                             &beta,
                             &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
                             &out,
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
-                            position_at_row(step) as u32,
-                            delta_layer_idx as u32,
                         )?;
                     }
                 } else {
-                    gpu.gated_delta_net_q8_batch_seq(
+                    gpu.gated_delta_net_f16_batch_seq(
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
-                        position_at_row(0) as u32,
-                        delta_layer_idx as u32,
                     )?;
                 }
 
@@ -3020,12 +3151,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
+                let wo_is_oq8 = matches!(layer.wo.gpu_dtype, DType::Oq8G256);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -3066,11 +3202,11 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wo.k,
                         n,
                     )?;
-                } else if wo_is_oq4 {
-                    // Opus W4A4: wo_input is FWHT(+AWQ)-rotated above (wo_is_mq).
-                    // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
-                    // + add into the residual stream (pbs.x_batch).
-                    gpu.gemm_oq4_grouped_residual_act_batched(
+                } else if wo_is_oq8 {
+                    // Opus W8A8 o_proj: grouped int8-WMMA GEMM into scratch +
+                    // residual add (no fused oq8 residual kernel), mirroring the
+                    // oq4 arm below.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
                         &layer.wo.buf,
                         wo_input,
                         &pbs.x_batch,
@@ -3078,6 +3214,46 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wo.k,
                         n,
                     )?;
+                } else if wo_is_oq4 {
+                    // Opus W4A4: wo_input is FWHT(+AWQ)-rotated above (wo_is_mq).
+                    // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
+                    // + add into the residual stream (pbs.x_batch).
+                    // A4 KLD gate: HIPFIRE_OQ4_PREFILL_ACT_BITS[_O]=16 uses the
+                    // W4A16 residual variant (act16 baseline), =8 the int8-MMQ
+                    // residual variant; default = W4A4. o_proj is the most
+                    // activation-sensitive oq4 site (plan §13c), so A8 here is
+                    // the cheapest real mixed-precision lever.
+                    let o_bits = oq4_act_bits("O");
+                    if o_bits.as_deref() == Some("16") {
+                        gpu.gemm_oq4_grouped_residual_f16_batched(
+                            &layer.wo.buf,
+                            wo_input,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                        )?;
+                    } else if o_bits.as_deref() == Some("8") {
+                        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                        gpu.gemm_oq4_residual_mmq(
+                            &layer.wo.buf,
+                            wo_input,
+                            &x_n,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                            true,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_residual_act_batched(
+                            &layer.wo.buf,
+                            wo_input,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                        )?;
+                    }
                 } else if wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     run_residual_gemm_key(
@@ -3222,6 +3398,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3229,6 +3409,7 @@ pub(crate) fn forward_prefill_chunk(
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
+                let ffn_is_oq8 = matches!(layer.w_gate.gpu_dtype, DType::Oq8G256);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -3428,21 +3609,101 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
-                } else if ffn_is_oq4 {
-                    // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
-                    run_fused_gate_up_key(
-                        gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
+                } else if ffn_is_oq8 {
+                    // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
+                    // same buffers the fused kernel writes; downstream silu_mul
+                    // is unchanged.
+                    gpu.quantize_act_oq8_batched(
                         &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch,
-                        &pbs.up_batch,
                         layer.w_gate.m,
-                        layer.w_up.m,
                         layer.w_gate.k,
                         n,
                     )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
+                } else if ffn_is_oq4 {
+                    // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
+                    // CAREFUL — the default here is NOT int4 activation. The
+                    // `FusedGateUpOq4G256` dispatch key routes to
+                    // `gemm_oq4_gate_up_mmq` (int8 MMQ) whenever n >= 64, falling
+                    // back to f16-WMMA below that; the int4 activation path is
+                    // never taken at prefill batch sizes. So gate_up has always
+                    // run at A8, including under a global `=4` (plan §13i).
+                    //
+                    // =16 unfuses to two W4A16 GEMMs, =8 pins the int8-MMQ pair
+                    // explicitly at any n, and =4 forces the TRUE int4-activation
+                    // path (two grouped-act GEMMs) — which nothing reached before,
+                    // so "full W4A4" numbers predating §13i all had gate_up at A8.
+                    // Default (unset) keeps the existing routing untouched.
+                    // The downstream silu_mul is identical in every case.
+                    let gate_up_bits = oq4_act_bits("GATEUP");
+                    if gate_up_bits.as_deref() == Some("4") {
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.w_gate.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.up_batch,
+                            layer.w_up.m,
+                            layer.w_up.k,
+                            n,
+                        )?;
+                    } else if gate_up_bits.as_deref() == Some("8") {
+                        gpu.gemm_oq4_gate_up_mmq(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    } else if gate_up_bits.as_deref() == Some("16") {
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.w_gate.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.up_batch,
+                            layer.w_up.m,
+                            layer.w_up.k,
+                            n,
+                            256,
+                        )?;
+                    } else {
+                        run_fused_gate_up_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    }
                 } else if gdn_tape.is_some() {
                     gpu.gemm_gate_up_hfq4g256_exact(
                         &layer.w_gate.buf,
@@ -3503,6 +3764,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3511,6 +3776,7 @@ pub(crate) fn forward_prefill_chunk(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
+                let w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -3562,11 +3828,9 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_down.k,
                         n,
                     )?;
-                } else if w_down_is_oq4 {
-                    // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
-                    // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
-                    // into scratch + residual add into the hidden stream.
-                    gpu.gemm_oq4_grouped_residual_act_batched(
+                } else if w_down_is_oq8 {
+                    // Opus W8A8 down: grouped int8-WMMA GEMM + residual add.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
                         &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
@@ -3574,6 +3838,44 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_down.k,
                         n,
                     )?;
+                } else if w_down_is_oq4 {
+                    // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
+                    // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
+                    // into scratch + residual add into the hidden stream.
+                    // A4 KLD gate: [_DOWN]=16 uses the W4A16 residual variant,
+                    // =8 the int8-MMQ one (down is the 2nd most act-sensitive
+                    // oq4 site after o_proj — plan §13c).
+                    let down_bits = oq4_act_bits("DOWN");
+                    if down_bits.as_deref() == Some("16") {
+                        gpu.gemm_oq4_grouped_residual_f16_batched(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &pbs.x_batch,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                        )?;
+                    } else if down_bits.as_deref() == Some("8") {
+                        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+                        gpu.gemm_oq4_residual_mmq(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &x_n,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                            true,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_residual_act_batched(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &pbs.x_batch,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                        )?;
+                    }
                 } else if w_down_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
                     run_residual_gemm_key(
@@ -3731,12 +4033,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let qkv_is_oq4 = matches!(layer.wq.gpu_dtype, DType::Oq4G256);
+                let qkv_is_oq8 = matches!(layer.wq.gpu_dtype, DType::Oq8G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 let qkv_is_f32 = matches!(layer.wq.gpu_dtype, DType::F32);
                 let qkv_is_f16 = matches!(layer.wq.gpu_dtype, DType::F16 | DType::BF16);
@@ -3887,6 +4194,22 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wq.k,
                         n,
                     )?;
+                } else if qkv_is_oq8 && qkv_same_dtype {
+                    // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
+                    // off the shared FWHT-rotated activation.
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::Oq8G256)
+                            && matches!(layer.wv.gpu_dtype, DType::Oq8G256),
+                        "FA qkv Oq8 dispatch requires all of wq/wk/wv to be Oq8G256",
+                    );
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+                    for (w, y) in [
+                        (&layer.wq, &pbs.fa_q_full_batch),
+                        (&layer.wk, &pbs.fa_k_batch),
+                        (&layer.wv, &pbs.fa_v_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if qkv_is_oq4 && qkv_same_dtype {
                     // OQ4+ batched prefill FA QKV: int8-WMMA MMQ (n>=64) quantizing
                     // the shared FWHT(+AWQ)-rotated activation to q8_1 ONCE across
@@ -3897,7 +4220,45 @@ pub(crate) fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
                         "FA qkv Oq4 dispatch requires all of wq/wk/wv to be Oq4G256",
                     );
-                    if n >= 64 {
+                    // A4 int4-act gate: HIPFIRE_OQ4_PREFILL_ACT_BITS=4 forces TRUE
+                    // W4A4 (int4 activations) on qkv even at n>=64, where the default
+                    // routes to W4A8-MMQ. qkv@n>=64 is the ONLY non-W4A4 site in oq4
+                    // prefill (gate_up/o/down are already W4A4), so this makes a
+                    // fully-W4A4 scored prefill reachable for the A4 KLD gate. Default
+                    // (unset) keeps W4A8-MMQ, the shipped incumbent. See plan doc §9a.
+                    let act_bits = oq4_act_bits("QKV");
+                    let force_a4 = act_bits.as_deref() == Some("4");
+                    if act_bits.as_deref() == Some("16") {
+                        // A4 KLD act16 baseline: W4A16 per-projection qkv (no fused f16
+                        // qkv kernel), into the same q/k/v buffers as the W4A4 path.
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wq.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            layer.wq.m,
+                            layer.wq.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wk.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_k_batch,
+                            layer.wk.m,
+                            layer.wk.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_v_batch,
+                            layer.wv.m,
+                            layer.wv.k,
+                            n,
+                            256,
+                        )?;
+                    } else if n >= 64 && !force_a4 {
                         gpu.gemm_oq4_qkv_mmq(
                             &layer.wq.buf,
                             &layer.wk.buf,
@@ -4974,12 +5335,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
+                let fa_wo_is_oq8 = matches!(layer.wo.gpu_dtype, DType::Oq8G256);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let fa_wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -5003,6 +5369,16 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
+                } else if fa_wo_is_oq8 {
+                    // Opus W8A8: fa_wo_input is FWHT-rotated above.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.wo.buf,
                         fa_wo_input,
                         &pbs.x_batch,
                         layer.wo.m,
@@ -5155,6 +5531,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5163,6 +5543,7 @@ pub(crate) fn forward_prefill_chunk(
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
+                let fa_ffn_is_oq8 = matches!(layer.w_gate.gpu_dtype, DType::Oq8G256);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let fa_ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let fa_ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -5206,6 +5587,20 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if fa_ffn_is_oq8 {
+                    // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
+                    gpu.quantize_act_oq8_batched(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if fa_ffn_is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (fa_ffn_is_mq).
                     run_fused_gate_up_key(
@@ -5385,6 +5780,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5393,6 +5792,7 @@ pub(crate) fn forward_prefill_chunk(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
+                let fa_w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let fa_w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let fa_w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -5416,6 +5816,16 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
+                } else if fa_w_down_is_oq8 {
+                    // Opus W8A8: ffn_hidden_batch is FWHT-rotated above.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
                         layer.w_down.m,
@@ -6084,79 +6494,80 @@ pub(crate) fn forward_prefill_chunk(
                     );
                 }
                 if let Some(parents) = tree_parents {
-                    if matches!(dn_state.quant, StateQuant::FP32) {
-                        return Err(hip_bridge::HipError::new(
-                            0,
-                            "FP32-state batched prefill does not support tree DeltaNet replay yet",
-                        ));
-                    }
-                    let tape_q8 = pbs
-                        .dn_s_tape_q8
+                    let tape = pbs
+                        .dn_s_tape
                         .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch");
-                    let tape_sc = pbs
-                        .dn_s_tape_scales
-                        .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        .expect("tree-aware LA requires dn_s_tape scratch");
+                    let tree = match dn_state.quant {
+                        StateQuant::FP32 => Gpu::gated_delta_net_f32_tree_batch_seq,
+                        StateQuant::FP16 => Gpu::gated_delta_net_f16_tree_batch_seq,
+                    };
+                    tree(
+                        gpu,
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
+                        tape,
                         parents,
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if use_q8_gdn_per_token {
-                    for step in 0..n {
-                        // #17: the Q8 requant seed is derived from the absolute
-                        // sequence position and the LA layer index, so the old
-                        // `debug_set_gdn_requant_frame` poke that synthesized a
-                        // serial-decode-matching frame here is no longer needed.
-                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
-                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
-                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
-                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
-                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
-                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
-                        gpu.gated_delta_net_q8(
-                            &q,
-                            &k,
-                            &v,
-                            &alpha,
-                            &beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &out,
-                            1,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            position_at_row(step) as u32,
-                            delta_layer_idx as u32,
-                        )?;
-                    }
-                } else {
-                    gpu.gated_delta_net_q8_batch_seq(
+                } else if matches!(dn_state.quant, StateQuant::FP32) {
+                    // Was MISSING: this MoE branch fell straight through to the
+                    // Q8 kernels regardless of state precision, reading FP32
+                    // state as int8 and a [n_heads] scales vector as
+                    // [n_heads × head_dim]. Only unreached because batched
+                    // prefill is declined for MoE models (`pbs_eligible`).
+                    gpu.gated_delta_net_f32_batch_seq(
                         &pbs.dn_q_batch,
                         &pbs.dn_k_batch,
                         &pbs.dn_v_batch,
                         &pbs.dn_alpha_batch,
                         &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
-                        position_at_row(0) as u32,
-                        delta_layer_idx as u32,
+                    )?;
+                } else if use_gdn_per_token {
+                    for step in 0..n {
+                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
+                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
+                        gpu.gated_delta_net_f16_batch_seq(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
+                } else {
+                    gpu.gated_delta_net_f16_batch_seq(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 }
                 debug_stop_after!("gdn", layer_idx);

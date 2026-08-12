@@ -9,6 +9,7 @@ use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
+use std::borrow::Cow;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -151,11 +152,28 @@ impl VisionWeights {
 
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
+/// Decode a lossless bf16 recoding to plain bf16 bytes, if that is what this is.
+///
+/// `--format bf16` applies `Bf16Huff` (qt=50) by default and
+/// `HIPFIRE_BF16L3_RESIDENT` leaves `Bf16Lut3` (qt=49) packed, so a bf16 vision
+/// tower arrives with a quant code the dtype matches below do not know. Returns
+/// `(logical_qt, bytes)` — unchanged for anything that is not a recoding.
+fn decode_recoded<'a>(qt: u8, data: &'a [u8], n: usize, name: &str) -> (u8, Cow<'a, [u8]>) {
+    hipfire_runtime::hfq::decode_recoded_bf16(qt, data, n)
+        .unwrap_or_else(|| panic!("{name}: failed to decode recoded vision tensor (qt={qt})"))
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_cow(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    let mut vals: Vec<f32> = match info.quant_type {
+    let (qt, data) = decode_recoded(info.quant_type, data.as_ref(), n, name);
+    let data = data.as_ref();
+    let mut vals: Vec<f32> = match qt {
         1 => data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -164,11 +182,12 @@ fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
         6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
-        _ => panic!(
-            "expected F16/F32/HFQ4 for {name}, got qt={}",
-            info.quant_type
-        ),
+        _ => panic!("expected F16/F32/BF16/HFQ4 for {name}, got qt={qt}"),
     };
     vals.truncate(n);
     vals
@@ -181,13 +200,25 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
     let (info, data) = hfq
-        .tensor_data(name)
+        .tensor_data_cow(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
-    match info.quant_type {
+    let (qt, data) = decode_recoded(info.quant_type, data.as_ref(), n, name);
+    let data = data.as_ref();
+    match qt {
         1 => {
             // F16 — upload directly. Shape records element count, not byte count.
             gpu.upload_raw(data, &[n])
+        }
+        16 => {
+            // BF16 — narrow to F16 for gemm_f16, same as the HFQ4 arm below.
+            let f16_bytes: Vec<u8> = data
+                .chunks_exact(2)
+                .flat_map(|c| {
+                    f32_to_f16(bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).to_le_bytes()
+                })
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
         }
         6 | 7 => {
             // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
@@ -199,7 +230,9 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
                 .collect();
             gpu.upload_raw(&f16_bytes, &[n])
         }
-        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+        other => panic!(
+            "{name}: unsupported vision quant_type={other} (expected F16=1, BF16=16, HFQ4=6/7)"
+        ),
     }
 }
 
@@ -267,7 +300,7 @@ pub fn load_vision_weights(
     // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load
     // time for the gemm_f16 path — there is no GPU HFQ4 kernel for vision yet.
     // See CHANGELOG.md "v0.1.7-alpha.4 / Vision" for details.
-    if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
+    if let Some(info) = hfq.find_tensor_info("model.visual.patch_embed.proj.weight") {
         let fmt = match info.quant_type {
             1 => "F16 (direct)",
             6 => "HFQ4-G256 (dequanting to F16 on load)",

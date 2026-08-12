@@ -160,12 +160,21 @@ fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
     }
 }
 
+/// Read a tensor's bytes, decoding any lossless bf16 recoding to plain bf16.
+///
+/// `--format bf16` applies `Bf16Huff` (qt=50) by default, and
+/// `HIPFIRE_BF16L3_RESIDENT` leaves `Bf16Lut3` (qt=49) packed, so a plain bf16
+/// artifact reaches this loader with a quant code `dequant_qt`/`linear_dtype`
+/// do not know. Decoding here rather than in those means they only ever see
+/// logical codes — a new caller cannot forget the case.
 fn hfq_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .ok_or_else(|| format!("nemotron hfq: missing tensor {name:?}"))?;
-    let _ = &info.shape;
-    Ok((info.quant_type, data))
+    use hipfire_runtime::hfq::LogicalReadError;
+    hfq.tensor_data_logical(name).map_err(|e| match e {
+        LogicalReadError::Missing => format!("nemotron hfq: missing tensor {name:?}"),
+        LogicalReadError::Decode(qt) => {
+            format!("nemotron hfq: failed to decode recoded tensor {name} (qt={qt})")
+        }
+    })
 }
 
 pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str, String> {

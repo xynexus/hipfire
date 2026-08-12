@@ -409,6 +409,22 @@ pub fn run_moe_decode(
         p.n_exp,
         p.norm_topk_prob
     ))?;
+    // Feed the shared router histogram (see the CPU-fallback call below for why
+    // this port was missing it). Gated on the histogram being armed because,
+    // unlike the fallback, this path keeps top-K on-device — recording costs a
+    // per-token device->host copy, so it must stay off by default.
+    if crate::moe_telemetry::moe_router_histogram_active() {
+        hip!(gpu.bind_thread())?;
+        let mut idx = vec![0i32; p.k];
+        let bytes = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let weights = hip!(gpu.download_f32(p.topk_weights))?;
+        let indices: Vec<usize> = idx
+            .into_iter()
+            .map(crate::moe_telemetry::router_index_i32_to_usize)
+            .collect();
+        crate::moe_telemetry::record_moe_router_selection(p.layer, &indices, &weights);
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -500,34 +516,52 @@ pub fn run_moe_decode(
             2 * p.mi,
             gate_up_k,
         ))?;
-    } else if res.routed_indexable_oq4 {
-        // Opus Quant W4A16 indexed gate_up (132 B/group MoE-block kernel; `xr`
-        // is FWHT-rotated above, same basis as the MQ path). Batched variant
-        // with batch=1 (single-token decode).
-        hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-            p.expert_gate_up_ptrs,
+    } else if res.routed_indexable_oq4 || res.routed_indexable_oq8 {
+        // Opus Quant indexed gate_up (OQ4 132 B/group, OQ8 260 B/group
+        // OqPlusCompact-expanded). Batched variant with batch=1 (single-token
+        // decode).
+        //
+        // These read x PER SLOT, not the shared `xr`: routed experts carry
+        // DIFFERENT AWQ scales (routing gives each a different token subset,
+        // hence a different imatrix), and the divide must precede the FWHT, so
+        // one rotation cannot serve them all. With no sidecars this is the
+        // plain rotation replicated per slot, which the kernels still require.
+        hip!(gpu.rotate_x_mq_awq_indexed_batched(
+            p.x_norm,
+            p.expert_gate_up_awq_ptrs,
             p.topk_indices,
-            xr,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
+            p.x_rot_expanded,
             gate_up_k,
             p.k,
             1,
         ))?;
-    } else if res.routed_indexable_oq8 {
-        // Opus Quant W8A16 indexed gate_up (260 B/group, OqPlusCompact-expanded).
-        hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            xr,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            gate_up_k,
-            p.k,
-            1,
-        ))?;
+        if res.routed_indexable_oq4 {
+            hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot_expanded,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+                1,
+                true,
+            ))?;
+        } else {
+            hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.x_rot_expanded,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+                1,
+                true,
+            ))?;
+        }
     } else {
         // routed_indexable_paro
         hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
@@ -557,6 +591,19 @@ pub fn run_moe_decode(
             p.k,
             p.mi,
             paro_down.krot,
+        ))?;
+    } else if let Some(down_awq) = p.expert_down_awq_ptrs {
+        // Per-expert AWQ on the down input — routed experts do not share a
+        // scale. `rot_batch` is already one row per krank, so only the lookup
+        // changes. See `fused_silu_mul_rotate_mq_awq_indexed`.
+        hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed(
+            p.gate_batch,
+            p.up_batch,
+            Some(down_awq),
+            p.topk_indices,
+            p.rot_batch,
+            p.mi,
+            p.k,
         ))?;
     } else {
         // MQ4/MQ6: no AWQ on expert down weights for Phase 1 targets (A3B)
@@ -743,6 +790,12 @@ fn run_moe_decode_cpu_fallback(
             }
         }
     }
+    // Feed the shared router histogram. The verbatim port of
+    // `moe_ffn_decode_impl` dropped this, so expert-balance telemetry was blank
+    // for every model routed through this executor — which is every MoE whose
+    // `k != 8`, since those fail the `use_gpu_topk` guard and land here.
+    // Indices/weights are already on the host, so this costs nothing extra.
+    crate::moe_telemetry::record_moe_router_selection(p.layer, &topk_indices, &topk_weights);
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
     if p.shared_down_w.dtype == DType::MQ4G256 {
@@ -1797,28 +1850,49 @@ pub fn run_moe_prefill(
                     k_top,
                     n,
                 )),
-                DType::Oq4G256 => hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                    p.expert_gate_up_ptrs,
-                    p.topk_indices,
-                    gate_up_source,
-                    p.gate_batch,
-                    p.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )),
-                DType::Oq8G256 => hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                    p.expert_gate_up_ptrs,
-                    p.topk_indices,
-                    gate_up_source,
-                    p.gate_batch,
-                    p.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k_top,
-                    n,
-                )),
+                // Opus Quant reads x PER SLOT, not the shared `gate_up_source`:
+                // routed experts carry DIFFERENT AWQ scales, and the divide
+                // must precede the FWHT, so one rotation cannot serve them all.
+                // With no sidecars this is the plain rotation replicated per
+                // slot, which the kernels still require.
+                dt @ (DType::Oq4G256 | DType::Oq8G256) => {
+                    hip!(gpu.rotate_x_mq_awq_indexed_batched(
+                        p.x_norm_batch,
+                        p.expert_gate_up_awq_ptrs,
+                        p.topk_indices,
+                        p.x_rot_expanded,
+                        gate_up_k,
+                        k_top,
+                        n,
+                    ))?;
+                    if dt == DType::Oq4G256 {
+                        hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                            p.expert_gate_up_ptrs,
+                            p.topk_indices,
+                            p.x_rot_expanded,
+                            p.gate_batch,
+                            p.up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true,
+                        ))
+                    } else {
+                        hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                            p.expert_gate_up_ptrs,
+                            p.topk_indices,
+                            p.x_rot_expanded,
+                            p.gate_batch,
+                            p.up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true,
+                        ))
+                    }
+                }
                 _other => {
                     return Err(DispatchError::UnsupportedVariant {
                         family: "moe",
@@ -1865,7 +1939,22 @@ pub fn run_moe_prefill(
             | DType::MQ3G256Lloyd
             | DType::Oq4G256
             | DType::Oq8G256 => {
-                if let Some(awq) = p.down_awq_scale {
+                if let Some(down_awq) = p.expert_down_awq_ptrs {
+                    // Per-expert AWQ: `down_awq_scale` below is ONE
+                    // representative's, which routed experts do not share
+                    // (different token subset → different imatrix → different
+                    // s). `rot_batch` is already one row per (token, krank),
+                    // so only the scale lookup changes.
+                    hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed(
+                        p.gate_batch,
+                        p.up_batch,
+                        Some(down_awq),
+                        p.topk_indices,
+                        p.rot_batch,
+                        mi,
+                        total_slots,
+                    ))?;
+                } else if let Some(awq) = p.down_awq_scale {
                     hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
                         p.gate_batch,
                         p.up_batch,

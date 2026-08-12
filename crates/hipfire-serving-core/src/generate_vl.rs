@@ -12,7 +12,6 @@
 //! `main.rs` monolith (no behavior change); items called from `main.rs` are
 //! `pub`.
 
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -39,7 +38,7 @@ use crate::output_filter::{block_attractor_unclosed_cpu, loop_guard_from_runtime
 pub fn generate_vl(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     params: &GenerateVLParams,
 ) {
     // Keep host-side VL sampling deterministic per request instead of carrying
@@ -669,7 +668,7 @@ pub fn generate_vl(
 pub fn generate_vl_dots_ocr(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
@@ -1041,7 +1040,7 @@ pub fn decode_vl_frames(
 pub fn generate_vl_gemma3(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     params: &GenerateVLParams,
     frames: &[Vec<u8>],
     // Optional per-image text labels, emitted before each `<start_of_image>` so

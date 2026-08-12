@@ -7567,9 +7567,20 @@ fn ffn_batched(
         Some(&pbs.wmma_x_scratch_f16),
     )?;
 
+    dump_buf(
+        gpu,
+        &format!("12_l{layer_idx}_moe_scores_raw"),
+        &pbs.moe_scores_batch,
+    );
+
     // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
+    dump_buf(
+        gpu,
+        &format!("13_l{layer_idx}_moe_scores_softplus"),
+        &pbs.moe_scores_batch,
+    );
 
     // Routing + routed experts + combine now run through the centralized MoE
     // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
@@ -8140,6 +8151,16 @@ fn ffn_batched(
     hipfire_runtime::dispatch::moe_family()
         .run_bias_aware_prefill(gpu, &moe_params)
         .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
+    dump_buf(
+        gpu,
+        &format!("14_l{layer_idx}_moe_topk_weights"),
+        &pbs.moe_topk_weights_batch,
+    );
+    dump_buf(
+        gpu,
+        &format!("15_l{layer_idx}_ffn_out_after_moe"),
+        &pbs.ffn_out_batch,
+    );
 
     Ok(())
 }

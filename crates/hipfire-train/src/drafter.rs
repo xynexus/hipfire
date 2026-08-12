@@ -161,6 +161,7 @@ impl Drafter {
             head_dim: cfg.head_dim,
             inter: cfg.inter,
             rope_base: cfg.rope_base,
+            rotary_dim: 0,
             eps: cfg.eps,
             lora_scale: 1.0 / 4.0,
             lora_rank: 4,
@@ -268,6 +269,12 @@ pub fn free_drafter_acts(gpu: &mut Gpu, a: DrafterActs) -> HipResult<()> {
         let BlockActivations {
             xn1,
             rinv1,
+            q_pre,
+            k_pre,
+            rinv_q,
+            rinv_k,
+            attn_gate,
+            ctx_pre_gate,
             hq,
             hv,
             q_r,
@@ -286,6 +293,12 @@ pub fn free_drafter_acts(gpu: &mut Gpu, a: DrafterActs) -> HipResult<()> {
         for t in [
             xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
         ] {
+            gpu.free_tensor(t)?;
+        }
+        for t in [q_pre, k_pre, rinv_q, rinv_k, attn_gate, ctx_pre_gate]
+            .into_iter()
+            .flatten()
+        {
             gpu.free_tensor(t)?;
         }
     }
@@ -327,6 +340,9 @@ fn block_views<'a>(lw: &'a LayerWeights, ll: &'a LayerLora) -> (BlockWeights<'a>
     (
         BlockWeights {
             norm1: &lw.norm1,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             wq: &lw.wq,
             wk: &lw.wk,
             wv: &lw.wv,
@@ -568,6 +584,9 @@ pub fn drafter_forward(
     for (lw, ll) in &d.layers {
         let bw = BlockWeights {
             norm1: &lw.norm1,
+            q_norm: None,
+            k_norm: None,
+            attn_out_gate: false,
             wq: &lw.wq,
             wk: &lw.wk,
             wv: &lw.wv,

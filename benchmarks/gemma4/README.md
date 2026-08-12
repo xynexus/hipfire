@@ -73,7 +73,7 @@ shared GPU lock:
 hipfire lock run gemma4-phase5-oq8 -- \
   python3 benchmarks/gemma4/run_full_model_admission.py \
     --oracle-model /path/to/pinned/google/gemma-4-31B/snapshot \
-    --candidate-model ~/.hipfire/models/Gemma-4-31B.oq8.hfq \
+    --candidate-model ~/.hipfire/models/Gemma-4-31B--oq8.hfq \
     --output ~/.hipfire/evidence/gemma4/phase5-oq8-admission
 ```
 

@@ -61,6 +61,12 @@ fn free_block(gpu: &mut Gpu, b: BlockActivations) {
     let BlockActivations {
         xn1,
         rinv1,
+        q_pre,
+        k_pre,
+        rinv_q,
+        rinv_k,
+        attn_gate,
+        ctx_pre_gate,
         hq,
         hv,
         q_r,
@@ -79,6 +85,12 @@ fn free_block(gpu: &mut Gpu, b: BlockActivations) {
     for t in [
         xn1, rinv1, hq, hv, q_r, k_r, v, p_all, ctx, x_mid, xn2, rinv2, gate, up, act, pos,
     ] {
+        let _ = gpu.free_tensor(t);
+    }
+    for t in [q_pre, k_pre, rinv_q, rinv_k, attn_gate, ctx_pre_gate]
+        .into_iter()
+        .flatten()
+    {
         let _ = gpu.free_tensor(t);
     }
 }

@@ -117,12 +117,16 @@ fn families() -> &'static [FamilyPlan] {
         },
         // DeepSeek4 compressed-KV/indexer coverage: one tiny ratio-4 layer
         // exercises compressor streams, indexer projections, and mixed attention.
+        // Opus unblocked 2026-08-05: the MLA compressor/indexer streams are
+        // declared SourcePrecision by deepseek4's -spec, and the quantizer now
+        // honours that class for EVERY output format rather than only the
+        // deepseek4-* ones, so a generic OQ build no longer quantizes them.
         FamilyPlan {
             arch: "deepseek4_compressed",
             anchor: "deepseek4-source-precision",
-            candidates: &["deepseek4-source-precision"],
+            candidates: &["deepseek4-source-precision", "oq4", "oq8"],
             quant_flags: &["--allow-mq2-lloyd"],
-            calibrated: &[],
+            calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
         },
         // DeepSeek4 MTP coverage: one main layer seeds `mtp_last_hidden`, then
         // the tiny probe returns logits from the draft MTP layer itself.
@@ -355,11 +359,7 @@ fn requires_hessian_arg(format: &str) -> bool {
 }
 
 fn blocked_oq_cell_reason(family: &str, format: &str) -> Option<&'static str> {
-    if family == "deepseek4_compressed" && format.starts_with("oq") {
-        Some(
-            "blocked: DeepSeek4 compressed-KV/indexer OQ quantizes base tensors, but compressed attention tensors still require source-precision/F16 upload policy; keep explicit until compressor/indexer OQ dtype routing is implemented",
-        )
-    } else if family == "deepseek4_mtp" && format.starts_with("oq") {
+    if family == "deepseek4_mtp" && format.starts_with("oq") {
         Some(
             "blocked: DeepSeek4 MTP OQ omits packaged mtp.0.* tensors in generic OQ artifacts; keep explicit until native MTP tensor inclusion and OQ dtype policy are implemented",
         )
@@ -370,7 +370,7 @@ fn blocked_oq_cell_reason(family: &str, format: &str) -> Option<&'static str> {
 
 fn explicit_blocked_oq_cells(family: &str) -> &'static [(&'static str, bool)] {
     match family {
-        "deepseek4_compressed" | "deepseek4_mtp" => &[
+        "deepseek4_mtp" => &[
             ("oq4", false),
             ("oq4+", true),
             ("oq4++", true),
@@ -1005,9 +1005,12 @@ mod tests {
         assert!(deepseek4.calibrated.contains(&"oq4.25++"));
         assert!(deepseek4.calibrated.contains(&"oq8+"));
         assert!(deepseek4.calibrated.contains(&"oq8++"));
-        assert!(blocked_oq_cell_reason("deepseek4_compressed", "oq8").is_some());
+        // deepseek4_compressed is no longer blocked: the quantizer honours the
+        // arch-declared SourcePrecision class for every format, so its
+        // compressor/indexer tensors survive a generic OQ build.
+        assert!(blocked_oq_cell_reason("deepseek4_compressed", "oq8").is_none());
+        assert!(explicit_blocked_oq_cells("deepseek4_compressed").is_empty());
         assert!(blocked_oq_cell_reason("deepseek4_mtp", "oq8").is_some());
-        assert_eq!(explicit_blocked_oq_cells("deepseek4_compressed").len(), 7);
         assert_eq!(explicit_blocked_oq_cells("deepseek4_mtp").len(), 7);
 
         let llama = families()

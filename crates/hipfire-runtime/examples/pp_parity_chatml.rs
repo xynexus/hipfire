@@ -108,7 +108,7 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
         4096,
     )
     .expect("kv");
-    let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::Q8).expect("dn");
+    let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::FP32).expect("dn");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, 4096).expect("scratch");
 
     // Per-token prefill (matches daemon pp=2 flow; pp=1 daemon uses
@@ -165,7 +165,8 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
     )
     .expect("kv multi");
     let (mut dn, _la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::FP32)
+            .expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
     let dev_last = gpus.output_device;

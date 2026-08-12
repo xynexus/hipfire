@@ -21,6 +21,7 @@
 
 #![allow(unused_imports)]
 
+use hipfire_arch_cohere2_spec as _;
 use hipfire_arch_deepseek4_spec as _;
 use hipfire_arch_dots_ocr_spec as _;
 use hipfire_arch_embeddinggemma_spec as _;
@@ -48,7 +49,7 @@ mod tests {
         // Every migrated arch id must be reachable with an Ingest policy through the
         // bundle (the path the quantizer uses).
         for id in [
-            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24,
+            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25,
         ] {
             let a = reg
                 .get(ArchId(id))

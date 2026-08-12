@@ -10,9 +10,13 @@
 //! bits-per-weight budget. The result is a per-tensor format map the quantizer
 //! consults so oq2 only ever carries the least-important weights.
 
+use faer::Mat;
 use std::collections::{HashMap, HashSet};
 
-use crate::codecs::{dequant_oq2g256, dequant_oq4g256, quantize_oq2g256, quantize_oq4g256};
+use crate::codecs::{
+    dequant_oq2g256, dequant_oq4g256, dequant_oq8g256, quantize_oq2g256, quantize_oq4g256,
+    quantize_oq8g256,
+};
 
 /// On-disk / in-kernel-VRAM bits-per-weight of the three Opus tiers (block
 /// overhead folded in): oq2 = 66 B/256, oq4 = 130 B/256, oq8 = 258 B/256. These
@@ -22,9 +26,11 @@ pub const OQ4_BPW: f64 = 130.0 * 8.0 / 256.0; // 4.0625
 pub const OQ8_BPW: f64 = 258.0 * 8.0 / 256.0; // 8.0625
 
 /// One of the three Opus weight tiers a dense-linear tensor can take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tier {
     Oq2,
+    /// The floor the wired `--mixed-bpw` path uses, hence the `Default`.
+    #[default]
     Oq4,
     Oq8,
 }
@@ -171,6 +177,92 @@ pub fn oq2_sensitivity(
         .sum()
 }
 
+/// TRUE layer output error at oq4: `tr(dW H dW^T)` with the FULL Hessian.
+///
+/// [`oq4_sensitivity`] computes this quantity's DIAGONAL approximation — the
+/// captured imatrix is `diag(H) = E[x_j^2]` — which is the standard GPTQ/imatrix
+/// proxy. The diagonal drops every cross-channel term, and measurement says that
+/// is not a small omission here: ranked by the diagonal proxy, `o_proj` lands
+/// 79th-113th of 113 while being the single largest measured promotion win
+/// (-15.1% KLD alone). It has low per-weight reconstruction error but feeds the
+/// residual stream directly, and only the off-diagonal sees that.
+///
+/// `dW` is already in the ORIGINAL basis: `quantize_oq4g256` rotates and
+/// `dequant_oq4g256` rotates back, so the round-trip error needs no inverse
+/// transform and `hessian` is the raw captured `H`, not a rebased one. That is
+/// what makes this affordable — no O(k^3) congruence, just the contraction.
+///
+/// Cost is `m*k^2` MACs. `hessian` is row-major `k*k`.
+///
+/// Known approximation, unchanged from the diagonal version: this quantizes the
+/// RAW weights, while the pipeline applies AWQ scaling first. It measures what
+/// 4-bit costs at this layer, not what one particular artifact's AWQ choices
+/// cost.
+pub fn oq4_output_sensitivity(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    hessian: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Option<f64> {
+    debug_assert_eq!(weights_f32.len(), m * k);
+    if hessian.len() != k * k {
+        return None;
+    }
+    let q = quantize_oq4g256(weights_f32, signs1, signs2);
+    let deq = dequant_oq4g256(&q, m * k, signs1, signs2);
+
+    // E (m x k) and H (k x k) in f32: f64 would be 537 MB for a k=8192 Hessian,
+    // and this is a ranking statistic, not a solve.
+    let e = Mat::<f32>::from_fn(m, k, |r, c| weights_f32[r * k + c] - deq[r * k + c]);
+    let h = Mat::<f32>::from_fn(k, k, |i, j| hessian[i * k + j]);
+
+    // tr(E H E^T) = sum over all entries of (E H) elementwise-times E. faer's
+    // matmul is blocked and threaded; a rayon-over-rows matvec would re-stream
+    // the whole Hessian per row (268 MB at k=8192).
+    let eh = &e * &h;
+    let mut acc = 0.0f64;
+    for r in 0..m {
+        for c in 0..k {
+            acc += (eh[(r, c)] as f64) * (e[(r, c)] as f64);
+        }
+    }
+    Some(acc)
+}
+
+/// imatrix-weighted output error at oq8 — the RESIDUAL that promotion cannot
+/// remove.
+///
+/// `assign_tiers` credits an oq4 -> oq8 promotion with the whole of `err_oq4`,
+/// which assumes oq8 is lossless. It is near-lossless (3.5e-4 KLD from bf16) but
+/// not zero, so a tensor whose oq4 error is mostly irreducible gets
+/// over-credited and outranks one whose error would actually go away. The
+/// honest gain is `err_oq4 - err_oq8`.
+pub fn oq8_sensitivity(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    imatrix_col: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> f64 {
+    debug_assert_eq!(weights_f32.len(), m * k);
+    let q = quantize_oq8g256(weights_f32, signs1, signs2);
+    let deq = dequant_oq8g256(&q, m * k, signs1, signs2);
+    let mut per_col = vec![0.0f64; k];
+    for row in 0..m {
+        let base = row * k;
+        for c in 0..k {
+            let d = (weights_f32[base + c] - deq[base + c]) as f64;
+            per_col[c] += d * d;
+        }
+    }
+    (0..k)
+        .map(|c| per_col[c] * imatrix_col.get(c).copied().unwrap_or(1.0) as f64)
+        .sum()
+}
+
 /// imatrix-weighted output error at oq4 (per tensor), the sibling of
 /// [`oq2_sensitivity`] used for 3-tier assignment. `< oq2` error and `>` the
 /// (≈0) oq8 error, so the two together give the marginal quality of each upgrade
@@ -208,12 +300,40 @@ pub struct TierCandidate {
     pub numel: usize,
     pub err_oq2: f64,
     pub err_oq4: f64,
+    /// Actual bits-per-weight this tensor costs AT THE FLOOR TIER, which is not
+    /// always `floor.bpw()`. An `oq<BITS>++` base carries `N_out` outliers per
+    /// 256-group in a `130 + 2*N_out` byte block, so an oq4.25++ base really
+    /// costs 4.25 b/w, not the 4.0625 of plain oq4 — and `N_out` is per tensor
+    /// (`HIPFIRE_OUTLIERS_BY_LAYER`), so one constant cannot express it.
+    ///
+    /// Costing the floor at the plain-tier rate understates realized b/w by the
+    /// outlier surcharge (0.1875 at oq4.25++), which both misreports the result
+    /// AND inflates the budget, promoting more tensors than the target allows.
+    /// `None` means the base carries no outliers and costs exactly
+    /// `floor.bpw()`, which is the right answer for every plain-tier caller.
+    pub base_bpw: Option<f64>,
+}
+
+impl TierCandidate {
+    /// Cost of this tensor at `tier`, given the plan's `floor`. Only the floor
+    /// tier is per-tensor; an upgraded tensor is a plain tier with no outliers.
+    fn bpw_at(&self, tier: Tier, floor: Tier) -> f64 {
+        if tier == floor {
+            self.base_bpw.unwrap_or_else(|| floor.bpw())
+        } else {
+            tier.bpw()
+        }
+    }
 }
 
 /// Per-tensor tier assignment across oq2/oq4/oq8.
 #[derive(Clone, Debug, Default)]
 pub struct TierPlan {
     pub tiers: HashMap<String, Tier>,
+    /// The floor the plan was built at. Kept because a candidate's cost at the
+    /// floor is per-tensor (`TierCandidate::base_bpw`), so scoring a plan needs
+    /// to know which tier is the floor.
+    pub floor: Tier,
 }
 
 impl TierPlan {
@@ -232,7 +352,7 @@ impl TierPlan {
         }
         let bits: f64 = candidates
             .iter()
-            .map(|c| self.tier(&c.name).bpw() * c.numel as f64)
+            .map(|c| c.bpw_at(self.tier(&c.name), self.floor) * c.numel as f64)
             .sum();
         bits / total as f64
     }
@@ -246,15 +366,27 @@ impl TierPlan {
 /// Reducing total weighted output error per byte spent is what we maximize.
 pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64, floor: Tier) -> TierPlan {
     let total: usize = candidates.iter().map(|c| c.numel).sum();
-    let mut plan = TierPlan::default();
+    let mut plan = TierPlan {
+        floor,
+        ..Default::default()
+    };
     for c in candidates {
         plan.tiers.insert(c.name.clone(), floor);
     }
     if total == 0 {
         return plan;
     }
-    let target = target_bpw.clamp(floor.bpw(), OQ8_BPW);
-    let budget_bits = (target - floor.bpw()) * total as f64; // extra above all-floor
+    // Budget is measured against what the floor ACTUALLY costs per tensor, not
+    // `floor.bpw()`: an oq4.25++ base already spends 0.1875 b/w per weight on
+    // outliers, and charging the plain-oq4 rate would hand that back as budget
+    // to spend again on promotions.
+    let floor_bits: f64 = candidates
+        .iter()
+        .map(|c| c.bpw_at(floor, floor) * c.numel as f64)
+        .sum();
+    let floor_bpw = floor_bits / total as f64;
+    let target = target_bpw.clamp(floor_bpw, OQ8_BPW);
+    let budget_bits = target * total as f64 - floor_bits; // extra above all-floor
     let mut spent = 0.0f64;
 
     loop {
@@ -264,10 +396,14 @@ pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64, floor: Tier) 
             let (gain, cost, from_ok) = match plan.tier(&c.name) {
                 Tier::Oq2 => (
                     c.err_oq2 - c.err_oq4,
-                    (OQ4_BPW - OQ2_BPW) * c.numel as f64,
+                    (OQ4_BPW - c.bpw_at(Tier::Oq2, floor)) * c.numel as f64,
                     true,
                 ),
-                Tier::Oq4 => (c.err_oq4, (OQ8_BPW - OQ4_BPW) * c.numel as f64, true),
+                Tier::Oq4 => (
+                    c.err_oq4,
+                    (OQ8_BPW - c.bpw_at(Tier::Oq4, floor)) * c.numel as f64,
+                    true,
+                ),
                 Tier::Oq8 => (0.0, 0.0, false),
             };
             if !from_ok || cost <= 0.0 || spent + cost > budget_bits + 1e-6 {
@@ -378,7 +514,49 @@ mod tests {
             numel,
             err_oq2: e2,
             err_oq4: e4,
+            base_bpw: None,
         }
+    }
+
+    /// `tcand` with an explicit floor cost, for the outlier-carrying bases.
+    fn tcand_base(name: &str, numel: usize, e2: f64, e4: f64, base_bpw: f64) -> TierCandidate {
+        TierCandidate {
+            name: name.to_string(),
+            numel,
+            err_oq2: e2,
+            err_oq4: e4,
+            base_bpw: Some(base_bpw),
+        }
+    }
+
+    /// An `oq4.25++` base costs 4.25 b/w, not the 4.0625 of plain oq4. Costing
+    /// the floor at the plain rate both understated realized b/w and handed the
+    /// 0.1875 difference back as spendable budget, so a target EQUAL to the base
+    /// still promoted tensors — the caller asked for no extra bits and got some.
+    #[test]
+    fn oq_plus_floor_is_charged_at_its_real_bpw_not_the_plain_tier_rate() {
+        const OQ4_25: f64 = 4.25; // 4.0625 + 3 outliers/16
+        let cs = vec![
+            tcand_base("a", 4096, 10.0, 3.0, OQ4_25),
+            tcand_base("b", 4096, 4.0, 1.0, OQ4_25),
+        ];
+
+        // Target == the base: there is no budget, so nothing may be promoted.
+        let none = assign_tiers(&cs, OQ4_25, Tier::Oq4);
+        assert_eq!(none.count(Tier::Oq8), 0, "promoted on a zero budget");
+        assert!(
+            (none.realized_bpw(&cs) - OQ4_25).abs() < 1e-9,
+            "realized {} should be the true base {OQ4_25}",
+            none.realized_bpw(&cs)
+        );
+
+        // Budget for exactly one of two equal-sized tensors: (8.0625-4.25)/2
+        // above the base. The more sensitive one wins.
+        let half = OQ4_25 + (OQ8_BPW - OQ4_25) / 2.0;
+        let one = assign_tiers(&cs, half, Tier::Oq4);
+        assert_eq!(one.count(Tier::Oq8), 1);
+        assert_eq!(one.tier("a"), Tier::Oq8);
+        assert!(one.realized_bpw(&cs) <= half + 1e-9);
     }
 
     #[test]

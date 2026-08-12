@@ -3254,6 +3254,7 @@ pub(crate) struct LongctxPrompt {
     pub(crate) prompt_path: String,
     pub(crate) prompt_ref: PromptRef,
     pub(crate) max_seq: usize,
+    pub(crate) expected_answer: String,
     pub(crate) metrics: BTreeMap<String, Value>,
 }
 
@@ -3325,6 +3326,7 @@ pub(crate) fn materialize_longctx_prompt(config: &EvalConfig) -> Result<LongctxP
         prompt_path: prompt_path_string,
         prompt_ref,
         max_seq,
+        expected_answer: expected.to_string(),
         metrics,
     })
 }

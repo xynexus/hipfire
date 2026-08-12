@@ -21,7 +21,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — Tier-1 native single-load artifact collector (thin CLI).
 //
-//! Loads a bf16 `.hfq` once and runs the matching arch collector, writing a
+//! Loads a bf16 `.hfq` OR a HuggingFace safetensors directory once and runs the
+//! matching arch collector, writing a
 //! unified `<model>.calib.hfq` bundling the per-tensor Hessian + imatrix (+
 //! MoE router histogram for MoE models, + KLDREF with `--kldref`). Gemma3-VL
 //! (`arch_id=13`) is collected text-only through the `language_model.` prefix.
@@ -148,7 +149,16 @@ fn main() {
     }
     let seed: u64 = arg("--seed", Some("0".into())).unwrap().parse().unwrap();
 
-    let mut hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&model)).expect("open model");
+    // `--model` accepts either a bf16 `.hfq` or a HuggingFace safetensors
+    // directory (config.json + *.safetensors). A directory is read directly
+    // into an in-memory HfqFile — no intermediate bf16 `.hfq` on disk.
+    let model_path = Path::new(&model);
+    let mut hfq = if model_path.is_dir() {
+        hipfire_runtime::hfq::HfqFile::from_safetensors(model_path)
+            .expect("open safetensors model directory")
+    } else {
+        hipfire_runtime::hfq::HfqFile::open(model_path).expect("open model")
+    };
     // `--arch <id>` overrides the hfq's stored arch_id. Needed for hfqs that
     // predate proper arch tagging (e.g. some qwen3 MoE bf16 hfqs are stamped
     // arch_id=0/llama but load fine through the qwen35 backend at 5/6).
@@ -293,6 +303,10 @@ fn main() {
     } else {
         &tokens_owned[..n_tok]
     };
+    // Refuse the frozen eval slice: calibrating on it trains on the test set.
+    if !corpus.is_empty() {
+        hipfire_runtime::calibration::reject_eval_corpus(&corpus).expect("calibration corpus");
+    }
     let kldref_topk = parity_job
         .as_ref()
         .map(|parity| parity.job.options.kldref_top_k)
@@ -312,8 +326,16 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     // Provenance keys (caller-known) layered onto the driver's technical metadata.
+    // Index-only, so this is cheap even on a multi-GB source. Ties the calib to
+    // the exact artefact it saw — a path alone does not, once that path is
+    // rebuilt.
+    let source_fingerprint =
+        hipfire_runtime::hfq::HfqFile::open_index_only(std::path::Path::new(&model))
+            .map(|h| h.index_fingerprint())
+            .unwrap_or_else(|_| String::new());
     let mut provenance = vec![
         ("source_model", serde_json::json!(model)),
+        ("source_fingerprint", serde_json::json!(source_fingerprint)),
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
         ("source_arch_id", serde_json::json!(source_arch_id)),
@@ -584,9 +606,38 @@ fn main() {
                 "nemotron-h",
             )
         }
+        // Dense LLaMA/Mistral (0) and plain Qwen3/Qwen2 (1) share the
+        // runtime-hosted LLaMA forward, so one arm serves both. The embedding
+        // workload at arch 1 is matched earlier and takes precedence.
+        0 | 1 => {
+            let config =
+                hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config from hfq");
+            let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("load_weights_hfq");
+            let opts = hipfire_runtime::llama_calibration::CalibOpts {
+                kldref: want_kldref,
+                kldref_topk,
+            };
+            let summary = hipfire_runtime::llama_calibration::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &opts,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "llama-text",
+            )
+        }
         other => {
             panic!(
-                "collect_artifacts: unsupported arch_id {other}; handled 5/6/10/11/12/13/14/16/19"
+                "collect_artifacts: unsupported arch_id {other}; handled 0/1/5/6/10/11/12/13/14/16/19"
             )
         }
     };

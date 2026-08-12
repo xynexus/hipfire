@@ -32,8 +32,10 @@ use serde::Deserialize;
 
 pub mod arch;
 pub mod calibration;
+pub mod calibration_stream;
 pub mod cpu;
 pub mod gpu;
+pub mod ingest;
 pub mod weights;
 
 pub use hipfire_model::ARCH_ID_ZAYA;

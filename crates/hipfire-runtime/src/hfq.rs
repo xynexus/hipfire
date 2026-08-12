@@ -7,16 +7,18 @@
 use crate::hfq_modules::{parse_module_table, validate_modules, HfqModuleRecord};
 use crate::llama::{LlamaConfig, LlamaWeights, ModelArch};
 use crate::quant::f16_to_f32;
+use crate::safetensors_source::SafetensorsSource;
 use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
+use hipfire_quant_format::{storage, QuantType};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use twox_hash::XxHash64;
 
 // The OQ4 arch-packing transform now lives in `crate::oq4_arch` (single source
@@ -633,6 +635,207 @@ pub struct HfqTensorInfo {
     pub data_size: usize,
 }
 
+/// Map a safetensors dtype string to the HFQ `QuantType` byte used for
+/// unquantized source tensors (bf16=16, f16=1, f32=2), matching what
+/// `hipfire-quantize --format bf16` stamps. Returns `None` for dtypes
+/// `HfqFile::from_safetensors` does not pass through (pre-quantized / fp8).
+fn map_safetensors_dtype(dtype: &str) -> Option<u8> {
+    match dtype {
+        "BF16" | "bfloat16" => Some(16),
+        "F16" | "float16" => Some(1),
+        "F32" | "float32" => Some(2),
+        _ => None,
+    }
+}
+
+/// Byte width of a supported safetensors float dtype.
+fn dtype_byte_width(dtype: &str) -> Option<usize> {
+    match dtype {
+        "BF16" | "bfloat16" | "F16" | "float16" => Some(2),
+        "F32" | "float32" => Some(4),
+        _ => None,
+    }
+}
+
+/// Per-file ceiling for a captured sidecar. `vocab.json` runs ~7 MB on a large
+/// vocabulary, so the cap has to clear that comfortably; anything above this is
+/// a weight-shaped file we do not want inlined into the header.
+const MAX_SIDECAR_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Ceiling on the whole captured set. `metadata_json` is parsed in full every
+/// time a model is opened, so the sidecar blob is a load-time cost on every
+/// run, not just at conversion.
+const MAX_SIDECAR_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Files that are never sidecars: weight shards, and the shard index, which is
+/// meaningless once export re-shards at a different size.
+fn is_weight_like(name: &str) -> bool {
+    if name == "model.safetensors.index.json" {
+        return true;
+    }
+    matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()),
+        Some("safetensors" | "bin" | "pt" | "pth" | "gguf" | "h5" | "msgpack" | "onnx")
+    )
+}
+
+/// Recursively capture the non-weight files of an HF snapshot so an export can
+/// reproduce the directory byte-for-byte.
+///
+/// Keys are `/`-separated paths relative to `dir` (`assets/logo.png`). Values
+/// are `{"text": ...}` for valid UTF-8 and `{"b64": ...}` otherwise, so JSON
+/// sidecars stay readable in the header while PNGs still survive.
+///
+/// `tokenizer.json` is deliberately excluded: it is already stored verbatim
+/// under `"tokenizer"`, and duplicating it costs ~20 MB in a blob that is
+/// parsed on every model open. Dot-entries (`.git/`, `.cache/`) are skipped.
+fn collect_hf_sidecars(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let mut total: u64 = 0;
+    collect_hf_sidecars_into(dir, dir, 0, &mut total, &mut out);
+    out
+}
+
+fn collect_hf_sidecars_into(
+    root: &Path,
+    dir: &Path,
+    depth: u32,
+    total: &mut u64,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Sort so the captured set is deterministic across filesystems.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+
+    for path in paths {
+        let Some(base) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if base.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_hf_sidecars_into(root, &path, depth + 1, total, out);
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(key) = rel.to_str().map(|s| s.replace('\\', "/")) else {
+            continue;
+        };
+        if is_weight_like(&key) || key == "tokenizer.json" {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() > MAX_SIDECAR_FILE_BYTES || *total + meta.len() > MAX_SIDECAR_TOTAL_BYTES {
+            eprintln!(
+                "hfq: skipping sidecar {key} ({} bytes) — over the capture budget",
+                meta.len()
+            );
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        *total += bytes.len() as u64;
+        let value = match String::from_utf8(bytes) {
+            Ok(text) => serde_json::json!({ "text": text }),
+            Err(e) => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(e.as_bytes());
+                serde_json::json!({ "b64": b64 })
+            }
+        };
+        out.insert(key, value);
+    }
+}
+
+/// Decode the `"hf_sidecars"` blob written by [`collect_hf_sidecars`] back into
+/// `(relative path, contents)` pairs, ready to be written into an export
+/// directory. Entries that are malformed are dropped rather than failing the
+/// whole export.
+pub fn hf_sidecars_from_metadata(metadata_json: &str) -> Vec<(String, Vec<u8>)> {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return Vec::new();
+    };
+    let Some(obj) = meta.get("hf_sidecars").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            out.push((key.clone(), text.as_bytes().to_vec()));
+        } else if let Some(b64) = value.get("b64").and_then(|b| b.as_str()) {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                out.push((key.clone(), bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Fold a safetensors directory's tokenizer sidecars into HFQ-style metadata so
+/// an `HfqFile::from_safetensors` model is self-describing exactly like a real
+/// `.hfq` (whose quantizer embeds these at convert time). A real `.hfq` carries
+/// the tokenizer inline; a raw safetensors `metadata_json` (just
+/// `{architecture, config}`) does not, so the tokenizer/chat/eos consumers
+/// (`hfq_tokenizer_metadata`, `from_hfq_metadata`, `hfq_chat_template`) would
+/// otherwise fail. Embeds, when present and not already set:
+/// - `"tokenizer"`: raw `tokenizer.json` text (as a JSON string);
+/// - `"tokenizer_config"`: parsed `tokenizer_config.json` (chat_template);
+/// - `"generation_config"`: parsed `generation_config.json` (authoritative
+///   bos/eos ids). Missing sidecars are simply skipped.
+/// - `"hf_sidecars"`: every other non-weight file in the snapshot, verbatim.
+///   The parsed keys above lose byte-level formatting and cover only what the
+///   runtime consumes; a multimodal checkpoint also needs
+///   `preprocessor_config.json`, `processor_config.json`, `vocab.json` and the
+///   like, and none of it can be recovered later from an `.hfq` that never
+///   stored it. See [`collect_hf_sidecars`].
+fn embed_tokenizer_metadata(base: &str, dir: &Path) -> String {
+    let mut meta: serde_json::Value =
+        serde_json::from_str(base).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = meta.as_object_mut() else {
+        return base.to_string();
+    };
+    if !obj.contains_key("tokenizer") {
+        if let Ok(s) = std::fs::read_to_string(dir.join("tokenizer.json")) {
+            obj.insert("tokenizer".to_string(), serde_json::Value::String(s));
+        }
+    }
+    for (file, key) in [
+        ("tokenizer_config.json", "tokenizer_config"),
+        ("generation_config.json", "generation_config"),
+    ] {
+        if !obj.contains_key(key) {
+            if let Ok(s) = std::fs::read_to_string(dir.join(file)) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    obj.insert(key.to_string(), v);
+                }
+            }
+        }
+    }
+    if !obj.contains_key("hf_sidecars") {
+        let sidecars = collect_hf_sidecars(dir);
+        if !sidecars.is_empty() {
+            obj.insert(
+                "hf_sidecars".to_string(),
+                serde_json::Value::Object(sidecars),
+            );
+        }
+    }
+    serde_json::to_string(&meta).unwrap_or_else(|_| base.to_string())
+}
+
 pub struct HfqFile {
     _file: File,
     /// Path used to open the file. Exposed via [`Self::path`] so the
@@ -658,6 +861,206 @@ pub struct HfqFile {
     pread_buf: std::cell::RefCell<Vec<u8>>,
     pub version: u32,
     modules: Vec<HfqModuleRecord>,
+    /// Present only for [`Self::from_safetensors`]: owns the mmapped safetensors
+    /// shards that back tensor reads. When set, the byte accessors serve from
+    /// these shard mmaps (indexed via `st_locs`) instead of `self.mmap`/
+    /// `self._file`, and `drop_mmap` is a no-op — the shard mmaps are the only
+    /// resident copy of the weights.
+    st_source: Option<SafetensorsSource>,
+    /// Parallel to `tensors`: the physical `(shard, offset, len)` of each
+    /// tensor's bytes within `st_source`. Empty for file-backed HFQM opens.
+    st_locs: Vec<StLoc>,
+    /// Parallel to `tensors`: for a compressed-BF16 tensor being transparently
+    /// expanded, the `(stored quant_type, offset, len)` of its packed bytes in
+    /// the file. `None` for every normally-stored tensor.
+    ///
+    /// Lives here rather than on [`HfqTensorInfo`] so the index entry can present
+    /// the *logical* view — `quant_type == 16`, `data_size == n * 2` — and every
+    /// existing BF16 consumer keeps working untouched, while file-range users
+    /// (layer paging, pread) still get the real compressed extent.
+    bf16_packed: Vec<Option<(u8, usize, usize)>>,
+    /// `ModelSource`-shaped mirror of `tensors`, built on first use.
+    ///
+    /// The trait hands out `&TensorInfo`, so a source has to STORE one — and
+    /// HFQ stores `HfqTensorInfo`. That single borrow is what left
+    /// `impl ModelSource for HfqFile` a stub returning `None` for years. The
+    /// mirror is index metadata only (no payloads), a few hundred entries even
+    /// on the largest artifacts, so materialising it is far cheaper than
+    /// reshaping the trait around the difference.
+    ///
+    /// Lazy rather than built in each constructor: `HfqFile` has four, and a
+    /// consumer that never touches the trait should not pay for it.
+    ms_infos: std::cell::OnceCell<Vec<TensorInfo>>,
+}
+
+/// Keep GPU-decodable recodings packed in RAM instead of expanding them at load.
+///
+/// Off by default: expanding costs more RAM but needs no kernel support, so every
+/// existing consumer keeps working. Turn it on only for models served through
+/// kernels that decode the packed form natively (`gemv_bf16l3`), where it also
+/// buys ~1.18x weight bandwidth — but only once the working set exceeds the GPU's
+/// last-level cache; below that it is a measured slowdown.
+///
+/// Only [`QuantType::Bf16Lut3`] can stay resident. Huffman codes are bit-serial,
+/// so `Bf16Huff` is always expanded regardless of this flag.
+/// `HIPFIRE_BF16L3_RESIDENT=0` — an explicit opt-OUT, distinguishable from
+/// unset because residency is on by default for heads.
+fn bf16l3_resident_disabled() -> bool {
+    hipfire_env::BF16L3_RESIDENT.get().as_deref() == Some("0")
+}
+
+fn bf16l3_resident() -> bool {
+    // Present and not literally "0" — deliberately NOT `flag()`: this predates
+    // the 1/true/on/yes spelling and any other value counts as on.
+    hipfire_env::BF16L3_RESIDENT.is_set()
+        && hipfire_env::BF16L3_RESIDENT.get().as_deref() != Some("0")
+}
+
+/// A tensor consumed by the output projection (and, when tied, the embedding
+/// gather). Matches `hipfire_quantize::hfq_out::is_gather_shaped`, which is what
+/// steers these to LUT3 in the first place.
+///
+fn is_head_tensor(name: &str) -> bool {
+    name.contains("lm_head") || name.contains("embed_tokens")
+}
+
+/// Rewrite losslessly-recoded index entries to their logical view, returning the
+/// physical extents. Which types are recodings, what they expand to, and how long
+/// the expansion is all come from `hipfire_quant_format::storage` — the one place
+/// that knowledge lives, so a new codec cannot be invisible here.
+fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, usize)>> {
+    let resident = bf16l3_resident();
+    tensors
+        .iter_mut()
+        .map(|t| {
+            let stored = QuantType::from_code(t.quant_type)?;
+            if !stored.is_lossless_recoding() {
+                return None;
+            }
+            // Residency opts a GPU-decodable coding out of expansion.
+            //
+            // A LUT3 HEAD stays packed by DEFAULT. It is the only large tensor
+            // that is a pure GEMV consumer, so it is the only one with a kernel
+            // that reads the packed form — `gemv_bf16l3_xf32`, measured at
+            // 1.917 ms against plain bf16's 3.241 at 128256 x 2048, taking
+            // tg128 from 90.74 to 102.53 with byte-identical output.
+            //
+            // Deliberately NOT extended to every Bf16Lut3 tensor. Layer weights
+            // must serve prefill too, `gemv_bf16l3_xf32` is batch-1, and there
+            // is no BF16L3 GEMM — so they would be decoded at load anyway, for
+            // no benefit and a second decode path to keep correct. The env var
+            // still forces that global behaviour when set.
+            //
+            // When the model ties its head, this same entry also backs the
+            // embedding gather. That is fine: the gather decodes it explicitly
+            // at `token_embd` load, because a lookup reads one arbitrary row and
+            // the escape plane is only addressable by walking a block.
+            //
+            // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
+            // A LUT3 HEAD stays packed by DEFAULT, so `gemv_bf16l3_xf32` serves
+            // it: 1.917 ms against plain bf16's 3.241 at 128256 x 2048, worth
+            // tg128 90.05 -> 101.45 with byte-identical output.
+            //
+            // This was attempted once before and reverted: `expand_bf16_index`
+            // is arch-agnostic but the loaders were not, and the tiny-quant gate
+            // went from 8 failures to 58 with `got qt=49` panics across qwen35,
+            // gemma4, zaya, qwen2 and dots-ocr. Every one of those now decodes a
+            // packed tensor, and forcing residency globally reproduces the
+            // baseline 8 exactly — which is what makes the default safe.
+            //
+            // NOT extended to every Bf16Lut3 tensor. Layer weights must serve
+            // prefill, `gemv_bf16l3_xf32` is batch-1, and there is no BF16L3
+            // GEMM, so they are decoded at load regardless. The env var still
+            // forces that global behaviour.
+            //
+            // On a tied model this entry also backs the embedding gather, which
+            // decodes it explicitly at `token_embd` load — a lookup reads one
+            // arbitrary row and the escape plane needs a block walk.
+            //
+            // `HIPFIRE_BF16L3_RESIDENT=0` opts out entirely, head included.
+            let head_default = !bf16l3_resident_disabled() && is_head_tensor(&t.name);
+            if (resident || head_default) && stored == QuantType::Bf16Lut3 {
+                return None;
+            }
+            let physical = (t.quant_type, t.data_offset, t.data_size);
+            let n: usize = t.shape.iter().map(|&d| d as usize).product();
+            t.data_size = stored.logical_byte_len(n)?;
+            t.quant_type = stored.logical() as u8;
+            Some(physical)
+        })
+        .collect()
+}
+
+/// Decode a recoded payload back to its logical bytes.
+///
+/// Public because arch loaders outside this crate need it: residency leaves
+/// `Bf16Lut3` packed, and any loader that then reads the tensor must decode
+/// rather than assume plain bf16. Returns `None` if `stored_qt` is not a
+/// lossless recoding.
+///
+/// Huffman decode is bit-serial (~600 MB/s/core), so a full artifact would take
+/// minutes on one thread; it is spread across cores using the format's chunk
+/// table. Byte-aligned codings ignore the thread count.
+pub fn decode_bf16_packed(stored_qt: u8, packed: &[u8], n: usize) -> Option<Vec<u8>> {
+    let stored = QuantType::from_code(stored_qt)?;
+    storage::expand(stored, packed, n, decode_threads()).map(|b| b.into_owned())
+}
+
+/// True for the lossless BF16 recodings: `Bf16Lut3` (49) and `Bf16Huff` (50).
+///
+/// A tensor carrying one of these reaches an arch loader with a quant code the
+/// loader's dtype match arms do not know — `--format bf16` applies `Bf16Huff`
+/// by DEFAULT, and `expand_bf16_index` deliberately leaves `Bf16Lut3` head
+/// tensors packed. Named rather than open-coded as `matches!(qt, 49 | 50)`,
+/// which is how the same three-line check ended up in five arch crates.
+#[inline]
+pub fn is_packed_bf16(qt: u8) -> bool {
+    matches!(qt, 49 | 50)
+}
+
+/// Decode a possibly-recoded payload to its logical form.
+///
+/// Returns the LOGICAL quant code with the bytes: `(16, expanded)` for a
+/// recoding, otherwise the input unchanged and borrowed. `n` is the ELEMENT
+/// count, which callers must take from the shape rather than `data_size` — a
+/// tensor reaching here is one `expand_bf16_index` declined to expand, so its
+/// `data_size` is still the packed physical length.
+pub fn decode_recoded_bf16<'a>(
+    qt: u8,
+    data: &'a [u8],
+    n: usize,
+) -> Option<(u8, std::borrow::Cow<'a, [u8]>)> {
+    if !is_packed_bf16(qt) {
+        return Some((qt, std::borrow::Cow::Borrowed(data)));
+    }
+    decode_bf16_packed(qt, data, n).map(|v| (16u8, std::borrow::Cow::Owned(v)))
+}
+
+/// Why [`HfqFile::tensor_data_logical`] could not produce logical bytes.
+///
+/// Distinguishes absent from present-but-undecodable, because reporting a
+/// present-but-compressed tensor as MISSING sends the reader after a broken
+/// artifact instead of an unsupported storage coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalReadError {
+    /// No tensor by that name.
+    Missing,
+    /// Present, but the recoding at this quant code would not expand.
+    Decode(u8),
+}
+
+/// Threads used to expand a bit-serial payload. Every core, always — decode is
+/// pure compute over independent chunks and reaches ~21 GB/s here, well past any
+/// disk it overlaps with, so there is nothing worth tuning.
+fn decode_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |p| p.get())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StLoc {
+    shard: usize,
+    offset: usize,
+    len: usize,
 }
 
 impl HfqFile {
@@ -704,6 +1107,7 @@ impl HfqFile {
             &meta_index,
             metadata_offset,
             data_offset,
+            base,
             n_tensors,
             file_len,
             version,
@@ -717,7 +1121,10 @@ impl HfqFile {
         if !modules.is_empty() {
             validate_modules(&modules, file_len)?;
         }
+        let mut tensors = tensors;
+        let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: path.to_path_buf(),
             mmap: None,
@@ -728,6 +1135,9 @@ impl HfqFile {
             pread_buf: std::cell::RefCell::new(Vec::new()),
             version,
             modules,
+            st_source: None,
+            st_locs: Vec::new(),
+            bf16_packed,
         })
     }
 
@@ -797,6 +1207,7 @@ impl HfqFile {
             meta_index,
             metadata_offset,
             data_offset,
+            base,
             n_tensors,
             mmap.len(),
             version,
@@ -822,7 +1233,10 @@ impl HfqFile {
             validate_modules(&modules, mmap.len())?;
         }
 
+        let mut tensors = tensors;
+        let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: path.to_path_buf(),
             mmap: Some(mmap),
@@ -833,6 +1247,135 @@ impl HfqFile {
             pread_buf: std::cell::RefCell::new(Vec::new()),
             version,
             modules,
+            st_source: None,
+            st_locs: Vec::new(),
+            bf16_packed,
+        })
+    }
+
+    /// Build an in-memory `HfqFile` directly over a HuggingFace safetensors
+    /// directory — no intermediate bf16 `.hfq` written to disk. This lets the
+    /// resident calibration path (`collect_artifacts`) and any `&HfqFile`
+    /// arch loader consume a raw HF checkpoint exactly as it consumes a bf16
+    /// `.hfq`.
+    ///
+    /// The presentation matches what `hipfire-quantize --format bf16` writes,
+    /// so the arch weight loaders need no changes:
+    /// - dense tensor names are the raw HF safetensors keys (no ggml rename);
+    /// - dtype is passed through, tagged with the matching `QuantType` byte
+    ///   (bf16→16, f16→1, f32→2), bytes verbatim (no numeric conversion);
+    /// - stacked routed-expert tensors (`...experts.gate_up_proj` /
+    ///   `...experts.down_proj`, stored 3D as `[num_experts, …]`) are split
+    ///   into the per-expert 2D `...experts.{x}.{proj}.weight` tensors the MoE
+    ///   loaders request; the fused gate_up projection stays fused.
+    ///
+    /// Only float source dtypes (BF16/F16/F32) are handled; a pre-quantized HF
+    /// checkpoint (GPTQ/AWQ/FP8) errors rather than mis-tagging its bytes.
+    pub fn from_safetensors(dir: &Path) -> std::io::Result<Self> {
+        let source = SafetensorsSource::open(dir)?;
+
+        let mut tensors: Vec<HfqTensorInfo> = Vec::new();
+        let mut tensor_map: HashMap<String, usize> = HashMap::new();
+        let mut st_locs: Vec<StLoc> = Vec::new();
+
+        // Deterministic order (HashMap iteration is not) for reproducible logs
+        // and to avoid any latent index-order dependence in scan-style callers.
+        let mut layout = source.tensor_layout();
+        layout.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, shard, offset, len, dtype, shape) in layout {
+            let qt = map_safetensors_dtype(&dtype).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: tensor {name} has unsupported dtype {dtype:?} \
+                         (from_safetensors handles bf16/f16/f32 source only)",
+                        dir.display()
+                    ),
+                )
+            })?;
+            let esz = dtype_byte_width(&dtype).expect("dtype width known when qt mapped");
+
+            // Stacked routed-expert weights: 3D `[E, …]` parents named
+            // `....experts.<proj>` with no `.weight` suffix. Split into the
+            // per-expert 2D tensors the MoE loaders request. Each expert slice
+            // is a contiguous sub-range of the parent's row-major bytes.
+            let is_stacked_expert =
+                shape.len() == 3 && name.contains(".experts.") && !name.ends_with(".weight");
+            if is_stacked_expert {
+                let (head, tail) = name.split_once(".experts.").expect("`.experts.` present");
+                let n_experts = shape[0];
+                let per_elems: usize = shape[1..].iter().product();
+                let per_len = per_elems * esz;
+                if per_len == 0 || per_len.checked_mul(n_experts) != Some(len) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: stacked expert {name} shape {shape:?} dtype {dtype:?} \
+                             does not match stored byte length {len}",
+                            dir.display()
+                        ),
+                    ));
+                }
+                let child_shape: Vec<u32> = shape[1..].iter().map(|&d| d as u32).collect();
+                for x in 0..n_experts {
+                    let child = format!("{head}.experts.{x}.{tail}.weight");
+                    let idx = tensors.len();
+                    tensors.push(HfqTensorInfo {
+                        name: child.clone(),
+                        quant_type: qt,
+                        shape: child_shape.clone(),
+                        group_size: 0,
+                        data_offset: 0, // unused: st-backed reads come from st_locs
+                        data_size: per_len,
+                    });
+                    tensor_map.insert(child, idx);
+                    st_locs.push(StLoc {
+                        shard,
+                        offset: offset + x * per_len,
+                        len: per_len,
+                    });
+                }
+            } else {
+                let idx = tensors.len();
+                tensors.push(HfqTensorInfo {
+                    name: name.clone(),
+                    quant_type: qt,
+                    shape: shape.iter().map(|&d| d as u32).collect(),
+                    group_size: 0,
+                    data_offset: 0, // unused: st-backed reads come from st_locs
+                    data_size: len,
+                });
+                tensor_map.insert(name, idx);
+                st_locs.push(StLoc { shard, offset, len });
+            }
+        }
+
+        let arch_id = source.arch_id();
+        // Embed tokenizer/chat/generation sidecars so the model is
+        // self-describing like a real `.hfq` (config stays under "config").
+        let metadata_json = embed_tokenizer_metadata(source.metadata_json(), dir);
+        // A real fd for the `_file` field. The safetensors byte path never
+        // reads it (bytes come from the shard mmaps), and drop_mmap()
+        // short-circuits for st-backed files, so config.json is a safe handle.
+        let file = File::open(dir.join("config.json"))?;
+        Ok(Self {
+            ms_infos: std::cell::OnceCell::new(),
+            _file: file,
+            path: dir.to_path_buf(),
+            mmap: None,
+            arch_id,
+            metadata_json,
+            tensor_map,
+            pread_buf: std::cell::RefCell::new(Vec::new()),
+            version: HFQM_VERSION,
+            modules: Vec::new(),
+            st_source: Some(source),
+            // Safetensors-backed tensors are never compressed: the dtype comes
+            // straight from the shard headers.
+            bf16_packed: vec![None; tensors.len()],
+            tensors,
+            st_locs,
         })
     }
 
@@ -848,6 +1391,11 @@ impl HfqFile {
     /// On discrete-GPU systems this is unnecessary (GPU VRAM is separate),
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
+        if self.st_source.is_some() {
+            // Safetensors-backed: the shard mmaps ARE the only resident copy of
+            // the weights; there is no separate HFQM mmap to drop.
+            return;
+        }
         self.mmap = None;
         // Cancel any in-flight readahead triggered by the Sequential advice at open
         // time. On UMA systems the slab loader opens an O_DIRECT fd immediately after
@@ -907,6 +1455,91 @@ impl HfqFile {
     /// also omit the outer `model.` prefix entirely, so that variant is tried
     /// as well. Returns `None` only when no variant matches — the per-callsite
     /// `?` early-return is preserved.
+    /// Read a tensor's bytes with any lossless BF16 recoding decoded to plain
+    /// bf16, returning the LOGICAL quant code alongside.
+    ///
+    /// This is what an arch loader wants: decoding once at the read boundary
+    /// means the loader's dtype match arms only ever see logical codes, so a
+    /// new caller cannot forget the case. Five arch crates each grew a private
+    /// copy of exactly this (`16cb54d56`); they now share one.
+    ///
+    /// Note this is deliberately NOT what [`ModelSource::tensor`] does — that
+    /// returns the payload for the coding the artifact DECLARES, so a
+    /// `Bf16Lut3` head stays packed for the kernel that decodes it natively.
+    /// Use this when you need bf16 in hand; use `tensor()` when you want the
+    /// tensor as stored.
+    pub fn tensor_data_logical(&self, name: &str) -> Result<(u8, Vec<u8>), LogicalReadError> {
+        let (info, data) = self
+            .tensor_data_vec(name)
+            .ok_or(LogicalReadError::Missing)?;
+        if !is_packed_bf16(info.quant_type) {
+            return Ok((info.quant_type, data));
+        }
+        let n: usize = info.shape.iter().map(|&d| d as usize).product();
+        let qt = info.quant_type;
+        let logical = decode_bf16_packed(qt, &data, n).ok_or(LogicalReadError::Decode(qt))?;
+        Ok((16, logical))
+    }
+
+    /// `ModelSource`-shaped view of the tensor index, built once on demand.
+    ///
+    /// Parallel to `self.tensors`, so a `resolve_idx` result indexes both.
+    /// Sizes and offsets are the LOGICAL ones the index already advertises —
+    /// for a transparently-expanded BF16 recoding that is the expanded length,
+    /// matching what `tensor()` hands back. Anything wanting the physical
+    /// extent (layer paging, pread) must keep using `physical_range`.
+    fn ms_infos(&self) -> &[TensorInfo] {
+        self.ms_infos.get_or_init(|| {
+            self.tensors
+                .iter()
+                .map(|t| {
+                    // LOGICAL view. A lossless BF16 recoding (Bf16Lut3 /
+                    // Bf16Huff) IS bf16 — the coding is a storage detail — so
+                    // the trait reports it as bf16 and `tensor()` hands back
+                    // expanded bytes to match. Reporting the stored code here
+                    // instead makes every consumer that switches on dtype
+                    // reject a perfectly ordinary bf16 tensor, which is exactly
+                    // how the qwen3.5 calibration adapter first met an `.hfq`
+                    // ("unsupported dtype HFQ_QT49").
+                    //
+                    // Callers that specifically want the STORED form — serving,
+                    // where `gemv_bf16l3` decodes natively and expanding would
+                    // waste the whole point — use HfqFile's inherent accessors,
+                    // which are unaffected.
+                    let logical_qt = if is_packed_bf16(t.quant_type) {
+                        16
+                    } else {
+                        t.quant_type
+                    };
+                    let n: usize = t.shape.iter().map(|&d| d as usize).product();
+                    TensorInfo {
+                        name: t.name.clone(),
+                        // HFQ's authority is `quant_type`; `dtype` is the
+                        // safetensors-shaped field and only three codes have a
+                        // faithful spelling. The rest get an explicit marker
+                        // rather than a plausible-looking lie.
+                        dtype: match logical_qt {
+                            16 => "BF16".to_string(),
+                            1 => "F16".to_string(),
+                            2 => "F32".to_string(),
+                            other => format!("HFQ_QT{other}"),
+                        },
+                        shape: t.shape.iter().map(|&d| d as usize).collect(),
+                        quant_type: logical_qt,
+                        data_offset: t.data_offset,
+                        // A packed tensor's `data_size` is its PHYSICAL length;
+                        // the logical view is two bytes per element.
+                        data_size: if is_packed_bf16(t.quant_type) {
+                            n * 2
+                        } else {
+                            t.data_size
+                        },
+                    }
+                })
+                .collect()
+        })
+    }
+
     fn resolve_idx(&self, name: &str) -> Option<usize> {
         if let Some(&idx) = self.tensor_map.get(name) {
             return Some(idx);
@@ -954,9 +1587,40 @@ impl HfqFile {
         Some(&self.tensors[idx])
     }
 
+    /// Borrow a tensor's bytes. Returns `None` for a losslessly recoded tensor —
+    /// prefer [`Self::tensor_data_cow`] unless you know the tensor is never one.
+    ///
+    /// `--bf16-codec` DEFAULTS to `huff`, so any BF16 tensor in any recent
+    /// artifact may be stored compressed, and `is_gather_shaped` steers
+    /// `embed_tokens` / `lm_head` to LUT3 specifically — the big tensors are the
+    /// likeliest to be recoded, not the least.
+    ///
+    /// The `None` is the trap: callers wrote `.expect("<name> not found")` and
+    /// reported a PRESENT tensor as missing, or tested `.is_some()` and silently
+    /// took a fallback path. Both shapes shipped (see the sweep in commits
+    /// 4e6166cca / 226bb66b2 / 9a6a5bbd3), and one loaded an embedding table as
+    /// an untied model's output weights with no error at all.
+    ///
+    /// For metadata alone use [`Self::find_tensor_info`] — it needs no bytes and
+    /// so does not care how the tensor is stored.
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+        // A BF16L3 tensor's bytes are compressed; there is no BF16 buffer in the
+        // file to borrow. Returning the packed bytes here would hand back
+        // garbage tagged as BF16, so refuse and make the caller use a decoding
+        // path (`tensor_data_cow` / `tensor_data_vec` / `tensor_data_pread`).
+        if self.bf16_packed[idx].is_some() {
+            debug_assert!(
+                false,
+                "tensor_data() on compressed-BF16 tensor {name} — use tensor_data_cow()"
+            );
+            return None;
+        }
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            return Some((info, source.shard_bytes(loc.shard, loc.offset, loc.len)?));
+        }
         debug_assert!(
             self.mmap.is_some(),
             "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
@@ -983,18 +1647,31 @@ impl HfqFile {
         use std::os::unix::io::AsRawFd;
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            let bytes = source.shard_bytes(loc.shard, loc.offset, loc.len)?;
+            {
+                let mut buf = self.pread_buf.borrow_mut();
+                buf.clear();
+                buf.extend_from_slice(bytes);
+            }
+            return Some((info, self.pread_buf.borrow()));
+        }
         let fd = self._file.as_raw_fd();
+        // Read the physical extent — compressed for a BF16L3 tensor, whose
+        // `info.data_size` already advertises the expanded length.
+        let (phys_off, phys_len) = self.physical_range(idx);
         {
             let mut buf = self.pread_buf.borrow_mut();
-            buf.resize(info.data_size, 0);
+            buf.resize(phys_len, 0);
             let mut total_read = 0usize;
-            while total_read < info.data_size {
+            while total_read < phys_len {
                 let n = unsafe {
                     libc::pread(
                         fd,
                         buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
+                        phys_len - total_read,
+                        (phys_off + total_read) as libc::off_t,
                     )
                 };
                 if n <= 0 {
@@ -1003,7 +1680,10 @@ impl HfqFile {
                 total_read += n as usize;
             }
             // Evict these pages from cache — works because pread doesn't hold a mapping.
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            fadvise_dontneed(fd, phys_off, phys_len);
+            if let Some((qt, _, _)) = self.bf16_packed[idx] {
+                *buf = decode_bf16_packed(qt, &buf, info.data_size / 2)?;
+            }
         }
         Some((info, self.pread_buf.borrow()))
     }
@@ -1012,6 +1692,34 @@ impl HfqFile {
     #[cfg(not(unix))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         self.tensor_data(name)
+    }
+
+    /// Borrow the tensor's logical bytes, decoding only when they are stored
+    /// compressed. Use this wherever a caller would reach for [`Self::tensor_data`]
+    /// on a tensor that MIGHT be a lossless BF16 recoding (`Bf16Lut3` /
+    /// `Bf16Huff`) — most importantly the embedding table, which is the one
+    /// tensor big enough that recoding it is worth ~12% of an artifact.
+    ///
+    /// [`Self::tensor_data`] deliberately returns `None` for those (it can only
+    /// hand back the mmap'd PACKED bytes, which tagged as BF16 would be
+    /// garbage). Callers that then `.expect("<name> not found")` report a
+    /// present-but-compressed tensor as MISSING, which is a genuinely
+    /// misleading trail to follow — it reads as a broken artifact rather than
+    /// an unsupported storage coding.
+    ///
+    /// Borrowed in the common uncompressed case, so this does not cost the
+    /// embedding table's several hundred MB unless the decode is real.
+    pub fn tensor_data_cow(
+        &self,
+        name: &str,
+    ) -> Option<(&HfqTensorInfo, std::borrow::Cow<'_, [u8]>)> {
+        let idx = self.resolve_idx(name)?;
+        if self.bf16_packed[idx].is_some() {
+            let (info, bytes) = self.tensor_data_vec(name)?;
+            return Some((info, std::borrow::Cow::Owned(bytes)));
+        }
+        let (info, bytes) = self.tensor_data(name)?;
+        Some((info, std::borrow::Cow::Borrowed(bytes)))
     }
 
     /// Read tensor data using the best available path:
@@ -1023,19 +1731,28 @@ impl HfqFile {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
 
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            let bytes = source.shard_bytes(loc.shard, loc.offset, loc.len)?;
+            return Some((info, bytes.to_vec()));
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             let fd = self._file.as_raw_fd();
-            let mut buf = vec![0u8; info.data_size];
+            // Physical extent: compressed for BF16L3, whose `info.data_size`
+            // already advertises the expanded length.
+            let (phys_off, phys_len) = self.physical_range(idx);
+            let mut buf = vec![0u8; phys_len];
             let mut total_read = 0usize;
-            while total_read < info.data_size {
+            while total_read < phys_len {
                 let n = unsafe {
                     libc::pread(
                         fd,
                         buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
+                        phys_len - total_read,
+                        (phys_off + total_read) as libc::off_t,
                     )
                 };
                 if n <= 0 {
@@ -1043,7 +1760,10 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            fadvise_dontneed(fd, phys_off, phys_len);
+            if let Some((qt, _, _)) = self.bf16_packed[idx] {
+                buf = decode_bf16_packed(qt, &buf, info.data_size / 2)?;
+            }
             return Some((info, buf));
         }
 
@@ -1075,13 +1795,22 @@ impl HfqFile {
     /// whose name contains `prefix.` (e.g. "layers.5.").
     #[allow(dead_code)]
     pub fn layer_data_range(&self, prefix: &str) -> Option<(usize, usize)> {
+        if self.st_source.is_some() {
+            // st-backed tensors have no single-file byte range (data_offset is
+            // unused); the shard fadvise hint this feeds does not apply.
+            return None;
+        }
         let needle = format!("{prefix}.");
         let mut lo = usize::MAX;
         let mut hi = 0usize;
-        for t in &self.tensors {
+        for (i, t) in self.tensors.iter().enumerate() {
             if t.name.contains(&needle) {
-                lo = lo.min(t.data_offset);
-                hi = hi.max(t.data_offset + t.data_size);
+                // Physical extent: a BF16L3 tensor's file range is its
+                // compressed length, not the expanded `data_size`. Using the
+                // latter would over-cover and evict the next tensor's pages.
+                let (off, len) = self.physical_range(i);
+                lo = lo.min(off);
+                hi = hi.max(off + len);
             }
         }
         if lo < hi {
@@ -1089,6 +1818,45 @@ impl HfqFile {
         } else {
             None
         }
+    }
+
+    /// The tensor's real byte extent in the file. For a transparently expanded
+    /// BF16L3 tensor this is the compressed range, which is what page-eviction
+    /// hints and raw reads need — `info.data_size` is the expanded length.
+    fn physical_range(&self, idx: usize) -> (usize, usize) {
+        match self.bf16_packed[idx] {
+            Some((_, off, len)) => (off, len),
+            None => (self.tensors[idx].data_offset, self.tensors[idx].data_size),
+        }
+    }
+
+    /// Whether this tensor is stored BF16L3-compressed on disk and expanded on
+    /// read. Such a tensor cannot be slab-loaded or mmap-borrowed: its file
+    /// bytes are not the BF16 buffer the index advertises.
+    /// The encoding actually stored on disk for `name`: its `quant_type` byte
+    /// and its on-disk byte length.
+    ///
+    /// For a losslessly-recoded tensor both differ from the index's reported
+    /// `quant_type`/`data_size`, which this reader rewrites to the expanded
+    /// view so consumers need no per-codec branch. Inspection tooling wants the
+    /// stored truth instead — without this it cannot tell a compressed artifact
+    /// from a plain one.
+    pub fn stored_encoding(&self, name: &str) -> Option<(u8, usize)> {
+        let idx = self.resolve_idx(name)?;
+        Some(match self.bf16_packed[idx] {
+            Some((qt, _, len)) => (qt, len),
+            None => (self.tensors[idx].quant_type, self.tensors[idx].data_size),
+        })
+    }
+
+    pub fn is_bf16_expanded(&self, name: &str) -> bool {
+        self.resolve_idx(name)
+            .is_some_and(|i| self.bf16_packed[i].is_some())
+    }
+
+    /// True if any tensor is a transparently expanded compressed-BF16 tensor.
+    pub fn has_bf16_expanded(&self) -> bool {
+        self.bf16_packed.iter().any(|p| p.is_some())
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
@@ -1114,15 +1882,89 @@ impl HfqFile {
         &self.tensors
     }
 
+    /// Stable content fingerprint over the metadata and tensor index — NOT the
+    /// payload, so it is index-only cheap even on a 40 GB artefact.
+    ///
+    /// Recorded by calibration writers as `source_fingerprint` so a `.calib.hfq`
+    /// can be tied back to the exact artefact it was captured from. A calib is
+    /// only valid for the weights it saw; matching the source PATH proves
+    /// nothing once that path is rebuilt. Scope matches the
+    /// `hfq_metadata_and_tensor_index_v1` fingerprint `hipfire-coexistence`
+    /// reports, but is computed independently — that one is `pub(crate)` there
+    /// and the runtime must not depend on the coexistence crate.
+    pub fn index_fingerprint(&self) -> String {
+        // FNV-1a/64. Chosen over a cryptographic hash because this detects
+        // accidental mismatch, not tampering, and must stay cheap.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        eat(self.metadata_json.as_bytes());
+        eat(&self.arch_id.to_le_bytes());
+        for t in &self.tensors {
+            eat(t.name.as_bytes());
+            eat(&[t.quant_type]);
+            eat(&t.group_size.to_le_bytes());
+            eat(&t.data_size.to_le_bytes());
+            for d in &t.shape {
+                eat(&d.to_le_bytes());
+            }
+        }
+        format!("fnv64:{h:016x}")
+    }
+
+    /// The lossless recoding a tensor is STORED as, if any: `(quant_type,
+    /// packed byte length)`.
+    ///
+    /// `tensors()` reports the LOGICAL view — `expand_bf16_index` rewrites a
+    /// recoded entry's dtype and length at open, so a BF16L3-compressed tensor
+    /// reads as plain `BF16` there. That is right for anyone consuming values
+    /// and wrong for anyone asking what is on disk, which is what this answers.
+    /// `None` means the tensor is stored exactly as `tensors()` describes it.
+    ///
+    /// Indices match `tensors()`.
+    pub fn stored_recoding(&self, idx: usize) -> Option<(u8, usize)> {
+        self.bf16_packed
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|(qt, _off, size)| (qt, size))
+    }
+
+    /// Whether this file supports the `O_DIRECT` GPU slab loader. True for a
+    /// real file-backed HFQM; false for a safetensors-backed in-memory file
+    /// (`from_safetensors`), whose bytes are spread across shards with no
+    /// single `O_DIRECT`-openable path and unused `data_offset`s. Such callers
+    /// fall back to the per-tensor `tensor_data_vec` path, which serves from
+    /// the shard mmaps.
+    pub fn supports_slab_load(&self) -> bool {
+        // A BF16L3 tensor needs a CPU decode between file and VRAM, which the
+        // slab loader's raw file→GPU copy cannot do. Fall back to the
+        // per-tensor path for the whole file rather than silently uploading
+        // compressed bytes tagged as BF16.
+        self.st_source.is_none() && !self.has_bf16_expanded()
+    }
+
     pub fn modules(&self) -> &[HfqModuleRecord] {
         &self.modules
     }
 }
 
+/// Parse the metadata+index block of one HFQM container.
+///
+/// `base` is the container's start within the file — nonzero for a container
+/// embedded in another file (a bundled LoRA or MTP head). `metadata_offset` and
+/// `data_offset` arrive already rebased by it; `base` is needed here because a
+/// v2 index stores each tensor's offset relative to the container, so it has to
+/// be rebased the same way. `base` is 0 for a standalone file.
 fn parse_hfqm_meta_index(
     meta_index: &[u8],
     metadata_offset: usize,
     data_offset: usize,
+    base: usize,
     n_tensors: usize,
     file_len: usize,
     version: u32,
@@ -1200,22 +2042,33 @@ fn parse_hfqm_meta_index(
             let offset_div32 =
                 u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
-            offset_div32
+            // Stored relative to the container, so rebase like the header
+            // offsets. Without this an embedded container reads every tensor
+            // `base` bytes early — out of the host file's own data — returning
+            // plausible-looking garbage instead of failing.
+            //
+            // Alignment is a property of the container's own layout, so it is
+            // checked before rebasing: `base` is where the host file happened to
+            // end and is under no obligation to be 32-byte aligned.
+            let relative = offset_div32
                 .checked_mul(HFQM_V2_OFFSET_ALIGN)
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
-                })?
+                })?;
+            if relative % HFQM_V2_OFFSET_ALIGN != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HFQM tensor {name} offset {relative} is not 32-byte aligned"),
+                ));
+            }
+            relative.checked_add(base).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
+            })?
         } else {
             let offset = cumulative_offset;
             cumulative_offset = cumulative_offset.saturating_add(data_size);
             offset
         };
-        if version >= 2 && tensor_offset % HFQM_V2_OFFSET_ALIGN != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("HFQM tensor {name} offset {tensor_offset} is not 32-byte aligned"),
-            ));
-        }
         if tensor_offset + data_size > file_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -1272,17 +2125,48 @@ impl ModelSource for HfqFile {
         None // HFQ files encode quant_type per-tensor, not via a global config
     }
 
-    fn tensor_data(&self, _name: &str) -> Option<(&TensorInfo, &[u8])> {
-        // HfqFile's tensor_data returns (&HfqTensorInfo, &[u8]).
-        // We can't return a reference to a TensorInfo we don't own,
-        // so this method is not directly usable for HFQ. The HFQ path
-        // continues to use HfqFile's native methods; ModelSource is
-        // primarily for safetensors. See the blanket adapter below.
-        None
+    fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
+        // Borrowed-only, per the trait contract: a tensor whose stored bytes
+        // are not its logical bytes has no logical buffer to borrow, so this
+        // must decline rather than pair packed bytes with the logical
+        // `TensorInfo`. Doing that pairing is a genuinely nasty failure — the
+        // metadata says n*2 bytes of bf16 and the slice is the packed length,
+        // so the caller reads a plausible-looking tensor of the wrong size
+        // ("embedding payload length does not match its declared shape").
+        //
+        // Two distinct cases must both decline: `bf16_packed` (transparently
+        // expanded, which the inherent accessor already refuses) and a
+        // deliberately-resident coding the index still reports as packed.
+        let idx = self.resolve_idx(name)?;
+        if is_packed_bf16(self.tensors.get(idx)?.quant_type) {
+            return None;
+        }
+        let (_, bytes) = HfqFile::tensor_data(self, name)?;
+        Some((self.ms_infos().get(idx)?, bytes))
     }
 
-    fn tensor_info(&self, _name: &str) -> Option<&TensorInfo> {
-        None // HFQ uses its own HfqTensorInfo type
+    fn tensor(&self, name: &str) -> Option<(&TensorInfo, std::borrow::Cow<'_, [u8]>)> {
+        let idx = self.resolve_idx(name)?;
+        // LOGICAL bytes, matching the logical `TensorInfo` from `ms_infos`.
+        // Borrowed when stored verbatim, owned when a recoding — including a
+        // deliberately-resident Bf16Lut3 head — has to be expanded. That
+        // expansion is the whole reason the trait needed a Cow.
+        let stored_qt = self.tensors.get(idx)?.quant_type;
+        let bytes = if is_packed_bf16(stored_qt) {
+            // Still packed in the index — `expand_bf16_index` declined to
+            // expand it (a resident Bf16Lut3 head). Expand here so the payload
+            // matches the logical `TensorInfo`.
+            std::borrow::Cow::Owned(self.tensor_data_logical(name).ok()?.1)
+        } else {
+            // Verbatim, or already transparently expanded: keep the borrow.
+            self.tensor_data_cow(name)?.1
+        };
+        Some((self.ms_infos().get(idx)?, bytes))
+    }
+
+    fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        let idx = self.resolve_idx(name)?;
+        self.ms_infos().get(idx)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -1380,9 +2264,13 @@ fn load_f16_tensor(
     st_name: &str,
     shape: &[usize],
 ) -> HipResult<GpuTensor> {
+    // `tensor_data_cow`: a losslessly recoded (LUT3/Huffman) tensor is stored
+    // compressed and the borrowing accessor refuses it, which would report a
+    // present tensor as "not found". Borrows when stored plainly.
     let (info, data) = hfq
-        .tensor_data(st_name)
+        .tensor_data_cow(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
+    let data = data.as_ref();
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 => {
@@ -1402,6 +2290,28 @@ fn load_f16_tensor(
             // non-256-divisible tensors) as BF16; the llama loader must accept
             // them for norm/embedding tensors. bf16→f32 = high 16 bits.
             data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
+        49 | 50 => {
+            // A lossless recoding that residency (BF16L3) or the codec itself
+            // (Huffman) left packed. Decode rather than panic: this is reached
+            // for norms and other small tensors, which have no packed-consumer
+            // kernel and whose decode cost is negligible.
+            //
+            // HIPFIRE_BF16L3_RESIDENT is global, so turning it on to keep the
+            // lm_head packed also leaves every other bf16 tensor packed — norms
+            // included. Before this arm that panicked with
+            // `got quant_type=49` on model.norm.weight.
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = decode_bf16_packed(info.quant_type, data, n).unwrap_or_else(|| {
+                panic!(
+                    "failed to decode recoded tensor {st_name} (quant_type={})",
+                    info.quant_type
+                )
+            });
+            logical
+                .chunks_exact(2)
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect()
         }
@@ -1472,9 +2382,13 @@ fn load_weight_tensor(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
+    // `tensor_data_cow`: a losslessly recoded (LUT3/Huffman) tensor is stored
+    // compressed and the borrowing accessor refuses it, which would report a
+    // present tensor as "not found". Borrows when stored plainly.
     let (info, data) = hfq
-        .tensor_data(st_name)
+        .tensor_data_cow(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
+    let data = data.as_ref();
 
     let wt_result: HipResult<WeightTensor> = match info.quant_type {
         0 => {
@@ -1791,54 +2705,100 @@ fn load_weight_tensor(
             })
         }
         1 => {
-            // F16 — dequant to F32 for F32 GEMV
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            // F16 — keep native so `weight_gemm` takes the batched
+            // `gemm_f16_x_f32_wmma` path instead of upcasting to F32 and falling
+            // back to a per-token GEMV. Needs K % 16 == 0 (16-wide WMMA K
+            // fragments); non-aligned linears stay on the F32 upcast path.
+            // `HIPFIRE_BF16_WEIGHTS=f32` forces the old upcast (rollback).
+            let force_f32 = hipfire_env::BF16_WEIGHTS.get().as_deref() == Some("f32");
+            if k % 16 == 0 && !force_f32 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::F16;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F16,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F32,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            }
         }
         16 => {
-            // BF16 — dequant to F32 for F32 GEMV. The qtip3 path leaves
-            // non-256-divisible linears (e.g. down_proj, k=1408) as BF16.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            // BF16 — keep native so `weight_gemm` takes the batched
+            // `gemm_bf16_x_bf16_wmma` path (+ the m128 overlay) and decode uses
+            // the bf16 `weight_gemv`, instead of upcasting to F32 and falling
+            // back to a per-token GEMV loop (the arch-0 prefill bottleneck).
+            // The bf16 WMMA kernel reads 16-wide K fragments, so it needs
+            // K % 16 == 0; the rare non-aligned linear stays on the F32 upcast
+            // path for correctness. `HIPFIRE_BF16_WEIGHTS=f32` forces the old
+            // upcast everywhere (rollback / debugging).
+            let force_f32 = hipfire_env::BF16_WEIGHTS.get().as_deref() == Some("f32");
+            if k % 16 == 0 && !force_f32 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::BF16;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::BF16,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F32,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            }
         }
-        31 => {
-            // Qtip3G256 — packed bitshift-trellis (100 B/group), served by the
-            // gemv_qtip3g256 kernel. Wires qtip3 into the plain-llama path
-            // (previously only the qwen3.5 arch loaded qtip3).
+        qt @ (31 | 51) => {
+            // Qtip3G256 (31) / Qtip3G256I3 (51) — packed bitshift-trellis
+            // (100 B/group), served by gemv_qtip3g256 and gemv_qtip3g256i3
+            // respectively. IDENTICAL bytes; the code selects which computed
+            // codebook the kernel decodes with, which is exactly why they are two
+            // codes: cross-decoding produces noise that no structural check sees.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Qtip3G256,
+                gpu_dtype: if qt == 51 {
+                    DType::Qtip3G256I3
+                } else {
+                    DType::Qtip3G256
+                },
                 m,
                 k,
                 row_stride: 0,
@@ -1868,9 +2828,9 @@ fn load_weight_tensor(
         // this call); only OQ4 W4A4 (below) was wired here before, so families
         // loading through `load_weights_hfq` panicked on 35 despite the generic
         // dtype-dispatched kernels already supporting them.
-        qt @ (33 | 35 | 36) => {
+        qt @ (33 | 35 | 36 | 38 | 52) => {
             let (bytes, gpu_dtype) = oq8_arch_load(qt, data, m, k)
-                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/38/52");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1897,6 +2857,38 @@ fn load_weight_tensor(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        49 | 50 => {
+            // A lossless recoding left packed — BF16L3 under residency, or
+            // Huffman. Decode to plain bf16 rather than keep it packed.
+            //
+            // Only a GEMV consumer can read the packed form: `gemv_bf16l3_xf32`
+            // is batch-1, and there is no BF16L3 GEMM, so a layer weight kept
+            // packed would work at decode and break at prefill. The lm_head is
+            // different — it is GEMV-only — and stays packed via its own branch
+            // in `load_weights_hfq`, which runs before this.
+            //
+            // HIPFIRE_BF16L3_RESIDENT is global, so enabling it to pack the head
+            // also leaves every layer weight packed on an all-bf16 model. Before
+            // this arm that panicked here with `unsupported quant_type 49`.
+            let n: usize = info.shape.iter().map(|&d| d as usize).product();
+            let logical = decode_bf16_packed(info.quant_type, data, n).unwrap_or_else(|| {
+                panic!(
+                    "failed to decode recoded weight {st_name} (quant_type={})",
+                    info.quant_type
+                )
+            });
+            let mut buf = gpu.upload_raw(&logical, &[m, k])?;
+            buf.dtype = DType::BF16;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
                 m,
                 k,
                 row_stride: 0,
@@ -1970,9 +2962,13 @@ pub fn load_weights_hfq(
     }
 
     eprintln!("  loading token_embd...");
+    // `tensor_data_cow`, not `tensor_data`: a LUT3/Huffman-recoded embed table
+    // is stored compressed, and the borrowing accessor refuses those. Reaching
+    // for it here reported the tensor as MISSING when it was merely coded.
     let embd_info = hfq
-        .tensor_data("model.embed_tokens.weight")
+        .tensor_data_cow("model.embed_tokens.weight")
         .expect("embed_tokens not found");
+    let embd_info = (embd_info.0, embd_info.1.as_ref());
     let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
         // Q4_K: upload raw, use Q4K embedding lookup at inference
         eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
@@ -1998,6 +2994,30 @@ pub fn load_weights_hfq(
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::Q8_0,
+        )
+    } else if embd_info.0.quant_type == 49 {
+        // BF16L3 that residency kept packed. The GATHER cannot use it: a lookup
+        // reads one arbitrary row, and BF16L3's escape plane is only addressable
+        // by walking a block, so there is no gather kernel for it. Decode here.
+        //
+        // This is what HIPFIRE_BF16L3_RESIDENT's "a gather-read table ... will
+        // fail to load" refers to; before this arm it panicked in
+        // `load_f16_tensor` with `got quant_type=49`.
+        //
+        // The tied lm_head is a separate buffer and DOES stay packed — it is a
+        // pure GEMV consumer, which `gemv_bf16l3_xf32` serves. So residency buys
+        // the head's bandwidth without the gather losing its random access.
+        let n = embd_info.0.shape.iter().map(|&d| d as usize).product();
+        let logical = decode_bf16_packed(49, embd_info.1, n)
+            .ok_or_else(|| HipError::new(0, "token_embd: BF16L3 decode failed"))?;
+        eprintln!(
+            "    (bf16l3 -> bf16 for gather, {} MB packed -> {} MB)",
+            embd_info.1.len() / 1_000_000,
+            logical.len() / 1_000_000
+        );
+        (
+            gpu.upload_raw(&logical, &[logical.len()])?,
+            EmbeddingFormat::BF16,
         )
     } else if embd_info.0.quant_type == 16 {
         // Native bf16 table: upload raw 2 B/elem; gather converts to f32 inline
@@ -2030,41 +3050,117 @@ pub fn load_weights_hfq(
     let output_norm = load_f16_tensor(hfq, gpu, "model.norm.weight", &[config.dim])?;
 
     eprintln!("  loading output...");
+    let mut return_packed_head: Option<WeightTensor> = None;
     let output = if hfq.find_tensor("lm_head.weight").is_some() {
         load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
     } else {
         // Tied embeddings — reuse token_embd as F32 output weights for the
         // logit GEMV. Dequant by the embed's actual format (qtip3 models store
         // embed as Q8F16; the old code assumed F16 and would garble Q8 bytes).
-        let (embd_t, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
+        // Same reason as the load above: a recoded table must be decoded here,
+        // or the tied-output dequant reads packed bytes as if they were BF16.
+        let (embd_t, data) = hfq.tensor_data_cow("model.embed_tokens.weight").unwrap();
+        let data = data.as_ref();
         let n = config.vocab_size * config.dim;
-        let f32_data: Vec<f32> = match embd_t.quant_type {
-            3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block
-            2 => data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            16 => data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            _ => data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-        };
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-        };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
+        // A BF16 embedding is uploaded AS bf16 rather than widened.
+        //
+        // Widening recovers nothing — the stored value is already bf16, so f32
+        // is exact re-encoding — while doubling the resident head and the
+        // per-token read: 1050.7 MB against 525.3 MB at 128256 x 2048. It also
+        // costs a ~1 GB host conversion at load, skipped entirely below.
+        //
+        // It used to be the right trade regardless, because BF16 had no GEMV
+        // entry and `weight_gemv` fell back to a batch-1 WMMA GEMM: 14.6 ms
+        // against `gemv_f32`'s 5.2 ms. `gemv_bf16_xf32` and its dispatch-family
+        // registration remove that — bf16 weight against an f32 activation runs
+        // in 3.2 ms and matches the widened path to 6.7e-8, f32 accumulation
+        // noise. The widening is now pure cost.
+        //
+        // Only BF16 changes. Q8F16 / F16 / F32 embeddings still decode to f32,
+        // their stored form not being one the GEMV path takes directly. The
+        // embedding GATHER is untouched: `token_embd` is its own buffer, loaded
+        // above.
+        // BF16L3 stays PACKED when residency kept it so, and dispatches to
+        // `gemv_bf16l3_xf32`: 1.917 ms against the plain-bf16 GEMV's 3.241 at
+        // 128256 x 2048, reading 376.3 MB instead of 525.3. Lossless, and
+        // verified at 2.570e-7 worst deviation with an identical argmax.
+        //
+        // Only reachable with HIPFIRE_BF16L3_RESIDENT set; without it
+        // `expand_bf16_index` has already rewritten this entry to logical BF16
+        // and decoded the bytes, so the arm below handles it.
+        //
+        // The kernel requires K % 256 == 0. Rather than assume a well-behaved
+        // hidden size, decode explicitly when it does not hold — the bytes in
+        // `data` are packed, so falling through to the f32 arm would read them
+        // as raw bf16 and garble every logit.
+        if embd_t.quant_type == 49 {
+            if config.dim % 256 == 0 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::Bf16L3;
+                return_packed_head = Some(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::Bf16L3,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                });
+            } else {
+                let logical = decode_bf16_packed(embd_t.quant_type, data, n)
+                    .ok_or_else(|| HipError::new(0, "tied lm_head: BF16L3 decode failed"))?;
+                let mut buf = gpu.upload_raw(&logical, &[config.vocab_size, config.dim])?;
+                buf.dtype = DType::BF16;
+                return_packed_head = Some(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::BF16,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                });
+            }
+        }
+        if let Some(w) = return_packed_head.take() {
+            w
+        } else if embd_t.quant_type == 16 {
+            let mut buf = gpu.upload_raw(data, &[config.vocab_size, config.dim])?;
+            buf.dtype = DType::BF16;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        } else {
+            let f32_data: Vec<f32> = match embd_t.quant_type {
+                3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block
+                2 => data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+            };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
         }
     };
 
@@ -2672,11 +3768,136 @@ pub fn load_weights_paroquant_llama(
 mod tests {
     use super::*;
 
+    /// `impl ModelSource for HfqFile` returned `None` from `tensor_data` and
+    /// `tensor_info` for years, with a comment saying the trait was "primarily
+    /// for safetensors". Anything reaching an HFQ through the trait therefore
+    /// saw an EMPTY model rather than an error — which is how streamed
+    /// calibration ended up hard-wired to the concrete safetensors type.
+    ///
+    /// Guard the fix: through the trait, an HFQ must report its tensors, hand
+    /// back their metadata, and yield bytes identical to the safetensors source
+    /// it was built from.
+    #[test]
+    fn model_source_trait_sees_hfq_tensors() {
+        use hipfire_model::ModelSource;
+
+        let dir = temp_path("modelsource-trait");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "model.embed_tokens.weight".to_string(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": [16, 16],
+                "data_offsets": [0, payload.len()],
+            }),
+        );
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+        std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+
+        let hfq = HfqFile::from_safetensors(&dir).unwrap();
+
+        // The stub reported an empty model here.
+        let names = ModelSource::tensor_names(&hfq);
+        assert!(
+            names.contains(&"model.embed_tokens.weight"),
+            "trait must list HFQ tensors, got {names:?}"
+        );
+
+        let info = ModelSource::tensor_info(&hfq, "model.embed_tokens.weight")
+            .expect("trait must expose tensor metadata for an HFQ");
+        assert_eq!(info.shape, vec![16, 16]);
+        assert_eq!(info.quant_type, 16, "BF16 source keeps its quant type");
+
+        let (_, data) = ModelSource::tensor(&hfq, "model.embed_tokens.weight")
+            .expect("trait must yield tensor bytes for an HFQ");
+        assert_eq!(&*data, payload.as_slice());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "hipfire-hfqm-package-test-{}-{name}",
             std::process::id()
         ))
+    }
+
+    /// The sidecars a multimodal snapshot needs must survive the capture →
+    /// metadata → restore path byte-for-byte, including a binary asset and a
+    /// nested directory. This is the property that makes an `.hfq` → HF export
+    /// reproduce a loadable checkpoint rather than a text-model skeleton.
+    #[test]
+    fn captures_and_restores_hf_sidecars_verbatim() {
+        let dir = temp_path("sidecar-snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache/huggingface")).unwrap();
+
+        // Formatting that a parse/re-serialize round trip would destroy.
+        let preproc = "{\n  \"image_size\":  384,\n  \"do_rescale\": true\n}\n";
+        std::fs::write(dir.join("preprocessor_config.json"), preproc).unwrap();
+        std::fs::write(dir.join("vocab.json"), r#"{"a":0,"b":1}"#).unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "{{ bos_token }}").unwrap();
+        // Invalid UTF-8 — must take the base64 arm.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0xff, 0xfe, 0x00];
+        std::fs::write(dir.join("assets/logo.png"), png).unwrap();
+        // Excluded: weight shard, shard index, dot-dir, and the tokenizer that
+        // is already stored verbatim under its own key.
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), [0u8; 8]).unwrap();
+        std::fs::write(dir.join("model.safetensors.index.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"big":true}"#).unwrap();
+        std::fs::write(dir.join(".cache/huggingface/junk"), "no").unwrap();
+
+        let metadata = embed_tokenizer_metadata(r#"{"architecture":"test"}"#, &dir);
+        let restored: std::collections::HashMap<String, Vec<u8>> =
+            hf_sidecars_from_metadata(&metadata).into_iter().collect();
+
+        assert_eq!(
+            restored.get("preprocessor_config.json").map(|v| &v[..]),
+            Some(preproc.as_bytes()),
+            "byte-exact formatting must survive"
+        );
+        assert_eq!(
+            restored.get("assets/logo.png").map(|v| &v[..]),
+            Some(&png[..]),
+            "binary assets must round-trip through base64"
+        );
+        assert!(restored.contains_key("vocab.json"));
+        assert!(restored.contains_key("chat_template.jinja"));
+
+        for excluded in [
+            "model-00001-of-00002.safetensors",
+            "model.safetensors.index.json",
+            "tokenizer.json",
+            ".cache/huggingface/junk",
+        ] {
+            assert!(
+                !restored.contains_key(excluded),
+                "{excluded} must not be captured"
+            );
+        }
+
+        // The pre-existing tokenizer embedding is untouched by the sweep.
+        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            meta.get("tokenizer").and_then(|t| t.as_str()),
+            Some(r#"{"big":true}"#)
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2755,5 +3976,129 @@ mod tests {
 
         let _ = std::fs::remove_file(payload);
         let _ = std::fs::remove_file(package_path);
+    }
+
+    /// Write one safetensors shard from `(name, dtype, shape, bytes)` tuples,
+    /// laying the data blob out in tuple order.
+    fn write_safetensors_shard(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        let mut blob: Vec<u8> = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let start = blob.len();
+            blob.extend_from_slice(bytes);
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, blob.len()],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&blob);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn from_safetensors_passes_dense_and_splits_stacked_experts() {
+        let dir = temp_path("st-from-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["Qwen3_5_MoeForCausalLM"],"model_type":"qwen3_5_moe","num_experts":2}"#,
+        )
+        .unwrap();
+        // Tokenizer sidecar embed: chat_template must surface through the
+        // self-describing metadata just like a real `.hfq`.
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"SMOKE-TEMPLATE"}"#,
+        )
+        .unwrap();
+
+        // Dense embed: bf16 [4] = 8 bytes. Stacked experts gate_up_proj:
+        // bf16 [E=2, R=2, C=2] = 16 bytes; expert 0 = first 8, expert 1 = last 8.
+        let embed: Vec<u8> = (1u8..=8).collect();
+        let experts: Vec<u8> = (10u8..26).collect();
+        write_safetensors_shard(
+            &dir.join("model.safetensors"),
+            &[
+                ("model.embed_tokens.weight", "BF16", vec![4], embed.clone()),
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    "BF16",
+                    vec![2, 2, 2],
+                    experts.clone(),
+                ),
+            ],
+        );
+
+        let hfq = HfqFile::from_safetensors(&dir).unwrap();
+        assert_eq!(hfq.arch_id, 6, "qwen3.5-moe + num_experts>0 → arch 6");
+
+        // Dense: raw HF name, bf16 tag (16), shape/bytes verbatim.
+        let embed_info = hfq
+            .find_tensor_info("model.embed_tokens.weight")
+            .expect("dense embed present");
+        assert_eq!(embed_info.quant_type, 16);
+        assert_eq!(embed_info.shape, vec![4u32]);
+        assert_eq!(
+            hfq.tensor_data_vec("model.embed_tokens.weight").unwrap().1,
+            embed
+        );
+
+        // Stacked parent is NOT exposed; per-expert 2D tensors are, with the
+        // `.weight` suffix, fused gate_up kept, and correct byte sub-ranges.
+        assert!(hfq
+            .find_tensor_info("model.layers.0.mlp.experts.gate_up_proj")
+            .is_none());
+        let e0 = hfq
+            .find_tensor_info("model.layers.0.mlp.experts.0.gate_up_proj.weight")
+            .expect("expert 0 present");
+        assert_eq!(e0.quant_type, 16);
+        assert_eq!(e0.shape, vec![2u32, 2]);
+        assert_eq!(
+            hfq.tensor_data_vec("model.layers.0.mlp.experts.0.gate_up_proj.weight")
+                .unwrap()
+                .1,
+            experts[0..8]
+        );
+        assert_eq!(
+            hfq.tensor_data_vec("model.layers.0.mlp.experts.1.gate_up_proj.weight")
+                .unwrap()
+                .1,
+            experts[8..16]
+        );
+
+        // Exactly three tensors: 1 dense + 2 experts (gate_up not split further).
+        assert_eq!(hfq.tensors().len(), 3);
+
+        // Sidecar tokenizer_config folded into metadata → chat_template surfaces.
+        assert_eq!(hfq.chat_template().as_deref(), Some("SMOKE-TEMPLATE"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_safetensors_rejects_prequantized_dtype() {
+        let dir = temp_path("st-from-dir-bad-dtype");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_safetensors_shard(
+            &dir.join("model.safetensors"),
+            &[("w", "F8_E4M3", vec![4], vec![0u8; 4])],
+        );
+        assert!(HfqFile::from_safetensors(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

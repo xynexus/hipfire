@@ -2,7 +2,7 @@
   "schema": "hipfire.gemma4.full-model-admission-plan.v1",
   "frozen_at": "2026-07-15",
   "candidate": {
-    "artifact": "Gemma-4-31B.oq8.hfq",
+    "artifact": "Gemma-4-31B--oq8.hfq",
     "quantization_hash": "705685e2d7993d57"
   },
   "oracle": {

@@ -468,6 +468,8 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
     }
     match key {
         K::GemvF32 => hip!(gpu.gemv_f32(w.buf, x, y)),
+        K::GemvBf16 => hip!(gpu.gemv_bf16_xf32(w.buf, x, y, m, k)),
+        K::GemvBf16L3 => hip!(gpu.gemv_bf16l3_xf32(w.buf, x, y, m, k)),
         K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
         K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
         K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
@@ -488,6 +490,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
         // QTIP-3/4: x is pre-FWHT-rotated; the plain trellis kernel does y = W·x_rot.
         K::GemvQtip3G256Prerotated => hip!(gpu.gemv_qtip3g256(w.buf, x, y, m, k)),
+        K::GemvQtip3G256I3Prerotated => hip!(gpu.gemv_qtip3g256i3(w.buf, x, y, m, k)),
         K::GemvQtip4G256Prerotated => hip!(gpu.gemv_qtip4g256(w.buf, x, y, m, k)),
         K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
@@ -515,6 +518,74 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
                 hip!(gpu.quantize_act_oq8(x, &xq, &xs, 1, k, GROUP))?;
                 let ws = w.buf.sub_offset(m * k, m * ng * 4);
                 hip!(gpu.gemm_oq8_grouped_wmma(w.buf, &ws, &xq, &xs, y, m, k, 1, GROUP))
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            res
+        }
+        // Compact-resident Opus W8A8: identical to GemvOq8G256Prerotated except
+        // the weight stays as on-disk OqPlusCompact blocks and the kernel decodes
+        // the nibbles + sparse overlay per tile. A GEMV here is just the batched
+        // GEMM at n=1, exactly as the Oq8 arm above is. `block_stride` is derived
+        // from the buffer — `[M, K/256]` blocks of `130 + 2*N_out` bytes — so no
+        // extra metadata rides on the weight.
+        K::GemvOqCompactG256Prerotated => {
+            const GROUP: usize = 256;
+            let ng = k / GROUP;
+            let blocks = m * ng;
+            if blocks == 0 || w.buf.byte_size() % blocks != 0 {
+                return Err(DispatchError::MissingImpl { key });
+            }
+            let block_stride = w.buf.byte_size() / blocks;
+            let xq = hip!(gpu.alloc_tensor(&[k], DType::Raw))?;
+            let xs = hip!(gpu.alloc_tensor(&[ng], DType::F32))?;
+            let res = (|| {
+                hip!(gpu.quantize_act_oq8(x, &xq, &xs, 1, k, GROUP))?;
+                hip!(gpu.gemm_oq_compact_grouped_wmma(
+                    w.buf,
+                    &xq,
+                    &xs,
+                    y,
+                    m,
+                    k,
+                    1,
+                    GROUP,
+                    block_stride
+                ))
+            })();
+            let _ = gpu.free_tensor(xq);
+            let _ = gpu.free_tensor(xs);
+            res
+        }
+        // Opus Quant W4A16 decode: x is FWHT-rotated f32; multiply the int4 grouped
+        // weight by the full-precision activation (no act quant at B=1). Weight
+        // buffer: [int4 M*K/2 | f32 scales M*ng]; the dense gemv reads both.
+        // Same body as the G256 arm at a 128-element group. The group also
+        // selects the FWHT length upstream (RotationPlan::FwhtG128), so x
+        // arrives rotated by the 128-point transform.
+        K::GemvOqCompactG128Prerotated => {
+            const GROUP: usize = 128;
+            let ng = k / GROUP;
+            let blocks = m * ng;
+            if blocks == 0 || w.buf.byte_size() % blocks != 0 {
+                return Err(DispatchError::MissingImpl { key });
+            }
+            let block_stride = w.buf.byte_size() / blocks;
+            let xq = hip!(gpu.alloc_tensor(&[k], DType::Raw))?;
+            let xs = hip!(gpu.alloc_tensor(&[ng], DType::F32))?;
+            let res = (|| {
+                hip!(gpu.quantize_act_oq8(x, &xq, &xs, 1, k, GROUP))?;
+                hip!(gpu.gemm_oq_compact_grouped_wmma(
+                    w.buf,
+                    &xq,
+                    &xs,
+                    y,
+                    m,
+                    k,
+                    1,
+                    GROUP,
+                    block_stride
+                ))
             })();
             let _ = gpu.free_tensor(xq);
             let _ = gpu.free_tensor(xs);

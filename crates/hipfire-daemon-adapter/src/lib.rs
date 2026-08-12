@@ -5,7 +5,8 @@
 //! Async daemon JSONL process adapter.
 
 pub use hipfire_daemon_protocol::{
-    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SteerApplyRequest,
+    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SetResourceBudgetRequest,
+    SteerApplyRequest,
 };
 /// Re-exported so resource-lock status consumers (admin API, TUI) can match the
 /// live flock state without a direct `hipfire-lock` dependency.
@@ -76,16 +77,69 @@ fn set_load_progress(current: u32, total: u32, phase: &str) {
 /// decode; only a true EOF (0 bytes) or a hard IO error stops us. Load progress
 /// no longer comes from here — it arrives as structured `load_progress` frames
 /// on stdout (see `Daemon::load`).
+/// Durable log for the inference worker's stderr, alongside `serve.log`. The
+/// worker's output — including any panic backtrace or HIP fault — is teed here
+/// so a crash trace survives the worker's death regardless of how the
+/// front-end's own stderr happens to be routed (pidfile daemon, foreground,
+/// captured pipe, …). This is the file to read after a silent worker crash.
+fn daemon_log_path() -> Option<PathBuf> {
+    // Mirror `hipfire_config::hipfire_dir()` (`$HOME/.hipfire`) without taking a
+    // dependency on that crate from the adapter.
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire").join("daemon.log"))
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn spawn_stderr_progress_reader(stderr: ChildStderr) {
+    let log_path = daemon_log_path();
     tokio::spawn(async move {
+        // Best-effort: open the durable daemon log in append mode so successive
+        // worker (re)spawns accumulate a continuous crash history. A failure to
+        // open it must not disrupt the required drain below.
+        let mut log = match log_path.as_ref() {
+            Some(p) => tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .await
+                .ok(),
+            None => None,
+        };
         let mut reader = BufReader::new(stderr);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
         loop {
             buf.clear();
             match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) => break, // EOF: daemon closed stderr / exited.
+                Ok(0) => {
+                    // EOF: the worker closed stderr / exited. Record a durable
+                    // marker so a silent (signal) death is not invisible — the
+                    // exit status itself is logged separately via
+                    // `is_worker_alive` when the engine is next probed.
+                    if let Some(log) = log.as_mut() {
+                        let marker = format!(
+                            "[hipfire-daemon] {} worker stderr closed — inference worker exited (crash or shutdown)\n",
+                            unix_secs()
+                        );
+                        let _ = log.write_all(marker.as_bytes()).await;
+                        let _ = log.flush().await;
+                    }
+                    tracing::error!(
+                        "hipfire-daemon inference worker stderr closed — worker exited (crash or shutdown); see ~/.hipfire/daemon.log"
+                    );
+                    break;
+                }
                 Ok(_) => {}
                 Err(_) => break, // Hard IO error on the pipe.
+            }
+            // Tee the raw line (newline included) to the durable log before any
+            // trimming, so the on-disk record is byte-faithful.
+            if let Some(log) = log.as_mut() {
+                let _ = log.write_all(&buf).await;
             }
             // Trim the trailing newline for re-emit.
             if buf.last() == Some(&b'\n') {
@@ -109,22 +163,41 @@ trait DaemonTransport: Send {
         value: &'a serde_json::Value,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
+    /// Whether the underlying worker process is still alive. Non-process
+    /// transports (mocks) are always considered alive.
+    fn is_worker_alive(&mut self) -> bool {
+        true
+    }
+    /// OS process id of the underlying worker, if this transport is backed by a
+    /// child process. `None` for non-process transports (mocks) or once the
+    /// child has been reaped.
+    fn worker_pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 struct StdioTransport {
-    _child: Child,
+    child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Set once the worker's exit status has been logged, so a dead worker is
+    /// reported exactly once rather than on every liveness probe.
+    exit_logged: bool,
 }
 
 impl StdioTransport {
     async fn spawn(bin: &Path) -> anyhow::Result<Self> {
+        // Ensure the worker emits a backtrace on panic; an operator-provided
+        // value (e.g. `full`) wins so deeper traces can be requested.
+        let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
         let mut child = Command::new(bin)
+            .env("RUST_BACKTRACE", backtrace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Piped (not inherited) so we can parse per-layer load progress; the
-            // reader task below re-emits every line to our stderr, so operator
-            // logs are unchanged.
+            // reader task below re-emits every line to our stderr and tees it to
+            // ~/.hipfire/daemon.log, so operator logs are unchanged and a crash
+            // trace is durably captured.
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -137,9 +210,10 @@ impl StdioTransport {
         }
 
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             stdout,
+            exit_logged: false,
         })
     }
 }
@@ -187,6 +261,143 @@ impl DaemonTransport for StdioTransport {
             Ok(serde_json::from_str(line)?)
         })
     }
+
+    fn worker_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn is_worker_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true, // still running
+            Ok(Some(status)) => {
+                if !self.exit_logged {
+                    self.exit_logged = true;
+                    tracing::error!(
+                        "hipfire-daemon inference worker exited: {status}; see ~/.hipfire/daemon.log for its output and any backtrace"
+                    );
+                }
+                false
+            }
+            // Can't determine the state (e.g. already reaped) — assume alive to
+            // avoid a false "worker down" report.
+            Err(_) => true,
+        }
+    }
+}
+
+/// Ask the worker at `pid` to stop its in-flight generation: SIGUSR1, whose
+/// handler sets the process-global atomic the per-token decode loop polls. The
+/// worker stays resident (model loaded) and emits its normal terminal `done`.
+///
+/// Synchronous, so a `Drop` impl can call it. A request future cancelled by a
+/// client disconnect gets no chance to await [`DaemonEngine::abort_and_drain`],
+/// and the abandoned generation would otherwise decode to completion into a pipe
+/// nobody reads — burning GPU and stalling the next request behind it. Frames
+/// already queued stay in the stream; the next request skips them by id.
+pub fn signal_worker_cancel(pid: u32) -> anyhow::Result<()> {
+    // SAFETY: `kill(2)` with SIGUSR1 to the worker we spawned. The worker's
+    // handler only sets an atomic; delivery is harmless even if the worker has
+    // just finished (the flag is reset at the next request start).
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("failed to SIGUSR1 worker pid {pid}: {err}");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        anyhow::bail!("cooperative cancel unsupported on this platform")
+    }
+}
+
+/// A connection to an ALREADY-RUNNING daemon over its unix socket.
+///
+/// The counterpart to [`StdioTransport`], which spawns a private daemon and owns
+/// its pipes. The distinction matters because exactly one daemon may run per
+/// machine — it holds an exclusive flock on `~/.hipfire/daemon.pid` — so every
+/// caller that spawns is a caller that cannot coexist with `hipfire serve`.
+/// Attaching is what lets them share the one daemon instead of competing for it.
+///
+/// Read and write use the two halves of the same stream, so a reply can be read
+/// while a request is in flight, exactly as the piped-stdio pair allowed.
+struct SocketTransport {
+    write: tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+}
+
+impl SocketTransport {
+    async fn connect(path: &Path) -> anyhow::Result<Self> {
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
+            anyhow::anyhow!("failed to connect to daemon socket {}: {e}", path.display())
+        })?;
+        let (read, write) = stream.into_split();
+        Ok(Self {
+            write: tokio::io::BufWriter::new(write),
+            read: BufReader::new(read),
+        })
+    }
+}
+
+impl DaemonTransport for SocketTransport {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(req)?;
+            debug!("> {line}");
+            self.write.write_all(line.as_bytes()).await?;
+            self.write.write_all(b"\n").await?;
+            self.write.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(value)?;
+            debug!("> {line}");
+            self.write.write_all(line.as_bytes()).await?;
+            self.write.write_all(b"\n").await?;
+            self.write.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
+        Box::pin(async move {
+            let mut line = String::new();
+            self.read.read_line(&mut line).await?;
+            if line.is_empty() {
+                anyhow::bail!("daemon socket closed unexpectedly");
+            }
+            let line = line.trim_end();
+            debug!("< {line}");
+            Ok(serde_json::from_str(line)?)
+        })
+    }
+}
+
+/// Where a listening daemon puts its socket. Beside `daemon.pid`, whose flock is
+/// what makes the daemon a singleton — this is the door to that one daemon.
+///
+/// Defined here rather than in the daemon binary so both ends agree on the path
+/// by construction; the daemon depends on this crate.
+pub fn default_socket_path() -> PathBuf {
+    #[cfg(unix)]
+    let home = std::env::var("HOME").unwrap_or_default();
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    PathBuf::from(home).join(".hipfire").join("daemon.sock")
 }
 
 pub struct DaemonEngine {
@@ -212,12 +423,102 @@ pub enum GenerateStreamControl {
 }
 
 impl DaemonEngine {
+    /// Start a PRIVATE daemon and own it. The daemon dies with this process.
+    ///
+    /// Use this only when the caller genuinely needs its own daemon — most often
+    /// because it just built the binary and must exercise *that* build (gates,
+    /// benches, evals). For anything that should share the machine's one daemon,
+    /// prefer [`attach_or_spawn`](Self::attach_or_spawn): only one daemon can hold
+    /// the `daemon.pid` flock, so a second `spawn` while `hipfire serve` is up
+    /// fails outright rather than queueing.
     pub async fn spawn(bin: &Path) -> anyhow::Result<Self> {
         let transport = StdioTransport::spawn(bin).await?;
         Ok(Self {
             transport: Box::new(transport),
             worker_key_id: None,
         })
+    }
+
+    /// Ask the daemon what its scheduler has done.
+    ///
+    /// These counters only exist inside the daemon: reply ordering observed by a
+    /// client reflects socket races rather than service order, so scheduling
+    /// behaviour cannot be reconstructed from outside.
+    pub async fn scheduler_status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SchedulerStatus).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::SchedulerStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("scheduler_status: {}", e.message),
+            other => anyhow::bail!("scheduler_status: unexpected response {other:?}"),
+        }
+    }
+
+    /// Push memory budgets to the daemon and get the resulting reservation back.
+    ///
+    /// This is what makes attaching viable for a caller that would otherwise have
+    /// configured the daemon by spawning it with an environment: budgets are the
+    /// part of that configuration which is not fixed at exec. Device selection and
+    /// resource locking are — the daemon consumed them before HIP init and before
+    /// taking its flocks — so an attaching caller accepts those as the daemon's.
+    pub async fn set_resource_budget(
+        &mut self,
+        req: SetResourceBudgetRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SetResourceBudget(req)).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::ResourceStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("set_resource_budget: {}", e.message),
+            other => anyhow::bail!("set_resource_budget: unexpected response {other:?}"),
+        }
+    }
+
+    /// Attach to the daemon already listening on `path`.
+    ///
+    /// Fails if nothing is listening; callers that should work either way want
+    /// [`attach_or_spawn`](Self::attach_or_spawn).
+    pub async fn connect(path: &Path) -> anyhow::Result<Self> {
+        let transport = SocketTransport::connect(path).await?;
+        Ok(Self {
+            transport: Box::new(transport),
+            worker_key_id: None,
+        })
+    }
+
+    /// Share the running daemon if there is one, otherwise start a private one.
+    ///
+    /// This is the right default for anything user-facing. Before it existed,
+    /// `hipfire chat` spawned its own daemon, which tried to take the same
+    /// exclusive flock on `~/.hipfire/daemon.pid` that a running `hipfire serve`
+    /// already held — so chatting while serving simply failed. Attaching makes the
+    /// two coexist, and reuses the model the daemon already has resident instead
+    /// of loading a second copy.
+    ///
+    /// The fallback is deliberate rather than an error path: with no daemon
+    /// running there is nothing to share, and spawning is exactly the old
+    /// behaviour. A connect failure for any other reason (stale socket file,
+    /// permissions) also falls through to spawning, which then fails loudly on the
+    /// flock if a daemon really is alive — a clearer error than a connect refusal.
+    pub async fn attach_or_spawn(bin: &Path) -> anyhow::Result<Self> {
+        let socket = default_socket_path();
+        if socket.exists() {
+            match Self::connect(&socket).await {
+                Ok(engine) => {
+                    debug!("attached to running daemon at {}", socket.display());
+                    return Ok(engine);
+                }
+                Err(error) => {
+                    debug!("socket present but not connectable ({error}); spawning instead");
+                }
+            }
+        }
+        Self::spawn(bin).await
+    }
+
+    /// Whether the inference worker process is still alive. Logs the worker's
+    /// exit status once when it is first observed dead. Used by `/health` so the
+    /// server reports `degraded` instead of `ok` when the worker has crashed.
+    pub fn worker_alive(&mut self) -> bool {
+        self.transport.is_worker_alive()
     }
 
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {
@@ -241,6 +542,66 @@ impl DaemonEngine {
             id: request_id.into(),
         }))
         .await
+    }
+
+    /// OS process id of the inference worker, if backed by a child process.
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.transport.worker_pid()
+    }
+
+    /// Cooperatively cancel the in-flight generation and drain the daemon
+    /// stream back to a clean state so this engine can be reused.
+    ///
+    /// The daemon's request channel is busy generating and cannot service an
+    /// in-band `abort`, so we signal out-of-band with SIGUSR1: the worker's
+    /// signal handler sets a process-global cancel flag that its per-token
+    /// decode loop polls and honors within ~1 token, then emits the normal
+    /// terminal `done` frame. We drain events (discarding any late tokens)
+    /// until that `done` (or an `error`) for `request_id` arrives, bounded by a
+    /// short timeout since cancellation is now fast.
+    ///
+    /// On success the worker and its loaded model stay resident and the engine
+    /// is ready for the next request. On any failure (no pid, signal failure,
+    /// timeout, or a transport read error) an `Err` is returned so the caller
+    /// can fall back to discarding the engine (the old SIGKILL-on-drop path).
+    pub async fn abort_and_drain(&mut self, request_id: &str) -> anyhow::Result<()> {
+        let pid = self
+            .worker_pid()
+            .ok_or_else(|| anyhow::anyhow!("cannot cancel: worker pid unavailable"))?;
+
+        signal_worker_cancel(pid)?;
+
+        // Drain until the terminal frame for this request. Cancellation is fast,
+        // so a short bound is enough; on timeout the caller discards the engine.
+        let drain = async {
+            loop {
+                match self.recv().await? {
+                    DaemonResponse::Done(d) => {
+                        if d.id == request_id {
+                            return Ok(());
+                        }
+                        // Stale done from an earlier request; keep draining.
+                    }
+                    DaemonResponse::Error(e) => {
+                        // A terminal error for the aborted request also leaves the
+                        // stream drained; treat it as a clean stop for reuse.
+                        if e.id.as_deref() == Some(request_id) {
+                            return Ok(());
+                        }
+                        // Unrelated error frame — keep draining.
+                    }
+                    // Late tokens / tool-calls / other frames: discard and keep
+                    // draining until the terminal done/error.
+                    _ => {}
+                }
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(5), drain).await {
+            Ok(result) => result,
+            Err(_) => {
+                anyhow::bail!("timed out draining worker after cancel of request {request_id}")
+            }
+        }
     }
 
     /// Ask the daemon to close an active thinking block and answer.
@@ -2023,6 +2384,72 @@ mod tests {
 
         assert!(done.is_none());
         assert_eq!(seen, vec!["first"]);
+    }
+
+    /// A client disconnect cancels the worker's generation but leaves the frames
+    /// it already queued in the stream — including that request's terminal
+    /// `done`. The next request must skip all of them by id and still return its
+    /// own result, or a cancelled request would poison its successor.
+    #[tokio::test]
+    async fn generate_skips_an_abandoned_requests_leftover_frames() {
+        let leftover_done = DoneEvent {
+            id: "cancelled-req".to_string(),
+            tokens: 7,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("cancelled".to_string()),
+            response_id: None,
+            extra: Default::default(),
+        };
+        let mut engine = mock_engine(vec![
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "cancelled-req".to_string(),
+                text: "abandoned".to_string(),
+            }),
+            DaemonResponse::Done(leftover_done),
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
+                id: "req-2".to_string(),
+                text: "mine".to_string(),
+            }),
+            DaemonResponse::Done(DoneEvent {
+                id: "req-2".to_string(),
+                tokens: 1,
+                tok_s: None,
+                prefill_tokens: None,
+                prefill_ms: None,
+                prefill_tok_s: None,
+                decode_tok_s: None,
+                ttft_ms: None,
+                finish_reason: Some("stop".to_string()),
+                response_id: None,
+                extra: Default::default(),
+            }),
+        ]);
+
+        let req = GenerateTextRequest::from_prompt(
+            "req-2".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        );
+        let mut seen = Vec::new();
+        let done = engine
+            .generate_streaming_events_controlled(req, |event| {
+                if let GenerateStreamEvent::Token(text) = event {
+                    seen.push(text);
+                }
+                GenerateStreamControl::Continue
+            })
+            .await
+            .unwrap()
+            .expect("own done");
+
+        assert_eq!(seen, vec!["mine"]);
+        assert_eq!(done.id, "req-2");
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]

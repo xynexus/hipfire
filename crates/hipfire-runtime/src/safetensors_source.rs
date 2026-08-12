@@ -4,6 +4,7 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
+use hipfire_arch_api::ArchRegistry;
 use hipfire_model::{
     ModelSource, QuantConfig, TensorInfo, TensorStorageLocation, ARCH_ID_GEMMA3_TEXT,
     ARCH_ID_GEMMA3_VL, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H,
@@ -28,10 +29,119 @@ fn release_mmap_range(mmap: &Mmap, offset: usize, len: usize) -> std::io::Result
     unsafe { mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) }
 }
 
+/// Where a shard's bytes come from.
+///
+/// `Mmap` is a `.safetensors` file on disk: payload is a borrowed slice of
+/// mapped pages, and the `madvise`/`fadvise` release paths are meaningful.
+/// `Archive` is a shard inside an `.hfa`, whose payload is stored as
+/// independently decodable pieces — it must be decoded into OWNED memory, so
+/// the borrowed accessors decline and `ModelSource::tensor` does the work.
+enum ShardBacking {
+    Mmap {
+        _file: File,
+        mmap: Mmap,
+    },
+    Archive {
+        archive: std::sync::Arc<hipfire_quant_format::hfa::HfaArchive>,
+        rel: String,
+    },
+}
+
 struct SafetensorsFile {
-    _file: File,
-    mmap: Mmap,
+    backing: ShardBacking,
+    /// For `Mmap`, the shard file. For `Archive`, a SYNTHETIC `<archive>#<shard>`
+    /// — never opened, but it must be stable and distinct per shard because
+    /// `TensorLoadPlan` keys physical-alias detection on (path, offset, len).
     path: PathBuf,
+}
+
+/// Index one shard's safetensors header into the source's tensor tables.
+///
+/// Shared by the on-disk and archive backends: an `.hfa` stores each shard's
+/// header VERBATIM, so the tensor table, dtypes and `data_offsets` it yields
+/// are identical to the restored file's and only the byte source differs.
+///
+/// `base_offset` is added to each tensor's `data_offsets[0]`: the header size
+/// for a real file (making `data_offset` a FILE offset), and 0 for an archive,
+/// where reads go through the tensor name rather than a file offset. Alias
+/// detection compares offsets only within one source, so a constant shift is
+/// immaterial to it. `bounds` is the shard's byte length when there is a
+/// mapped file to bound against.
+#[allow(clippy::too_many_arguments)]
+fn index_shard_tensors(
+    raw: &serde_json::Value,
+    base_offset: usize,
+    bounds: Option<usize>,
+    label: &Path,
+    file_idx: usize,
+    tensors: &mut Vec<TensorInfo>,
+    tensor_map: &mut HashMap<String, (usize, usize)>,
+) -> std::io::Result<()> {
+    let serde_json::Value::Object(map) = raw else {
+        return Ok(());
+    };
+    for (name, meta) in map {
+        if name == "__metadata__" {
+            continue;
+        }
+        let name = name.clone();
+        let dtype = meta["dtype"].as_str().unwrap_or("F16").to_string();
+        let shape: Vec<usize> = meta["shape"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let offsets = meta["data_offsets"].as_array().ok_or_else(|| {
+            invalid_safetensors(label, &format!("tensor {name} has no data_offsets"))
+        })?;
+        if offsets.len() != 2 {
+            return Err(invalid_safetensors(
+                label,
+                &format!("tensor {name} data_offsets must contain two values"),
+            ));
+        }
+        let start = offsets[0]
+            .as_u64()
+            .ok_or_else(|| invalid_safetensors(label, &format!("tensor {name} start is not u64")))?
+            as usize;
+        let end = offsets[1]
+            .as_u64()
+            .ok_or_else(|| invalid_safetensors(label, &format!("tensor {name} end is not u64")))?
+            as usize;
+        let outside = end < start
+            || bounds.is_some_and(|limit| {
+                base_offset
+                    .checked_add(end)
+                    .is_none_or(|absolute| absolute > limit)
+            });
+        if outside {
+            return Err(invalid_safetensors(
+                label,
+                &format!("tensor {name} byte range is outside the shard"),
+            ));
+        }
+        if tensor_map.contains_key(&name) {
+            return Err(invalid_safetensors(
+                label,
+                &format!("tensor {name} appears in more than one shard"),
+            ));
+        }
+
+        let tensor_idx = tensors.len();
+        tensors.push(TensorInfo {
+            name: name.clone(),
+            dtype,
+            shape,
+            quant_type: 0xFF, // not an HFQ quant_type
+            data_offset: base_offset + start,
+            data_size: end - start,
+        });
+        tensor_map.insert(name, (file_idx, tensor_idx));
+    }
+    Ok(())
 }
 
 pub struct SafetensorsSource {
@@ -45,6 +155,104 @@ pub struct SafetensorsSource {
 }
 
 impl SafetensorsSource {
+    /// Open an `.hfa` source archive as a model source, WITHOUT restoring it.
+    ///
+    /// The archive holds a HuggingFace snapshot — `config.json`, tokenizer, and
+    /// the `*.safetensors` shards with BF16 payloads losslessly recoded. It
+    /// stores each shard's safetensors header verbatim, so the tensor table
+    /// this builds is identical to the one `open()` builds from the restored
+    /// directory; only payload retrieval differs.
+    ///
+    /// This is what lets calibration consume an archive directly. Restoring a
+    /// 122B first costs 244 GB of disk whose sole purpose was to hand the
+    /// calibrate path a directory it recognised.
+    pub fn open_hfa(path: &Path) -> std::io::Result<Self> {
+        use hipfire_quant_format::hfa::HfaArchive;
+        let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+
+        let archive = std::sync::Arc::new(
+            HfaArchive::open(path).map_err(|e| invalid(format!("{}: {e}", path.display())))?,
+        );
+        let config_bytes = archive
+            .read_small_file("config.json")
+            .map_err(|e| invalid(format!("{}: config.json: {e}", path.display())))?;
+        let config_str = String::from_utf8(config_bytes)
+            .map_err(|e| invalid(format!("{}: config.json is not UTF-8: {e}", path.display())))?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_str).map_err(|e| invalid(e.to_string()))?;
+
+        let arch_id = derive_arch_id(&config)?;
+        let quant_config = parse_quant_config(&config);
+        // The archive carries tokenizer.json inside it, so there is no file
+        // beside it for `tokenizer_json_path` to point at. Fold it into the
+        // metadata under the `tokenizer` key — the same place an `.hfq` keeps
+        // it, and the key the calibrate path already falls back to when a
+        // source has no tokenizer file on disk.
+        let mut metadata_json_cached = build_metadata_json(&config, &config_str);
+        if let Ok(bytes) = archive.read_small_file("tokenizer.json") {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if let Ok(serde_json::Value::Object(mut map)) =
+                    serde_json::from_str::<serde_json::Value>(&metadata_json_cached)
+                {
+                    map.insert("tokenizer".into(), serde_json::Value::String(text));
+                    if let Ok(encoded) = serde_json::to_string(&serde_json::Value::Object(map)) {
+                        metadata_json_cached = encoded;
+                    }
+                }
+            }
+        }
+
+        let mut shards = archive.safetensors_names();
+        shards.sort();
+        if shards.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{}: archive contains no .safetensors shards",
+                    path.display()
+                ),
+            ));
+        }
+
+        let mut files = Vec::new();
+        let mut tensors = Vec::new();
+        let mut tensor_map = HashMap::new();
+        for (file_idx, rel) in shards.iter().enumerate() {
+            let header = archive
+                .shard_header(rel)
+                .map_err(|e| invalid(format!("{}: {rel}: {e}", path.display())))?;
+            // Synthetic and never opened, but stable and distinct per shard:
+            // `TensorLoadPlan` keys physical-alias detection on it.
+            let label = PathBuf::from(format!("{}#{rel}", path.display()));
+            index_shard_tensors(
+                &header,
+                0,
+                None,
+                &label,
+                file_idx,
+                &mut tensors,
+                &mut tensor_map,
+            )?;
+            files.push(SafetensorsFile {
+                backing: ShardBacking::Archive {
+                    archive: archive.clone(),
+                    rel: rel.clone(),
+                },
+                path: label,
+            });
+        }
+
+        Ok(Self {
+            dir: path.to_path_buf(),
+            files,
+            tensors,
+            tensor_map,
+            metadata_json_cached,
+            arch_id,
+            quant_config,
+        })
+    }
+
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         // Read config.json
         let config_path = dir.join("config.json");
@@ -54,7 +262,7 @@ impl SafetensorsSource {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         // Derive arch_id from architectures field
-        let arch_id = derive_arch_id(&config);
+        let arch_id = derive_arch_id(&config)?;
 
         // Parse quantization config
         let quant_config = parse_quant_config(&config);
@@ -104,69 +312,18 @@ impl SafetensorsSource {
             let raw: serde_json::Value = serde_json::from_str(header_json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-            if let serde_json::Value::Object(map) = raw {
-                for (name, meta) in map {
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let dtype = meta["dtype"].as_str().unwrap_or("F16").to_string();
-                    let shape: Vec<usize> = meta["shape"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let offsets = meta["data_offsets"].as_array().ok_or_else(|| {
-                        invalid_safetensors(st_path, &format!("tensor {name} has no data_offsets"))
-                    })?;
-                    if offsets.len() != 2 {
-                        return Err(invalid_safetensors(
-                            st_path,
-                            &format!("tensor {name} data_offsets must contain two values"),
-                        ));
-                    }
-                    let start = offsets[0].as_u64().ok_or_else(|| {
-                        invalid_safetensors(st_path, &format!("tensor {name} start is not u64"))
-                    })? as usize;
-                    let end = offsets[1].as_u64().ok_or_else(|| {
-                        invalid_safetensors(st_path, &format!("tensor {name} end is not u64"))
-                    })? as usize;
-                    if end < start
-                        || header_size
-                            .checked_add(end)
-                            .is_none_or(|end| end > mmap.len())
-                    {
-                        return Err(invalid_safetensors(
-                            st_path,
-                            &format!("tensor {name} byte range is outside the shard"),
-                        ));
-                    }
-                    if tensor_map.contains_key(&name) {
-                        return Err(invalid_safetensors(
-                            st_path,
-                            &format!("tensor {name} appears in more than one shard"),
-                        ));
-                    }
-
-                    let tensor_idx = tensors.len();
-                    let info = TensorInfo {
-                        name: name.clone(),
-                        dtype,
-                        shape,
-                        quant_type: 0xFF, // not an HFQ quant_type
-                        data_offset: header_size + start,
-                        data_size: end - start,
-                    };
-                    tensors.push(info);
-                    tensor_map.insert(name, (file_idx, tensor_idx));
-                }
-            }
+            index_shard_tensors(
+                &raw,
+                header_size,
+                Some(mmap.len()),
+                st_path,
+                file_idx,
+                &mut tensors,
+                &mut tensor_map,
+            )?;
 
             files.push(SafetensorsFile {
-                _file: file,
-                mmap,
+                backing: ShardBacking::Mmap { _file: file, mmap },
                 path: st_path.clone(),
             });
         }
@@ -180,6 +337,43 @@ impl SafetensorsSource {
             arch_id,
             quant_config,
         })
+    }
+
+    /// Raw bytes at an absolute byte range within a specific shard mmap.
+    ///
+    /// Used to back an in-memory [`crate::hfq::HfqFile`] over a safetensors
+    /// directory: stacked routed-expert sub-ranges are not exposed as named
+    /// tensors, so the HfqFile builder addresses them directly by
+    /// `(shard, offset, len)` computed from the parent tensor's layout.
+    ///
+    /// Mapped shards only — returns `None` for an archive-backed source, whose
+    /// bytes exist only once decoded and so cannot be borrowed.
+    pub fn shard_bytes(&self, shard_idx: usize, offset: usize, len: usize) -> Option<&[u8]> {
+        let ShardBacking::Mmap { mmap, .. } = &self.files.get(shard_idx)?.backing else {
+            return None;
+        };
+        mmap.get(offset..offset.checked_add(len)?)
+    }
+
+    /// Per-tensor physical layout as `(name, shard_idx, absolute_offset,
+    /// byte_len, dtype, shape)`. Exposes the shard index the `ModelSource` API
+    /// hides so an `HfqFile` can be built directly over the mmapped shards
+    /// without a temporary bf16 `.hfq` roundtrip.
+    pub fn tensor_layout(&self) -> Vec<(String, usize, usize, usize, String, Vec<usize>)> {
+        self.tensor_map
+            .iter()
+            .map(|(name, &(file_idx, tensor_idx))| {
+                let info = &self.tensors[tensor_idx];
+                (
+                    name.clone(),
+                    file_idx,
+                    info.data_offset,
+                    info.data_size,
+                    info.dtype.clone(),
+                    info.shape.clone(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -199,11 +393,34 @@ impl ModelSource for SafetensorsSource {
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
         let &(file_idx, tensor_idx) = self.tensor_map.get(name)?;
         let info = &self.tensors[tensor_idx];
-        let mmap = &self.files[file_idx].mmap;
+        // Borrowed-only per the trait contract. An archive shard has no mapped
+        // payload to borrow, so it declines here and `tensor()` decodes.
+        let ShardBacking::Mmap { mmap, .. } = &self.files[file_idx].backing else {
+            return None;
+        };
         Some((
             info,
             &mmap[info.data_offset..info.data_offset + info.data_size],
         ))
+    }
+
+    /// Logical payload: borrowed from mapped pages, or decoded out of the
+    /// archive. Decoding touches only the pieces covering this tensor.
+    fn tensor(&self, name: &str) -> Option<(&TensorInfo, std::borrow::Cow<'_, [u8]>)> {
+        let &(file_idx, tensor_idx) = self.tensor_map.get(name)?;
+        let info = &self.tensors[tensor_idx];
+        match &self.files[file_idx].backing {
+            ShardBacking::Mmap { mmap, .. } => Some((
+                info,
+                std::borrow::Cow::Borrowed(
+                    &mmap[info.data_offset..info.data_offset + info.data_size],
+                ),
+            )),
+            ShardBacking::Archive { archive, rel } => {
+                let (bytes, _dtype, _shape) = archive.tensor_bytes(rel, name).ok()?;
+                Some((info, std::borrow::Cow::Owned(bytes)))
+            }
+        }
     }
 
     fn release_tensor_pages(&self, name: &str) {
@@ -229,10 +446,15 @@ impl ModelSource for SafetensorsSource {
             // posix_fadvise then gives the page cache the matching backing-file
             // hint. The mapping remains valid and refaults if a declared alias
             // later reads the same source range.
-            let _ = release_mmap_range(&self.files[file_idx].mmap, data_offset, byte_len);
+            let ShardBacking::Mmap { mmap, _file } = &self.files[file_idx].backing else {
+                // Archive payloads are owned buffers the caller already drops;
+                // there are no shared pages to release.
+                return false;
+            };
+            let _ = release_mmap_range(mmap, data_offset, byte_len);
             unsafe {
                 libc::posix_fadvise(
-                    self.files[file_idx]._file.as_raw_fd(),
+                    _file.as_raw_fd(),
                     data_offset as libc::off_t,
                     byte_len as libc::off_t,
                     libc::POSIX_FADV_DONTNEED,
@@ -295,7 +517,7 @@ fn invalid_safetensors(path: &Path, message: &str) -> std::io::Error {
     )
 }
 
-fn derive_arch_id(config: &serde_json::Value) -> u32 {
+fn derive_arch_id(config: &serde_json::Value) -> std::io::Result<u32> {
     let archs = config
         .get("architectures")
         .and_then(|a| a.as_array())
@@ -313,31 +535,31 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
         if arch_lower.contains("gemma3forcausallm") {
-            return ARCH_ID_GEMMA3_TEXT;
+            return Ok(ARCH_ID_GEMMA3_TEXT);
         }
         if arch_lower.contains("gemma3forconditionalgeneration") {
-            return ARCH_ID_GEMMA3_VL;
+            return Ok(ARCH_ID_GEMMA3_VL);
         }
         if arch_lower.contains("qwen3_5")
             || arch_lower.contains("qwen3.5")
             || arch_lower.contains("qwen3_6")
             || arch_lower.contains("qwen3.6")
         {
-            return if has_experts { 6 } else { 5 };
+            return Ok(if has_experts { 6 } else { 5 });
         }
         if arch_lower.contains("qwen3") || arch_lower.contains("qwen2") {
-            return 1;
+            return Ok(1);
         }
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-            return 0;
+            return Ok(0);
         }
         // NemotronHForCausalLM (Mamba-2 + attn + MLP hybrid). Match the "H"
         // hybrid specifically so plain (llama-based) Nemotron isn't caught.
         if arch_lower.contains("nemotronh") {
-            return ARCH_ID_NEMOTRON_H;
+            return Ok(ARCH_ID_NEMOTRON_H);
         }
         if arch_lower.contains("mamba2") {
-            return ARCH_ID_MAMBA2;
+            return Ok(ARCH_ID_MAMBA2);
         }
     }
 
@@ -348,37 +570,42 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         .map(|s| s.eq_ignore_ascii_case("mamba2"))
         .unwrap_or(false)
     {
-        return ARCH_ID_MAMBA2;
+        return Ok(ARCH_ID_MAMBA2);
     }
 
-    // Fallback: check model_type
-    let model_type = config
-        .get("model_type")
-        .or_else(|| text_config.get("model_type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match model_type {
-        "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
-            if has_experts {
-                6
-            } else {
-                5
-            }
-        }
-        "qwen3" | "qwen2" => 1,
-        "llama" | "mistral" => 0,
-        "gemma3_text" => ARCH_ID_GEMMA3_TEXT,
-        "gemma3" => ARCH_ID_GEMMA3_VL,
-        "nemotron_h" => ARCH_ID_NEMOTRON_H,
-        "mamba2" => ARCH_ID_MAMBA2,
-        _ => {
-            eprintln!(
-                "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"
-            );
-            5
+    // Canonical model identity is owned by the linked architecture specs. Check
+    // both the wrapper and text-core model_type because multimodal Hugging Face
+    // configs commonly carry one at each level.
+    let mut model_types = Vec::new();
+    for value in [
+        config.get("model_type").and_then(|v| v.as_str()),
+        text_config.get("model_type").and_then(|v| v.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !model_types.contains(&value) {
+            model_types.push(value);
         }
     }
+    let registry = ArchRegistry::build();
+    for model_type in &model_types {
+        if let Some(registered) = registry.find_by_model_type(model_type) {
+            return Ok(registered.id.0 as u32);
+        }
+    }
+
+    let rendered = if model_types.is_empty() {
+        "<missing>".to_string()
+    } else {
+        model_types.join(", ")
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "unsupported Hugging Face model_type(s) [{rendered}]; no linked hipfire architecture spec accepts this source"
+        ),
+    ))
 }
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
@@ -435,6 +662,7 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::fs;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -474,7 +702,8 @@ mod tests {
             derive_arch_id(&serde_json::json!({
                 "architectures": ["Gemma3ForCausalLM"],
                 "model_type": "gemma3_text"
-            })),
+            }))
+            .unwrap(),
             ARCH_ID_GEMMA3_TEXT
         );
         assert_eq!(
@@ -482,9 +711,24 @@ mod tests {
                 "architectures": ["Gemma3ForConditionalGeneration"],
                 "model_type": "gemma3",
                 "text_config": { "model_type": "gemma3_text" }
-            })),
+            }))
+            .unwrap(),
             ARCH_ID_GEMMA3_VL
         );
+    }
+
+    #[test]
+    fn unknown_model_type_is_never_guessed_as_qwen35() {
+        let error = derive_arch_id(&serde_json::json!({
+            "architectures": ["HipfireDefinitelyUnknownForCausalLM"],
+            "model_type": "hipfire_test_unknown"
+        }))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("hipfire_test_unknown"));
+        assert!(error
+            .to_string()
+            .contains("no linked hipfire architecture spec"));
     }
 
     #[test]
@@ -525,12 +769,54 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `ModelSource::tensor` must stay ZERO-COPY for safetensors.
+    ///
+    /// The Cow return exists so decoding sources can hand back owned buffers.
+    /// Nothing in the type system stops an mmap-backed source from quietly
+    /// returning `Cow::Owned` instead — and on a 244 GB checkpoint that is the
+    /// difference between reading it and copying it. Assert both the variant
+    /// and that the bytes are the SAME memory the borrowed accessor returns,
+    /// since `Cow::Borrowed` of a freshly-copied slice would still pass a
+    /// variant-only check.
+    #[test]
+    fn model_source_tensor_is_zero_copy_for_safetensors() {
+        let dir = temp_dir("tensor-zero-copy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let payload = vec![0x3cu8; 4096];
+        write_shard(&dir.join("model.safetensors"), "weight", &payload);
+
+        let source = SafetensorsSource::open(&dir).unwrap();
+        let (_, cow) = ModelSource::tensor(&source, "weight").unwrap();
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "safetensors tensor() must not copy"
+        );
+        let borrowed = source.tensor_data("weight").unwrap().1;
+        assert_eq!(
+            cow.as_ptr(),
+            borrowed.as_ptr(),
+            "tensor() returned different memory than tensor_data(); it copied"
+        );
+        assert_eq!(&*cow, payload.as_slice());
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn released_mmap_range_refaults_the_original_tensor_bytes() {
         let dir = temp_dir("madvise-refault");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
         let payload = vec![0x5au8; 128 * 1024];
         write_shard(&dir.join("model.safetensors"), "weight", &payload);
 

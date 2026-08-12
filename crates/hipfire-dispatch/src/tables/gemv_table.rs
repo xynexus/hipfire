@@ -21,6 +21,8 @@ fn register_plain(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::F32,
         DType::F16,
+        DType::BF16,
+        DType::Bf16L3,
         DType::Q8_0,
         DType::Q8HFQ,
         DType::Q4K,
@@ -67,6 +69,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MQ4G256,
         DType::MQ3G256,
         DType::Qtip3G256,
+        DType::Qtip3G256I3,
         DType::Qtip4G256,
         DType::MQ2G256,
         DType::MQ6G256,
@@ -77,6 +80,8 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MFP4G32,
         DType::Oq8G256,
         DType::Oq4G256,
+        DType::OqCompactG256,
+        DType::OqCompactG128,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_prerotated(dtype) else {
@@ -101,6 +106,7 @@ fn register_residual(registry: &mut KernelRegistry) {
         DType::MQ4G256,
         DType::MQ3G256,
         DType::Qtip3G256,
+        DType::Qtip3G256I3,
         DType::Qtip4G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
@@ -140,6 +146,7 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         DType::MQ4G256,
         DType::MQ3G256,
         DType::Qtip3G256,
+        DType::Qtip3G256I3,
         DType::Qtip4G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,

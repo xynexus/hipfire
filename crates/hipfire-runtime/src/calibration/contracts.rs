@@ -463,6 +463,17 @@ impl CaptureRegistry {
     pub fn descriptors(&self) -> impl Iterator<Item = &CaptureDescriptor> {
         self.descriptors.values()
     }
+
+    /// Preserve the architecture-owned logical capture roster while making
+    /// every known tap a no-op. CASK-only passes still validate that forwards
+    /// emit registered IDs; they simply avoid allocating Hessian/imatrix
+    /// accumulators for those IDs.
+    pub fn skip_all(mut self) -> Self {
+        for descriptor in self.descriptors.values_mut() {
+            descriptor.policy = CapturePolicy::Skip;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +530,11 @@ pub struct CalibrationOptions {
     pub expert_coverage_policy: ExpertCoveragePolicy,
     pub kldref: bool,
     pub kldref_top_k: usize,
+    /// Cap on retained KLDREF positions. `None` keeps every corpus row. A KLD
+    /// *reference* is statistically ample over a few thousand positions while the
+    /// Hessians need every row, and the reference costs a full-vocabulary lm-head
+    /// projection per row — so this is the lever on the dominant KLDREF term.
+    pub kldref_rows: Option<usize>,
 }
 
 impl Default for CalibrationOptions {
@@ -533,6 +549,7 @@ impl Default for CalibrationOptions {
             expert_coverage_policy: ExpertCoveragePolicy::Strict,
             kldref: true,
             kldref_top_k: 64,
+            kldref_rows: None,
         }
     }
 }
@@ -554,6 +571,11 @@ impl CalibrationOptions {
         {
             return Err(CalibError::InvalidOptions(
                 "required expert fraction must be finite and in (0, 1]".into(),
+            ));
+        }
+        if self.kldref && self.kldref_rows == Some(0) {
+            return Err(CalibError::InvalidOptions(
+                "kldref row cap must be nonzero when set".into(),
             ));
         }
         if self.kldref && self.kldref_top_k == 0 {
@@ -711,6 +733,62 @@ pub struct LayerRouterStats {
     pub topk_hits: Vec<u64>,
     pub route_weights: Vec<WeightStats>,
     pub cooccurrence: BTreeMap<u64, u64>,
+    /// Per-expert routed-token histogram, `token id -> count`. Empty unless the
+    /// family adapter supplies the token with each routing decision (a shape-only
+    /// routing plan cannot). Answers *what* an expert specialises in rather than
+    /// only how much load it takes — a starved expert whose tokens are all digits
+    /// or CJK is a corpus gap, not a dead expert.
+    ///
+    /// Truncated to the top [`TOKEN_PROFILE_KEEP`] ids per expert when a layer is
+    /// snapshotted; `token_profile_dropped` records how many distinct ids that
+    /// discarded so a report never implies it saw the whole tail.
+    #[serde(default)]
+    pub token_counts: Vec<BTreeMap<u32, u64>>,
+    #[serde(default)]
+    pub token_profile_dropped: Vec<u64>,
+    /// Per-expert routed-*sample-stratum* histogram, `stratum -> count`. Token
+    /// identity is the right lens for lexically-driven routing but says little
+    /// where routing is semantic: the middle third of a decoder can be
+    /// language-universal while still specialising by domain. This counts the
+    /// label of the sample each routed token came from, so an expert can be
+    /// characterised by *what kind of document* reaches it.
+    ///
+    /// Empty unless the corpus supplies per-sample strata (see
+    /// [`CalibrationSample::stratum`]) — a single-stratum corpus records one
+    /// bucket, which the report treats as no signal rather than a finding.
+    #[serde(default)]
+    pub stratum_counts: Vec<BTreeMap<String, u64>>,
+}
+
+/// Distinct token ids kept per expert when persisting a token profile. The live
+/// accumulator is exact; only the snapshot is bounded.
+pub const TOKEN_PROFILE_KEEP: usize = 256;
+
+/// Where a routed row came from, for the per-expert specialisation profiles.
+/// Every field is optional because not every routing seam knows them: the
+/// grouped-MoE dispatch callback sees only indices and weights, while a
+/// per-token adapter knows both the corpus token and its sample's stratum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutedRowContext<'a> {
+    pub token: Option<u32>,
+    pub stratum: Option<&'a str>,
+}
+
+impl<'a> RoutedRowContext<'a> {
+    /// No provenance — load and gate statistics only.
+    pub const fn unknown() -> Self {
+        Self {
+            token: None,
+            stratum: None,
+        }
+    }
+
+    pub const fn new(token: u32, stratum: &'a str) -> Self {
+        Self {
+            token: Some(token),
+            stratum: Some(stratum),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -966,6 +1044,28 @@ impl LayerRouterStats {
             topk_hits: vec![0; num_experts],
             route_weights: vec![WeightStats::default(); num_experts],
             cooccurrence: BTreeMap::new(),
+            token_counts: vec![BTreeMap::new(); num_experts],
+            token_profile_dropped: vec![0; num_experts],
+            stratum_counts: vec![BTreeMap::new(); num_experts],
+        }
+    }
+
+    /// Bound the persisted token profile to the `keep` most-routed ids per expert,
+    /// recording how many distinct ids were discarded.
+    fn truncate_token_profile(&mut self, keep: usize) {
+        for (expert, counts) in self.token_counts.iter_mut().enumerate() {
+            if counts.len() <= keep {
+                continue;
+            }
+            let mut ranked: Vec<(u32, u64)> = counts.iter().map(|(id, n)| (*id, *n)).collect();
+            // Count descending, then token id ascending — deterministic on ties.
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            let dropped = ranked.len() - keep;
+            ranked.truncate(keep);
+            *counts = ranked.into_iter().collect();
+            if let Some(slot) = self.token_profile_dropped.get_mut(expert) {
+                *slot = dropped as u64;
+            }
         }
     }
 }
@@ -1052,12 +1152,17 @@ impl ExpertTelemetry {
         (layer * self.num_experts + expert) * EXPERT_CAPTURE_ROLES.len() + role_index
     }
 
+    /// Record one token's routing decision. [`RoutedRowContext`] carries whatever
+    /// the caller knows about where the row came from; a shape-only routing plan
+    /// supplies neither field and only load/weight stats accrue.
     pub fn record_router_selection(
         &mut self,
         layer: usize,
+        context: RoutedRowContext<'_>,
         indices: &[usize],
         weights: &[f32],
     ) -> Result<(), CalibError> {
+        let RoutedRowContext { token, stratum } = context;
         self.validate_layer(layer)?;
         for (rank, &expert) in indices.iter().take(self.k_top).enumerate() {
             if expert < self.num_experts {
@@ -1084,6 +1189,12 @@ impl ExpertTelemetry {
             stats.topk_hits[expert] += 1;
             stats.routed_slots += 1;
             stats.route_weights[expert].record(weight);
+            if let (Some(token), Some(counts)) = (token, stats.token_counts.get_mut(expert)) {
+                *counts.entry(token).or_insert(0) += 1;
+            }
+            if let (Some(stratum), Some(counts)) = (stratum, stats.stratum_counts.get_mut(expert)) {
+                *counts.entry(stratum.to_string()).or_insert(0) += 1;
+            }
             valid_experts.push(expert);
         }
         valid_experts.sort_unstable();
@@ -1147,6 +1258,57 @@ impl ExpertTelemetry {
         stats.full_reduction_tiles = stats
             .full_reduction_tiles
             .saturating_add(full_reduction_tiles as u64);
+        Ok(())
+    }
+
+    /// Record one admitted row captured directly by a sequential expert path.
+    ///
+    /// Grouped expert execution stages multiple rows before reducing them, but
+    /// the streamed reference adapters execute and capture one selected expert
+    /// at a time.  The latter still reports the same logical reduction-tile
+    /// contract: every admitted row requires one gather launch and each exact
+    /// tile boundary accounts for one complete reduction tile.
+    pub fn record_direct_capture_launch(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        role: ExpertCaptureRole,
+    ) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        self.validate_expert(expert)?;
+        let admitted_rows = self.capture_stats(layer, expert, role).admitted_rows;
+        if admitted_rows == 0 {
+            return Err(CalibError::InvalidCapture(format!(
+                "layer {layer} expert {expert} {role}: cannot record a direct capture launch before admitting a row"
+            )));
+        }
+        let tile_rows = self.quota.tile_rows as u64;
+        self.record_capture_launches(
+            layer,
+            expert,
+            role,
+            1,
+            usize::from(admitted_rows % tile_rows == 0),
+        )
+    }
+
+    /// Close any nonempty logical reduction tiles for a sequential expert
+    /// layer. This is idempotent so cleanup and checkpoint paths may both call
+    /// it without corrupting telemetry.
+    pub fn finalize_direct_capture_layer(&mut self, layer: usize) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        let tile_rows = self.quota.tile_rows as u64;
+        for expert in 0..self.num_experts {
+            for role in EXPERT_CAPTURE_ROLES {
+                let stats = self.capture_stats(layer, expert, role);
+                if stats.launch_telemetry_recorded
+                    && stats.admitted_rows % tile_rows != 0
+                    && stats.partial_reduction_tiles == 0
+                {
+                    self.record_partial_reduction_tile(layer, expert, role)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1236,12 +1398,14 @@ impl ExpertTelemetry {
 
     pub fn layer_snapshot(&self, layer: usize) -> Result<ExpertLayerTelemetry, CalibError> {
         self.validate_layer(layer)?;
+        let mut router = self.router[layer].clone();
+        router.truncate_token_profile(TOKEN_PROFILE_KEEP);
         Ok(ExpertLayerTelemetry {
             layer,
             num_experts: self.num_experts,
             k_top: self.k_top,
             quota: self.quota,
-            router: self.router[layer].clone(),
+            router,
             gate_up: (0..self.num_experts)
                 .map(|expert| {
                     self.capture_stats(layer, expert, ExpertCaptureRole::GateUpInput)
@@ -1713,13 +1877,21 @@ mod tests {
             }),
             Err(CalibError::DuplicateOutputName(_))
         ));
+        let skipped = registry.skip_all();
+        assert_eq!(
+            skipped.resolve_output("model.layers.0.experts.3.up_proj"),
+            Some(id)
+        );
+        assert_eq!(skipped.get(id).unwrap().policy, CapturePolicy::Skip);
     }
 
     #[test]
     fn expert_capture_quota_stops_capture_but_keeps_seen_telemetry() {
         let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 16).unwrap();
         for _ in 0..6 {
-            telemetry.record_router_selection(0, &[0], &[0.5]).unwrap();
+            telemetry
+                .record_router_selection(0, RoutedRowContext::unknown(), &[0], &[0.5])
+                .unwrap();
             assert!(telemetry
                 .record_capture_route(0, 0, ExpertCaptureRole::GateUpInput, 0.5)
                 .is_ok());
@@ -1781,11 +1953,38 @@ mod tests {
     }
 
     #[test]
+    fn sequential_capture_launches_reconcile_full_and_partial_tiles() {
+        let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 8).unwrap();
+        for _ in 0..3 {
+            telemetry
+                .record_router_selection(0, RoutedRowContext::unknown(), &[0], &[1.0])
+                .unwrap();
+            for role in EXPERT_CAPTURE_ROLES {
+                assert_eq!(
+                    telemetry.record_capture_route(0, 0, role, 1.0).unwrap(),
+                    CaptureAdmission::Capture
+                );
+                telemetry.record_direct_capture_launch(0, 0, role).unwrap();
+            }
+        }
+        telemetry.finalize_direct_capture_layer(0).unwrap();
+        telemetry.finalize_direct_capture_layer(0).unwrap();
+
+        for role in EXPERT_CAPTURE_ROLES {
+            let stats = telemetry.capture_stats(0, 0, role);
+            assert_eq!(stats.capture_gather_launches, 3);
+            assert_eq!(stats.full_reduction_tiles, 1);
+            assert_eq!(stats.partial_reduction_tiles, 1);
+        }
+        telemetry.reconcile().unwrap();
+    }
+
+    #[test]
     fn strict_coverage_fails_and_preserve_reports_fallback_experts() {
         let mut telemetry = ExpertTelemetry::new(1, 2, 1, quota(), 8).unwrap();
         for expert in [0usize, 0, 1] {
             telemetry
-                .record_router_selection(0, &[expert], &[1.0])
+                .record_router_selection(0, RoutedRowContext::unknown(), &[expert], &[1.0])
                 .unwrap();
             telemetry
                 .record_capture_route(0, expert, ExpertCaptureRole::GateUpInput, 1.0)
@@ -1813,7 +2012,9 @@ mod tests {
     #[test]
     fn router_and_capture_counts_must_reconcile() {
         let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 8).unwrap();
-        telemetry.record_router_selection(0, &[0], &[1.0]).unwrap();
+        telemetry
+            .record_router_selection(0, RoutedRowContext::unknown(), &[0], &[1.0])
+            .unwrap();
         telemetry
             .record_capture_route(0, 0, ExpertCaptureRole::GateUpInput, 1.0)
             .unwrap();
@@ -1825,7 +2026,9 @@ mod tests {
     fn serialized_layer_telemetry_reconciles_without_live_accumulator() {
         let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 8).unwrap();
         for _ in 0..2 {
-            telemetry.record_router_selection(0, &[0], &[1.0]).unwrap();
+            telemetry
+                .record_router_selection(0, RoutedRowContext::unknown(), &[0], &[1.0])
+                .unwrap();
             telemetry
                 .record_capture_route(0, 0, ExpertCaptureRole::GateUpInput, 1.0)
                 .unwrap();

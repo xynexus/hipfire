@@ -854,7 +854,7 @@ fn moe_res_mq6_routed_indexable() {
 }
 
 #[test]
-fn moe_res_oq_routed_defaults_to_cpu_fallback() {
+fn moe_res_oq_routed_opted_out_falls_back_to_cpu() {
     let mut d = dtypes_all_mq4();
     d.routed_gate_up = DType::Oq8G256;
     d.routed_down = DType::Oq8G256;
@@ -862,6 +862,21 @@ fn moe_res_oq_routed_defaults_to_cpu_fallback() {
     assert!(!r.routed_indexable_oq8);
     assert!(!r.use_gpu_topk);
     assert!(r.needs_x_rot_local);
+}
+
+/// OFF unless explicitly opted in. The default was flipped ON and reverted the
+/// same day (2026-08-12) when the tiny MoE OQ cells went non-finite, so this
+/// asserts the opt-in shape directly. Tested against the pure parse rather than
+/// the env so it cannot race a parallel test runner.
+#[test]
+fn moe_oq_indexed_is_off_unless_explicitly_enabled() {
+    use crate::families::moe::oq_indexed_decode_enabled_from;
+    assert!(!oq_indexed_decode_enabled_from(None));
+    assert!(!oq_indexed_decode_enabled_from(Some("")));
+    assert!(!oq_indexed_decode_enabled_from(Some("0")));
+    assert!(!oq_indexed_decode_enabled_from(Some("off")));
+    assert!(oq_indexed_decode_enabled_from(Some("1")));
+    assert!(oq_indexed_decode_enabled_from(Some("on")));
 }
 
 #[test]

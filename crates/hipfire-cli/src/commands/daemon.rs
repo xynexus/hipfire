@@ -236,9 +236,26 @@ impl ServeStatus {
             .health_text
             .as_deref()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        // The front-end answers /health even when its inference worker has
+        // crashed; surface that as `degraded` rather than a blanket `healthy`.
+        let worker_down = health.as_ref().is_some_and(|h| {
+            h.get("worker_alive") == Some(&serde_json::Value::Bool(false))
+                || h.get("status").and_then(serde_json::Value::as_str) == Some("degraded")
+        });
+        let status_label = if worker_down {
+            "degraded".to_string()
+        } else {
+            self.state_label().to_string()
+        };
+        let health_label = if worker_down {
+            "degraded (inference worker down)".to_string()
+        } else {
+            self.health_label().to_string()
+        };
+        // Real bind + API-auth posture reported by the server (#192).
         let reported = health.as_ref().and_then(health_bind);
         let mut fields = vec![
-            ("Status", self.state_label().to_string()),
+            ("Status", status_label),
             (
                 "Address",
                 reported
@@ -247,7 +264,7 @@ impl ServeStatus {
                     .primary,
             ),
             ("Process", self.process_label()),
-            ("Health", self.health_label().to_string()),
+            ("Health", health_label),
         ];
         if let Some(reachable) = reported.as_ref().and_then(|bind| bind.reachable.clone()) {
             fields.push(("Reachable", reachable));
@@ -272,7 +289,16 @@ impl ServeStatus {
         fields.push(("PID file", human_path(&paths.serve_pid)));
         fields.push(("Log", human_path(&paths.serve_log)));
 
-        render_block(title, &fields, self.note(paths, loaded).as_deref())
+        let note = if worker_down {
+            Some(format!(
+                "The HTTP front-end is up but the inference worker has exited; \
+                 requests fail until it respawns. See {}.",
+                human_path(&paths.root.join("daemon.log"))
+            ))
+        } else {
+            self.note(paths, loaded)
+        };
+        render_block(title, &fields, note.as_deref())
     }
 
     fn state_label(&self) -> &'static str {

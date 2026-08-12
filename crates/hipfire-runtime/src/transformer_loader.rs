@@ -248,6 +248,20 @@ impl<'a> TransformerLoader<'a> {
                     .unwrap_or_else(|error| panic!("{}: {error}", self.family));
                 Ok((gpu.upload_f32(&values, &shape)?, EmbeddingFormat::F32))
             }
+            // A lossless recoding left packed — Bf16Lut3 under
+            // HIPFIRE_BF16L3_RESIDENT, or Bf16Huff. The GATHER cannot read the
+            // packed form (a lookup reads one arbitrary row; BF16L3's escape
+            // plane is only addressable by walking a block), so decode it.
+            qt @ (49 | 50) => {
+                let n = vocab_size * hidden_size;
+                let logical = crate::hfq::decode_bf16_packed(qt, &data, n).unwrap_or_else(|| {
+                    panic!("{}: failed to decode recoded embedding {name}", self.family)
+                });
+                Ok((
+                    gpu.upload_raw(&logical, &[logical.len()])?,
+                    EmbeddingFormat::BF16,
+                ))
+            }
             quant_type => panic!(
                 "{}: unsupported embedding quant type {quant_type} for {name}",
                 self.family
@@ -268,9 +282,9 @@ impl<'a> TransformerLoader<'a> {
             // compact) via the shared `oq8_arch_load`, parallel to the OQ4 arm
             // below — the single arch-agnostic OQ8 dispatch every loader routes
             // through.
-            qt @ (33 | 35 | 36) => {
+            qt @ (33 | 35 | 36 | 52) => {
                 let (bytes, dtype) = oq8_arch_load(qt, &data, m, k)
-                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
                 self.upload_weight_bytes(gpu, bytes, dtype, m, k)?
             }
             OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
@@ -280,6 +294,18 @@ impl<'a> TransformerLoader<'a> {
             }
             16 => {
                 let mut buf = gpu.upload_raw(&data, &[data.len()])?;
+                buf.dtype = DType::BF16;
+                weight_tensor(buf, DType::BF16, m, k)
+            }
+            // Packed recoding: decode to plain bf16 rather than keep it packed.
+            // Only a GEMV consumer can read the packed form, and a linear weight
+            // must serve prefill too — there is no BF16L3 GEMM.
+            qt @ (49 | 50) => {
+                let logical =
+                    crate::hfq::decode_bf16_packed(qt, &data, m * k).unwrap_or_else(|| {
+                        panic!("{}: failed to decode recoded weight {name}", self.family)
+                    });
+                let mut buf = gpu.upload_raw(&logical, &[logical.len()])?;
                 buf.dtype = DType::BF16;
                 weight_tensor(buf, DType::BF16, m, k)
             }

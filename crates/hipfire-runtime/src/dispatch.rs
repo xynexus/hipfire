@@ -91,5 +91,23 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    wmma_only || mq3_gfx10_scalar
+    // bf16/f16 weights batch the prefill via the plain WMMA GEMM
+    // (gemm_bf16_x_bf16_wmma / gemm_f16_x_f32_wmma) on every RDNA3/3.5/4 WMMA
+    // arch, incl. gfx1103 (Phoenix). Without this, a bf16 llama model (loaded
+    // native rather than F32-upcast) is judged non-batchable and the serving
+    // prefill falls back to a per-token loop — the ~10 t/s PP≈TG regression. F32
+    // has no batched-prefill kernel and correctly stays off this list.
+    let bf16_f16_wmma = matches!(dt, DType::BF16 | DType::F16)
+        && matches!(
+            arch,
+            "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1200"
+                | "gfx1201"
+        );
+    wmma_only || mq3_gfx10_scalar || bf16_f16_wmma
 }

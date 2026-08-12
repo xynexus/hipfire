@@ -100,6 +100,14 @@ pub struct PrefillBatchScratch {
     // stays on the residual_scaled atomic kernel.
     pub moe_down_expanded_batch: Option<GpuTensor>,
 
+    // Per-slot rotated gate_up input — [N × k_top × dim] f32, the mirror of
+    // `moe_down_expanded_batch` on the input side. The indexed OQ gate_up
+    // GEMVs read one rotated basis PER (token, krank) because routed experts
+    // carry different AWQ scales; `x_rot_batch` holds only the shared
+    // single-basis rotation and cannot serve them. Written by
+    // `rotate_x_mq_awq_indexed_batched`.
+    pub moe_x_rot_expanded_batch: Option<GpuTensor>,
+
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
     // allocated when num_experts > 0; gated at runtime by
     // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max is tile-aligned:
@@ -114,18 +122,20 @@ pub struct PrefillBatchScratch {
     pub grouped_moe_scratch: Option<grouped_moe::GroupedMoeScratch>,
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
-    // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
-    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
-    // since LA dispatch is serial per-cycle. Only allocated when the model
-    // has LA layers (linear_num_value_heads > 0). Call sites that pass
-    // parent_indices must ensure these tensors exist.
+    // Per-token S-state tape consumed by the gated_delta_net_{f32,f16}_tree
+    // kernels when TreeVerifyCtx.parent_indices is Some. Reused across LA
+    // layers since LA dispatch is serial per-cycle. Only allocated when the
+    // model has LA layers (linear_num_value_heads > 0). Call sites that pass
+    // parent_indices must ensure this tensor exists.
     //
-    // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
-    // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
+    // [max_batch × n_v_heads × head_dim × head_dim], sized at 4 bytes/element:
+    // f32 uses the buffer exactly, f16 uses the first half. Sizing for the
+    // wider case keeps the allocation independent of `DeltaNetState::quant`,
+    // which is per-session and not known here. Neither precision has scales,
+    // so the Q8-era scales tape is gone.
     //
-    // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
-    pub dn_s_tape_q8: Option<GpuTensor>,
-    pub dn_s_tape_scales: Option<GpuTensor>,
+    // At max_batch=22, n_v_heads=16, head_dim=128 → 23.1 MB.
+    pub dn_s_tape: Option<GpuTensor>,
 }
 
 /// One independent dense-Qwen35 request/session row for the future fused
@@ -613,8 +623,13 @@ pub fn prefill_session_batch_attention_q8_layer(
     )
 }
 
+/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
+///
+/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
+/// f16 state, which is why the caller selects this by `DeltaNetState::quant`
+/// rather than by model. No scales: f16 carries a per-element exponent.
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -630,45 +645,22 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
     n_heads: usize,
     head_dim: usize,
 ) -> HipResult<()> {
-    if delta_layer_index >= route_shape.dn_s_layers
-        || delta_layer_index >= route_shape.dn_scale_layers
-    {
+    if delta_layer_index >= route_shape.dn_s_layers {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "grouped MoE session prefill routed Q8 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                "grouped MoE session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
                 route_shape,
             ),
         ));
     }
-    // #17 — Q8 requant seed. Every other GDN caller passes the absolute
-    // sequence position of the block it is processing. This one CANNOT: the
-    // kernel takes a single `frame` scalar, but this launch covers rows from
-    // MULTIPLE sessions that sit at DIFFERENT absolute positions (the
-    // per-row positions live device-side in `device_tables.row_positions`,
-    // and the kernel mixes `row_session_indices` only for state routing, not
-    // into the RNG). A single scalar cannot represent them.
-    //
-    // Passing a constant here still fixes the actual defect: the seed is no
-    // longer a function of how many dispatches have happened, so execution
-    // history (e.g. a different spec-decode drafter) can no longer perturb
-    // these numerics. What it does NOT give is decorrelation ACROSS sequence
-    // positions within this path — every position in a multi-session prefix
-    // batch dithers from the same base. Layers are still decorrelated, since
-    // `delta_layer_index` is mixed into the seed by the dispatcher.
-    //
-    // Making this per-position correct requires the kernel to read
-    // `row_positions` (a kernel change, deliberately out of scope here).
-    // FLAGGED FOR DESIGN DECISION — do not "fix" by reintroducing a counter.
-    const ROUTED_BATCH_SEQ_POS: u32 = 0;
-    gpu.gated_delta_net_q8_routed_batch_seq(
+    gpu.gated_delta_net_f16_routed_batch_seq(
         q_batch,
         k_batch,
         v_batch,
         gate_batch,
         beta_batch,
         &device_tables.dn_s_ptrs,
-        &device_tables.dn_scale_ptrs,
         &device_tables.row_session_indices,
         out_batch,
         route_shape.dn_s_layers,
@@ -677,7 +669,6 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
         n_heads,
         head_dim,
         sessions,
-        ROUTED_BATCH_SEQ_POS,
     )
 }
 
@@ -763,11 +754,67 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(&weights.output)?;
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_oq_compact_act_batched(
+                    &weights.output.buf,
+                    &rot,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                    block_stride,
+                )
+            });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
+        // Opus W8A8 lm_head — see `dense_session_prefill_gemm_full_precision`.
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_oq8_grouped_act_batched(
+                    &weights.output.buf,
+                    &rot,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
-            let rotated = gpu
-                .rotate_x_mq_batched(&normed_rows, &rot, weights.output.k, row_count)
-                .and_then(|()| {
+            // AWQ-aware — see `dense_session_prefill_gemm_full_precision`.
+            let rotated = rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rot,
+                weights.output.k,
+                row_count,
+            )
+            .and_then(|()| {
                     gpu.gemm_hfq4g256(
                         &weights.output.buf,
                         &rot,
@@ -1072,9 +1119,9 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
                 "grouped MoE session fused prefix row {idx} has unsupported KV quantization flags; first MoE target is plain Q8 KV"
             ));
         }
-        if !matches!(signature.dn_quant, StateQuant::Q8 | StateQuant::FP32) {
+        if !matches!(signature.dn_quant, StateQuant::FP32 | StateQuant::FP16) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports Q8 or FP32",
+                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports FP32 or FP16",
                 signature.dn_quant,
             ));
         }
@@ -1086,11 +1133,55 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
 // (F32/F16/BF16/Raw) plus plain Q8_0 and MQ4G256 (quantized dense models). MQ6G256
 // and other quant formats have no batched non-residual kernel yet, so models using
 // them fall back to serial_reference via the contract. (Name kept to avoid churn.)
-fn dense_prefill_weight_full_precision_supported(weight: &WeightTensor) -> bool {
-    matches!(
+/// Why `weight` cannot go through the fused dense body, or `None` if it can.
+fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'static str> {
+    // AWQ-calibrated artifacts ("+" quants) store weights PRE-SCALED as `W·s`
+    // and require the forward path to apply `x /= s` upstream of the linear,
+    // completing `(W·s)·(x/s) = W·x` — see `WeightTensor::awq_scale`. Applying
+    // it is per-dtype work, not a blanket property of this body: MQ4G256 gets
+    // it from the FWHT pre-rotation, which now dispatches through
+    // `rotate_x_mq_batched_for` at every dense site. No other dense arm divides
+    // by the scale, so an AWQ sidecar on one would still compute `(W·s)·x` —
+    // silently, since the dtype is otherwise accepted. Keep routing those to
+    // serial. Widen this only alongside the arm that applies the scale.
+    // The arms that pre-rotate through `rotate_x_mq_batched_for` apply the scale
+    // (it dispatches the `x /= awq_scale` + FWHT kernel when the sidecar is
+    // present); every other arm would compute `(W·s)·x`. Keep this list in step
+    // with the `_for` call sites below — adding a rotated arm without adding it
+    // here silently routes an AWQ model to serial, which is how the Opus arms
+    // were caught during bring-up.
+    if weight.awq_scale.is_some() && !matches!(weight.gpu_dtype, DType::MQ4G256 | DType::Oq8G256) {
+        return Some(
+            "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256, OqCompactG256)",
+        );
+    }
+    // Oq4G256 (oq4/oq4+/oq4++) is deliberately NOT admitted yet: wiring it to
+    // `gemm_oq4_grouped_act_batched` compiled and ran, but failed fused-vs-serial
+    // parity at b8 on qwen3.5-0.8b--oq4++ (3 of 8 sessions produced a different
+    // first token — near-tie flips, so it reads numerical rather than gross,
+    // most likely an activation-precision difference between that kernel and the
+    // serial oq4 path). Parity is the bar, so it stays on serial until that is
+    // understood.
+    //
+    // Oq8G256 is the whole Opus family on this path: Opus executes as W8A8, and
+    // 4-bit forms (oq4.25++ = OqPlusCompact on disk) are expanded to dense int8
+    // at load — `oq_gpu_dtype_for_quant_type` maps OqPlusG256/OqPlusCompact/
+    // Oq8G256 all to `DType::Oq8G256`. So admitting this one dtype is what puts
+    // the premier quant on the fused path.
+    if !matches!(
         weight.gpu_dtype,
-        DType::F32 | DType::F16 | DType::BF16 | DType::Raw | DType::Q8_0 | DType::MQ4G256
-    )
+        DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::Raw
+            | DType::Q8_0
+            | DType::MQ4G256
+            | DType::Oq8G256
+            | DType::OqCompactG256
+    ) {
+        return Some("unsupported weight dtype");
+    }
+    None
 }
 
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
@@ -1109,38 +1200,44 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
             weights.embd_format,
         ));
     }
-    if !dense_prefill_weight_full_precision_supported(&weights.output) {
+    if let Some(reason) = dense_prefill_weight_unsupported_reason(&weights.output) {
         return Err(format!(
-            "dense session fused prefix does not support lm_head dtype {:?} yet",
+            "dense session fused prefix does not support lm_head ({reason}; dtype {:?})",
             weights.output.gpu_dtype,
         ));
     }
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        let supported = match layer {
-            LayerWeights::DeltaNet(layer) => {
-                dense_prefill_weight_full_precision_supported(&layer.wqkv)
-                    && dense_prefill_weight_full_precision_supported(&layer.wz)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_alpha)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_beta)
-                    && dense_prefill_weight_full_precision_supported(&layer.wo)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
+        let unsupported = match layer {
+            LayerWeights::DeltaNet(layer) => [
+                &layer.wqkv,
+                &layer.wz,
+                &layer.w_alpha,
+                &layer.w_beta,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .into_iter()
+            .find_map(dense_prefill_weight_unsupported_reason),
+            LayerWeights::FullAttn(layer) => [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .into_iter()
+            .find_map(dense_prefill_weight_unsupported_reason),
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
+                Some("MoE layer weights; the dense fused prefix is dense-only")
             }
-            LayerWeights::FullAttn(layer) => {
-                dense_prefill_weight_full_precision_supported(&layer.wq)
-                    && dense_prefill_weight_full_precision_supported(&layer.wk)
-                    && dense_prefill_weight_full_precision_supported(&layer.wv)
-                    && dense_prefill_weight_full_precision_supported(&layer.wo)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
-                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
-            }
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         };
-        if !supported {
+        if let Some(reason) = unsupported {
             return Err(format!(
-                "dense session fused prefix layer {layer_idx} has unsupported dense/MoE weight dtypes; first target is dense full-precision weights"
+                "dense session fused prefix layer {layer_idx} has unsupported weights ({reason})"
             ));
         }
     }
@@ -2395,6 +2492,14 @@ fn forward_dense_session_batch_layers_full_precision(
                     config.head_dim,
                     config.norm_eps,
                 )?;
+                record_streamed_prerope_q_if_enabled(
+                    gpu,
+                    capture_layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    row_count,
+                    config,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
@@ -2817,7 +2922,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
-    delta_q8: bool,
+    delta_f16: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
         gpu,
@@ -2836,7 +2941,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         None,
         None,
         true,
-        delta_q8,
+        delta_f16,
     )
 }
 
@@ -2963,6 +3068,52 @@ fn capture_streamed_dense_input(
         .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
 }
 
+fn record_streamed_prerope_q_if_enabled(
+    gpu: &mut Gpu,
+    layer: usize,
+    q_batch: &GpuTensor,
+    k_batch: &GpuTensor,
+    rows: usize,
+    config: &Qwen35Config,
+) -> HipResult<()> {
+    if !hipfire_runtime::triattn::tap_enabled() {
+        return Ok(());
+    }
+    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+        gpu,
+        layer,
+        &q_batch.buf,
+        rows,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    if gpu_handled {
+        return Ok(());
+    }
+
+    let q_stride = config.n_heads * config.head_dim;
+    let q_cpu = gpu.download_f32(q_batch)?;
+    if hipfire_runtime::triattn::tap_needs_k() {
+        let k_stride = config.n_kv_heads * config.head_dim;
+        let k_cpu = gpu.download_f32(k_batch)?;
+        for row in 0..rows {
+            hipfire_runtime::triattn::record_prerope_qk(
+                layer,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+                Some(&k_cpu[row * k_stride..(row + 1) * k_stride]),
+            );
+        }
+    } else {
+        for row in 0..rows {
+            hipfire_runtime::triattn::record_prerope_q(
+                layer,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_grouped_moe_session_batch_layers(
     gpu: &mut Gpu,
@@ -2984,7 +3135,7 @@ fn forward_grouped_moe_session_batch_layers(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     kv_q8: bool,
-    delta_q8: bool,
+    delta_f16: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -3296,8 +3447,8 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count * k_dim * 4,
                     )?;
                 }
-                if delta_q8 {
-                    grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+                if delta_f16 {
+                    grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
                         gpu,
                         device_tables,
                         route_shape,
@@ -3630,6 +3781,14 @@ fn forward_grouped_moe_session_batch_layers(
                     config.head_dim,
                     config.norm_eps,
                 )?;
+                record_streamed_prerope_q_if_enabled(
+                    gpu,
+                    capture_layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    row_count,
+                    config,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
@@ -3887,9 +4046,12 @@ pub fn forward_prefill_grouped_moe_session_batch(
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     // Signature validation guarantees one state layout for every row. Select
     // the already-implemented routed recurrence branch once for the batch.
-    let delta_q8 = signatures
+    // FP16 state is half the stride of FP32, so the routed kernel and the state
+    // precision must be chosen together — the f32 kernel over f16 state reads
+    // every element at the wrong offset.
+    let delta_f16 = signatures
         .first()
-        .map(|signature| signature.dn_quant == StateQuant::Q8)
+        .map(|signature| matches!(signature.dn_quant, StateQuant::FP16))
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
@@ -3962,7 +4124,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
-        delta_q8,
+        delta_f16,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
@@ -4098,6 +4260,14 @@ impl PrefillBatchScratch {
             } else {
                 None
             },
+            moe_x_rot_expanded_batch: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.dim],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
             // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
             // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
@@ -4113,20 +4283,15 @@ impl PrefillBatchScratch {
             } else {
                 None
             },
-            dn_s_tape_q8: if config.linear_num_value_heads > 0 {
+            dn_s_tape: if config.linear_num_value_heads > 0 {
+                // 4 bytes/element — the f32 tree kernel's stride. The f16 tree
+                // kernel uses the first half of the same buffer.
                 let bytes = max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
-                    * config.linear_value_head_dim;
+                    * config.linear_value_head_dim
+                    * 4;
                 Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
-            } else {
-                None
-            },
-            dn_s_tape_scales: if config.linear_num_value_heads > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
-                    DType::F32,
-                )?)
             } else {
                 None
             },
@@ -4178,8 +4343,8 @@ impl PrefillBatchScratch {
             self.moe_hidden_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
-            self.dn_s_tape_q8,
-            self.dn_s_tape_scales,
+            self.moe_x_rot_expanded_batch,
+            self.dn_s_tape,
         ]
         .into_iter()
         .flatten()
@@ -4202,7 +4367,7 @@ impl PrefillBatchScratch {
 /// byte-identical to decode. FA layers always use a per-token gather/scatter
 /// fallback — the FA causal attention kernel can't yet be batched (task #71).
 ///
-/// `gated_delta_net_q8_batch_seq` runs one launch per LA layer; the kernel
+/// `gated_delta_net_{f32,f16}_batch_seq` runs one launch per LA layer; the kernel
 /// loops over the N tokens internally and requants the Q8 state after every
 /// token, matching the decode requant cadence (distributionally equivalent to
 /// decode, not byte-identical — the stochastic-rounding frame differs).
@@ -4230,7 +4395,7 @@ impl PrefillBatchScratch {
 ///
 /// `gdn_tape`: if `Some`, captures the post-processed `(q, k, v, α, β)` for
 /// every DN (LinearAttention) layer and block position BEFORE the batched
-/// `gated_delta_net_q8_batch_seq` call. Enables the DFlash rollback path
+/// `gated_delta_net_{f32,f16}_batch_seq` call. Enables the DFlash rollback path
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
@@ -4486,6 +4651,34 @@ pub(crate) fn gemm_raw_x_f32_residual_batched_auto(
     gpu.add_inplace_f32(&y_n, &scratch_n)
 }
 
+/// Byte stride of one OqPlusCompact block for `weight`, derived from the buffer
+/// rather than carried as metadata: the weight is `[M, K/256]` blocks of
+/// `130 + 2*N_out` bytes, so the stride falls out of the allocation size.
+fn oq_compact_block_stride(weight: &WeightTensor) -> Result<usize, hip_bridge::HipError> {
+    const GROUP: usize = 256;
+    let blocks = weight.m * (weight.k / GROUP);
+    if blocks == 0 || weight.k % GROUP != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "OqCompactG256 requires K % 256 == 0 and M*K/256 > 0 (M={} K={})",
+                weight.m, weight.k
+            ),
+        ));
+    }
+    let bytes = weight.buf.byte_size();
+    if bytes % blocks != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "OqCompactG256 buffer {bytes} B is not divisible by {blocks} blocks (M={} K={})",
+                weight.m, weight.k
+            ),
+        ));
+    }
+    Ok(bytes / blocks)
+}
+
 // Batched single-projection GEMM for the dense fused prefill. Despite the
 // `_full_precision` name (kept to avoid churning ~10 call sites), this now
 // dispatches plain Q8_0 and MQ4G256 weights too — quantized dense models route
@@ -4506,9 +4699,44 @@ fn dense_session_prefill_gemm_full_precision(
             gemm_raw_x_f32_auto(gpu, &weight.buf, x, y, weight.m, weight.k, n)
         }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
+        // Opus W8A8: same FWHT-256 pre-rotation as MQ, then the batched
+        // quantize-act + grouped int8 WMMA. Mirrors the serial recipe documented
+        // on `weight_gemv` (rotate -> quantize_act_oq8 -> gemm_oq8_grouped_wmma);
+        // `gemm_oq8_grouped_act_batched` does the last two and owns its scratch.
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result =
+                gpu.gemm_oq8_grouped_act_batched(&weight.buf, &rot, y, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
+        }
+        // Compact-resident Opus: same W8A8 math, weights decoded from the
+        // on-disk blocks in-kernel instead of a pre-expanded int8 plane.
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(weight)?;
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq_compact_act_batched(
+                &weight.buf,
+                &rot,
+                y,
+                weight.m,
+                weight.k,
+                n,
+                block_stride,
+            );
+            let _ = gpu.free_tensor(rot);
+            result
+        }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
-            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            // AWQ-aware. When `weight` ships an `awq_scale` sidecar its stored
+            // bytes are pre-scaled `W·s`, so the activation must be divided by
+            // `s` before the FWHT to complete `(W·s)·(x/s) = W·x`. `_for`
+            // dispatches that kernel and is byte-identical to the plain rotate
+            // when there is no sidecar.
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
             let result = gpu.gemm_hfq4g256(&weight.buf, &rot, y, weight.m, weight.k, n);
             let _ = gpu.free_tensor(rot);
             result
@@ -4561,9 +4789,40 @@ fn dense_session_prefill_gemm_full_precision_residual(
             let accum = y_residual.sub_offset(0, n * weight.m);
             gpu.add_inplace_f32(&accum, &out)
         }
+        DType::OqCompactG256 => {
+            let block_stride = oq_compact_block_stride(weight)?;
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq_compact_residual_act_batched(
+                &weight.buf,
+                &rot,
+                y_residual,
+                weight.m,
+                weight.k,
+                n,
+                block_stride,
+            );
+            let _ = gpu.free_tensor(rot);
+            result
+        }
+        DType::Oq8G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
+            let result = gpu.gemm_oq8_grouped_residual_act_batched(
+                &weight.buf,
+                &rot,
+                y_residual,
+                weight.m,
+                weight.k,
+                n,
+            );
+            let _ = gpu.free_tensor(rot);
+            result
+        }
         DType::MQ4G256 => {
             let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
-            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            // AWQ-aware — see `dense_session_prefill_gemm_full_precision`.
+            rotate_x_mq_batched_for(gpu, weight, x, &rot, weight.k, n)?;
             let result =
                 gpu.gemm_hfq4g256_residual(&weight.buf, &rot, y_residual, weight.m, weight.k, n);
             let _ = gpu.free_tensor(rot);
@@ -5111,7 +5370,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // preamble (rmsnorm, rotate, 4-way fused GEMM) and FFN (gate_up + down).
     // 256 costs ~80 MB of scratch on 9B vs 20 MB at 64 — trivial on modern
     // cards — and drops chunk count for pp2048 from 32 → 8. The inner
-    // gated_delta_net_q8_batch_seq loop is still sequential per token, so
+    // gated_delta_net batch_seq loop is still sequential per token, so
     // the per-chunk DeltaNet cost is linear in N either way; raising the
     // batch just amortizes the NON-DeltaNet kernels more.
     //

@@ -7,9 +7,11 @@
 //!
 //! Writes `docs/CLI.md` (via `clap-markdown`) and `man/hipfire*.1` (via
 //! `clap_mangen`, one page for the root command and one per subcommand). With
-//! `--check` it renders to memory and diffs against the committed files instead
-//! of writing, exiting non-zero on drift — the freshness gate `tests/no-gpu-ci.sh`
-//! runs so the docs can't silently fall out of sync with the code.
+//! `--check` it renders to memory and diffs against what is on disk instead of
+//! writing, exiting non-zero on drift — the freshness gate `tests/no-gpu-ci.sh`
+//! runs so the docs can't silently fall out of sync with the code. Only
+//! `docs/CLI.md` is tracked; `/man/` is gitignored, so its absence is not drift.
+//! See `check_file`.
 
 use std::path::Path;
 
@@ -40,10 +42,19 @@ pub fn run(args: GenDocsArgs) -> anyhow::Result<()> {
         check_file(
             Path::new(&args.docs_dir).join("CLI.md"),
             &markdown,
+            true,
             &mut stale,
         );
+        // `/man/` is gitignored, so a clean checkout has no man pages at all.
+        // Requiring them made this gate unsatisfiable off a developer's own
+        // tree; drift detection rides on the tracked `docs/CLI.md` above.
         for (name, bytes) in &man_pages {
-            check_file(Path::new(&args.man_dir).join(name), bytes, &mut stale);
+            check_file(
+                Path::new(&args.man_dir).join(name),
+                bytes,
+                false,
+                &mut stale,
+            );
         }
         if !stale.is_empty() {
             anyhow::bail!(
@@ -120,11 +131,22 @@ fn trim_trailing_line_ws(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn check_file(path: std::path::PathBuf, expected: impl AsRef<[u8]>, stale: &mut Vec<String>) {
-    let matches = std::fs::read(&path)
-        .map(|got| got == expected.as_ref())
-        .unwrap_or(false);
-    if !matches {
-        stale.push(path.display().to_string());
+/// Record `path` as stale unless it matches freshly generated `expected`.
+///
+/// `required` separates the two outputs. `docs/CLI.md` is tracked, so a missing
+/// file is real drift. The man pages under `/man/` are generated and gitignored,
+/// so their absence is the normal state of a clean checkout — but one that is
+/// present still has to match, or a stale local copy would quietly mislead
+/// whoever read it. Only `NotFound` is forgiven; an unreadable file still fails.
+fn check_file(
+    path: std::path::PathBuf,
+    expected: impl AsRef<[u8]>,
+    required: bool,
+    stale: &mut Vec<String>,
+) {
+    match std::fs::read(&path) {
+        Ok(got) if got == expected.as_ref() => {}
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => stale.push(path.display().to_string()),
     }
 }

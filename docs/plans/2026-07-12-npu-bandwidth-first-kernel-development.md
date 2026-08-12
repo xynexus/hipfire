@@ -181,7 +181,7 @@ the eight-column control remains near the 56-GB/s R56 roof.
 
 The loader now writes an atomic 128-byte version/hash header plus the exact
 8,192,000-byte R34 payload. It rejects source-SHA or payload-SHA mismatch. A
-real `EmbeddingGemma-300M.npu.oq4.hfq` run produced 24 layer files under
+real `EmbeddingGemma-300M--npu.oq4.hfq` run produced 24 layer files under
 `~/.hipfire/npu/prepacked/`, completed the resident M256 model, and a second run
 consumed the files without changing their size, mtime, or SHA-256.
 
@@ -204,7 +204,7 @@ is converted offline. OQ8 uses the same API and container with a distinct
 encoding value. Mixed W4-plus-overlay has a reserved generic encoding and will
 need a segmented full-K payload before it can use this physical schedule.
 
-A real resident-only load of `EmbeddingGemma-300M.npu.oq4.hfq` created 216
+A real resident-only load of `EmbeddingGemma-300M--npu.oq4.hfq` created 216
 packed files (nine individual/combined projection forms for each of 24 layers)
 under `~/.hipfire/npu/prepacked/`. The layer-0 combined QKV file is 2,359,488
 bytes: a 192-byte header plus 2,359,296 payload bytes for eight columns, six

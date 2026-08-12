@@ -12,7 +12,6 @@
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
 //! items called from `main.rs` are `pub`.
 
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_qwen35::qwen35;
@@ -226,7 +225,7 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
             kv_quant_asym3: false,
             kv_quant_asym4: false,
             kv_quant_fwht: false,
-            dn_quant: qwen35::StateQuant::Q8,
+            dn_quant: qwen35::StateQuant::FP32,
         };
         session_count
     ];
@@ -305,7 +304,7 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
 /// Emit the `generate_batch_prefill_ready` capability event for the real
 /// (non-dummy) qwen35 backend.
 pub fn emit_generate_batch_prefill_ready(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
     let line = serde_json::json!({
@@ -324,7 +323,7 @@ pub fn emit_generate_batch_prefill_ready(
 /// Emit a `generate_batch_prefill_ready` event reporting the request is
 /// unsupported, with the reason.
 pub fn emit_generate_batch_prefill_unsupported(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
     reason: &str,
 ) {
@@ -347,7 +346,7 @@ pub fn emit_generate_batch_prefill_unsupported(
 pub fn run_generate_batch_decode_step_qwen35(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
     validate_qwen35_decode_batch_runtime_surface(
@@ -489,14 +488,68 @@ pub fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
         .max(1)
 }
 
-/// Whether the dense native-decode multi-row kernel is enabled (env override).
+/// Whether the dense native-decode multi-row kernel is enabled.
+///
+/// On by default: a multi-row chunk advances N sessions in ONE pass over the
+/// weights instead of N singleton forwards, which is the whole point of the
+/// fused decode path. Measured on gfx1103 (Qwen3.5-0.8B--mq4, 4 sessions in
+/// lockstep, 38 steps): chunk 4x1 = 1229 ms vs chunk 1x4 = 2710 ms, output
+/// byte-identical — 2.2x for the same result.
+///
+/// It was off by default while the fused body silently miscomputed AWQ
+/// pre-scaled weights; that is now rejected at the weights contract
+/// (`dense_prefill_weight_unsupported_reason`), so such models take the serial
+/// path instead of reaching this kernel.
+///
+/// `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=0` (or `off`/`false`/`no`) is the kill
+/// switch back to one-session-per-forward. Mirrors the
+/// `server_prefill_batch_enabled` convention.
 pub fn qwen35_decode_dense_native_multirow_enabled() -> bool {
-    matches!(
+    multirow_enabled_from_env_value(
         std::env::var("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW")
             .ok()
             .as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
     )
+}
+
+/// Pure half of [`qwen35_decode_dense_native_multirow_enabled`], split out so the
+/// default and the kill switch are testable without mutating process env.
+fn multirow_enabled_from_env_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod multirow_gate_tests {
+    use super::multirow_enabled_from_env_value;
+
+    #[test]
+    fn multirow_is_on_by_default_with_a_kill_switch() {
+        // Unset -> on. This is the change: multi-row amortizes one weight pass
+        // across N sessions (2.2x measured on gfx1103), and the AWQ artifacts
+        // that used to be miscomputed here are now rejected by the weights
+        // contract before reaching the kernel.
+        assert!(multirow_enabled_from_env_value(None));
+
+        for off in ["0", "off", "false", "no", "OFF", " No "] {
+            assert!(
+                !multirow_enabled_from_env_value(Some(off)),
+                "{off:?} should disable multi-row"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "ON", "anything-else"] {
+            assert!(
+                multirow_enabled_from_env_value(Some(on)),
+                "{on:?} should leave multi-row enabled"
+            );
+        }
+    }
 }
 
 /// Whether internal parity-checking (native vs serial reference) is enabled
@@ -579,7 +632,7 @@ pub fn qwen35_decode_token_outcome(
 pub fn qwen35_decode_step_serial_reference(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -667,7 +720,7 @@ pub fn qwen35_decode_step_serial_reference(
 pub fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    _stdout: &mut std::io::Stdout,
+    _stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {
@@ -681,7 +734,7 @@ pub fn qwen35_decode_step_fused_dense_layer_chunked(
 pub fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    _stdout: &mut std::io::Stdout,
+    _stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {

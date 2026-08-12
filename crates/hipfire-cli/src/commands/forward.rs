@@ -87,16 +87,19 @@ pub struct HostProfileArgs {
 
 const COLLECT_ARTIFACTS_HELP: &str = r#"hipfire collect-artifacts - single-load Tier-1 calibration artifact collector
 
-Loads a bf16 .hfq once and writes a unified <model>.calib.hfq bundling the
+Loads a bf16 .hfq OR a HuggingFace safetensors directory once and writes a
+unified <model>.calib.hfq bundling the
 per-tensor Hessian + imatrix (full Hessian for dense projections; imatrix-only
 for MoE routed experts), the MoE router histogram (MoE models), and optionally
 KLDREF.
 
 Usage:
-  hipfire collect-artifacts --model <bf16.hfq> --corpus <text> \
+  hipfire collect-artifacts --model <bf16.hfq|hf_dir> --corpus <text> \
       --output <out.calib.hfq> [--max-tokens N] [--kldref]
 
---model accepts a local name, shorthand, alias, or path.
+--model accepts a local name, shorthand, alias, .hfq path, or a HuggingFace
+safetensors directory (config.json + *.safetensors), read directly with no
+intermediate bf16 .hfq.
 
 Build runner:
   cargo build --release -p hipfire-runtime --example collect_artifacts"#;

@@ -163,6 +163,19 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
 
 ## Phase D — KVarN KV (long-context bandwidth)
 
+> **REALITY (2026-07-23): SHIPPED, not skipped.** The "SKIP the GPU Sinkhorn
+> subsystem" verdict below (2026-06-16, scoped to single-tier per-token KVarN on
+> the 780M) was **overridden by the 2026-07-14 KV-default directive** once the
+> hot/cold hierarchical cache reframed KVarN as the *cold-tier codec*. KVarN now
+> lives in its own crate `crates/hipfire-kvquant/` (kvarn.rs moved there) with a
+> real **GPU kvarn kernel** (`170443011`, head_dim-512 for gemma4 global layers),
+> **selectable K bits 2/4/8, default 4** (`55af8e316`), an **8-bit hot ring**
+> (`db7891bca`), and the hierarchical cache (`crates/hipfire-runtime/src/kv_hier.rs`).
+> It is wired into run/perplexity/pflash/infer examples and the qwen35 prefill
+> path. **KVarN + hierarchical are the primary KV systems; asym is the retained
+> baseline-to-beat.** The 2026-06-16 skip reasoning is preserved below as history
+> (it was correct *for the per-token variant on this box*); do not act on it.
+
 Reference now in-tree: `./Quantization/KVarN…/` — paper + full repo (spec
 `KVARN_MLA_BACKEND_SPEC.md`, Python refs `kvarn_mla_*`, Rust). Algorithm:
 variance-normalized 4-bit KV — Sinkhorn per-channel scale/zp + per-token
@@ -272,6 +285,41 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
 - **Gate:** long-context coherence + τ stability under compressed KV.
 
 ## Phase E — MTP spec-decode optimization (moved from Phase B follow-up)
+
+> **REALITY (2026-07-23): MTP is SUPERSEDED by DFlash for qwen3.5 — wind Phase E
+> down.** In the live serving path (`hipfire-serving-core/src/generate.rs`)
+> DFlash takes priority; `generate_mtp` only runs when *no* DFlash sidecar is
+> loaded (`generate.rs:2337`, guarded on `m.dflash.is_none()`). Measured
+> acceptance settles it: **DFlash τ≈5.7 on qwen3.5-9B, lossless**
+> (`benchmarks/results/dflash-phasef-acceptance-20260719.md`) vs **MTP's best
+> qwen τ=1.66** — and MTP is still net-negative on wall-clock (13.1 vs 57.7
+> tok/s AR on 0.8B). The repo's own design note is explicit: an MTP head and a
+> DFlash/DSpark block drafter are *competing* drafters for one target, with
+> DFlash "the higher-τ replacement" and MTP at best "the cheap MTP-1-style
+> fallback" (`docs/references/specdecode/deepspec-notes.md:236-240`).
+>
+> Status of the individual items:
+> - **E1 (GDN-tape replay elimination): LANDED.** MTP now carries a
+>   `trunk_gdn_tape` (`mtp_spec.rs:418/606/644`) — the plan's premise that "MTP
+>   passes `gdn_tape: None`" no longer holds.
+> - **E2 (compressed-vocab draft lm_head): LANDED.** `spec_step_mtp_compressed`
+>   + `--vocab-sidecar` wired (`mtp_spec.rs:1789`).
+> - **E3 (MTP verify-graph capture): SUPERSEDED — do not build.** E3 was defined
+>   as porting `verify_dflash_block_with_graph_policy` *onto MTP*; that DFlash
+>   facility already exists and is the maintained path qwen3.5 routes through
+>   first. Graphing the displaced drafter is redundant.
+> - **E4 (tree MTP): DEAD twice over.** Blocked on an unwritten FP32/FP16
+>   tree-replay kernel, *and* the tree approach itself was measured and rejected:
+>   DDTree net-loses to linear chain on every drafter (`78b96e6ce`), so DFlash's
+>   default is linear chain. A tree MTP inherits the same "independent
+>   per-position marginals → no joint to exploit" loss.
+>
+> **Go-forward if any spec-decode effort continues:** it belongs on DFlash
+> (actively developed, default, lossless) or on finishing **DSpark's qwen35
+> integration** (wired 2026-07-03 `3d42af18d` but left "tau=0 pending"), **not**
+> on MTP. Keep `generate_mtp` only as the cheap fallback for models that ship an
+> MTP head but no DFlash sidecar. The MTP-perf analysis below is retained as
+> history.
 
 Phase B wired MTP and fixed DFlash's τ<1, but the **warmed A/B shows MTP is
 net-negative on the 0.8B**: AR 57.7 tok/s vs MTP 13.1 tok/s (~4.4× slower),
@@ -519,7 +567,16 @@ Papers + reference implementations vendored for Phases C/D:
   - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
     qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
   Then C2 decode kernel (only worth building once a bit-rate passes PPL).
-- **Phase D: clean-room CPU core LANDED (2026-06-16).** `hipfire-quantize/src/
+- **Phase D: ✅ SHIPPED as the default KV path (2026-07, supersedes the
+  2026-06-16 skip).** KVarN moved to its own crate `crates/hipfire-kvquant/`
+  with a GPU kvarn kernel (head_dim-512, `170443011`), selectable K bits 2/4/8
+  default 4 (`55af8e316`), 8-bit hot ring (`db7891bca`), and the hot/cold
+  hierarchical cache (`kv_hier.rs`). KVarN + hierarchical are the primary KV
+  systems; asym is the retained baseline. See the REALITY banner under
+  "## Phase D" and memory `project-hot-cold-hier-kv-impl` /
+  `project-kv-default-kvarn-hier`. The clean-room CPU-core note below is the
+  2026-06-16 origin point, kept as history.
+- **Phase D (origin, 2026-06-16): clean-room CPU core LANDED.** `hipfire-quantize/src/
   kvarn.rs` — log-domain Sinkhorn `variance_normalize` (imbalance 167→3.5,
   perfect=2.0) + per-channel 4-bit `quantize_tile`/`dequantize_tile`
   (`deq=(q*scale_abs+zp_abs)*s_col`, per-row Sinkhorn scale absorbed). Tests:
@@ -530,5 +587,10 @@ Papers + reference implementations vendored for Phases C/D:
   head_dim, share engine FWHT) + long-context coherence gate.
 - **Phase D (ref):** KVarN paper + repo in `./Quantization/` — algorithm ported
   clean-room; MLA tile layout (R=512 latent) intentionally NOT ported (GQA).
-- **Phase E: scoped + instrumented** — MTP perf (phase split measured; E1
-  GDN-tape replay, E2 compressed draft lm_head, E3 verify graph).
+- **Phase E: WINDING DOWN — MTP superseded by DFlash for qwen3.5 (2026-07-23).**
+  E1 (GDN-tape replay) and E2 (compressed draft lm_head) LANDED. E3 (MTP verify
+  graph) and E4 (tree MTP) SUPERSEDED — do not build (DFlash already owns
+  graph-capture and beats MTP at τ≈5.7 vs 1.66; tree drafting net-loses per
+  `78b96e6ce`). `generate_mtp` retained only as the no-DFlash-sidecar fallback.
+  See the REALITY banner under "## Phase E". Go-forward spec-decode effort =
+  DFlash or DSpark qwen35 integration, not MTP.

@@ -34,6 +34,9 @@ bash tests/tiny-affected-gate-nogpu.sh
 echo "== Resident/streamed parity workflow (no GPU) =="
 bash tests/resident-streamed-parity-nogpu.sh
 
+echo "== ZAYA ragged-slice parity workflow (no GPU) =="
+bash tests/zaya-ragged-slice-parity-nogpu.sh
+
 echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
@@ -46,7 +49,10 @@ echo "== Python CPU tests =="
 "$PYTHON" -m mypy tests scripts benchmarks tools --config-file pyproject.toml
 "$PYTHON" -m pytest tests
 
-echo "== Env-var docs freshness (docs/env-vars.md + env_docs.rs vs source) =="
+echo "== Env-var registry (declared in hipfire-env, per-crate enforcement) =="
+./tests/env-registry-gate.sh
+
+echo "== Env-var docs coverage (docs named HIPFIRE_* vars exist in source) =="
 cargo run -q -p hipfire-cli -- gen-env-docs --check
 
 echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="

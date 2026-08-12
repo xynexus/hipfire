@@ -27,7 +27,7 @@ use hipfire_daemon_adapter::{
 use hipfire_generate::{
     openai_chat_completion_done_chunk_json, GenerateTextRequest, GenerationSamplingPolicy,
 };
-use hipfire_model::{discover_dflash_draft_for_model, ModelLoadParams, ModelWorkerKey};
+use hipfire_model::{ModelLoadParams, ModelWorkerKey};
 use hipfire_prompt::{Message as PromptMessage, Role, ToolCall as PromptToolCall};
 use hipfire_scheduler::{
     create_request_session_draft, plan_model_residency, server_prefill_batch_enabled,
@@ -232,35 +232,16 @@ fn load_params_for_model_config(
 
 fn maybe_attach_dflash_draft(
     cfg: &HipfireConfig,
-    model_path: Option<&Path>,
+    _model_path: Option<&Path>,
     params: &mut ModelLoadParams,
 ) {
     if cfg.dflash_mode == "off" {
-        return;
-    }
-    let is_a3b = model_path
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase().contains("a3b"))
-        .unwrap_or(false);
-    let has_explicit_sidecar = cfg
-        .cask_sidecar
-        .as_deref()
-        .filter(|sidecar| !sidecar.is_empty())
-        .is_some_and(|sidecar| Path::new(sidecar).is_file());
-    let allowed =
-        cfg.dflash_mode == "on" || (cfg.dflash_mode == "auto" && (!is_a3b || has_explicit_sidecar));
-    if !allowed {
         return;
     }
     if let Ok(explicit) = std::env::var("HIPFIRE_DFLASH_DRAFT") {
         if !explicit.is_empty() {
             params.draft = Some(explicit);
         }
-        return;
-    }
-    if let Some(path) = model_path.and_then(discover_dflash_draft_for_model) {
-        params.draft = Some(path.to_string_lossy().into_owned());
     }
 }
 
@@ -280,33 +261,20 @@ fn maybe_attach_cask_sidecar(
     }
 
     if let Some(sidecar) = cfg.cask_sidecar.as_deref().filter(|s| !s.is_empty()) {
-        if Path::new(sidecar).is_file() {
-            params.cask_sidecar = Some(sidecar.to_string());
-            attach_cask_policy(cfg, params);
-        } else {
-            params.cask_sidecar = None;
-            clear_cask_policy(params);
-        }
+        params.cask_sidecar = Some(sidecar.to_string());
+        attach_cask_policy(cfg, params);
         return;
     }
 
     if !cfg.cask_auto_attach {
         return;
     }
-    let Some(model_path) = model_path else {
-        return;
-    };
-    let filename = model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if filename.to_ascii_lowercase().contains("a3b") {
-        return;
-    }
-    if let Some(sidecar) = discover_triattn_sidecar(model_path) {
-        params.cask_sidecar = Some(sidecar.to_string_lossy().into_owned());
-        attach_cask_policy(cfg, params);
-    }
+    let _ = model_path;
+    // Embedded and canonical sibling resolution happens in serving-core so
+    // every caller shares explicit > embedded > sibling precedence. Forward
+    // the policy here without turning an auto-discovered sibling into a fake
+    // explicit override.
+    attach_cask_policy(cfg, params);
 }
 
 fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
@@ -315,41 +283,6 @@ fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
     params.cask_beta = Some(cfg.cask_beta);
     params.cask_core_frac = Some(cfg.cask_core_frac);
     params.cask_fold_m = Some(cfg.cask_fold_m);
-}
-
-fn clear_cask_policy(params: &mut ModelLoadParams) {
-    params.cask = None;
-    params.cask_budget = None;
-    params.cask_beta = None;
-    params.cask_core_frac = None;
-    params.cask_fold_m = None;
-}
-
-fn discover_triattn_sidecar(model_path: &Path) -> Option<std::path::PathBuf> {
-    let filename = model_path.file_name().and_then(|name| name.to_str())?;
-    let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut dirs = vec![
-        model_dir.to_path_buf(),
-        hipfire_config::hipfire_dir().join("triattn"),
-    ];
-    dirs.dedup();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with(&format!("{filename}.triattn"))
-                && (name.ends_with(".bin") || name.ends_with(".hfq"))
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 #[derive(Clone, Debug)]
@@ -628,6 +561,9 @@ pub(crate) async fn ensure_model_loaded(
     }
 
     let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
+    // Spawns rather than attaches: `daemon_spawn_env` is built PER MODEL (e.g. the
+    // DFlash n-gram override) and takes effect only through the spawned child's
+    // environment. An attached daemon would ignore it entirely.
     daemon_spawn_env.apply();
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
     apply_residency_evictions(state, &mut engine, &residency_plan).await?;
@@ -1476,6 +1412,17 @@ pub(crate) struct ThinkStreamFilter {
 }
 
 impl ThinkStreamFilter {
+    /// A filter for a stream that begins *inside* the think block — the chat
+    /// templates open `<think>` in the generation prompt when thinking is enabled,
+    /// so the model's first token is already reasoning and no opening marker will
+    /// ever appear in the stream.
+    pub(crate) fn started_in_think() -> Self {
+        Self {
+            in_think: true,
+            strip_next_leading_newline: false,
+        }
+    }
+
     pub(crate) fn observe(&mut self, text: &str, preserve: bool) -> Vec<AssistantDelta> {
         if preserve {
             let text = text.replace("<|im_end|>", "");
@@ -1623,11 +1570,21 @@ fn estimated_prompt_tokens(messages: &[ChatMessage]) -> Vec<u32> {
     tokens
 }
 
-fn scheduler_worker_key(model_path: &str, cfg: &HipfireConfig) -> ModelWorkerKey {
+/// Build the scheduler's view of the current model.
+///
+/// `arch` is the tag the daemon reported on load ([`LoadedModelState::arch`]).
+/// It must be threaded through: the scheduler classifies recurrent and
+/// arena-private families from it to decide whether two sessions may share a
+/// fused prefill batch, and with no tag it fails closed and disables batching.
+fn scheduler_worker_key(
+    model_path: &str,
+    cfg: &HipfireConfig,
+    arch: Option<String>,
+) -> ModelWorkerKey {
     ModelWorkerKey {
         artifact_path: model_path.to_string(),
         artifact_digest: None,
-        arch_id: "unknown".to_string(),
+        arch_id: arch.unwrap_or_else(|| "unknown".to_string()),
         quant_family: "unknown".to_string(),
         state_mode: cfg.kv_cache.clone(),
         max_seq_bucket: cfg.max_seq as usize,
@@ -1650,9 +1607,16 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
         return Ok(());
     }
 
+    // Taken before `config` and released immediately — never hold both.
+    let arch = state
+        .loaded_models
+        .lock()
+        .await
+        .get(model_path)
+        .and_then(|loaded| loaded.arch.clone());
     let worker_key = {
         let cfg = state.config.lock().await;
-        scheduler_worker_key(model_path, &cfg)
+        scheduler_worker_key(model_path, &cfg, arch)
     };
     let session = create_request_session_draft(CreateRequestSessionInput {
         id: req_id.to_string(),
@@ -1737,6 +1701,28 @@ pub(crate) async fn execute_blocking_chat_for_principal(
         execute_blocking_chat_owned(state, body, scheduler_owner_from_principal(principal)).await?;
     report_done_usage(accounting, &result.done);
     Ok(result)
+}
+
+/// Sends the worker a cooperative cancel (SIGUSR1) if dropped while armed.
+///
+/// A client disconnect drops the whole request future, so the `Ok(None)` cancel
+/// path below never runs — nothing would tell the worker to stop. Drop can't
+/// await, so it signals and leaves the drain to the next request (which skips
+/// the abandoned request's frames by id).
+struct CancelWorkerOnDrop(Option<u32>);
+
+impl CancelWorkerOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelWorkerOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = hipfire_daemon_adapter::signal_worker_cancel(pid);
+        }
+    }
 }
 
 async fn execute_blocking_chat_cancellable<F>(
@@ -1965,7 +1951,13 @@ where
     };
 
     let mut engine_guard = state.engine.lock().await;
-    let mut engine = match engine_guard.take() {
+    // Borrow the engine, never move it out: a client disconnect drops this whole
+    // future (axum cancels the handler task, and `/v1/responses` awaits us
+    // inline rather than on a spawned task), and an owned `DaemonEngine` would
+    // be dropped with it — `kill_on_drop` SIGKILLs the inference worker, taking
+    // the loaded model and every other in-flight request down silently. Borrowed,
+    // the engine stays in `AppState` and a dropped future only releases the lock.
+    let engine = match engine_guard.as_mut() {
         Some(e) => e,
         None => {
             return Err(json!({"error": {"message": "daemon not running", "type": "server_error"}}))
@@ -1974,13 +1966,16 @@ where
 
     if !loaded.cache_capable {
         if let Err(e) = engine.reset().await {
-            *engine_guard = Some(engine);
             return Err(json!({"error": {"message": e.to_string(), "type": "server_error"}}));
         }
     }
 
     let mut raw_text = String::new();
     let mut raw_tool_calls = Vec::new();
+    // Captured before the move so a client disconnect can cooperatively cancel
+    // this exact request in the worker (SIGUSR1 + drain) instead of SIGKILL.
+    let gen_req_id = gen_req.id.clone();
+    let cancel_on_drop = CancelWorkerOnDrop(engine.worker_pid());
     let result = engine
         .generate_streaming_events_controlled(gen_req, |event| {
             if should_cancel() {
@@ -1993,10 +1988,11 @@ where
             GenerateStreamControl::Continue
         })
         .await;
+    // Past the await: every arm below either finishes or cancels explicitly.
+    cancel_on_drop.disarm();
 
     match result {
         Ok(Some(done)) => {
-            *engine_guard = Some(engine);
             let raw_reply = raw_text.clone();
             let mut text = strip_visible_thinking(raw_text, preserve_thinking, true);
             let mut tool_calls = daemon_tool_calls_to_openai(raw_tool_calls, &req_id);
@@ -2019,17 +2015,27 @@ where
             }))
         }
         Ok(None) => {
-            tracing::info!(request_id = %req_id, "non-stream client disconnected; dropping daemon");
-            *state.loaded_model_path.lock().await = None;
-            *state.loaded_model_cache_capable.lock().await = None;
-            *state.loaded_model_max_seq.lock().await = None;
-            drop(engine);
+            // Client disconnected mid-generation. Cooperatively cancel the
+            // worker's in-flight generation (SIGUSR1 + drain) and keep the
+            // worker + loaded model resident for reuse. Only fall back to
+            // discarding the engine (old SIGKILL-on-drop) if the cancel/drain
+            // fails, since unread events would corrupt the next request.
+            let drained = engine.abort_and_drain(&gen_req_id).await;
+            match drained {
+                Ok(()) => {
+                    tracing::info!(request_id = %req_id, "non-stream client disconnected; cancelled generation, worker retained");
+                }
+                Err(e) => {
+                    tracing::warn!(request_id = %req_id, error = %e, "non-stream cancel/drain failed; dropping daemon");
+                    *state.loaded_model_path.lock().await = None;
+                    *state.loaded_model_cache_capable.lock().await = None;
+                    *state.loaded_model_max_seq.lock().await = None;
+                    *engine_guard = None;
+                }
+            }
             Ok(None)
         }
-        Err(e) => {
-            *engine_guard = Some(engine);
-            Err(json!({"error": {"message": e.to_string(), "type": "server_error"}}))
-        }
+        Err(e) => Err(json!({"error": {"message": e.to_string(), "type": "server_error"}})),
     }
 }
 
@@ -2319,6 +2325,9 @@ async fn stream_chat(
             }
         }
 
+        // Captured before the move so a client disconnect can cooperatively
+        // cancel this exact request in the worker (SIGUSR1 + drain).
+        let gen_req_id = gen_req.id.clone();
         let result = engine
             .generate_streaming_events_controlled(gen_req, |event| match event {
                 GenerateStreamEvent::Token(token) => {
@@ -2491,11 +2500,23 @@ async fn stream_chat(
                     .await;
             }
             Ok(None) => {
-                tracing::info!(request_id = %req_id, "stream client disconnected; dropping daemon");
-                *state.loaded_model_path.lock().await = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-                drop(engine);
+                // Client disconnected mid-stream. Cooperatively cancel the
+                // worker's in-flight generation (SIGUSR1 + drain) and keep the
+                // worker + loaded model resident for reuse. Fall back to
+                // discarding the engine only if the cancel/drain fails.
+                match engine.abort_and_drain(&gen_req_id).await {
+                    Ok(()) => {
+                        tracing::info!(request_id = %req_id, "stream client disconnected; cancelled generation, worker retained");
+                        *engine_guard = Some(engine);
+                    }
+                    Err(e) => {
+                        tracing::warn!(request_id = %req_id, error = %e, "stream cancel/drain failed; dropping daemon");
+                        *state.loaded_model_path.lock().await = None;
+                        *state.loaded_model_cache_capable.lock().await = None;
+                        *state.loaded_model_max_seq.lock().await = None;
+                        drop(engine);
+                    }
+                }
                 return;
             }
             Err(e) => {
@@ -3310,7 +3331,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_attach_discovered_dflash_draft_like_bun() {
+    fn load_params_leave_dflash_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-dflash-draft-{}",
             std::process::id()
@@ -3328,12 +3349,12 @@ mod tests {
         };
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(params.draft.as_deref(), Some(draft.to_str().unwrap()));
+        assert_eq!(params.draft, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn load_params_drop_missing_explicit_cask_sidecar_like_bun() {
+    fn load_params_preserve_missing_explicit_cask_for_fail_closed_load() {
         let cfg = HipfireConfig {
             cask_sidecar: Some("/definitely/missing/model.triattn.hfq".to_string()),
             cask: true,
@@ -3342,12 +3363,15 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", None);
 
-        assert_eq!(params.cask_sidecar, None);
-        assert_eq!(params.cask, None);
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/definitely/missing/model.triattn.hfq")
+        );
+        assert_eq!(params.cask, Some(true));
     }
 
     #[test]
-    fn load_params_auto_attach_triattn_sidecar_like_bun() {
+    fn load_params_leave_triattn_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-triattn-sidecar-{}",
             std::process::id()
@@ -3366,10 +3390,7 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(
-            params.cask_sidecar.as_deref(),
-            Some(sidecar.to_str().unwrap())
-        );
+        assert_eq!(params.cask_sidecar, None);
         assert_eq!(params.cask_budget, Some(2048));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3404,7 +3425,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let model = root.join("Qwen3.5-122B-A10B.mq4.hfq");
+        let model = root.join("Qwen3.5-122B-A10B--mq4.hfq");
         std::fs::write(&model, vec![0u8; 128]).unwrap();
         let cfg = HipfireConfig {
             model_residency_mode: "qwen_moe_modules".to_string(),

@@ -32,34 +32,86 @@ pub fn inv_cholesky_lower(h_rowmajor: &[f32], k: usize, damp: f64) -> Option<Mat
 /// (`crate::cpu_fwht_256`). Row-pass then column-pass (same R both sides),
 /// putting H in the same incoherent domain as the FWHT-rotated weights so the
 /// OBS feedback is consistent.
-fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
-    let nb = k / 256;
-    let mut buf = [0.0f32; 256];
-    for r in 0..k {
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = h[r * k + b * 256 + c] as f32;
+/// Rotate a [k, k] Hessian into the FWHT frame the trellis sees. Exposed so the
+/// GPU-resident conditioning path can build L without duplicating this.
+pub fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
+    use rayon::prelude::*;
+    // Rows are independent, so this pass parallelizes directly.
+    let rows_pass = |h: &mut [f64]| {
+        let nb = k / 256;
+        h.par_chunks_mut(k).for_each(|row| {
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = row[b * 256 + c] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    row[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                h[r * k + b * 256 + c] = buf[c] as f64;
+        });
+    };
+    // The column pass is the row pass on the transpose. Transposing twice costs
+    // two O(k²) copies but buys the same parallelism, whereas striding down
+    // columns of a `&mut [f64]` cannot be split by rayon without unsafe.
+    //
+    // Measured at 23% of greedy conditioning's wall-time (119.0s of 514s) while
+    // fully SERIAL — the single cheapest speedup left in this path.
+    let transpose = |src: &[f64], dst: &mut [f64]| {
+        dst.par_chunks_mut(k).enumerate().for_each(|(i, drow)| {
+            for (j, v) in drow.iter_mut().enumerate() {
+                *v = src[j * k + i];
             }
-        }
-    }
-    for col in 0..k {
-        for b in 0..nb {
-            for r in 0..256 {
-                buf[r] = h[(b * 256 + r) * k + col] as f32;
-            }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for r in 0..256 {
-                h[(b * 256 + r) * k + col] = buf[r] as f64;
-            }
-        }
-    }
+        });
+    };
+    rows_pass(h);
+    let mut t = vec![0.0f64; k * k];
+    transpose(h, &mut t);
+    rows_pass(&mut t);
+    transpose(&t, h);
 }
 
-fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+/// Lower Cholesky of (H_rot + lambda I)^-1. Exposed alongside rotate_hessian.
+/// Same contract as [`inv_cholesky_lower_rotated`], without the identity solve.
+///
+/// The original computes `(H+λI)⁻¹` as `chol.solve(Mat::identity(k, k))`, which
+/// materialises a k×k identity — 512 MB at k=8192, allocated per tensor PER
+/// damping retry — and costs ~k³ (k triangular solves). `DenseSolveCore::inverse`
+/// is the `potri` equivalent: it forms the inverse from the factor in ~k³/3 and
+/// allocates only the result. Total drops from ~1.67·k³ to ~k³.
+///
+/// The second factorization is NOT redundant and must stay: `L·Lᵀ = (H+λI)⁻¹`
+/// needs a LOWER factor of the inverse. `C⁻ᵀ` also satisfies `L·Lᵀ = A⁻¹` but is
+/// UPPER triangular, and substituting it silently degrades LDLQ to RTN while
+/// every residual check still passes — that cost 57 minutes earlier in this
+/// project, so the shape is asserted in the test rather than assumed.
+pub fn inv_cholesky_lower_rotated_fast(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+    use faer::linalg::solvers::DenseSolveCore;
+    let base = damp.max(1e-12);
+    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+        let lambda = base * mult;
+        let hd = Mat::<f64>::from_fn(k, k, |i, j| {
+            h[i * k + j] + if i == j { lambda } else { 0.0 }
+        });
+        let Ok(chol) = hd.llt(Side::Lower) else {
+            continue;
+        };
+        let hinv = chol.inverse();
+        let Ok(chol2) = hinv.llt(Side::Lower) else {
+            continue;
+        };
+        return Some(chol2.L().to_owned());
+    }
+    None
+}
+
+/// REFERENCE implementation, kept as the equivalence oracle for
+/// [`inv_cholesky_lower_rotated_fast`], which is what callers use. Retained
+/// rather than deleted because a rewrite of this routine has already failed
+/// silently once — comparing the two outputs directly is the cheapest check that
+/// would have caught it.
+pub fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     let base = damp.max(1e-12);
     for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
         let lambda = base * mult;
@@ -140,7 +192,7 @@ pub fn qtip_ldlq_dequant_bits(
     // Rotate the Hessian, then L with L·Lᵀ = (H_rot + λI)⁻¹.
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     // Rotate the weights into the same domain.
     let nb = k / 256;
@@ -233,6 +285,46 @@ pub fn qtip_ldlq_dequant_bits(
     Some(out)
 }
 
+#[cfg(feature = "gpu")]
+thread_local! {
+    /// Lazily-initialised device for the Cholesky, one per thread that asks.
+    /// A thread_local rather than a global because `Gpu` is neither Send nor
+    /// Sync; the tensor loop that reaches here is sequential, so one handle is
+    /// created and reused for the whole model.
+    static CHOL_GPU: std::cell::RefCell<Option<hipfire_rdna::Gpu>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `inv_cholesky_lower_rotated_fast`, or its GPU sibling when
+/// `HIPFIRE_GPU_CHOLESKY=1` is set and a device is available.
+///
+/// Opt-in rather than default: the device factorizations run in f32, and the
+/// agreement with the f64 reference degrades as the Hessian gets worse
+/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2). Whether
+/// that matters is a KLD question, not a norm question, so it ships behind a
+/// flag until measured on a real artifact.
+fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+    #[cfg(feature = "gpu")]
+    {
+        if hipfire_env::GPU_CHOLESKY.flag() {
+            let out = CHOL_GPU.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = hipfire_rdna::Gpu::init().ok();
+                }
+                slot.as_mut()
+                    .and_then(|g| inv_cholesky_lower_rotated_gpu(g, h, k, damp))
+            });
+            if out.is_some() {
+                return out;
+            }
+            // Device missing or the factorization broke down — fall through to
+            // the CPU path rather than failing the quantize.
+        }
+    }
+    inv_cholesky_lower_rotated_fast(h, k, damp)
+}
+
 /// Opus W4A4 (oq4) LDLQ: Hessian error-feedback **symmetric int4** weight quant,
 /// emitting the SAME packed `[f16 scale][128 signed nibbles]` per-256-group layout
 /// as `codecs::quantize_oq4g256` (130 B/group, row-major), but with the GPTQ/OBS
@@ -262,7 +354,7 @@ pub fn oq4_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
@@ -385,7 +477,7 @@ pub fn oq3_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -505,7 +597,7 @@ pub fn oq2_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -616,7 +708,7 @@ pub fn oq8_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -730,7 +822,7 @@ pub fn oqplus_tiered_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -765,24 +857,11 @@ pub fn oqplus_tiered_ldlq_pack(
                 for (c, g) in grp.iter_mut().enumerate() {
                     *g = rr_row[c0 + c] as f32;
                 }
-                let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                // Joint (scale, outlier set): outliers are the top n_out by
+                // int8-upgrade gain (int4_err² − int8_err²), chosen against the
+                // scale they will actually be encoded at.
+                let (scale, idx) = crate::codecs::mixed_clipsearch(&grp, n_out);
                 let inv = 1.0 / scale;
-                // Outliers: top n_out by int8-upgrade gain (int4_err² − int8_err²).
-                let gain = |i: usize| -> f32 {
-                    let v = grp[i];
-                    let q4 = (v * inv).round().clamp(-7.0, 7.0);
-                    let q8 = (v * inv).round().clamp(-127.0, 127.0);
-                    let e4 = v - q4 * scale;
-                    let e8 = v - q8 * scale;
-                    e4 * e4 - e8 * e8
-                };
-                let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-                idx.sort_unstable_by(|&a, &c| {
-                    gain(c)
-                        .partial_cmp(&gain(a))
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                        .then_with(|| a.cmp(&c))
-                });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
                     is_w8[i] = true;
@@ -861,7 +940,7 @@ pub fn oqplus_compact_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -896,23 +975,11 @@ pub fn oqplus_compact_ldlq_pack(
                 for (c, g) in grp.iter_mut().enumerate() {
                     *g = rr_row[c0 + c] as f32;
                 }
-                let scale = crate::codecs::symmetric_clipsearch(&grp, 7.0);
+                // Joint (scale, outlier set) — same selector as the non-LDLQ
+                // compact packer, so the two agree on everything but the OBS
+                // error feedback.
+                let (scale, idx) = crate::codecs::mixed_clipsearch(&grp, n_out);
                 let inv = 1.0 / scale;
-                let gain = |i: usize| -> f32 {
-                    let v = grp[i];
-                    let q4 = (v * inv).round().clamp(-7.0, 7.0);
-                    let q8 = (v * inv).round().clamp(-127.0, 127.0);
-                    let e4 = v - q4 * scale;
-                    let e8 = v - q8 * scale;
-                    e4 * e4 - e8 * e8
-                };
-                let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-                idx.sort_unstable_by(|&a, &c| {
-                    gain(c)
-                        .partial_cmp(&gain(a))
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                        .then_with(|| a.cmp(&c))
-                });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
                     is_w8[i] = true;
@@ -977,6 +1044,297 @@ pub fn oqplus_compact_ldlq_pack(
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod chol_tests {
+    use super::*;
+
+    /// Build an ill-conditioned SPD matrix: a rank-deficient Gram plus a small
+    /// ridge, which is what a real Hessian looks like here and what makes the
+    /// damping-retry loop matter.
+    fn ill_conditioned(k: usize, ridge: f64) -> Vec<f64> {
+        let r = k / 4; // rank-deficient by construction
+        let mut a = vec![0.0f64; k * r];
+        for i in 0..k {
+            for j in 0..r {
+                a[i * r + j] = ((i * 7 + j * 13) % 23) as f64 / 23.0 - 0.5;
+            }
+        }
+        let mut h = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0;
+                for t in 0..r {
+                    acc += a[i * r + t] * a[j * r + t];
+                }
+                h[i * k + j] = acc + if i == j { ridge } else { 0.0 };
+            }
+        }
+        h
+    }
+
+    /// The identity-free variant must reproduce the original EXACTLY in shape and
+    /// to tight tolerance in value. Comparing the outputs directly is both
+    /// cheaper and stronger than comparing downstream KLD: a subtly wrong L could
+    /// move KLD by less than run-to-run noise and pass, whereas any deviation
+    /// shows up here.
+    #[test]
+    fn identity_free_inverse_cholesky_matches_the_original() {
+        for (k, ridge, damp) in [(256usize, 1e-3, 1e-2), (256, 1e-8, 1e-6)] {
+            let h = ill_conditioned(k, ridge);
+            let a = inv_cholesky_lower_rotated(&h, k, damp).expect("original");
+            let b = inv_cholesky_lower_rotated_fast(&h, k, damp).expect("fast");
+
+            // Shape first: LOWER triangular. C^-T also satisfies L·Lᵀ = A⁻¹ but is
+            // UPPER, and swapping it in degrades LDLQ to RTN with every residual
+            // check still passing.
+            let mut upper = 0.0f64;
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    upper = upper.max(b[(i, j)].abs());
+                }
+            }
+            assert_eq!(upper, 0.0, "fast variant is not lower-triangular (k={k})");
+
+            let scale = (0..k).map(|i| a[(i, i)].abs()).fold(0.0f64, f64::max);
+            let mut worst = 0.0f64;
+            for i in 0..k {
+                for j in 0..=i {
+                    worst = worst.max((a[(i, j)] - b[(i, j)]).abs());
+                }
+            }
+            assert!(
+                worst / scale < 1e-9,
+                "fast variant differs by {worst} (rel {:.3e}, k={k}, ridge={ridge})",
+                worst / scale
+            );
+        }
+    }
+
+    /// Not a correctness test — a throughput probe. The greedy pipeline spends
+    /// ~400s of ~600s in this routine. MEASURED: faer already uses all 32 rayon
+    /// threads by default (Par::rayon(0) resolves to current_num_threads) and
+    /// setting it explicitly changes nothing, so the low rate is NOT a
+    /// misconfiguration — Cholesky just scales badly at these sizes, because the
+    /// panel factorization serialises. That is the argument for moving the
+    /// trailing SYRK to the GPU rather than tuning the CPU path.
+    #[test]
+    fn cholesky_throughput_probe() {
+        let k = 2048usize;
+        let h = ill_conditioned(k, 1e-3);
+        println!(
+            "  rayon threads={}  faer par={:?}",
+            rayon::current_num_threads(),
+            faer::get_global_parallelism()
+        );
+        let t = std::time::Instant::now();
+        let l = inv_cholesky_lower_rotated_fast(&h, k, 1e-2).expect("factorization");
+        let secs = t.elapsed().as_secs_f64();
+
+        // two Cholesky factorizations + one inverse, each ~k^3/3
+        let flops = 3.0 * (k as f64).powi(3) / 3.0;
+        println!(
+            "  k={k}  {:.3}s  {:.1} GFLOP/s  (one AVX-512 core is ~20-50)",
+            secs,
+            flops / secs / 1e9
+        );
+        assert_eq!(l.nrows(), k);
+    }
+
+    /// The GPU right-looking factorization must reproduce faer's `llt` on the
+    /// same matrix. Tolerance is f32-scale, not f64: the trailing update runs in
+    /// f32 by design, so exact agreement is not the claim — agreement to within
+    /// single precision is, and that is what decides whether this is usable.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_right_looking_matches_faer_llt() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let k = 512usize;
+        let h = ill_conditioned(k, 1e-1); // well-conditioned enough for a clean compare
+        let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j]);
+        let reference = hd.llt(Side::Lower).expect("faer llt").L().to_owned();
+
+        let got = super::llt_lower_right_looking_gpu(&mut gpu, &h, k).expect("gpu llt");
+
+        let scale = (0..k)
+            .map(|i| reference[(i, i)].abs())
+            .fold(0.0f64, f64::max);
+        let mut worst = 0.0f64;
+        for i in 0..k {
+            for j in 0..=i {
+                worst = worst.max((reference[(i, j)] - got[i * k + j]).abs());
+            }
+        }
+        println!(
+            "  gpu-vs-faer worst |dL| = {:.3e} (rel {:.3e})",
+            worst,
+            worst / scale
+        );
+        assert!(
+            worst / scale < 1e-4,
+            "GPU factorization differs by rel {:.3e} — f32 trailing update is not \
+             accurate enough for this matrix",
+            worst / scale
+        );
+    }
+
+    /// Is the GPU path actually faster? The draft round-trips the whole k×k per
+    /// block, so this is not a foregone conclusion — the transfers may cost more
+    /// than the trailing update saves.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_right_looking_throughput_vs_faer() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        // Warm up: the gather/scatter/syrk kernels are hiprtc-compiled on first
+        // use, and that one-off lands entirely in whichever size runs first.
+        let warm = ill_conditioned(256, 1e-1);
+        let _ = super::llt_lower_right_looking_gpu(&mut gpu, &warm, 256);
+        for k in [1024usize, 2048] {
+            let h = ill_conditioned(k, 1e-1);
+            let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j]);
+            let t = std::time::Instant::now();
+            let _ = hd.llt(Side::Lower).expect("faer");
+            let cpu = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let _ = super::llt_lower_right_looking_gpu(&mut gpu, &h, k).expect("gpu");
+            let gpu_s = t.elapsed().as_secs_f64();
+            let f = (k as f64).powi(3) / 3.0;
+            println!(
+                "  k={k}  faer {:.3}s ({:.1} GF/s)   gpu {:.3}s ({:.1} GF/s)   speedup {:.2}x",
+                cpu,
+                f / cpu / 1e9,
+                gpu_s,
+                f / gpu_s / 1e9,
+                cpu / gpu_s
+            );
+        }
+    }
+
+    /// The GPU inverse-Cholesky must agree with the CPU reference. Tolerance is
+    /// f32-scale because the two factorizations run in f32 on the device; the
+    /// inverse between them stays f64, since compounding device precision through
+    /// an inverse is where it would actually bite.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_inv_cholesky_matches_the_cpu_reference() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        for (k, ridge, damp) in [(256usize, 1e-1, 1e-2), (512, 1e-2, 1e-3)] {
+            let h = ill_conditioned(k, ridge);
+            let cpu = inv_cholesky_lower_rotated_fast(&h, k, damp).expect("cpu");
+            let got = super::inv_cholesky_lower_rotated_gpu(&mut gpu, &h, k, damp).expect("gpu");
+
+            // Lower-triangular by construction — the whole point of the second
+            // factorization. C^-T also satisfies L·Lᵀ = A⁻¹ but is UPPER.
+            let mut upper = 0.0f64;
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    upper = upper.max(got[(i, j)].abs());
+                }
+            }
+            assert_eq!(upper, 0.0, "gpu result is not lower-triangular (k={k})");
+
+            let scale = (0..k).map(|i| cpu[(i, i)].abs()).fold(0.0f64, f64::max);
+            let mut worst = 0.0f64;
+            for i in 0..k {
+                for j in 0..=i {
+                    worst = worst.max((cpu[(i, j)] - got[(i, j)]).abs());
+                }
+            }
+            println!(
+                "  k={k} ridge={ridge}: worst |dL| rel = {:.3e}",
+                worst / scale
+            );
+            assert!(
+                worst / scale < 5e-3,
+                "gpu inv-cholesky differs by rel {:.3e} (k={k})",
+                worst / scale
+            );
+        }
+    }
+
+    /// Both variants must agree that a hopeless matrix is hopeless — the retry
+    /// loop is where a rewrite most easily diverges, because it picks a different
+    /// lambda on each pass.
+    #[test]
+    fn both_variants_agree_on_breakdown() {
+        let k = 64usize;
+        let h = vec![f64::NAN; k * k];
+        assert!(inv_cholesky_lower_rotated(&h, k, 1e-6).is_none());
+        assert!(inv_cholesky_lower_rotated_fast(&h, k, 1e-6).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    /// The parallel rotate_hessian does the column pass as `transpose ->
+    /// row-pass -> transpose`. That is only valid if it reproduces the original
+    /// serial row-then-column loops EXACTLY — a silently different rotation
+    /// would put H in a frame the trellis does not see, and would surface as a
+    /// quality regression rather than an error.
+    fn rotate_hessian_serial(h: &mut [f64], k: usize, s1: &[f32], s2: &[f32]) {
+        let nb = k / 256;
+        let mut buf = [0.0f32; 256];
+        for r in 0..k {
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = h[r * k + b * 256 + c] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, s1, s2);
+                for c in 0..256 {
+                    h[r * k + b * 256 + c] = buf[c] as f64;
+                }
+            }
+        }
+        for col in 0..k {
+            for b in 0..nb {
+                for r in 0..256 {
+                    buf[r] = h[(b * 256 + r) * k + col] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, s1, s2);
+                for r in 0..256 {
+                    h[(b * 256 + r) * k + col] = buf[r] as f64;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_rotate_hessian_matches_the_serial_loops() {
+        let k = 512usize; // two 256-blocks, so both passes cross a block boundary
+        let s1 = crate::gen_fwht_signs(42, 256);
+        let s2 = crate::gen_fwht_signs(1042, 256);
+        // Symmetric, non-trivial, and not separable across blocks.
+        let mut h = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let v = ((i * 31 + j * 17) % 97) as f64 / 97.0 + if i == j { 3.0 } else { 0.0 };
+                h[i * k + j] = v;
+                h[j * k + i] = v;
+            }
+        }
+        let mut a = h.clone();
+        let mut b = h;
+        rotate_hessian(&mut a, k, &s1, &s2);
+        rotate_hessian_serial(&mut b, k, &s1, &s2);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max);
+        assert!(worst == 0.0, "parallel rotation differs by {worst}");
+    }
 }
 
 #[cfg(test)]
@@ -1267,4 +1625,394 @@ mod tests {
         );
         assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// QTIP-3 conditioning (qtip3++ candidates)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Which conditioning to apply to the QTIP trellis encode. All three answer the
+/// same question — how to spend Hessian information on a beam search — and they
+/// sit at very different points on the cost curve, so they are measured rather
+/// than argued about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QtipCondMode {
+    /// Weight each step's squared error by the ROTATED Hessian diagonal.
+    /// Cheapest; expected weakest, because the FWHT exists to flatten exactly
+    /// that diagonal.
+    Weighted,
+    /// Plain beam per group, but feed the winning path's error forward to later
+    /// groups through L. Captures cross-group error at almost no encode cost;
+    /// no feedback within a group.
+    Greedy,
+    /// Carry a residual per beam candidate, so error feeds forward WITHIN a
+    /// group too, and across groups as in `Greedy`. Faithful LDLQ; pays O(n) per
+    /// candidate per step, so the caller must narrow the beam to afford it.
+    BeamLdlq,
+}
+
+/// Conditioned QTIP encode. `rotated` is the already-FWHT-rotated weight matrix
+/// [m, k]; the Hessian is rotated here to match that frame.
+///
+/// Returns `(symbols, targets)`. `targets` is what the symbols were actually
+/// chosen to represent — identical to `rotated` for [`QtipCondMode::Weighted`],
+/// but the RESIDUAL-adjusted values for the LDLQ modes. The caller must refit
+/// the per-group scale against `targets`, not against `rotated`: under error
+/// feedback a block encodes its adjusted target and the compensation for its own
+/// error is carried by later blocks. Refitting against the original weights
+/// would discard that compensation and quietly degrade to plain RTN-with-extra-
+/// steps — the same trap that made an earlier LDLQ run silently do nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn qtip_conditioned_encode(
+    rotated: &[f32],
+    m: usize,
+    k: usize,
+    h_rowmajor_f32: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+    cb: &[f32],
+    beam: usize,
+    bits: u32,
+    mode: QtipCondMode,
+    // Optional external encoder for ONE block of `m` groups, laid out
+    // contiguously as [m * 256]. `Greedy` needs only the chosen path, so it can
+    // delegate to a stronger encoder (the GPU exact Viterbi) and still feed its
+    // error forward — that combination is the point of this parameter, because
+    // encoder quality was measured to dominate conditioning at small beams.
+    // `BeamLdlq` ignores it: its feedback lives INSIDE the beam, so it cannot
+    // delegate without the encoder itself carrying per-candidate residuals.
+    block_encoder: Option<&dyn Fn(&[f32], usize) -> Vec<u8>>,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    use rayon::prelude::*;
+    assert_eq!(rotated.len(), m * k);
+    assert_eq!(h_rowmajor_f32.len(), k * k);
+    assert_eq!(k % 256, 0, "qtip conditioning requires k % 256 == 0");
+
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    rotate_hessian(&mut h, k, signs1, signs2);
+
+    if mode == QtipCondMode::Weighted {
+        // Normalize the rotated diagonal to mean 1 so the cost stays on the same
+        // scale as the unweighted encode (only the RELATIVE weighting matters,
+        // and an unnormalized H would just rescale every candidate equally).
+        let diag: Vec<f64> = (0..k).map(|i| h[i * k + i].max(0.0)).collect();
+        let mean = diag.iter().sum::<f64>() / k as f64;
+        let diag: Vec<f64> = if mean > 0.0 {
+            diag.iter().map(|d| d / mean).collect()
+        } else {
+            vec![1.0; k]
+        };
+        let mut symbols = vec![0u8; m * k];
+        symbols
+            .par_chunks_mut(256)
+            .enumerate()
+            .zip(rotated.par_chunks(256))
+            .for_each(|((gi, srow), grp)| {
+                let c0 = (gi * 256) % k;
+                let scale0 = crate::qtip::group_scale(grp);
+                let sym = crate::qtip::beam_encode_group_bits_weighted(
+                    grp,
+                    scale0,
+                    cb,
+                    beam,
+                    bits,
+                    &diag[c0..c0 + 256],
+                );
+                srow.copy_from_slice(&sym);
+            });
+        return Some((symbols, rotated.to_vec()));
+    }
+
+    let l = inv_cholesky_dispatch(&h, k, damp)?;
+    drop(h);
+    let nb = k / 256;
+    let mut residual: Vec<f64> = rotated.iter().map(|&w| w as f64).collect();
+    let mut symbols = vec![0u8; m * k];
+    let mut targets = vec![0.0f32; m * k];
+
+    for blk in 0..nb {
+        let c0 = blk * 256;
+        let c1 = c0 + 256;
+        // The [256, 256] diagonal sub-block of L for this group, row-major.
+        let l_block: Vec<f64> = if mode == QtipCondMode::BeamLdlq {
+            let mut lb = vec![0.0f64; 256 * 256];
+            for f in 0..256 {
+                for c in 0..=f {
+                    lb[f * 256 + c] = l[(c0 + f, c0 + c)];
+                }
+            }
+            lb
+        } else {
+            Vec::new()
+        };
+
+        // Gather this block from every row into one contiguous [m * 256] buffer so
+        // an external encoder sees the same layout it would for a whole tensor.
+        let block_flat: Vec<f32> = if block_encoder.is_some() && mode == QtipCondMode::Greedy {
+            let mut v = vec![0.0f32; m * 256];
+            v.par_chunks_mut(256)
+                .zip(residual.par_chunks(k))
+                .for_each(|(dst, rr)| {
+                    for (d, &sv) in dst.iter_mut().zip(&rr[c0..c1]) {
+                        *d = sv as f32;
+                    }
+                });
+            v
+        } else {
+            Vec::new()
+        };
+        let ext_syms: Option<Vec<u8>> = if block_flat.is_empty() {
+            None
+        } else {
+            block_encoder.map(|f| f(&block_flat, m))
+        };
+
+        let per_row: Vec<(Vec<u8>, Vec<f32>, Vec<f64>)> = residual
+            .par_chunks(k)
+            .enumerate()
+            .map(|(row, rr)| {
+                let grp: Vec<f32> = rr[c0..c1].iter().map(|&v| v as f32).collect();
+                let scale0 = crate::qtip::group_scale(&grp);
+                let sym = match (&ext_syms, mode) {
+                    (Some(es), _) => es[row * 256..row * 256 + 256].to_vec(),
+                    (None, QtipCondMode::BeamLdlq) => crate::qtip::beam_encode_group_bits_ldlq(
+                        &grp, scale0, cb, beam, bits, &l_block,
+                    ),
+                    (None, _) => crate::qtip::beam_encode_group_bits(&grp, scale0, cb, beam, bits),
+                };
+                // Refit the scale against what was actually encoded, then measure
+                // the error THAT reconstruction leaves behind.
+                let scale = crate::qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+                let deq = crate::qtip::decode_group_bits(&sym, scale, cb, bits);
+                let mut err = vec![0.0f64; 256];
+                for c in 0..256 {
+                    let lcc = l[(c0 + c, c0 + c)];
+                    err[c] = if lcc > 0.0 {
+                        (grp[c] as f64 - deq[c] as f64) / lcc
+                    } else {
+                        0.0
+                    };
+                }
+                (sym, grp, err)
+            })
+            .collect();
+
+        for (row, (sym, grp, _)) in per_row.iter().enumerate() {
+            symbols[row * k + c0..row * k + c1].copy_from_slice(sym);
+            targets[row * k + c0..row * k + c1].copy_from_slice(grp);
+        }
+
+        if c1 < k {
+            residual
+                .par_chunks_mut(k)
+                .zip(per_row.par_iter())
+                .for_each(|(rr, (_, _, err))| {
+                    for (c, &ec) in err.iter().enumerate() {
+                        if ec == 0.0 {
+                            continue;
+                        }
+                        let col = c0 + c;
+                        for f in c1..k {
+                            let lfc = l[(f, col)];
+                            if lfc != 0.0 {
+                                rr[f] -= ec * lfc;
+                            }
+                        }
+                    }
+                });
+        }
+    }
+    Some((symbols, targets))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Right-looking blocked Cholesky, trailing update on GPU
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Lower Cholesky `A = L·Lᵀ` by right-looking blocks, with the trailing
+/// submatrix update on the GPU.
+///
+/// MIXED PRECISION BY DESIGN. The panel (diagonal factorization + TRSM) runs on
+/// the host in f64: it is O(k·jb²), negligible next to the trailing update, and
+/// it is where an ill-conditioned Hessian actually breaks down. The trailing
+/// update — the O(k³) — runs in f32 on the GPU, which is the only reason this is
+/// worth doing at all: the CPU path measures ~20 GFLOP/s with all 32 threads
+/// (verified not a misconfiguration), and Cholesky scales badly at these sizes
+/// because the panel serialises.
+///
+/// Returns `None` on non-positive-definite input, matching faer's `llt`, so the
+/// damping-retry loop above behaves identically.
+///
+/// `a` is `[k, k]` row-major, lower triangle read; the result overwrites the
+/// lower triangle. The upper triangle is left untouched (the kernel skips it, and
+/// writing it would break the symmetry each panel download assumes).
+#[cfg(feature = "gpu")]
+pub fn llt_lower_right_looking_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &[f64],
+    k: usize,
+) -> Option<Vec<f64>> {
+    const JB: usize = 128;
+
+    // Device copy in f32. Only the lower triangle is meaningful from here on.
+    // The matrix stays DEVICE-RESIDENT; only the k x jb panel crosses the bus
+    // each block. The first draft round-tripped the whole [k, k] per block —
+    // 256 MB at k=8192 against the ~4 MB actually needed — which is why it
+    // plateaued at 27 GF/s.
+    //
+    // The device copy is authoritative. Factoring a panel read from a stale
+    // device buffer factors the ORIGINAL matrix rather than the trailing-updated
+    // one: 98% relative error, which is exactly what the first draft did.
+    let host0: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+    let dev = gpu.upload_owned_f32(&host0, &[k, k]).ok()?;
+    drop(host0);
+    let panel_dev = gpu.alloc_owned(&[k * JB], hipfire_rdna::DType::F32).ok()?;
+
+    let mut j0 = 0usize;
+    while j0 < k {
+        let jb = JB.min(k - j0);
+        let rows = k - j0;
+        gpu.chol_panel_gather(&dev, &panel_dev, k, j0, jb, rows)
+            .ok()?;
+        gpu.device_synchronize().ok()?;
+        let flat = gpu.download_f32(&panel_dev).ok()?;
+        let mut panel = vec![0.0f64; rows * jb];
+        for r in 0..rows {
+            for c in 0..jb {
+                panel[r * jb + c] = flat[r * jb + c] as f64;
+            }
+        }
+
+        // Diagonal block: unblocked Cholesky in f64.
+        for c in 0..jb {
+            let mut d = panel[c * jb + c];
+            for t in 0..c {
+                d -= panel[c * jb + t] * panel[c * jb + t];
+            }
+            if !(d > 0.0) {
+                return None; // not positive definite — caller retries with more damping
+            }
+            let d = d.sqrt();
+            panel[c * jb + c] = d;
+            for r in (c + 1)..rows {
+                let mut v = panel[r * jb + c];
+                for t in 0..c {
+                    v -= panel[r * jb + t] * panel[c * jb + t];
+                }
+                panel[r * jb + c] = v / d;
+            }
+        }
+
+        // Write the factored panel back and let the GPU take the trailing update.
+        let back: Vec<f32> = panel.iter().map(|&v| v as f32).collect();
+        let back_dev = gpu.upload_owned_f32(&back, &[rows, jb]).ok()?;
+        gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows)
+            .ok()?;
+        gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
+        gpu.device_synchronize().ok()?;
+        j0 += jb;
+    }
+    let out = gpu.download_f32(&dev).ok()?;
+    gpu.reclaim_pending();
+    Some(out.iter().map(|&v| v as f64).collect())
+}
+
+/// GPU-backed `inv_cholesky_lower_rotated`: both factorizations run on the
+/// device, the inverse is formed from the raw factor.
+///
+/// The blocker on wiring [`llt_lower_right_looking_gpu`] in was that the routine
+/// is factor -> invert -> factor and faer's `inverse()` needs its own `Llt`
+/// object, which a raw device-produced factor cannot supply. So the inverse is
+/// built directly instead: with `H+λI = C·Cᵀ` (C lower),
+///
+///     (H+λI)⁻¹ = C⁻ᵀ·C⁻¹
+///
+/// via a lower-triangular inverse then one symmetric product — the same O(k³/3)
+/// each that faer's `inverse()` costs, with no `Llt` required. That leaves the
+/// two Cholesky factorizations (2/3 of the work) on the GPU.
+///
+/// Returns `None` on non-positive-definite input at every damping multiplier,
+/// matching the CPU versions exactly so callers behave identically.
+#[cfg(feature = "gpu")]
+pub fn inv_cholesky_lower_rotated_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    h: &[f64],
+    k: usize,
+    damp: f64,
+) -> Option<Mat<f64>> {
+    let base = damp.max(1e-12);
+    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+        let lambda = base * mult;
+        let mut hd = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                hd[i * k + j] = h[i * k + j] + if i == j { lambda } else { 0.0 };
+            }
+        }
+        let Some(c) = llt_lower_right_looking_gpu(gpu, &hd, k) else {
+            continue;
+        };
+        // C⁻¹ by forward substitution, column by column. Lower triangular, so
+        // this is O(k³/3) and stays in f64 — the factor came back in f32 from the
+        // device, and compounding that through an inverse is where precision
+        // would actually bite.
+        // COLUMN-MAJOR and PARALLEL. Each column of C⁻¹ is an independent forward
+        // substitution, and writing column-major keeps that column contiguous.
+        // The first version of this was a naive row-major single-threaded triple
+        // loop: ~1.8e11 scalar ops on one core at k=8192, which made the whole
+        // quantize 34x SLOWER than the CPU path it was meant to accelerate
+        // (19026s vs 564s) even though the GPU factorizations themselves were
+        // fine. Replacing faer's multithreaded inverse with hand-rolled loops is
+        // where the time went, not the device.
+        use rayon::prelude::*;
+        if (0..k).any(|i| c[i * k + i].abs() < 1e-30) {
+            continue;
+        }
+        let mut cinv_cm = vec![0.0f64; k * k]; // cinv_cm[col*k + row] = C⁻¹[row][col]
+        cinv_cm
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(col, out)| {
+                out[col] = 1.0 / c[col * k + col];
+                for row in (col + 1)..k {
+                    let mut acc = 0.0;
+                    for t in col..row {
+                        acc += c[row * k + t] * out[t];
+                    }
+                    out[row] = -acc / c[row * k + row];
+                }
+            });
+        // hinv[i][j] = Σ_t C⁻¹[t][i]·C⁻¹[t][j] — with column-major storage both
+        // operands are contiguous, so this is a dot product per (i, j).
+        let mut hinv = vec![0.0f64; k * k];
+        hinv.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+            let ci = &cinv_cm[i * k..i * k + k];
+            for j in 0..=i {
+                let cj = &cinv_cm[j * k..j * k + k];
+                let start = i.max(j);
+                let mut acc = 0.0;
+                for t in start..k {
+                    acc += ci[t] * cj[t];
+                }
+                row[j] = acc;
+            }
+        });
+        for i in 0..k {
+            for j in (i + 1)..k {
+                hinv[i * k + j] = hinv[j * k + i];
+            }
+        }
+        let Some(l) = llt_lower_right_looking_gpu(gpu, &hinv, k) else {
+            continue;
+        };
+        return Some(Mat::<f64>::from_fn(k, k, |i, j| {
+            if j <= i {
+                l[i * k + j]
+            } else {
+                0.0
+            }
+        }));
+    }
+    None
 }

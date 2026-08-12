@@ -10,6 +10,7 @@ mod dispatch;
 pub mod feature_flags;
 pub mod generic_warn;
 pub mod gtt_share;
+pub mod kernel_trace;
 mod kernels;
 pub mod pool;
 pub mod profile;
@@ -17,6 +18,7 @@ pub mod profile_rocprof;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
+pub use dispatch::lmhead_twostage;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, DType, Gpu, GpuTensor, OpusNpuIoLayout, OwnedTensor,
     LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,

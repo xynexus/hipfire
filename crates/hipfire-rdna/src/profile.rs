@@ -282,18 +282,6 @@ pub fn elementwise1_bytes(n: usize) -> usize {
     n * 4 * 2
 }
 
-/// DeltaNet Q8 recurrence: roughly state in + state out + Q/K/V + gate/beta +
-/// output. Dominated by state read+write.
-pub fn gated_delta_net_q8_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {
-    let state_bytes = n_heads * head_dim * head_dim; // Q8: 1 byte each
-    let state_scales = n_heads * head_dim * 4;
-    let qkv = 3 * n_tokens * n_heads * head_dim * 4;
-    let gate_beta = 2 * n_tokens * n_heads * 4;
-    let out = n_tokens * n_heads * head_dim * 4;
-    // State is read + written
-    2 * state_bytes + 2 * state_scales + qkv + gate_beta + out
-}
-
 /// DeltaNet FP32 recurrence: state in + state out + Q/K/V + gate/beta +
 /// output. Dominated by the FP32 state read+write.
 pub fn gated_delta_net_f32_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {

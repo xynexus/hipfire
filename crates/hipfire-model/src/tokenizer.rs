@@ -22,16 +22,11 @@ static TOKENIZER_CONFIG: OnceLock<TokenizerConfig> = OnceLock::new();
 
 fn tokenizer_config() -> &'static TokenizerConfig {
     TOKENIZER_CONFIG.get_or_init(|| {
-        let normalize_prompt = match std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() {
-            Some("0") | Some("false") | Some("off") | Some("no") => false,
-            _ => true,
-        };
-        let prompt_heat_json =
-            std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1");
-        let prompt_heat_limit = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
+        // `is_off` rather than `!flag()`: unset must mean "on" here, so only an
+        // explicit 0/false/off/no disables normalization.
+        let normalize_prompt = !hipfire_env::NORMALIZE_PROMPT.is_off();
+        let prompt_heat_json = hipfire_env::PROMPT_HEAT_JSON.flag();
+        let prompt_heat_limit = hipfire_env::PROMPT_HEAT_LIMIT.parse_or(64);
 
         TokenizerConfig {
             normalize_prompt,
@@ -48,12 +43,18 @@ fn tokenizer_config() -> &'static TokenizerConfig {
 /// instead of on the whole prompt, restoring the canonical O(N) shape
 /// with bounded per-chunk constants.
 ///
-/// Lookahead `\s+(?!\S)` is omitted from the canonical pattern; the
-/// `regex` crate doesn't support lookaround and the surviving `\s+`
-/// branch matches the same byte spans. Order of alternation preserves
-/// the priority the reference encoders use, so chunking boundaries
-/// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
-/// (verified against locked niah_4k token md5).
+/// Lookahead `\s+(?!\S)` is omitted from the pattern text because the
+/// `regex` crate has no lookaround — `split_whitespace_reservation`
+/// reproduces it on the match instead. It is NOT redundant with the
+/// plain `\s+` branch: the reference hands the final whitespace char of
+/// a run back to the following word, so `"    return"` chunks as
+/// `("   ", " return")`, not `("    ", "return")`. Dropping it diverged
+/// from HF on 17.6% of tokens over Python source and 2.5% over prose
+/// (measured against `tokenizers` on Qwen3.5-0.8B, 2026-07-26).
+///
+/// Order of alternation preserves the priority the reference encoders
+/// use, so chunking boundaries match HF tokenizers' Split-then-ByteLevel
+/// pipeline byte-for-byte.
 const GPT2_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
 fn gpt2_pretok_re() -> &'static Regex {
@@ -62,6 +63,43 @@ fn gpt2_pretok_re() -> &'static Regex {
         Regex::new(GPT2_PRETOK_PATTERN)
             .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
     })
+}
+
+/// Stand-in for the `\s+(?!\S)` branch the `regex` crate can't express.
+/// Given a match `text[start..end]`, return the end offset the reference
+/// pattern would have produced.
+///
+/// The reference tries `\s+(?!\S)` before the bare `\s+`: it matches the
+/// whole run at end-of-input, otherwise backtracks one char so the
+/// negative lookahead sees whitespace. The scan then RESUMES at that char,
+/// where the letter/punct branch absorbs it via its optional leading-char
+/// prefix (`" return"`) — or, for a digit run, does not (`\p{N}{1,3}` has
+/// no space prefix, so `"  123"` stays `(" ", " ", "123")`). Callers must
+/// therefore re-run the regex from the returned offset rather than
+/// prepending the reserved char to the next match.
+///
+/// Only the last-resort `\s+` branch needs this. A match containing `\r`
+/// or `\n` came from `\s*[\r\n]+`, which already stops at its last
+/// newline and outranks both whitespace branches; a match with any
+/// non-whitespace char came from a letter/digit/punct branch.
+fn split_whitespace_reservation(text: &str, start: usize, end: usize) -> usize {
+    if end >= text.len() {
+        return end; // run reaches end-of-input: lookahead succeeds whole
+    }
+    let s = &text[start..end];
+    let mut chars = s.chars();
+    let Some(last) = chars.next_back() else {
+        return end;
+    };
+    // Needs ≥2 chars to give one back, all whitespace, no line breaks.
+    if chars.as_str().is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_whitespace() && c != '\r' && c != '\n')
+    {
+        return end;
+    }
+    end - last.len_utf8()
 }
 
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
@@ -941,8 +979,17 @@ impl Tokenizer {
         // → tokens, so `len/4` is a sane lower bound that avoids early
         // reallocs without wasting memory on short inputs.
         let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
-        for m in gpt2_pretok_re().find_iter(text) {
-            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        // Driven with `find_at` rather than `find_iter` because
+        // `split_whitespace_reservation` can hand a byte back to the next
+        // chunk, and the scan must resume at that byte (the reference
+        // re-runs the whole alternation there — see the fn's doc comment).
+        let re = gpt2_pretok_re();
+        let mut pos = 0usize;
+        while let Some(m) = re.find_at(text, pos) {
+            let end = split_whitespace_reservation(text, m.start(), m.end());
+            self.encode_gpt2_chunk(text[m.start()..end].as_bytes(), &mut result);
+            debug_assert!(end > pos, "pretok scan must make progress");
+            pos = end;
         }
         result
     }
@@ -1521,11 +1568,10 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
-    if matches!(
-        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
-        Some("0") | Some("false") | Some("off") | Some("no")
-    ) {
+    // Default ON. Explicit "0" / "false" / "off" / "no" opts out. Read live
+    // rather than through `tokenizer_config()` so tests that set the var after
+    // the `OnceLock` has been initialised still observe it.
+    if hipfire_env::NORMALIZE_PROMPT.is_off() {
         return Cow::Borrowed(s);
     }
     if !tokenizer_config().normalize_prompt {
@@ -1641,6 +1687,51 @@ mod bpe_tests {
             sentencepiece_add_prefix_space: false,
             sentencepiece_uses_bpe: false,
         }
+    }
+
+    /// Drive the pretokenizer exactly as `encode_gpt2_bpe` does and collect
+    /// the chunk strings.
+    fn pretok_chunks(text: &str) -> Vec<&str> {
+        let re = gpt2_pretok_re();
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while let Some(m) = re.find_at(text, pos) {
+            let end = split_whitespace_reservation(text, m.start(), m.end());
+            out.push(&text[m.start()..end]);
+            assert!(end > pos, "pretok scan must make progress");
+            pos = end;
+        }
+        out
+    }
+
+    /// Expected values are HF `tokenizers` `pre_tokenize_str` output for the
+    /// canonical pattern (Qwen3.5-0.8B), with ByteLevel markers mapped back
+    /// to raw bytes. Locks the `\s+(?!\S)` reservation the `regex` crate
+    /// cannot express directly.
+    #[test]
+    fn pretok_reserves_last_whitespace_for_following_word() {
+        // The bug this fixes: 4-space indent + word.
+        assert_eq!(
+            pretok_chunks("def foo():\n    return 1"),
+            vec!["def", " foo", "():\n", "   ", " return", " ", "1"],
+        );
+        // Single space is already absorbed by the letter branch — no split.
+        assert_eq!(pretok_chunks("a b"), vec!["a", " b"]);
+        // Digit runs have no space prefix, so the reserved char stands alone.
+        assert_eq!(pretok_chunks("a  12"), vec!["a", " ", " ", "12"]);
+        // Trailing whitespace at end-of-input keeps the whole run.
+        assert_eq!(pretok_chunks("a   "), vec!["a", "   "]);
+        // `\s*[\r\n]+` outranks both whitespace branches: stops at the last
+        // newline, and the spaces after it are a separate reserved run.
+        assert_eq!(pretok_chunks("a\n\n  b"), vec!["a", "\n\n", " ", " b"]);
+        // Mixed whitespace: the tab is part of the run, the space is given back.
+        assert_eq!(pretok_chunks("a \t b"), vec!["a", " \t", " b"]);
+        // Non-ASCII whitespace (U+3000 ideographic space) is `\s` too, and is
+        // 3 bytes — the give-back must be char-wise, not byte-wise.
+        assert_eq!(
+            pretok_chunks("a\u{3000}\u{3000}b"),
+            vec!["a", "\u{3000}", "\u{3000}b"],
+        );
     }
 
     #[test]

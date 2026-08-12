@@ -55,7 +55,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let hfq_path = args
         .next()
-        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native.mq4.hfq".to_string());
+        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native--mq4.hfq".to_string());
     let ntok: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
 
     let hfq = HfqFile::open(Path::new(&hfq_path)).expect("open hfq");

@@ -400,6 +400,12 @@ fn api_auth_posture_note(
 
 async fn spawn_daemon_for_serving(state: &SharedState) -> anyhow::Result<()> {
     let cfg = state.config.lock().await.clone();
+    // Spawns rather than attaches, deliberately. `apply_daemon_startup_env`
+    // configures the daemon through the environment the CHILD inherits — resource
+    // locking and the scheduler memory budgets — so attaching to an already-running
+    // daemon would silently drop that configuration and leave it running whatever
+    // it started with. Moving this config onto the wire is what would unblock
+    // attaching here.
     apply_daemon_startup_env(&cfg);
     let bin = hipfire_daemon_adapter::find_daemon_bin_or_error()?;
     let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(&bin).await?;

@@ -129,6 +129,17 @@ mtp = "none"
 kv = "fp32+kvarn"
 vision = "none"
 
+# Cohere2-MoE/BLS has registry-backed source identity and quant-policy ingress.
+# Serving remains none until the parallel-block BF16 runtime passes parity.
+[[arch]]
+ids = [25]
+label = "cohere2-moe"
+prefill = "none"
+dflash = "none"
+mtp = "none"
+kv = "none"
+vision = "none"
+
 [[arch]]
 ids = [7]
 label = "qwen2"

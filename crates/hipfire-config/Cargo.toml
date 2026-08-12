@@ -6,6 +6,7 @@ license.workspace = true
 description = "Shared CLI/server configuration and local path helpers for hipfire"
 
 [dependencies]
+hipfire-auth = { path = "../hipfire-auth" }
 dirs = "5"
 serde.workspace = true
 serde_json = "1"

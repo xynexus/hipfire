@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 
-use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter, UsageWriter};
+use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter, RatePolicy, UsageWriter};
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
@@ -248,6 +248,17 @@ impl AppState {
     ) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
+        // Loopback binds get their own base rate policy — throttling processes
+        // on this machine mostly gets in the way. Keyed on the BIND address,
+        // not the request principal: `AuthKind::AnonymousLocal` only means "no
+        // credential presented", which a remote client also gets under
+        // `unsafe_allow_unauthenticated_remote`. Computed here because `config`
+        // is moved into the struct literal below.
+        let rate_limiter_base = if crate::api_auth::is_loopback_host(&config.host) {
+            RatePolicy::loopback_default().with_override(&config.local_rate_policy)
+        } else {
+            RatePolicy::default()
+        };
         let sdapi_output_root = PathBuf::from(&config.sdapi_output_root);
         let sdapi_geometry_limits = crate::routes::sdapi::SdapiGeometryLimits::from_config(&config);
         let models_dir = hipfire_config::configured_models_dir(&config);
@@ -309,7 +320,7 @@ impl AppState {
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
             access,
-            rate_limiter: RateLimiter::default(),
+            rate_limiter: RateLimiter::with_base(rate_limiter_base),
             usage_writer,
         })
     }

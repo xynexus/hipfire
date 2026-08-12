@@ -37,6 +37,34 @@ struct Tensor {
     data: Vec<u8>,
 }
 
+/// Drop metadata that describes the SOURCE file's byte layout.
+///
+/// `hfqm_modules` is a table of ABSOLUTE byte ranges into the file it was built
+/// from. A subset extract keeps a handful of tensors and renumbers everything,
+/// so every range in that table becomes wrong — and `HfqFile::open` validates
+/// them, so the extract is unreadable by every other tool:
+///
+///   HFQM module layers.0.experts.0 invalid range 2038587392..2040263680
+///   for file_len 22921216
+///
+/// Rebasing is not the fix: the modules describe pageable expert groups whose
+/// tensors are mostly NOT in the extract, so there is nothing coherent to point
+/// them at. A tensor subset is not a pageable artifact — the table should simply
+/// not be there.
+fn strip_layout_metadata(meta_json: &str) -> String {
+    let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_json) else {
+        return meta_json.to_string();
+    };
+    let removed = meta
+        .as_object_mut()
+        .and_then(|obj| obj.remove("hfqm_modules"))
+        .is_some();
+    if removed {
+        eprintln!("  (dropped hfqm_modules: byte ranges do not survive a subset extract)");
+    }
+    serde_json::to_string(&meta).unwrap_or_else(|_| meta_json.to_string())
+}
+
 fn write_hfq(
     path: &str,
     arch: u32,
@@ -121,7 +149,7 @@ fn load_all(path: &str) -> (u32, String, Vec<Tensor>) {
     let tensors = names
         .into_iter()
         .map(|(name, qt, shape, gs)| {
-            let (_, data) = hfq.tensor_data(&name).expect("tensor data");
+            let (_, data) = hfq.tensor_data_cow(&name).expect("tensor data");
             Tensor {
                 name,
                 quant_type: qt,
@@ -158,18 +186,58 @@ fn main() {
             let ts = hfq.tensors();
             println!("tensors: {}", ts.len());
             let mut total = 0u64;
+            let mut stored_total = 0u64;
+            let mut recoded = 0usize;
             for t in ts {
+                // The index reports the LOGICAL encoding — a losslessly-recoded
+                // tensor is presented as the type it expands to. An inspection
+                // tool must show what is actually on disk, or a compressed
+                // artifact is indistinguishable from a plain one.
+                let (stored_qt, stored_len) = hfq
+                    .stored_encoding(&t.name)
+                    .unwrap_or((t.quant_type, t.data_size));
                 total += t.data_size as u64;
+                stored_total += stored_len as u64;
+                let qt = if stored_qt == t.quant_type {
+                    format!("{}", t.quant_type)
+                } else {
+                    recoded += 1;
+                    format!("{stored_qt}->{}", t.quant_type)
+                };
+                let size = if stored_len == t.data_size {
+                    format!("{:.2} MB", t.data_size as f64 / 1e6)
+                } else {
+                    format!(
+                        "{:.2} MB on disk (-> {:.2} MB)",
+                        stored_len as f64 / 1e6,
+                        t.data_size as f64 / 1e6
+                    )
+                };
                 println!(
-                    "  {:60} qt={:<2} shape={:?} g={} {:.2} MB",
-                    t.name,
-                    t.quant_type,
-                    t.shape,
-                    t.group_size,
-                    t.data_size as f64 / 1e6
+                    "  {:60} qt={:<6} shape={:?} g={} {size}",
+                    t.name, qt, t.shape, t.group_size
                 );
             }
-            println!("total tensor bytes: {:.2} MB", total as f64 / 1e6);
+            if recoded > 0 {
+                println!(
+                    "  ({recoded} tensor(s) losslessly recoded on disk: {:.2} MB stored, \
+                     {:.2} MB expanded, {:.4}x; `qt=STORED->LOGICAL`)",
+                    stored_total as f64 / 1e6,
+                    total as f64 / 1e6,
+                    total as f64 / stored_total.max(1) as f64
+                );
+            }
+            // Report the on-disk total too, or a recoded artifact appears to
+            // occupy its expanded size — which is not what the file costs.
+            if stored_total == total {
+                println!("total tensor bytes: {:.2} MB", total as f64 / 1e6);
+            } else {
+                println!(
+                    "total tensor bytes: {:.2} MB on disk ({:.2} MB expanded)",
+                    stored_total as f64 / 1e6,
+                    total as f64 / 1e6
+                );
+            }
         }
         "extract" => {
             let inp = argv
@@ -188,7 +256,7 @@ fn main() {
             for t in &kept {
                 eprintln!("  {}", t.name);
             }
-            write_hfq(out, arch, &meta, &kept).expect("write");
+            write_hfq(out, arch, &strip_layout_metadata(&meta), &kept).expect("write");
         }
         "meta-set" => {
             let inp = argv

@@ -133,6 +133,7 @@ node_modules/
 
 # Local reference checkouts. These are optional development inputs, not part of
 # the repository; add a real gitlink explicitly if one becomes a dependency.
+docs/reference/rdna35-isa-markdown/
 third_party/DeepSpec/
 third_party/IRON/
 third_party/H-Neurons/

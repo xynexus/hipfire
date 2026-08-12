@@ -238,11 +238,32 @@ pub const GEMV_MQ3G256_LLOYD_SRC: &str =
 /// QTIP-3: FWHT-rotated trellis-coded 3-bit, fused on-the-fly decode + matvec
 /// (100 B/group, computed 1MAD codebook, zero LDS). Arch-generic (gfx1103/1100).
 pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256.hip");
+/// QTIP-3 with the 3INST computed codebook (`QuantType::Qtip3G256I3` = 51).
+/// Same 100 B/group layout and 12-bit trellis as [`GEMV_QTIP3G256_SRC`]; only
+/// the state->value map differs (3INST, excess kurtosis -0.111, vs 1MAD's
+/// -0.312). A distinct kernel because the codebook is part of the wire format:
+/// decoding one with the other silently yields noise.
+pub const GEMV_QTIP3G256I3_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256i3.hip");
 /// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
 /// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
 pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
 /// QTIP trellis ENCODER (offline): full Viterbi over the 12-bit state space, one
 /// block per 256-group, dp ping-pong in LDS. Replaces the ~1h/1B CPU beam encode.
+/// QTIP trellis encoder for the 3INST codebook. Must stay in lockstep with
+/// [`GEMV_QTIP3G256I3_SRC`]: the encoder minimises error against the codebook it
+/// bakes, so an encoder/decoder codebook mismatch yields weights optimal for a
+/// function the decoder never evaluates.
+/// OBS error propagation for block-sequential QTIP conditioning: the rank-256
+/// update that feeds a finished block's error forward to all later columns.
+/// Strided destination, hence its own kernel rather than the general GEMM.
+/// Trailing-submatrix update for right-looking blocked Cholesky. Carries the
+/// O(k^3); the panel factorization stays on the host in f64.
+pub const CHOL_SYRK_TRAILING_SRC: &str =
+    include_str!("../../../kernels/src/chol_syrk_trailing.hip");
+pub const QTIP_OBS_PROPAGATE_SRC: &str =
+    include_str!("../../../kernels/src/qtip_obs_propagate.hip");
+pub const QTIP_VITERBI_ENCODE_I3_SRC: &str =
+    include_str!("../../../kernels/src/qtip_viterbi_encode_i3.hip");
 pub const QTIP_VITERBI_ENCODE_SRC: &str =
     include_str!("../../../kernels/src/qtip_viterbi_encode.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
@@ -1091,6 +1112,11 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Per-EXPERT AWQ rotate for the indexed MoE path: one rotated basis per
+/// (token, krank), each divided by ITS expert's awq_scale. See the kernel
+/// preamble for why a single shared rotation is wrong for routed experts.
+pub const ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rotate_x_mq_awq_indexed_batched.hip");
 /// GPU side of the shared EmbeddingGemma Opus projection boundary. Packs
 /// AWQ/FWHT/Q8 activations directly into the AIE whole-array input layout and
 /// deblocks the physical f32 output into one to three row-major GPU tensors.
@@ -1101,6 +1127,13 @@ pub const OPUS_NPU_IO_SRC: &str = include_str!("../../../kernels/src/opus_npu_io
 /// signs1 gather and FWHT.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
+/// Per-EXPERT AWQ variant of the above, for the indexed MoE down_proj stage:
+/// each (token, krank) slot divides by ITS expert's awq_scale, selected on
+/// device from `topk_indices`. The down-side mirror of
+/// [`ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC`] — see that kernel's preamble for why
+/// one shared scale is wrong for routed experts.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
@@ -2447,6 +2480,11 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// Multi-row register-blocked Q8_0 GEMV — raises memory-level parallelism on
+/// large-M gemvs (lm_head) that are latency-bound with one row per wave. See
+/// kernels/src/gemv_q8_0_mrow.hip and docs/perf/zaya-decode-optimization.md EXP-22.
+pub const GEMV_Q8_0_MROW_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_mrow.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
@@ -2817,6 +2855,7 @@ pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str =
 
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
+pub const TRIATTN_SCORE_F32_SRC: &str = include_str!("../../../kernels/src/triattn_score_f32.hip");
 
 /// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
 pub const TRIATTN_SCORE_ASYM3_SRC: &str =
@@ -3123,6 +3162,14 @@ pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_de
 /// (no LDS). See kernels/src/zaya_cca.hip.
 pub const ZAYA_CCA_SRC: &str = include_str!("../../../kernels/src/zaya_cca.hip");
 
+/// ZAYA decode cooperative megakernel (Phase 0, megakernel-B): fuses the MLP
+/// half of a decode block (post-attn rmsnorm+rotate → router MLP+select → MoE
+/// gate_up → silu_mul+rotate → MoE down+affine) into one cooperative launch,
+/// grid-strided over all resident workgroups with `grid.sync()` between phases.
+/// See kernels/src/zaya_megakernel.hip and
+/// docs/plans/2026-07-24-zaya-cooperative-megakernel.md.
+pub const ZAYA_MEGAKERNEL_SRC: &str = include_str!("../../../kernels/src/zaya_megakernel.hip");
+
 /// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
 /// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the
 /// rolling conv-state ring-buffer advance into one launch. conv_bias is always
@@ -3172,51 +3219,55 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_routed_batch_seq.hip");
 
-/// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
-/// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
-/// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8.hip");
-
-/// gfx1151 register-state GDN Q8 experiment. Keeps one S row per thread in
-/// registers and preserves the production stochastic-requant ABI.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_REG_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gfx1151/gated_delta_net_q8_reg.gfx1151.hip");
-
-/// Routed Q8 Gated Delta Net for independent request sessions. One block per
-/// session/head/S-tile scans round-major prefix rows and updates only that
-/// session's recurrent Q8 S state.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_routed_batch_seq.hip");
-/// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
-/// requant outside the loop. Supports EF residual. Lower VGPR pressure.
-#[allow(dead_code)]
-pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
-
-/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
-/// to a caller-owned tape buffer, so sibling tokens read the parent's
-/// post-update state rather than the previous sibling's. Required for
-/// correctness when processing a DDTree-linearized token block.
+/// FP32 tree-aware DeltaNet replay. DFS order with per-token persist-write to a
+/// caller-owned tape, so sibling tokens read the parent's post-update state
+/// rather than the previous sibling's. The tape holds raw f32 — no scales, no
+/// requant, no stochastic rounding. `s_init` is the pre-block snapshot
+/// (READ-ONLY); the caller replays the accepted spine linearly afterwards to
+/// commit the trajectory (same pattern as conv1d_silu_split_tree).
 ///
-/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
-/// kernel never advances persistent dn_state.s_matrices — caller runs
-/// linear replay on the accepted spine post-acceptance to commit the
-/// trajectory (same pattern as conv1d_silu_split_tree).
+/// Spine topology reproduces `gated_delta_net_f32` called n_tokens=1 N times
+/// byte-exactly (same `col = tid * 4` lane mapping, so the same summation order).
 #[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
+pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_tree.hip");
 
-/// GDN recurrence with Q4-quantized S state in VRAM.
-/// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
-/// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
-/// 8x compression vs FP32 (8KB + 512B scales per head vs 64KB).
+/// FP16 tree-aware DeltaNet replay. Both `s_init` and the tape are f16, matching
+/// [`GATED_DELTA_NET_F16_SRC`] — under FP16 state the persistent S matrix IS
+/// f16. Storage f16, arithmetic FP32.
+///
+/// Not byte-exact against the linear FP32 kernel (one f16 rounding per tape
+/// round-trip, accumulating with tree DEPTH, not sibling count). Use the f32
+/// tree kernel when exactness against an FP32 reference is the thing under
+/// test; against the f16 LINEAR kernel on a spine it IS exact.
 #[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q4_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q4.hip");
+pub const GATED_DELTA_NET_F16_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_tree.hip");
+
+/// Linear DeltaNet recurrence with the persistent S state stored as f16 —
+/// the sanctioned half-precision state path (qwen35/state.rs names FP16 or a
+/// purpose-built codec as the only alternatives to FP32, and rules out Q8).
+///
+/// Storage f16, arithmetic FP32: the tile widens into LDS once per call and
+/// narrows once at the end, so a multi-token batch pays a single rounding
+/// rather than one per token. Exactly half the state bytes of
+/// [`GATED_DELTA_NET_SRC`], with no scales tensor, no error-feedback
+/// accumulator and no stochastic rounding — so unlike Q8 it is deterministic
+/// and spec-decode rollback is trivially lossless.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16.hip");
+
+/// Routed FP16-state DeltaNet for independent sessions — the f16 counterpart of
+/// `gated_delta_net_f32_routed_batch_seq`, and the entry point where f16 pays
+/// off most: state is per-SEQUENCE, so cross-session batching is exactly the
+/// high-concurrency case whose resident state f16 halves.
+///
+/// The pointers in `state_ptrs` address f16 buffers, HALF the f32 stride — a
+/// caller holding f32 state must not reach this kernel.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F16_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f16_routed_batch_seq.hip");
 
 /// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
 /// Eliminates 85µs CPU roundtrip per DeltaNet layer.
@@ -3983,6 +4034,32 @@ pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
 /// `kernels/src/gemm_bf16_tiled_wmma.hip`.
 pub const GEMM_BF16_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
+/// LDS-staged, double-buffered, register-super-tiled bf16 GEMM (gfx1103 wave32) —
+/// the DiT throughput kernel. Bit-exact to `gemm_bf16_tiled_wmma` but LDS-staged
+/// (BM64×BN128 block tile, 8 waves, BK=64 double-buffered). K%64==0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_lds.hip`.
+pub const GEMM_BF16_TILED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_lds.hip");
+/// EXPERIMENT: LDS bf16 GEMM + `extra` throwaway VALU FMAs/WMMA, to measure the
+/// DiT GEMM's free-ALU headroom (the QTIP/correction budget). Not production.
+/// See `kernels/src/bench_bf16_lds_freealu.hip`.
+pub const BENCH_BF16_LDS_FREEALU_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_lds_freealu.hip");
+/// DIAGNOSTIC-ONLY compute-headroom probe: the register-tiled 4x4 bf16 GEMM plus
+/// N side FMAs per K-step, to measure how much unrelated VALU work the
+/// (compute-bound, ~10%-of-peak) DiT GEMM absorbs for free — i.e. the budget a
+/// codebook/trellis weight decode (QTIP, LO-BCQ) or correction branch has to fit
+/// inside. Not routed into any model path. See
+/// `kernels/src/bench_bf16_alu_headroom.hip`.
+pub const BENCH_BF16_ALU_HEADROOM_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_alu_headroom.hip");
+/// Software-pipelined (prefetched) variants of `gemm_bf16_tiled_wmma` — same math
+/// and WMMA order, so bit-exact, but the next K-step's fragments are loaded before
+/// the current step's WMMAs so global-load latency overlaps the matrix core.
+/// Chases the ~15% stall the free-ALU probe exposed (plan §12c). K % 32 == 0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_pf.hip`.
+pub const GEMM_BF16_TILED_WMMA_PF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_pf.hip");
 
 /// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
 /// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked
@@ -3990,6 +4067,11 @@ pub const GEMM_BF16_TILED_WMMA_SRC: &str =
 /// `kernels/src/gemm_opus_tiled_wmma.hip`.
 pub const GEMM_OPUS_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_opus_tiled_wmma.hip");
+
+/// Plain-basis arch-20 DFLASH Opus reference GEMM. Consumes qt=45/46/47
+/// interleaved blocks directly without FWHT, host expansion, or repacking.
+pub const GEMM_DFLASH_OQ_PLAIN_REF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_dflash_oq_plain_ref.hip");
 
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
@@ -4064,6 +4146,15 @@ pub const GEMM_W3A4_I32_WMMA_LDS_SRC: &str =
 /// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
+pub const GEMM_OQ4_GROUPED_WMMA_BF16OUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_bf16out.hip");
+/// LDS-staged, double-buffered, register-super-tiled optimization of
+/// `gemm_oq4_grouped_wmma` (same bit-exact per-group f32 accumulation). Provides
+/// both `gemm_oq4_grouped_wmma_lds` (f32 out) and `gemm_oq4_grouped_wmma_lds_bf16out`
+/// (bf16 out). gfx1103 wave32, BM64×BN128 block tile. K%64==0, group%64==0.
+/// See `kernels/src/gemm_oq4_grouped_wmma_lds.hip`.
+pub const GEMM_OQ4_GROUPED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_lds.hip");
 
 /// OQ4+ batched PREFILL: W4A16 grouped GEMM (4-bit-resident weight dequantized
 /// to f16 inline, f16×f16 WMMA against full-precision f16 activations). The
@@ -4134,6 +4225,11 @@ pub const GEMM_OQ4_RESIDUAL_MMQ_SRC: &str =
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
 pub const QUANTIZE_ACT_OQ4_SRC: &str = include_str!("../../../kernels/src/quantize_act_oq4.hip");
+/// Clip-search variant of `quantize_act_oq4` (Stream B activation "+"): per-group
+/// MSE-optimal clip ratio instead of plain absmax. Same output format. Gated by
+/// `HIPFIRE_OQ4_ACT_CLIP=1`. See `kernels/src/quantize_act_oq4_clip.hip`.
+pub const QUANTIZE_ACT_OQ4_CLIP_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_oq4_clip.hip");
 
 /// Opus Quant W8A8 core: grouped signed-INT8 × signed-INT8 GEMM with per-group
 /// scale rescale (v_wmma_i32_16x16x16_iu8). The int8 generalization of
@@ -4141,6 +4237,15 @@ pub const QUANTIZE_ACT_OQ4_SRC: &str = include_str!("../../../kernels/src/quanti
 /// zero LDS. See `kernels/src/gemm_oq8_grouped_wmma.hip`.
 pub const GEMM_OQ8_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq8_grouped_wmma.hip");
+
+/// Opus Quant compact-resident W8A8: the `gemm_oq8_grouped_wmma` core reading
+/// OqPlusCompact (qt=36) blocks directly — int4 bulk plus the sparse int8
+/// overlay decoded in-kernel — so oq4.25++ stays ~4.25 bits/weight resident
+/// instead of being expanded to one int8 per weight at load. Same FWHT-rotated
+/// W8A8 semantics as the dense kernel, so the two are bit-comparable. See
+/// `kernels/src/gemm_oq_compact_grouped_wmma.hip`.
+pub const GEMM_OQ_COMPACT_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_grouped_wmma.hip");
 
 /// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
 /// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
@@ -4168,6 +4273,12 @@ pub const GEMV_OQ4_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_o
 /// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
 /// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.
 pub const GEMV_OQ8_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq8_grouped.hip");
+/// Bandwidth-optimized W8A16 decode GEMV (128-bit loads + 2 groups/wave ILP).
+/// Requires K % 512 == 0. See `kernels/src/gemv_oq8_grouped_v2.hip`.
+pub const GEMV_OQ8_GROUPED_V2_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8_grouped_v2.hip");
+pub const GEMV_OQ8_W8A8_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8_w8a8_grouped.hip");
 
 /// OQ+ (W8A8) fused QKVZA: in_proj_qkv/z/beta/alpha grouped-iu8 GEMMs in ONE launch
 /// over a shared int8 activation (int8 generalization of fused_qkvza_oq4_wmma).
@@ -4247,7 +4358,38 @@ pub const KVARN_BUILD_KCACHE_SRC: &str =
 pub const GEMV_F16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f32.hip");
 pub const GEMV_F16_F16_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f16.hip");
 pub const GEMV_BF16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_f32.hip");
+pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
+/// Per-row symmetric Q4 GEMV — the coarse candidate-scorer for the two-stage
+/// lm_head shortlist. See kernels/src/gemv_q4sym_f32.hip.
+pub const GEMV_Q4SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q4sym_f32.hip");
+/// Per-row symmetric Q2 GEMV — the aggressive coarse scorer (row-norm makes it
+/// viable). See kernels/src/gemv_q2sym_f32.hip.
+pub const GEMV_Q2SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q2sym_f32.hip");
+/// Fine pass of the two-stage lm_head: exact bf16 dot over a shortlist of rows,
+/// scatter-writing into the (pre-masked) logits. See kernels/src/gemv_bf16_gather_f32.hip.
+pub const GEMV_BF16_GATHER_F32_SRC: &str =
+    include_str!("../../../kernels/src/gemv_bf16_gather_f32.hip");
+/// GPU top-K passes for the two-stage lm_head (min/max → histogram → compact); keep the
+/// coarse score device-resident and select the shortlist without a host download.
+pub const LMHEAD_COARSE_MINMAX_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_minmax.hip");
+pub const LMHEAD_COARSE_HIST_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_hist.hip");
+pub const LMHEAD_COARSE_COMPACT_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
+pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
+pub const GEMV_BF16L3_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3_xf32.hip");
+pub const GEMM_BF16L3_XF32_SRC: &str = include_str!("../../../kernels/src/gemm_bf16l3_xf32.hip");
+
+/// Expand a BF16H (Huffman-coded exponent) payload to plain BF16 on device.
+///
+/// Unlike [`GEMV_BF16L3_SRC`] this does NOT decode inside a GEMV — a
+/// variable-length code has no random access, so the tensor is materialised as
+/// BF16 in VRAM. What it removes is the host round-trip and host-side decode at
+/// load, not weight bandwidth.
+pub const BF16_HUFF_DECODE_SRC: &str = include_str!("../../../kernels/src/bf16_huff_decode.hip");
+pub const GEMV_BF16_VEC8_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_vec8.hip");
 pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
 pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
 

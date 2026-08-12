@@ -297,7 +297,7 @@ encodes into cold/primed layer and sample CSVs:
 - `benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-components-m256-20260715.csv`
 - `benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-samples-m256-20260715.csv`
 
-Protocol: one fresh process, `EmbeddingGemma-300M.npu.oq8.hfq`, one 256-token
+Protocol: one fresh process, `EmbeddingGemma-300M--npu.oq8.hfq`, one 256-token
 document, three encodes, resident completed-layer route, both resident and XDNA
 dispatch tracing enabled. The two primed encodes averaged:
 

@@ -36,7 +36,7 @@ pub struct WeightTensor {
     pub gpu_dtype: DType,  // dispatch type for kernel selection
     pub m: usize,          // output dim (rows)
     pub k: usize,          // input dim (cols)
-    pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    pub row_stride: usize, // byte stride/layout discriminator for packed formats; 0 otherwise
     /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
     pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
@@ -199,8 +199,8 @@ fn dispatch_err_to_hip(e: hipfire_dispatch::types::DispatchError) -> hip_bridge:
 /// Pre-flight (no-GPU, no-execute) check: would `weight_gemv` accept this weight
 /// dtype, or refuse it as unsupported? Mirrors `weight_gemv`'s dispatch decision
 /// exactly, so the gate can never pass something the GEMV path then rejects:
-///   - `BF16` → dedicated `gemm_bf16_x_bf16_wmma` path.
-///   - rotation-free dtypes → the `run_auto` path needs a `for_gemv*` kernel key.
+///   - rotation-free dtypes (including `BF16`) → the `run_auto` path needs a
+///     `for_gemv*` kernel key.
 ///   - rotation-needing dtypes → either a dedicated `weight_gemv` arm (handles its
 ///     own rotation/quant) or the generic FWHT-G256 arm (the Layer-1 gate).
 ///
@@ -215,10 +215,10 @@ pub fn gemv_dtype_supported(dtype: DType, has_awq: bool) -> Result<(), hip_bridg
     };
     use DType::*;
 
-    if dtype == BF16 {
-        return Ok(());
-    }
-
+    // BF16 used to short-circuit here because it had no family key and
+    // `weight_gemv` special-cased it to a batch-1 WMMA GEMM. It now registers as
+    // `KernelKey::GemvBf16` -> `gemv_bf16_xf32`, so it goes through the same key
+    // lookup as everything else — which is what keeps this function honest.
     if !dtype_needs_rotation(dtype) {
         // run_auto path: requires a dispatch-family key for its auto variant.
         let key = match dtype_post_rotation_variant(dtype) {
@@ -383,8 +383,10 @@ mod preflight_tests {
 #[inline]
 fn capture_at_weight_gemv_wrapper(dtype: DType) -> bool {
     // Full-precision GEMV routes terminate in capture-aware RDNA entrypoints:
-    // BF16 in `gemm_bf16_x_bf16_wmma_labeled`, F16 in
-    // `gemm_f16_batched_lmhead`. Keeping wrapper capture enabled for either
+    // BF16 in `gemv_bf16_xf32` (batch 1) or `gemm_bf16_x_bf16_wmma_labeled`
+    // (batched), F16 in `gemv_f16_xf32` / `gemm_f16_batched_lmhead`. The bf16
+    // batch-1 tap was missing until 2026-08-07, which cost every bf16-sourced
+    // calib its `mlp.down_proj` Hessian. Keeping wrapper capture enabled for either
     // would count each activation twice. Quantized routes have no universal
     // lower-level chokepoint and remain owned here.
     !matches!(dtype, DType::BF16 | DType::F16)
@@ -429,10 +431,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
-        // BF16 weights use WMMA GEMM directly (dispatch family has no BF16 GEMV entry).
-        if w.gpu_dtype == DType::BF16 {
-            return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
-        }
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
             .map_err(dispatch_err_to_hip);
@@ -584,6 +582,16 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_oq4_scratch()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            // HIPFIRE_OQ4_ACT4=1 (verification harness): consume the rotated
+            // activation as TRUE int4 (quantize_act_oq4 → iu4·iu4 gemm at B=1)
+            // instead of the default W4A16 gemv. Lets `hipfire chat` exercise the
+            // full-model int4-ACTIVATION path per-token, end to end, so int4-act
+            // coherence/accumulation can be compared directly against W4A16
+            // (env unset). Not a serving default — the roofline (memory-capped
+            // ~1.6× prefill-only) does not justify int4-act at B=1 decode.
+            if std::env::var("HIPFIRE_OQ4_ACT4").as_deref() == Ok("1") {
+                return gpu.gemm_oq4_grouped_act_batched(&w.buf, &xr, y, w.m, w.k, 1);
+            }
             // Weight scales view: byte offset M*(K/2) into the combined buffer.
             let ws = w.buf.sub_offset(w.m * (w.k / 2), w.m * ng * 4);
             gpu.gemv_oq4_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)
@@ -1369,6 +1377,21 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
+        // Without this the packed head fell through to the per-column fallback
+        // below, which reads the whole 367 MB payload once per column — 62% of
+        // GPU time in a KLD reference build.
+        //
+        // Two kernels, split by batch. The cooperative-decode WMMA form wins
+        // everywhere batched (measured vs plain BF16 at N=256: lm_head 1.46x
+        // against the scalar form's 2.31x, dn_qkv 1.25x against 2.28x) and at
+        // N=64 it is FASTER than plain BF16 (0.57-0.68x) — same WMMA compute,
+        // 1.38x fewer weight bytes. The scalar form still edges it at batch-1
+        // (0.55x vs 0.67x on an lm_head), which is where a stray small call
+        // lands; true batch-1 goes through `weight_gemv` instead.
+        DType::Bf16L3 if batch_size >= 16 => {
+            gpu.gemm_bf16l3_wmma_coop(&w.buf, x, y, w.m, w.k, batch_size)
+        }
+        DType::Bf16L3 => gpu.gemm_bf16l3_xf32(&w.buf, x, y, w.m, w.k, batch_size),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
