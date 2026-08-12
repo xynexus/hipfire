@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 hipfire contributors
+// hipfire — see LICENSE and NOTICE in the project root.
+//! Attribute the DeltaNet multi-step error to the specific operation that causes
+//! it, now that `parity_gated_delta_net_f64acc{,_routed}` have established an
+//! oracle worth measuring against.
+//!
+//! The f32 kernel has four places precision can be lost per token:
+//!
+//!   TILE   the LDS tile is `float`, so the state is rounded to f32 after EVERY
+//!          token's update — a per-step round-trip on a recurrent accumulator
+//!   KV     `kv = <S[r,:], k>`: a 128-term dot product plus a 5-level
+//!          `__shfl_down` tree, all f32
+//!   UPD    `s = alpha*s + k*delta`
+//!   OUT    `out = <S[r,:], q>`: another 128-term dot + tree
+//!
+//! Each is independently switchable here. Everything else runs in f64, so the
+//! error of a configuration is attributable to exactly the terms left in f32.
+//!
+//! This runs on the CPU on purpose: it needs no kernel variants, no dispatcher
+//! plumbing and no kernel cache, and it reproduces the GPU reduction ORDER
+//! exactly (the 32-lane tree, 4 values per lane) rather than approximating it
+//! with a serial sum. The check that it is faithful is the ALL-F32 row: it has to
+//! land near the GPU f32 kernel's measured error against the same reference
+//! (2.997e-7 plain / 1.570e-7 routed). If it does not, the model is wrong and
+//! none of the attribution below means anything.
+//!
+//!   cargo run --release -p hipfire-rdna --example deltanet_error_ablation
+
+const HD: usize = 128;
+const N_HEADS: usize = 2;
+
+fn lcg(seed: u32, n: usize) -> Vec<f32> {
+    let mut s = seed.max(1);
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+            ((s as f32 + 0.5) / 2_147_483_648.0) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct Cfg {
+    tile_f32: bool,
+    kv_f32: bool,
+    upd_f32: bool,
+    out_f32: bool,
+}
+
+/// Dot product in the GPU's order: lane `l` holds 4 contiguous values, then a
+/// 5-level halving tree across 32 lanes. Reduction order changes the rounding,
+/// so a serial sum here would not model the kernel.
+fn dot_tree(a: &[f64], b: &[f64], as_f32: bool) -> f64 {
+    let mut lanes = [0.0f64; 32];
+    for (l, lane) in lanes.iter_mut().enumerate() {
+        let c = l * 4;
+        let mut acc = if as_f32 {
+            let p0 = (a[c] as f32) * (b[c] as f32);
+            let p1 = (a[c + 1] as f32) * (b[c + 1] as f32);
+            let p2 = (a[c + 2] as f32) * (b[c + 2] as f32);
+            let p3 = (a[c + 3] as f32) * (b[c + 3] as f32);
+            (((p0 + p1) + p2) + p3) as f64
+        } else {
+            a[c] * b[c] + a[c + 1] * b[c + 1] + a[c + 2] * b[c + 2] + a[c + 3] * b[c + 3]
+        };
+        if as_f32 {
+            acc = acc as f32 as f64;
+        }
+        *lane = acc;
+    }
+    let mut o = 16;
+    while o > 0 {
+        for l in 0..o {
+            lanes[l] += lanes[l + o];
+            if as_f32 {
+                lanes[l] = lanes[l] as f32 as f64;
+            }
+        }
+        o >>= 1;
+    }
+    lanes[0]
+}
+
+fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32], beta: &[f32], s0: &[f32]) -> Vec<f64> {
+    let stride = N_HEADS * HD;
+    let mut s: Vec<f64> = s0.iter().map(|&x| x as f64).collect();
+    for t in 0..n_tokens {
+        for h in 0..N_HEADS {
+            let alpha = (gate[t * N_HEADS + h] as f64).exp();
+            let beta_v = beta[t * N_HEADS + h] as f64;
+            let base = t * stride + h * HD;
+            let kt: Vec<f64> = (0..HD).map(|c| k[base + c] as f64).collect();
+            let qt: Vec<f64> = (0..HD).map(|c| q[base + c] as f64).collect();
+            for r in 0..HD {
+                let row = h * HD * HD + r * HD;
+                let srow: Vec<f64> = s[row..row + HD].to_vec();
+                let kv = dot_tree(&srow, &kt, cfg.kv_f32);
+                let mut delta = (v[base + r] as f64 - alpha * kv) * beta_v;
+                if cfg.upd_f32 {
+                    delta = delta as f32 as f64;
+                }
+                for c in 0..HD {
+                    let mut nv = if cfg.upd_f32 {
+                        ((alpha as f32) * (s[row + c] as f32) + (kt[c] as f32) * (delta as f32))
+                            as f64
+                    } else {
+                        alpha * s[row + c] + kt[c] * delta
+                    };
+                    // The LDS tile is `float`, so the state is re-rounded here
+                    // every token — this is the per-step round-trip term.
+                    if cfg.tile_f32 {
+                        nv = nv as f32 as f64;
+                    }
+                    s[row + c] = nv;
+                }
+                let srow2: Vec<f64> = s[row..row + HD].to_vec();
+                let _ = dot_tree(&srow2, &qt, cfg.out_f32);
+            }
+        }
+    }
+    s
+}
+
+fn rel(a: &[f64], b: &[f64]) -> f64 {
+    let mut n = 0.0;
+    let mut d = 0.0;
+    for (x, y) in a.iter().zip(b) {
+        n += (x - y).powi(2);
+        d += y * y;
+    }
+    (n / d.max(1e-300)).sqrt()
+}
+
+fn main() {
+    let stride = N_HEADS * HD;
+    for &n_tokens in &[24usize, 96] {
+        let q = lcg(1, n_tokens * stride);
+        let k = lcg(2, n_tokens * stride);
+        let v = lcg(3, n_tokens * stride);
+        let gate: Vec<f32> = lcg(4, n_tokens * N_HEADS).iter().map(|x| x * 0.02).collect();
+        let beta: Vec<f32> = lcg(5, n_tokens * N_HEADS).iter().map(|x| x * 0.5).collect();
+        let s0: Vec<f32> = lcg(6, N_HEADS * HD * HD).iter().map(|x| x * 0.1).collect();
+
+        let exact = run(
+            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false },
+            n_tokens, &q, &k, &v, &gate, &beta, &s0,
+        );
+
+        let cases: [(&str, Cfg); 6] = [
+            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true }),
+            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false }),
+            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false }),
+            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false }),
+            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true }),
+            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true }),
+        ];
+        println!("\n=== {n_tokens} tokens, heads={N_HEADS}, head_dim={HD} ===");
+        println!("{:<30} {:>14}", "configuration", "rel L2 err");
+        for (name, cfg) in cases {
+            let got = run(cfg, n_tokens, &q, &k, &v, &gate, &beta, &s0);
+            println!("{name:<30} {:>14.4e}", rel(&got, &exact));
+        }
+    }
+    println!(
+        "\nFidelity check: 'all f32' must land near the GPU f32 kernel's measured\n\
+         error vs the same style of f64 reference (2.997e-7 at 24 tokens). If it\n\
+         does not, this model is wrong and the attribution above is void."
+    );
+    println!(
+        "\nTwo rows are structural, not bugs, and the table must not be read as a\n\
+         clean decomposition:\n\
+         * 'only OUT dot f32' is EXACTLY 0 because out_v is written to the output\n\
+           and never fed back into S. It cannot move the STATE at any token count.\n\
+           It does move the logits, which this example does not measure.\n\
+         * 'all f32 EXCEPT tile' EQUALS 'all f32' because an f32 UPDATE already\n\
+           produces an f32-valued result, so the tile's rounding is then a no-op.\n\
+           UPD subsumes TILE; the terms are NOT orthogonal and do not sum. The\n\
+           isolated storage cost is the 'only TILE f32' row, where the update runs\n\
+           in f64 and only the store rounds."
+    );
+}

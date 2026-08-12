@@ -94,6 +94,50 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
+## [Medium] DeltaNet multi-step error attributed: the KV dot product dominates, storage is least
+
+Measured 2026-08-12 with `deltanet_error_ablation`, now that both FP64 oracles
+are validated. Each precision term is switched independently while everything
+else runs in f64, so a configuration's error is attributable to what is left in
+f32. Relative L2 error of the STATE against an all-f64 run:
+
+| configuration | 24 tokens | 96 tokens |
+|---|---|---|
+| all f32 (models the kernel) | 3.140e-7 | 1.727e-6 |
+| **only KV dot + reduction f32** | **2.530e-7** | **1.298e-6** |
+| only UPDATE f32 (subsumes tile) | 2.033e-7 | 1.062e-6 |
+| only TILE f32 (storage alone) | 1.380e-7 | 5.941e-7 |
+| only OUT dot f32 | 0 | 0 |
+
+The model is faithful: "all f32" lands at 3.140e-7 against the GPU f32 kernel's
+measured 2.997e-7 on the same shape, ~5%. It runs on the CPU but reproduces the
+GPU REDUCTION ORDER (4 values per lane, then a 5-level 32-lane halving tree),
+which a serial sum would not.
+
+**`kv = <S[r,:], k>` and its reduction tree is the largest single term** — 81% of
+the total at 24 tokens, 75% at 96 — and the LDS tile's f32 storage is the
+smallest of the three, at 44% / 34%. That inverts where the FP16-vs-FP32 debate
+has been aimed: the argument has been about STORAGE width while the dominant loss
+is a 128-term dot product summed in f32.
+
+Two rows are structural and the table must not be read as a clean decomposition:
+- `only OUT dot f32` is exactly 0 because `out_v` is written to the output and
+  never fed back into S, so it cannot move the state at any token count. It does
+  move the logits, which this experiment does not measure — a separate question.
+- `all f32 EXCEPT tile` equals `all f32` because an f32 update already yields an
+  f32-valued result, making the tile's rounding a no-op. **UPD subsumes TILE, so
+  the terms are not orthogonal and do not sum** (81+65+44 > 100). The isolated
+  storage cost is the `only TILE f32` row, where the update runs in f64 and only
+  the store rounds.
+
+Every term grows ~5.2-5.5x for 4x the tokens, i.e. slightly superlinear, matching
+the compounding seen end to end.
+
+Actionable: compensated (Kahan/Neumaier) summation on the KV dot product and its
+reduction tree targets the largest term and costs no fp64 rate penalty. That is a
+better first move than any storage-format change, and this table is the argument
+for it.
+
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
