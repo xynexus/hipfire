@@ -266,11 +266,23 @@ What the thread was right about, and what it was wrong about:
 cannot distinguish "small" from "small so far".** Same fp64-oracle reference, same
 corpus, one chunk each:
 
-| chunk length | tokens scored | mean_kld(f32 \|\| fp64 oracle) |
-|---|---|---|
-| 512 | 511 | 3.744e-10 |
-| 2048 | 2047 | 1.477e-10 |
-| 8192 | 4095 | 2.016e-10 |
+**Read the "tokens scored" column carefully — it is `n_ctx/2 - 1`, not `n_ctx`.**
+`scoring_start = n_ctx / 2` (`handlers/calibrate.rs:688`): the first half of every
+chunk is unscored context warm-up, so a chunk of 512 scores 255 tokens at depths
+256..511. An earlier revision of this table asserted `n_ctx - 1` for the first two
+rows; that was inferred from the third row's shape rather than read from the runs,
+and it was wrong.
+
+| chunk length | tokens scored | context depth | mean_kld(f32 \|\| fp64 oracle) |
+|---|---|---|---|
+| 512 | 255 (obs) | 256..511 | 3.744e-10 |
+| 2048 | 1023 (derived) | 1024..2047 | 1.477e-10 |
+| 8192 | 4095 (obs) | 4096..8191 | 2.016e-10 |
+
+`(obs)` = read from the run's `total_scored`; `(derived)` = computed from
+`n_ctx/2 - 1`, because that run's output was not captured to a file and only its
+KLD survives. The 512 row was re-run to confirm both the count and the KLD
+(3.7444e-10, bit-reproducible), which is what established the formula.
 
 **Flat, and non-monotonic, over an 8x span of context** — the 8192 point is
 LOWER than the 512 one. There is no growth term to extrapolate. This is the
