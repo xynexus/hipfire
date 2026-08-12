@@ -94,6 +94,55 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
+## [Medium] Batch-64 collapse is GTT exhaustion from per-session DeltaNet state, not batching
+
+Profiled 2026-08-12 at widths 16/32/64 on `Qwen3.6-35B-A3B--oq4` (kvarn KV,
+paged experts, 8 GiB expert cache, max_seq 512):
+
+| width | sessions ok | tok/s |
+|---|---|---|
+| 16 | 16/16 | 5.66 |
+| 32 | 32/32 | 5.54 |
+| 64 | **19/64** | 2.55 |
+
+The full error — truncated in the earlier sweep, which is why this looked like a
+batching problem — names the cause exactly:
+
+```
+clone qwen35 checkpoint dn.s_matrices[14] alloc:
+  hipMalloc(2097152 bytes = 2.00 MiB), free=10.6 MiB of total=43008.0 MiB
+```
+
+Ten MiB free of 42 GiB. It is an out-of-memory, and the allocation that fails is a
+**checkpoint clone of DeltaNet state**, not anything KV or expert related.
+
+**Per-session cost, from `text_config` (`linear_attention: 30, full_attention: 10`):**
+
+| item | size |
+|---|---|
+| DeltaNet state — 30 layers x `[524288] F32` | **60 MiB** |
+| KVarN KV — 10 layers (records + f32 window + Q8 V) | ~6.5 MiB |
+| checkpoint clone of the DN state | **+60 MiB** |
+
+**The recurrent state is ~9x the KV cost per session, and the checkpoint doubles
+it.** Concurrency on a hybrid model is therefore bounded by DeltaNet state, not by
+the KV cache — which is the opposite of where capacity planning usually looks, and
+the opposite of where this plan's own 0.4 analysis looks (expert bytes and KV).
+
+Two consequences worth acting on:
+- the checkpoint clones DN state eagerly. If that clone can be made genuinely
+  copy-on-write, per-session cost roughly halves and the reachable width roughly
+  doubles for free.
+- `rocm-smi --showmeminfo vram` is useless here: it reported 80-93 MiB of 256 MiB
+  across the whole run, because that is the dedicated carve-out, not the 42 GiB
+  GTT pool the allocator actually draws from. The allocator's own
+  `free=X of total=Y` message is the only truthful source on this box.
+
+Not yet checked: `PrefillBatchScratch` is sized from `pbs.max_batch`, so per-round
+scratch (activations, fa_q/k/v, logits) also grows with width and may be a
+co-factor at 64. The DN clone is what actually failed, but it failed with 10 MiB
+left, so whatever else grew is complicit.
+
 ## [FIXED 2026-08-11] Routed KVarN prefill wrote K in the WRONG BASIS — both arms
 
 Root-caused numerically after text-level A/B ran out of resolution. `HIPFIRE_KVARN_DUMP`
