@@ -238,6 +238,11 @@ pub struct MoeParams<'a> {
     /// per slot either way.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// True when resident routed experts sit in the `oq4_arch` COMBINED layout
+    /// (the default for qt=34/37), so the OQ4 grouped kernel must skip past the
+    /// split nibbles and split f32 scales to reach its interleaved block stream.
+    /// False when `oq_moe` repacked them, which emits that stream at offset 0.
+    pub routed_oq_arch_combined: bool,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
@@ -465,6 +470,11 @@ pub struct MoePrefillParams<'a> {
     /// same name.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// True when resident routed experts sit in the `oq4_arch` COMBINED layout
+    /// (the default for qt=34/37), so the OQ4 grouped kernel must skip past the
+    /// split nibbles and split f32 scales to reach its interleaved block stream.
+    /// False when `oq_moe` repacked them, which emits that stream at offset 0.
+    pub routed_oq_arch_combined: bool,
     // intermediate buffers
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,

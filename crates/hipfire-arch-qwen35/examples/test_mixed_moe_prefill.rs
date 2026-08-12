@@ -260,6 +260,9 @@ fn run_case(gpu: &mut Gpu, quant_dtype: DType, full_dtype: DType, k_top: usize) 
             rows,
             false,
             false,
+            // This fixture builds interleaved 132-B blocks at offset 0,
+            // i.e. the oq_moe layout, not oq4_arch combined.
+            false,
         )
         .unwrap();
         gpu.moe_gate_up_unscatter_k8(&grouped, &sorted, &gate, &up, mi, k_top, bucket.m_total)
@@ -406,6 +409,9 @@ fn run_paged_oq4_case(gpu: &mut Gpu) {
         bucket.m_total,
         rows,
         false,
+        false,
+        // This fixture builds interleaved 132-B blocks at offset 0,
+        // i.e. the oq_moe layout, not oq4_arch combined.
         false,
     )
     .expect("run paged grouped OQ4");
