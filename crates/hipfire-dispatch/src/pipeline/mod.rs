@@ -274,11 +274,12 @@ pub fn run_moe_decode(
     check_moe_decode_batch_size(p.batch_size)?;
 
     // Shape admission, not just the flag: the indexed OQ path's FWHT rotates are
-    // G256 on both sides (K = hidden, K = mi). See `oq_indexed_shape_supported`.
+    // G256 on both sides (K = hidden, K = mi), and the kernels are k8-only.
+    // See `oq_indexed_admissible`.
     let res = MoeResolution::resolve_with_oq_indexed(
         &p.dtypes,
         p.k,
-        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi),
+        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi, p.k),
     );
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that

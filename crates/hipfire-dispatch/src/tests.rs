@@ -883,19 +883,39 @@ fn moe_oq_indexed_is_on_unless_explicitly_disabled() {
     }
 }
 
-/// The shape half of admission. `mi = 128` on the arch-6 toy MoE is the exact
-/// value that made the down-side FWHT launch a zero-sized grid; `hidden = 768`
-/// on the same fixture is fine, so BOTH sides have to be checked, not just one.
+/// Admission, both halves. `mi = 128` on the arch-6 toy MoE is the exact value
+/// that made the down-side FWHT launch a zero-sized grid; `hidden = 768` on the
+/// same fixture is fine, so BOTH sides have to be checked, not just one.
 #[test]
 fn moe_oq_indexed_shape_refuses_sub_256_fwht_k() {
-    use crate::families::moe::oq_indexed_shape_supported;
-    assert!(!oq_indexed_shape_supported(768, 128), "arch-6 toy MoE");
-    assert!(!oq_indexed_shape_supported(128, 768), "gate_up side");
-    assert!(!oq_indexed_shape_supported(2048, 384), "384 truncates");
-    assert!(!oq_indexed_shape_supported(0, 768));
-    assert!(!oq_indexed_shape_supported(2048, 0));
-    assert!(oq_indexed_shape_supported(2048, 768), "35B-A3B");
-    assert!(oq_indexed_shape_supported(256, 256));
+    use crate::families::moe::oq_indexed_admissible;
+    const K8: usize = 8;
+    assert!(!oq_indexed_admissible(768, 128, K8), "arch-6 toy MoE");
+    assert!(!oq_indexed_admissible(128, 768, K8), "gate_up side");
+    assert!(!oq_indexed_admissible(2048, 384, K8), "384 truncates");
+    assert!(!oq_indexed_admissible(0, 768, K8));
+    assert!(!oq_indexed_admissible(2048, 0, K8));
+    assert!(oq_indexed_admissible(2048, 768, K8), "35B-A3B");
+    assert!(oq_indexed_admissible(256, 256, K8));
+}
+
+/// The top-k half. An admissible SHAPE is not enough: the loader repacks routed
+/// OQ experts into the indexed kernels' block layout, and those kernels only run
+/// at k_top 8. A top-2 model with a fine shape therefore gets block-layout bytes
+/// that the CPU fallback reads as canonical — measured NaN on a top-2 mi=768
+/// fixture, against 0.06812199 with the path off. Guarding shape alone was not
+/// enough, and flipping the default is what made it reachable.
+#[test]
+fn moe_oq_indexed_refuses_every_top_k_but_eight() {
+    use crate::families::moe::{oq_indexed_admissible, INDEXED_MOE_K_TOP};
+    assert_eq!(INDEXED_MOE_K_TOP, 8);
+    for k in [1usize, 2, 4, 6, 7, 9, 10, 16] {
+        assert!(
+            !oq_indexed_admissible(2048, 768, k),
+            "k_top={k} must be refused; the kernels are k8-only"
+        );
+    }
+    assert!(oq_indexed_admissible(2048, 768, INDEXED_MOE_K_TOP));
 }
 
 #[test]

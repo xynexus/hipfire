@@ -100,28 +100,41 @@ pub fn oq_indexed_decode_enabled_from(v: Option<&str>) -> bool {
     !matches!(v, Some("0") | Some("off") | Some("false") | Some("no"))
 }
 
-/// Shape admission for the indexed OQ path. It rotates activations with the
-/// 256-wide FWHT on BOTH sides — gate_up over `K = hidden`, down over `K = mi` —
-/// and every one of those rotates is a G256 format, so a `K` that is not a
-/// positive multiple of 256 is not a shape this path has.
+/// The only top-k the indexed routed-expert kernels exist for. They are the
+/// `*_k8_indexed*` family and `use_gpu_topk` admits them at this `k` and no
+/// other; every other top-k decodes through the CPU-top-K fallback.
+pub const INDEXED_MOE_K_TOP: usize = 8;
+
+/// Admission for the indexed OQ path, ignoring the env switch. TWO independent
+/// conditions, and both have bitten:
 ///
-/// `hipfire_rdna::dispatch::fwht_groups` now errors on such a `K` instead of
+/// **Shape.** The path rotates activations with the 256-wide FWHT on BOTH sides —
+/// gate_up over `K = hidden`, down over `K = mi` — and each is a G256 format, so
+/// a `K` that is not a positive multiple of 256 is not a shape it has.
+/// `hipfire_rdna::dispatch::fwht_groups` errors on such a `K` instead of
 /// launching the zero-sized grid that used to return success without writing its
-/// destination. Admission has to refuse the shape BEFORE that, or the loud
-/// failure just replaces a wrong answer with a dead model: the arch-6 toy MoE is
-/// `hidden = 768`, `mi = 128`, and that `mi` is what turned seven `qwen3_5_moe`
-/// OQ cells non-finite. The 35B-A3B (`hidden = 2048`, `mi = 768`) passes.
+/// destination, but admission must refuse BEFORE that or the loud failure just
+/// replaces a wrong answer with a dead model. The arch-6 toy MoE is `mi = 128`,
+/// which is what turned seven `qwen3_5_moe` OQ cells non-finite.
 ///
-/// This must agree everywhere — the loader's MoE-block repack decides the weight
-/// LAYOUT, so a site that disagrees runs indexed kernels on arch-combined bytes.
-pub fn oq_indexed_shape_supported(hidden: usize, mi: usize) -> bool {
-    hidden != 0 && mi != 0 && hidden % 256 == 0 && mi % 256 == 0
+/// **Top-k.** The loader repacks routed OQ experts into the indexed kernels'
+/// BLOCK layout (132 B / 260 B), so it must repack only when those kernels can
+/// actually run. At `k_top != 8` dispatch falls back to CPU top-K, which reads
+/// the same tensors as canonical 130 B / 258 B — silent garbage. Measured on a
+/// top-2 fixture at `mi = 768`: **NaN** with the switch on, `0.06812199` with it
+/// off. Found by PR #248 while merging the shape half; the shape guard alone was
+/// not enough, and flipping the default is what made it reachable.
+///
+/// This must agree everywhere. The loader's repack decides the weight LAYOUT, so
+/// any site that disagrees runs one layout's kernels over the other's bytes.
+pub fn oq_indexed_admissible(hidden: usize, mi: usize, k_top: usize) -> bool {
+    hidden != 0 && mi != 0 && hidden % 256 == 0 && mi % 256 == 0 && k_top == INDEXED_MOE_K_TOP
 }
 
-/// The flag AND the shape. Every site that used to read
+/// The flag AND admission. Every site that used to read
 /// [`oq_indexed_decode_enabled`] directly wants this one.
-pub fn oq_indexed_decode_active(hidden: usize, mi: usize) -> bool {
-    oq_indexed_decode_enabled() && oq_indexed_shape_supported(hidden, mi)
+pub fn oq_indexed_decode_active(hidden: usize, mi: usize, k_top: usize) -> bool {
+    oq_indexed_decode_enabled() && oq_indexed_admissible(hidden, mi, k_top)
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the

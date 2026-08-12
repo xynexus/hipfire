@@ -1760,7 +1760,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
     hidden: usize,
     mi: usize,
 ) -> MoeDecodeDispatchFlags {
-    let oq_indexed_decode = qwen35_moe_oq_indexed_decode_active(hidden, mi);
+    let oq_indexed_decode = qwen35_moe_oq_indexed_decode_active(hidden, mi, k_top);
     let gate_side_mq4 = dtypes.router == DType::MQ4G256
         && dtypes.shared_expert_scalar_gate == DType::MQ4G256
         && dtypes.shared_expert_gate == DType::MQ4G256
@@ -1847,12 +1847,12 @@ fn moe_decode_dispatch_flags_for_dtypes(
     }
 }
 
-fn qwen35_moe_oq_indexed_decode_active(hidden: usize, mi: usize) -> bool {
+fn qwen35_moe_oq_indexed_decode_active(hidden: usize, mi: usize, k_top: usize) -> bool {
     // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
     // opts out, AND the shape must admit the G256 FWHT rotates on both sides.
     // One shared predicate — this must agree with the loader's MoE-block repack
     // or the dispatch runs against un-repacked weights.
-    hipfire_dispatch::families::moe::oq_indexed_decode_active(hidden, mi)
+    hipfire_dispatch::families::moe::oq_indexed_decode_active(hidden, mi, k_top)
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {

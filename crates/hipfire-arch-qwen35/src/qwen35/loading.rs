@@ -6340,12 +6340,18 @@ fn load_moe_expert(
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
     // Shared predicate — see `oq_indexed_decode_active`. The repack below and the
-    // dispatch predicate must never disagree on what enables this path, and that
-    // includes the shape half: this must key off the MODEL's (hidden, mi), not
-    // this tensor's (m, k), or gate_up and down disagree within one expert.
+    // dispatch predicate must never disagree on what enables this path.
+    //
+    // Both halves matter and both must come from the MODEL, not this tensor:
+    // (hidden, mi) rather than (m, k), or gate_up and down disagree within one
+    // expert; and `num_experts_per_tok`, because the repack produces the indexed
+    // kernels' BLOCK layout (132 B / 260 B) and those kernels only run at
+    // `k_top == 8`. Repacking for a top-2 model leaves the CPU fallback decoding
+    // block-layout bytes as canonical 130 B / 258 B ones — measured NaN.
     let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_active(
         config.dim,
         config.moe_intermediate_size,
+        config.num_experts_per_tok,
     );
     if !oq_indexed_decode
         && matches!(
