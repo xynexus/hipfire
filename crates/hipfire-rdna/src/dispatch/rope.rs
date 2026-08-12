@@ -22,7 +22,7 @@ impl Gpu {
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let xp = x.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
         let kv = k as i32;
@@ -55,7 +55,7 @@ impl Gpu {
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let xp = x.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
         let s1 = s1_ptr;
@@ -130,7 +130,7 @@ impl Gpu {
         )?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let xp = x.buf.as_ptr();
         let awp = awq_scale.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
@@ -188,7 +188,7 @@ impl Gpu {
         )?;
         let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let slots = (n_tokens * k_top) as u32;
         let xp = x.buf.as_ptr();
         let ap = expert_awq_ptrs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
@@ -236,7 +236,7 @@ impl Gpu {
         )?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let xp = x.buf.as_ptr();
         let awp = awq_scale.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
@@ -286,7 +286,7 @@ impl Gpu {
         let xp = x.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
         let xfp = self.mq_x_rot_fp8.as_ref().unwrap().as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let kv = k as i32;
         let bytes = crate::profile::mq_rotate_bytes(k) + k; // +1 byte/elem fp8 write
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
@@ -321,7 +321,7 @@ impl Gpu {
         let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
 
         let rot_func = &self.functions["mq8_rotate_quantize_x"];
         let mut xp = x.buf.as_ptr();

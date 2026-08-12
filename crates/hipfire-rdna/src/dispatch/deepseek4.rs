@@ -2032,7 +2032,7 @@ impl Gpu {
         )?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
+        let n_groups = super::fwht_groups(k)?;
         let gp = gate.buf.as_ptr();
         let up_p = up.buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
