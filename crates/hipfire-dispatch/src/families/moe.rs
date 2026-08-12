@@ -51,35 +51,40 @@ pub struct MoeDtypes {
 }
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — the single parse of the switch controlling
-/// the indexed routed-OQ path. **OFF by default**; set `1`/`on` to opt in.
+/// the indexed routed-OQ path. **ON by default** since 2026-08-12; set `0`/`off`
+/// to fall back to the CPU top-K path.
 ///
-/// The per-expert AWQ rotation this path needs was wrong until 2026-08-12 (routed
-/// experts do not share an AWQ scale, so one rotation for all of them was a scale
-/// error from layer 0 — KLD 5.108296, ppl 1171.67). Fixing it took the 35B-A3B
-/// oq4.25++ to KLD 0.031515 / ppl 7.4643, against 0.030367 / 7.4622 for the
-/// fallback, with layer-0 residual cosine 0.999999.
+/// The road here is worth keeping, because the default was flipped ON, reverted,
+/// and flipped ON again in one day, and only the last one had evidence behind it:
 ///
-/// **That was enough to make it correct on that model and NOT enough to make it
-/// the default.** It was flipped on the strength of those numbers and reverted
-/// the same day: `tests/tiny-quant-gate.sh` turned seven `qwen3_5_moe` OQ cells
-/// from finite to **non-finite KLD** (oq4, oq8, and the five calib variants).
-/// With the flag off those cells route to the CPU fallback and are finite, which
-/// is exactly why the breakage was invisible while it was opt-in. The tiny MoE
-/// fixture is far smaller than the 35B, so the suspect is a shape the big model
-/// never exercises — the FWHT rotates need `K % 256 == 0` and launch a zero-sized
-/// grid otherwise, leaving the destination buffer untouched.
+/// 1. The per-expert AWQ rotation was wrong — routed experts do NOT share an AWQ
+///    scale, so one rotation for all of them was a scale error from layer 0
+///    (35B-A3B oq4.25++: KLD 5.108296, ppl 1171.67). Fixed: KLD 0.031515 / ppl
+///    7.4643 against 0.030367 / 7.4622 for the fallback, layer-0 residual cosine
+///    0.244 -> 0.999999.
+/// 2. Flipped on those numbers, and `tests/tiny-quant-gate.sh` turned seven
+///    `qwen3_5_moe` OQ cells **non-finite**. One model's KLD is not the GPU
+///    correctness tier.
+/// 3. Root cause: the FWHT rotates are G256 on both sides and compute
+///    `n_groups = K / 256`, so the toy `moe_inter = 128` launched a ZERO-SIZED
+///    grid — dispatched, no blocks, success, destination never written.
+/// 4. Both halves fixed: `hipfire_rdna::dispatch::fwht_groups` errors on such a
+///    `K`, and [`oq_indexed_decode_active`] refuses admission before that.
+/// 5. And only then flipped: the tier now has a fixture that REACHES this path
+///    (`qwen3_5_moe_indexed` — top-8, `moe_inter` 768), verified to move the KLD
+///    when the switch moves, which is the thing steps 1-2 never established.
 ///
-/// Before flipping this again: `./tests/tiny-affected-gate.sh --base origin/master
-/// --require-coverage` must be green on the MoE OQ cells. One model's KLD is not
-/// a substitute for the fixture tier — that is the mistake this comment exists to
-/// stop repeating.
+/// So `qwen3_5_moe` (`moe_inter = 128`) covers the fallback and
+/// `qwen3_5_moe_indexed` covers this path. If you change either fixture's shape,
+/// you are changing what this switch is tested by.
 ///
 /// This parse MUST stay single. Three sites used to read it independently and
 /// two spellings disagreed: the loader's MoE-block repack and this resolver
 /// accepted only `"1"`, while qwen35's dispatch predicate also accepted `"on"`.
 /// `=on` therefore enabled the indexed dispatch against weights that were never
 /// repacked for it — guaranteed garbage, from a value that looks like it should
-/// work.
+/// work. The same trap now points the other way: an unrecognised OFF spelling
+/// leaves the path ON, so the off-values are matched explicitly and generously.
 pub fn oq_indexed_decode_enabled() -> bool {
     oq_indexed_decode_enabled_from(
         std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
@@ -89,10 +94,10 @@ pub fn oq_indexed_decode_enabled() -> bool {
 }
 
 /// The parse itself, split out so it is testable without touching process-global
-/// env (which races under a parallel test runner). The default was inverted and
-/// re-reverted on 2026-08-12, so it carries a direct assertion either way.
+/// env (which races under a parallel test runner). The default has been inverted
+/// twice, so it carries a direct assertion either way.
 pub fn oq_indexed_decode_enabled_from(v: Option<&str>) -> bool {
-    matches!(v, Some("1") | Some("on"))
+    !matches!(v, Some("0") | Some("off") | Some("false") | Some("no"))
 }
 
 /// Shape admission for the indexed OQ path. It rotates activations with the

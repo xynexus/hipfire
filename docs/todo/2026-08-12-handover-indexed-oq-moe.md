@@ -14,12 +14,12 @@ down side. Per-expert rotation is now wired through every dispatch site, and
 verified end-to-end: the layer-0 residual cosine against the flag-off oracle went
 from **0.244 to 0.999999**, with no layer below 0.9994 across all 40, and KLD
 went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
-within 3.8% of the CPU fallback it has to match. **The flag stays OFF by
-default** — `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1` opts in.
+within 3.8% of the CPU fallback it has to match. **`HIPFIRE_QWEN35_MOE_OQ_INDEXED`
+now defaults ON** — see "The default is now ON" below for what it took.
 
-⚠️ **It was flipped ON and reverted the same day.** (Root-caused and guarded
-since — see the ✅ items below. The flag stays off by choice now, not by defect.) `tests/tiny-quant-gate.sh`
-turns seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,
+⚠️ **It was flipped ON and reverted the same day** — the account below is the
+first attempt, kept because the sequence is the lesson. `tests/tiny-quant-gate.sh`
+turned seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,
 and the five calib variants) with the flag on; with it off they route to the CPU
 fallback and are finite, which is why the breakage stayed invisible while the
 path was opt-in. The 35B numbers above are real and were not enough — the tiny
@@ -70,12 +70,45 @@ Fix shape, cheapest first — **(1) and (2) are both landed:**
 a shape it cannot serve, which is exactly what admission is supposed to mean —
 `mi = 128` keeps the fixture on the CPU fallback in both arms.
 
-**The flag is still OFF by default, deliberately.** The gate being green now
-proves the toy fixture is *excluded*, not that the indexed path is exercised —
-no fixture in the tier has a ≥256 `mi`. Flipping the default would still be
-resting on one model's KLD, which is the mistake this document exists to stop
-repeating. Opt in per run (`HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`) until a fixture
-with an admissible MoE shape covers it.
+## The default is now ON
+
+Flipped in this order, and the order is the point:
+
+1. **A fixture that reaches the path** (`188bc3020`). `qwen3_5_moe_indexed` —
+   arch 6, `fixture_named("indexed")`, top-8 of 16 experts, `moe_inter = 768`,
+   plus `FamilyPlan.probe_env` pinning the switch on. All three are load-bearing:
+   shape alone leaves it opt-in, the switch alone leaves it inadmissible, and
+   top-8-of-8 would let a kernel that ignored `topk_indices` score clean.
+2. **Coverage proven, not assumed.** Same artifact, switch 0 vs 1, deterministic
+   on repeat: oq4 `0.06008206` -> `0.06008204`, oq8 `0.00391040` -> `0.00332723`.
+   Different numbers mean different code ran. The old fixture is bit-identical
+   across the same A/B, which is what "not covered" looks like.
+3. **Selected automatically** (`0f6321cd9`). `tiny-affected-gate` picks it up on
+   any `arch-qwen35/*` change; `tiny-state-gate` had to learn it too, since that
+   gate exits 3 INCONCLUSIVE on any skip and receives the same family list.
+4. **Only then the flip.** `HIPFIRE_QWEN35_MOE_OQ_INDEXED` now defaults ON;
+   `0`/`off`/`false`/`no` opts out. Off-spellings are matched generously because
+   the failure direction reversed — an unrecognised value now leaves it ON.
+
+Post-flip evidence:
+
+- Full `tiny-quant-gate.sh`, all 20 families: the same **8** standing failures as
+  before the flip, at identical drift values (`docs/tiny-quant-gate-8-failures.md`).
+  No new failure, nothing moved.
+- The seven `qwen3_5_moe` OQ cells that went non-finite in the first flip are
+  finite and **byte-identical to their flag-off values** (oq4 `0.19407192`, oq8
+  `0.01994928`, oq4+/++ `0.19465974`, oq4.25++ `0.19017793`, oq8+/++
+  `0.00567818`) — the shape guard holds them on the fallback under the new
+  default, which is exactly its job.
+- `qwen3_5_moe_indexed`: 8/8 pass.
+
+Blast radius is qwen35 MoE only. deepseek4 reaches `MoeFamily` through
+`run_bias_aware{,_prefill}`, which never consults this switch; minimax and
+lfm2moe have their own forwards and were never gated by it.
+
+Coverage split to preserve: `qwen3_5_moe` (`moe_inter = 128`) covers the
+admission guard's FALLBACK branch, `qwen3_5_moe_indexed` covers the path. Change
+either fixture's shape and you change what this switch is tested by.
 
 ## The bug, in one paragraph
 

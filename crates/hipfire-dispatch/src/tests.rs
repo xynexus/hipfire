@@ -864,19 +864,23 @@ fn moe_res_oq_routed_opted_out_falls_back_to_cpu() {
     assert!(r.needs_x_rot_local);
 }
 
-/// OFF unless explicitly opted in. The default was flipped ON and reverted the
-/// same day (2026-08-12) when the tiny MoE OQ cells went non-finite, so this
-/// asserts the opt-in shape directly. Tested against the pure parse rather than
-/// the env so it cannot race a parallel test runner.
+/// ON unless explicitly opted out (default flipped 2026-08-12, once the tier had
+/// a fixture that reaches the path). The off-spellings are matched generously
+/// because an unrecognised one now leaves the path ON — the failure direction
+/// reversed with the default. Tested against the pure parse rather than the env
+/// so it cannot race a parallel test runner.
 #[test]
-fn moe_oq_indexed_is_off_unless_explicitly_enabled() {
+fn moe_oq_indexed_is_on_unless_explicitly_disabled() {
     use crate::families::moe::oq_indexed_decode_enabled_from;
-    assert!(!oq_indexed_decode_enabled_from(None));
-    assert!(!oq_indexed_decode_enabled_from(Some("")));
-    assert!(!oq_indexed_decode_enabled_from(Some("0")));
-    assert!(!oq_indexed_decode_enabled_from(Some("off")));
+    assert!(oq_indexed_decode_enabled_from(None));
     assert!(oq_indexed_decode_enabled_from(Some("1")));
     assert!(oq_indexed_decode_enabled_from(Some("on")));
+    for off in ["0", "off", "false", "no"] {
+        assert!(
+            !oq_indexed_decode_enabled_from(Some(off)),
+            "{off} must disable"
+        );
+    }
 }
 
 /// The shape half of admission. `mi = 128` on the arch-6 toy MoE is the exact

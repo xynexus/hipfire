@@ -1034,10 +1034,10 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
 mod tests {
     use super::*;
 
-    /// The env switch is half of what makes this family cover anything — the
-    /// fixture shape is admissible, but the path is still opt-in at runtime. Drop
-    /// the switch and the cells score the CPU fallback under a name that says
-    /// otherwise.
+    /// The env switch PINS this family to the indexed path. It was load-bearing
+    /// when the path was opt-in; now that the default is on it is a pin, and it
+    /// stays — this family's entire job is covering that path, so it must not
+    /// follow the default if someone flips it back.
     #[test]
     fn indexed_moe_family_opts_into_the_indexed_path() {
         let plan = families()
@@ -1052,7 +1052,9 @@ mod tests {
         for f in plan.candidates.iter().chain(plan.calibrated) {
             assert!(f.starts_with("oq"), "{f} does not reach the indexed path");
         }
-        // The baseline family must NOT carry the switch — it is the fallback arm.
+        // The baseline family must NOT carry the switch: it runs at whatever the
+        // default is, and its `moe_inter = 128` keeps it on the CPU fallback via
+        // the SHAPE guard. Pinning it would test a configuration nobody ships.
         let base = families()
             .iter()
             .find(|p| p.arch == "qwen3_5_moe")
