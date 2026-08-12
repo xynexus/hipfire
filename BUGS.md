@@ -194,6 +194,44 @@ Doing (1) alone buys 20-35%. Neither alone approaches the f64 oracle's 12x.
 All CPU-modelled, in the harness whose all-f32 row reproduces the GPU kernel to
 ~5%. No kernel change is written.
 
+## [CLOSED — no action] DeltaNet f32 precision loss is real, measured, and IRRELEVANT to output
+
+Measured 2026-08-12, and it ends the precision thread. Built a KLD reference with
+the validated FP64 oracle, then scored the production f32 kernel against it on a
+real corpus (`benchmarks/calib/calib-1m.txt` slice, n_ctx 512, teacher-forced):
+
+    mean_kld(f32 kernel || fp64 oracle) = 3.744e-10
+
+Against the oq4 quantization KLD already on record for this model, 0.039, that is
+**~8 orders of magnitude smaller**. The model's own weight quantization swamps the
+arithmetic precision by a factor of ~100 million.
+
+So every lever this thread identified should NOT be pulled:
+- **no Kahan on the KV dot** (modelled -20/-35% of a term worth 3.7e-10)
+- **no Dekker/FMA** (already measured 0.6% WORSE end to end, and now moot)
+- **no storage-precision change for accuracy reasons.** FP16 DeltaNet state
+  remains purely a CAPACITY decision (19/64 -> 64/64 sessions at width 64); the
+  accuracy argument on either side is noise at this scale.
+
+What the thread was right about, and what it was wrong about:
+- Right: the f32 kernel really does drift ~7x more from fp64 than FP16 storage
+  drifts from f32 (3.5% vs 0.5% state divergence at 120 decode steps). The
+  attribution is real — the KV dot dominates, storage is smallest.
+- Wrong: that any of it reaches the output. State divergence is not KLD, and
+  nobody had connected them. A recurrence amplifies perturbations, so the
+  assumption cut both ways and needed measuring rather than arguing.
+
+Caveat on scope, stated so nobody over-reads this: the KLD eval is teacher-forced
+and prefill-dominated, where the state is rebuilt from the prompt each chunk. The
+3.5% figure came from 120 autoregressive DECODE steps, where error accumulates
+freely. This measurement therefore under-weights long-generation accumulation. It
+would take ~8 orders of magnitude of amplification to matter, so the conclusion is
+not in doubt, but a long-generation KLD would close it completely.
+
+Also observed: chunk 1 of the scoring run died with `paged expert residency
+layer=20 expert=78 ... free=15.1 MiB of total=43008.0 MiB` — the expert-cache
+pressure documented elsewhere in this file, unrelated to precision.
+
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
