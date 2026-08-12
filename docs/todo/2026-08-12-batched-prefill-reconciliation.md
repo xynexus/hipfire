@@ -86,12 +86,14 @@ false whether or not the layer-kind clause is there, and removing it is inert.
 router_logits=true`) but it prints its INPUTS, never its verdict — which is why
 the timing A/B, not the trace, is what settled this.
 
-So the real work is widening `is_batchable_la` to the OQ family and proving the
-batched LA/MoE dispatch is correct for those dtypes. That is a bigger job than
-deleting a clause, and it is the actual prerequisite for the pp512 number. Note
-the branch measured qwen3.**6**-35B-A3B oq4++ while this test used
-qwen3.**5**-35B-A3B oq4.25++; if the branch also widened `is_batchable_la`, that
-widening — not the clause — is where its speedup came from. Check that first.
+The obvious next suspect was `is_batchable_la`, which does not admit OQ. **That
+was tried too, and is ALSO inert** — see the gate audit at the end of this
+document for the numbers. Do not start there.
+
+Note the branch measured qwen3.**6**-35B-A3B oq4++ while these tests used
+qwen3.**5**-35B-A3B oq4.25++. Two different models, and the artifacts may differ
+in which gate they trip, so confirm on the same model before attributing the
+branch's speedup to any one clause.
 
 ### 2. ⚠️ BLOCKER — settle this before landing (1)
 
