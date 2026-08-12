@@ -94,7 +94,48 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
-## [Medium] DeltaNet multi-step error attributed: the KV dot product dominates, storage is least
+## [CORRECTED] DeltaNet error attribution — the UPDATE/STORE dominates, NOT the KV dot
+
+**The attribution below is WRONG and is kept only to show what produced it.** It
+was measured with synthetic k/q that were NOT L2-normalised, while the real model
+normalises them (`fused_qk_l2_norm_scale_f32`, visible in every DeltaNet launch
+trace). Unnormalised k has ||k||^2 ~ 43, which inflates the dot product's dynamic
+range and with it that term's rounding error. Re-measured with k/q L2-normalised,
+beta a sigmoid in (0,1), and a decaying gate:
+
+| term | with unnormalised k (WRONG) | with realistic inputs |
+|---|---|---|
+| only KV dot f32 | 2.530e-7 (81%) | **1.267e-8 (8.6%)** |
+| only UPDATE f32 | 2.033e-7 (65%) | **1.477e-7 (100%)** |
+| only TILE f32 | 1.380e-7 (44%) | 8.739e-8 (59%) |
+| all f32 | 3.140e-7 | 1.481e-7 |
+
+**The KV dot is ~8% of the error, not 81%.** The state update and its f32 tile
+store are the whole term. Every recommendation derived from the old table is void:
+compensated summation on the KV dot would target an 8% contributor, so neither
+Kahan nor Dekker is worth writing.
+
+**The error is also FLAT in context length, not compounding**, once the gate
+decays as it does in a real model — 24 / 96 / 384 tokens gives 1.481e-7 /
+1.602e-7 / 1.932e-7, a 30% rise for 16x the tokens. Old error decays out of the
+state faster than new error accumulates.
+
+**fp16/fp16 (half-precision ARITHMETIC, not just storage): ~1.5e-3**, four orders
+of magnitude worse than f32 and roughly flat in length (1.44e-3 / 2.00e-3 /
+1.57e-3). That is the answer to "how little precision does the recurrence need":
+f32 arithmetic is required; f16 arithmetic is not viable, independently of what
+the state is STORED as.
+
+Three harness artifacts were chased before the inputs were realistic, each of
+which produced NaN in the f64 REFERENCE and could have been reported as a
+precision finding: a gate allowing alpha > 1, a signed beta inverting the delta
+rule into positive feedback, and finally the missing qk normalisation. The
+attribution swung by 10x between the first table and the last. **The lesson is
+that this attribution is extremely sensitive to the input distribution, so any
+future number from this harness needs the inputs checked against what the model
+actually feeds the kernel.**
+
+## [SUPERSEDED — see above] DeltaNet multi-step error attributed: the KV dot product dominates, storage is least
 
 Measured 2026-08-12 with `deltanet_error_ablation`, now that both FP64 oracles
 are validated. Each precision term is switched independently while everything

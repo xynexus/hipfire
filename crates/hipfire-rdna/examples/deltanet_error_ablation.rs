@@ -30,6 +30,23 @@
 const HD: usize = 128;
 const N_HEADS: usize = 2;
 
+/// L2-normalise each (token, head) vector, matching the model's qk norm.
+fn l2_norm_per_head(x: &[f32], n_tokens: usize) -> Vec<f32> {
+    let mut out = x.to_vec();
+    for t in 0..n_tokens {
+        for h in 0..N_HEADS {
+            let base = t * N_HEADS * HD + h * HD;
+            let n: f32 = out[base..base + HD].iter().map(|v| v * v).sum::<f32>().sqrt();
+            if n > 0.0 {
+                for v in out[base..base + HD].iter_mut() {
+                    *v /= n;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
     (0..n)
@@ -51,6 +68,11 @@ struct Cfg {
     /// correction term so the bits that fall off the bottom of each add are
     /// recovered, rather than discarded.
     kv_kahan: bool,
+    /// Everything in f16 — the "fp16/fp16" variant: half-precision STORAGE and
+    /// half-precision ARITHMETIC, not just storage. This is the lower bound of
+    /// the question "how little precision does the recurrence need", and it is
+    /// the configuration nobody has measured.
+    all_f16: bool,
     /// Kahan PLUS two-product (Dekker/FMA): `e = fma(a, b, -a*b)` recovers the
     /// bits lost by each MULTIPLY, which compensation of the adds alone cannot
     /// reach. On RDNA an FMA is one instruction, so this is +1 FMA per product.
@@ -59,6 +81,29 @@ struct Cfg {
 
 /// f32 two-sum: exact error term of `a + b` when |a| >= |b| is not assumed
 /// (Neumaier's variant, which handles either ordering).
+/// Round an f64 through IEEE binary16 and back. Rust has no stable f16, so this
+/// does the rounding explicitly: 10 explicit mantissa bits, subnormals below
+/// ~6.1e-5, and a hard ceiling at 65504.
+fn to_f16(x: f64) -> f64 {
+    let v = x as f32;
+    if !v.is_finite() {
+        return v as f64;
+    }
+    let a = v.abs();
+    if a > 65504.0 {
+        return if v < 0.0 { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    if a < 6.103_515_6e-5 {
+        // subnormal: quantise to the fixed 2^-24 grid
+        let step = 5.960_464_5e-8f32;
+        return ((v / step).round() * step) as f64;
+    }
+    let bits = v.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127;
+    let step = (2.0f32).powi(exp - 10);
+    ((v / step).round() * step) as f64
+}
+
 fn two_sum_f32(a: f32, b: f32) -> (f32, f32) {
     let s = a + b;
     let c = if a.abs() >= b.abs() {
@@ -140,6 +185,27 @@ fn dot_tree_kahan(a: &[f64], b: &[f64]) -> f64 {
     (sums[0] + corr[0]) as f64
 }
 
+/// The same tree, but every product and every partial sum rounded to f16.
+fn dot_tree_f16(a: &[f64], b: &[f64]) -> f64 {
+    let mut lanes = [0.0f64; 32];
+    for (l, lane) in lanes.iter_mut().enumerate() {
+        let c = l * 4;
+        let mut acc = 0.0f64;
+        for j in 0..4 {
+            acc = to_f16(acc + to_f16(to_f16(a[c + j]) * to_f16(b[c + j])));
+        }
+        *lane = acc;
+    }
+    let mut o = 16;
+    while o > 0 {
+        for l in 0..o {
+            lanes[l] = to_f16(lanes[l] + lanes[l + o]);
+        }
+        o >>= 1;
+    }
+    lanes[0]
+}
+
 /// Dot product in the GPU's order: lane `l` holds 4 contiguous values, then a
 /// 5-level halving tree across 32 lanes. Reduction order changes the rounding,
 /// so a serial sum here would not model the kernel.
@@ -187,7 +253,9 @@ fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32],
             for r in 0..HD {
                 let row = h * HD * HD + r * HD;
                 let srow: Vec<f64> = s[row..row + HD].to_vec();
-                let kv = if cfg.kv_dekker {
+                let kv = if cfg.all_f16 {
+                    dot_tree_f16(&srow, &kt)
+                } else if cfg.kv_dekker {
                     dot_tree_dekker(&srow, &kt)
                 } else if cfg.kv_kahan {
                     dot_tree_kahan(&srow, &kt)
@@ -195,11 +263,16 @@ fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32],
                     dot_tree(&srow, &kt, cfg.kv_f32)
                 };
                 let mut delta = (v[base + r] as f64 - alpha * kv) * beta_v;
-                if cfg.upd_f32 {
+                if cfg.all_f16 {
+                    delta = to_f16(delta);
+                } else if cfg.upd_f32 {
                     delta = delta as f32 as f64;
                 }
                 for c in 0..HD {
-                    let mut nv = if cfg.upd_f32 {
+                    let mut nv = if cfg.all_f16 {
+                        to_f16(to_f16(to_f16(alpha) * to_f16(s[row + c]))
+                            + to_f16(to_f16(kt[c]) * to_f16(delta)))
+                    } else if cfg.upd_f32 {
                         ((alpha as f32) * (s[row + c] as f32) + (kt[c] as f32) * (delta as f32))
                             as f64
                     } else {
@@ -207,7 +280,9 @@ fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32],
                     };
                     // The LDS tile is `float`, so the state is re-rounded here
                     // every token — this is the per-step round-trip term.
-                    if cfg.tile_f32 {
+                    if cfg.all_f16 {
+                        nv = to_f16(nv);
+                    } else if cfg.tile_f32 {
                         nv = nv as f32 as f64;
                     }
                     s[row + c] = nv;
@@ -232,30 +307,52 @@ fn rel(a: &[f64], b: &[f64]) -> f64 {
 
 fn main() {
     let stride = N_HEADS * HD;
-    for &n_tokens in &[24usize, 96] {
-        let q = lcg(1, n_tokens * stride);
-        let k = lcg(2, n_tokens * stride);
+    for &n_tokens in &[24usize, 96, 384] {
+        let q = l2_norm_per_head(&lcg(1, n_tokens * stride), n_tokens);
+        // k and q are L2-NORMALISED per head in the real model — that is what
+        // `fused_qk_l2_norm_scale_f32` does, and it appears in every DeltaNet
+        // launch trace. Without it ||k||^2 is ~43 for random unit-ish data, the
+        // delta rule's stability condition beta*||k||^2 < 2 is violated, and the
+        // f64 REFERENCE itself diverges to NaN by 384 tokens. Two earlier
+        // versions of this harness chased that NaN through the gate and then
+        // beta before the normalisation turned out to be the missing piece.
+        let k = l2_norm_per_head(&lcg(2, n_tokens * stride), n_tokens);
         let v = lcg(3, n_tokens * stride);
-        let gate: Vec<f32> = lcg(4, n_tokens * N_HEADS).iter().map(|x| x * 0.02).collect();
-        let beta: Vec<f32> = lcg(5, n_tokens * N_HEADS).iter().map(|x| x * 0.5).collect();
+        // alpha = exp(gate) multiplies the state every token, so gate MUST be
+        // <= 0 or the recurrence grows without bound. An earlier version used
+        // +/-0.02 and the f64 reference itself went NaN by 384 tokens — a
+        // harness artifact that looked like a precision result. Real gates decay.
+        let gate: Vec<f32> = lcg(4, n_tokens * N_HEADS)
+            .iter()
+            .map(|x| -(x.abs() * 0.05) - 0.001)
+            .collect();
+        // beta is a gate in [0,1] in the real model (a sigmoid output). Signed
+        // beta inverts the delta rule into POSITIVE feedback and the recurrence
+        // diverges — which is what actually produced the NaNs at 384 tokens,
+        // not the gate and not any precision effect.
+        let beta: Vec<f32> = lcg(5, n_tokens * N_HEADS)
+            .iter()
+            .map(|x| 1.0 / (1.0 + (-x).exp()))
+            .collect();
         let s0: Vec<f32> = lcg(6, N_HEADS * HD * HD).iter().map(|x| x * 0.1).collect();
 
         let exact = run(
-            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false },
+            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false },
             n_tokens, &q, &k, &v, &gate, &beta, &s0,
         );
 
-        let cases: [(&str, Cfg); 10] = [
-            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false }),
-            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false }),
-            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false }),
-            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false, kv_kahan: false, kv_dekker: false }),
-            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true, kv_kahan: false, kv_dekker: false }),
-            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false }),
-            ("all f32 + KAHAN kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: true, kv_dekker: false }),
-            ("only KV f32, KAHAN", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: true, kv_dekker: false }),
-            ("all f32 + DEKKER kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: true }),
-            ("only KV f32, DEKKER", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: true }),
+        let cases: [(&str, Cfg); 11] = [
+            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
+            ("all f32 + KAHAN kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: true, kv_dekker: false, all_f16: false }),
+            ("only KV f32, KAHAN", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: true, kv_dekker: false, all_f16: false }),
+            ("all f32 + DEKKER kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: true, all_f16: false }),
+            ("only KV f32, DEKKER", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: true, all_f16: false }),
+            ("ALL f16 (storage+arith)", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: true }),
         ];
         println!("\n=== {n_tokens} tokens, heads={N_HEADS}, head_dim={HD} ===");
         println!("{:<30} {:>14}", "configuration", "rel L2 err");
