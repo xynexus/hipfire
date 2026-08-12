@@ -46,6 +46,54 @@ struct Cfg {
     kv_f32: bool,
     upd_f32: bool,
     out_f32: bool,
+    /// Compensated (Neumaier) summation for the KV dot + its reduction tree,
+    /// still in f32 storage. Models the proposed kernel change: carry a running
+    /// correction term so the bits that fall off the bottom of each add are
+    /// recovered, rather than discarded.
+    kv_kahan: bool,
+}
+
+/// f32 two-sum: exact error term of `a + b` when |a| >= |b| is not assumed
+/// (Neumaier's variant, which handles either ordering).
+fn two_sum_f32(a: f32, b: f32) -> (f32, f32) {
+    let s = a + b;
+    let c = if a.abs() >= b.abs() {
+        (a - s) + b
+    } else {
+        (b - s) + a
+    };
+    (s, c)
+}
+
+/// Compensated version of `dot_tree`: every lane keeps (sum, correction) in f32
+/// and the tree combines both halves, so the correction survives the reduction
+/// instead of being dropped at each level. This is what the kernel change would
+/// do — one extra f32 register per lane and a second shuffle per level.
+fn dot_tree_kahan(a: &[f64], b: &[f64]) -> f64 {
+    let mut sums = [0.0f32; 32];
+    let mut corr = [0.0f32; 32];
+    for l in 0..32 {
+        let c = l * 4;
+        let (mut s, mut k) = (0.0f32, 0.0f32);
+        for j in 0..4 {
+            let p = (a[c + j] as f32) * (b[c + j] as f32);
+            let (ns, nc) = two_sum_f32(s, p);
+            s = ns;
+            k += nc;
+        }
+        sums[l] = s;
+        corr[l] = k;
+    }
+    let mut o = 16;
+    while o > 0 {
+        for l in 0..o {
+            let (ns, nc) = two_sum_f32(sums[l], sums[l + o]);
+            sums[l] = ns;
+            corr[l] += nc + corr[l + o];
+        }
+        o >>= 1;
+    }
+    (sums[0] + corr[0]) as f64
 }
 
 /// Dot product in the GPU's order: lane `l` holds 4 contiguous values, then a
@@ -95,7 +143,11 @@ fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32],
             for r in 0..HD {
                 let row = h * HD * HD + r * HD;
                 let srow: Vec<f64> = s[row..row + HD].to_vec();
-                let kv = dot_tree(&srow, &kt, cfg.kv_f32);
+                let kv = if cfg.kv_kahan {
+                    dot_tree_kahan(&srow, &kt)
+                } else {
+                    dot_tree(&srow, &kt, cfg.kv_f32)
+                };
                 let mut delta = (v[base + r] as f64 - alpha * kv) * beta_v;
                 if cfg.upd_f32 {
                     delta = delta as f32 as f64;
@@ -143,17 +195,19 @@ fn main() {
         let s0: Vec<f32> = lcg(6, N_HEADS * HD * HD).iter().map(|x| x * 0.1).collect();
 
         let exact = run(
-            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false },
+            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false },
             n_tokens, &q, &k, &v, &gate, &beta, &s0,
         );
 
-        let cases: [(&str, Cfg); 6] = [
-            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true }),
-            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false }),
-            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false }),
-            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false }),
-            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true }),
-            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true }),
+        let cases: [(&str, Cfg); 8] = [
+            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false }),
+            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false }),
+            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false }),
+            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false, kv_kahan: false }),
+            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true, kv_kahan: false }),
+            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false }),
+            ("all f32 + KAHAN kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: true }),
+            ("only KV f32, KAHAN", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: true }),
         ];
         println!("\n=== {n_tokens} tokens, heads={N_HEADS}, head_dim={HD} ===");
         println!("{:<30} {:>14}", "configuration", "rel L2 err");

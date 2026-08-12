@@ -133,10 +133,34 @@ Two rows are structural and the table must not be read as a clean decomposition:
 Every term grows ~5.2-5.5x for 4x the tokens, i.e. slightly superlinear, matching
 the compounding seen end to end.
 
-Actionable: compensated (Kahan/Neumaier) summation on the KV dot product and its
-reduction tree targets the largest term and costs no fp64 rate penalty. That is a
-better first move than any storage-format change, and this table is the argument
-for it.
+**Compensated summation on the KV dot: modelled, and it is a real but PARTIAL
+fix.** Neumaier compensation carried through the reduction tree (each lane keeps
+`(sum, correction)` in f32; the tree combines both halves so the correction
+survives each level):
+
+| configuration | 24 tok | 96 tok |
+|---|---|---|
+| all f32 | 3.140e-7 | 1.727e-6 |
+| **all f32 + Kahan KV** | **2.500e-7** (-20%) | **1.127e-6** (-35%) |
+| only KV f32 | 2.530e-7 | 1.298e-6 |
+| **only KV f32, Kahan** | **1.271e-7** (-50%) | **6.945e-7** (-46%) |
+
+It roughly HALVES the KV term and takes 20-35% off the total, and the benefit
+GROWS with sequence length — the right direction for a compounding error, and the
+opposite of what dithering did.
+
+It halves rather than eliminates because compensation fixes the ADDS, not the
+MULTIPLIES: each `s[c]*k[c]` is rounded to f32 before it ever reaches the sum.
+Removing that too needs two-product (Dekker/FMA) compensation, which is a larger
+change. So the ceiling on this approach is roughly the halving shown, not the 12x
+the f64 oracle achieves.
+
+Cost, for the decision: one extra f32 register per lane and a second shuffle per
+tree level — 5 extra shuffles per dot product, on a kernel that is latency- rather
+than ALU-bound. Cheap, but not free, on the hot path.
+
+Modelled on CPU only so far, in the same harness whose all-f32 row reproduces the
+GPU kernel to ~5%. The kernel change is not written.
 
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
