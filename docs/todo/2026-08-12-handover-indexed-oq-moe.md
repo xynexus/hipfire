@@ -229,7 +229,8 @@ exactly instead of being "fixed" speculatively.
   same treatment: build the pointer tables, allocate the per-slot scratch, pass
   `x_per_slot = true`. The call sites carry a comment saying so.
 - **Paged mode passes a null AWQ table and warns** if the artifact has expert
-  sidecars. The 122B has none today.
+  sidecars. ⚠️ **"The 122B has none today" was FALSE** — it carries 11,644 of
+  them. Corrected below.
 
 ## Tools (use these, they save hours)
 
@@ -288,6 +289,57 @@ quantize is 33-42 h with no speedup available. Source is staged byte-exact at
 `~/.hipfire/models/models--Qwen--Qwen3.5-397B-A17B.hfa`.
 
 The blocker named here — "the 122B artifact cannot be served on this box because
-decode needs the indexed path" — is now **removed on the qwen35 side**: the
-indexed path is correct. What remains before a 122B serving claim is running it,
-not fixing it.
+decode needs the indexed path" — is **removed on the qwen35 side**: the indexed
+path is correct and now the default.
+
+## The 122B still does not run — and "running it, not fixing it" was wrong
+
+That sentence used to end this document. It was written without trying, and it
+is false in three independent ways. Measured 2026-08-12 against
+`~/.hipfire/models/Qwen3.5-122B-A10B--oq4.25++.hfq` (77.21 GB logical, 71.91 GiB
+payload, 12,288 routed experts):
+
+**1. Paged mode HARD-ERRORS at layer 0.** Not degrades — fails:
+
+```
+paged MoE expert 7 gate_up has unsupported quant type 16 (BF16 — ...
+--expert-coverage-policy preserve-undercovered ...)
+```
+
+644 routed experts (1,288 tensors) are BF16 because calibration kept
+undercovered experts at source precision. The paged MoE decode kernel takes only
+OQ routed dtypes. `paged_moe_quant_hint` in `loading.rs` states this exactly —
+"The 122B carries 644 such experts, and they are what stops it paging" — so the
+fact was known in-tree and the handover contradicted it.
+
+**2. Even with (1) fixed, paged would silently drop AWQ on 11,644 experts.**
+The artifact carries 21,914 routed-expert `awq_scale` tensors; `load_moe_ffn_paged`
+passes `(None, None)` and warns. That is precisely the `(W·s)·x` instead of `W·x`
+bug this whole document is about, whose measured cost on the resident path was
+KLD 0.030367 -> 5.108296. Distribution: 11,644 of 12,288 gate_up have a sidecar;
+the 689 without are the 644 BF16 experts plus 45 OQ ones.
+
+**3. Fully resident OOMs.** Dies at layer 35/48, 48.99 of 71.91 GiB loaded,
+7,369 MB free of 122,880. A clean `hipMalloc: out of memory`, not the amdgpu
+kworker deadlock the 397B produces.
+
+### What would actually make it run, cheapest first
+
+- **AWQ in paged mode is small and worth doing regardless.** The scales are
+  ~8.2 KB per expert (`[3072]` + `[1024]` f16), so ~100 MB for all 12,288 —
+  nothing against an 8 GiB expert cache. Load them RESIDENT while the pager owns
+  the weights, and build the same pointer tables `build_expert_awq_ptr_tables`
+  builds. No kernel work: `rotate_x_mq_awq_indexed_batched` already treats a null
+  ENTRY as "this expert has no sidecar, take the plain rotation", which is exactly
+  the mixed 11,644/689 case.
+- **Then the BF16 routed experts**, either by teaching the paged decode the
+  BF16 routed dtype (the resident path already handles mixed BF16/OQ experts) or
+  by requantizing so every routed expert is OQ. The `.hfa` source is staged at
+  `~/.hipfire/models/models--Qwen--Qwen3.5-122B-A10B.hfa`; requantizing is the
+  expensive option and it also throws away the deliberate
+  `preserve-undercovered` quality decision.
+- Blocker 3 then becomes moot: paged peak is 9.32 GB.
+
+**Do not repeat the mistake this document was written about.** The claim that
+only a run remained was itself an untested assertion, in a document whose central
+lesson is that untested assertions about this path are how it broke twice.
