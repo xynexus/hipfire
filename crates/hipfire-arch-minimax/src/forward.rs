@@ -431,6 +431,12 @@ fn decode_step_body(
                     &state.up_batch,
                     2 * inter,
                     hidden,
+                    // `x_per_slot = false`: one shared rotated activation for
+                    // all kranks. The minimax loader builds no per-expert AWQ
+                    // scale table, so there is nothing to select per slot. If
+                    // minimax ever grows AWQ-scaled routed experts this must
+                    // become the per-slot layout — see qwen35's MoE path.
+                    false,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
             DType::Oq8G256 => gpu
@@ -442,6 +448,7 @@ fn decode_step_body(
                     &state.up_batch,
                     2 * inter,
                     hidden,
+                    false,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up oq8: {e:?}"))?,
             // QTIP3 trellis experts: same FWHT-pre-rotated `ffn_x_rot` input as
@@ -893,6 +900,7 @@ fn minimax_moe_block(
                 &state.up_batch,
                 2 * inter,
                 hidden,
+                false,
             )
             .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
         DType::Oq8G256 => gpu
@@ -904,6 +912,7 @@ fn minimax_moe_block(
                 &state.up_batch,
                 2 * inter,
                 hidden,
+                false,
             )
             .map_err(|e| format!("minimax L{l}: gate_up oq8: {e:?}"))?,
         other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
@@ -1478,6 +1487,7 @@ pub fn forward_batch(
                     hidden,
                     k_top,
                     b,
+                    false,
                 )
                 .map_err(|e| format!("minimax L{l} batch gate_up oq4: {e:?}"))?,
             DType::Oq8G256 => gpu
@@ -1491,6 +1501,7 @@ pub fn forward_batch(
                     hidden,
                     k_top,
                     b,
+                    false,
                 )
                 .map_err(|e| format!("minimax L{l} batch gate_up oq8: {e:?}"))?,
             other => {

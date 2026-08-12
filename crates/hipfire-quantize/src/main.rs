@@ -41,6 +41,7 @@
 #[allow(unused_imports)]
 use codecs::*;
 pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant};
+use std::borrow::Cow;
 // HFQ writer + provenance/metadata machinery now lives in the library so the
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
@@ -115,6 +116,24 @@ enum Oq4LdlqHessian {
     Hfhs(crate::hfhs_diag::HfhsFull),
 }
 
+/// Routed-expert projections that read the LAYER-SHARED FFN input, and so may
+/// borrow a layer-pooled Hessian. `down_proj`/`w2` are deliberately absent:
+/// they read that expert's own SwiGLU intermediate, and the per-expert input
+/// profiles measured near-orthogonal (cosine 0.04-0.35, `moe_expert_saliency_
+/// study`), so pooling them would average unrelated bases.
+const POOLABLE_EXPERT_LEAVES: &[&str] = &["gate_up_proj", "gate_proj", "up_proj", "w1", "w3"];
+
+/// Tensors that consume the same layer FFN input as the routed experts' gate/up
+/// and therefore carry the pooled Hessian already. The router is the principled
+/// donor — it decides routing FROM that input, so it sees it by construction.
+/// `mlp.gate.down_proj` is zaya's equivalent (its gate block reads `normed`);
+/// the shared expert reads the same input on qwen-style MoE.
+const POOLED_HESSIAN_DONORS: &[&str] = &[
+    "mlp.gate",
+    "mlp.gate.down_proj",
+    "mlp.shared_expert.gate_proj",
+];
+
 impl Oq4LdlqHessian {
     fn k_of(&self, name: &str) -> Option<usize> {
         match self {
@@ -132,6 +151,11 @@ impl Oq4LdlqHessian {
         }
     }
 }
+
+/// How many tensors were quantized against a borrowed layer-pooled Hessian.
+/// Reported at the end of the run so a pooled build is never mistaken for one
+/// where every expert had its own.
+static POOLED_HESSIAN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 
@@ -312,17 +336,90 @@ static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
 
+/// Layer-pooled Hessian donor for a routed-expert projection that reads the
+/// layer-shared FFN input. Routed experts are captured imatrix-only, so without
+/// this `--ldlq` silently RTN-quantizes every one of them.
+///
+/// Safe because the donor must match K exactly: a tensor consuming a different
+/// activation has a different width and is rejected rather than silently
+/// mis-weighting the solve.
+fn pooled_donor_candidates(name: &str) -> Vec<String> {
+    let Some((prefix, rest)) = name.split_once(".mlp.experts.") else {
+        return Vec::new();
+    };
+    // `<expert-index>.<leaf>` — reject anything that is not a routed expert.
+    // Quantizer-side names carry a `.weight` suffix that calib names do not.
+    let Some((idx, leaf)) = rest.split_once('.') else {
+        return Vec::new();
+    };
+    let leaf = leaf.strip_suffix(".weight").unwrap_or(leaf);
+    if idx.parse::<u32>().is_err() || !POOLABLE_EXPERT_LEAVES.contains(&leaf) {
+        return Vec::new();
+    }
+    POOLED_HESSIAN_DONORS
+        .iter()
+        .map(|d| format!("{prefix}.{d}"))
+        .collect()
+}
+
+fn pooled_hessian_donor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<String> {
+    // NOT `parse_or::<bool>`: `bool::from_str` accepts only "true"/"false", so
+    // the documented `=1` would silently parse-fail and disable the flag.
+    if !matches!(
+        hipfire_env::POOLED_EXPERT_HESSIAN.get().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    ) {
+        return None;
+    }
+    pooled_donor_candidates(name)
+        .into_iter()
+        .find(|donor| idx.k_of(donor) == Some(k))
+}
+
+/// Routed-expert leaves whose tensors skip LDLQ entirely, from
+/// `HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES`. Lets ONE calibration artifact produce
+/// both the with- and without-per-expert-Hessian arms of a comparison, so the
+/// two differ only in the thing under test rather than in their capture.
+fn ldlq_skipped_expert_leaf(name: &str) -> bool {
+    let Some(raw) = hipfire_env::LDLQ_SKIP_EXPERT_LEAVES.get() else {
+        return false;
+    };
+    let Some((_, rest)) = name.split_once(".mlp.experts.") else {
+        return false;
+    };
+    let Some((idx, leaf)) = rest.split_once('.') else {
+        return false;
+    };
+    if idx.parse::<u32>().is_err() {
+        return false;
+    }
+    let leaf = leaf.strip_suffix(".weight").unwrap_or(leaf);
+    raw.split(',')
+        .map(str::trim)
+        .any(|s| !s.is_empty() && s == leaf)
+}
+
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if ldlq_skipped_expert_leaf(name) {
+        LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES)");
+        return None;
+    }
     let candidates = calibration_tensor_name_candidates(name);
-    let Some((key, hk)) = candidates
+    let direct = candidates
         .iter()
-        .find_map(|key| idx.k_of(key).map(|hk| (key.as_str(), hk)))
-    else {
+        .find_map(|key| idx.k_of(key).map(|hk| (key.to_string(), hk)));
+    let Some((key, hk)) = direct.or_else(|| {
+        let donor = pooled_hessian_donor(idx, name, k)?;
+        POOLED_HESSIAN_HITS.fetch_add(1, Ordering::Relaxed);
+        Some((donor, k))
+    }) else {
         LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (no Hessian entry for {candidates:?})");
         return None;
     };
+    let key = key.as_str();
     if hk != k {
         LDLQ_K_MISMATCH.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
@@ -362,6 +459,15 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
     eprintln!(
         "  LDLQ tensors:     success={success} attempts={attempts} missing={missing} k_mismatch={k_mismatch} pack_failed={pack_failed}"
     );
+    // Never let a pooled build be mistaken for one where every expert had its
+    // own Hessian — the two are different experiments.
+    let pooled = POOLED_HESSIAN_HITS.load(Ordering::Relaxed);
+    if pooled > 0 {
+        eprintln!(
+            "  LDLQ pooled:      {pooled} routed-expert tensor(s) used a LAYER-POOLED Hessian \
+             (HIPFIRE_POOLED_EXPERT_HESSIAN=1)"
+        );
+    }
     if strict && success == 0 {
         return Err(format!(
             "calibrated plus format requested, but LDLQ applied to zero tensors (attempts={attempts}, missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
@@ -526,11 +632,29 @@ struct TensorMeta {
     data_offsets: [usize; 2],
 }
 
+/// Where a shard's bytes come from.
+///
+/// `Mmap` is a real `.safetensors` file: payload is a borrowed slice of mapped
+/// pages, and `drop_tensor_pages` can hand them back to the kernel. `Archive`
+/// is a shard inside an `.hfa`, whose payload is stored as independently
+/// decodable pieces — it must be decoded into OWNED memory, which is why
+/// `tensor_data` yields a `Cow` rather than a slice. Same reason
+/// `HfqInputFile::tensor_data` already returns one.
+enum ShardBackend {
+    Mmap {
+        file: File,
+        mmap: Mmap,
+        header_size: usize,
+    },
+    Archive {
+        archive: std::sync::Arc<hipfire_quantize::hfa::HfaArchive>,
+        rel: String,
+    },
+}
+
 struct SafetensorsFile {
-    _file: File,
     path: PathBuf,
-    mmap: Mmap,
-    header_size: usize,
+    backend: ShardBackend,
     tensors: HashMap<String, TensorMeta>,
 }
 
@@ -600,10 +724,47 @@ impl SafetensorsFile {
         }
 
         Ok(Self {
-            _file: file,
             path: path.to_path_buf(),
-            mmap,
-            header_size: 8 + header_len,
+            backend: ShardBackend::Mmap {
+                file,
+                mmap,
+                header_size: 8 + header_len,
+            },
+            tensors,
+        })
+    }
+
+    /// One shard inside an `.hfa`, presented with the same surface as a shard
+    /// on disk. The archive stores each shard's safetensors header VERBATIM, so
+    /// the tensor table is parsed from exactly the same JSON the restored file
+    /// would carry — the tensor set and its `data_offsets` are identical either
+    /// way, and only the payload retrieval differs.
+    fn open_in_archive(
+        archive: std::sync::Arc<hipfire_quantize::hfa::HfaArchive>,
+        rel: &str,
+        archive_path: &Path,
+    ) -> Result<Self, String> {
+        let header = archive.shard_header(rel)?;
+        let obj = header
+            .as_object()
+            .ok_or_else(|| format!("hfa: shard {rel} header is not a JSON object"))?;
+        let mut tensors = HashMap::new();
+        for (name, value) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let meta: TensorMeta = serde_json::from_value(value.clone())
+                .map_err(|e| format!("hfa: shard {rel} tensor {name} has invalid metadata: {e}"))?;
+            tensors.insert(name.clone(), meta);
+        }
+        Ok(Self {
+            // `<archive>#<shard>` keeps every shard distinct in the input-hash
+            // ledger, which keys on (path, tensor name).
+            path: PathBuf::from(format!("{}#{rel}", archive_path.display())),
+            backend: ShardBackend::Archive {
+                archive,
+                rel: rel.to_string(),
+            },
             tensors,
         })
     }
@@ -612,22 +773,52 @@ impl SafetensorsFile {
         self.tensors.get(name)
     }
 
-    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, &[u8])> {
+    fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, Cow<'_, [u8]>)> {
         let meta = self.tensors.get(name)?;
-        let start = self.header_size + meta.data_offsets[0];
-        let end = self.header_size + meta.data_offsets[1];
-        let data = &self.mmap[start..end];
-        record_input_hash_tensor(&self.path, name, meta, start, data);
-        Some((meta, data))
+        match &self.backend {
+            ShardBackend::Mmap {
+                mmap, header_size, ..
+            } => {
+                let start = header_size + meta.data_offsets[0];
+                let end = header_size + meta.data_offsets[1];
+                let data = &mmap[start..end];
+                record_input_hash_tensor(&self.path, name, meta, start, data);
+                Some((meta, Cow::Borrowed(data)))
+            }
+            ShardBackend::Archive { archive, rel } => {
+                // Decodes only the pieces covering THIS tensor, not the shard.
+                let (bytes, _dtype, _shape) = archive
+                    .tensor_bytes(rel, name)
+                    .map_err(|e| {
+                        eprintln!("error: hfa: cannot read {rel}/{name}: {e}");
+                        std::process::exit(2);
+                    })
+                    .ok()?;
+                // Logical offset within the reconstructed shard — the same value
+                // the mmap arm would see minus its header, and stable across runs.
+                record_input_hash_tensor(&self.path, name, meta, meta.data_offsets[0], &bytes);
+                Some((meta, Cow::Owned(bytes)))
+            }
+        }
     }
 
     /// Advise the kernel to drop page cache for a tensor's data region.
     /// On UMA systems this is critical: 234 GB of mmap'd safetensors
     /// pages compete with hipMalloc for the same physical RAM.
+    ///
+    /// Archive-backed shards decode into owned buffers that the caller already
+    /// drops, so there are no shared pages to release — the equivalent saving
+    /// happens by construction.
     #[cfg(unix)]
     fn drop_tensor_pages(&self, name: &str) {
+        let ShardBackend::Mmap {
+            file, header_size, ..
+        } = &self.backend
+        else {
+            return;
+        };
         if let Some(meta) = self.tensors.get(name) {
-            let start = self.header_size + meta.data_offsets[0];
+            let start = header_size + meta.data_offsets[0];
             let len = meta.data_offsets[1] - meta.data_offsets[0];
             use std::os::unix::io::AsRawFd;
             // POSIX_FADV_DONTNEED = 4
@@ -635,7 +826,7 @@ impl SafetensorsFile {
                 extern "C" {
                     fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
                 }
-                posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
+                posix_fadvise(file.as_raw_fd(), start as i64, len as i64, 4);
             }
         }
     }
@@ -809,10 +1000,10 @@ fn tensor_to_f32_with_optional_fp8_scale(
             .tensor_data(sname)
             .unwrap_or_else(|| panic!("FP8 scale tensor missing: {sname}"));
         if smeta.dtype == "F8_E8M0" {
-            return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+            return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, &sbytes, &smeta.shape);
         } else if smeta.dtype == "F32" {
             // MiniMax-M2: e4m3 + F32 block-[128,128] weight_scale_inv (multiply).
-            return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+            return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, &sbytes, &smeta.shape);
         } else {
             panic!(
                 "expected F8_E8M0 or F32 scale for {name}, got {}",
@@ -901,7 +1092,7 @@ fn build_rotation_overrides(
             if let Some((meta, raw)) = st.tensor_data(name) {
                 return Some(tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw,
+                    &raw,
                     meta,
                     fp8_scale_for,
                     st_files,
@@ -3916,14 +4107,17 @@ impl HfqInputFormat {
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
+            "oq8" => Some(Self::Oq8),
+            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
+            // Catch-all LAST. The origin/master merge landed this arm above the
+            // oq8 arms — in a region git did not flag as a conflict — which made
+            // every oq8 form unreachable and, since `parse_opus_mixed_format`
+            // does not accept them, rejected `--format oq8` outright.
             _ => match parse_opus_mixed_format(flag) {
                 Some(spec) if spec.group == 128 => Some(Self::OqPlusCompactG128),
                 Some(_) => Some(Self::OqPlusCompact),
                 None => None,
             },
-            "oq8" => Some(Self::Oq8),
-            "oq8+" | "oq8++" => Some(Self::Oq8Plus),
-            _ => None,
         }
     }
 }
@@ -4015,16 +4209,30 @@ fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String>
 /// ragged matrix would otherwise join the tail of one row to the head of the
 /// next, which does not match either the HFQ matrix contract or the runtime's
 /// `K.div_ceil(256)` group indexing.
-fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, mut pack_row: F) -> Vec<u8>
+/// Pack an Opus matrix row by row, IN PARALLEL.
+///
+/// The sibling `quantize_*g256` encoders in `codecs.rs` already rayon over their
+/// block chunks; this row loop was the one serial link, so the whole non-LDLQ
+/// Opus path ran on a single core while the LDLQ path used every core. Rows are
+/// independent — the codec carries no cross-row state — and `collect` into an
+/// ordered Vec keeps the output byte-identical to the serial form.
+///
+/// Thread-safety note: `pack_row` runs on rayon workers, so it must not touch a
+/// thread_local set by the caller. Today's closures only call pure codec
+/// functions; the AWQ sidecar is written before this is entered, and the clip
+/// override is a global `AtomicBool` precisely because a thread_local there was
+/// already caught being invisible to workers (see `codecs::CLIP_DISABLED`).
+fn quantize_opus_rows<F>(weights: &[f32], m: usize, k: usize, pack_row: F) -> Vec<u8>
 where
-    F: FnMut(&[f32]) -> Vec<u8>,
+    F: Fn(&[f32]) -> Vec<u8> + Sync + Send,
 {
+    use rayon::prelude::*;
     assert_eq!(weights.len(), m * k, "Opus matrix shape");
-    let mut output = Vec::new();
-    for row in weights.chunks_exact(k) {
-        output.extend_from_slice(&pack_row(row));
-    }
-    output
+    weights
+        .par_chunks_exact(k)
+        .map(&pack_row)
+        .collect::<Vec<Vec<u8>>>()
+        .concat()
 }
 
 fn pad_opus_columns(weights: &[f32], m: usize, k: usize) -> (Vec<f32>, usize) {
@@ -6951,7 +7159,7 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
                 if meta.shape.len() != 2 {
                     return Err(format!("{wname} is not 2D"));
                 }
-                found = Some((to_f32(bytes, &meta.dtype), meta.shape[0], meta.shape[1]));
+                found = Some((to_f32(&bytes, &meta.dtype), meta.shape[0], meta.shape[1]));
                 break;
             }
         }
@@ -8294,27 +8502,73 @@ fn main() {
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
     let original_input_dir = input_dir.to_string();
-    let input_dir = resolve_model_path(input_dir);
+    // `.hfa` source archive: a HuggingFace snapshot with its BF16 payloads
+    // losslessly recoded. Consumed IN PLACE — the alternative is
+    // `hipfire-coexistence repack --output <dir>`, a full restore that costs
+    // the whole checkpoint again on disk (244 GB for Qwen3.5-122B-A10B) purely
+    // so a quantizer that walks each tensor once can read it.
+    //
+    // Everything downstream is unchanged: the archive stores each shard's
+    // safetensors header VERBATIM, so the tensor table, dtypes and
+    // `data_offsets` are identical to the restored file's. Only payload
+    // retrieval differs, and that is confined to `SafetensorsFile::tensor_data`.
+    let hfa_archive: Option<std::sync::Arc<hipfire_quantize::hfa::HfaArchive>> = {
+        let raw = Path::new(&original_input_dir);
+        if hipfire_quantize::hfa::is_hfa(raw) {
+            match hipfire_quantize::hfa::HfaArchive::open(raw) {
+                Ok(a) => Some(std::sync::Arc::new(a)),
+                Err(e) => {
+                    eprintln!(
+                        "error: cannot open .hfa source archive\n input: {original_input_dir}\n reason: {e}"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let input_dir = if hfa_archive.is_some() {
+        // resolve_model_path expects a directory or model id; an archive is
+        // already an exact path, so keep it as-is for diagnostics.
+        original_input_dir.clone()
+    } else {
+        resolve_model_path(input_dir)
+    };
     let input_dir = Path::new(&input_dir);
     let output_path = Path::new(output_path);
 
     // Read model config
     let config_path = input_dir.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-        eprintln!(
-            "error: cannot read model config\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             expected: {config}\n\
-             reason: {e}\n\
-             hint: pass a Hugging Face snapshot directory, a cache root containing refs/main and snapshots/, or a model id like org/name. \
-             For /srv/huggingface cache roots, refs/main must point to a snapshot containing config.json.",
-            original = original_input_dir,
-            resolved = input_dir.display(),
-            config = config_path.display(),
-        );
-        std::process::exit(2);
-    });
+    let config_str = if let Some(archive) = hfa_archive.as_ref() {
+        let bytes = archive.read_small_file("config.json").unwrap_or_else(|e| {
+            eprintln!(
+                "error: .hfa archive has no readable config.json\n archive: {}\n reason: {e}",
+                input_dir.display()
+            );
+            std::process::exit(2);
+        });
+        String::from_utf8(bytes).unwrap_or_else(|e| {
+            eprintln!("error: .hfa config.json is not valid UTF-8: {e}");
+            std::process::exit(2);
+        })
+    } else {
+        std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read model config\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 expected: {config}\n\
+                 reason: {e}\n\
+                 hint: pass a Hugging Face snapshot directory, a .hfa source archive, a cache root containing refs/main and snapshots/, or a model id like org/name. \
+                 For /srv/huggingface cache roots, refs/main must point to a snapshot containing config.json.",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+                config = config_path.display(),
+            );
+            std::process::exit(2);
+        })
+    };
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
         eprintln!(
             "error: invalid model config JSON\n\
@@ -8579,23 +8833,34 @@ fn main() {
         );
     }
 
-    // Read tokenizer if present
-    let tokenizer_json = input_dir.join("tokenizer.json");
-    let tokenizer_str = if tokenizer_json.exists() {
-        std::fs::read_to_string(&tokenizer_json).ok()
-    } else {
-        None
+    // Companion files (tokenizer, chat template, generation config) come from
+    // the archive when the source is a `.hfa` — it stores them verbatim
+    // alongside the shards. Routing all four reads through one helper is what
+    // keeps an archive source from silently producing an artifact with an empty
+    // tokenizer, which is what a per-call-site `input_dir.join()` did.
+    let read_sidecar = |rel: &str| -> Option<String> {
+        match hfa_archive.as_ref() {
+            Some(archive) => archive
+                .read_small_file(rel)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok()),
+            None => {
+                let path = input_dir.join(rel);
+                if path.exists() {
+                    std::fs::read_to_string(&path).ok()
+                } else {
+                    None
+                }
+            }
+        }
     };
 
+    // Read tokenizer if present
+    let tokenizer_str = read_sidecar("tokenizer.json");
+
     // Read tokenizer_config.json (has chat_template)
-    let tokenizer_config_path = input_dir.join("tokenizer_config.json");
-    let tokenizer_config: Option<serde_json::Value> = if tokenizer_config_path.exists() {
-        std::fs::read_to_string(&tokenizer_config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    let tokenizer_config: Option<serde_json::Value> =
+        read_sidecar("tokenizer_config.json").and_then(|s| serde_json::from_str(&s).ok());
     let mut tokenizer_config = match chat_template_override {
         Some(template) => Some(tokenizer_config_with_chat_template(
             tokenizer_config,
@@ -8617,9 +8882,8 @@ fn main() {
             .and_then(|t| t.as_str())
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false);
-        let jinja_path = input_dir.join("chat_template.jinja");
-        if !has_tpl && jinja_path.exists() {
-            if let Ok(tpl) = std::fs::read_to_string(&jinja_path) {
+        if !has_tpl {
+            if let Some(tpl) = read_sidecar("chat_template.jinja") {
                 let obj = tokenizer_config.get_or_insert_with(|| serde_json::json!({}));
                 if let Some(map) = obj.as_object_mut() {
                     map.insert("chat_template".into(), serde_json::Value::String(tpl));
@@ -8638,14 +8902,8 @@ fn main() {
     // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
     // generation_config when config.eos_token_id is absent. Resolves
     // R5 in docs/plans/dots-ocr-devlog.md §7.
-    let generation_config_path = input_dir.join("generation_config.json");
-    let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
-        std::fs::read_to_string(&generation_config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    let generation_config: Option<serde_json::Value> =
+        read_sidecar("generation_config.json").and_then(|s| serde_json::from_str(&s).ok());
 
     // Build metadata for .hfq. The quantization_hash is added after tensor
     // production so it covers the final quantized payload bytes.
@@ -8697,48 +8955,79 @@ fn main() {
         }
     }
 
-    // Load all safetensors files
-    let st_paths = find_safetensors(input_dir).unwrap_or_else(|e| {
+    // Load all safetensors shards — from the directory, or straight out of the
+    // `.hfa` archive without restoring it.
+    let st_files: Vec<SafetensorsFile> = if let Some(archive) = hfa_archive.as_ref() {
+        let shards = archive.safetensors_names();
+        if shards.is_empty() {
+            eprintln!(
+                "error: .hfa archive contains no .safetensors shards\n archive: {}",
+                input_dir.display()
+            );
+            std::process::exit(2);
+        }
         eprintln!(
-            "error: cannot read safetensors shards\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             reason: {e}",
-            original = original_input_dir,
-            resolved = input_dir.display(),
+            "HFA input: {} shard(s), read in place (no restore)",
+            shards.len()
         );
-        std::process::exit(2);
-    });
-    if st_paths.is_empty() {
-        eprintln!(
-            "error: no .safetensors files found in model directory\n\
-             input: {original}\n\
-             resolved: {resolved}\n\
-             hint: pass the model snapshot directory that contains model-*.safetensors, or the top-level HF cache root with refs/main.",
-            original = original_input_dir,
-            resolved = input_dir.display(),
-        );
-        std::process::exit(2);
-    }
-    let st_files: Vec<SafetensorsFile> = st_paths
-        .iter()
-        .map(|p| {
-            eprintln!("Loading: {}", p.display());
-            SafetensorsFile::open(p).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: cannot open safetensors shard\n\
-                     input: {original}\n\
-                     resolved: {resolved}\n\
-                     shard: {shard}\n\
-                     reason: {e}",
-                    original = original_input_dir,
-                    resolved = input_dir.display(),
-                    shard = p.display(),
-                );
-                std::process::exit(2);
+        shards
+            .iter()
+            .map(|rel| {
+                eprintln!("Loading: {}#{rel}", input_dir.display());
+                SafetensorsFile::open_in_archive(archive.clone(), rel, input_dir).unwrap_or_else(
+                    |e| {
+                        eprintln!(
+                            "error: cannot open shard inside .hfa\n archive: {}\n shard: {rel}\n reason: {e}",
+                            input_dir.display()
+                        );
+                        std::process::exit(2);
+                    },
+                )
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        let st_paths = find_safetensors(input_dir).unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot read safetensors shards\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 reason: {e}",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+            );
+            std::process::exit(2);
+        });
+        if st_paths.is_empty() {
+            eprintln!(
+                "error: no .safetensors files found in model directory\n\
+                 input: {original}\n\
+                 resolved: {resolved}\n\
+                 hint: pass the model snapshot directory that contains model-*.safetensors, a .hfa source archive, or the top-level HF cache root with refs/main.",
+                original = original_input_dir,
+                resolved = input_dir.display(),
+            );
+            std::process::exit(2);
+        }
+        st_paths
+            .iter()
+            .map(|p| {
+                eprintln!("Loading: {}", p.display());
+                SafetensorsFile::open(p).unwrap_or_else(|e| {
+                    eprintln!(
+                        "error: cannot open safetensors shard\n\
+                         input: {original}\n\
+                         resolved: {resolved}\n\
+                         shard: {shard}\n\
+                         reason: {e}",
+                        original = original_input_dir,
+                        resolved = input_dir.display(),
+                        shard = p.display(),
+                    );
+                    std::process::exit(2);
+                })
+            })
+            .collect()
+    };
     begin_input_hash();
 
     // Collect all tensor names.
@@ -8785,7 +9074,7 @@ fn main() {
                     }
                     let (m, k) = (meta.shape[0], meta.shape[1]);
                     let w = tensor_to_f32_with_optional_fp8_scale(
-                        name, raw, meta, &empty_fp8, &st_files,
+                        name, &raw, meta, &empty_fp8, &st_files,
                     );
                     if w.len() != m * k {
                         continue;
@@ -9222,7 +9511,7 @@ fn main() {
                 .write_next(
                     entry,
                     |writer| {
-                        writer.write_all(raw_data)?;
+                        writer.write_all(&raw_data)?;
                         Ok(())
                     },
                     |_| {},
@@ -9333,7 +9622,7 @@ fn main() {
         if use_f32_passthrough {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9385,7 +9674,7 @@ fn main() {
             {
                 let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9510,7 +9799,7 @@ fn main() {
             if name.ends_with(".feed_forward.expert_bias") {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9558,7 +9847,7 @@ fn main() {
             if let Some(oq_format) = per_tensor_oq {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9628,7 +9917,7 @@ fn main() {
             {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9664,7 +9953,7 @@ fn main() {
             // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9796,11 +10085,11 @@ fn main() {
                 let (smeta, sbytes) = st_files[*sfi]
                     .tensor_data(sname)
                     .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
-                dequantize_e2m1_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape)
+                dequantize_e2m1_ue8m0_to_f32(&raw_data, &meta.shape, &sbytes, &smeta.shape)
             } else {
                 let vals = tensor_to_f32_with_optional_fp8_scale(
                     name,
-                    raw_data,
+                    &raw_data,
                     meta,
                     &fp8_scale_for,
                     &st_files,
@@ -9884,7 +10173,7 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9948,7 +10237,7 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9983,7 +10272,7 @@ fn main() {
         {
             let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -9996,7 +10285,7 @@ fn main() {
                 // bf16 from the perturbed f32 so the normal forward yields a
                 // faithful QTIP-2 PPL.
                 let (q, qt, label) = if use_bf16 {
-                    source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data)
+                    source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data)
                 } else {
                     (f32_slice_to_f16_bytes(&f32_data), QuantType::F16, "F16")
                 };
@@ -10683,7 +10972,7 @@ fn main() {
             let src_dtype = meta.dtype.as_str();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10721,7 +11010,7 @@ fn main() {
             let src_dtype = meta.dtype.as_str();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10755,7 +11044,7 @@ fn main() {
         if should_quantize(name) && n_elements >= 32 {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
-                raw_data,
+                &raw_data,
                 meta,
                 &fp8_scale_for,
                 &st_files,
@@ -10827,7 +11116,7 @@ fn main() {
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
                 let (quantized, qt, gs, label) = if let Some(ov) = is_embed
-                    .then(|| embed_precision_override(raw_data, &meta.dtype, &f32_data))
+                    .then(|| embed_precision_override(&raw_data, &meta.dtype, &f32_data))
                     .flatten()
                 {
                     // --embed-precision bf16|f16: keep the gather table at source
@@ -10837,7 +11126,7 @@ fn main() {
                     ov
                 } else if use_bf16 {
                     let (data, qt, label) =
-                        source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
+                        source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data);
                     (data, qt, 0u32, label)
                 } else if use_fp16 {
                     let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
@@ -11727,7 +12016,7 @@ fn main() {
             // Quantize vision matrix weights to HFQ4G256/HFQ4G128. Vision norms
             // and biases stay source precision because the VL loaders upload
             // them as F32 side inputs, not dequantized matrix operands.
-            let f32_data = to_f32(raw_data, &meta.dtype);
+            let f32_data = to_f32(&raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let k_dim = if shape.len() == 2 {
@@ -11791,9 +12080,9 @@ fn main() {
             // decoded to the portable F16 fallback because HFQ has no matching
             // raw source codec for them.
             let (data, quant_type, label) = match meta.dtype.as_str() {
-                "F16" | "F32" => source_precision_tensor_bytes(raw_data, &meta.dtype, &[]),
+                "F16" | "F32" => source_precision_tensor_bytes(&raw_data, &meta.dtype, &[]),
                 _ => {
-                    let f32_vals = to_f32(raw_data, &meta.dtype);
+                    let f32_vals = to_f32(&raw_data, &meta.dtype);
                     (f32_slice_to_f16_bytes(&f32_vals), QuantType::F16, "F16")
                 }
             };
@@ -11856,11 +12145,12 @@ fn main() {
             // width, so keeping BF16 in normal MQ/HFQ artifacts remains
             // portable: older arches can downgrade to F16 at load time.
             let f32_data = if meta.dtype == "F32" {
-                to_f32(raw_data, "F32")
+                to_f32(&raw_data, "F32")
             } else {
                 Vec::new()
             };
-            let (data, qt, label) = source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
+            let (data, qt, label) =
+                source_precision_tensor_bytes(&raw_data, &meta.dtype, &f32_data);
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             quant_log!(
                 "  {label:<10} {} {:?} ({} elements, {:.1} KB)",
@@ -15359,6 +15649,65 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pooled_donors_only_for_shared_input_expert_projections() {
+        // Quantizer-side names carry `.weight`; calib names do not. Both must
+        // resolve, or the fallback silently never fires on real tensors.
+        let w = pooled_donor_candidates("model.layers.7.mlp.experts.3.gate_up_proj.weight");
+        assert!(w.contains(&"model.layers.7.mlp.gate.down_proj".to_string()));
+        assert!(
+            pooled_donor_candidates("model.layers.7.mlp.experts.3.down_proj.weight").is_empty()
+        );
+
+        // gate/up read the layer-shared FFN input, so they may borrow.
+        let d = pooled_donor_candidates("model.layers.7.mlp.experts.3.gate_up_proj");
+        assert!(d.contains(&"model.layers.7.mlp.gate".to_string()));
+        assert!(d.contains(&"model.layers.7.mlp.gate.down_proj".to_string()));
+        assert!(
+            !pooled_donor_candidates("model.language_model.layers.2.mlp.experts.11.w1").is_empty()
+        );
+
+        // down_proj/w2 read the expert's OWN SwiGLU intermediate — a private
+        // basis (cosine 0.04-0.35 between experts), so pooling is invalid.
+        assert!(pooled_donor_candidates("model.layers.7.mlp.experts.3.down_proj").is_empty());
+        assert!(pooled_donor_candidates("model.layers.7.mlp.experts.3.w2").is_empty());
+
+        // Dense tensors and non-expert paths never borrow.
+        assert!(pooled_donor_candidates("model.layers.7.mlp.gate_proj").is_empty());
+        assert!(pooled_donor_candidates("model.layers.7.mlp.shared_expert.gate_proj").is_empty());
+        // `experts.<not-a-number>` is not a routed expert.
+        assert!(
+            pooled_donor_candidates("model.layers.7.mlp.experts.pooled.gate_up_proj").is_empty()
+        );
+    }
+
+    #[test]
+    fn ldlq_expert_leaf_skip_is_scoped_to_routed_experts() {
+        // Serialised with other env-mutating tests would be ideal, but this
+        // reads one variable and restores it immediately.
+        std::env::set_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", "down_proj,w2");
+        assert!(ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
+        assert!(ldlq_skipped_expert_leaf("model.layers.3.mlp.experts.7.w2"));
+        // gate/up is the arm under comparison and must NOT be skipped.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.gate_up_proj.weight"
+        ));
+        // Dense tensors that merely end in the same leaf must not be caught —
+        // this is the whole reason it parses the expert index.
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.gate.down_proj.weight"
+        ));
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.shared_expert.down_proj.weight"
+        ));
+        std::env::remove_var("HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES");
+        assert!(!ldlq_skipped_expert_leaf(
+            "model.layers.3.mlp.experts.7.down_proj.weight"
+        ));
+    }
 
     /// Build a fake source mmap with a v2 tail blob at `offset`, plus the
     /// matching front `tail_metadata` pointer. Returns (front_json, mmap_bytes).

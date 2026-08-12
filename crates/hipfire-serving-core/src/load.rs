@@ -607,6 +607,19 @@ pub fn load_model(
     pp: usize,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
+    // The serving path takes hipfire containers only. A HuggingFace
+    // safetensors directory is an external format: converting it is offline
+    // tooling's job (AGENTS.md — "conversion and compatibility concerns are
+    // offline tooling"), and routing it here silently misclassified every
+    // non-ParoQuant checkpoint, failing deep in the loader with the unrelated
+    // "ParoQuant model must have quantization_config".
+    if Path::new(path).is_dir() {
+        return Err(format!(
+            "{path} is a directory; the daemon loads .hfq containers only. \
+             Convert it first: `hipfire-quantize --input {path} --output <model>--bf16.hfq --format bf16` \
+             (or another --format). An .hfa archive unpacks with `hipfire-coexistence repack`."
+        ));
+    }
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
@@ -641,13 +654,6 @@ pub fn load_model(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
-    // ─── ParoQuant / safetensors directory path ────────────────────────────
-    // If the path is a directory with config.json, try loading as a
-    // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
-    if Path::new(path).is_dir() {
-        return load_model_safetensors(path, max_seq, &kv_mode, gpu);
-    }
-
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let compose_manifest = compose_manifest_from_metadata(&hfq.metadata_json)
         .map_err(|error| format!("embedded component manifest: {error}"))?;

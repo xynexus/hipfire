@@ -100,6 +100,14 @@ pub struct PrefillBatchScratch {
     // stays on the residual_scaled atomic kernel.
     pub moe_down_expanded_batch: Option<GpuTensor>,
 
+    // Per-slot rotated gate_up input — [N × k_top × dim] f32, the mirror of
+    // `moe_down_expanded_batch` on the input side. The indexed OQ gate_up
+    // GEMVs read one rotated basis PER (token, krank) because routed experts
+    // carry different AWQ scales; `x_rot_batch` holds only the shared
+    // single-basis rotation and cannot serve them. Written by
+    // `rotate_x_mq_awq_indexed_batched`.
+    pub moe_x_rot_expanded_batch: Option<GpuTensor>,
+
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
     // allocated when num_experts > 0; gated at runtime by
     // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max is tile-aligned:
@@ -4252,6 +4260,14 @@ impl PrefillBatchScratch {
             } else {
                 None
             },
+            moe_x_rot_expanded_batch: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.dim],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
             // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
             // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
@@ -4327,6 +4343,7 @@ impl PrefillBatchScratch {
             self.moe_hidden_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
+            self.moe_x_rot_expanded_batch,
             self.dn_s_tape,
         ]
         .into_iter()

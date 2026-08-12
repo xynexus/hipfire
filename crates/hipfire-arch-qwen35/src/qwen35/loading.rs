@@ -1854,6 +1854,8 @@ fn paro_load_moe_ffn(
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
     let expert_down_dtypes = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) =
+        build_expert_awq_ptr_tables(gpu, &experts)?;
 
     Ok(MoeFfnWeights {
         router,
@@ -1862,6 +1864,8 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         layer_idx,
         expert_shape: None,
         expert_gate_up_dtype,
@@ -2460,6 +2464,68 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
     hipfire_runtime::quant::dtype_for_quant_type(qt, k)
 }
 
+/// Build the per-expert AWQ scale pointer tables consumed by
+/// `rotate_x_mq_awq_indexed_batched`, mirroring `expert_gate_up_ptrs`.
+///
+/// Returns `(None, None)` when NO routed expert carries a sidecar — the plain
+/// rotation is then already correct, so callers keep the cheaper path and stay
+/// byte-identical to before. A per-expert 0 entry means "this expert has no
+/// sidecar" and the kernel falls back to the plain rotation for that slot,
+/// which is what mixed artifacts need.
+fn build_expert_awq_ptr_tables(
+    gpu: &mut Gpu,
+    experts: &[ExpertWeights],
+) -> HipResult<(Option<GpuTensor>, Option<GpuTensor>)> {
+    if experts.is_empty()
+        || !experts
+            .iter()
+            .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some())
+    {
+        return Ok((None, None));
+    }
+    let mut build = |sel: &dyn Fn(&ExpertWeights) -> Option<&GpuTensor>| -> HipResult<GpuTensor> {
+        let bytes: Vec<u8> = experts
+            .iter()
+            .flat_map(|e| sel(e).map_or(0u64, |t| t.buf.as_ptr() as u64).to_ne_bytes())
+            .collect();
+        let t = gpu.alloc_tensor(&[2 * experts.len()], DType::F32)?;
+        gpu.hip.memcpy_htod(&t.buf, &bytes)?;
+        Ok(t)
+    };
+    let gu = build(&|e: &ExpertWeights| e.gate_up.awq_scale.as_ref())?;
+    let dn = build(&|e: &ExpertWeights| e.down.awq_scale.as_ref())?;
+    Ok((Some(gu), Some(dn)))
+}
+
+/// Explain an unpageable routed-expert quant type at the point of rejection.
+///
+/// Quant type 16 is BF16, which appears in an otherwise-quantized artifact when
+/// calibration ran with `--expert-coverage-policy preserve-undercovered`: experts
+/// the corpus barely activated are kept at source precision. The 122B carries 644
+/// such experts, and they are what stops it paging.
+fn paged_moe_quant_hint(qt: u8) -> &'static str {
+    match qt {
+        16 => {
+            " (BF16 — this artifact was quantized with \
+             --expert-coverage-policy preserve-undercovered, which keeps \
+             undercovered routed experts at source precision. The paged MoE \
+             decode kernel handles only OQ routed dtypes, so such an artifact \
+             cannot be paged; requantize so every routed expert is OQ, or load \
+             it fully resident)"
+        }
+        _ => "",
+    }
+}
+
+/// Routed-expert dtype for the paged MoE path.
+///
+/// Deliberately NARROWER than the resident path. Mapping BF16 (16) to F16 here
+/// was tried and reverted: the model then loads fine (12288 modules, 9.3 GB
+/// resident, 6.2 of 71.9 GiB streamed) and panics on the first decode with
+/// `moe.decode-routed-dtype-unsupported-no-fallback`, because the paged MoE
+/// decode kernel accepts only OQ routed dtypes. Widening this map turns a clear
+/// load-time rejection into a mid-generation panic, so it stays narrow until the
+/// kernel gains an F16 routed path.
 pub(super) fn paged_moe_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
     hipfire_runtime::quant::oq_gpu_dtype_for_quant_type(qt).or_else(|| slab_dtype_for_quant(qt, k))
 }
@@ -3212,20 +3278,56 @@ pub fn dump_embed_fp32(
     Ok((vocab, dim))
 }
 
-/// Run the resident model over `chunk` (per-token decode, fresh KV + DeltaNet
-/// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored
-/// position `j` in `[scoring_start, n_ctx-1)`. The single forward path that both
-/// reference build and candidate scoring funnel through.
+/// Positions per lm-head window. Staging is `rows x vocab` f32 — 256 rows at
+/// Qwen3.5's 248320 vocab is 254 MB, where the whole 2048-token chunk would be
+/// 2.0 GB in one allocation.
+const SCORED_HEAD_WINDOW: usize = 256;
+
+/// Run the resident model over `chunk` and invoke
+/// `at_scored(j, full_logits, actual_next)` for each scored position `j` in
+/// `[scoring_start, n_ctx-1)`. The single forward path that both reference build
+/// and candidate scoring funnel through.
+///
+/// Two things were per-token here, and they had to be fixed together because
+/// each one alone leaves the other dominating:
+///
+///  * The BODY ran one `forward_scratch` per position — 162 GEMM launches per
+///    token, re-reading every weight in the model each time (~1.6 GB x 2048 =
+///    3.3 TB of weight traffic per chunk). `forward_prefill_batch_with_pbs_opts`
+///    runs the whole chunk once and hands back every position's post-output-norm
+///    hidden state, measured at 58.5 -> 1660 tok/s.
+///  * The HEAD then ran one GEMV per scored position. Each GEMV streams the
+///    entire lm_head, so 2039 of them read 748 GB and took 76% of GPU time even
+///    after the packed-LUT3 win. Batched as a GEMM the head is read once per
+///    window instead of once per position.
+///
+/// `per_token_hidden_out` is written post-output-norm, so the head must NOT
+/// re-normalize. Positions below `scoring_start` never need logits and are
+/// skipped entirely.
 fn forward_chunk_scored(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     chunk: &[u32],
     scoring_start: usize,
-    mut at_scored: impl FnMut(usize, &[f32], usize),
+    mut at_scored: impl FnMut(&hipfire_runtime::kld_eval::ScoredWindow<'_>),
 ) -> HipResult<()> {
+    use hipfire_runtime::kld_eval::ScoredWindow;
     let n = chunk.len();
-    let mut kv = kv::KvCache::new_gpu(
+    // Position `p` is scored against `chunk[p + 1]`, so the final token is
+    // consumed as a target and never itself scored.
+    let scorable = n.saturating_sub(1);
+    if scorable == 0 || scoring_start >= scorable {
+        return Ok(());
+    }
+    let vocab = config.vocab_size;
+    let dim = config.dim;
+
+    // Q8 KV, not f32. The batched prefill's F4 guard rejects an f32 KV cache
+    // outright — that tier has no batched attention kernel (`BatchEq(1)` only,
+    // MissingImpl at resolve) — so an f32 KV cache silently forces the per-token
+    // fallback and gives back the entire win above.
+    let mut kv = kv::KvCache::new_gpu_q8(
         gpu,
         config.n_layers,
         config.n_kv_heads,
@@ -3234,15 +3336,83 @@ fn forward_chunk_scored(
     )?;
     let mut dn = DeltaNetState::new(gpu, config)?;
     let scratch = Qwen35Scratch::new(gpu, config, 64)?;
-    for pos in 0..n.saturating_sub(1) {
-        forward_scratch(
-            gpu, weights, config, chunk[pos], pos, &mut kv, &mut dn, &scratch,
-        )?;
-        if pos >= scoring_start {
-            let lg = gpu.download_f32(&scratch.logits)?;
-            at_scored(pos - scoring_start, &lg, chunk[pos + 1] as usize);
-        }
+    let hidden = gpu.alloc_tensor(&[n * dim], DType::F32)?;
+
+    // HIPFIRE_KLD_PHASE_TIMING=1 splits the per-chunk cost into body / head /
+    // download / scoring. The four are on completely different resources, so a
+    // wall-clock total says nothing about which to attack next.
+    let phase_timing = std::env::var("HIPFIRE_KLD_PHASE_TIMING").as_deref() == Ok("1");
+    let t_body = std::time::Instant::now();
+
+    // Ineligible weight/KV combinations fall back to a per-token loop INSIDE
+    // this call and still populate `hidden`, so there is no separate fallback to
+    // maintain here.
+    forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        chunk,
+        0,
+        &mut kv,
+        &mut dn,
+        &scratch,
+        None,
+        Some(&hidden),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )?;
+
+    if phase_timing {
+        let _ = gpu.device_synchronize();
     }
+    let body_s = t_body.elapsed().as_secs_f64();
+    let (mut head_s, mut dl_s, mut score_s) = (0.0f64, 0.0f64, 0.0f64);
+
+    let window = SCORED_HEAD_WINDOW.min(scorable - scoring_start);
+    let batch_logits = gpu.alloc_tensor(&[window * vocab], DType::F32)?;
+    let mut pos = scoring_start;
+    while pos < scorable {
+        let w = window.min(scorable - pos);
+        let rows = hidden.sub_offset(pos * dim, w * dim);
+        let t = std::time::Instant::now();
+        hipfire_runtime::weights::weight_gemm(gpu, &weights.output, &rows, &batch_logits, w)?;
+        if phase_timing {
+            let _ = gpu.device_synchronize();
+            head_s += t.elapsed().as_secs_f64();
+        }
+        // One download per window, replacing `w` full-vocab transfers.
+        let t = std::time::Instant::now();
+        let values = gpu.download_f32(&batch_logits.sub_offset(0, w * vocab))?;
+        dl_s += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        // Hand the whole window over at once. Per-position delivery pinned the
+        // consumer's log_z + top-K work to one core; a window lets it fan out.
+        let nexts: Vec<u32> = (0..w).map(|j| chunk[pos + j + 1]).collect();
+        at_scored(&ScoredWindow {
+            j0: pos - scoring_start,
+            logits: &values,
+            vocab,
+            nexts: &nexts,
+        });
+        score_s += t.elapsed().as_secs_f64();
+        pos += w;
+    }
+    if phase_timing {
+        eprintln!(
+            "  [kld-phase] body={body_s:.3}s head={head_s:.3}s download={dl_s:.3}s \
+             scoring={score_s:.3}s (n={n} scored={})",
+            scorable - scoring_start
+        );
+    }
+    let _ = gpu.free_tensor(batch_logits);
+    let _ = gpu.free_tensor(hidden);
+    kv.free_gpu(gpu);
+    dn.free_gpu(gpu);
     Ok(())
 }
 
@@ -3261,16 +3431,11 @@ impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
         gpu: &mut Gpu,
         chunk: &[u32],
         scoring_start: usize,
-        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+        at_scored: &mut dyn FnMut(&hipfire_runtime::kld_eval::ScoredWindow<'_>),
     ) -> Result<(), String> {
-        forward_chunk_scored(
-            gpu,
-            self.weights,
-            self.config,
-            chunk,
-            scoring_start,
-            |j, lg, next| at_scored(j, lg, next),
-        )
+        forward_chunk_scored(gpu, self.weights, self.config, chunk, scoring_start, |w| {
+            at_scored(w)
+        })
         .map_err(|e| format!("qwen35 kld forward: {e:?}"))
     }
 
@@ -3945,7 +4110,12 @@ fn collect_calibration_artifacts_sequences(
         vec![".experts.".to_string()],
         output,
         provenance,
-        |gpu| {
+        sequences,
+        // Shadows the caller's `sequences` with the seam-split view: qwen35
+        // already builds a fresh KV + DeltaNet state per sequence and restarts
+        // positions at 0, so re-splitting a long sample just yields more of the
+        // independent contexts this loop already handles correctly.
+        |gpu, sequences| {
             if is_moe {
                 reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
             }
@@ -4247,13 +4417,34 @@ pub fn load_weights(
             lm_info.quant_type
         );
         loaded_bytes += lm_data.len();
-        load_weight_tensor_raw(
-            gpu,
-            lm_info.quant_type,
-            &lm_data,
-            config.vocab_size,
-            config.dim,
-        )?
+        // Bf16Lut3 (qt 49) head, same arm as the tied branch below and for the
+        // same reason: `expand_bf16_index` deliberately leaves head tensors
+        // packed because LUT3 is GPU-decodable, so `load_weight_tensor_raw`
+        // never sees an expanded tensor and rejects qt 49 outright. Without
+        // this an UNTIED model written by our own `--format bf16` (which makes
+        // LUT3 the default head coding) cannot be loaded at all — which is how
+        // Qwen3.5-35B-A3B failed to calibrate.
+        let force_bf16_head = std::env::var("HIPFIRE_QWEN35_BF16_HEAD").as_deref() == Ok("1");
+        if !force_bf16_head && lm_info.quant_type == 49 && config.dim.is_multiple_of(256) {
+            let buf = gpu.upload_raw(&lm_data, &[lm_data.len()])?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::Bf16L3,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        } else {
+            load_weight_tensor_raw(
+                gpu,
+                lm_info.quant_type,
+                &lm_data,
+                config.vocab_size,
+                config.dim,
+            )?
+        }
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
         if let Some((matched_name, mut wt)) = load_weight_tensor_from_slabs(
@@ -4271,7 +4462,65 @@ pub fn load_weights(
             let (tied_info, tied_data) =
                 qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
             loaded_bytes += tied_data.len();
-            if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
+            // Bf16Lut3 head: hand the PACKED bytes to the GPU and let
+            // `gemv_bf16l3_xf32` decode in-kernel. `expand_bf16_index` already
+            // declines to expand a head tensor for exactly this reason — LUT3
+            // is the GPU-decodable coding (Huffman is not), so materializing it
+            // here throws away the whole point of storing it that way.
+            //
+            // Decoding instead produced a 1017 MB f32 head (248320x1024) whose
+            // GEMV measured 5255 us per call and 24.8% of all GPU time in a
+            // reference build — bandwidth-saturated at 192 GB/s reading values
+            // that came from bf16 to begin with. Packed it is 367 MB, and the
+            // same GEMV measures 1958 us: 2.68x against a 2.77x byte reduction,
+            // which is the whole win (effective bandwidth is unchanged).
+            //
+            // K % 256 is the kernel's group constraint; anything else falls
+            // through to the decode path below.
+            //
+            // OPT-IN, and the default flipped back after measurement. Packed
+            // only pays when the head is consumed one row at a time, because
+            // `gemv_bf16l3_xf32` is the only LUT3 kernel — there is no
+            // `gemm_bf16l3`. A batched consumer (prefill, KLD scoring) reads the
+            // head ONCE per window as a GEMM instead of once per position:
+            // 2039 GEMVs x 367 MB = 748 GB, against ~367 MB plus 1.04 TFLOP for
+            // the batched form. Measured, that is 3.98 s (76% of all GPU time)
+            // versus ~0.1 s — so batching beats packing by ~15x even after the
+            // 2.68x this arm buys. Keeping it packed would force the batched
+            // logits path to decline the dtype and fall back to per-token,
+            // which is how the two optimizations cancelled.
+            //
+            // HIPFIRE_QWEN35_LUT3_HEAD=1 restores the packed head for a
+            // decode-only deployment, where every step is batch-1 and the
+            // 2.68x is the whole story.
+            // MEASURED, and the opposite of what the batching argument above
+            // predicted. Per scored position on gfx1151:
+            //
+            //   Bf16Lut3 packed, gemv_bf16l3_xf32   1.95 ms   (3.98 s / 2039)
+            //   plain BF16, gemm_bf16_x_bf16_wmma   5.05 ms   (5.17 s / 1023)
+            //
+            // `weight_gemm` genuinely batches BF16 — it is a real WMMA GEMM, not
+            // a row loop — and it is still 2.6x worse per position than the
+            // packed GEMV. Reading 367 MB per call beats reading 508 MB even
+            // once per 256-row window, because this head is bandwidth-bound at
+            // M=248320 and the GEMM gets no useful reuse out of a weight that
+            // large. So packed stays the default.
+            //
+            // HIPFIRE_QWEN35_BF16_HEAD=1 forces the plain-BF16 head back for
+            // A/B measurement.
+            let force_bf16_head = std::env::var("HIPFIRE_QWEN35_BF16_HEAD").as_deref() == Ok("1");
+            if !force_bf16_head && embd_qt == 49 && config.dim.is_multiple_of(256) {
+                let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
+                WeightTensor {
+                    buf,
+                    gpu_dtype: DType::Bf16L3,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                }
+            } else if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
                 let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
                 let dtype = match embd_qt {
                     6 => DType::HFQ4G256,
@@ -6089,10 +6338,9 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-        .ok()
-        .as_deref()
-        == Some("1");
+    // Shared parse — see `oq_indexed_decode_enabled`. The repack below and the
+    // dispatch predicate must never disagree on what enables this path.
+    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_enabled();
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6134,6 +6382,28 @@ fn load_moe_expert(
         _ => return load_weight_tensor(hfq, gpu, slabs, name, m, k),
     };
     let buf = gpu.upload_raw(&blocks, &[blocks.len()])?;
+    // The MoE-block repack must carry the AWQ sidecar exactly as
+    // `load_weight_tensor` does. `--ldlq` pre-scales routed-expert weights at
+    // quantize time (the artifact stores W·s), so the forward has to divide x
+    // by s — and `rotate_x_mq_for` decides that purely from
+    // `awq_scale.is_some()`, falling back to the non-AWQ rotation otherwise.
+    //
+    // Hardcoding `None` here therefore computed (W·s)·x instead of W·x on EVERY
+    // routed expert, silently: the fallback exists so pre-AWQ artifacts stay
+    // byte-identical, so nothing errors. This is the same failure documented on
+    // `load_awq_scale_for` for MQ4 (KLD 0.6721 → 13.4893), reintroduced for OQ
+    // by this repack path. Measured here on a 35B-A3B oq4.25++ carrying 20476
+    // expert sidecars: KLD 0.030367 → 5.108296 (ppl 7.46 → 1171.67), with the
+    // per-block residual trace diverging at LAYER 0 (cosine 0.244, norm 16x) —
+    // a scale error from the first layer, not accumulated drift.
+    //
+    // Both Oq4G256 and Oq8G256 declare `supports_awq_sidecar()`. Artifacts
+    // without sidecars (real W8A8 Oq8) return None and keep the old behaviour.
+    let awq_scale = if dtype.supports_awq_sidecar() {
+        load_awq_scale_for(hfq, gpu, name, k)
+    } else {
+        None
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: dtype,
@@ -6141,7 +6411,7 @@ fn load_moe_expert(
         k,
         row_stride: 0,
         paro: None,
-        awq_scale: None,
+        awq_scale,
     })
 }
 
@@ -6213,6 +6483,8 @@ fn load_moe_ffn(
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
     let expert_down_dtypes = experts.iter().map(|e| e.down.gpu_dtype).collect();
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) =
+        build_expert_awq_ptr_tables(gpu, &experts)?;
 
     Ok(MoeFfnWeights {
         router,
@@ -6221,6 +6493,8 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -6297,8 +6571,9 @@ fn load_moe_ffn_paged(
                 HipError::new(
                     0,
                     &format!(
-                        "paged MoE expert {expert} gate_up has unsupported quant type {}",
-                        gate_up.quant_type
+                        "paged MoE expert {expert} gate_up has unsupported quant type {}{}",
+                        gate_up.quant_type,
+                        paged_moe_quant_hint(gate_up.quant_type)
                     ),
                 )
             })?,
@@ -6308,8 +6583,9 @@ fn load_moe_ffn_paged(
                 HipError::new(
                     0,
                     &format!(
-                        "paged MoE expert {expert} down has unsupported quant type {}",
-                        down.quant_type
+                        "paged MoE expert {expert} down has unsupported quant type {}{}",
+                        down.quant_type,
+                        paged_moe_quant_hint(down.quant_type)
                     ),
                 )
             },
@@ -6322,6 +6598,24 @@ fn load_moe_ffn_paged(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &zero_ptrs)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &zero_ptrs)?;
 
+    // Paged mode: `experts` is empty (the pager owns the buffers), so there are
+    // no WeightTensors to read `awq_scale` from and no per-expert AWQ tables.
+    // `None` selects the plain rotation, which is correct ONLY while paged
+    // artifacts carry no routed-expert AWQ sidecars — true of the 122B today
+    // (it has zero). If that changes, the AWQ divide would be silently dropped
+    // for paged experts, so this warns rather than degrading quietly.
+    if hfq
+        .find_tensor_info(&format!("{p}.mlp.experts.0.gate_up_proj.awq_scale.weight"))
+        .is_some()
+    {
+        eprintln!(
+            "warning: paged MoE layer {p} has routed-expert AWQ sidecars, which the \
+             paged path cannot apply (experts are not resident). Expect degraded \
+             quality; load fully resident for AWQ-scaled routed experts."
+        );
+    }
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) = (None, None);
+
     Ok(MoeFfnWeights {
         router,
         experts: Vec::new(),
@@ -6329,6 +6623,8 @@ fn load_moe_ffn_paged(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_awq_ptrs,
+        expert_down_awq_ptrs,
         layer_idx,
         expert_shape: Some(hipfire_runtime::weight_pager::ExpertShape {
             gate_up_m: 2 * mi,

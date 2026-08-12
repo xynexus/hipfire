@@ -536,28 +536,41 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
-fn mixed_overlay_indices(group: &[f32], scale: f32, n_out: usize) -> Vec<usize> {
+/// Rank group positions by int8-upgrade gain; the first `n_out` are the overlay.
+/// `pub` so budget studies can score allocations without re-deriving the metric.
+///
+/// Slice-typed rather than `[f32; 256]` so one selector covers every group size
+/// (G=128 as well as G=256).
+pub fn mixed_overlay_indices(group: &[f32], scale: f32, n_out: usize) -> Vec<usize> {
     let inv = 1.0 / scale.max(1e-12);
-    let gain = |index: usize| -> f32 {
-        let value = group[index];
-        let q4 = (value * inv).round().clamp(-7.0, 7.0);
-        let q8 = (value * inv).round().clamp(-127.0, 127.0);
-        let error4 = value - q4 * scale;
-        let error8 = value - q8 * scale;
-        error4 * error4 - error8 * error8
-    };
+    // Precomputed, NOT recomputed inside the comparator. A 256-element sort runs
+    // ~2000 comparisons and evaluating the gain inside the comparator costs two
+    // evaluations per comparison — ~4000 to rank 256 values. `mixed_clipsearch`
+    // calls this once per scale candidate, so that waste is multiplied by the grid.
+    let gains: Vec<f32> = group
+        .iter()
+        .map(|&value| {
+            let q4 = (value * inv).round().clamp(-7.0, 7.0);
+            let q8 = (value * inv).round().clamp(-127.0, 127.0);
+            let error4 = value - q4 * scale;
+            let error8 = value - q8 * scale;
+            error4 * error4 - error8 * error8
+        })
+        .collect();
     let mut indices: Vec<usize> = (0..group.len()).collect();
     indices.sort_unstable_by(|&left, &right| {
-        gain(right)
-            .partial_cmp(&gain(left))
+        gains[right]
+            .partial_cmp(&gains[left])
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| left.cmp(&right))
     });
-    debug_assert!((1..group.len()).contains(&n_out));
+    debug_assert!((1..=group.len()).contains(&n_out));
     indices
 }
 
-fn mixed_overlay_error(group: &[f32], scale: f32, indices: &[usize], n_out: usize) -> f32 {
+/// SSE of the mixed encoding: overlay slots clamp to int8, the bulk to int4.
+/// The objective `mixed_clipsearch` minimises; `pub` for the same reason.
+pub fn mixed_overlay_error(group: &[f32], scale: f32, indices: &[usize], n_out: usize) -> f32 {
     let inv = 1.0 / scale.max(1e-12);
     let mut is_w8 = vec![false; group.len()];
     for &index in &indices[..n_out] {
@@ -575,31 +588,50 @@ fn mixed_overlay_error(group: &[f32], scale: f32, indices: &[usize], n_out: usiz
         .sum()
 }
 
-fn refit_mixed_scale(group: &[f32], indices: &[usize], n_out: usize, fallback: f32) -> f32 {
-    const CLIP_GRID: [f32; 14] = [
-        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
-    ];
+/// Candidate group scales for the mixed W4-bulk + W8-overlay search, as
+/// multiples of `amax/7` (the int4 grid). Reaches further down than
+/// [`symmetric_clipsearch`]'s grid and contains every point of it, because
+/// `n_out` positions escape the ±7 clamp and so tolerate a much tighter scale
+/// than an int4-only search would ever consider.
+const MIXED_CLIP_GRID: [f32; 14] = [
+    1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
+];
+
+/// JOINT `(scale, overlay set)` search for a mixed W4-bulk + sparse-W8 group —
+/// the one selector for every mixed Opus packer (compact qt=36, the int8-stored
+/// tiered form, and both LDLQ variants), so they cannot drift apart.
+///
+/// This is an exact minimisation, not a heuristic. The group error is separable
+/// across positions, and for a FIXED scale the error-minimising overlay set is
+/// exactly the top-`n_out` positions by int8-upgrade gain — which is what
+/// [`mixed_overlay_indices`] returns. So recomputing the set INSIDE the scale
+/// sweep and keeping the best [`mixed_overlay_error`] yields the true joint
+/// minimum of `(scale, set)` over [`MIXED_CLIP_GRID`].
+///
+/// What it replaces: seeding from an int4-only clip-search and alternating
+/// set-at-fixed-scale / scale-at-fixed-set. That is coordinate descent from a
+/// biased seed — the seed scale is chosen as if EVERY position were clamped to
+/// ±7, but `n_out` of them are not, so it systematically over-shrinks before the
+/// set is ever considered, and the alternation can only descend from there.
+/// origin/master re-derived that alternating form while generalising the codec
+/// to G=128 slices; this keeps the joint search and takes the slice generality.
+pub fn mixed_clipsearch(group: &[f32], n_out: usize) -> (f32, Vec<usize>) {
+    debug_assert!((1..=group.len()).contains(&n_out));
     let amax = group.iter().fold(0.0f32, |max, value| max.max(value.abs()));
-    let mut best_scale = fallback.max(1e-12);
-    let mut best_error = mixed_overlay_error(group, best_scale, indices, n_out);
-    for clip in CLIP_GRID {
+    let mut best_scale = (amax / 7.0).max(1e-12);
+    let mut best_indices = mixed_overlay_indices(group, best_scale, n_out);
+    let mut best_error = mixed_overlay_error(group, best_scale, &best_indices, n_out);
+    for clip in MIXED_CLIP_GRID {
         let scale = (clip * amax / 7.0).max(1e-12);
-        let error = mixed_overlay_error(group, scale, indices, n_out);
+        let indices = mixed_overlay_indices(group, scale, n_out);
+        let error = mixed_overlay_error(group, scale, &indices, n_out);
         if error < best_error {
             best_scale = scale;
+            best_indices = indices;
             best_error = error;
         }
     }
-    best_scale
-}
-
-fn mixed_clipsearch(group: &[f32], n_out: usize) -> (f32, Vec<usize>) {
-    let initial_scale = symmetric_clipsearch(group, 7.0);
-    let initial_indices = mixed_overlay_indices(group, initial_scale, n_out);
-    let first_scale = refit_mixed_scale(group, &initial_indices, n_out, initial_scale);
-    let refined_indices = mixed_overlay_indices(group, first_scale, n_out);
-    let refined_scale = refit_mixed_scale(group, &refined_indices, n_out, first_scale);
-    (refined_scale, refined_indices)
+    (best_scale, best_indices)
 }
 
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
@@ -1070,10 +1102,10 @@ pub fn quantize_oqplus_tiered(
         let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
         cpu_fwht_256(&mut group, signs1, signs2);
-        // INT4-tuned scale: the bulk uses [-7,7] at this resolution; the top-frac
-        // outliers reuse the SAME scale but extend to the int8 range [-127,127].
-        let scale = symmetric_clipsearch(&group, 7.0);
-        let inv = 1.0 / scale;
+        // Joint (scale, outlier set) — see `mixed_clipsearch`. The bulk uses
+        // [-7,7] at this scale; the top-frac outliers reuse the SAME scale but
+        // extend to the int8 range [-127,127].
+        //
         // Outlier set = top n_out positions by the int8-UPGRADE GAIN, not raw
         // magnitude. FWHT-256 equalizes per-position activation energy across the
         // group (≈ uniform), so output-error saliency reduces to the weight-side
@@ -1083,21 +1115,8 @@ pub fn quantize_oqplus_tiered(
         // and badly-rounded mid values; this is output-error-optimal given the
         // rotation flattens the activation side — cf. the study's method-5
         // "activation outlier decomposition" being redundant with FWHT.)
-        let gain = |i: usize| -> f32 {
-            let v = group[i];
-            let q4 = (v * inv).round().clamp(-7.0, 7.0);
-            let q8 = (v * inv).round().clamp(-127.0, 127.0);
-            let e4 = v - q4 * scale;
-            let e8 = v - q8 * scale;
-            e4 * e4 - e8 * e8
-        };
-        let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-        idx.sort_unstable_by(|&a, &c| {
-            gain(c)
-                .partial_cmp(&gain(a))
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| a.cmp(&c))
-        });
+        let (scale, idx) = mixed_clipsearch(&group, n_out);
+        let inv = 1.0 / scale;
         let mut is_w8 = [false; 256];
         for &i in &idx[..n_out] {
             is_w8[i] = true;
@@ -2923,6 +2942,88 @@ mod tests {
                 refined_error <= initial_error + 1e-6,
                 "n_out={n_out}: refined {refined_error} > initial {initial_error}"
             );
+        }
+    }
+
+    /// The joint search must return the ARGMIN over the candidate grid, not
+    /// merely something better than where it started. This is what an
+    /// alternating scale/set search cannot promise: it evaluates the set at one
+    /// scale and the scale at one set, so a grid point whose OWN best set beats
+    /// the incumbent is never scored. Guards against anyone reintroducing
+    /// coordinate descent here.
+    #[test]
+    fn mixed_clipsearch_is_the_grid_argmin() {
+        // Three shapes: a heavy sparse tail, a flat group with no outliers at
+        // all (the scale should not shrink for free), and one dominated by a
+        // single spike (where the escape-the-clamp effect is strongest).
+        let groups: [[f32; 256]; 3] = [
+            core::array::from_fn(|i| {
+                ((i as f32 * 0.173).sin() * 1.7) + if i % 47 == 0 { 9.0 } else { 0.0 }
+            }),
+            core::array::from_fn(|i| (i as f32 * 0.311).cos() * 0.9),
+            core::array::from_fn(|i| {
+                if i == 200 {
+                    40.0
+                } else {
+                    (i as f32 * 0.07).sin()
+                }
+            }),
+        ];
+        for (g, group) in groups.iter().enumerate() {
+            for n_out in [1, 3, 4, 7, 15] {
+                let (best_scale, best_indices) = mixed_clipsearch(group, n_out);
+                let best_error = mixed_overlay_error(group, best_scale, &best_indices, n_out);
+                let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                for clip in MIXED_CLIP_GRID {
+                    let scale = (clip * amax / 7.0).max(1e-12);
+                    let indices = mixed_overlay_indices(group, scale, n_out);
+                    let error = mixed_overlay_error(group, scale, &indices, n_out);
+                    assert!(
+                        best_error <= error + 1e-6,
+                        "group {g} n_out={n_out}: clip {clip} scores {error} < returned {best_error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A degenerate all-zero group must not divide by zero or return a
+    /// non-finite scale — `amax/7` is 0 there, so every grid point collapses to
+    /// the 1e-12 floor.
+    #[test]
+    fn mixed_clipsearch_survives_a_zero_group() {
+        let group = [0.0f32; 256];
+        let (scale, indices) = mixed_clipsearch(&group, 3);
+        assert!(scale.is_finite() && scale > 0.0, "scale {scale}");
+        assert_eq!(indices.len(), 256);
+        assert!(mixed_overlay_error(&group, scale, &indices, 3).is_finite());
+    }
+
+    /// Same argmin property at G=128. `mixed_clipsearch_is_the_grid_argmin`
+    /// covers G=256 only, and the group size is exactly what changed in the
+    /// origin/master merge: upstream generalised this codec from `[f32; 256]`
+    /// to slices while re-deriving the OLD alternating search. The merge keeps
+    /// the joint search and takes the slice generality, so the smaller group
+    /// needs its own cover or the new size is untested.
+    #[test]
+    fn mixed_clipsearch_is_the_grid_argmin_at_g128() {
+        let group: Vec<f32> = (0..128)
+            .map(|i| (i as f32 * 0.173).sin() * 1.7 + if i % 23 == 0 { 9.0 } else { 0.0 })
+            .collect();
+        for n_out in [1, 3, 7, 15] {
+            let (best_scale, best_indices) = mixed_clipsearch(&group, n_out);
+            assert_eq!(best_indices.len(), 128);
+            let best_error = mixed_overlay_error(&group, best_scale, &best_indices, n_out);
+            let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for clip in MIXED_CLIP_GRID {
+                let scale = (clip * amax / 7.0).max(1e-12);
+                let indices = mixed_overlay_indices(&group, scale, n_out);
+                let error = mixed_overlay_error(&group, scale, &indices, n_out);
+                assert!(
+                    best_error <= error + 1e-6,
+                    "n_out={n_out}: clip {clip} scores {error} < returned {best_error}"
+                );
+            }
         }
     }
 }

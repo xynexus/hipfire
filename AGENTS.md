@@ -110,6 +110,39 @@ the relevant docs under `docs/`.
   gone; if you are staring at an error naming a pid that `ps` does not show,
   run it and read the message again.
 
+### Profiling the daemon with rocprofv3
+
+To get a kernel trace of daemon-side work (serving, calibration, KLD), drive
+the daemon over its **stdin JSON protocol** so it is the profiler's own child
+and exits at EOF:
+
+```sh
+cat > /tmp/req.jsonl <<'EOF'
+{"type":"load","model":"/path/model.hfq","params":{"max_seq":4096}}
+{"type":"kld_eval","mode":"build_ref","corpus":"/path/slice.txt","ref_path":"/tmp/x.kldref.hfq","n_ctx":2048,"max_chunks":1}
+{"type":"unload"}
+EOF
+rocprofv3 --kernel-trace --stats -d /tmp/prof -o run \
+  -- ./target/release/hipfire-daemon < /tmp/req.jsonl
+```
+
+Results land in `/tmp/prof/run_results.db` (SQLite; the `top_kernels` view has
+name/total_calls/total_duration/average/percentage). The three routes that do
+NOT work, so nobody re-derives them:
+
+- `rocprofv3 --attach <pid>` fails with `PTRACE_SEIZE ... Operation not
+  permitted`: `/proc/sys/kernel/yama/ptrace_scope` is `1`, so only descendants
+  of the profiler can be traced.
+- Profiling `hipfire eval` does not capture anything — the GPU work happens in
+  the daemon it spawns, and rocprofv3 does not follow that child.
+- Starting the daemon separately with `--listen` and pointing an eval at it
+  fails too: `hipfire eval` refuses to reuse a running daemon (`FATAL: hipfire
+  daemon already running`).
+
+Beware `pkill -f hipfire-daemon` in a wrapper script: `-f` matches the full
+command line of the shell running it, so it kills its own shell and surfaces as
+a bare `exit 144` with no output. Use `pkill -x hipfire-daemon`.
+
 ## Artifact Names
 
 Canonical artifact shape:

@@ -109,8 +109,11 @@ fn usage() {
          \x20            default: streams into ~/.hipfire/models/models--Org--Name.hfa,\n\
          \x20            encoding as it downloads so the raw checkpoint is never staged.\n\
          \x20            --raw fetches a HuggingFace cache tree instead.\n\
-         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw]\n\
-         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw]\n\
+         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
+         [--only <glob>]\n\
+         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
+         [--only <glob>]\n\
+         \x20            --only restricts the sweep; both read every byte they cover.\n\
          repack --input <hf_dir> --output <archive.hfa>   (lossless, no arch needed)\n\
          repack --input <archive.hfa> --output <hf_dir>   (restore, byte-identical)\n\
          repack --input <archive.hfa> --check             (verify stored checksums)\n\
@@ -613,6 +616,9 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
         None => root.join(archive_name(&repo)),
     };
     let include = val("--include");
+    // Verify and repair read every byte they cover, so restricting them to one
+    // shard is the difference between seconds and hashing the whole repo.
+    let only = val("--only");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -669,7 +675,8 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                 .into());
             }
             "verify" => {
-                let states = hipfire_hub::run::verify(&root, &repo, &revision).await?;
+                let states =
+                    hipfire_hub::run::verify(&root, &repo, &revision, only.as_deref()).await?;
                 let mut good = 0;
                 let mut gitok = 0;
                 let mut bad = 0;
@@ -682,7 +689,19 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                         // Reported apart from a SHA-256 match: the git blob
                         // hash is a real content check but a weaker one.
                         GoodGitOid => gitok += 1,
-                        Corrupt { want, got } => {
+                        Corrupt { want, got, windows } => {
+                            // Naming the windows is the point of recording a
+                            // table: it turns "this shard is wrong" into the
+                            // byte ranges `hub repair` will fetch.
+                            if let Some(w) = windows {
+                                let span: u64 = w.iter().map(|c| c.len).sum();
+                                eprintln!(
+                                    "  {} damaged window(s) in {} — {:.2} MB to refetch",
+                                    w.len(),
+                                    f.path,
+                                    span as f64 / 1e6
+                                );
+                            }
                             bad += 1;
                             eprintln!(
                                 "  CORRUPT {} expected {}… got {}…",
@@ -713,7 +732,7 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                 }
             }
             "repair" => {
-                let n = hipfire_hub::run::repair(&root, &repo, &revision).await?;
+                let n = hipfire_hub::run::repair(&root, &repo, &revision, only.as_deref()).await?;
                 eprintln!("hub: repaired {n} file(s)");
             }
             other => return Err(format!("hub: unknown op {other:?}").into()),

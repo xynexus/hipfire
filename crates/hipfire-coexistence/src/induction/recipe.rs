@@ -73,6 +73,37 @@ pub struct RecipeInputs {
 /// The recipe object built from `inputs`, computed the same way for the
 /// fingerprint and for embedding in the manifest. The corpus SHA-256 is read
 /// from disk (the corpus must exist), matching Python.
+/// Recipe fields that are recorded but NOT hashed.
+///
+/// Every one is a resolved absolute path, and a path says where a thing sits on
+/// one machine rather than what it is. Hashing them made `recipe_fingerprint`
+/// identify a filesystem layout: the same logical recipe fingerprinted
+/// differently on two boxes because a corpus was reached through a symlink or
+/// an HF cache root sat elsewhere. In a repo whose expensive artifacts are
+/// shared over NFS between machines, that is the wrong identity — it defeats
+/// resume across exactly the boundary the share exists to cross.
+///
+/// What identifies the inputs instead is content: `corpus_sha256` already
+/// pins the corpus, and the corpus is git-tracked, so the fingerprint is now
+/// reproducible anywhere the repo is.
+///
+/// KNOWN GAP, deliberate: with `model` unhashed, two runs that differ ONLY by
+/// which model they point at now share a fingerprint. Closing that wants a
+/// cheap content identity for a model directory (an index digest, not a
+/// 244 GB payload hash) — worth doing, but it is a separate change, and the
+/// alternative of hashing the path is a worse answer than no answer.
+///
+/// Must stay in lockstep with `_UNHASHED_PATH_FIELDS` in
+/// `scripts/two_pass_quantize.py`; the two fingerprints must agree byte for
+/// byte or resume gating diverges silently.
+const UNHASHED_PATH_FIELDS: [&str; 5] = [
+    "cask_artifact",
+    "calibration_artifact",
+    "corpus",
+    "model",
+    "quantized_artifact",
+];
+
 pub struct Recipe {
     /// Sorted key→value map. Serialized directly (a `BTreeMap`, so key order is
     /// stable irrespective of serde_json's crate-wide `preserve_order`).
@@ -137,7 +168,16 @@ impl Recipe {
         // Canonical encoding: sorted keys (BTreeMap), compact separators — the
         // serde_json default compact form is `{"a":1,...}` with no spaces, the
         // twin of Python `separators=(",", ":")`.
-        let encoded = serde_json::to_vec(&fields).expect("recipe encodes");
+        //
+        // Path fields are EXCLUDED from the hash (see `UNHASHED_PATH_FIELDS`).
+        // They remain in `fields`, so the manifest still records where
+        // everything lived; they just stop deciding the fingerprint.
+        let hashed: BTreeMap<&str, &Value> = fields
+            .iter()
+            .filter(|(key, _)| !UNHASHED_PATH_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        let encoded = serde_json::to_vec(&hashed).expect("recipe encodes");
         let recipe_fingerprint = format!("sha256:{}", sha256_hex(&encoded));
         Ok(Self {
             fields,
@@ -209,8 +249,40 @@ mod tests {
         let recipe = Recipe::build(&inputs).unwrap();
         assert_eq!(
             recipe.recipe_fingerprint,
-            "sha256:07d1c8eae61a4ed5c511e4e8c2e4fd3a4bc65368134baece8659ab05d56d2c9e"
+            "sha256:70dbbe3e2cfd58967fb0449c3f4c7ce51504670a7a6d4c723d91b6e13c5d1cf3"
         );
+
+        // The paths above are this machine's. Point every one of them somewhere
+        // else and the fingerprint must not move — that is the whole reason the
+        // path fields left the hash. Previously this assertion was impossible:
+        // the golden encoded nix1's filesystem, so the test failed on any box
+        // where a path resolved differently (here, a symlinked corpus).
+        let elsewhere = RecipeInputs {
+            model: PathBuf::from("/some/other/box/models/Qwen3.5-0.8B"),
+            calib: PathBuf::from("/elsewhere/Qwen3.5-0.8B.calib.hfq"),
+            output: PathBuf::from("/elsewhere/Qwen3.5-0.8B.oq4.25++.hfq"),
+            // Same corpus CONTENT reached by its non-symlinked path.
+            corpus: PathBuf::from("/home/sadara/.hipfire/src/benchmarks/calib/calib-5m.txt"),
+            ..inputs
+        };
+        assert_eq!(
+            Recipe::build(&elsewhere).unwrap().recipe_fingerprint,
+            recipe.recipe_fingerprint,
+            "recipe_fingerprint must identify the recipe, not the filesystem"
+        );
+
+        // The manifest still records where everything was — dropping the paths
+        // from the HASH must not drop them from the provenance record.
+        let manifest = recipe.as_manifest_fields();
+        for key in UNHASHED_PATH_FIELDS {
+            if key == "cask_artifact" {
+                continue; // only present when a CASK output was requested
+            }
+            assert!(
+                manifest.contains_key(key),
+                "{key} must stay in the manifest even though it is unhashed"
+            );
+        }
     }
 
     #[test]

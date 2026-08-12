@@ -534,6 +534,13 @@ pub struct Qwen35Scratch {
     // non-deterministic wavefront-order-dependent FP rounding under hipGraph
     // replay (task #100).
     pub moe_down_expanded: Option<GpuTensor>,
+    // Per-slot rotated gate_up input — [k × dim] f32, the mirror of
+    // `moe_down_expanded` on the input side. The indexed OQ gate_up GEMVs read
+    // one rotated basis PER (token, krank) because routed experts carry
+    // different AWQ scales; `moe_x_rot` holds only the shared single-basis
+    // rotation and cannot serve them. Written by
+    // `rotate_x_mq_awq_indexed_batched`.
+    pub moe_x_rot_expanded: Option<GpuTensor>,
     // Mixed paged-expert decode uses one tile-sized bucket at a time so the
     // launch dtype matches that expert's pointer layout. Persistent scratch
     // keeps the decode path allocation-free and works for K=8 and K=10.
@@ -692,6 +699,7 @@ impl Qwen35Scratch {
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            moe_x_rot_expanded: None,
             moe_bucket_sorted: None,
             moe_bucket_inverse: None,
             moe_bucket_tile_ids: None,
@@ -729,6 +737,7 @@ impl Qwen35Scratch {
                 s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Atomic-free decode MoE down output: [k × dim].
                 s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
+                s.moe_x_rot_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
                 s.moe_bucket_sorted = Some(gpu.alloc_tensor(&[16 * 4], DType::Raw)?);
                 s.moe_bucket_inverse = Some(gpu.alloc_tensor(&[k * 4], DType::Raw)?);
                 s.moe_bucket_tile_ids = Some(gpu.alloc_tensor(&[4], DType::Raw)?);
@@ -811,6 +820,7 @@ impl Qwen35Scratch {
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
+            self.moe_x_rot_expanded,
             self.moe_bucket_sorted,
             self.moe_bucket_inverse,
             self.moe_bucket_tile_ids,
@@ -1150,18 +1160,32 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32 | DType::F16
+        // BF16 was excluded on gfx1151 by the BUG-001 guard: the batched
+        // FullAttention BF16 q/k/v projection was reported to inflate `fa_q`
+        // ~9x there, so BF16 prefill was routed through the per-token
+        // `forward_scratch` loop and described as "slightly slower".
+        //
+        // That failure no longer reproduces, and "slightly" was off by a factor
+        // of 28. Re-tested on gfx1151 / qwen3.5-0.8b bf16, 2048-token chunk:
+        // prefill 58.5 -> 1646.3 tok/s, PPL 24.0318 -> 24.0551, top-1 argmax
+        // agreeing at 99.36%. Nothing resembling layer-0 garbage. The llama
+        // analogue (BUGS.md, "Batched prefill garbage for bf16/f16 llama
+        // models") was root-caused to missing BF16 projection arms rather than
+        // an attention-kernel fault and fixed; this reads as the same defect,
+        // and the guard outlived it.
+        //
+        // CAVEAT, deliberately accepted: the batched path is not numerically
+        // identical to per-token. Typical |delta logit| is ~6e-2 (max 2.4e-1)
+        // against ~4e-6 for pure reordering, and only 15% of positions keep the
+        // same top-256 set. The deltas are flat across position (5.99e-2 first
+        // half vs 6.60e-2 second), so this is a per-position path difference —
+        // most likely q8 KV scales taken per-tile in the batched attention
+        // versus per-token in the fallback — not accumulating drift. Anything
+        // that needs the two to agree bit-for-bit must pin the path explicitly.
+        | DType::BF16
     );
     if always_ok {
         return true;
-    }
-    // BUG-001 guard: the batched FullAttention BF16 q/k/v projection inflates
-    // `fa_q` ~9x on gfx1151 → garbage output (q8/asym KV enables the batched
-    // arm). F16/F32 batched are fine; only BF16 is broken on this arch. Route
-    // BF16 prefill through the per-token forward_scratch path here (correct,
-    // slightly slower) until the batched-arm projection is fixed; gfx1103 et al.
-    // keep the fast batched path. See BUGS.md / trigger a21dccf75.
-    if dt == DType::BF16 {
-        return arch != "gfx1151";
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
@@ -1822,14 +1846,10 @@ fn moe_decode_dispatch_flags_for_dtypes(
 }
 
 fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
-    // HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 re-enables the experimental indexed
-    // routed OQ decode kernels while debugging their finite-KLD failure.
-    matches!(
-        std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("on")
-    )
+    // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
+    // falls back. One shared parse — this must agree with the loader's
+    // MoE-block repack or the dispatch runs against un-repacked weights.
+    hipfire_dispatch::families::moe::oq_indexed_decode_enabled()
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
@@ -4177,20 +4197,25 @@ mod tests {
         }
     }
 
+    /// gfx1151 is in this list now, not excluded from it.
+    ///
+    /// The BUG-001 guard that kept BF16 dense prefill off gfx1151's batched
+    /// projection path was retired in `22d0d2825`, with the measurement in the
+    /// comment on `is_batchable_la`: prefill 58.5 -> 1646.3 tok/s, PPL 24.0318
+    /// -> 24.0551, top-1 argmax agreeing at 99.36%, no layer-0 garbage. The
+    /// assertion that gfx1151 must NOT be batchable outlived the guard it was
+    /// written to protect and had been failing CI ever since.
     #[test]
     fn dense_prefill_bf16_is_batchable_in_qwen35() {
         for arch in [
-            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201", "gfx942",
+            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+            "gfx942",
         ] {
             assert!(
                 is_batchable_la(DType::BF16, arch),
                 "BF16 dense prefill must stay on the batched BF16 WMMA-capable path on {arch}"
             );
         }
-        assert!(
-            !is_batchable_la(DType::BF16, "gfx1151"),
-            "BUG-001 keeps BF16 dense prefill off the broken gfx1151 batched projection path"
-        );
     }
 
     #[test]

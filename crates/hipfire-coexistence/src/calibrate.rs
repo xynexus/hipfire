@@ -286,7 +286,7 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
         job,
         source_manifest,
     } = build_calibration_run_inputs(&command)?;
-    let inspection = adapter.inspect(&source)?;
+    let inspection = adapter.inspect(source.as_ref())?;
     inspection.validate()?;
     // CASK-only skips capture: the calibration artifact is scratch, only the
     // TriAttn tap output matters. The engine mirrors this internally; the CLI
@@ -306,7 +306,7 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
     } else {
         None
     };
-    let tensor_plan = TensorLoadPlan::build(&source, inspection.tensor_requests.clone())?;
+    let tensor_plan = TensorLoadPlan::build(source.as_ref(), inspection.tensor_requests.clone())?;
     let geometry = resolve_geometry(&job)?;
     let resource_estimate = adapter.resource_estimate(&inspection, &job, geometry)?;
     let engine_build = calibration_engine_build_identity()?;
@@ -315,7 +315,7 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
     let mut dry_run = dry_run_report(
         &command,
         &snapshot,
-        &source,
+        source.as_ref(),
         adapter_family,
         adapter_version,
         &inspection,
@@ -405,7 +405,7 @@ pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value,
             command.residual_probe_output.clone(),
             command.residual_probe_rows,
         )
-        .run(adapter.as_mut(), &source, &mut gpu, &job);
+        .run(adapter.as_mut(), source.as_ref(), &mut gpu, &job);
     let cask_state = command
         .cask_output
         .as_ref()

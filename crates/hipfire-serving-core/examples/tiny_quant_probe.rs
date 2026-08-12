@@ -179,10 +179,13 @@ fn main() {
                 .expect("real-load proof currently wired for llama only");
             let vocab = fwd.kld_vocab_size();
             let (mut n_scored, mut n_finite) = (0usize, 0usize);
-            fwd.forward_chunk_scored(&mut gpu, &ids, 0, &mut |_j, lg, _next| {
-                n_scored += 1;
-                if lg.len() == vocab && lg.iter().all(|x| x.is_finite()) {
-                    n_finite += 1;
+            fwd.forward_chunk_scored(&mut gpu, &ids, 0, &mut |w| {
+                for i in 0..w.rows() {
+                    let lg = w.row(i);
+                    n_scored += 1;
+                    if lg.len() == vocab && lg.iter().all(|x| x.is_finite()) {
+                        n_finite += 1;
+                    }
                 }
             })
             .unwrap_or_else(|e| {

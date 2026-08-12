@@ -253,9 +253,20 @@ fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight,
                 .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
             Some((buf, dtype))
         } else if let Some(dtype) = linear_dtype(qt) {
-            let buf = gpu
+            let mut buf = gpu
                 .upload_raw(&data, &[data.len()])
                 .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
+            // A source-precision weight really is `[m, k]` of `dtype`, not an
+            // opaque byte blob. Saying so lets the batched `weight_gemm` WMMA
+            // path accept it — that path asserts the weight tensor's dtype, and
+            // an untagged `Raw` buffer trips the assert. `byte_size()` is
+            // identical either way (m*k*2 == data.len()). Genuinely packed
+            // quant formats stay `Raw`, since for those the byte blob IS the
+            // representation.
+            if matches!(dtype, DType::BF16 | DType::F16) {
+                buf.dtype = dtype;
+                buf.shape = vec![m, k];
+            }
             Some((buf, dtype))
         } else {
             None
@@ -639,6 +650,20 @@ pub struct GpuTrace {
 
 /// gemv over a sequence: `y[s,m] = x[s,k] @ w[m,k]^T` (per-token gemv loop,
 /// f32 or quantized via [`LinearWeight`]).
+/// `y[s, m] = x[s, k] · Wᵀ` over a whole sequence.
+///
+/// This was a per-token GEMV loop, which made every multi-token forward re-read
+/// the ENTIRE weight matrix once per token — about 37 MB per token per layer on
+/// zaya1-8b, so a 32k-token calibration capture moved ~48 TB of weight traffic
+/// and issued ~26M kernel launches. That is why prefill ran at decode speed
+/// (~31 tok/s) in all three multi-token forwards (calib, prefill, serve).
+/// `x` is already contiguous `[s, k]` and `y` is `[s, m]`, which is exactly the
+/// layout `weight_gemm` wants, so batching is a straight substitution.
+///
+/// CAPTURE IS OWNED HERE, exactly once per call, in both branches:
+/// `weight_gemm` taps internally (at its own wrapper for quantized dtypes, or
+/// inside `gemm_bf16_x_bf16_wmma_labeled` for BF16). Callers must NOT tap as
+/// well — doing so doubles every Hessian and imatrix, silently.
 fn gemv_seq(
     gpu: &mut Gpu,
     w: &LinearWeight,
@@ -648,6 +673,15 @@ fn gemv_seq(
     m: usize,
     k: usize,
 ) -> Result<(), String> {
+    if let LinearWeight::Quant(wt) = w {
+        if s > 1 {
+            return hipfire_runtime::weights::weight_gemm(gpu, wt, x, y, s)
+                .map_err(|e| format!("zaya gemm [{s}x{k}]->[{s}x{m}]: {e:?}"));
+        }
+    }
+    // Decode (s == 1) keeps the GEMV path bit-for-bit, and F32 weights have no
+    // batched entrypoint here. Neither taps downstream, so tap here instead.
+    gpu.maybe_capture_activation(w.buf(), x, s, k);
     for t in 0..s {
         let xt = x.sub_offset(t * k, k);
         let yt = y.sub_offset(t * m, m);
@@ -1259,10 +1293,6 @@ pub fn gpu_forward_calib(
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
             .map_err(|e| format!("{e:?}"))?;
         // capture the q/k/v projection inputs (all = post-input-norm hidden).
-        gpu.maybe_capture_activation(lw.q_proj.buf(), &normed, s, h);
-        gpu.maybe_capture_activation(lw.k_proj.buf(), &normed, s, h);
-        gpu.maybe_capture_activation(lw.v_cur.buf(), &normed, s, h);
-        gpu.maybe_capture_activation(lw.v_del.buf(), &normed, s, h);
         gemv_seq(gpu, &lw.q_proj, &normed, &q, s, q_dim, h)?;
         gemv_seq(gpu, &lw.k_proj, &normed, &k, s, k_dim, h)?;
         gemv_seq(gpu, &lw.v_cur, &normed, &vcur, s, v_half, h)?;
@@ -1313,7 +1343,6 @@ pub fn gpu_forward_calib(
             .map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gqa_attn_f32(&ctx, &query, &key, &value, s, nq, nkv, hd, attn_scale)
             .map_err(|e| format!("{e:?}"))?;
-        gpu.maybe_capture_activation(lw.o_proj.buf(), &ctx, s, q_dim);
         gemv_seq(gpu, &lw.o_proj, &ctx, &attn_out, s, h, q_dim)?;
         gpu.zaya_affine_residual_f32(
             &g_res2,
@@ -1330,7 +1359,6 @@ pub fn gpu_forward_calib(
         gpu.rmsnorm_f32(&g_res2, &lw.post_attn_ln, &normed, eps)
             .map_err(|e| format!("{e:?}"))?;
         // MoE: capture the router projections (dense); experts run but aren't captured.
-        gpu.maybe_capture_activation(lw.down_proj_w.buf(), &normed, s, h);
         gemv_seq(gpu, &lw.down_proj_w, &normed, &rhid, s, rh, h)?;
         gpu.zaya_bias_add_f32(&rhid, &lw.down_proj_b, rh, s * rh)
             .map_err(|e| format!("{e:?}"))?;
@@ -1344,19 +1372,16 @@ pub fn gpu_forward_calib(
             .map_err(|e| format!("{e:?}"))?;
         gpu.rmsnorm_f32(&rhid, &lw.rnorm_w, &rnormed, eps)
             .map_err(|e| format!("{e:?}"))?;
-        gpu.maybe_capture_activation(lw.fc1_w.buf(), &rnormed, s, rh);
         gemv_seq(gpu, &lw.fc1_w, &rnormed, &a1, s, rh, rh)?;
         gpu.zaya_bias_add_f32(&a1, &lw.fc1_b, rh, s * rh)
             .map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gelu_exact_f32(&a1, s * rh)
             .map_err(|e| format!("{e:?}"))?;
-        gpu.maybe_capture_activation(lw.fc2_w.buf(), &a1, s, rh);
         gemv_seq(gpu, &lw.fc2_w, &a1, &a2, s, rh, rh)?;
         gpu.zaya_bias_add_f32(&a2, &lw.fc2_b, rh, s * rh)
             .map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gelu_exact_f32(&a2, s * rh)
             .map_err(|e| format!("{e:?}"))?;
-        gpu.maybe_capture_activation(lw.out_proj_w.buf(), &a2, s, rh);
         gemv_seq(gpu, &lw.out_proj_w, &a2, &rlogits, s, n_route, rh)?;
         let logit_host = gpu.download_f32(&rlogits).map_err(|e| format!("{e:?}"))?;
         gpu.fill_f32(&moe_out, 0.0).map_err(|e| format!("{e:?}"))?;
@@ -1416,8 +1441,13 @@ pub fn gpu_forward_calib(
 
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
-    // capture the tied lm_head input (no gemv needed for the imatrix/Hessian).
-    gpu.maybe_capture_activation(w.embed.buf(), &fnorm, s, h);
+    // Capture the tied lm_head input. Normally there is no gemv to hang it off
+    // — the imatrix/Hessian only needs the activation — but under `--kldref`
+    // the lm-head gemv below DOES run, and `gemv_seq` now owns capture for it.
+    // Tapping in both places would double this tensor's statistics.
+    if kldref_topk.is_none() {
+        gpu.maybe_capture_activation(w.embed.buf(), &fnorm, s, h);
+    }
 
     // Optional KLDREF: run the tied lm-head to get logits [s, vocab], then keep
     // only the per-position logZ + top-k (a compact bf16 reference). The full

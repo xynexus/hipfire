@@ -523,86 +523,6 @@ fn clipsearch_plain(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
-/// Rank group positions by how much promoting them from int4 to int8 reduces
-/// squared error. The top `n_out` become the sparse overlay.
-fn mixed_overlay_indices_plain(group: &[f32; 256], scale: f32) -> [usize; 256] {
-    let inv = 1.0 / scale.max(1e-12);
-    let gain = |index: usize| -> f32 {
-        let value = group[index];
-        let q4 = (value * inv).round().clamp(-7.0, 7.0);
-        let q8 = (value * inv).round().clamp(-127.0, 127.0);
-        let e4 = value - q4 * scale;
-        let e8 = value - q8 * scale;
-        e4 * e4 - e8 * e8
-    };
-    let mut indices: [usize; 256] = core::array::from_fn(|i| i);
-    indices.sort_unstable_by(|&l, &r| {
-        gain(r)
-            .partial_cmp(&gain(l))
-            .unwrap_or(core::cmp::Ordering::Equal)
-    });
-    indices
-}
-
-/// SSE of the mixed encoding: outlier slots clamp to int8, the rest to int4.
-fn mixed_overlay_error_plain(
-    group: &[f32; 256],
-    scale: f32,
-    indices: &[usize; 256],
-    n_out: usize,
-) -> f32 {
-    let inv = 1.0 / scale.max(1e-12);
-    let mut is_w8 = [false; 256];
-    for &index in &indices[..n_out] {
-        is_w8[index] = true;
-    }
-    group
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| {
-            let limit = if is_w8[index] { 127.0 } else { 7.0 };
-            let q = (value * inv).round().clamp(-limit, limit);
-            let e = value - q * scale;
-            e * e
-        })
-        .sum()
-}
-
-/// Refit the scale knowing which slots will be int8 — a wider grid than the
-/// int4-only search, because outliers no longer force the scale up.
-fn refit_mixed_scale_plain(
-    group: &[f32; 256],
-    indices: &[usize; 256],
-    n_out: usize,
-    fallback: f32,
-) -> f32 {
-    const CLIP_GRID: [f32; 14] = [
-        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
-    ];
-    let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let mut best_scale = fallback.max(1e-12);
-    let mut best_error = mixed_overlay_error_plain(group, best_scale, indices, n_out);
-    for clip in CLIP_GRID {
-        let scale = (clip * amax / 7.0).max(1e-12);
-        let error = mixed_overlay_error_plain(group, scale, indices, n_out);
-        if error < best_error {
-            best_scale = scale;
-            best_error = error;
-        }
-    }
-    best_scale
-}
-
-/// Joint scale/overlay selection: clip-search, pick outliers, refit, repeat once.
-fn mixed_clipsearch_plain(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
-    let s0 = clipsearch_plain(group, 7.0);
-    let i0 = mixed_overlay_indices_plain(group, s0);
-    let s1 = refit_mixed_scale_plain(group, &i0, n_out, s0);
-    let i1 = mixed_overlay_indices_plain(group, s1);
-    let s2 = refit_mixed_scale_plain(group, &i1, n_out, s1);
-    (s2, i1)
-}
-
 /// Number of int8 overlay slots per 256-group for a requested mixed bit-width.
 ///
 /// Base cost is 4.0625 b/w (130 B/group = f16 scale + 128 nibbles); each overlay
@@ -718,7 +638,7 @@ fn quantize_oq4_mixed_plain(f32_data: &[f32], n_out: usize) -> Vec<u8> {
         let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
 
-        let (scale, idx) = mixed_clipsearch_plain(&group, n_out);
+        let (scale, idx) = hipfire_quantize::codecs::mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
         let out_off = b * block_bytes;
         let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);

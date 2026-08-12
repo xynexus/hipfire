@@ -1025,7 +1025,7 @@ impl CalibrationFamilyAdapter for Qwen35CalibrationAdapter {
             &[model.vocab_size, model.hidden_width],
             "embedding",
         )?;
-        let values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
+        let values = source_payload_f32(view.info.dtype.as_str(), &view.bytes)?;
         if values.len() != model.vocab_size * model.hidden_width {
             return Err(CalibError::InvalidSourcePlan(
                 "embedding payload length does not match its declared shape".into(),
@@ -1725,6 +1725,11 @@ fn load_streamed_moe_ffn(
             shared_expert_gate: pending.take_weight(shared_expert_gate),
             expert_gate_up_ptrs: pending.take_tensor(expert_gate_up_ptrs),
             expert_down_ptrs: pending.take_tensor(expert_down_ptrs),
+            // Calibration aliases slab weights and never AWQ-pre-scales them,
+            // so there is no per-expert scale to divide by and the plain
+            // rotation is correct.
+            expert_gate_up_awq_ptrs: None,
+            expert_down_awq_ptrs: None,
             layer_idx: layer as u16,
             expert_shape: None,
             expert_gate_up_dtype: Some(dtype),

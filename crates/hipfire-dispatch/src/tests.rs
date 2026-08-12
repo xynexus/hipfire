@@ -854,7 +854,7 @@ fn moe_res_mq6_routed_indexable() {
 }
 
 #[test]
-fn moe_res_oq_routed_defaults_to_cpu_fallback() {
+fn moe_res_oq_routed_opted_out_falls_back_to_cpu() {
     let mut d = dtypes_all_mq4();
     d.routed_gate_up = DType::Oq8G256;
     d.routed_down = DType::Oq8G256;
@@ -862,6 +862,20 @@ fn moe_res_oq_routed_defaults_to_cpu_fallback() {
     assert!(!r.routed_indexable_oq8);
     assert!(!r.use_gpu_topk);
     assert!(r.needs_x_rot_local);
+}
+
+/// The default INVERTED on 2026-08-12 (per-expert AWQ rotation fixed), so unset
+/// now means enabled. Asserted against the pure parse rather than the env so it
+/// cannot race a parallel test runner.
+#[test]
+fn moe_oq_indexed_is_on_unless_explicitly_disabled() {
+    use crate::families::moe::oq_indexed_decode_enabled_from;
+    assert!(oq_indexed_decode_enabled_from(None));
+    assert!(oq_indexed_decode_enabled_from(Some("")));
+    assert!(oq_indexed_decode_enabled_from(Some("1")));
+    assert!(oq_indexed_decode_enabled_from(Some("on")));
+    assert!(!oq_indexed_decode_enabled_from(Some("0")));
+    assert!(!oq_indexed_decode_enabled_from(Some("off")));
 }
 
 #[test]

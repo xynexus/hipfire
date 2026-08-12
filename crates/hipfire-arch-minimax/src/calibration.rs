@@ -91,15 +91,20 @@ pub fn collect_calibration_artifacts(
         vec![".block_sparse_moe.experts.".to_string()],
         output,
         &static_meta,
-        |gpu| {
-            let mut state =
-                MiniMaxState::new(gpu, config).map_err(|e| format!("minimax calib state: {e}"))?;
+        &[tokens],
+        |gpu, sequences| {
             let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-            for (pos, &tok) in tokens.iter().enumerate() {
-                let logits = decode_step(config, weights, &mut state, gpu, tok, pos as u32)
-                    .map_err(|e| format!("minimax calib decode: {e}"))?;
-                if opts.kldref {
-                    kldref.push((logsumexp(&logits), topk_logits(&logits, opts.kldref_topk)));
+            for seq in sequences {
+                // Fresh state and positions from 0 per sequence — that is what
+                // makes them independent contexts rather than one long one.
+                let mut state = MiniMaxState::new(gpu, config)
+                    .map_err(|e| format!("minimax calib state: {e}"))?;
+                for (pos, &tok) in seq.iter().enumerate() {
+                    let logits = decode_step(config, weights, &mut state, gpu, tok, pos as u32)
+                        .map_err(|e| format!("minimax calib decode: {e}"))?;
+                    if opts.kldref {
+                        kldref.push((logsumexp(&logits), topk_logits(&logits, opts.kldref_topk)));
+                    }
                 }
             }
             let extra_tensors = kldref_extra(&kldref);

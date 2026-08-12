@@ -95,6 +95,9 @@ fn dispatch_moe_gate_up(
                 hidden,
                 k_top,
                 batch,
+                // Shared [N × K] activation: this loader builds no per-expert
+                // AWQ scale table, so there is nothing to select per slot.
+                false,
             )
             .map_err(|e| format!("lfm2moe L{l}: gate_up(oq4): {e:?}")),
         DType::Oq8G256 => gpu
@@ -108,6 +111,7 @@ fn dispatch_moe_gate_up(
                 hidden,
                 k_top,
                 batch,
+                false, // shared [N × K] activation — see the oq4 arm
             )
             .map_err(|e| format!("lfm2moe L{l}: gate_up(oq8): {e:?}")),
         other => Err(format!(

@@ -265,6 +265,50 @@ env_vars! {
          (`mq6`, `mq4`, `mq3-lloyd`), leaving `w1`/`w3` at the base format. The \
          forward dispatches each on its own dtype, so they may differ.";
 
+    CALIB_ALLOW_EVAL_CORPUS = "HIPFIRE_CALIB_ALLOW_EVAL_CORPUS", Developer,
+        "Set 1 to allow calibrating on the frozen evaluation slice under \
+         `benchmarks/quality-baselines/`, which is otherwise refused. Doing so \
+         trains on the test set: it inflates every quality number and produces \
+         an inverted-U budget curve, because a calibration that has seen \
+         exactly the evaluated tokens scores best. The only honest use is \
+         deliberately measuring the size of that effect.";
+
+    CALIB_SEQ_LEN = "HIPFIRE_CALIB_SEQ_LEN", Developer,
+        "Split the calibration token stream into independent sequences of this \
+         length instead of one long sequence. Attention is O(seq²), so a single \
+         long sequence makes capture superlinear in the token budget (8192 -> \
+         32768 tokens measured 747s -> 10659s). A Hessian is a sum of per-row \
+         outer products and does not care whether rows came from one context or \
+         many, and KLD references are built at n_ctx=2048, so 2048 matches the \
+         evaluation distribution. Unset keeps the single-sequence behaviour.";
+
+    LDLQ_SKIP_EXPERT_LEAVES = "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", Developer,
+        "Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose \
+         tensors skip `--ldlq` even when the calibration carries a Hessian for \
+         them. Exists so ONE calibration artifact can produce both arms of a \
+         per-expert-Hessian comparison, which keeps the arms differing only in \
+         the thing under test instead of in their capture.";
+
+    CALIB_IMATRIX_ONLY = "HIPFIRE_CALIB_IMATRIX_ONLY", Developer,
+        "Comma-separated substrings whose tensors capture only an imatrix \
+         (diagonal) rather than a full [K,K] Hessian, overriding the arch \
+         default of `.experts.`. Empty string captures a full Hessian for \
+         everything. `.gate_up_proj` blocks the expensive K=hidden expert \
+         gate/up (which pools instead) while capturing per-expert `down_proj`, \
+         whose K is the MoE intermediate width and so stays affordable. \
+         Raises GPU residency during capture — one [K,K] f32 per captured \
+         tensor. See `docs/quant-formats/moe-expert-hessians.md`.";
+
+    POOLED_EXPERT_HESSIAN = "HIPFIRE_POOLED_EXPERT_HESSIAN", Developer,
+        "Set 1 to let a routed MoE expert's gate/up projection borrow the \
+         LAYER-POOLED Hessian under `--ldlq` when it has none of its own. \
+         Routed experts are captured imatrix-only, so `--ldlq` otherwise logs \
+         `ldlq: skip` and RTN-quantizes every one of them. Only gate/up borrow: \
+         they read the layer-shared FFN input, while `down_proj`/`w2` read that \
+         expert's own SwiGLU intermediate, whose per-expert bases measured \
+         near-orthogonal. The donor must match K exactly. See \
+         `docs/quant-formats/moe-expert-hessians.md`.";
+
     GPTQ_DAMPING = "HIPFIRE_GPTQ_DAMPING", Developer,
         "Sequential GPTQ error-feedback damping for the MQ2 Lloyd path. At 0 \
          (the default) the pass is a no-op and output is byte-identical to \

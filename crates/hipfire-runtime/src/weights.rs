@@ -383,8 +383,10 @@ mod preflight_tests {
 #[inline]
 fn capture_at_weight_gemv_wrapper(dtype: DType) -> bool {
     // Full-precision GEMV routes terminate in capture-aware RDNA entrypoints:
-    // BF16 in `gemm_bf16_x_bf16_wmma_labeled`, F16 in
-    // `gemm_f16_batched_lmhead`. Keeping wrapper capture enabled for either
+    // BF16 in `gemv_bf16_xf32` (batch 1) or `gemm_bf16_x_bf16_wmma_labeled`
+    // (batched), F16 in `gemv_f16_xf32` / `gemm_f16_batched_lmhead`. The bf16
+    // batch-1 tap was missing until 2026-08-07, which cost every bf16-sourced
+    // calib its `mlp.down_proj` Hessian. Keeping wrapper capture enabled for either
     // would count each activation twice. Quantized routes have no universal
     // lower-level chokepoint and remain owned here.
     !matches!(dtype, DType::BF16 | DType::F16)
@@ -1375,6 +1377,21 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
+        // Without this the packed head fell through to the per-column fallback
+        // below, which reads the whole 367 MB payload once per column — 62% of
+        // GPU time in a KLD reference build.
+        //
+        // Two kernels, split by batch. The cooperative-decode WMMA form wins
+        // everywhere batched (measured vs plain BF16 at N=256: lm_head 1.46x
+        // against the scalar form's 2.31x, dn_qkv 1.25x against 2.28x) and at
+        // N=64 it is FASTER than plain BF16 (0.57-0.68x) — same WMMA compute,
+        // 1.38x fewer weight bytes. The scalar form still edges it at batch-1
+        // (0.55x vs 0.67x on an lm_head), which is where a stray small call
+        // lands; true batch-1 goes through `weight_gemv` instead.
+        DType::Bf16L3 if batch_size >= 16 => {
+            gpu.gemm_bf16l3_wmma_coop(&w.buf, x, y, w.m, w.k, batch_size)
+        }
+        DType::Bf16L3 => gpu.gemm_bf16l3_xf32(&w.buf, x, y, w.m, w.k, batch_size),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),

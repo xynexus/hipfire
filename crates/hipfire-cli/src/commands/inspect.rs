@@ -53,21 +53,307 @@ const SHAPE_FIELDS: &[(&str, &str)] = &[
 
 pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let path = resolve(&args.target, &loaded)?;
-    let hfq = HfqFile::open_index_only(&path)
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
+    let hfq = HfqFile::open_index_only(&path).map_err(|e| {
+        // An .hfa is an HFAR archive of a HuggingFace directory, not an HFQM
+        // container, so the raw "not an HFQM container at offset 0" leaks an
+        // internal detail and names no way forward.
+        if is_hfar_archive(&path) {
+            anyhow::anyhow!(
+                "{} is an HFAR archive, not an .hfq container. It holds a HuggingFace \
+                 source directory; restore it first with `hipfire-coexistence repack \
+                 --input {} --output <hf_dir>`.",
+                path.display(),
+                path.display(),
+            )
+        } else {
+            anyhow::anyhow!("failed to open {}: {e}", path.display())
+        }
+    })?;
 
     let meta: Value = serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| json!({}));
     let components = component_summary(&meta)?;
+    // A calibration artefact carries arch 0 in its HFQM header and the real one
+    // in `source_arch_id`; trusting the header prints "arch: 0 (llama)" for a
+    // qwen35 calib, which is not merely uninformative but wrong.
+    let arch_id = calib_source_arch_id(&meta).unwrap_or(hfq.arch_id);
     let arch_name = hipfire_archs::registry()
-        .get(ArchId(hfq.arch_id as u16))
+        .get(ArchId(arch_id as u16))
         .map(|a| a.family);
 
     if args.json {
-        print_json(&args.target, &path, &hfq, &meta, arch_name, &components);
+        print_json(
+            &args.target,
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            &components,
+        );
     } else {
-        print_human(&path, &hfq, &meta, arch_name, args.tensors, &components);
+        print_human(
+            &path,
+            &hfq,
+            &meta,
+            arch_id,
+            arch_name,
+            args.tensors,
+            &components,
+        );
     }
     Ok(())
+}
+
+/// True when the file begins with an HFAR archive magic (`repack.rs`).
+fn is_hfar_archive(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && (&magic == b"HFAR0002" || &magic == b"HFAR0001")
+}
+
+/// One captured projection, aggregated across layers.
+struct CalibProjection {
+    /// Projection path with the layer index and any expert index elided,
+    /// e.g. `mlp.experts.*.down_proj`.
+    name: String,
+    layers: std::collections::BTreeSet<u32>,
+    n_hessian: usize,
+    n_imatrix: usize,
+    /// K (input width) seen for this projection; a Hessian is K x K.
+    k: Option<u32>,
+    /// Token counts across every tensor of this projection, sorted. Collected
+    /// per BASE name so a tensor contributes once, not once per artifact kind.
+    tokens: Vec<u64>,
+    counted: std::collections::BTreeSet<String>,
+}
+
+/// Split a calibration tensor name into (projection, layer, artifact kind).
+/// `model.language_model.layers.7.mlp.experts.3.down_proj.hessian`
+///   -> ("mlp.experts.*.down_proj", Some(7), "hessian")
+fn split_calib_tensor(name: &str) -> (String, Option<u32>, &str) {
+    let (base, kind) = match name.rsplit_once('.') {
+        Some((b, k @ ("hessian" | "imatrix"))) => (b, k),
+        _ => (name, ""),
+    };
+    // Everything after `layers.<N>.` is the projection; before it is the model
+    // prefix, which varies by arch (`model.`, `model.language_model.`).
+    let (layer, proj) = match base.split_once(".layers.") {
+        Some((_, rest)) => match rest.split_once('.') {
+            Some((idx, proj)) => (idx.parse::<u32>().ok(), proj),
+            None => (None, rest),
+        },
+        None => (None, base),
+    };
+    // Collapse per-expert captures so a 512-expert MoE reports one row.
+    let mut out = String::with_capacity(proj.len());
+    let mut parts = proj.split('.').peekable();
+    while let Some(p) = parts.next() {
+        if p.parse::<u32>().is_ok() {
+            out.push('*');
+        } else {
+            out.push_str(p);
+        }
+        if parts.peek().is_some() {
+            out.push('.');
+        }
+    }
+    (out, layer, kind)
+}
+
+/// Aggregate the tensor index of a calibration artefact into per-projection
+/// coverage. This is what answers "is this calib complete" — the question that
+/// otherwise needs an ad-hoc script over `--json`.
+fn calib_projections(hfq: &HfqFile, meta: &Value) -> Vec<CalibProjection> {
+    use std::collections::BTreeMap;
+    let tokens_by_tensor = meta_get(meta, "per_tensor_tokens").and_then(|v| v.as_object());
+    let mut by_proj: BTreeMap<String, CalibProjection> = BTreeMap::new();
+    for t in hfq.tensors() {
+        let (proj, layer, kind) = split_calib_tensor(&t.name);
+        if kind.is_empty() {
+            continue;
+        }
+        let e = by_proj
+            .entry(proj.clone())
+            .or_insert_with(|| CalibProjection {
+                name: proj,
+                layers: Default::default(),
+                n_hessian: 0,
+                n_imatrix: 0,
+                k: None,
+                tokens: Vec::new(),
+                counted: Default::default(),
+            });
+        if let Some(l) = layer {
+            e.layers.insert(l);
+        }
+        match kind {
+            // A Hessian is [K, K]; the imatrix is [K], so take K from whichever
+            // is present without assuming both are.
+            "hessian" => {
+                e.n_hessian += 1;
+                e.k = e.k.or_else(|| t.shape.first().copied());
+            }
+            "imatrix" => {
+                e.n_imatrix += 1;
+                e.k = e.k.or_else(|| t.shape.first().copied());
+            }
+            _ => {}
+        }
+        // Token counts are keyed by base name and shared by both artifact
+        // kinds. Collect from whichever arrives first so an imatrix-only
+        // projection (routed MoE experts) still reports its coverage.
+        let base = t.name.trim_end_matches(&format!(".{kind}"));
+        if !e.counted.contains(base) {
+            if let Some(n) = tokens_by_tensor
+                .and_then(|m| m.get(base))
+                .and_then(|v| v.as_u64())
+            {
+                e.tokens.push(n);
+                e.counted.insert(base.to_string());
+            }
+        }
+    }
+    let mut out: Vec<CalibProjection> = by_proj.into_values().collect();
+    for p in &mut out {
+        p.tokens.sort_unstable();
+    }
+    out
+}
+
+fn print_calib_coverage(hfq: &HfqFile, meta: &Value) {
+    let projs = calib_projections(hfq, meta);
+    if projs.is_empty() {
+        return;
+    }
+    let all_layers: std::collections::BTreeSet<u32> = projs
+        .iter()
+        .flat_map(|p| p.layers.iter().copied())
+        .collect();
+    println!(
+        "\ncoverage: {} projections across {} layers",
+        projs.len(),
+        all_layers.len()
+    );
+    let w = projs
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    println!(
+        "  {:<w$}  {:>6}  {:>7}  {:>6}  {:>5}",
+        "projection",
+        "layers",
+        "H / I",
+        "K",
+        "tokens",
+        w = w
+    );
+    for p in &projs {
+        let tok = match (p.tokens.first(), p.tokens.last()) {
+            (Some(lo), Some(hi)) if lo == hi => format!("{lo}"),
+            (Some(lo), Some(hi)) => format!("{lo}-{hi}"),
+            _ => "-".to_string(),
+        };
+        // A non-layer capture (embeddings, a pooling head) has no layer index;
+        // printing 0 would read as "zero layers covered".
+        let layers = if p.layers.is_empty() {
+            "-".to_string()
+        } else {
+            p.layers.len().to_string()
+        };
+        println!(
+            "  {:<w$}  {:>6}  {:>3} /{:>3}  {:>6}  {:>5}",
+            p.name,
+            layers,
+            p.n_hessian,
+            p.n_imatrix,
+            p.k.map(|k| k.to_string()).unwrap_or_else(|| "-".into()),
+            tok,
+            w = w,
+        );
+    }
+
+    // Factual warnings only — no arch-specific rules about which projections a
+    // layer "should" have, since hybrid stacks legitimately differ per layer.
+    let mut warnings: Vec<String> = Vec::new();
+    for p in &projs {
+        if p.n_hessian > 0 && p.n_imatrix > 0 && p.n_hessian != p.n_imatrix {
+            warnings.push(format!(
+                "{}: {} hessians but {} imatrix tensors",
+                p.name, p.n_hessian, p.n_imatrix
+            ));
+        }
+        // The failure mode that cost a session: `--ldlq` does not fail on a
+        // missing Hessian, it logs `ldlq: skip <t>` and RTN-quantizes. For
+        // routed MoE experts this may be deliberate (a K x K Hessian per
+        // expert is enormous), so state it rather than calling it an error.
+        if p.n_hessian == 0 && p.n_imatrix > 0 {
+            warnings.push(format!(
+                "{}: imatrix only, no Hessian — `--ldlq` / `oq*++` will fall back to RTN here",
+                p.name
+            ));
+        }
+        if p.n_imatrix == 0 && p.n_hessian > 0 {
+            warnings.push(format!("{}: Hessian only, no imatrix", p.name));
+        }
+    }
+    // Layer profiles: a layer's captured projection set. A hybrid arch has a
+    // few; a profile covering one or two layers is worth a look.
+    let mut profile_of: std::collections::BTreeMap<u32, Vec<&str>> = Default::default();
+    for p in &projs {
+        for l in &p.layers {
+            profile_of.entry(*l).or_default().push(&p.name);
+        }
+    }
+    let mut profiles: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+    for (layer, mut kinds) in profile_of {
+        kinds.sort_unstable();
+        profiles.entry(kinds.join(",")).or_default().push(layer);
+    }
+    if profiles.len() > 1 {
+        println!("  {} layer profiles:", profiles.len());
+        for (_, layers) in &profiles {
+            println!("    {:>4} layers  e.g. layer {}", layers.len(), layers[0]);
+        }
+    }
+    // No "rare profile" warning: a hybrid stack legitimately has one (lfm2.5
+    // carries 2 dense FFN layers among 22 MoE ones), so it fires on healthy
+    // artefacts. The profile listing above already shows the shape.
+    let starved: Vec<&CalibProjection> = projs
+        .iter()
+        .filter(|p| {
+            p.tokens
+                .last()
+                .zip(p.tokens.first())
+                .is_some_and(|(hi, lo)| *hi > 0 && *lo * 10 < *hi)
+        })
+        .collect();
+    for p in starved {
+        warnings.push(format!(
+            "{}: token coverage spans {}-{} — some rows saw <10% of the best-covered row",
+            p.name,
+            p.tokens.first().copied().unwrap_or(0),
+            p.tokens.last().copied().unwrap_or(0),
+        ));
+    }
+    if !warnings.is_empty() {
+        println!("\nwarnings:");
+        for w in warnings {
+            println!("  ! {w}");
+        }
+    }
+}
+
+/// `source_arch_id` of a calibration artefact, whose HFQM header arch is 0.
+fn calib_source_arch_id(meta: &Value) -> Option<u32> {
+    if meta_get(meta, "artifact_kind").and_then(|v| v.as_str()) != Some("calibration") {
+        return None;
+    }
+    meta_get(meta, "source_arch_id")?.as_u64().map(|v| v as u32)
 }
 
 /// Resolve an argument to a concrete path: an existing file path wins, else it
@@ -90,7 +376,16 @@ fn is_lossless_recoding_code(code: u8) -> bool {
     QuantType::from_code(code).is_some_and(|qt| qt.is_lossless_recoding())
 }
 
+/// Calibration-only HFQM quant_type, deliberately outside the `QuantType`
+/// byte-contract: exact F32 Hessian diagonal + BF16 lower strict triangle.
+/// Kept in sync with `QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32`
+/// (`hipfire_runtime::calibration`), which is private to that module.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
 fn quant_name(code: u8) -> String {
+    if code == QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 {
+        return "HessianBf16TrilDiagF32".to_string();
+    }
     match QuantType::from_code(code) {
         Some(qt) => format!("{qt:?}"),
         None => format!("qt{code}?"),
@@ -218,6 +513,7 @@ fn print_human(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
     list_tensors: bool,
     components: &[Value],
@@ -227,11 +523,37 @@ fn print_human(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     println!("artefact: {name}");
+    let calib = calib_source_arch_id(meta).is_some();
+    if calib {
+        println!("kind:     calibration (hessian + imatrix)");
+    }
     match arch_name {
-        Some(a) => println!("arch:     {} ({})", hfq.arch_id, a),
-        None => println!("arch:     {}", hfq.arch_id),
+        Some(a) if calib => println!("arch:     {arch_id} ({a}, from source_arch_id)"),
+        Some(a) => println!("arch:     {arch_id} ({a})"),
+        None => println!("arch:     {arch_id}"),
     }
     println!("format:   hfqm v{}", hfq.version);
+    // Comparable with a calib's `source fp`: that is this value, computed over
+    // the artefact the calib was captured from.
+    println!("fingerprint {}", hfq.index_fingerprint());
+    if calib {
+        for (key, label) in [
+            ("n_hessian", "hessians"),
+            ("n_imatrix", "imatrix"),
+            ("n_calib_tokens", "tokens"),
+            ("source_model", "source"),
+            ("source_fingerprint", "source fp"),
+            ("corpus", "corpus"),
+        ] {
+            if let Some(v) = meta_get(meta, key) {
+                println!("{label:9} {}", val_str(v));
+            }
+        }
+        if meta_get(meta, "source_fingerprint").is_none() {
+            println!("source fp (not recorded — artefact predates source fingerprinting)");
+        }
+        print_calib_coverage(hfq, meta);
+    }
 
     // Quant family / KV mode / sidecars.
     if let Some(v) = meta_get(meta, "quant_family") {
@@ -416,6 +738,7 @@ fn print_json(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
+    arch_id: u32,
     arch_name: Option<&str>,
     components: &[Value],
 ) {
@@ -482,9 +805,14 @@ fn print_json(
     let out = json!({
         "target": target,
         "path": path.display().to_string(),
-        "arch_id": hfq.arch_id,
+        // For a calibration artefact this is `source_arch_id`; the raw HFQM
+        // header value (always 0 there) stays available as `header_arch_id`.
+        "arch_id": arch_id,
+        "header_arch_id": hfq.arch_id,
+        "artifact_kind": meta_get(meta, "artifact_kind").cloned().unwrap_or(Value::Null),
         "arch_name": arch_name,
         "hfqm_version": hfq.version,
+        "fingerprint": hfq.index_fingerprint(),
         "quant_family": meta_get(meta, "quant_family"),
         "kv_mode": meta_get(meta, "kv_mode"),
         "sidecars": sidecar_tags(meta),
@@ -531,5 +859,47 @@ mod tests {
         assert_eq!(components[0]["encoding"], "hfqm-mapped-entries");
         assert_eq!(components[0]["byte_len"], 1024);
         assert_eq!(components[0]["sha256"], "abc");
+    }
+
+    #[test]
+    fn calibration_arch_comes_from_source_not_the_zero_header() {
+        // A calib artefact's HFQM header carries arch 0; trusting it printed
+        // "arch: 0 (llama)" for a qwen35 calib.
+        let calib = json!({"artifact_kind": "calibration", "source_arch_id": 5});
+        assert_eq!(calib_source_arch_id(&calib), Some(5));
+        // A model artefact must keep using its own header arch.
+        assert_eq!(calib_source_arch_id(&json!({"source_arch_id": 5})), None);
+        assert_eq!(calib_source_arch_id(&json!({})), None);
+    }
+
+    #[test]
+    fn calib_tensor_names_split_into_projection_layer_and_kind() {
+        // Arch prefixes vary (`model.`, `model.language_model.`); the layer
+        // index and any expert index must both be elided so a 512-expert MoE
+        // reports one row instead of 512.
+        assert_eq!(
+            split_calib_tensor("model.language_model.layers.7.mlp.down_proj.hessian"),
+            ("mlp.down_proj".to_string(), Some(7), "hessian")
+        );
+        assert_eq!(
+            split_calib_tensor("model.layers.31.mlp.experts.418.down_proj.imatrix"),
+            ("mlp.experts.*.down_proj".to_string(), Some(31), "imatrix")
+        );
+        // A non-layer capture (embeddings, pooling head) has no layer index.
+        assert_eq!(
+            split_calib_tensor("model.embed_tokens.hessian"),
+            ("model.embed_tokens".to_string(), None, "hessian")
+        );
+        // A weight tensor in a model artefact carries neither suffix.
+        assert_eq!(
+            split_calib_tensor("model.layers.0.mlp.down_proj.weight").2,
+            ""
+        );
+    }
+
+    #[test]
+    fn hessian_quant_code_is_named_not_marked_unknown() {
+        assert_eq!(quant_name(130), "HessianBf16TrilDiagF32");
+        assert!(quant_name(200).ends_with('?'), "reserved codes stay marked");
     }
 }

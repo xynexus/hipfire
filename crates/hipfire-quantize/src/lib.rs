@@ -31,6 +31,10 @@ pub mod codecs;
 pub mod gguf_import;
 pub mod gptq;
 pub mod hessian_io;
+/// `.hfa` archive reading moved to `hipfire-quant-format` so BOTH the writer
+/// (this crate) and the readers (`hipfire-runtime`) can see it. Re-exported so
+/// existing `hipfire_quantize::hfa::...` paths keep resolving.
+pub use hipfire_quant_format::hfa;
 #[allow(dead_code)]
 pub mod hfhs_diag;
 pub mod hfq_out;

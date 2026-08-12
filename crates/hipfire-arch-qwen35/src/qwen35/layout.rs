@@ -97,6 +97,20 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
 
+    /// Device-side per-expert AWQ scale pointers, same shape and construction
+    /// as `expert_gate_up_ptrs` (a 0 entry means that expert has no sidecar).
+    ///
+    /// The indexed MoE path rotates x per (token, krank) via
+    /// `rotate_x_mq_awq_indexed_batched`, which needs EACH expert's scale:
+    /// routed experts do NOT share one (measured on a 35B-A3B oq4.25++ —
+    /// expert0/expert1/expert7/shared all differ), because routing gives each a
+    /// different token subset and therefore a different imatrix.
+    ///
+    /// `None` when no routed expert carries a sidecar; the plain rotation is
+    /// then already correct and byte-identical.
+    pub expert_gate_up_awq_ptrs: Option<GpuTensor>,
+    pub expert_down_awq_ptrs: Option<GpuTensor>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,

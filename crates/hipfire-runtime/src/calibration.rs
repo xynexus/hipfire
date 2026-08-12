@@ -37,6 +37,111 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
+/// Split a calibration token stream into independent sequences, per
+/// `HIPFIRE_CALIB_SEQ_LEN`. This is the chunking POLICY, owned by the shared
+/// seam so no arch can accidentally calibrate under one unbounded context.
+///
+/// Every arch's resident calibration used to consume the whole token budget as
+/// a single growing context — zaya as one long sequence, and nemotron/minimax/
+/// lfm2moe as a per-token decode loop with `pos` running to the end and state
+/// reset only once at the start. Both shapes make attention cost accumulate as
+/// O(n²) in the budget, and both calibrate under a context far longer than the
+/// one being served (KLD references are built at `n_ctx=2048`). Splitting fixes
+/// the cost and the mismatch at once: a Hessian is a sum of per-row outer
+/// products, so it does not care which context a row came from. Measured on
+/// zaya1-8b at 32768 tokens: 10746 s → 1065 s, quality unchanged
+/// (`docs/quant-formats/moe-expert-hessians.md`, Q6).
+///
+/// Unset yields a single sequence, the historical behaviour.
+///
+/// The ARCH still owns what "independent" means for it — resetting KV, SSM or
+/// recurrent state between sequences, and restarting positions at 0.
+/// Takes the arch's natural sequences — one flat stream for the corpus-driven
+/// arches, or a sample set for those that already have one — and re-splits each
+/// to at most `HIPFIRE_CALIB_SEQ_LEN`. Unset leaves them untouched.
+pub fn calib_sequences<'a>(inputs: &[&'a [u32]]) -> Vec<&'a [u32]> {
+    let seq_len = hipfire_env::CALIB_SEQ_LEN
+        .parse::<usize>()
+        .filter(|n| *n >= 2)
+        .unwrap_or(usize::MAX);
+    let n_in: usize = inputs.iter().map(|s| s.len()).sum();
+    // A 1-token sequence has no next-token target and contributes only a
+    // degenerate row, so drop a trailing remainder of one.
+    let seqs: Vec<&'a [u32]> = inputs
+        .iter()
+        .flat_map(|s| s.chunks(seq_len).filter(|c| c.len() >= 2))
+        .collect();
+    if seqs.len() > inputs.len() {
+        eprintln!(
+            "  calib: {n_in} tokens as {} independent sequences of <= {seq_len} \
+             (was {})",
+            seqs.len(),
+            inputs.len()
+        );
+    }
+    seqs
+}
+
+/// Refuse to calibrate on the frozen evaluation slice.
+///
+/// `benchmarks/quality-baselines/slice/` is "the frozen prompt bytes used by
+/// every quant-quality eval" (its README); `benchmarks/calib/` holds the
+/// calibration corpora. Pointing calibration at the eval slice trains on the
+/// test set, and the damage is invisible in the numbers — it shows up as a
+/// large fake improvement plus an inverted-U budget curve, because a
+/// calibration that has seen exactly the evaluated tokens scores best.
+/// That cost this project a retracted "-13.6% from more calibration tokens"
+/// result (`docs/quant-formats/moe-expert-hessians.md`, Q7).
+///
+/// Set `HIPFIRE_CALIB_ALLOW_EVAL_CORPUS=1` to proceed anyway — the only honest
+/// use is deliberately measuring the size of the train-on-test effect.
+pub fn reject_eval_corpus(corpus: &str) -> Result<(), String> {
+    let is_eval = corpus.contains("quality-baselines");
+    if !is_eval || hipfire_env::CALIB_ALLOW_EVAL_CORPUS.get().is_some() {
+        if is_eval {
+            eprintln!(
+                "  calib: WARNING calibrating on the EVAL slice {corpus} \
+                 (HIPFIRE_CALIB_ALLOW_EVAL_CORPUS set) — results are train-on-test"
+            );
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "calib: {corpus} is the frozen EVALUATION slice, not a calibration corpus. \
+         Calibrating on it trains on the test set and silently inflates every \
+         quality number. Use a corpus from `benchmarks/calib/` (e.g. \
+         calib-multi-8m.txt), or set HIPFIRE_CALIB_ALLOW_EVAL_CORPUS=1 if you are \
+         deliberately measuring the train-on-test effect."
+    ))
+}
+
+/// The arch's imatrix-only substring list, or the `HIPFIRE_CALIB_IMATRIX_ONLY`
+/// override. Every arch blocks routed experts from full `[K,K]` Hessians by
+/// default (`vec![".experts."]`), because storing one per expert was assumed
+/// prohibitive. It is not, for `down_proj`: its K is the MoE INTERMEDIATE
+/// width, which shrinks as experts multiply, so the total stays ~2.6 GB on both
+/// zaya1-8b (640 x K=2048) and qwen3.6-35b-a3b (9778 x K=512). It is `gate_up`
+/// that is expensive at K=hidden — and that one pools
+/// (`docs/quant-formats/moe-expert-hessians.md`).
+///
+/// Set to a comma-separated substring list to re-scope, or to an empty string
+/// to capture a full Hessian for every registered tensor. Each entry is matched
+/// with `contains`, so `.gate_up_proj` blocks expert gate/up while leaving
+/// expert `down_proj` (and every dense tensor) captured.
+fn effective_imatrix_only(arch_default: Vec<String>) -> Vec<String> {
+    let Some(raw) = hipfire_env::CALIB_IMATRIX_ONLY.get() else {
+        return arch_default;
+    };
+    let list: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    eprintln!("  calib: imatrix-only override active: {list:?} (was {arch_default:?})");
+    list
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HessianStorage {
     DenseF32,
@@ -1044,10 +1149,11 @@ where
 
     for (group_idx, start) in (0..num_layers).step_by(group).enumerate() {
         let end = (start + group).min(num_layers);
+        let imatrix_only = effective_imatrix_only(imatrix_only.clone());
         let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
             CalibCollector::new()
         } else {
-            CalibCollector::with_imatrix_only(imatrix_only.clone())
+            CalibCollector::with_imatrix_only(imatrix_only)
         });
         gpu.capture_names = capture_names_for(start, end);
         gpu.active_capture = Some(collector.clone());
@@ -1398,16 +1504,22 @@ pub fn collect<F>(
     imatrix_only: Vec<String>,
     output: &std::path::Path,
     static_meta: &[(&str, serde_json::Value)],
+    sequences: &[&[u32]],
     forward: F,
 ) -> Result<CalibSummary, String>
 where
-    F: FnOnce(&mut Gpu) -> Result<CalibForward, String>,
+    F: FnOnce(&mut Gpu, &[&[u32]]) -> Result<CalibForward, String>,
 {
     let collector = arm(gpu, capture_names, imatrix_only);
 
+    // The seam owns the chunking policy, so no arch can silently calibrate
+    // under one unbounded context. The arch owns what "independent" means for
+    // it — resetting KV / SSM / recurrent state and restarting positions at 0.
+    let sequences = calib_sequences(sequences);
+
     // Run the arch forward, then ALWAYS disarm the capture before propagating
     // any error (a half-armed `gpu` would mis-capture a later forward).
-    let forward_out = forward(gpu);
+    let forward_out = forward(gpu, &sequences);
     disarm(gpu);
     let forward_out = forward_out?;
 
@@ -1428,6 +1540,7 @@ pub fn arm(
     capture_names: HashMap<usize, String>,
     imatrix_only: Vec<String>,
 ) -> std::sync::Arc<CalibCollector> {
+    let imatrix_only = effective_imatrix_only(imatrix_only);
     let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
         CalibCollector::new()
     } else {
@@ -1594,16 +1707,68 @@ pub fn logsumexp(logits: &[f32]) -> f32 {
 }
 
 /// Top-`k` (index, logit) descending — for the KLDREF reference.
+///
+/// Selection, not a sort. This is called once per scored position, so on a
+/// 248320-vocab model a 1175-chunk reference runs it 1.2M times; fully sorting
+/// the vocab to keep 256 of it cost ~4.5 billion comparisons per chunk and put
+/// the build at ~37 s/chunk, single-threaded — twelve hours for one reference.
+///
+/// Two things were expensive. The sort was O(n log n) to answer an O(n)
+/// question, and its comparator indexed back into `logits`, so every comparison
+/// took two random loads across a 1 MB array. Selecting over (logit, index)
+/// pairs keeps those loads sequential and `select_nth_unstable_by` is
+/// introselect, so only the k survivors get ordered.
+///
+/// Ties break on the index, ascending. The old `sort_unstable` left equal
+/// logits in an arbitrary order, which made the reference bytes depend on the
+/// sort's internal swaps; pinning the tiebreak makes the artifact reproducible.
 pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-    idx.truncate(k);
-    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+    let k = k.min(logits.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let cmp = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    let mut pairs: Vec<(f32, u32)> = logits.iter().copied().zip(0u32..).collect();
+    pairs.select_nth_unstable_by(k - 1, cmp);
+    pairs.truncate(k);
+    pairs.sort_unstable_by(cmp);
+    pairs.into_iter().map(|(v, i)| (i, v)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Selection must agree with the full sort it replaced, ties included, and
+    /// must not depend on how the selection algorithm happened to swap.
+    #[test]
+    fn topk_logits_matches_full_sort_and_is_tie_deterministic() {
+        fn reference(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+            let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+            // Same tiebreak the real one pins: logit desc, index asc.
+            idx.sort_by(|&a, &b| {
+                logits[b as usize]
+                    .total_cmp(&logits[a as usize])
+                    .then(a.cmp(&b))
+            });
+            idx.truncate(k.min(logits.len()));
+            idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+        }
+
+        // Deliberately tie-heavy: only 7 distinct values over 500 slots, so the
+        // k-boundary lands inside a run of equal logits every time.
+        let logits: Vec<f32> = (0..500).map(|i| ((i * 37) % 7) as f32).collect();
+        for k in [1usize, 8, 256, 500] {
+            assert_eq!(topk_logits(&logits, k), reference(&logits, k), "k={k}");
+        }
+
+        // Ordinary descending case, plus the degenerate edges.
+        let plain: Vec<f32> = vec![-1.5, 9.0, 0.0, 3.25, -7.0];
+        assert_eq!(topk_logits(&plain, 3), vec![(1, 9.0), (3, 3.25), (2, 0.0)]);
+        assert_eq!(topk_logits(&plain, 0), vec![]);
+        // k past the end clamps rather than panicking in select_nth.
+        assert_eq!(topk_logits(&plain, 99), reference(&plain, 99));
+    }
 
     #[test]
     fn compact_hessian_size_matches_diag_plus_lower_triangle() {

@@ -644,6 +644,33 @@ fn safetensors_header_identity(path: &Path) -> Result<String, CalibError> {
 }
 
 fn source_shard_identity(path: &Path) -> Result<SourceShardIdentity, CalibError> {
+    // An archive-backed shard's path is the synthetic `<archive>#<shard>` the
+    // source built; there is no file at it to hash. Identify it by the shard's
+    // own header instead — same class as the other arms (hash the index, never
+    // the payload), which is what keeps this cheap on a 180 GB archive.
+    if let Some((archive_path, shard)) = path.to_string_lossy().rsplit_once('#') {
+        let archive_path = Path::new(archive_path);
+        if archive_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("hfa"))
+        {
+            let archive = hipfire_quant_format::hfa::HfaArchive::open(archive_path)
+                .map_err(CalibError::InvalidSourcePlan)?;
+            let header = archive
+                .shard_header(shard)
+                .map_err(CalibError::InvalidSourcePlan)?;
+            let encoded = serde_json::to_vec(&header)
+                .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?;
+            return Ok(SourceShardIdentity {
+                file: shard.to_string(),
+                bytes: fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0),
+                identity_kind: "hfa_shard_header_hash".into(),
+                identity: stable_hash_bytes(&encoded),
+            });
+        }
+    }
+    // Every remaining arm needs a real file at `path`.
     let bytes = fs::metadata(path)
         .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?
         .len();
@@ -663,6 +690,38 @@ fn source_shard_identity(path: &Path) -> Result<SourceShardIdentity, CalibError>
                 });
             }
         }
+    }
+    // An `.hfq` shard is not safetensors, so its 8-byte prefix is not a header
+    // length and reading one would either error or hash the wrong bytes. Use
+    // the artifact's own index fingerprint — the same class of identity as the
+    // safetensors arm (hash the INDEX, never the payload), which is what keeps
+    // this cheap on a 161 GB source.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("hfq"))
+    {
+        let hfq = crate::hfq::HfqFile::open(path).map_err(|error| {
+            CalibError::InvalidSourcePlan(format!("open {}: {error}", path.display()))
+        })?;
+        let index = serde_json::to_vec(&serde_json::json!({
+            "arch_id": hfq.arch_id,
+            "metadata": hfq.metadata_json,
+            "tensors": hfq.tensors().iter().map(|t| serde_json::json!({
+                "name": t.name,
+                "quant_type": t.quant_type,
+                "shape": t.shape,
+                "data_offset": t.data_offset,
+                "data_size": t.data_size,
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|error| CalibError::InvalidSourcePlan(error.to_string()))?;
+        return Ok(SourceShardIdentity {
+            file,
+            bytes,
+            identity_kind: "hfq_index_hash".into(),
+            identity: stable_hash_bytes(&index),
+        });
     }
     Ok(SourceShardIdentity {
         file,
@@ -2925,7 +2984,14 @@ fn tune_geometry_for_gpu(
 /// factored form of the CLI's original inline source/adapter/job construction.
 pub struct CalibrationRunInputs {
     pub snapshot: PathBuf,
-    pub source: SafetensorsSource,
+    /// Boxed trait object, not the concrete safetensors reader.
+    ///
+    /// The engine core was already generic — `LayerStreamEngine::begin` and
+    /// `source_manifest_identity` both take `&dyn ModelSource`. Only this field
+    /// and its sibling on `DaemonCalibration` pinned the whole calibrate path
+    /// to safetensors, which is why an `.hfq`/`.hfa` could not be calibrated
+    /// from even after `HfqFile` learned to implement the trait.
+    pub source: Box<dyn ModelSource>,
     pub adapter: Box<dyn CalibrationFamilyAdapter>,
     pub adapter_family: &'static str,
     pub adapter_version: &'static str,
@@ -2940,12 +3006,61 @@ pub struct CalibrationRunInputs {
 pub fn build_calibration_run_inputs(
     command: &CalibrateCommand,
 ) -> Result<CalibrationRunInputs, Box<dyn Error>> {
-    let snapshot = resolve_hf_snapshot(&command.model)?;
-    let source = SafetensorsSource::open(&snapshot)?;
-    let tokenizer_path = source
-        .tokenizer_json_path()
-        .ok_or_else(|| format!("{} has no tokenizer.json", snapshot.display()))?;
-    let tokenizer_json = fs::read_to_string(&tokenizer_path)?;
+    // An `.hfq` is a single file and carries its own tokenizer; a directory is
+    // an HF snapshot or cache root and needs resolving first. Calibrating a
+    // `.hfq` directly is what removes the full restore from the large-model
+    // pipeline — a 244 GB expansion for Qwen3.5-122B-A10B whose only purpose
+    // was to hand this function a directory.
+    let model_ext = command
+        .model
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let model_is_file = command.model.is_file();
+    let (snapshot, source): (PathBuf, Box<dyn ModelSource>) =
+        if model_is_file && model_ext.as_deref() == Some("hfq") {
+            let hfq = crate::hfq::HfqFile::open(&command.model)?;
+            (command.model.clone(), Box::new(hfq))
+        } else if model_is_file && model_ext.as_deref() == Some("hfa") {
+            // Read the archive in place. Restoring it first costs the whole
+            // checkpoint again on disk (244 GB for Qwen3.5-122B-A10B) purely to
+            // produce a directory this function then walks exactly once.
+            let archive = crate::safetensors_source::SafetensorsSource::open_hfa(&command.model)?;
+            (command.model.clone(), Box::new(archive))
+        } else {
+            let snapshot = resolve_hf_snapshot(&command.model)?;
+            let source = SafetensorsSource::open(&snapshot)?;
+            (snapshot, Box::new(source))
+        };
+
+    // A safetensors snapshot ships tokenizer.json beside the shards; an HFQ
+    // embeds it under the `tokenizer` metadata key. Take whichever exists, so
+    // neither container is privileged. `tokenizer_fingerprint` follows the same
+    // split: a file hash when there is a file, the tokenizer bytes otherwise.
+    let tokenizer_path = source.tokenizer_json_path();
+    let (tokenizer_json, tokenizer_fingerprint) = match tokenizer_path.as_ref() {
+        Some(path) => (
+            fs::read_to_string(path)?,
+            file_hash(path).unwrap_or_else(|| "unavailable".into()),
+        ),
+        None => {
+            let metadata: serde_json::Value = serde_json::from_str(source.metadata_json())
+                .map_err(|e| format!("{}: unreadable metadata: {e}", snapshot.display()))?;
+            let embedded = metadata
+                .get("tokenizer")
+                .and_then(|t| t.as_str())
+                .filter(|t| t.trim_start().starts_with('{'))
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no tokenizer.json beside it and no usable embedded tokenizer",
+                        snapshot.display()
+                    )
+                })?
+                .to_string();
+            let fingerprint = stable_hash_bytes(embedded.as_bytes());
+            (embedded, fingerprint)
+        }
+    };
     let tokenizer = Tokenizer::from_hf_json(&tokenizer_json)?;
     let samples = load_corpus_samples(
         &command.corpus,
@@ -2954,16 +3069,16 @@ pub fn build_calibration_run_inputs(
         command.context,
     )?;
     let options = command.options()?;
-    let source_manifest = source_manifest_identity(&source)?;
+    let source_manifest = source_manifest_identity(source.as_ref())?;
     let corpus_fingerprint = file_hash(&command.corpus).unwrap_or_else(|| "unavailable".into());
     let job = CalibrationJob::new(
         source_manifest.fingerprint.clone(),
-        file_hash(&tokenizer_path).unwrap_or_else(|| "unavailable".into()),
+        tokenizer_fingerprint,
         SampleSet::new(samples, command.context, command.sampling_seed)?,
         options,
     )?
     .with_corpus_fingerprint(corpus_fingerprint)?;
-    let resolved = resolve_adapter(&source)?;
+    let resolved = resolve_adapter(source.as_ref())?;
     Ok(CalibrationRunInputs {
         snapshot,
         source,
@@ -3012,7 +3127,7 @@ fn engine_for(command: &CalibrateCommand) -> LayerStreamEngine {
 /// own `acquire_gpu_lock`.
 pub struct DaemonCalibration {
     adapter: Box<dyn CalibrationFamilyAdapter>,
-    source: SafetensorsSource,
+    source: Box<dyn ModelSource>,
     job: CalibrationJob,
     session: CalibrationSession,
     output: PathBuf,
@@ -3049,7 +3164,7 @@ impl DaemonCalibration {
         {
             fs::create_dir_all(parent)?;
         }
-        match engine_for(command).begin(adapter.as_mut(), &source, gpu, &job)? {
+        match engine_for(command).begin(adapter.as_mut(), source.as_ref(), gpu, &job)? {
             CalibrationSessionStart::Complete(result) => {
                 Ok(DaemonCalibrationStart::Complete(Box::new(result)))
             }
@@ -3072,7 +3187,7 @@ impl DaemonCalibration {
     /// Run exactly one layer — the calibration quantum. One daemon GPU turn.
     pub fn step(&mut self, gpu: &mut Gpu) -> Result<CalibrationStep, CalibError> {
         self.session
-            .step(self.adapter.as_mut(), &self.source, gpu, &self.job)
+            .step(self.adapter.as_mut(), self.source.as_ref(), gpu, &self.job)
     }
 
     /// Consume a session that [`Self::step`] reported as `Paused`.
@@ -3089,7 +3204,7 @@ impl DaemonCalibration {
             session,
             ..
         } = self;
-        session.finish(adapter.as_mut(), &source, gpu, &job)
+        session.finish(adapter.as_mut(), source.as_ref(), gpu, &job)
     }
 
     pub fn output(&self) -> &Path {

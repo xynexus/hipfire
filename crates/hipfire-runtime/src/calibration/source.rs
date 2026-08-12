@@ -676,7 +676,11 @@ fn physical_key(location: &TensorStorageLocation) -> (String, u64, u64) {
 
 pub struct PlannedTensorView<'a> {
     pub info: &'a TensorInfo,
-    pub bytes: &'a [u8],
+    /// Borrowed straight from the source's mapped pages in the common case;
+    /// OWNED when the source had to decode — an HFQ tensor carrying a lossless
+    /// bf16 recoding (`Bf16Huff` is the default for `--format bf16`, so this is
+    /// the norm for an `.hfq` source, not an edge case).
+    pub bytes: std::borrow::Cow<'a, [u8]>,
     pub action: ReadAction,
     pub from_prefetch: bool,
     source: Option<&'a dyn ModelSource>,
@@ -869,9 +873,12 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
                     entry.source_name
                 ))
             })?;
-            (info, bytes, true)
+            (info, std::borrow::Cow::Borrowed(bytes), true)
         } else {
-            let (info, bytes) = self.source.tensor_data(&entry.source_name).ok_or_else(|| {
+            // `tensor`, not `tensor_data`: the latter is borrowed-only and
+            // declines any tensor whose stored bytes are not its logical bytes,
+            // which is every recoded tensor in a bf16 `.hfq`.
+            let (info, bytes) = self.source.tensor(&entry.source_name).ok_or_else(|| {
                 CalibError::ReadLedger(format!(
                     "source tensor {} has metadata but no readable payload",
                     entry.source_name
@@ -1086,7 +1093,7 @@ pub fn load_source_tensor(
     let upload_started = Instant::now();
     let upload = if let Some(dtype) = native_source_gpu_dtype(gpu, view.info.dtype.as_str()) {
         validate_source_bytes(
-            view.bytes,
+            &view.bytes,
             shape.iter().product(),
             dtype.size(),
             &view.info.dtype,
@@ -1094,7 +1101,7 @@ pub fn load_source_tensor(
         .and_then(|()| {
             let mut tensor = gpu
                 .upload_raw_chunked(
-                    view.bytes,
+                    &view.bytes,
                     shape,
                     SOURCE_UPLOAD_CHUNK_BYTES,
                     |byte_offset, byte_len| {
@@ -1110,7 +1117,7 @@ pub fn load_source_tensor(
             Ok(tensor)
         })
     } else {
-        upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape)
+        upload_source_payload(gpu, view.info.dtype.as_str(), &view.bytes, shape)
     };
     let upload_us = elapsed_micros(upload_started).saturating_sub(chunk_release_us);
     let gpu_upload_bytes = shape
@@ -1157,7 +1164,7 @@ pub fn load_source_f32_tensor(
     let source_bytes = view.bytes.len();
     let from_prefetch = view.from_prefetch;
     let decode_started = Instant::now();
-    let mut values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
+    let mut values = source_payload_f32(view.info.dtype.as_str(), &view.bytes)?;
     if values.len() != elements {
         return Err(CalibError::InvalidSourcePlan(format!(
             "tensor {logical_name} decoded {} elements; expected {elements}",
@@ -1415,7 +1422,7 @@ mod tests {
         );
         let view = reader.read("layer0.weight").unwrap();
         assert!(view.from_prefetch);
-        assert_eq!(view.bytes, [0x7b; 24]);
+        assert_eq!(&*view.bytes, &[0x7b; 24]);
         drop(view);
         assert!(source.released.borrow().is_empty());
     }

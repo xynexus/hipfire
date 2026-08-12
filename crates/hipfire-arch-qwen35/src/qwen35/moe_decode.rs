@@ -68,6 +68,11 @@ pub(crate) struct MoeScratchRef<'a> {
     // the MoE FFN is byte-deterministic under hipGraph replay; see
     // task #100 root-cause notes in `forward_scratch`.
     down_expanded: &'a GpuTensor,
+    /// [k_top × dim] f32 — per-slot rotated gate_up input, the input-side
+    /// mirror of `down_expanded`. Routed experts carry DIFFERENT AWQ scales,
+    /// so the indexed OQ gate_up GEMVs need one rotated basis per krank;
+    /// `x_rot_local` holds only the single shared one.
+    x_rot_expanded: &'a GpuTensor,
     bucket_sorted: &'a GpuTensor,
     bucket_inverse: &'a GpuTensor,
     bucket_tile_ids: &'a GpuTensor,
@@ -98,6 +103,7 @@ impl<'a> MoeScratchRef<'a> {
             topk_indices: s.moe_topk_indices.as_ref().expect("MoE scratch"),
             topk_weights: s.moe_topk_weights.as_ref().expect("MoE scratch"),
             down_expanded: s.moe_down_expanded.as_ref().expect("MoE scratch"),
+            x_rot_expanded: s.moe_x_rot_expanded.as_ref().expect("MoE scratch"),
             bucket_sorted: s.moe_bucket_sorted.as_ref().expect("MoE scratch"),
             bucket_inverse: s.moe_bucket_inverse.as_ref().expect("MoE scratch"),
             bucket_tile_ids: s.moe_bucket_tile_ids.as_ref().expect("MoE scratch"),
@@ -143,6 +149,7 @@ pub(crate) fn moe_ffn_decode(
     let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
     let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
     let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
+    let x_rot_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
     let bucket_sorted = gpu.alloc_tensor(&[16 * 4], DType::Raw)?;
     let bucket_inverse = gpu.alloc_tensor(&[k * 4], DType::Raw)?;
     let bucket_tile_ids = gpu.alloc_tensor(&[4], DType::Raw)?;
@@ -165,6 +172,7 @@ pub(crate) fn moe_ffn_decode(
         topk_indices: &topk_indices,
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
+        x_rot_expanded: &x_rot_expanded,
         bucket_sorted: &bucket_sorted,
         bucket_inverse: &bucket_inverse,
         bucket_tile_ids: &bucket_tile_ids,
@@ -191,6 +199,7 @@ pub(crate) fn moe_ffn_decode(
         topk_indices,
         topk_weights,
         down_expanded,
+        x_rot_expanded,
         bucket_sorted,
         bucket_inverse,
         bucket_tile_ids,
@@ -846,6 +855,8 @@ pub(crate) fn moe_ffn_decode_impl(
             shared_down_w: ffn.shared_expert.down.dispatch_ref(),
             expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
             expert_down_ptrs: &ffn.expert_down_ptrs,
+            expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+            expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
             routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
             routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
             routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
@@ -886,6 +897,7 @@ pub(crate) fn moe_ffn_decode_impl(
             topk_indices: s.topk_indices,
             topk_weights: s.topk_weights,
             down_expanded: s.down_expanded,
+            x_rot_expanded: s.x_rot_expanded,
         };
         let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
         hipfire_runtime::dispatch::moe_family()
@@ -1215,59 +1227,75 @@ pub(crate) fn moe_ffn_decode_impl(
                 gate_up_k,
                 k,
             )?;
-        } else if routed_dtype_indexable_oq4 {
-            // Opus Quant W4A4 indexed gate_up (132 B/group kernel blocks; xr is
-            // FWHT-rotated above, same as the MQ path). Resident decode is a
-            // single token, so use the single-token kernel; paged decode keeps
-            // the batched layout because its top-k buffer is [N x K_TOP].
-            if ffn.experts.is_empty() {
-                gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xr,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k,
-                    1,
-                )?;
-            } else {
-                gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xr,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                )?;
-            }
-        } else if routed_dtype_indexable_oq8 {
-            // Opus Quant W8A8 indexed gate_up (260 B/group kernel blocks, from
+        } else if routed_dtype_indexable_oq4 || routed_dtype_indexable_oq8 {
+            // Opus Quant indexed gate_up (OQ4 132 B/group, OQ8 260 B/group from
             // OqPlusCompact-expanded experts).
-            if ffn.experts.is_empty() {
-                gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+            //
+            // These read x PER SLOT, not the shared `xr`: routed experts carry
+            // DIFFERENT AWQ scales (each sees a different token subset, hence a
+            // different imatrix), and the divide must precede the FWHT, so one
+            // rotation cannot serve them all. Expand x_norm into
+            // [K_TOP × dim], each slot divided by its own expert's scale. With
+            // no sidecars — paged mode included — this is the plain rotation
+            // replicated per slot, which the kernels still require.
+            gpu.rotate_x_mq_awq_indexed_batched(
+                x_norm,
+                ffn.expert_gate_up_awq_ptrs.as_ref(),
+                s.topk_indices,
+                s.x_rot_expanded,
+                gate_up_k,
+                k,
+                1,
+            )?;
+            let xs = s.x_rot_expanded;
+            // Resident decode is a single token, so use the single-token
+            // kernel; paged decode keeps the batched layout because its top-k
+            // buffer is [N x K_TOP].
+            match (routed_dtype_indexable_oq4, ffn.experts.is_empty()) {
+                (true, true) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
                     s.topk_indices,
-                    xr,
+                    xs,
                     s.gate_batch,
                     s.up_batch,
                     2 * mi,
                     gate_up_k,
                     k,
                     1,
-                )?;
-            } else {
-                gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
+                    true,
+                )?,
+                (true, false) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
                     &ffn.expert_gate_up_ptrs,
                     s.topk_indices,
-                    xr,
+                    xs,
                     s.gate_batch,
                     s.up_batch,
                     2 * mi,
                     gate_up_k,
-                )?;
+                    true,
+                )?,
+                (false, true) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xs,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k,
+                    1,
+                    true,
+                )?,
+                (false, false) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xs,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    true,
+                )?,
             }
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
@@ -1310,13 +1338,26 @@ pub(crate) fn moe_ffn_decode_impl(
                 paro_down.krot as usize,
             )?;
         } else {
-            // F2: AWQ-aware silu_mul+FWHT-rotate. All experts in this MoE
-            // layer share the same input residual basis → same imatrix
-            // → byte-identical AWQ scales; experts[0].down is
-            // representative. Helper dispatches on awq_scale presence,
-            // not on weight bytes layout.
+            // F2: AWQ-aware silu_mul+FWHT-rotate. The old premise here — that
+            // all experts in this layer share an input residual basis and so
+            // byte-identical AWQ scales, making experts[0].down representative
+            // — is FALSE for routed experts: routing gives each a different
+            // token subset, hence a different imatrix and a different s
+            // (measured on a 35B-A3B oq4.25++). When a per-expert table exists,
+            // select each slot's scale on device instead. `rot_batch` is
+            // already one row per (token, krank), so only the lookup changes.
             if ffn.experts.is_empty() {
                 gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+            } else if let Some(down_awq) = ffn.expert_down_awq_ptrs.as_ref() {
+                gpu.fused_silu_mul_rotate_mq_awq_indexed(
+                    s.gate_batch,
+                    s.up_batch,
+                    Some(down_awq),
+                    s.topk_indices,
+                    s.rot_batch,
+                    mi,
+                    k,
+                )?;
             } else {
                 fused_silu_mul_rotate_mq_batched_for(
                     gpu,
@@ -1596,6 +1637,8 @@ pub(crate) fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+        expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
@@ -1636,6 +1679,7 @@ pub(crate) fn moe_ffn_decode_impl(
         topk_indices: s.topk_indices,
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
+        x_rot_expanded: s.x_rot_expanded,
     };
     // Build one DispatchCtx per token (the family threads it through every
     // inner GEMV — no internal DispatchCtx::new reconstructions).

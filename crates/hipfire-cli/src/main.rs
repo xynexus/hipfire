@@ -174,9 +174,8 @@ enum Command {
     /// and operator UI schema artifacts.
     #[command(hide = true)]
     GenConfigSchema(commands::gen_config_schema::GenConfigSchemaArgs),
-    /// Regenerate the committed env-var docs (docs/env-vars.md +
-    /// crates/hipfire-runtime/src/env_docs.rs) by scanning the source tree.
-    /// Hidden: a maintenance command; run via
+    /// Regenerate the env-var docs (docs/env-vars.md) by scanning the source
+    /// tree. Hidden: a maintenance command; run via
     /// `cargo run -p hipfire-cli -- gen-env-docs`.
     #[command(hide = true)]
     GenEnvDocs(commands::gen_env_docs::GenEnvDocsArgs),

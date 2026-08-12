@@ -137,7 +137,7 @@ fn main() {
         let (_dn, dn_ptr) = build_experts(&mut gpu, k_top, dn_m, inter, 132);
         let dt = time_loop(&mut gpu, iters, |gpu| {
             gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
-                &gu_ptr, &topk_t, &x_gu, &y_gate, &y_up, gu_m, hidden,
+                &gu_ptr, &topk_t, &x_gu, &y_gate, &y_up, gu_m, hidden, false,
             )
             .unwrap();
         });
@@ -159,7 +159,7 @@ fn main() {
         let (_dn, dn_ptr) = build_experts(&mut gpu, k_top, dn_m, inter, 260);
         let dt = time_loop(&mut gpu, iters, |gpu| {
             gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
-                &gu_ptr, &topk_t, &x_gu, &y_gate, &y_up, gu_m, hidden,
+                &gu_ptr, &topk_t, &x_gu, &y_gate, &y_up, gu_m, hidden, false,
             )
             .unwrap();
         });

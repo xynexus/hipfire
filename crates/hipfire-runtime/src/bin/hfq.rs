@@ -37,6 +37,34 @@ struct Tensor {
     data: Vec<u8>,
 }
 
+/// Drop metadata that describes the SOURCE file's byte layout.
+///
+/// `hfqm_modules` is a table of ABSOLUTE byte ranges into the file it was built
+/// from. A subset extract keeps a handful of tensors and renumbers everything,
+/// so every range in that table becomes wrong — and `HfqFile::open` validates
+/// them, so the extract is unreadable by every other tool:
+///
+///   HFQM module layers.0.experts.0 invalid range 2038587392..2040263680
+///   for file_len 22921216
+///
+/// Rebasing is not the fix: the modules describe pageable expert groups whose
+/// tensors are mostly NOT in the extract, so there is nothing coherent to point
+/// them at. A tensor subset is not a pageable artifact — the table should simply
+/// not be there.
+fn strip_layout_metadata(meta_json: &str) -> String {
+    let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_json) else {
+        return meta_json.to_string();
+    };
+    let removed = meta
+        .as_object_mut()
+        .and_then(|obj| obj.remove("hfqm_modules"))
+        .is_some();
+    if removed {
+        eprintln!("  (dropped hfqm_modules: byte ranges do not survive a subset extract)");
+    }
+    serde_json::to_string(&meta).unwrap_or_else(|_| meta_json.to_string())
+}
+
 fn write_hfq(
     path: &str,
     arch: u32,
@@ -228,7 +256,7 @@ fn main() {
             for t in &kept {
                 eprintln!("  {}", t.name);
             }
-            write_hfq(out, arch, &meta, &kept).expect("write");
+            write_hfq(out, arch, &strip_layout_metadata(&meta), &kept).expect("write");
         }
         "meta-set" => {
             let inp = argv

@@ -1173,6 +1173,66 @@ impl Gpu {
         self.invalidate_x_caches_for(xrp);
         result
     }
+    /// Per-EXPERT AWQ variant of `fused_silu_mul_rotate_mq_awq_batched`, for
+    /// the indexed MoE down_proj stage. Each (token, krank) slot divides by ITS
+    /// expert's `awq_scale`, selected on device from `topk_indices`.
+    ///
+    /// `gate`, `up` and `x_rot` are `[N × K_TOP × K]` — already one row per
+    /// slot, so this needs no reshape; only the scale lookup differs from the
+    /// non-indexed AWQ kernel. Pass `n_slots = n_tokens * k_top`.
+    ///
+    /// `expert_awq_ptrs` is the `expert_down_awq_ptrs` table (`None` when no
+    /// expert at this layer carries a sidecar → plain rotation, byte-identical
+    /// to `fused_silu_mul_rotate_mq_batched`). Routed experts do NOT share one
+    /// scale — see `rotate_x_mq_awq_indexed_batched`, the gate_up mirror.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_silu_mul_rotate_mq_awq_indexed(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        expert_awq_ptrs: Option<&GpuTensor>,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        n_slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC,
+            "fused_silu_mul_mq_rotate_awq_indexed",
+        )?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let ap = expert_awq_ptrs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let ip = topk_indices.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * n_slots;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            [n_groups, n_slots as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr gp, ptr up_p, ptr ap, ptr ip, ptr s1, ptr s2, ptr xrp, i32 kv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// dp4a-port of fused_qkv_hfq4g256 for gfx906. Pre-quantizes x to
     /// Q8_1 via the shared MMQ scratch, then runs the dp4a-based GEMV.
     /// Math is identical modulo Q8_1 quant noise. Targets gfx906's
