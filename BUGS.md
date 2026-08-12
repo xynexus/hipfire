@@ -149,10 +149,35 @@ that blocker is gone; what still holds the default is that the supporting eviden
 is one prompt on one model. This measurement is a second, independent reason to
 want it (capacity, not just accuracy) and should be weighed in that decision.
 
-Two consequences worth acting on:
-- the checkpoint clones DN state eagerly. If that clone can be made genuinely
-  copy-on-write, per-session cost roughly halves AGAIN and the reachable width
-  roughly doubles.
+**Checkpoint lifecycle, traced 2026-08-12 — and CoW is NOT the lever it looks
+like.** The allocation that fails is a `Qwen35PrefillCheckpointKind::Final`
+checkpoint, created for EVERY session after batch prefill
+(`qwen35_prefill.rs:1924`), via
+`sequence_state_arena_checkpoint_session_state(source -> dest)`, which keeps BOTH
+the live session and the snapshot. The default eviction policy is
+`SequenceStateEvictionPolicy::ManualReleaseOnly`, so those snapshots are never
+reclaimed automatically. Per session that is ~67 MiB live + ~67 MiB retained.
+
+Note `HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS=0` does NOT suppress it — that gates
+SemanticBoundary checkpoints only, and the Final one is unconditional. Verified:
+the collapse reproduces identically with boundary checkpoints off.
+
+Copy-on-write would help far less than it appears, because the two halves behave
+differently once the snapshot exists:
+
+| state | live session's writes | CoW value |
+|---|---|---|
+| KV (~6.5 MiB) | append-only PAST the checkpoint cursor; `[0, cursor)` is never rewritten | shareable permanently — a real saving, but only ~10% of the session |
+| DeltaNet (60 MiB FP32 / 30 FP16) | the recurrent matrix is OVERWRITTEN every step | first decode step materializes the copy — CoW DEFERS it, and since every session decodes, peak memory is unchanged |
+
+So CoW buys the KV tenth and defers the DeltaNet nine-tenths. It does not reduce
+the peak that OOMs. The levers that actually move it, in order:
+1. **FP16 DeltaNet state** — measured above, takes 64 sessions from 19/64 to 64/64.
+2. **Release the Final checkpoints.** They are retained under ManualReleaseOnly
+   for the process lifetime; nothing reclaims them.
+3. **Do not take a Final checkpoint per session** when no prefix reuse will
+   consume it — it is a snapshot for resume, and a batch of one-shot completions
+   never reads it back.
 - `rocm-smi --showmeminfo vram` is useless here: it reported 80-93 MiB of 256 MiB
   across the whole run, because that is the dedicated carve-out, not the 42 GiB
   GTT pool the allocator actually draws from. The allocator's own
