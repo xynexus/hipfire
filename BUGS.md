@@ -262,12 +262,28 @@ What the thread was right about, and what it was wrong about:
   nobody had connected them. A recurrence amplifies perturbations, so the
   assumption cut both ways and needed measuring rather than arguing.
 
-Caveat on scope, stated so nobody over-reads this: the KLD eval is teacher-forced
-and prefill-dominated, where the state is rebuilt from the prompt each chunk. The
-3.5% figure came from 120 autoregressive DECODE steps, where error accumulates
-freely. This measurement therefore under-weights long-generation accumulation. It
-would take ~8 orders of magnitude of amplification to matter, so the conclusion is
-not in doubt, but a long-generation KLD would close it completely.
+**Re-measured across context length, 2026-08-12, because a single 512-token point
+cannot distinguish "small" from "small so far".** Same fp64-oracle reference, same
+corpus, one chunk each:
+
+| chunk length | tokens scored | mean_kld(f32 \|\| fp64 oracle) |
+|---|---|---|
+| 512 | 511 | 3.744e-10 |
+| 2048 | 2047 | 1.477e-10 |
+| 8192 | 4095 | 2.016e-10 |
+
+**Flat, and non-monotonic, over an 8x span of context** — the 8192 point is
+LOWER than the 512 one. There is no growth term to extrapolate. This is the
+end-to-end confirmation of the mechanism the corrected ablation found: a decaying
+gate drains old error from the state faster than new error accumulates, so the
+divergence does not compound with length. Note the state genuinely is advanced
+token-by-token across all 4095 tokens within the chunk, so recurrent accumulation
+IS exercised here; what is not exercised is autoregressive feedback.
+
+That last point is the remaining scope caveat, stated so nobody over-reads this:
+the eval is teacher-forced, so a perturbed logit never changes the next input
+token. The 3.5% figure came from 120 autoregressive DECODE steps. With ~8 orders
+of margin and a measured-flat length response, the conclusion is not in doubt.
 
 Also observed: chunk 1 of the scoring run died with `paged expert residency
 layer=20 expert=78 ... free=15.1 MiB of total=43008.0 MiB` — the expert-cache
@@ -384,8 +400,21 @@ with round-to-nearest and no error feedback. That bias compounds. Measured on th
 | 40 | 64 | **3.22e-05** |
 
 **13x more error for 2.5x more tokens** — superlinear, not a fixed storage cost.
-So a KLD figure measured at one context length understates longer ones, and a
-model with more recurrent layers accumulates more of it. That is the mechanism
+
+**Update 2026-08-12 — the KLD half of that inference was tested and does NOT
+hold.** "A KLD figure measured at one context length understates longer ones" was
+a prediction, not a measurement. Scoring the f32 kernel against the fp64 oracle at
+chunk lengths 512 / 2048 / 8192 gives 3.744e-10 / 1.477e-10 / 2.016e-10 — flat and
+non-monotonic over 8x (see the CLOSED entry above). Two things keep this from
+being a contradiction, and both matter: that sweep measures the f32-vs-oracle pair
+under teacher forcing, whereas the table above measures f16-vs-f32 state under
+autoregressive decode. So the superlinear STATE compounding stands as measured;
+what is now known false is the assumption that state divergence carries into KLD
+proportionally. The f16-vs-f32 KLD-vs-length sweep remains unmeasured.
+
+So a KLD figure measured at one context length was assumed to understate longer
+ones, and a model with more recurrent layers to accumulate more of it. That is
+the mechanism
 behind "worse on the bigger model", together with the 35B carrying 2.6x more of
 its state in FP16's low-precision region (31.3% of elements subnormal in FP16 vs
 12.2% on the 0.8B; min |S| 3.1e-14 vs 3.9e-12, and FP16 flushes everything below
