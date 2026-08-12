@@ -807,19 +807,30 @@ pub(crate) fn moe_ffn_decode_impl(
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        experts_all_gate_up_mq4: ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
+        experts_all_gate_up_mq4: !ffn.experts.is_empty()
+            && ffn
+                .experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
+        // Paged layers have NO `experts` — the pager owns the buffers — so this
+        // must fall back to the dtype metadata the paged loader records for
+        // exactly this purpose. Reading only `experts.first()` reported F32,
+        // which made `routed_indexable_oq*` false, `use_gpu_topk` false, and
+        // `check_moe_decode_supported` reject with
+        // `decode-routed-dtype-unsupported-no-fallback` — paged OQ decode could
+        // not run at all. Note `.all()` on an empty Vec is TRUE, which is why
+        // the MQ4 clause above needs the emptiness guard too.
         routed_gate_up: ffn
             .experts
             .first()
             .map(|e| e.gate_up.gpu_dtype)
+            .or(ffn.expert_gate_up_dtype)
             .unwrap_or(DType::F32),
         routed_down: ffn
             .experts
             .first()
             .map(|e| e.down.gpu_dtype)
+            .or(ffn.expert_down_dtype)
             .unwrap_or(DType::F32),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
@@ -868,9 +879,27 @@ pub(crate) fn moe_ffn_decode_impl(
                 mi,
                 config.num_experts_per_tok,
             ),
-            routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-            routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-            routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+            // Paged: shapes come from `expert_shape`, which the paged loader fills
+            // for exactly this reason. Reading only `experts` gave 0 and the
+            // rotate then failed `fwht_groups` with K=0.
+            routed_gate_up_k: ffn
+                .experts
+                .first()
+                .map(|e| e.gate_up.k)
+                .or(ffn.expert_shape.map(|s| s.gate_up_k))
+                .unwrap_or(0),
+            routed_down_m: ffn
+                .experts
+                .first()
+                .map(|e| e.down.m)
+                .or(ffn.expert_shape.map(|s| s.down_m))
+                .unwrap_or(0),
+            routed_down_k: ffn
+                .experts
+                .first()
+                .map(|e| e.down.k)
+                .or(ffn.expert_shape.map(|s| s.down_k))
+                .unwrap_or(0),
             routed_experts: &routed_experts,
             routed_gate_up_paro: ffn.experts.first().and_then(|e| {
                 e.gate_up
@@ -1655,9 +1684,25 @@ pub(crate) fn moe_ffn_decode_impl(
             mi,
             config.num_experts_per_tok,
         ),
-        routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-        routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-        routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+        // Paged: see the sibling site — shapes fall back to `expert_shape`.
+        routed_gate_up_k: ffn
+            .experts
+            .first()
+            .map(|e| e.gate_up.k)
+            .or(ffn.expert_shape.map(|s| s.gate_up_k))
+            .unwrap_or(0),
+        routed_down_m: ffn
+            .experts
+            .first()
+            .map(|e| e.down.m)
+            .or(ffn.expert_shape.map(|s| s.down_m))
+            .unwrap_or(0),
+        routed_down_k: ffn
+            .experts
+            .first()
+            .map(|e| e.down.k)
+            .or(ffn.expert_shape.map(|s| s.down_k))
+            .unwrap_or(0),
         routed_experts: &routed_experts,
         routed_gate_up_paro: ffn.experts.first().and_then(|e| {
             e.gate_up

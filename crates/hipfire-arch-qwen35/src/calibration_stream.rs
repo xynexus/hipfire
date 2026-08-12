@@ -1730,6 +1730,7 @@ fn load_streamed_moe_ffn(
             // rotation is correct.
             expert_gate_up_awq_ptrs: None,
             expert_down_awq_ptrs: None,
+            expert_awq_storage: Vec::new(),
             layer_idx: layer as u16,
             expert_shape: None,
             expert_gate_up_dtype: Some(dtype),
