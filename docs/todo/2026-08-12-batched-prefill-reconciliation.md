@@ -62,9 +62,36 @@ check below it already admits `DeltaNetMoe` on its own terms
 and is what forced qwen3.6-35B-A3B down the per-token fallback, re-reading all 40
 layers' attention projections once per token.
 
-Deleting it is the unlock. Note the quant list is now `FP32 | FP16`, **not** the
-`FP32 | Q8` the branch has — PR #247 deleted Q8 recurrent state and
-`StateQuant::Q8` no longer exists.
+Note the quant list is now `FP32 | FP16`, **not** the `FP32 | Q8` the branch has
+— PR #247 deleted Q8 recurrent state and `StateQuant::Q8` no longer exists.
+
+**CORRECTION (measured 2026-08-12): deleting that clause is NOT sufficient, and
+on an OQ model it changes nothing at all.** An earlier revision of this document
+called it "the unlock". It is not. Tried on
+`Qwen3.5-35B-A3B--oq4.25++.hfq`, same binary, same 543-token prompt,
+`max_tokens=1`, batched vs `HIPFIRE_PREFILL_BATCHED=0`:
+
+```
+batched (clause removed)   wall 64.48 s   (load 35.69 s)
+forced per-token fallback  wall 64.52 s   (load 35.81 s)
+```
+
+Identical. The reason is a **second, independent gate**: the per-layer
+`is_batchable_la` admits only
+`MQ4G256 | HFQ4G256 | MQ6G256 | HFQ6G256 | Q8_0 | ParoQ4G128 | F32 | F16 | BF16`
+— **no OQ dtype**. So for any OQ-quantized MoE model `pbs_eligible` returns
+false whether or not the layer-kind clause is there, and removing it is inert.
+`HIPFIRE_KERNEL_TRACE=1` confirms the predicate runs
+(`n=543 dn_quant=FP32 all_layers_dense_la=false moe_topk_ok=true K=8 E=256
+router_logits=true`) but it prints its INPUTS, never its verdict — which is why
+the timing A/B, not the trace, is what settled this.
+
+So the real work is widening `is_batchable_la` to the OQ family and proving the
+batched LA/MoE dispatch is correct for those dtypes. That is a bigger job than
+deleting a clause, and it is the actual prerequisite for the pp512 number. Note
+the branch measured qwen3.**6**-35B-A3B oq4++ while this test used
+qwen3.**5**-35B-A3B oq4.25++; if the branch also widened `is_batchable_la`, that
+widening — not the clause — is where its speedup came from. Check that first.
 
 ### 2. ⚠️ BLOCKER — settle this before landing (1)
 
