@@ -1,5 +1,25 @@
 # tiny-quant KLD baselines — gpu_arch family format mean_kld rel_tol
 # regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record
+#
+# KNOWN-STALE, 2026-08-12 — read before "fixing" a qwen3_5_moe failure.
+#
+# 1. The qwen3_5_moe cells MOVED when MoE routers became lossless BF16
+#    (72cd1c10b): mq4/mq6 0.215076 -> 0.223334, q8f16 0.179184 -> 0.179465.
+#    That delta is NOT a quality signal. The toy fixture is random-init, so
+#    there is no "correct" expert to be closer to — changing router precision
+#    reshuffles which experts fire, and KLD against the reference moves either
+#    way without meaning anything. Do not chase the direction; on a random model
+#    it is churn.
+#
+# 2. The gfx1151 qwen3_5_moe rows below look stale independently of that. This
+#    hardware measured mq4/mq6 at 0.215076 BEFORE the router change, which is
+#    the gfx1103 baseline (0.21510008), not the gfx1151 one (0.15463363). So the
+#    gfx1151 numbers appear to predate a change that moved both archs to ~0.215.
+#
+# Five other cells fail against these baselines and are NOT explained by either
+# point — qwen2/hfq4, gemma3/{q8f16,hfq4}, minimax/mq4, qwen3_5/q8f16. Those are
+# unexplained drift. A blanket --record would bury them, which is the reason
+# this file has not simply been regenerated.
 gfx1103 deepseek4 deepseek4-source-precision 0.00000000 0.25
 gfx1103 deepseek4 oq4 0.00303020 0.25
 gfx1103 deepseek4 oq4++-calib 0.00287635 0.25
