@@ -3746,23 +3746,21 @@ mod tests {
         }
     }
 
-    /// Renamed and inverted 2026-08-12 with the default. This test failing is how
-    /// the default change announced itself, which is the point of pinning it.
     #[test]
-    fn deltanet_state_defaults_to_fp16_and_fp32_is_opt_out() {
+    fn deltanet_state_defaults_to_fp32_and_fp16_is_opt_in() {
         let cfg = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
         // Redundancy is still reported — it names WHERE to validate a precision
         // change (small models first; that is where quantized state broke) — but
         // it no longer SELECTS anything. The threshold that once chose Q8 above a
         // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-        // FP16 unless HIPFIRE_DN_STATE_FP16 is explicitly off. Guarded so a
-        // developer running with the opt-out exported does not see a false
-        // failure — the env is process-wide and this test cannot own it.
-        if hipfire_env::DN_STATE_FP16.is_off() {
-            assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
-        } else {
+        // FP32 unless HIPFIRE_DN_STATE_FP16 opts in. Guarded so a developer
+        // running with it exported does not see a false failure — the env is
+        // process-wide and this test cannot own it.
+        if hipfire_env::DN_STATE_FP16.flag() {
             assert_eq!(default_state_quant(&cfg), StateQuant::FP16);
+        } else {
+            assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
         }
     }
 
@@ -6231,18 +6229,45 @@ mod tests {
         assert!(flags.needs_x_rot_local);
     }
 
+    /// Inverted 2026-08-12 to follow the default. `0714f618e` made indexed
+    /// routed-OQ decode ON by default but left this test asserting the old
+    /// fallback, so it was RED on origin/master — verified by running it in a
+    /// worktree at pristine master, not inferred from the rebase.
+    ///
+    /// `moe_decode_dispatch_flags_for_dtypes` reads the env itself (its third
+    /// argument is `paro_shared_present`, not the indexed flag), so this asserts
+    /// the DEFAULT. The env-free half of the contract is
+    /// `oq_indexed_decode_enabled_from`, covered below.
     #[test]
-    fn moe_decode_keeps_oq_on_generic_fallback_by_default() {
+    fn moe_decode_takes_the_indexed_oq_path_by_default() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::Oq4G256);
         dtypes.router = DType::Q8_0;
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
 
         let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
 
-        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
-        assert!(!flags.routed_dtype_indexable_oq4);
-        assert!(!flags.use_gpu_topk);
-        assert!(!flags.needs_x_rot_local);
+        // Guarded: the env is process-wide and this test cannot own it, so an
+        // operator running with the opt-out exported must not see a false
+        // failure.
+        if hipfire_dispatch::families::moe::oq_indexed_decode_enabled() {
+            assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Oq4);
+            assert!(flags.routed_dtype_indexable_oq4);
+        } else {
+            assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
+            assert!(!flags.routed_dtype_indexable_oq4);
+        }
+    }
+
+    /// The parse, without touching process-global env. Pins both directions of
+    /// the 2026-08-12 inversion: unset means ENABLED now.
+    #[test]
+    fn oq_indexed_decode_default_is_on_and_zero_opts_out() {
+        use hipfire_dispatch::families::moe::oq_indexed_decode_enabled_from as parse;
+        assert!(parse(None), "unset must mean enabled since 2026-08-12");
+        assert!(parse(Some("1")));
+        assert!(parse(Some("on")));
+        assert!(!parse(Some("0")));
+        assert!(!parse(Some("off")));
     }
 
     /// The loader repacks routed OQ experts into the indexed kernels' block

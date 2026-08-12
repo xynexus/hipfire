@@ -76,7 +76,7 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
-/// is FP16 by default since 2026-08-12; `HIPFIRE_DN_STATE_FP16=0` opts out.
+/// is FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
 #[deprecated(note = "Q8 state was removed; precision is FP32 or opt-in FP16")]
 pub fn deltanet_state_fp32_below() -> usize {
     usize::MAX
@@ -122,21 +122,27 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // The kernels, their dispatch entry points and every caller are now gone,
     // so that blocker is cleared.
     //
-    // Made the default again 2026-08-12, on a CAPACITY argument rather than an
-    // accuracy one. Per-session DeltaNet state is 30 layers x 2 MiB = 60 MiB on
-    // the 35B-A3B, ~9x its KV cost, and it is what bounds concurrency: at width
-    // 64 the FP32 state OOMs the GTT pool mid-prefill and only 19/64 sessions
-    // complete. FP16 storage takes that to 64/64 with throughput monotonic in
-    // width (5.96 / 6.25 / 6.31 tok/s at 16 / 32 / 64). See BUGS.md.
+    // REVERTED to opt-in 2026-08-12 after `pr/deltanet-fp16-state` landed the
+    // measurement this branch did not have. Both are kept because they measure
+    // different things and neither alone should move the default:
     //
-    // The accuracy evidence is still one prompt on one model, so FP32 remains
-    // one flag away and stays the oracle to diff against.
-    // `is_off()`, not `!flag()`: unset must mean "not explicitly off", which is
-    // the whole point of the opt-out spelling.
-    if hipfire_env::DN_STATE_FP16.is_off() {
-        StateQuant::FP32
-    } else {
+    //   * ACCURACY (the PR, teacher-forced, same weights, only state precision
+    //     differing): mean KLD 5.65e-05 on the dense 2B but 2.57e-03 on the
+    //     35B-A3B oq4.25++ — ~45x worse on the larger MoE model. FP16 state
+    //     costs MORE where it would be used most. This is decisive and it says
+    //     FP32.
+    //   * CAPACITY (this branch): per-session state is 30 layers x 2 MiB =
+    //     60 MiB on the 35B-A3B, ~9x its KV, and it bounds concurrency — at
+    //     width 64 FP32 state OOMs the GTT pool mid-prefill and only 19/64
+    //     sessions complete, where FP16 gives 64/64 (BUGS.md).
+    //
+    // So FP16 is the right choice for a high-concurrency deployment and the
+    // wrong default. Opt in per-deployment; do not move the default on the
+    // capacity number alone, which is what this branch briefly did.
+    if hipfire_env::DN_STATE_FP16.flag() {
         StateQuant::FP16
+    } else {
+        StateQuant::FP32
     }
 }
 
