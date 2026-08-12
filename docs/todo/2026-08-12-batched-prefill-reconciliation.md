@@ -131,3 +131,55 @@ is `experts_per_tok: 2` and `use_gpu_topk` requires `k_top == 8`, so the fixture
 never exercises this path. Evidence has to come from a real 35B-A3B run: the
 pp512 number plus a per-layer cosine against the per-token reference (the branch
 recorded layer-0 1.000000 @16 tok, layer-39 0.999378 @16 tok, 0.998326 @128 tok).
+
+## Gate audit (measured 2026-08-12) — `is_batchable_la` is stale, and not the only blocker
+
+`pbs_eligible` is a CHAIN of predicates. Two were widened and measured; neither
+flipped eligibility. Recording the whole map so the next attempt instruments
+instead of guessing, which is what cost this one.
+
+Test rig, reusable and cheap: `Qwen3.5-35B-A3B--oq4.25++.hfq`, one 543-token
+prompt, `max_tokens=1`, same binary run twice — once normally, once with
+`HIPFIRE_PREFILL_BATCHED=0` to force the per-token path. Wall minus load time is
+the prefill cost. No rebuild needed between arms.
+
+| change tried | batched | forced per-token | verdict |
+|---|---|---|---|
+| remove `all(DeltaNet \| FullAttn)` clause | 64.48 s (load 35.69) | 64.52 s (load 35.81) | inert |
+| add `Oq4G256 \| Oq8G256` to `is_batchable_la` | 65.18 s (load 36.44) | 65.73 s (load 36.90) | inert |
+
+Neither landed.
+
+### What the artifact actually is
+
+`hipfire inspect` on the oq4.25++ 35B-A3B: **`OqPlusCompact` 20791 tensors /
+18.13 GB**, plus `Q8F16` 80 tensors / 22.37 MB. So attention projections AND
+routed experts are OQ; only the tiny router/scalar-gate tensors are Q8F16.
+`dtype_for_quant_type` maps `OqPlusCompact -> DType::Oq8G256` and
+`Q8F16 -> DType::Q8_0`, so at runtime the LA projections present as `Oq8G256`.
+
+### Which links admit what
+
+| predicate | admits OQ? | note |
+|---|---|---|
+| `is_batchable_la` (LA projections) | **NO** | list is `MQ4G256 \| HFQ4G256 \| MQ6G256 \| HFQ6G256 \| Q8_0 \| ParoQ4G128 \| F32 \| F16 \| BF16` — every quantized entry is a DEPRECATED family. No OQ, no QTIP. |
+| `moe_prefill_quant_family_supported_for_arch` (routed experts) | **yes** | `Oq4G256 \| Oq8G256 => !arch.starts_with("gfx9")` |
+| `moe_prefill_side_gate_dtype_supported` (router / scalar gate) | n/a | wants `MQ4G256 \| Q8_0 \| F32 \| F16 \| BF16`; the artifact's `Q8F16` router maps to `Q8_0`, so this passes |
+
+`prefill_chunk` **already dispatches** `Oq4G256` and `Oq8G256` for the LA
+projections, so `is_batchable_la` was rejecting dtypes the dispatch supports —
+a real gap, just not the deciding one. **QTIP is absent from both the gate and
+the batched dispatch** (`Qtip3G256`, `Qtip3G256I3`, `Qtip4G256` have zero arms
+in `prefill_chunk`), so QTIP cannot be enabled by widening a list; it needs the
+batched dispatch built first.
+
+### Next step: instrument, do not read
+
+`HIPFIRE_KERNEL_TRACE=1` prints `pbs_eligible` INPUTS only —
+`n=543 dn_quant=FP32 all_layers_dense_la=false moe_topk_ok=true (K=8, E=256)
+router_logits=true arch=gfx1151`, all admitting — and never the verdict or which
+clause failed. Add a temporary per-clause trace (the `any(..)` layer-kind check,
+each `is_batchable_la` call with its dtype, and `moe_ffn_batched_admissible`'s
+sub-results), run the rig once, and the answer falls out. One rebuild beats
+another round of predicate reading.
+
