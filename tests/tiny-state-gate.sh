@@ -30,7 +30,7 @@ SEED="${HIPFIRE_TINYSTATE_SEED:-42}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 
-ALL_FAMILIES=(llama qwen2 dots_ocr deepseek4 deepseek4_compressed deepseek4_mtp gemma3 gemma3_vl gemma4_dense gemma4_ple gemma4_moe minimax lfm2_moe mamba2 qwen3_5 qwen3_5_vl qwen3_5_moe)
+ALL_FAMILIES=(llama qwen2 dots_ocr deepseek4 deepseek4_compressed deepseek4_mtp gemma3 gemma3_vl gemma4_dense gemma4_ple gemma4_moe minimax lfm2_moe mamba2 qwen3_5 qwen3_5_vl qwen3_5_moe qwen3_5_moe_indexed)
 families=("${ALL_FAMILIES[@]}")
 if [ -n "${HIPFIRE_TINYQUANT_FAMILIES:-}" ]; then
     IFS=',' read -r -a families <<<"$HIPFIRE_TINYQUANT_FAMILIES"
@@ -41,7 +41,7 @@ anchor_for() {
         llama) echo q8f16 ;;
         deepseek4 | deepseek4_compressed | deepseek4_mtp) echo deepseek4-source-precision ;;
         minimax | lfm2_moe) echo mq6 ;;
-        qwen2 | dots_ocr | gemma3 | gemma3_vl | gemma4_dense | gemma4_ple | gemma4_moe | mamba2 | qwen3_5 | qwen3_5_vl | qwen3_5_moe) echo fp16 ;;
+        qwen2 | dots_ocr | gemma3 | gemma3_vl | gemma4_dense | gemma4_ple | gemma4_moe | mamba2 | qwen3_5 | qwen3_5_vl | qwen3_5_moe | qwen3_5_moe_indexed) echo fp16 ;;
         *) return 1 ;;
     esac
 }
