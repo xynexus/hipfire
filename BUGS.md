@@ -94,6 +94,46 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
+## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
+
+Measured 2026-08-12 with a new FP64-accumulate oracle
+(`kernels/src/gated_delta_net_f64acc{,_routed_batch_seq}.hip`,
+`HIPFIRE_DN_STATE_F64_ORACLE=1`). FP32 storage, `double` tile and arithmetic,
+identical routing and lane mapping — so it isolates the error the f32 kernel
+accrues inside its own tile from any storage round-trip.
+
+L2 relative divergence of the DeltaNet state, 35B-A3B, 120 decode steps (pos 144):
+
+| comparison | divergence |
+|---|---|
+| FP16 storage vs the FP32 kernel | 5.05e-03 |
+| **the FP32 kernel vs the FP64 oracle** | **3.51e-02** |
+
+**The reference is ~7x further from fp64 than FP16 is from the reference.** Every
+FP16-vs-FP32 KLD figure quoted for this subsystem — including the 2.57e-03 that
+kept FP16 opt-in — measures divergence from an accumulator that is itself drifting
+harder than the thing being measured.
+
+Why: `gated_delta_net.hip` is float throughout. The per-token update does a
+`HD`-term dot product, a cross-lane `__shfl_down` tree, and a multiply-accumulate
+into the state, all in f32, and the result is fed back in. Storage format is a
+side issue next to that.
+
+What this reframes:
+- **FP16 state storage is a second-order concern.** Arguing about 10 vs 24
+  mantissa bits of STORAGE while the ACCUMULATION loses more than that is the
+  wrong axis.
+- Compensated (Kahan/Neumaier) summation in f32 is the obvious lever and costs no
+  fp64 rate penalty — the dot product and the `__shfl_down` reduction are both
+  ordinary summations. Worth trying before any further storage-format work.
+- The oracle is not a serving path: fp64 on consumer RDNA3 runs at a small
+  fraction of fp32. It is a correctness reference, measured offline.
+
+Caveat on reading these numbers: a recurrence amplifies any perturbation, so
+neither figure is "the error" in an absolute sense — both are trajectory
+divergence after 144 steps. The comparison is still apples-to-apples: swapping
+f32->f64 accumulation moves the state 7x more than swapping f16->f32 storage does.
+
 ## [Medium] FP16 DeltaNet state error COMPOUNDS with sequence length — no bug, but the framing understates it
 
 Investigated 2026-08-12 on the suspicion that a 45x KLD gap between the 2B and

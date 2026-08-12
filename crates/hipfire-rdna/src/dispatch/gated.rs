@@ -158,11 +158,31 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
-        self.ensure_kernel(
-            "gated_delta_net",
-            kernels::GATED_DELTA_NET_SRC,
-            "gated_delta_net_f32",
-        )?;
+// Oracle swap, same as the routed sibling: identical signature and lane
+        // mapping, `double` tile and arithmetic. Single-session decode takes
+        // THIS kernel while batched decode takes the routed one, so both need
+        // the swap or an oracle run silently measures nothing.
+        static F64_ORACLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let f64_oracle = *F64_ORACLE.get_or_init(|| {
+            matches!(
+                std::env::var("HIPFIRE_DN_STATE_F64_ORACLE").ok().as_deref(),
+                Some("1") | Some("on") | Some("true") | Some("yes")
+            )
+        });
+        let (cache_key, src, entry) = if f64_oracle {
+            (
+                "gated_delta_net_f64acc",
+                kernels::GATED_DELTA_NET_F64ACC_SRC,
+                "gated_delta_net_f64acc",
+            )
+        } else {
+            (
+                "gated_delta_net",
+                kernels::GATED_DELTA_NET_SRC,
+                "gated_delta_net_f32",
+            )
+        };
+        self.ensure_kernel(cache_key, src, entry)?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let vp = v.buf.as_ptr();
@@ -213,10 +233,30 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
+        // Oracle swap: identical signature, routing and lane mapping; `double` tile
+        // and arithmetic. Off by default and slow by design — it exists to
+        // measure how far this f32 path drifts, since every FP16-vs-FP32 state
+        // figure is quoted against it.
+        static F64_ORACLE_ROUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let f64_oracle = *F64_ORACLE_ROUTED.get_or_init(|| {
+            matches!(
+                std::env::var("HIPFIRE_DN_STATE_F64_ORACLE").ok().as_deref(),
+                Some("1") | Some("on") | Some("true") | Some("yes")
+            )
+        });
+        let kname = if f64_oracle {
+            "gated_delta_net_f64acc_routed_batch_seq"
+        } else {
+            "gated_delta_net_f32_routed_batch_seq"
+        };
         self.ensure_kernel(
-            "gated_delta_net_f32_routed_batch_seq",
-            kernels::GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC,
-            "gated_delta_net_f32_routed_batch_seq",
+            kname,
+            if f64_oracle {
+                kernels::GATED_DELTA_NET_F64ACC_ROUTED_BATCH_SEQ_SRC
+            } else {
+                kernels::GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC
+            },
+            kname,
         )?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
@@ -240,7 +280,7 @@ impl Gpu {
         );
         let n_tiles = (128 / 4) as u32;
         let result = self.launch_kernargs(
-            "gated_delta_net_f32_routed_batch_seq",
+            kname,
             [n_heads as u32, n_tiles, n_sessions as u32],
             [32, 1, 1],
             0,
