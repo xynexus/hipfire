@@ -52,7 +52,7 @@ echo "== Python CPU tests =="
 echo "== Env-var registry (declared in hipfire-env, per-crate enforcement) =="
 ./tests/env-registry-gate.sh
 
-echo "== Env-var docs freshness (docs/env-vars.md + env_docs.rs vs source) =="
+echo "== Env-var docs coverage (docs named HIPFIRE_* vars exist in source) =="
 cargo run -q -p hipfire-cli -- gen-env-docs --check
 
 echo "== CLI docs freshness (docs/CLI.md + man/ vs clap definition) =="

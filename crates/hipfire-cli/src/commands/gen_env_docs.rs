@@ -2,38 +2,50 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! `hipfire gen-env-docs` (hidden) — scan the tracked source tree for
-//! environment-variable usage and render the committed env-var docs:
-//! `docs/env-vars.md` (a Markdown table) and
-//! `crates/hipfire-runtime/src/env_docs.rs` (the compiled `EnvVarDoc` registry).
+//! environment-variable usage and render `docs/env-vars.md`, a Markdown table.
 //!
 //! This is the Rust-native replacement for the former `scripts/gen-env-docs.py`
 //! + `scripts/check-env-docs.py`. With `--check` it regenerates to memory and
-//! diffs against what is on disk (plus verifies that every `HIPFIRE_*` var
-//! named in the top-level docs is covered), exiting non-zero on drift — the
-//! freshness gate `tests/no-gpu-ci.sh` runs. Only `env_docs.rs` is tracked; the
-//! Markdown is gitignored, so its absence is not drift. See `check_file`.
+//! verifies that every `HIPFIRE_*` var named in the top-level docs is covered,
+//! exiting non-zero otherwise — the gate `tests/no-gpu-ci.sh` runs.
 //!
-//! Two deliberate improvements over the Python it replaces:
-//!   * `source:` fields are **repo-relative**, not absolute machine paths.
-//!   * Pipe-escaping on read-back is idempotent (the Python re-escaped `|`
-//!     every run, so its output never stabilized — there was no working
-//!     content gate). The `.rs` output is also piped through `rustfmt` so it
-//!     stops fighting `cargo fmt`.
+//! **It used to also emit `crates/hipfire-runtime/src/env_docs.rs`**, 6.3k lines
+//! declaring 780 `EnvVarDoc` constants. Nothing ever read one. It existed only
+//! to be a *tracked* anchor the freshness check could diff against, because the
+//! Markdown is gitignored and so cannot serve that role. That anchor cost more
+//! than it caught: every entry carries a `source: "path:line"`, so any edit that
+//! shifted a line number rewrote the file and failed the gate on a change that
+//! touched no env var at all. The circularity is the tell — it detected drift in
+//! a file whose only purpose was detecting drift.
+//!
+//! **`source:` is a repo-relative path with NO line number.** That is what
+//! actually kills the churn, and it applies to the Markdown too: the table used
+//! to record `path:line`, so inserting a line anywhere above a read site
+//! rewrote the entry and failed `--check` on a change that touched no env var.
+//! The `hipfire-env` merge below already used a line-free source for exactly
+//! this reason ("stable under unrelated line moves in the reader"); the scanner
+//! now agrees with it. `line_idx` still carries the position internally, where
+//! comment scanning genuinely needs it — it just never reaches the output.
+//!
+//! `--check` therefore verifies two things that cannot churn: the Markdown
+//! matches if present (absent is fine — fresh clones and CI do not have it),
+//! and `coverage_gaps` finds no `HIPFIRE_*` named in AGENTS.md / README.md /
+//! CONTRIBUTING.md that is missing from the table.
 //!
 //! **The output is a pure function of the tracked sources.** It deliberately
 //! does NOT read descriptions back out of `docs/env-vars.md`: that file is
 //! gitignored, so it exists in a worktree that has run the generator before and
-//! never in a fresh clone. Preferring its text made the `.rs` differ between a
-//! warm worktree and CI — the gate then failed in CI while passing locally on
-//! the same commit, for 16 vars whose description came from the markdown rather
-//! than from source. Any input to this generator must be tracked, or the
-//! content gate is not reproducible.
+//! never in a fresh clone. Preferring its text made output differ between a warm
+//! worktree and CI — the gate then failed in CI while passing locally on the
+//! same commit, for 16 vars whose description came from the markdown rather than
+//! from source. Any input to this generator must be tracked, or the check is not
+//! reproducible.
 
 #![allow(clippy::doc_lazy_continuation)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use regex::Regex;
 
@@ -42,11 +54,8 @@ pub struct GenEnvDocsArgs {
     /// Markdown reference written/checked (repo-relative).
     #[arg(long, default_value = "docs/env-vars.md")]
     pub doc: String,
-    /// Generated Rust registry module written/checked (repo-relative).
-    #[arg(long, default_value = "crates/hipfire-runtime/src/env_docs.rs")]
-    pub rust_module: String,
-    /// Verify the committed files match the current source without writing;
-    /// exit non-zero on any drift (for CI).
+    /// Verify the docs are consistent with the current source without writing;
+    /// exit non-zero otherwise (for CI).
     #[arg(long)]
     pub check: bool,
 }
@@ -56,7 +65,7 @@ pub struct GenEnvDocsArgs {
 struct EnvDoc {
     name: String,
     description: String,
-    /// Repo-relative `path:line`.
+    /// Repo-relative path, no line number.
     source: String,
 }
 
@@ -100,20 +109,15 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
     let docs = collect_env_data(&root)?;
 
     let markdown = render_markdown(&docs);
-    let rust_unformatted = render_rust_module(&docs);
-    let rust = rustfmt(&rust_unformatted)?;
-
     let doc_path = root.join(&args.doc);
-    let rust_path = root.join(&args.rust_module);
 
     if args.check {
         let mut stale = Vec::new();
-        // The Markdown is generated and gitignored, so a clean checkout simply
-        // does not have it. Requiring it made this gate unsatisfiable anywhere
-        // but a tree where someone had already run the writer. Drift detection
-        // rides on the tracked `env_docs.rs` instead.
-        check_file(&doc_path, markdown.as_bytes(), false, &mut stale);
-        check_file(&rust_path, rust.as_bytes(), true, &mut stale);
+        // `docs/env-vars.md` is generated and gitignored, so a clean checkout
+        // simply does not have it and that is not drift — but a copy that IS
+        // present has to match, or a stale local file quietly misleads whoever
+        // reads it.
+        check_file(&doc_path, markdown.as_bytes(), &mut stale);
         let missing = coverage_gaps(&root, &markdown);
 
         if !stale.is_empty() || !missing.is_empty() {
@@ -130,7 +134,7 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
                     "docs/env-vars.md missing `{name}` referenced by {doc}\n"
                 ));
             }
-            msg.push_str("regenerate with `cargo run -p hipfire-cli -- gen-env-docs` and commit.");
+            msg.push_str("regenerate with `cargo run -p hipfire-cli -- gen-env-docs`.");
             anyhow::bail!("{msg}");
         }
         eprintln!("gen-env-docs: env docs are up to date");
@@ -142,8 +146,6 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
     }
     std::fs::write(&doc_path, markdown.as_bytes())?;
     eprintln!("gen-env-docs: wrote {}", doc_path.display());
-    std::fs::write(&rust_path, rust.as_bytes())?;
-    eprintln!("gen-env-docs: wrote {}", rust_path.display());
     Ok(())
 }
 
@@ -167,14 +169,14 @@ fn doc_only_entries() -> Vec<EnvDoc> {
             name: "HIPFIRE_LOCAL".to_string(),
             description: "Force local-spawn behavior and skip serve HTTP in documented workflows"
                 .to_string(),
-            source: "README.md:962".to_string(),
+            source: "README.md".to_string(),
         },
         EnvDoc {
             name: "HIPFIRE_PYTHON".to_string(),
             description:
                 "Python interpreter used by the no-GPU CI shell gate for Python tooling and tests"
                     .to_string(),
-            source: ".github/CONTRIBUTING.md:86".to_string(),
+            source: ".github/CONTRIBUTING.md".to_string(),
         },
     ]
 }
@@ -203,7 +205,7 @@ fn tracked_sources(root: &Path) -> anyhow::Result<Vec<String>> {
 
 struct EnvUsage {
     name: String,
-    /// Repo-relative `path:line`.
+    /// Repo-relative path, no line number — see `extract_env_usages`.
     source: String,
     line_idx: usize, // 0-based
 }
@@ -229,7 +231,13 @@ fn extract_env_usages(rel: &str, lines: &[String], re: &Regex) -> Vec<EnvUsage> 
                 if !name.is_empty() {
                     out.push(EnvUsage {
                         name: name.to_string(),
-                        source: format!("{rel}:{}", i + 1),
+                        // Path only, no `:line`. A line number here made the
+                        // rendered docs a function of every unrelated edit
+                        // above the read site, so a change touching no env var
+                        // still failed the freshness check. `line_idx` below
+                        // keeps the position for comment scanning, which is
+                        // what actually needs it.
+                        source: rel.to_string(),
                         line_idx: i,
                     });
                     break;
@@ -265,7 +273,7 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
         let usage_list = &usages[name];
         let mut best: Option<EnvDoc> = None;
         for usage in usage_list {
-            let lines = &raw_lines[source_path(&usage.source)];
+            let lines = &raw_lines[&usage.source];
             let line = &lines[usage.line_idx];
             let cands = extract_comment_descriptions(usage.line_idx, lines);
             let desc = infer_default(name, &cands, line, lines, usage.line_idx, &usage.source);
@@ -324,10 +332,6 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
 
     docs.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(docs)
-}
-
-fn source_path(source: &str) -> &str {
-    source.rsplit_once(':').map(|(p, _)| p).unwrap_or(source)
 }
 
 // ─── description heuristics (ported from gen-env-docs.py) ───────────────────
@@ -668,10 +672,6 @@ fn infer_default(
 
 // ─── rendering ──────────────────────────────────────────────────────────────
 
-fn escape_rust_str(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn render_markdown(docs: &[EnvDoc]) -> String {
     let total = docs.len();
     let hipfire = docs
@@ -700,88 +700,20 @@ fn render_markdown(docs: &[EnvDoc]) -> String {
     lines.join("\n") + "\n"
 }
 
-fn render_rust_module(docs: &[EnvDoc]) -> String {
-    let mut s = String::new();
-    s.push_str("#![allow(dead_code)]\n\n");
-    s.push_str("// SPDX-License-Identifier: Apache-2.0\n");
-    s.push_str("//\n");
-    s.push_str("// Generated automatically from source env usage by `hipfire gen-env-docs`.\n");
-    s.push_str("// Do not hand-edit. Re-run `cargo run -p hipfire-cli -- gen-env-docs`.\n\n");
-    s.push_str("/// Canonical environment-variable documentation registry.\n");
-    s.push_str("///\n");
-    s.push_str("/// Each entry is sourced from inline comments or generated defaults.\n");
-    s.push_str("pub struct EnvVarDoc {\n");
-    s.push_str("    pub name: &'static str,\n");
-    s.push_str("    pub description: &'static str,\n");
-    s.push_str("    pub source: &'static str,\n");
-    s.push_str("}\n\n");
-    s.push_str("impl EnvVarDoc {\n");
-    s.push_str("    pub const fn name(&self) -> &'static str {\n");
-    s.push_str("        self.name\n");
-    s.push_str("    }\n");
-    s.push_str("}\n\n");
-
-    for doc in docs {
-        s.push_str(&format!("/// `{}` — {}\n", doc.name, doc.description));
-        s.push_str(&format!(
-            "pub const ENV_{}: EnvVarDoc = EnvVarDoc {{\n",
-            doc.name
-        ));
-        s.push_str(&format!("    name: \"{}\",\n", doc.name));
-        s.push_str(&format!(
-            "    description: \"{}\",\n",
-            escape_rust_str(&doc.description)
-        ));
-        s.push_str(&format!("    source: \"{}\",\n", doc.source));
-        s.push_str("};\n\n");
-    }
-
-    s.push_str("/// All documented environment variables in deterministic order.\n");
-    s.push_str("pub const ALL_ENV_VARS: &[EnvVarDoc] = &[\n");
-    for doc in docs {
-        s.push_str(&format!("    ENV_{},\n", doc.name));
-    }
-    s.push_str("];\n");
-    s
-}
-
-/// Pipe the generated module through `rustfmt` so the committed file is
-/// fmt-stable (this is the fix for the perpetual `cargo fmt` churn).
-fn rustfmt(src: &str) -> anyhow::Result<String> {
-    use std::io::Write;
-    let mut child = Command::new("rustfmt")
-        .args(["--edition", "2021", "--emit", "stdout"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn rustfmt (is it installed?): {e}"))?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(src.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "rustfmt failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(out.stdout)?)
-}
-
 /// Record `path` as stale unless it matches freshly generated `expected`.
 ///
-/// `required` separates the two outputs. `env_docs.rs` is tracked, so a missing
-/// file is real drift. `docs/env-vars.md` is generated and gitignored, so its
-/// absence is the normal state of a clean checkout — but if it is present it
-/// still has to match, or a stale local copy would quietly mislead whoever read
-/// it. Only `NotFound` is forgiven; an unreadable file is still a failure.
-fn check_file(path: &Path, expected: &[u8], required: bool, stale: &mut Vec<String>) {
+/// The only output left is generated and gitignored, so its absence is the
+/// normal state of a clean checkout — but if it is present it still has to
+/// match, or a stale local copy would quietly mislead whoever read it. Only
+/// `NotFound` is forgiven; an unreadable file is still a failure.
+///
+/// The `required` parameter this used to take existed for `env_docs.rs`, which
+/// was tracked and so had to be present. That output is gone; a bool with one
+/// live value is a trap, not a feature.
+fn check_file(path: &Path, expected: &[u8], stale: &mut Vec<String>) {
     match std::fs::read(path) {
         Ok(got) if got == expected => {}
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => stale.push(path.display().to_string()),
     }
 }
@@ -814,11 +746,11 @@ fn coverage_gaps(root: &Path, markdown: &str) -> Vec<(String, String)> {
 mod tests {
     use super::check_file;
 
-    /// A missing optional file is not drift, but a missing required one is —
-    /// the distinction the `--check` gate rests on. Present-and-different stays
-    /// stale either way.
+    /// An absent generated file is not drift — the gate must stay satisfiable
+    /// in a fresh clone, where the gitignored Markdown simply does not exist.
+    /// A file that IS present still has to match.
     #[test]
-    fn absent_optional_output_is_not_drift() {
+    fn absent_generated_output_is_not_drift() {
         let dir = std::env::temp_dir().join(format!("hipfire-env-docs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the scratch directory");
         let absent = dir.join("absent.md");
@@ -826,17 +758,14 @@ mod tests {
         std::fs::write(&present, b"stale").expect("write the scratch file");
 
         let mut stale = Vec::new();
-        check_file(&absent, b"fresh", false, &mut stale);
+        check_file(&absent, b"fresh", &mut stale);
         assert!(stale.is_empty(), "an absent generated file is not drift");
 
-        check_file(&absent, b"fresh", true, &mut stale);
-        assert_eq!(stale.len(), 1, "an absent tracked file is drift");
+        check_file(&present, b"fresh", &mut stale);
+        assert_eq!(stale.len(), 1, "a present file must still match");
 
-        check_file(&present, b"fresh", false, &mut stale);
-        assert_eq!(stale.len(), 2, "a present file must still match");
-
-        check_file(&present, b"stale", false, &mut stale);
-        assert_eq!(stale.len(), 2, "a matching file is never drift");
+        check_file(&present, b"stale", &mut stale);
+        assert_eq!(stale.len(), 1, "a matching file is never drift");
 
         std::fs::remove_dir_all(&dir).ok();
     }

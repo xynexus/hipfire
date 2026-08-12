@@ -27,7 +27,6 @@ pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
 pub mod dispatch;
-pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
 pub mod hfq;
