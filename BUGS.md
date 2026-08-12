@@ -257,7 +257,10 @@ So every lever this thread identified should NOT be pulled:
 What the thread was right about, and what it was wrong about:
 - Right: the f32 kernel really does drift ~7x more from fp64 than FP16 storage
   drifts from f32 (3.5% vs 0.5% state divergence at 120 decode steps). The
-  attribution is real — the KV dot dominates, storage is smallest.
+  DIVERGENCE is real and reproducible.
+- Wrong: the attribution of it. "The KV dot dominates, storage is smallest" was
+  an artifact of unnormalised synthetic k/q; with realistic inputs the KV dot is
+  ~8% and the UPDATE/STORE is the whole term. See the CORRECTED entry above.
 - Wrong: that any of it reaches the output. State divergence is not KLD, and
   nobody had connected them. A recurrence amplifies perturbations, so the
   assumption cut both ways and needed measuring rather than arguing.
@@ -278,11 +281,34 @@ and it was wrong.
 | 512 | 255 (obs) | 256..511 | 3.744e-10 |
 | 2048 | 1023 (derived) | 1024..2047 | 1.477e-10 |
 | 8192 | 4095 (obs) | 4096..8191 | 2.016e-10 |
+| 16384 | 8191 (obs) | 8192..16383 | 7.834e-11 |
+| 32768 | 16383 (obs) | 16384..32767 | 1.360e-10 |
 
 `(obs)` = read from the run's `total_scored`; `(derived)` = computed from
 `n_ctx/2 - 1`, because that run's output was not captured to a file and only its
 KLD survives. The 512 row was re-run to confirm both the count and the KLD
 (3.7444e-10, bit-reproducible), which is what established the formula.
+
+**64x of context depth, and the KLD does not move.** Every point sits within ~5x
+of every other, the ordering is non-monotonic, and the DEEPEST point (16383
+tokens) is 2.8x LOWER than the shallowest. There is no growth term to
+extrapolate and no trend to fit — this is scatter around ~1.5e-10, not a curve.
+The mechanism is the one the corrected ablation identified: a decaying gate
+drains old error out of the recurrent state faster than new error accumulates.
+
+The state is advanced token-by-token across all 16383 tokens within the chunk,
+so recurrent accumulation over a long context IS exercised. What is still not
+exercised is autoregressive feedback — teacher forcing means a perturbed logit
+never changes the next input token. That is the one remaining scope caveat, and
+against ~8 orders of margin it does not put the conclusion in doubt.
+
+Measurement note on the last row, because the conditions differ: the 32768 score
+ran with `HIPFIRE_QWEN35_PAGED_EXPERTS=0` (all experts resident) while its
+reference was built WITH paging, and every other row used paging on both sides.
+Paging is a residency mechanism, not a numeric one, so this should not matter —
+and empirically it did not: the row lands mid-range among the others rather than
+as an outlier, which is itself a small piece of evidence that expert paging is
+numerically neutral. The switch was forced, not chosen; see below.
 
 **Flat, and non-monotonic, over an 8x span of context** — the 8192 point is
 LOWER than the 512 one. There is no growth term to extrapolate. This is the
@@ -297,9 +323,39 @@ the eval is teacher-forced, so a perturbed logit never changes the next input
 token. The 3.5% figure came from 120 autoregressive DECODE steps. With ~8 orders
 of margin and a measured-flat length response, the conclusion is not in doubt.
 
-Also observed: chunk 1 of the scoring run died with `paged expert residency
-layer=20 expert=78 ... free=15.1 MiB of total=43008.0 MiB` — the expert-cache
-pressure documented elsewhere in this file, unrelated to precision.
+**CLOSED. Do not re-open on new precision modelling alone.** The question was
+"how much precision does the DeltaNet recurrence need, including near max
+context", and it is answered: f32 arithmetic is required and sufficient; f16
+ARITHMETIC is not viable (~1.5e-3, four orders worse, see the CORRECTED entry);
+the f32 error does not compound with context over a 64x sweep; and the whole term
+is ~8 orders below the model's own quantization. Re-opening needs a NEW REGIME —
+autoregressive long generation is the only one identified — not another
+estimate of a term already bounded at 1e-10.
+
+### Side finding: the expert pager leaks, and it is what blocked 16383 at first
+
+Both paged attempts at the 32768 chunk died with
+`paged expert residency ... hipMalloc(1.55 MiB), free=15.1 MiB of
+total=43008.0 MiB`. The diagnostic part is HOW they died:
+
+| expert cache budget | survived |
+|---|---|
+| 14336 MB | ~1 hour |
+| 6144 MB | ~1 minute |
+| pager off (all resident) | ran to completion |
+
+**A smaller cache died faster.** That is backwards for a budget — a smaller cache
+should bound residency harder, not exhaust memory sooner — and it is exactly the
+signature of the `upload_raw`/`GpuPool` asymmetry already filed as a Tier-1
+prerequisite: `Gpu::upload_raw` mallocs directly while `free_tensor` frees into
+`GpuPool`, so every eviction parks VRAM in a free-list the next cold load cannot
+reach. Smaller cache -> more evictions -> more paging traffic -> faster leak.
+Disabling the pager removes every eviction, and the same run then completed.
+
+So this is not "expert-cache pressure" or a capacity limit of the box, which is
+how the earlier note in this file described it. It is a leak proportional to
+paging traffic, and the three-point cache sweep above is the cheapest reproducer
+found so far. Worth attaching to that filing rather than leaving it here.
 
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
