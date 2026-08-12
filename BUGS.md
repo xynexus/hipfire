@@ -94,7 +94,7 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
-## [High, PROVISIONAL] The FP32 DeltaNet reference drifts more than FP16 drifts from it
+## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
 (`kernels/src/gated_delta_net_f64acc{,_routed_batch_seq}.hip`,
@@ -160,11 +160,22 @@ Two things this caught, both mine:
 - The acceptance bound was first set to 1e-15, which failed a CORRECT kernel.
   The bound was wrong, not the kernel.
 
-The ROUTED oracle (`gated_delta_net_f64acc_routed_batch_seq`) was generated
-mechanically from its source and does carry the correct `TILE_ROWS 4`, so it was
-never subject to the first bug — but it has NOT been through this parity test,
-and it is what produced the 3.5%. Until it has an equivalent check against a
-routed CPU reference, treat that number as indicative, not established.
+**The ROUTED oracle is now validated too, so the 3.5% is ESTABLISHED.**
+`parity_gated_delta_net_f64acc_routed` drives the routed kernels through
+session-major pointer tables against an independent f64 CPU reference, with the
+three sessions' rows INTERLEAVED in the batch — a reference that processed each
+session's rows contiguously would agree with a kernel that ignored routing
+altogether, so the interleaving is what makes the check mean something:
+
+| routed kernel | rel L2 err vs f64 CPU reference |
+|---|---|
+| `gated_delta_net_f32_routed_batch_seq` | 1.570e-7 |
+| `gated_delta_net_f64acc_routed_batch_seq` | **2.585e-8** |
+
+Same shape as the plain pair: the oracle sits at the FP32 storage floor and the
+f32 kernel is ~6x worse. Both oracles are now checked against an independent
+implementation, so the comparison at the top of this entry rests on measured
+kernels rather than on assumption.
 
 ## [Medium] FP16 DeltaNet state error COMPOUNDS with sequence length — no bug, but the framing understates it
 

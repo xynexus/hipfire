@@ -58,7 +58,7 @@ __global__ void gated_delta_net_f64acc_routed_batch_seq(
     const int stride = n_heads * HD;
     const int row_start = tile * TILE_ROWS;
 
-    __shared__ double S_tile[TILE_ROWS * HD];  // 8 KiB (double)
+    __shared__ double S_tile[TILE_ROWS * HD];  // TILE_ROWS(4) x 128 doubles = 4 KiB
 
     float* state = reinterpret_cast<float*>(
         static_cast<uintptr_t>(state_ptrs[(size_t)session_idx * ptr_layer_stride + delta_layer_index])
