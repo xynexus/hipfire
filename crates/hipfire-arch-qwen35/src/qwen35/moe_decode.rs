@@ -620,6 +620,9 @@ fn run_paged_mixed_routed_decode(
             1,
             false,
             false,
+            // Resident routed experts sit in the oq4_arch combined
+            // layout unless oq_moe repacked them (indexed opt-in).
+            !hipfire_dispatch::families::moe::oq_indexed_decode_active(config.dim, mi),
         )
         .map_err(HipError::from)?;
         gpu.moe_gate_up_unscatter_k8(
@@ -666,6 +669,9 @@ fn run_paged_mixed_routed_decode(
             k_top,
             false,
             false,
+            // Resident routed experts sit in the oq4_arch combined
+            // layout unless oq_moe repacked them (indexed opt-in).
+            !hipfire_dispatch::families::moe::oq_indexed_decode_active(config.dim, mi),
         )
         .map_err(HipError::from)?;
         gpu.moe_down_combine_grouped_k8(
@@ -749,7 +755,7 @@ pub(crate) fn moe_ffn_decode_impl(
     // fused GEMV falls back to four individual `weight_gemv` calls.
     let prefill_dtypes = MoePrefillDtypes::from_ffn(ffn);
     let dispatch_flags = if let Some(dtypes) = prefill_dtypes {
-        moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some())
+        moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some(), config.dim, mi)
     } else {
         let gate_side_mq4 = config.has_shared_expert
             && ffn.router.gpu_dtype == DType::MQ4G256
@@ -828,7 +834,7 @@ pub(crate) fn moe_ffn_decode_impl(
                 d.expert_down_uniform,
                 d.routed_profile,
                 k,
-                qwen35_moe_oq_indexed_decode_enabled(),
+                qwen35_moe_oq_indexed_decode_active(config.dim, mi),
                 routed_dtype_indexable_mq4,
                 routed_dtype_indexable_mq6,
                 routed_dtype_indexable_mq2_lloyd,
@@ -1013,6 +1019,13 @@ pub(crate) fn moe_ffn_decode_impl(
             expert_residency: residency_provider
             .as_ref()
             .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
+            routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
+                config.dim, mi,
+            ),
+            // From `routed_shape`, NOT `ffn.experts.first()`: under paged
+            // residency `experts` is empty, so the `map_or(0, ...)` form master
+            // uses would silently dispatch with k/m/n = 0. `routed_shape` is
+            // read from the layout and is correct either way.
             routed_gate_up_k: routed_shape.gate_up_k,
             routed_down_m: routed_shape.down_m,
             routed_down_k: routed_shape.down_k,
@@ -1835,6 +1848,11 @@ pub(crate) fn moe_ffn_decode_impl(
         expert_residency: residency_provider
         .as_ref()
         .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
+        routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
+            config.dim, mi,
+        ),
+        // From `routed_shape`, NOT `ffn.experts.first()` — see the sibling
+        // call site above: `experts` is empty under paged residency.
         routed_gate_up_k: routed_shape.gate_up_k,
         routed_down_m: routed_shape.down_m,
         routed_down_k: routed_shape.down_k,

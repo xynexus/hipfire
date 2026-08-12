@@ -4,6 +4,14 @@ Opened 2026-08-11 after discovering the `Qwen3.5-122B-A10B--oq4.25++.hfq`
 artifact had never been executed — only verified by size, format, hash and
 tensor count. It does not run.
 
+> **SUPERSEDED 2026-08-12 on the decode blocker.** Everything below about
+> `HIPFIRE_QWEN35_MOE_OQ_INDEXED` being a switch for known-wrong kernels was
+> accurate when written and is now history: the failure was a per-expert AWQ
+> scale error, it is fixed, the path is admission-guarded on shape, the tiny
+> tier has a fixture that reaches it, and **the default is now ON**. Read
+> `docs/todo/2026-08-12-handover-indexed-oq-moe.md` first. The dead ends below
+> are still worth not re-walking.
+
 ## What works
 
 `HIPFIRE_QWEN35_RESIDENCY_MODE=qwen_moe_modules` (or

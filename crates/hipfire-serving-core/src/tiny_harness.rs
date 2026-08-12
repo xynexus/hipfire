@@ -84,7 +84,10 @@ impl TinyArch {
         {
             "qwen3_5" | "qwen35" | "qwen3_5_text" => Ok(Self::Qwen35),
             "qwen3_5_vl" | "qwen35_vl" | "qwen3_5_vision_language" => Ok(Self::Qwen35Vl),
-            "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
+            // `_indexed` is the same arch with a wider fixture (top-8,
+            // moe_inter 768) so the indexed routed-expert path is admitted.
+            "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" | "qwen3_5_moe_indexed"
+            | "qwen35moe_indexed" => Ok(Self::Qwen35Moe),
             "deepseek4" | "deepseek_v4" | "deepseek4_flash" | "deepseek_v4_flash" => {
                 Ok(Self::Deepseek4)
             }

@@ -76,7 +76,7 @@ out="$TMP/shared.out"
 write_paths "$case_file" "crates/hipfire-quantize/src/fixture.rs"
 if run_selector "$case_file" "$out"; then status=0; else status=$?; fi
 assert_status 0 "$status" "shared fixture mapping"
-assert_contains "$out" "selected families: deepseek4,deepseek4_compressed,deepseek4_mtp,dots_ocr,gemma3,gemma3_vl,gemma4_dense,gemma4_moe,gemma4_ple,lfm2_moe,llama,mamba2,minimax,qwen2,qwen3_5,qwen3_5_moe,qwen3_5_vl" "shared fixture mapping"
+assert_contains "$out" "selected families: deepseek4,deepseek4_compressed,deepseek4_mtp,dots_ocr,gemma3,gemma3_vl,gemma4_dense,gemma4_moe,gemma4_ple,lfm2_moe,llama,mamba2,minimax,qwen2,qwen3_5,qwen3_5_moe,qwen3_5_moe_indexed,qwen3_5_vl" "shared fixture mapping"
 assert_contains "$out" "selected gates: quant=1 state=1 spec=0" "shared fixture mapping"
 
 case_file="$TMP/dots_ocr.txt"

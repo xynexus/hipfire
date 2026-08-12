@@ -123,6 +123,63 @@ fn raw_upload_chunks(
 /// ```
 ///
 /// Tags: `ptr` (any `*const`/`*mut _`), `i32`, `u32`, `f32`, `u64`.
+/// Grid.x for a 256-wide FWHT rotation, rejecting shapes that would launch an
+/// EMPTY grid.
+///
+/// `k / 256` is `0` for any `k < 256`, and a zero-sized grid is not an error in
+/// HIP: the kernel is dispatched, launches no blocks, returns success, and never
+/// writes its destination. The caller then consumes whatever was already in that
+/// buffer — uninitialised memory, which surfaces downstream as a non-finite
+/// result with nothing in the logs pointing here.
+///
+/// That is not hypothetical. It took seven `qwen3_5_moe` OQ cells to non-finite
+/// KLD when the indexed MoE path became reachable, because the arch-6 toy preset
+/// has `moe_intermediate = 128` and the down-side rotate got `grid.x = 0`. See
+/// `docs/todo/2026-08-12-handover-indexed-oq-moe.md`.
+///
+/// Every caller of this is a G256 format, so a sub-256 `K` is always a caller
+/// bug. Fail loudly at the dispatch instead of silently writing nothing.
+pub(crate) fn fwht_groups(k: usize) -> HipResult<u32> {
+    if k == 0 || k % 256 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "256-wide FWHT rotation requires K % 256 == 0 and K > 0 (got K={k}); \
+                 a smaller K would launch a zero-sized grid and leave the \
+                 destination buffer unwritten"
+            ),
+        ));
+    }
+    Ok((k / 256) as u32)
+}
+
+#[cfg(test)]
+mod fwht_groups_tests {
+    use super::fwht_groups;
+
+    /// The whole point is the sub-256 case: it must be an ERROR, never a
+    /// zero-sized grid. `moe_intermediate = 128` on the arch-6 toy MoE is what
+    /// produced seven non-finite KLD cells before this guard existed.
+    #[test]
+    fn sub_256_k_is_rejected_not_silently_empty() {
+        for k in [1usize, 32, 128, 255] {
+            assert!(fwht_groups(k).is_err(), "K={k} must be rejected");
+        }
+        assert!(fwht_groups(0).is_err(), "K=0 must be rejected");
+        // Non-multiples above 256 truncate too, so they are equally unsafe.
+        for k in [257usize, 384, 1000] {
+            assert!(fwht_groups(k).is_err(), "K={k} must be rejected");
+        }
+    }
+
+    #[test]
+    fn exact_multiples_give_the_expected_group_count() {
+        assert_eq!(fwht_groups(256).unwrap(), 1);
+        assert_eq!(fwht_groups(768).unwrap(), 3); // toy MoE hidden
+        assert_eq!(fwht_groups(2048).unwrap(), 8); // 35B-A3B hidden
+    }
+}
+
 macro_rules! kernargs {
     (@one ptr $v:expr) => {
         hip_bridge::KernArg::Ptr($v as *const ::std::ffi::c_void)

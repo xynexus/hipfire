@@ -51,26 +51,40 @@ pub struct MoeDtypes {
 }
 
 /// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — the single parse of the switch controlling
-/// the indexed routed-OQ path. **ON by default**; set `0`/`off` to fall back to
-/// the CPU-top-K path.
+/// the indexed routed-OQ path. **ON by default** since 2026-08-12; set `0`/`off`
+/// to fall back to the CPU top-K path.
 ///
-/// It was off by default while its per-expert AWQ rotation was wrong (routed
-/// experts do not share an AWQ scale, so one rotation for all of them was a
-/// scale error from layer 0 — KLD 5.108296, ppl 1171.67). Fixed 2026-08-12:
-/// KLD 0.031515 / ppl 7.4643 against 0.030367 / 7.4622 for the fallback it
-/// replaces, with layer-0 residual cosine 0.999999. The remaining 3.8% is the
-/// expected non-bit-identity of a different accumulation order, so the indexed
-/// path is now the better default: same quality, and it is the only path that
-/// can serve a paged-expert artifact at all.
+/// The road here is worth keeping, because the default was flipped ON, reverted,
+/// and flipped ON again in one day, and only the last one had evidence behind it:
+///
+/// 1. The per-expert AWQ rotation was wrong — routed experts do NOT share an AWQ
+///    scale, so one rotation for all of them was a scale error from layer 0
+///    (35B-A3B oq4.25++: KLD 5.108296, ppl 1171.67). Fixed: KLD 0.031515 / ppl
+///    7.4643 against 0.030367 / 7.4622 for the fallback, layer-0 residual cosine
+///    0.244 -> 0.999999.
+/// 2. Flipped on those numbers, and `tests/tiny-quant-gate.sh` turned seven
+///    `qwen3_5_moe` OQ cells **non-finite**. One model's KLD is not the GPU
+///    correctness tier.
+/// 3. Root cause: the FWHT rotates are G256 on both sides and compute
+///    `n_groups = K / 256`, so the toy `moe_inter = 128` launched a ZERO-SIZED
+///    grid — dispatched, no blocks, success, destination never written.
+/// 4. Both halves fixed: `hipfire_rdna::dispatch::fwht_groups` errors on such a
+///    `K`, and [`oq_indexed_decode_active`] refuses admission before that.
+/// 5. And only then flipped: the tier now has a fixture that REACHES this path
+///    (`qwen3_5_moe_indexed` — top-8, `moe_inter` 768), verified to move the KLD
+///    when the switch moves, which is the thing steps 1-2 never established.
+///
+/// So `qwen3_5_moe` (`moe_inter = 128`) covers the fallback and
+/// `qwen3_5_moe_indexed` covers this path. If you change either fixture's shape,
+/// you are changing what this switch is tested by.
 ///
 /// This parse MUST stay single. Three sites used to read it independently and
 /// two spellings disagreed: the loader's MoE-block repack and this resolver
 /// accepted only `"1"`, while qwen35's dispatch predicate also accepted `"on"`.
 /// `=on` therefore enabled the indexed dispatch against weights that were never
 /// repacked for it — guaranteed garbage, from a value that looks like it should
-/// work. The same hazard now runs the other way (a disable that only half
-/// applies would be just as broken), which is why the off-switch is parsed here
-/// too and nowhere else.
+/// work. The same trap now points the other way: an unrecognised OFF spelling
+/// leaves the path ON, so the off-values are matched explicitly and generously.
 pub fn oq_indexed_decode_enabled() -> bool {
     oq_indexed_decode_enabled_from(
         std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
@@ -80,10 +94,34 @@ pub fn oq_indexed_decode_enabled() -> bool {
 }
 
 /// The parse itself, split out so it is testable without touching process-global
-/// env (which races under a parallel test runner). The default INVERTED on
-/// 2026-08-12 — unset now means enabled — so it is worth a direct assertion.
+/// env (which races under a parallel test runner). The default has been inverted
+/// twice, so it carries a direct assertion either way.
 pub fn oq_indexed_decode_enabled_from(v: Option<&str>) -> bool {
-    !matches!(v, Some("0") | Some("off"))
+    !matches!(v, Some("0") | Some("off") | Some("false") | Some("no"))
+}
+
+/// Shape admission for the indexed OQ path. It rotates activations with the
+/// 256-wide FWHT on BOTH sides — gate_up over `K = hidden`, down over `K = mi` —
+/// and every one of those rotates is a G256 format, so a `K` that is not a
+/// positive multiple of 256 is not a shape this path has.
+///
+/// `hipfire_rdna::dispatch::fwht_groups` now errors on such a `K` instead of
+/// launching the zero-sized grid that used to return success without writing its
+/// destination. Admission has to refuse the shape BEFORE that, or the loud
+/// failure just replaces a wrong answer with a dead model: the arch-6 toy MoE is
+/// `hidden = 768`, `mi = 128`, and that `mi` is what turned seven `qwen3_5_moe`
+/// OQ cells non-finite. The 35B-A3B (`hidden = 2048`, `mi = 768`) passes.
+///
+/// This must agree everywhere — the loader's MoE-block repack decides the weight
+/// LAYOUT, so a site that disagrees runs indexed kernels on arch-combined bytes.
+pub fn oq_indexed_shape_supported(hidden: usize, mi: usize) -> bool {
+    hidden != 0 && mi != 0 && hidden % 256 == 0 && mi % 256 == 0
+}
+
+/// The flag AND the shape. Every site that used to read
+/// [`oq_indexed_decode_enabled`] directly wants this one.
+pub fn oq_indexed_decode_active(hidden: usize, mi: usize) -> bool {
+    oq_indexed_decode_enabled() && oq_indexed_shape_supported(hidden, mi)
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -307,6 +345,11 @@ pub struct MoeParams<'a> {
     /// with no provider — and `check_moe_decode_supported` refuses the latter
     /// rather than dispatching against a table that is still all-zero.
     pub expert_residency: Option<&'a dyn ExpertResidency>,
+    /// True when resident routed experts sit in the `oq4_arch` COMBINED layout
+    /// (the default for qt=34/37), so the OQ4 grouped kernel must skip past the
+    /// split nibbles and split f32 scales to reach its interleaved block stream.
+    /// False when `oq_moe` repacked them, which emits that stream at offset 0.
+    pub routed_oq_arch_combined: bool,
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
@@ -534,6 +577,11 @@ pub struct MoePrefillParams<'a> {
     /// same name.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// True when resident routed experts sit in the `oq4_arch` COMBINED layout
+    /// (the default for qt=34/37), so the OQ4 grouped kernel must skip past the
+    /// split nibbles and split f32 scales to reach its interleaved block stream.
+    /// False when `oq_moe` repacked them, which emits that stream at offset 0.
+    pub routed_oq_arch_combined: bool,
     // intermediate buffers
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,

@@ -317,7 +317,13 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    let res = MoeResolution::resolve(&p.dtypes, p.k);
+    // Shape admission, not just the flag: the indexed OQ path's FWHT rotates are
+    // G256 on both sides (K = hidden, K = mi). See `oq_indexed_shape_supported`.
+    let res = MoeResolution::resolve_with_oq_indexed(
+        &p.dtypes,
+        p.k,
+        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi),
+    );
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
@@ -1528,6 +1534,13 @@ pub fn run_grouped_moe_gemm(
     rows: usize,
     paro_i8: bool,
     paro_i8_k8: bool,
+    // True when resident routed experts sit in the `oq4_arch` COMBINED layout —
+    // the default for qt=34/37. The expert pointer table stores the buffer base,
+    // and in that layout the interleaved `[f32 scale][128 nibbles]` stream the
+    // OQ4 grouped kernel reads trails the split nibbles and split f32 scales.
+    // False when `oq_moe` repacked them (indexed-decode opt-in), which emits the
+    // interleaved stream at offset 0.
+    oq_arch_combined: bool,
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
         ($e:expr) => {
@@ -1595,6 +1608,11 @@ pub fn run_grouped_moe_gemm(
                 x_row_div,
                 m_total,
                 rows,
+                if oq_arch_combined {
+                    m * (k / 2) + m * (k / 256) * 4
+                } else {
+                    0
+                },
             ))
         }
         DType::F16 if gpu.arch == "gfx1151" => {
@@ -1801,6 +1819,7 @@ pub fn run_moe_prefill(
             n,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            p.routed_oq_arch_combined,
         )?;
         // Stage 3 unscatter combine: Y_grouped → gate_batch + up_batch.
         hip!(gpu.moe_gate_up_unscatter_k8(
@@ -2117,6 +2136,7 @@ pub fn run_moe_prefill(
             total_slots,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            p.routed_oq_arch_combined,
         )?;
         hip!(gpu.moe_down_combine_grouped_k8(
             p.y_down_grouped,

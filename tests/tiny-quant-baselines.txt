@@ -1,5 +1,21 @@
 # tiny-quant KLD baselines — gpu_arch family format mean_kld rel_tol
 # regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record
+#
+# The 8 standing failures are ALREADY CLASSIFIED — see
+# docs/tiny-quant-gate-8-failures.md before debugging any of them. Summary:
+# four are stale baselines where the fixture now scores BETTER (the printed
+# "drift" is the current mean KLD, not a delta, so lower is better), three are
+# vacuous cells measuring nothing, and the q8f16 ones are on a deprecated
+# format. None needs a fix; the set clears by re-recording and deletion.
+#
+# One update to that document, 2026-08-12: the qwen3_5_moe cells moved when MoE
+# routers became lossless BF16 (72cd1c10b) — mq4/mq6 0.215099 -> 0.223334,
+# q8f16 0.179210 -> 0.179465. That is not a quality signal and does not change
+# the classification. The fixture is random-init, so router precision reshuffles
+# which experts fire with no "correct" answer to move toward; and mq4/mq6 remain
+# bit-identical to each other after the move, which is the very property that
+# marks them vacuous.
+#
 gfx1103 deepseek4 deepseek4-source-precision 0.00000000 0.25
 gfx1103 deepseek4 oq4 0.00303020 0.25
 gfx1103 deepseek4 oq4++-calib 0.00287635 0.25
@@ -192,3 +208,10 @@ gfx1151 qwen3_5_moe mq3 0.24754102 0.25
 gfx1151 qwen3_5_moe mq4 0.15463363 0.25
 gfx1151 qwen3_5_moe mq6 0.15463363 0.25
 gfx1151 qwen3_5_moe q8f16 0.14130644 0.25
+gfx1151 qwen3_5_moe_indexed oq4 0.06008204 0.25
+gfx1151 qwen3_5_moe_indexed oq4++-calib 0.04760109 0.25
+gfx1151 qwen3_5_moe_indexed oq4+-calib 0.05723667 0.25
+gfx1151 qwen3_5_moe_indexed oq4.25++-calib 0.03901826 0.25
+gfx1151 qwen3_5_moe_indexed oq8 0.00332723 0.25
+gfx1151 qwen3_5_moe_indexed oq8++-calib 0.00290585 0.25
+gfx1151 qwen3_5_moe_indexed oq8+-calib 0.00307532 0.25

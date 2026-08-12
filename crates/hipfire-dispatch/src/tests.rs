@@ -864,18 +864,38 @@ fn moe_res_oq_routed_opted_out_falls_back_to_cpu() {
     assert!(r.needs_x_rot_local);
 }
 
-/// The default INVERTED on 2026-08-12 (per-expert AWQ rotation fixed), so unset
-/// now means enabled. Asserted against the pure parse rather than the env so it
-/// cannot race a parallel test runner.
+/// ON unless explicitly opted out (default flipped 2026-08-12, once the tier had
+/// a fixture that reaches the path). The off-spellings are matched generously
+/// because an unrecognised one now leaves the path ON — the failure direction
+/// reversed with the default. Tested against the pure parse rather than the env
+/// so it cannot race a parallel test runner.
 #[test]
 fn moe_oq_indexed_is_on_unless_explicitly_disabled() {
     use crate::families::moe::oq_indexed_decode_enabled_from;
     assert!(oq_indexed_decode_enabled_from(None));
-    assert!(oq_indexed_decode_enabled_from(Some("")));
     assert!(oq_indexed_decode_enabled_from(Some("1")));
     assert!(oq_indexed_decode_enabled_from(Some("on")));
-    assert!(!oq_indexed_decode_enabled_from(Some("0")));
-    assert!(!oq_indexed_decode_enabled_from(Some("off")));
+    for off in ["0", "off", "false", "no"] {
+        assert!(
+            !oq_indexed_decode_enabled_from(Some(off)),
+            "{off} must disable"
+        );
+    }
+}
+
+/// The shape half of admission. `mi = 128` on the arch-6 toy MoE is the exact
+/// value that made the down-side FWHT launch a zero-sized grid; `hidden = 768`
+/// on the same fixture is fine, so BOTH sides have to be checked, not just one.
+#[test]
+fn moe_oq_indexed_shape_refuses_sub_256_fwht_k() {
+    use crate::families::moe::oq_indexed_shape_supported;
+    assert!(!oq_indexed_shape_supported(768, 128), "arch-6 toy MoE");
+    assert!(!oq_indexed_shape_supported(128, 768), "gate_up side");
+    assert!(!oq_indexed_shape_supported(2048, 384), "384 truncates");
+    assert!(!oq_indexed_shape_supported(0, 768));
+    assert!(!oq_indexed_shape_supported(2048, 0));
+    assert!(oq_indexed_shape_supported(2048, 768), "35B-A3B");
+    assert!(oq_indexed_shape_supported(256, 256));
 }
 
 #[test]

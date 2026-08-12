@@ -6370,12 +6370,17 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    // `oq_indexed_decode` arrives as a PARAMETER, deliberately. origin/master
-    // read the shared `oq_indexed_decode_enabled()` here instead, to stop the
-    // repack and the dispatch predicate disagreeing — same goal, but reading it
-    // here would shadow the argument and drop the OTHER half of the predicate:
-    // the caller ANDs the env flag with `k_top == INDEXED_MOE_K_TOP`, because a
-    // top-2 model must not get kernel-layout weights no kernel will read.
+    // `oq_indexed_decode` arrives as a PARAMETER, deliberately, and the caller
+    // builds it from BOTH halves of the predicate. Computing it here instead —
+    // as master did — would shadow the argument and silently drop the k_top
+    // half: the caller ANDs in `k_top == INDEXED_MOE_K_TOP`, because a top-2
+    // model must not get kernel-layout weights no kernel will ever read.
+    //
+    // The shape half master added is kept, and kept at the caller for the same
+    // reason: `oq_indexed_decode_active` must key off the MODEL's (hidden, mi),
+    // never this tensor's (m, k), or gate_up and down disagree within one
+    // expert. Both halves now live in one expression at the single call site,
+    // which is what stops the repack and the dispatch predicate diverging.
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6484,8 +6489,10 @@ fn load_moe_ffn(
     // to a model whose top-k keeps it on the NON-indexed fallback, which then
     // decodes 132 B/260 B blocks as canonical 130 B/258 B ones — silent garbage,
     // observed as non-finite KLD on every Opus cell of a top-2 fixture.
-    let oq_indexed_decode = super::qwen35_moe_oq_indexed_decode_enabled()
-        && config.num_experts_per_tok == super::INDEXED_MOE_K_TOP;
+    let oq_indexed_decode = super::qwen35_moe_oq_indexed_decode_active(
+        config.dim,
+        config.moe_intermediate_size,
+    ) && config.num_experts_per_tok == super::INDEXED_MOE_K_TOP;
     for x in 0..n_exp {
         let gate_up = load_moe_expert(
             hfq,

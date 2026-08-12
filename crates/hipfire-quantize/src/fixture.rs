@@ -322,6 +322,12 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             named_toy_fixture_from_registry(5, "vl", seed)?
         }
         "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => toy_fixture_from_registry(6, seed)?,
+        // Same arch, shaped so the indexed routed-expert decode is ADMITTED
+        // (top-8, moe_inter 768). The default arm is top-2 / moe_inter 128 and
+        // is excluded from that path by both gates — see `moe_indexed_preset`.
+        "qwen3_5_moe_indexed" | "qwen35moe_indexed" => {
+            named_toy_fixture_from_registry(6, "indexed", seed)?
+        }
         "deepseek4" | "deepseek_v4" | "deepseek4_flash" | "deepseek_v4_flash" => {
             toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, seed)?
         }
@@ -365,7 +371,7 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         other => {
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5/qwen3_5_vl \
-                 (arch 5 dense), qwen3_5_moe (arch 6 MoE), deepseek4/deepseek4_compressed/deepseek4_mtp (arch 9), \
+                 (arch 5 dense), qwen3_5_moe/qwen3_5_moe_indexed (arch 6 MoE),deepseek4/deepseek4_compressed/deepseek4_mtp (arch 9), \
                  qwen2 (arch 7, quantize with --arch-id 7), qwen3_legacy (arch 1), dots_ocr (arch 8), \
                  gemma3 (arch 12), gemma3_vl (arch 13), \
                  minimax (arch 10), nemotron_h (arch 14), mamba2 (arch 15), zaya (arch 16), lfm2_moe (arch 11), \

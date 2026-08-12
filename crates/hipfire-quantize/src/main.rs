@@ -11160,6 +11160,44 @@ fn main() {
                         256u32,
                         "OQ8-ROUTER",
                     )
+                } else if !q8_router_flag
+                    && (name.ends_with("mlp.gate.weight")
+                        || name.ends_with("mlp.shared_expert_gate.weight"))
+                {
+                    // MoE routers stay LOSSLESS. The router drives top-k expert
+                    // SELECTION, a discrete decision: quant error near a tie does
+                    // not blur an output, it swaps which expert runs, and two
+                    // experts compute different functions. That is unlike weight
+                    // error inside a GEMM, which averages down over the reduction.
+                    // The old policy already conceded half the point by refusing
+                    // 4-bit here and stopping at Q8; this finishes it.
+                    //
+                    // It is close to free, and cheaper than the raw numbers
+                    // suggest: the container's BF16 storage codec compresses this
+                    // on write with no action here (measured on the arch-6 toy
+                    // MoE: `mlp.gate.weight` logical BF16 4.10 KB, `stored
+                    // Bf16Huff 2.69 KB, 1.524x`). On Qwen3.5-35B-A3B the 40
+                    // routers ([256, 2048]) plus 40 shared-expert scalar gates are
+                    // 22.4 MB at Q8F16; BF16 is ~40.1 MB logical but lands at
+                    // ~26 MB on disk after Huff — roughly +0.02% of an 18.13 GB
+                    // artifact, for lossless routing.
+                    //
+                    // Both serving paths already take BF16 routers: decode's
+                    // `moe_gemv_plain` has a BF16 fast path
+                    // (`gemm_bf16_x_bf16_wmma`) as its FIRST branch, and
+                    // prefill_chunk dispatches BF16 for `ffn.router`.
+                    //
+                    // So write plain BF16 and let the storage layer pick the
+                    // codec. `Bf16Huff`/`Bf16Lut3` are on-disk-only today —
+                    // `QuantType::logical()` maps each to BF16 and the index entry
+                    // is rewritten before any consumer sees it — so naming one
+                    // here would buy nothing the container is not already doing.
+                    // The half that is still missing is VRAM-resident decode; see
+                    // docs/todo/2026-08-12-router-bf16-codec-upgrade.md.
+                    //
+                    // `--q8-router` restores the previous Q8F16 behaviour.
+                    let bf16_bytes = f32_slice_to_bf16_bytes(&f32_data);
+                    (bf16_bytes, QuantType::BF16, 0u32, "BF16-ROUTER")
                 } else if kmap_level == QuantLevel::Q8 {
                     // K-map says Q8 (embed, lm_head, router)
                     let q = quantize_q8f16(&f32_data);

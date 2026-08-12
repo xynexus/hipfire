@@ -114,6 +114,7 @@ add_all_supported() {
     add_family qwen3_5
     add_family qwen3_5_vl
     add_family qwen3_5_moe
+    add_family qwen3_5_moe_indexed
 }
 
 select_quant() {
@@ -232,6 +233,9 @@ while IFS= read -r path; do
             add_family qwen3_5
             add_family qwen3_5_vl
             add_family qwen3_5_moe
+            # The MoE OQ cells above run the CPU fallback; only this one reaches
+            # the indexed routed-expert path (see its FamilyPlan).
+            add_family qwen3_5_moe_indexed
             select_all_tiny
             ;;
 
