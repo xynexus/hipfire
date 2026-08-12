@@ -273,7 +273,13 @@ pub fn run_moe_decode(
     // decode width; >1 must route to grouped prefill (Step 8).
     check_moe_decode_batch_size(p.batch_size)?;
 
-    let res = MoeResolution::resolve(&p.dtypes, p.k);
+    // Shape admission, not just the flag: the indexed OQ path's FWHT rotates are
+    // G256 on both sides (K = hidden, K = mi). See `oq_indexed_shape_supported`.
+    let res = MoeResolution::resolve_with_oq_indexed(
+        &p.dtypes,
+        p.k,
+        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi),
+    );
 
     // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
     // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any

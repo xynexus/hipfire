@@ -95,6 +95,30 @@ pub fn oq_indexed_decode_enabled_from(v: Option<&str>) -> bool {
     matches!(v, Some("1") | Some("on"))
 }
 
+/// Shape admission for the indexed OQ path. It rotates activations with the
+/// 256-wide FWHT on BOTH sides — gate_up over `K = hidden`, down over `K = mi` —
+/// and every one of those rotates is a G256 format, so a `K` that is not a
+/// positive multiple of 256 is not a shape this path has.
+///
+/// `hipfire_rdna::dispatch::fwht_groups` now errors on such a `K` instead of
+/// launching the zero-sized grid that used to return success without writing its
+/// destination. Admission has to refuse the shape BEFORE that, or the loud
+/// failure just replaces a wrong answer with a dead model: the arch-6 toy MoE is
+/// `hidden = 768`, `mi = 128`, and that `mi` is what turned seven `qwen3_5_moe`
+/// OQ cells non-finite. The 35B-A3B (`hidden = 2048`, `mi = 768`) passes.
+///
+/// This must agree everywhere — the loader's MoE-block repack decides the weight
+/// LAYOUT, so a site that disagrees runs indexed kernels on arch-combined bytes.
+pub fn oq_indexed_shape_supported(hidden: usize, mi: usize) -> bool {
+    hidden != 0 && mi != 0 && hidden % 256 == 0 && mi % 256 == 0
+}
+
+/// The flag AND the shape. Every site that used to read
+/// [`oq_indexed_decode_enabled`] directly wants this one.
+pub fn oq_indexed_decode_active(hidden: usize, mi: usize) -> bool {
+    oq_indexed_decode_enabled() && oq_indexed_shape_supported(hidden, mi)
+}
+
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
 /// routing-config logic, relocated from `moe_ffn_decode_impl` into one typed,
 /// testable place (review finding #1). Pure function of `MoeDtypes` + k.

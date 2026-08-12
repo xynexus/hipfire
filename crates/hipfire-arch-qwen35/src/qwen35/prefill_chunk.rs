@@ -894,7 +894,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         false,
                         // Resident routed experts sit in the oq4_arch combined
                         // layout unless oq_moe repacked them (indexed opt-in).
-                        !hipfire_dispatch::families::moe::oq_indexed_decode_enabled(),
+                        !hipfire_dispatch::families::moe::oq_indexed_decode_active(config.dim, mi),
                     )
                     .map_err(HipError::from)?;
                     gpu.moe_gate_up_unscatter_k8(
@@ -1428,7 +1428,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         false,
                         // Resident routed experts sit in the oq4_arch combined
                         // layout unless oq_moe repacked them (indexed opt-in).
-                        !hipfire_dispatch::families::moe::oq_indexed_decode_enabled(),
+                        !hipfire_dispatch::families::moe::oq_indexed_decode_active(config.dim, mi),
                     )
                     .map_err(HipError::from)?;
                     gpu.moe_down_combine_grouped_k8(
@@ -1814,7 +1814,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-        routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_enabled(),
+        routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
+            config.dim, mi,
+        ),
         gate_batch,
         up_batch,
         rot_batch,

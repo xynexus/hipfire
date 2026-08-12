@@ -879,6 +879,21 @@ fn moe_oq_indexed_is_off_unless_explicitly_enabled() {
     assert!(oq_indexed_decode_enabled_from(Some("on")));
 }
 
+/// The shape half of admission. `mi = 128` on the arch-6 toy MoE is the exact
+/// value that made the down-side FWHT launch a zero-sized grid; `hidden = 768`
+/// on the same fixture is fine, so BOTH sides have to be checked, not just one.
+#[test]
+fn moe_oq_indexed_shape_refuses_sub_256_fwht_k() {
+    use crate::families::moe::oq_indexed_shape_supported;
+    assert!(!oq_indexed_shape_supported(768, 128), "arch-6 toy MoE");
+    assert!(!oq_indexed_shape_supported(128, 768), "gate_up side");
+    assert!(!oq_indexed_shape_supported(2048, 384), "384 truncates");
+    assert!(!oq_indexed_shape_supported(0, 768));
+    assert!(!oq_indexed_shape_supported(2048, 0));
+    assert!(oq_indexed_shape_supported(2048, 768), "35B-A3B");
+    assert!(oq_indexed_shape_supported(256, 256));
+}
+
 #[test]
 fn moe_res_oq_routed_opt_in_uses_indexed_path() {
     let mut d = dtypes_all_mq4();

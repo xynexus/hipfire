@@ -6334,13 +6334,19 @@ fn load_moe_expert(
     name: &str,
     m: usize,
     k: usize,
+    config: &Qwen35Config,
 ) -> HipResult<WeightTensor> {
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    // Shared parse — see `oq_indexed_decode_enabled`. The repack below and the
-    // dispatch predicate must never disagree on what enables this path.
-    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_enabled();
+    // Shared predicate — see `oq_indexed_decode_active`. The repack below and the
+    // dispatch predicate must never disagree on what enables this path, and that
+    // includes the shape half: this must key off the MODEL's (hidden, mi), not
+    // this tensor's (m, k), or gate_up and down disagree within one expert.
+    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_active(
+        config.dim,
+        config.moe_intermediate_size,
+    );
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6450,6 +6456,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi,
             config.dim,
+            config,
         )?;
         let down = load_moe_expert(
             hfq,
@@ -6458,6 +6465,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
             config.dim,
             mi,
+            config,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }

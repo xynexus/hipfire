@@ -1757,8 +1757,10 @@ fn moe_decode_dispatch_flags_for_dtypes(
     dtypes: &MoePrefillDtypes,
     k_top: usize,
     paro_shared_present: bool,
+    hidden: usize,
+    mi: usize,
 ) -> MoeDecodeDispatchFlags {
-    let oq_indexed_decode = qwen35_moe_oq_indexed_decode_enabled();
+    let oq_indexed_decode = qwen35_moe_oq_indexed_decode_active(hidden, mi);
     let gate_side_mq4 = dtypes.router == DType::MQ4G256
         && dtypes.shared_expert_scalar_gate == DType::MQ4G256
         && dtypes.shared_expert_gate == DType::MQ4G256
@@ -1845,11 +1847,12 @@ fn moe_decode_dispatch_flags_for_dtypes(
     }
 }
 
-fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
+fn qwen35_moe_oq_indexed_decode_active(hidden: usize, mi: usize) -> bool {
     // Indexed routed-OQ decode: OFF by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=1
-    // opts in. One shared parse — this must agree with the loader's MoE-block
-    // repack or the dispatch runs against un-repacked weights.
-    hipfire_dispatch::families::moe::oq_indexed_decode_enabled()
+    // opts in, AND the shape must admit the G256 FWHT rotates on both sides.
+    // One shared predicate — this must agree with the loader's MoE-block repack
+    // or the dispatch runs against un-repacked weights.
+    hipfire_dispatch::families::moe::oq_indexed_decode_active(hidden, mi)
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
@@ -5497,7 +5500,7 @@ mod tests {
             &dtypes, false, "gfx1100"
         ));
 
-        let decode = moe_decode_dispatch_flags_for_dtypes(&dtypes, 10, false);
+        let decode = moe_decode_dispatch_flags_for_dtypes(&dtypes, 10, false, 2048, 768);
         assert_eq!(decode.routed_path, MoeDecodeIndexedRoutedPath::None);
         assert!(!decode.use_gpu_topk);
         assert!(
@@ -5665,7 +5668,7 @@ mod tests {
         dtypes.router = DType::Q8_0;
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq6);
         assert!(flags.routed_dtype_indexable_mq6);
@@ -5679,7 +5682,7 @@ mod tests {
     fn moe_decode_keeps_mq4_control_on_indexed_path() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq4);
         assert!(flags.gate_side_mq4);
@@ -5695,7 +5698,7 @@ mod tests {
         dtypes.router = DType::Q8_0;
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
         assert!(!flags.routed_dtype_indexable_oq4);
@@ -5710,7 +5713,7 @@ mod tests {
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
         dtypes.expert_down = DType::MQ4G256;
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
         assert!(flags.routed_gate_up_mq6);
@@ -5723,7 +5726,7 @@ mod tests {
     fn moe_decode_k8_shape_required_for_gpu_topk() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 4, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 4, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq6);
         assert!(flags.routed_dtype_indexable_mq6);
@@ -5746,7 +5749,7 @@ mod tests {
             false
         ));
 
-        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
         assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
         assert!(!flags.routed_dtype_indexable_mq4);
