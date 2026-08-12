@@ -94,6 +94,42 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
+## [High] Session release LEAKS its KV and DeltaNet GPU buffers — and blocks sound CoW
+
+Found 2026-08-12 while implementing copy-on-write checkpoints. Sessions are
+released with `m.q35_registry.sessions.remove(session_id)`
+(`serving-core/src/session.rs:1621`, `:1848`), which drops the
+`Qwen35RequestSessionState` — but nothing frees its device memory:
+
+- no `Drop` impl on `KvCache`, `DeltaNetState`, or the session state;
+- `GpuTensor` has no `Drop` either (v2-plan risk #1 states this outright);
+- the only `free_tensor` in `session.rs` is for `logits` (`:301`). Nothing frees
+  `k_gpu`, `v_gpu`, `k_window`, `s_matrices`, `conv_states`.
+
+An `OwnedTensor` RAII wrapper DOES exist (`hipfire-rdna/src/dispatch/mod.rs:377`)
+and is simply not used for session state.
+
+Per released session that is ~30 MiB of DeltaNet state (FP16) plus ~6.5 MiB of KV
+on a 35B-A3B — and double that for any session that also has a retained Final
+checkpoint. It is invisible in the usual way: on 42 GiB of GTT it reads as "the
+model got slower" long before it reads as OOM.
+
+**This is the prerequisite for copy-on-write checkpoints, not a detail beside
+them.** CoW needs to know when a shared buffer's last referent goes away so the
+survivor can free it. On a base where release frees nothing, "sharing" a buffer is
+indistinguishable from leaking it twice: the implementation would appear to work —
+tests would pass, memory would look fine relative to today — precisely because the
+system already never frees. That is a fake CoW, and the failure mode when
+ownership is later added is a use-after-free on a buffer some other session is
+still reading.
+
+Order of work: give session state real ownership first (`OwnedTensor` or an
+explicit release path on the registry remove), prove it with the VRAM slope
+sampled in a long multi-session run, and then build CoW on top. The acceptance
+test for the CoW step already exists — `HIPFIRE_KVARN_DUMP` compares two sessions'
+K state numerically, so a session reading a buffer another session wrote shows up
+as a diff rather than as plausible text.
+
 ## [Medium] Batch-64 collapse is GTT exhaustion from per-session DeltaNet state, not batching
 
 Profiled 2026-08-12 at widths 16/32/64 on `Qwen3.6-35B-A3B--oq4` (kvarn KV,
