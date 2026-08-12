@@ -76,7 +76,7 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
-/// is now FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
+/// is FP16 by default since 2026-08-12; `HIPFIRE_DN_STATE_FP16=0` opts out.
 #[deprecated(note = "Q8 state was removed; precision is FP32 or opt-in FP16")]
 pub fn deltanet_state_fp32_below() -> usize {
     usize::MAX
@@ -120,14 +120,23 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // them unconditionally and half-size FP16 state faulted with
     //   Memory Fault ... kernel: gated_delta_net_q8
     // The kernels, their dispatch entry points and every caller are now gone,
-    // so that blocker is cleared. FP16 stays opt-in until a teacher-forced
-    // FP32-vs-FP16 KLD run on more than one model says otherwise — the
-    // evidence above is one prompt on one model, which is not enough to move
-    // the default.
-    if hipfire_env::DN_STATE_FP16.flag() {
-        StateQuant::FP16
-    } else {
+    // so that blocker is cleared.
+    //
+    // Made the default again 2026-08-12, on a CAPACITY argument rather than an
+    // accuracy one. Per-session DeltaNet state is 30 layers x 2 MiB = 60 MiB on
+    // the 35B-A3B, ~9x its KV cost, and it is what bounds concurrency: at width
+    // 64 the FP32 state OOMs the GTT pool mid-prefill and only 19/64 sessions
+    // complete. FP16 storage takes that to 64/64 with throughput monotonic in
+    // width (5.96 / 6.25 / 6.31 tok/s at 16 / 32 / 64). See BUGS.md.
+    //
+    // The accuracy evidence is still one prompt on one model, so FP32 remains
+    // one flag away and stays the oracle to diff against.
+    // `is_off()`, not `!flag()`: unset must mean "not explicitly off", which is
+    // the whole point of the opt-out spelling.
+    if hipfire_env::DN_STATE_FP16.is_off() {
         StateQuant::FP32
+    } else {
+        StateQuant::FP16
     }
 }
 

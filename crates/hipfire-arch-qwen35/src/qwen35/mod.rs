@@ -3746,15 +3746,24 @@ mod tests {
         }
     }
 
+    /// Renamed and inverted 2026-08-12 with the default. This test failing is how
+    /// the default change announced itself, which is the point of pinning it.
     #[test]
-    fn deltanet_state_defaults_to_fp32_and_fp16_is_opt_in() {
+    fn deltanet_state_defaults_to_fp16_and_fp32_is_opt_out() {
         let cfg = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
         // Redundancy is still reported — it names WHERE to validate a precision
         // change (small models first; that is where quantized state broke) — but
         // it no longer SELECTS anything. The threshold that once chose Q8 above a
         // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-        assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
+        // FP16 unless HIPFIRE_DN_STATE_FP16 is explicitly off. Guarded so a
+        // developer running with the opt-out exported does not see a false
+        // failure — the env is process-wide and this test cannot own it.
+        if hipfire_env::DN_STATE_FP16.is_off() {
+            assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
+        } else {
+            assert_eq!(default_state_quant(&cfg), StateQuant::FP16);
+        }
     }
 
     #[test]
