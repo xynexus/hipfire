@@ -267,6 +267,26 @@ pub enum QuantType {
     /// a far more expensive format. Its FWHT is the 128-length one already used
     /// by MQ4G128 (sign seeds 43/1043, versus 42/1042 at G=256).
     OqPlusCompactG128 = 52,
+    /// Opus Quant W4A4 routed experts, already in the **MoE-block** layout the
+    /// indexed routed-expert kernels consume: per-256-group
+    /// `[f32 scale][128 nibbles]` = 132 B, versus the canonical
+    /// [`QuantType::Oq4G256`] form's f16 scale at 130 B.
+    ///
+    /// This is [`QuantType::Oq4G256ArchPacked`]'s idea one layout over, and for a
+    /// different consumer. Arch-packed (qt 37) serves the DENSE loader, which
+    /// uploads a whole layer's experts as one combined blob; the weight pager
+    /// refuses it because that blob has no per-expert addressing. This code is
+    /// the paged counterpart: each expert is independently addressable and
+    /// already transformed, so `WeightPager` fetches it VERBATIM instead of
+    /// running `oq4_canonical_to_moe_blocks` on the CPU per page-in. Measured
+    /// before this existed: a paged 40×256-expert OQ4 model pinned one core at
+    /// ~96% with the GPU at 0%.
+    ///
+    /// As with qt 37, the quant_type code IS the layout version — a future change
+    /// to the MoE-block layout takes a NEW code, so a stale derived artifact is
+    /// refused at load rather than read as garbage. Produced by `hipfire
+    /// optimize`; the canonical file remains the source of truth.
+    Oq4G256MoeBlocks = 53,
 }
 
 impl QuantType {
@@ -326,6 +346,7 @@ impl QuantType {
             35 => Oq8G256,
             36 => OqPlusCompact,
             52 => OqPlusCompactG128,
+            53 => Oq4G256MoeBlocks,
             37 => Oq4G256ArchPacked,
             38 => Oq3G256,
             39 => Oq2G256,
@@ -398,6 +419,8 @@ impl QuantType {
             MQ4G256Lloyd => Some(160),
             // Opus Quant (symmetric)
             Oq4G256 => Some(130), // 2 (f16 scale) + 128 nibbles
+            // f32 scale (not f16) so the indexed kernels read it directly.
+            Oq4G256MoeBlocks => Some(132), // 4 (f32 scale) + 128 nibbles
             Oq3G256 => Some(98),  // 2 (f16 scale) + 8×3 u32 bit-planes
             Oq2G256 => Some(66),  // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
             Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)

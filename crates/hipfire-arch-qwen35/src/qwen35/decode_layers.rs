@@ -25,11 +25,12 @@ pub(crate) fn forward_scratch_layers(
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let _qkv_dim = k_dim * 2 + v_dim;
-    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
-    // single-GPU decode through the lowered super-op executor. Skipped when a
+    // #397 Ship 6 — forward-as-pipeline. Single-GPU decode routes through the
+    // lowered super-op executor BY DEFAULT (see forward_lowered_enabled);
+    // HIPFIRE_FORWARD_LOWERED=0 opts back to the hand arms below. Skipped when a
     // hidden-state ring buffer or GDN tape capture is active (spec-decode
-    // capture engages only the hand path for now). Default off → the hand arms
-    // below run unchanged.
+    // capture engages only the hand path for now), and when a steer session is
+    // live — so the hand arms below are the exception path, not the default one.
     // RoughQuant corrections are wired into THIS hand path, but the hand path is
     // currently broken (bf16 self-KLD 13.89 vs lowered 0.000 — see
     // docs/roughquant/phase3-real-format-scope.md). Until it is resurrected OR the

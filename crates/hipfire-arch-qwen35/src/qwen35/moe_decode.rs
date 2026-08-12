@@ -333,6 +333,43 @@ pub(crate) fn download_i32_tensor(
     Ok(data)
 }
 
+/// `ExpertResidency` over the qwen35 weight pager (option A).
+///
+/// Only makes the selected experts resident — it does not touch the pointer
+/// table, because the pager maintains that itself on every residency transition.
+/// That is the whole reason the split exists: the previous shape had each
+/// dispatch site patch after ensuring, and the default-ON lowered pipeline never
+/// did, so the table stayed all-zero and the kernels dereferenced null.
+struct PagerExpertResidency<'a> {
+    pager: &'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>,
+}
+
+impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'_> {
+    fn ensure_resident(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        selected: &[u32],
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let mut pager = self.pager.borrow_mut();
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            // Propagate the pager's own message. A residency failure here means
+            // the kernel would read a null slot and wedge the device, so this
+            // must surface as an error and never be swallowed.
+            pager.ensure_expert_module_resident(key, gpu).map_err(|e| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "paged expert residency layer={layer} expert={expert}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
@@ -433,30 +470,56 @@ pub(crate) fn ensure_paged_experts_resident(
         .collect::<Vec<_>>();
     unique.sort_unstable();
     unique.dedup();
+    use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+
     let mut pager = pager.borrow_mut();
-    pager
-        .would_fit_expert_module_set(ffn.layer_idx, &unique)
-        .map_err(|e| HipError::new(0, &format!("page expert module set: {e}")))?;
-    for &expert in &unique {
-        pager
-            .ensure_expert_module_resident(
+    page_timing::timed(Phase::WouldFit, || {
+        pager.would_fit_expert_module_set(ffn.layer_idx, &unique)
+    })
+    .map_err(|e| HipError::new(0, &format!("page expert module set: {e}")))?;
+    // Reported PER EXPERT, not just aggregated into the phase total: the
+    // aggregate is only printed once a whole admission completes, so a stall
+    // inside this loop would show as silence rather than as a large number.
+    // That is exactly what happened the first two times this was instrumented.
+    let admit_start = std::time::Instant::now();
+    for (i, &expert) in unique.iter().enumerate() {
+        let t = std::time::Instant::now();
+        page_timing::timed(Phase::EnsureResident, || {
+            pager.ensure_expert_module_resident(
                 hipfire_runtime::weight_pager::ExpertModuleKey {
                     layer: ffn.layer_idx,
                     expert,
                 },
                 gpu,
             )
-            .map_err(|e| HipError::new(0, &format!("page expert module: {e}")))?;
+        })
+        .map_err(|e| HipError::new(0, &format!("page expert module: {e}")))?;
+        if page_timing::enabled() {
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if ms > 1.0 || i + 1 == unique.len() {
+                eprintln!(
+                    "[pager-expert] layer={} {}/{} expert={} {:.1}ms (set so far {:.1}ms)",
+                    ffn.layer_idx,
+                    i + 1,
+                    unique.len(),
+                    expert,
+                    ms,
+                    admit_start.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+        }
     }
-    pager
-        .patch_expert_module_ptr_table(
+    page_timing::timed(Phase::PatchPtrTable, || {
+        pager.patch_expert_module_ptr_table(
             ffn.layer_idx,
             &unique,
             &ffn.expert_gate_up_ptrs,
             &ffn.expert_down_ptrs,
             gpu,
         )
-        .map_err(|e| HipError::new(0, &format!("patch expert module ptrs: {e}")))?;
+    })
+    .map_err(|e| HipError::new(0, &format!("patch expert module ptrs: {e}")))?;
+    page_timing::admission(unique.len());
     Ok(())
 }
 
@@ -665,6 +728,10 @@ pub(crate) fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    // Residency provider for the lowered MoE path. `Some` exactly when this model
+    // is paged; a fully-resident model gets `None` and the lowered path keeps
+    // top-K on-device with no readback, unchanged.
+    let residency_provider = pager.map(|p| PagerExpertResidency { pager: p });
     let _ = hidden;
 
     let router_logits = s.router_logits;
@@ -748,6 +815,47 @@ pub(crate) fn moe_ffn_decode_impl(
     // of the HFQ4 ones — same control flow, different kernel binary.
     let use_gpu_topk = dispatch_flags.use_gpu_topk;
     let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
+    // Why a routed decode was refused is otherwise invisible: the dispatch error
+    // carries only `use_gpu_topk`/`routed_experts_resident`, not the dtypes that
+    // decided them, so a refusal on a paged or mixed artifact is unattributable
+    // from outside. `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1` names them.
+    if std::env::var("HIPFIRE_QWEN35_MOE_DTYPE_DEBUG").as_deref() == Ok("1") {
+        match prefill_dtypes {
+            Some(d) => eprintln!(
+                "[moe-dtype] layer={} experts_resident={} n_dtypes={} gate_up={:?} down={:?} \
+                 uniform(gu/dn)={}/{} profile={:?} k={} oq_indexed_gate={} \
+                 idx(mq4/mq6/mq2l/paro/oq4/oq8)={}/{}/{}/{}/{}/{} path={:?} use_gpu_topk={}",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                d.expert_gate_up,
+                d.expert_down,
+                d.expert_gate_up_uniform,
+                d.expert_down_uniform,
+                d.routed_profile,
+                k,
+                qwen35_moe_oq_indexed_decode_active(config.dim, mi, k),
+                routed_dtype_indexable_mq4,
+                routed_dtype_indexable_mq6,
+                routed_dtype_indexable_mq2_lloyd,
+                routed_dtype_indexable_paro,
+                routed_dtype_indexable_oq4,
+                routed_dtype_indexable_oq8,
+                dispatch_flags.routed_path,
+                use_gpu_topk,
+            ),
+            None => eprintln!(
+                "[moe-dtype] layer={} MoePrefillDtypes::from_ffn returned None \
+                 (experts_resident={} n_gate_up_dtypes={} expert_gate_up_dtype={:?}) \
+                 -> every indexed path disabled",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                ffn.expert_gate_up_dtype,
+            ),
+        }
+    }
+
     let paged_mixed_routed = ffn.experts.is_empty()
         && prefill_dtypes.is_some_and(|dtypes| dtypes.routed_profile.is_mixed());
     let x_rot_local = if needs_x_rot_local {
@@ -802,25 +910,57 @@ pub(crate) fn moe_ffn_decode_impl(
     } else {
         None
     };
+    // The routed dtypes come from the per-expert dtype tables, NOT from
+    // `ffn.experts`. Under paged residency `experts` is empty by design, so
+    // `experts.first()` yields nothing there — and the previous
+    // `.unwrap_or(DType::F32)` turned "I don't know" into a confident F32,
+    // which the executor's own resolution then read as a non-indexable routed
+    // dtype and refused with `decode-routed-dtype-unsupported-no-fallback`.
+    //
+    // That produced two independent resolutions of the same fact that disagreed:
+    // the arch-side flags above resolved `Uniform(Oq4G256)` / `use_gpu_topk=true`
+    // from `expert_gate_up_dtypes`, while this snapshot said F32. Measured on a
+    // paged Qwen3.6-35B-A3B--oq4 artifact, which is why paged MoE decode failed
+    // for EVERY routed format, not just Opus.
+    //
+    // `moe_expert_gate_up_dtype`/`moe_expert_down_dtype` already prefer the dtype
+    // tables and fall back to resident experts, so they are correct in both modes.
+    let routed_gate_up_dtype = moe_expert_gate_up_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed gate_up dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
+    let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed down dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
         shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        experts_all_gate_up_mq4: ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
-        routed_gate_up: ffn
-            .experts
-            .first()
-            .map(|e| e.gate_up.gpu_dtype)
-            .unwrap_or(DType::F32),
-        routed_down: ffn
-            .experts
-            .first()
-            .map(|e| e.down.gpu_dtype)
-            .unwrap_or(DType::F32),
+        // `.all()` over an EMPTY iterator is vacuously true, so the old form
+        // claimed "every routed expert is MQ4" for any paged model regardless of
+        // its actual format. Read the dtype table first, and when neither source
+        // knows, answer `false` — an unknown must not present as uniformity.
+        experts_all_gate_up_mq4: if !ffn.expert_gate_up_dtypes.is_empty() {
+            ffn.expert_gate_up_dtypes
+                .iter()
+                .all(|d| *d == DType::MQ4G256)
+        } else if !ffn.experts.is_empty() {
+            ffn.experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        } else {
+            false
+        },
+        routed_gate_up: routed_gate_up_dtype,
+        routed_down: routed_down_dtype,
         has_paro_shared: ffn.paro_shared.is_some(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
@@ -839,6 +979,16 @@ pub(crate) fn moe_ffn_decode_impl(
             .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
             .collect();
 
+        // Routed geometry comes from `moe_expert_shape`, which prefers
+        // `ffn.expert_shape` and only then falls back to a resident expert.
+        // `ffn.experts.first()` is None under paged residency, and the previous
+        // `map_or(0, ..)` marshalled ZEROS to the executor — which then launched
+        // the indexed down GEMV with `grid.x = 0` and failed
+        // `hipModuleLaunchKernel: invalid argument`. Same silent-default shape as
+        // the routed dtypes above, one struct over.
+        let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
+            HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
+        })?;
         let moe_params = hipfire_dispatch::families::moe::MoeParams {
             layer: layer_idx,
             dtypes: moe_dtypes,
@@ -863,14 +1013,24 @@ pub(crate) fn moe_ffn_decode_impl(
             expert_down_ptrs: &ffn.expert_down_ptrs,
             expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
             expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+            // Option A: the lowered path reads top-k back and makes the
+            // selected experts resident before dispatch. The pointer table
+            // follows automatically (push), so this only supplies residency.
+            expert_residency: residency_provider
+            .as_ref()
+            .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
             routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
                 config.dim,
                 mi,
                 config.num_experts_per_tok,
             ),
-            routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-            routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-            routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+            // From `routed_shape`, NOT `ffn.experts.first()`: under paged
+            // residency `experts` is empty, so the `map_or(0, ...)` form master
+            // uses would silently dispatch with k/m/n = 0. `routed_shape` is
+            // read from the layout and is correct either way.
+            routed_gate_up_k: routed_shape.gate_up_k,
+            routed_down_m: routed_shape.down_m,
+            routed_down_k: routed_shape.down_k,
             routed_experts: &routed_experts,
             routed_gate_up_paro: ffn.experts.first().and_then(|e| {
                 e.gate_up
@@ -1084,11 +1244,17 @@ pub(crate) fn moe_ffn_decode_impl(
         }
     }
     if ffn.experts.is_empty() {
+        // The D2H top-k readback is a full device sync per MoE layer per token —
+        // one of the candidates for the paged path's CPU cost, so it is timed
+        // separately from the pager phases inside `ensure_paged_experts_resident`.
         let indices = if let Some(indices) = topk_indices_cpu.as_ref() {
             indices.clone()
         } else {
-            download_i32_tensor(gpu, s.topk_indices, k)?
-                .into_iter()
+            use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+            let raw = page_timing::timed(Phase::TopkReadback, || {
+                download_i32_tensor(gpu, s.topk_indices, k)
+            })?;
+            raw.into_iter()
                 .map(router_index_i32_to_usize)
                 .collect::<Vec<_>>()
         };
@@ -1160,6 +1326,28 @@ pub(crate) fn moe_ffn_decode_impl(
         )?;
         return Ok(());
     }
+
+    // The branch below takes the indexed path when experts are PAGED
+    // (`experts.is_empty()`) regardless of `use_gpu_topk` — but every indexed
+    // kernel is `*_k8_indexed*` and is launched with `grid.y = INDEXED_MOE_K_TOP`.
+    // A paged model whose top-k is not that value would have those kernels read
+    // `topk_indices` past its end. Refuse by name instead, reusing the predicate
+    // the lowered executor already applies at `pipeline/mod.rs` rather than
+    // growing a third copy of the rule. Costs nothing on the supported paths:
+    // resident experts satisfy it, and paged + k_top == 8 sets `use_gpu_topk`.
+    hipfire_dispatch::pipeline::check_moe_decode_supported(
+        use_gpu_topk,
+        k,
+        n_exp,
+        !ffn.experts.is_empty(),
+        // A provider is attached exactly when this model is paged, and it is
+        // handed to `run_moe_decode` via `MoeParams::expert_residency`. This
+        // guard runs BEFORE that delegation, so it has to agree with it —
+        // hardcoding `false` here refuses the configuration the lowered path is
+        // now able to serve.
+        residency_provider.is_some(),
+    )
+    .map_err(|e| HipError::new(0, &format!("qwen35 moe decode: {e:?}")))?;
 
     if use_gpu_topk || ffn.experts.is_empty() {
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
@@ -1623,6 +1811,12 @@ pub(crate) fn moe_ffn_decode_impl(
         .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
         .collect();
 
+    // Routed geometry from `moe_expert_shape` — see the note at the other
+    // `MoeParams` construction in this file. `ffn.experts.first()` is None under
+    // paged residency and would marshal zeros.
+    let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
+        HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
+    })?;
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
         layer: layer_idx,
         dtypes: moe_dtypes,
@@ -1650,14 +1844,22 @@ pub(crate) fn moe_ffn_decode_impl(
         expert_down_ptrs: &ffn.expert_down_ptrs,
         expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        // Option A: the lowered path reads top-k back and makes the
+        // selected experts resident before dispatch. The pointer table
+        // follows automatically (push), so this only supplies residency.
+        expert_residency: residency_provider
+        .as_ref()
+        .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
         routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
             config.dim,
             mi,
             config.num_experts_per_tok,
         ),
-        routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
-        routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
-        routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+        // From `routed_shape`, NOT `ffn.experts.first()` — see the sibling
+        // call site above: `experts` is empty under paged residency.
+        routed_gate_up_k: routed_shape.gate_up_k,
+        routed_down_m: routed_shape.down_m,
+        routed_down_k: routed_shape.down_k,
         routed_experts: &routed_experts,
         routed_gate_up_paro: ffn.experts.first().and_then(|e| {
             e.gate_up

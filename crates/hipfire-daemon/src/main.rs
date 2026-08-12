@@ -81,7 +81,7 @@ use hipfire_serving_core::{
     qwen35_prefill, request, session,
 };
 use load::*;
-use model::{CaskConfig, EmbeddingGemmaState, LoadedModel, RAW_OVERRIDE};
+use model::{CaskConfig, EmbeddingGemmaState, LoadedModel};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
 use qwen35_decode::*;
 use qwen35_prefill::*;
@@ -1324,6 +1324,29 @@ fn main() {
 
         daemon_state.scheduler_stats = pending.stats().clone();
 
+        // One dispatch boundary pair per frame, closed by the guard's `Drop` on
+        // every exit path including the `continue`s below. `aux` carries the
+        // queue depth left behind this frame, which is what distinguishes a
+        // daemon that had a choice from one that was simply handed work in
+        // arrival order — the difference `overtaken_total` reports as a count
+        // and this reports in time.
+        let _dispatch = hipfire_runtime::exec_trace::DispatchGuard::begin(pending.len() as u64);
+        // VRAM is sampled per frame, not per record: it is a driver call, and
+        // the leak it exists to catch (v2 plan, risk 1) develops over minutes.
+        // Sampling it into the same ring as the latency series is the point —
+        // a paging executor's failure reads as "the model got slower" long
+        // before it reads as OOM, and only a shared timeline separates the two.
+        if hipfire_runtime::exec_trace::enabled() {
+            if let Ok((free, total)) = daemon_state.gpu.hip.get_vram_info() {
+                hipfire_runtime::exec_trace::record(
+                    hipfire_runtime::exec_trace::TraceEvent::VramSample,
+                    hipfire_runtime::exec_trace::NO_STREAM,
+                    0,
+                    total.saturating_sub(free) as u64,
+                );
+            }
+        }
+
         let transport::Inbound {
             payload,
             reply,
@@ -1462,6 +1485,7 @@ fn main() {
 
             DaemonRequest::ResourceStatus => handlers::status::resource_status(&mut daemon_state),
             DaemonRequest::SchedulerStatus => handlers::status::scheduler_status(&mut daemon_state),
+            DaemonRequest::ExecutorTrace => handlers::status::executor_trace(&mut daemon_state),
             DaemonRequest::SetResourceBudget(req) => {
                 handlers::status::set_resource_budget(&mut daemon_state, req)
             }

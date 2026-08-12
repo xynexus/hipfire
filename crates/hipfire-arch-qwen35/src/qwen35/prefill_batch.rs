@@ -224,6 +224,7 @@ pub struct DensePrefillSessionBatchStateSignature {
     pub kv_compact_offset: usize,
     pub kv_quantized: bool,
     pub kv_quant_q8: bool,
+    pub kv_quant_kvarn: bool,
     pub kv_quant_asym2: bool,
     pub kv_quant_asym3: bool,
     pub kv_quant_asym4: bool,
@@ -234,6 +235,15 @@ pub struct DensePrefillSessionBatchStateSignature {
 pub struct DensePrefillSessionKvStateRoute<'a> {
     pub k_gpu: &'a [GpuTensor],
     pub v_gpu: &'a [GpuTensor],
+    /// KVarN only: the per-layer f32 recent windows holding each session's
+    /// trailing partial 128-token K block. Empty for every other KV mode, which
+    /// keeps one K buffer per layer and needs no second table.
+    ///
+    /// Empty-means-absent mirrors `DensePrefillSessionDeltaStateRoute::s_scales`
+    /// rather than introducing an `Option`, so the pointer-table builder can gate
+    /// on the shape field being non-zero exactly as it already does for
+    /// `dn_scale_ptrs`.
+    pub k_window_gpu: &'a [GpuTensor],
     pub physical_cap: usize,
     pub compact_offset: usize,
 }
@@ -268,6 +278,9 @@ pub struct DensePrefillSessionBatchPointerTableShape {
     pub max_rows_per_round: usize,
     pub kv_k_ptrs: usize,
     pub kv_v_ptrs: usize,
+    /// KVarN only; 0 for every other KV mode. See
+    /// `DensePrefillSessionKvStateRoute::k_window_gpu`.
+    pub kv_win_ptrs: usize,
     pub dn_s_ptrs: usize,
     pub dn_scale_ptrs: usize,
     pub dn_conv_ptrs: usize,
@@ -324,6 +337,8 @@ pub struct DensePrefillSessionBatchPointerTablePlan {
 pub struct DensePrefillSessionBatchHostPointerTables {
     pub kv_k_ptrs: Vec<u64>,
     pub kv_v_ptrs: Vec<u64>,
+    /// KVarN only; empty for every other KV mode.
+    pub kv_win_ptrs: Vec<u64>,
     pub dn_s_ptrs: Vec<u64>,
     pub dn_scale_ptrs: Vec<u64>,
     pub dn_conv_ptrs: Vec<u64>,
@@ -337,6 +352,8 @@ pub struct DensePrefillSessionBatchHostPointerTables {
 pub struct DensePrefillSessionBatchDevicePointerTables {
     pub kv_k_ptrs: GpuTensor,
     pub kv_v_ptrs: GpuTensor,
+    /// KVarN only. Zero-length when the KV mode keeps one K buffer per layer.
+    pub kv_win_ptrs: GpuTensor,
     pub dn_s_ptrs: GpuTensor,
     pub dn_scale_ptrs: GpuTensor,
     pub dn_conv_ptrs: GpuTensor,
@@ -354,6 +371,7 @@ impl DensePrefillSessionBatchHostPointerTables {
     ) -> Result<(), String> {
         let checks = [
             ("kv_k_ptrs", self.kv_k_ptrs.len(), shape.kv_k_ptrs),
+            ("kv_win_ptrs", self.kv_win_ptrs.len(), shape.kv_win_ptrs),
             ("kv_v_ptrs", self.kv_v_ptrs.len(), shape.kv_v_ptrs),
             ("dn_s_ptrs", self.dn_s_ptrs.len(), shape.dn_s_ptrs),
             (
@@ -395,6 +413,7 @@ impl DensePrefillSessionBatchDevicePointerTables {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.kv_k_ptrs);
         let _ = gpu.free_tensor(self.kv_v_ptrs);
+        let _ = gpu.free_tensor(self.kv_win_ptrs);
         let _ = gpu.free_tensor(self.dn_s_ptrs);
         let _ = gpu.free_tensor(self.dn_scale_ptrs);
         let _ = gpu.free_tensor(self.dn_conv_ptrs);
@@ -443,6 +462,7 @@ pub fn upload_dense_prefill_session_batch_pointer_tables(
     Ok(DensePrefillSessionBatchDevicePointerTables {
         kv_k_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_k_ptrs)?,
         kv_v_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_v_ptrs)?,
+        kv_win_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_win_ptrs)?,
         dn_s_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_s_ptrs)?,
         dn_scale_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_scale_ptrs)?,
         dn_conv_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_conv_ptrs)?,
@@ -628,6 +648,279 @@ pub fn prefill_session_batch_attention_q8_layer(
 /// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
 /// f16 state, which is why the caller selects this by `DeltaNetState::quant`
 /// rather than by model. No scales: f16 carries a per-element exponent.
+/// KVarN companion to [`prefill_session_batch_write_q8_kv_layer`].
+///
+/// KVarN splits K across two buffers: 4-bit variance-normalized records for every
+/// COMPLETE `group`-token block, plus an f32 recent window holding the trailing
+/// partial block. V stays plain Q8_0, so the V half is literally the same call
+/// the Q8 path makes.
+///
+/// This writes only the per-token half. When a session's block completes, the
+/// window must be gathered and quantized into its records — a per-session event
+/// that fires once per `group` tokens and needs the route's `GpuTensor`s rather
+/// than the raw pointer tables, so it lives in the caller. See
+/// [`grouped_moe_prefill_session_batch_kvarn_block_flushes`].
+///
+/// CALLER CONTRACT (inherited from the kernel): no session may advance across
+/// more than one block boundary in a single call, because the window physically
+/// holds `group` tokens. Split the row range at boundaries — the flush planner
+/// below computes exactly where.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_session_batch_write_kvarn_kv_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    k_src: &GpuTensor,
+    v_src: &GpuTensor,
+    n_kv_heads: usize,
+    head_dim: usize,
+    group: usize,
+    row_offset: usize,
+    row_count: usize,
+    total_rows: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed KVarN KV write layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    if row_offset + row_count > total_rows {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill KVarN segment rows [{row_offset}, {}) exceed batch of {total_rows}",
+                row_offset + row_count,
+            ),
+        ));
+    }
+    // K -> per-session f32 recent window at `pos % group`, for this segment only.
+    gpu.kv_cache_write_kvarn_window_routed_batched(
+        &device_tables.kv_win_ptrs,
+        k_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_kv_heads,
+        head_dim,
+        group,
+        row_offset,
+        row_count,
+    )?;
+    // V -> plain Q8_0. Note this kernel has no row_offset: V is a flat
+    // position-addressed store with no wrapping window, so it is safe to write
+    // the whole batch once. The caller therefore issues the V write on the FIRST
+    // segment only — passing `row_offset == 0` — rather than once per segment,
+    // which would rewrite the same rows repeatedly (harmless but wasteful) and
+    // obscure that only K is segmented.
+    if row_offset == 0 {
+        gpu.kv_cache_write_q8_0_routed_batched(
+            &device_tables.kv_v_ptrs,
+            v_src,
+            &device_tables.row_session_indices,
+            &device_tables.row_positions,
+            route_shape.kv_v_layers,
+            kv_layer_index,
+            n_kv_heads,
+            head_dim,
+            total_rows,
+        )?;
+    }
+    Ok(())
+}
+
+/// KVarN companion to [`prefill_session_batch_attention_q8_layer`].
+///
+/// Takes three pointer tables where the Q8/F32 arms take two: records, window,
+/// and V. Each row's `n_full_blocks` is derived inside the kernel from its own
+/// `positions[row]`, so rows at different sequence lengths coexist in one launch
+/// — which is the whole reason this path can batch sessions at all.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_session_batch_attention_kvarn_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    q_batch: &GpuTensor,
+    out_batch: &GpuTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    max_ctx_len: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed KVarN attention layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.attention_kvarn_routed_batched(
+        q_batch,
+        &device_tables.kv_k_ptrs,
+        &device_tables.kv_win_ptrs,
+        &device_tables.kv_v_ptrs,
+        out_batch,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        max_ctx_len,
+        row_count,
+    )
+}
+
+/// What the KVarN block flush needs and a pointer table cannot carry.
+///
+/// `forward_grouped_moe_session_batch_layers` is handed raw device pointer
+/// tables, which is enough to WRITE the window but not to flush it: gathering and
+/// quantizing a completed block needs the actual `records` / `window` tensors and
+/// a scratch buffer. This carries them alongside, so the flush stays where the
+/// write is instead of forcing the layer loop up into the caller.
+pub struct KvarnBatchFlushContext<'a> {
+    /// Per-session routes, indexed by `session_index` — the same slice the
+    /// pointer tables were built from, so the two cannot disagree about which
+    /// session is which.
+    pub routes: &'a [DensePrefillSessionStateRoute<'a>],
+    /// Reusable gather scratch, `[n_kv_heads * head_dim * group]` f32.
+    pub tiles: &'a GpuTensor,
+    /// Tokens per KVarN block (`KvCache::KVARN_GROUP`).
+    pub group: usize,
+    /// K code width; 4 unless `HIPFIRE_KVARN_BITS` says otherwise.
+    pub bits: usize,
+    /// Segment end offsets from
+    /// [`grouped_moe_prefill_session_batch_kvarn_block_flushes`]. Segment `i`
+    /// covers rows `[splits[i-1], splits[i])`; the last entry is the row count.
+    pub splits: &'a [usize],
+    /// `flushes[i]` runs after segment `i` is written. Same length as `splits`.
+    ///
+    /// Precomputed rather than derived in the layer body because the row slots
+    /// live in the pointer-table plan, which the layer function does not get —
+    /// and because the boundary arithmetic is unit-tested where it is computed.
+    pub flushes: &'a [Vec<KvarnBlockFlush>],
+}
+
+/// Gather + quantize each completed block into its session's records, for one
+/// layer. Mirrors the flush half of `Gpu::kvarn_attend`, but per-session, because
+/// in a routed batch different sessions complete blocks at different rows.
+pub fn grouped_moe_prefill_session_batch_kvarn_flush_layer(
+    gpu: &mut Gpu,
+    ctx: &KvarnBatchFlushContext<'_>,
+    layer_index: usize,
+    flushes: &[KvarnBlockFlush],
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> HipResult<()> {
+    if flushes.is_empty() {
+        return Ok(());
+    }
+    let rec_bytes = hipfire_runtime::kv::KvCache::kvarn_k_record_bytes_bits(head_dim, ctx.bits);
+    // A record is always a multiple of 4 bytes, so the F32-typed records buffer
+    // is addressable in whole elements (same assumption kvarn_attend makes).
+    let tile_elems = n_kv_heads * rec_bytes / 4;
+    for flush in flushes {
+        let route = ctx.routes.get(flush.session_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KVarN flush references missing session {}",
+                    flush.session_index
+                ),
+            )
+        })?;
+        let window = route.kv.k_window_gpu.get(layer_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("KVarN flush session {} has no window for layer {layer_index}", flush.session_index),
+            )
+        })?;
+        let records = route.kv.k_gpu.get(layer_index).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("KVarN flush session {} has no records for layer {layer_index}", flush.session_index),
+            )
+        })?;
+        // window [group, kv_dim] token-major -> tiles [n_kv_heads, head_dim*group]
+        // channel-major, which is the orientation the record format wants.
+        gpu.kvarn_gather_k_tiles(window, ctx.tiles, 1, n_kv_heads, head_dim, ctx.group)?;
+        let rec_view = records.sub_offset(flush.block_index * tile_elems, tile_elems);
+        gpu.kvarn_quantize_tile(
+            ctx.tiles,
+            &rec_view,
+            n_kv_heads,
+            head_dim,
+            ctx.group,
+            rec_bytes,
+            ctx.bits,
+        )?;
+    }
+    Ok(())
+}
+
+/// One session's completed KVarN block, ready to gather+quantize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvarnBlockFlush {
+    pub session_index: usize,
+    /// Block ordinal within the session — `records[block_index]` is the target.
+    pub block_index: usize,
+}
+
+/// Which sessions complete a KVarN block over `rows`, and where the row range
+/// must be split so no session crosses more than one boundary per launch.
+///
+/// Returns `(split_points, flushes)`. `split_points` are row indices at which the
+/// caller must stop, run the flushes accumulated so far, and resume; the last
+/// entry is always `rows.len()`. A session that writes `group` or more rows in
+/// one launch would wrap its own window and silently destroy tokens the flush had
+/// not yet quantized, which is why this is computed rather than assumed.
+///
+/// Pure — no GPU, so it is unit-testable against the boundary arithmetic that is
+/// otherwise only observable as corrupted attention.
+pub fn grouped_moe_prefill_session_batch_kvarn_block_flushes(
+    rows: &[DensePrefillSessionBatchPrefixRowSlot],
+    group: usize,
+) -> (Vec<usize>, Vec<Vec<KvarnBlockFlush>>) {
+    assert!(group > 0, "KVarN block group must be non-zero");
+    let mut splits = Vec::new();
+    let mut flushes: Vec<Vec<KvarnBlockFlush>> = Vec::new();
+
+    // Cut after EVERY row that completes a block. Batching adjacent completions
+    // from different sessions into one segment would also be correct, but only
+    // if no session recurs within the merged span — and getting that wrong
+    // corrupts a window with no observable symptom until attention reads it.
+    // Completions are rare (one per `group` tokens per session), so the extra
+    // segments cost far less than the reasoning does.
+    for (idx, row) in rows.iter().enumerate() {
+        if row.position % group == group - 1 {
+            splits.push(idx + 1);
+            flushes.push(vec![KvarnBlockFlush {
+                session_index: row.session_index,
+                block_index: row.position / group,
+            }]);
+        }
+    }
+    // Trailing segment: the rows after the last completion still have to be
+    // written, and they flush nothing.
+    if splits.last() != Some(&rows.len()) {
+        splits.push(rows.len());
+        flushes.push(Vec::new());
+    }
+    (splits, flushes)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
@@ -739,6 +1032,23 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
         ),
         DType::F16 | DType::BF16 | DType::Raw => gemm_raw_x_f32_auto(
             gpu,
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        // LUT3-packed bf16 lm_head, decoded in-kernel. `gemm_bf16l3_xf32` is the
+        // batched sibling of the `gemv_bf16l3_xf32` the serial path uses, so the
+        // weights stay packed — no rotation (LUT3 is a lossless bf16 recoding,
+        // not a quantization, so there is no awq_scale or FWHT basis to undo).
+        //
+        // Without this arm a LUT3 lm_head took the whole fused dense batch out:
+        // the tensor is emitted by the bf16 codec whenever it is gather-shaped
+        // and wins on size, which is the DEFAULT for a tied-embedding model, so
+        // "fused dense" was unreachable for most dense artifacts.
+        DType::Bf16L3 => gpu.gemm_bf16l3_xf32(
             &weights.output.buf,
             &normed_rows,
             batch_logits,
@@ -1016,10 +1326,14 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
     Ok(())
 }
 
+/// `allow_kvarn` widens the KV requirement from "plain Q8 or FP32" to also admit
+/// KVarN, exactly as the grouped-MoE contract does. Explicit parameter rather
+/// than an env read so the contract stays pure and both sides are testable.
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
     config: &Qwen35Config,
     signatures: &[DensePrefillSessionBatchStateSignature],
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
+    allow_kvarn: bool,
 ) -> Result<(), String> {
     if config.num_experts != 0 || config.has_shared_expert {
         return Err(
@@ -1046,14 +1360,16 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
         // KV and any other quantized-but-not-plain-Q8 state stay on
         // serial_reference (not fused). (Row uniformity is already enforced by
         // `validate_dense_prefill_session_batch_state_signatures`.)
+        let kvarn_ok = allow_kvarn && signature.kv_quant_kvarn;
         if signature.kv_quant_asym2
             || signature.kv_quant_asym3
             || signature.kv_quant_asym4
             || signature.kv_quant_fwht
-            || (signature.kv_quantized && !signature.kv_quant_q8)
+            || (signature.kv_quantized && !(signature.kv_quant_q8 || kvarn_ok))
         {
             return Err(format!(
-                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8 or FP32 KV is fused"
+                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8{} or FP32 KV is fused",
+                if allow_kvarn { ", KVarN," } else { "" },
             ));
         }
         if signature.dn_quant != StateQuant::FP32 {
@@ -1066,11 +1382,16 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
     Ok(())
 }
 
+/// `allow_kvarn` widens the KV requirement from Q8-only to "Q8 or KVarN". It is
+/// an explicit parameter rather than an env read so the contract stays pure and
+/// both sides of it are unit-testable; the caller supplies
+/// `qwen35_kvarn_fused_batch_enabled()`.
 pub fn validate_grouped_moe_prefill_session_batch_state_contract(
     config: &Qwen35Config,
     signatures: &[DensePrefillSessionBatchStateSignature],
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     arch: &str,
+    allow_kvarn: bool,
 ) -> Result<(), String> {
     if config.num_experts == 0 || !config.has_shared_expert {
         return Err(
@@ -1105,9 +1426,11 @@ pub fn validate_grouped_moe_prefill_session_batch_state_contract(
                 signature.kv_compact_offset,
             ));
         }
-        if !signature.kv_quantized || !signature.kv_quant_q8 {
+        let kvarn_ok = allow_kvarn && signature.kv_quant_kvarn;
+        if !signature.kv_quantized || !(signature.kv_quant_q8 || kvarn_ok) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} must use Q8 KV state for the MQ4 control path"
+                "grouped MoE session fused prefix row {idx} must use Q8{} KV state for the MQ4 control path",
+                if allow_kvarn { " or KVarN" } else { "" },
             ));
         }
         if signature.kv_quant_asym2
@@ -1174,6 +1497,7 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
             | DType::F16
             | DType::BF16
             | DType::Raw
+            | DType::Bf16L3
             | DType::Q8_0
             | DType::MQ4G256
             | DType::Oq8G256
@@ -1421,13 +1745,21 @@ impl DensePrefillSessionBatchPointerTableShape {
     }
 }
 
+/// `kv_window_layers`: 0 for every KV mode except KVarN, which carries a second
+/// per-layer K buffer (the f32 recent window). See
+/// [`dense_prefill_session_batch_pointer_table_shape`].
 pub fn dense_prefill_session_batch_pointer_table_plan(
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     route_shape: DensePrefillSessionStateRouteShape,
     sessions: usize,
+    kv_window_layers: usize,
 ) -> DensePrefillSessionBatchPointerTablePlan {
-    let shape =
-        dense_prefill_session_batch_pointer_table_shape(execution_plan, route_shape, sessions);
+    let shape = dense_prefill_session_batch_pointer_table_shape(
+        execution_plan,
+        route_shape,
+        sessions,
+        kv_window_layers,
+    );
     let mut kv_layer_slots = Vec::with_capacity(shape.kv_k_ptrs);
     for session_index in 0..sessions {
         for layer_index in 0..route_shape.kv_k_layers {
@@ -1491,6 +1823,7 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
     }
     let mut kv_k_ptrs = Vec::with_capacity(plan.shape.kv_k_ptrs);
     let mut kv_v_ptrs = Vec::with_capacity(plan.shape.kv_v_ptrs);
+    let mut kv_win_ptrs = Vec::with_capacity(plan.shape.kv_win_ptrs);
     for slot in &plan.kv_layer_slots {
         let route = routes.get(slot.session_index).ok_or_else(|| {
             format!(
@@ -1512,6 +1845,20 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
         })?;
         kv_k_ptrs.push(k.buf.as_ptr() as u64);
         kv_v_ptrs.push(v.buf.as_ptr() as u64);
+        // KVarN carries a second K buffer per layer (the f32 recent window).
+        // Gated on the shape rather than on the slice being non-empty, so a
+        // route that forgets to supply windows fails the shape check loudly
+        // instead of silently producing a short table the kernel would index
+        // past.
+        if plan.shape.kv_win_ptrs != 0 {
+            let win = route.kv.k_window_gpu.get(slot.layer_index).ok_or_else(|| {
+                format!(
+                    "dense session prefill KVarN K-window slot references missing layer {}",
+                    slot.layer_index,
+                )
+            })?;
+            kv_win_ptrs.push(win.buf.as_ptr() as u64);
+        }
     }
 
     let mut dn_s_ptrs = Vec::with_capacity(plan.shape.dn_s_ptrs);
@@ -1588,6 +1935,7 @@ pub fn dense_prefill_session_batch_host_pointer_tables(
     let tables = DensePrefillSessionBatchHostPointerTables {
         kv_k_ptrs,
         kv_v_ptrs,
+        kv_win_ptrs,
         dn_s_ptrs,
         dn_scale_ptrs,
         dn_conv_ptrs,
@@ -1770,10 +2118,18 @@ pub fn validate_dense_prefill_session_state_route_shapes_for_config(
     Ok(())
 }
 
+/// `kv_window_layers` is the KVarN f32 recent-window count per session — 0 for
+/// every other KV mode, `n_layers` under KVarN. It is a parameter rather than a
+/// `DensePrefillSessionStateRouteShape` field on purpose: that shape is compared
+/// against a model-derived expectation by
+/// `validate_dense_prefill_session_state_route_shapes_for_config`, which reads
+/// only `Qwen35Config` and so cannot know the KV mode. Threading it here costs 2
+/// call sites instead of 12.
 pub fn dense_prefill_session_batch_pointer_table_shape(
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
     route_shape: DensePrefillSessionStateRouteShape,
     sessions: usize,
+    kv_window_layers: usize,
 ) -> DensePrefillSessionBatchPointerTableShape {
     DensePrefillSessionBatchPointerTableShape {
         sessions,
@@ -1782,6 +2138,7 @@ pub fn dense_prefill_session_batch_pointer_table_shape(
         max_rows_per_round: execution_plan.max_rows_per_round,
         kv_k_ptrs: sessions * route_shape.kv_k_layers,
         kv_v_ptrs: sessions * route_shape.kv_v_layers,
+        kv_win_ptrs: sessions * kv_window_layers,
         dn_s_ptrs: sessions * route_shape.dn_s_layers,
         dn_scale_ptrs: sessions * route_shape.dn_scale_layers,
         dn_conv_ptrs: sessions * route_shape.dn_conv_layers,
@@ -1812,6 +2169,7 @@ pub fn validate_dense_prefill_session_batch_rows(
             kv_compact_offset: row.kv_cache.compact_offset,
             kv_quantized: row.kv_cache.quantized,
             kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_kvarn: row.kv_cache.quant_kvarn,
             kv_quant_asym2: row.kv_cache.quant_asym2,
             kv_quant_asym3: row.kv_cache.quant_asym3,
             kv_quant_asym4: row.kv_cache.quant_asym4,
@@ -1867,6 +2225,7 @@ fn validate_dense_calibration_session_rows_for_config(
         kv_compact_offset: first.kv_cache.compact_offset,
         kv_quantized: first.kv_cache.quantized,
         kv_quant_q8: first.kv_cache.quant_q8,
+        kv_quant_kvarn: first.kv_cache.quant_kvarn,
         kv_quant_asym2: first.kv_cache.quant_asym2,
         kv_quant_asym3: first.kv_cache.quant_asym3,
         kv_quant_asym4: first.kv_cache.quant_asym4,
@@ -1894,6 +2253,7 @@ fn validate_dense_calibration_session_rows_for_config(
             kv_compact_offset: row.kv_cache.compact_offset,
             kv_quantized: row.kv_cache.quantized,
             kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_kvarn: row.kv_cache.quant_kvarn,
             kv_quant_asym2: row.kv_cache.quant_asym2,
             kv_quant_asym3: row.kv_cache.quant_asym3,
             kv_quant_asym4: row.kv_cache.quant_asym4,
@@ -2150,6 +2510,10 @@ fn forward_dense_session_batch_layers_full_precision(
     // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
     // attention use the Q8 path. false = full-precision F32 KV.
     kv_q8: bool,
+    // `Some` selects the KVarN arms ahead of kv_q8/f32. Same context the
+    // grouped-MoE path uses — the routed window write, flush executor and
+    // segment planner are FFN-agnostic, so dense reuses them unchanged.
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2514,7 +2878,86 @@ fn forward_dense_session_batch_layers_full_precision(
                     row_count,
                     0,
                 )?;
-                if kv_q8 {
+                if let Some(kvarn) = kvarn {
+                    // KVarN stores K in the FWHT-rotated basis at head_dim 256 —
+                    // `prefill_chunk.rs` rotates K and Q in place before its
+                    // write, and the routed path must match or the cache ends up
+                    // in a different basis than every reader expects. Measured
+                    // cost of omitting it: max |delta| 11.59 on the K window vs
+                    // 0.081 once both sides agree (a 143x error), with EVERY
+                    // prefilled token wrong.
+                    //
+                    // Once per layer, before the segment loop: it rewrites the
+                    // whole fa_k/fa_q batch, so doing it per segment would rotate
+                    // earlier segments repeatedly.
+                    static BATCH_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *BATCH_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            row_count,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            row_count,
+                        )?;
+                    }
+                    // Same segment-then-flush shape as the grouped-MoE path: the
+                    // window physically holds `group` tokens, so a run of rows
+                    // that fills one must be drained before the next run wraps it.
+                    let mut seg_start = 0usize;
+                    for (seg_idx, &split) in kvarn.splits.iter().enumerate() {
+                        let seg_rows = split.saturating_sub(seg_start);
+                        if seg_rows > 0 {
+                            prefill_session_batch_write_kvarn_kv_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_k_batch,
+                                &pbs.fa_v_batch,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kvarn.group,
+                                seg_start,
+                                seg_rows,
+                                row_count,
+                            )?;
+                        }
+                        if let Some(flushes) = kvarn.flushes.get(seg_idx) {
+                            grouped_moe_prefill_session_batch_kvarn_flush_layer(
+                                gpu,
+                                kvarn,
+                                layer_idx,
+                                flushes,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                        }
+                        seg_start = split;
+                    }
+                    prefill_session_batch_attention_kvarn_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else if kv_q8 {
                     // Plain-Q8 KV: the routed write/attention helpers are shared
                     // with the grouped-MoE fused path — they are FFN-agnostic and
                     // operate on Q8_0 (inline-scale) KV buffers via the same
@@ -2704,6 +3147,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
 ) -> HipResult<()> {
     forward_dense_session_batch_layers_full_precision(
         gpu,
@@ -2722,6 +3166,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         dense_capture,
         post_layer_capture,
         kv_q8,
+        kvarn,
     )
 }
 
@@ -2783,6 +3228,7 @@ fn forward_prefill_dense_session_batch_impl(
             kv_compact_offset: row.kv_cache.compact_offset,
             kv_quantized: row.kv_cache.quantized,
             kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_kvarn: row.kv_cache.quant_kvarn,
             kv_quant_asym2: row.kv_cache.quant_asym2,
             kv_quant_asym3: row.kv_cache.quant_asym3,
             kv_quant_asym4: row.kv_cache.quant_asym4,
@@ -2799,13 +3245,21 @@ fn forward_prefill_dense_session_batch_impl(
         config,
         &contract_signatures,
         &execution_plan,
+        crate::qwen35::qwen35_kvarn_fused_batch_enabled(),
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
-    let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+    // Uniform rows (state-signature contract), so row 0 decides for the batch.
+    let kvarn_batch = qwen35_kvarn_fused_batch_enabled()
+        && contract_signatures.first().is_some_and(|s| s.kv_quant_kvarn);
+    let pointer_table_plan = dense_prefill_session_batch_pointer_table_plan(
+        &execution_plan,
+        route_shape,
+        rows.len(),
+        if kvarn_batch { route_shape.kv_k_layers } else { 0 },
+    );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
@@ -2825,6 +3279,9 @@ fn forward_prefill_dense_session_batch_impl(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
+                // Empty for every mode except KVarN; the table is only built
+                // when the shape says KVarN, so passing it is unconditional.
+                k_window_gpu: &row.kv_cache.k_window,
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
@@ -2840,7 +3297,10 @@ fn forward_prefill_dense_session_batch_impl(
     let host_pointer_tables =
         dense_prefill_session_batch_host_pointer_tables(&pointer_table_plan, &routes)
             .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-    drop(routes);
+    // `routes` used to be dropped here, purely as tidiness once the host tables
+    // were built. The KVarN flush context borrows it (for the per-session
+    // records/window tensors), so it now lives to end of scope. Nothing between
+    // here and there needs `rows` mutably — the compiler enforces that.
     let device_pointer_tables = upload_dense_prefill_session_batch_pointer_tables(
         gpu,
         pointer_table_plan.shape,
@@ -2855,6 +3315,39 @@ fn forward_prefill_dense_session_batch_impl(
     // Row signatures are uniform (state-signature contract), so row 0's KV quant
     // decides the per-layer KV write/attention path for the whole batch.
     let kv_q8 = signatures.first().map(|s| s.kv_quant_q8).unwrap_or(false);
+    // Same construction as the grouped-MoE path: routes for the records/window
+    // tensors, gather scratch, and the row-shaped segment/flush plan.
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let kvarn_state = if kvarn_batch {
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(
+            &pointer_table_plan.prefix_rows,
+            group,
+        );
+        // Not `?`: an early return would skip the pointer-table free below.
+        let tiles = match gpu.alloc_tensor(
+            &[config.n_kv_heads * config.head_dim * group],
+            hipfire_rdna::DType::F32,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                device_pointer_tables.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+        Some((splits, flushes, tiles))
+    } else {
+        None
+    };
+    let kvarn_ctx = kvarn_state
+        .as_ref()
+        .map(|(splits, flushes, tiles)| KvarnBatchFlushContext {
+            routes: &routes,
+            tiles,
+            group,
+            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            splits,
+            flushes,
+        });
     let result = forward_prefill_dense_session_batch_prefix_full_precision(
         gpu,
         weights,
@@ -2869,7 +3362,12 @@ fn forward_prefill_dense_session_batch_impl(
         finalize_logits,
         dense_capture,
         post_layer_capture,
+        kvarn_ctx.as_ref(),
     );
+    drop(kvarn_ctx);
+    if let Some((_, _, tiles)) = kvarn_state {
+        let _ = gpu.free_tensor(tiles);
+    }
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
 }
@@ -2912,7 +3410,10 @@ pub(crate) fn forward_prefill_dense_session_batch_with_capture(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
+/// Renamed from `..._prefix_q8_kv`: the path now also carries KVarN, and a name
+/// asserting Q8 is the same class of stale label that made the lowered-forward
+/// doc comments misleading. `kvarn` being `Some` selects the KVarN arms.
+fn forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -2922,6 +3423,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
     delta_f16: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
@@ -2941,6 +3443,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         None,
         None,
         true,
+        kvarn,
         delta_f16,
     )
 }
@@ -2988,6 +3491,9 @@ pub(crate) fn forward_streamed_dense_layer_batch(
         dense_capture,
         None,
         false,
+        // Streamed calibration runs FP32 KV, never KVarN — one-layer view, no
+        // session batch behind it. Mirrors the grouped-MoE streamed path.
+        None,
     )
 }
 
@@ -3035,6 +3541,9 @@ pub(crate) fn forward_streamed_grouped_moe_layer_batch(
         capture,
         dense_capture,
         false,
+        // Streamed calibration runs FP32 KV, never KVarN — it is a one-layer
+        // view with no session batch behind it.
+        None,
         false,
     )
 }
@@ -3135,6 +3644,10 @@ fn forward_grouped_moe_session_batch_layers(
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
     kv_q8: bool,
+    // `Some` selects the KVarN KV arms over `kv_q8`/f32. Carries what the
+    // pointer tables cannot: the per-session records/window tensors, gather
+    // scratch, and the precomputed segment/flush plan.
+    kvarn: Option<&KvarnBatchFlushContext<'_>>,
     delta_f16: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
@@ -3803,7 +4316,90 @@ fn forward_grouped_moe_session_batch_layers(
                     row_count,
                     0,
                 )?;
-                if kv_q8 {
+                if let Some(kvarn) = kvarn {
+                    // KVarN stores K in the FWHT-rotated basis at head_dim 256 —
+                    // `prefill_chunk.rs` rotates K and Q in place before its
+                    // write, and the routed path must match or the cache ends up
+                    // in a different basis than every reader expects. Measured
+                    // cost of omitting it: max |delta| 11.59 on the K window vs
+                    // 0.081 once both sides agree (a 143x error), with EVERY
+                    // prefilled token wrong.
+                    //
+                    // Once per layer, before the segment loop: it rewrites the
+                    // whole fa_k/fa_q batch, so doing it per segment would rotate
+                    // earlier segments repeatedly.
+                    static BATCH_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *BATCH_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            row_count,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            row_count,
+                        )?;
+                    }
+                    // Segment-wise: write a run of rows, then drain any window
+                    // that just filled, before the next run can wrap it. The
+                    // split points come from the tested planner — computing them
+                    // here would put the one piece of arithmetic whose failure is
+                    // silent in the one place it cannot be unit-tested.
+                    let mut seg_start = 0usize;
+                    for (seg_idx, &split) in kvarn.splits.iter().enumerate() {
+                        let seg_rows = split.saturating_sub(seg_start);
+                        if seg_rows > 0 {
+                            prefill_session_batch_write_kvarn_kv_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_k_batch,
+                                &pbs.fa_v_batch,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kvarn.group,
+                                seg_start,
+                                seg_rows,
+                                row_count,
+                            )?;
+                        }
+                        if let Some(flushes) = kvarn.flushes.get(seg_idx) {
+                            grouped_moe_prefill_session_batch_kvarn_flush_layer(
+                                gpu,
+                                kvarn,
+                                layer_idx,
+                                flushes,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                        }
+                        seg_start = split;
+                    }
+                    // Attention reads records + window together, so it runs once
+                    // over the whole batch after every segment has landed.
+                    prefill_session_batch_attention_kvarn_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else if kv_q8 {
                     prefill_session_batch_write_q8_kv_layer(
                         gpu,
                         device_tables,
@@ -4030,6 +4626,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
             kv_compact_offset: row.kv_cache.compact_offset,
             kv_quantized: row.kv_cache.quantized,
             kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_kvarn: row.kv_cache.quant_kvarn,
             kv_quant_asym2: row.kv_cache.quant_asym2,
             kv_quant_asym3: row.kv_cache.quant_asym3,
             kv_quant_asym4: row.kv_cache.quant_asym4,
@@ -4037,13 +4634,18 @@ pub fn forward_prefill_grouped_moe_session_batch(
             dn_quant: row.dn_state.quant,
         })
         .collect();
+    let kvarn_fused = qwen35_kvarn_fused_batch_enabled();
     validate_grouped_moe_prefill_session_batch_state_contract(
         config,
         &signatures,
         &execution_plan,
         gpu.arch.as_str(),
+        kvarn_fused,
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    // Every row shares one KV layout (the contract above guarantees it), so one
+    // row's flag decides the batch.
+    let kvarn_batch = kvarn_fused && signatures.iter().all(|s| s.kv_quant_kvarn);
     // Signature validation guarantees one state layout for every row. Select
     // the already-implemented routed recurrence branch once for the batch.
     // FP16 state is half the stride of FP32, so the routed kernel and the state
@@ -4055,7 +4657,14 @@ pub fn forward_prefill_grouped_moe_session_batch(
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+        dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            rows.len(),
+            // KVarN needs a window pointer per layer per session; every other
+            // mode keeps one K buffer and wants the table absent.
+            if kvarn_batch { route_shape.kv_k_layers } else { 0 },
+        );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,
@@ -4075,6 +4684,10 @@ pub fn forward_prefill_grouped_moe_session_batch(
             kv: DensePrefillSessionKvStateRoute {
                 k_gpu: &row.kv_cache.k_gpu,
                 v_gpu: &row.kv_cache.v_gpu,
+                // Empty for every KV mode except KVarN, where it holds the
+                // per-layer f32 recent windows. Passing it unconditionally is
+                // safe: the table is only built when the shape says KVarN.
+                k_window_gpu: &row.kv_cache.k_window,
                 physical_cap: row.kv_cache.physical_cap,
                 compact_offset: row.kv_cache.compact_offset,
             },
@@ -4114,7 +4727,43 @@ pub fn forward_prefill_grouped_moe_session_batch(
             ));
         }
     }
-    let result = forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
+    // KVarN needs three things the pointer tables cannot carry: the routes (for
+    // records/window tensors), gather scratch, and the segment/flush plan. Build
+    // them once for the whole batch — the plan is row-shaped, not layer-shaped.
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let kvarn_state = if kvarn_batch {
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(
+            &pointer_table_plan.prefix_rows,
+            group,
+        );
+        // Not `?`: an early return here would skip the pointer-table free below
+        // and leak it. Mirrors the row bounds check above, which frees first.
+        let tiles = match gpu.alloc_tensor(
+            &[config.n_kv_heads * config.head_dim * group],
+            hipfire_rdna::DType::F32,
+        ) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                device_pointer_tables.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+        Some((splits, flushes, tiles))
+    } else {
+        None
+    };
+    let kvarn_ctx = kvarn_state
+        .as_ref()
+        .map(|(splits, flushes, tiles)| KvarnBatchFlushContext {
+            routes: &routes,
+            tiles,
+            group,
+            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            splits,
+            flushes,
+        });
+
+    let result = forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
         gpu,
         weights,
         config,
@@ -4124,8 +4773,13 @@ pub fn forward_prefill_grouped_moe_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
+        kvarn_ctx.as_ref(),
         delta_f16,
     );
+    drop(kvarn_ctx);
+    if let Some((_, _, tiles)) = kvarn_state {
+        let _ = gpu.free_tensor(tiles);
+    }
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
 }

@@ -128,10 +128,16 @@ pub(crate) fn rerank(
 }
 
 pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
-    // Explicit per-request raw-prompt override (optional `"raw"`
-    // bool). Absent → None → auto default (raw iff no chat_template).
-    // Always set, so it resets every request (no cross-request leak).
-    RAW_OVERRIDE.with(|c| c.set(msg.get("raw").and_then(|v| v.as_bool())));
+    // Explicit per-request raw-prompt override (optional `"raw"` bool).
+    // Absent → None → auto default (raw iff no chat_template).
+    //
+    // Carried as a value from here down rather than parked in a thread-local.
+    // The old `RAW_OVERRIDE` cell claimed to reset every request, and did — but
+    // only for THIS handler. The batch prefill path read the same cell and never
+    // wrote it, so a batch prefill inherited whatever the last plain generate
+    // left behind: measured as a 15-token chat-framed prompt becoming a 7-token
+    // unframed one, with different prefix hashes, i.e. different KV-reuse keys.
+    let raw_override = msg.get("raw").and_then(|v| v.as_bool());
     let protocol_generate =
         serde_json::from_value::<hipfire_generate::GenerateTextRequest>(msg.clone()).ok();
     let id = protocol_generate
@@ -615,6 +621,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     repeat_window,
                     max_think_tokens: vl_max_think_tokens,
                     encode_only: vision_cache_only,
+                    raw: raw_override,
                 };
                 generate_vl_gemma3(
                     m,
@@ -670,6 +677,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             repeat_window,
             max_think_tokens: vl_max_think_tokens,
             encode_only: false, // qwen35-vl / dots-ocr always decode
+            raw: raw_override,
         };
         if is_dots_ocr {
             generate_vl_dots_ocr(
@@ -805,6 +813,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 .as_ref()
                 .and_then(|req| req.evidence_dir.as_deref())
                 .or_else(|| msg.get("evidence_dir").and_then(|v| v.as_str())),
+            raw_override,
         );
     }
 }

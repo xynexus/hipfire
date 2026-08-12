@@ -19,6 +19,86 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// `HIPFIRE_LAUNCH_TRACE` — diagnostic kernel-launch tracing at the single
+/// dispatch chokepoint. `0`/unset off (one cached env read, no per-launch cost),
+/// `1` prints every launch, `2` also synchronizes after each one.
+///
+/// Level 2 exists because kernel launches are asynchronous: a device fault
+/// surfaces at whatever unrelated call touches the queue next, so a kernel that
+/// wedges the GPU gets blamed on its successor. Synchronizing per launch makes
+/// the last traced line the kernel that actually faulted, at ruinous cost to
+/// throughput — a bisection tool, not something to leave on.
+fn launch_trace_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("HIPFIRE_LAUNCH_TRACE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// `HIPFIRE_MOE_PTR_TABLE_DUMP=1` — dump an indexed-MoE expert pointer table and
+/// the selected top-k from the HOST, immediately before the launch that consumes
+/// them.
+///
+/// The indexed kernels do `A = expert_ptrs[topk_indices[..]]` and dereference `A`
+/// directly, so a null or stale slot faults the device — and HIP attributes that
+/// fault to whatever touches the queue NEXT, not to the kernel that caused it.
+/// Reading the table host-side beforehand separates "bad pointer table" from
+/// "in-kernel indexing bug" without costing a GPU reset per attempt.
+///
+/// This lives at the DISPATCHER rather than a call site, for the same reason
+/// `HIPFIRE_LAUNCH_TRACE` does: `gemv_oq4g256_moe_gate_up_k8_indexed_batched` has
+/// five dispatch sites (qwen35 hand decode, qwen35 chunked prefill, two in the
+/// lowered pipeline, and lfm2moe/minimax). Instrumenting the wrong one prints
+/// nothing while the fault happens anyway — which is exactly what happened on the
+/// first attempt at this.
+pub(crate) fn dump_moe_ptr_table(
+    gpu: &Gpu,
+    label: &str,
+    expert_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    k_top: usize,
+    batch_size: usize,
+) {
+    if std::env::var("HIPFIRE_MOE_PTR_TABLE_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Table is [2 * n_exp] f32 slots = n_exp u64 device addresses.
+    let n_exp = expert_ptrs.numel() / 2;
+    let n_idx = k_top.saturating_mul(batch_size.max(1));
+    let mut table = vec![0u64; n_exp];
+    let mut idx = vec![0i32; n_idx];
+    {
+        let tb =
+            unsafe { std::slice::from_raw_parts_mut(table.as_mut_ptr() as *mut u8, n_exp * 8) };
+        if let Err(e) = gpu.hip.memcpy_dtoh(tb, &expert_ptrs.buf) {
+            eprintln!("[ptr_table] {label}: ptr readback failed: {}", e.message);
+            return;
+        }
+        let ib = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, n_idx * 4) };
+        if let Err(e) = gpu.hip.memcpy_dtoh(ib, &topk_indices.buf) {
+            eprintln!("[ptr_table] {label}: topk readback failed: {}", e.message);
+            return;
+        }
+    }
+    let non_null = table.iter().filter(|p| **p != 0).count();
+    eprintln!(
+        "[ptr_table] {label}: n_exp={n_exp} non_null={non_null}/{n_exp} k_top={k_top} batch={batch_size}"
+    );
+    for (slot, raw) in idx.iter().enumerate() {
+        if *raw < 0 || *raw as usize >= n_exp {
+            eprintln!("[ptr_table]   slot={slot} expert={raw} <== OUT OF RANGE (n_exp={n_exp})");
+            continue;
+        }
+        let p = table[*raw as usize];
+        eprintln!(
+            "[ptr_table]   slot={slot} expert={raw} ptr=0x{p:016x}{}",
+            if p == 0 { "  <== NULL" } else { "" }
+        );
+    }
+}
+
 fn raw_upload_chunks(
     total_bytes: usize,
     max_chunk_bytes: usize,
@@ -1428,7 +1508,11 @@ impl Gpu {
         shared_mem: u32,
         args: &[hip_bridge::KernArg],
     ) -> HipResult<()> {
-        if self.capture_mode || self.flags.force_blob_path {
+        let trace = launch_trace_level();
+        if trace > 0 {
+            eprintln!("[launch] {func_name} grid={grid:?} block={block:?} smem={shared_mem}");
+        }
+        let launch_result = if self.capture_mode || self.flags.force_blob_path {
             let mut blob = hip_bridge::KernargBlob::new();
             for a in args {
                 blob.push_arg(a);
@@ -1456,6 +1540,7 @@ impl Gpu {
                     buf.as_mut_slice(),
                 )
             }
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("{func_name}: {}", e.message)))
         } else {
             let mut params: Vec<*mut std::ffi::c_void> =
                 args.iter().map(hip_bridge::KernArg::param_ptr).collect();
@@ -1468,7 +1553,24 @@ impl Gpu {
                 self.hip
                     .launch_kernel(func, grid, block, shared_mem, stream, &mut params)
             }
+            // A launch failure that does not name its kernel is unattributable:
+            // `hip_bridge::Function` is an opaque handle, so the name only exists
+            // here. Attach it rather than making the next reader bisect grid
+            // shapes against every `launch_kernargs` call site.
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("{func_name}: {}", e.message)))
+        };
+        // Level 2 synchronizes after every launch. Launches are asynchronous, so
+        // a device fault normally surfaces at some LATER unrelated call — which is
+        // how a wedge in one kernel gets misattributed to whatever ran next (a
+        // `hipModuleLoad`, say). Synchronizing here makes the last traced line the
+        // kernel that actually faulted. Ruinous for throughput; that is the point.
+        if trace >= 2 {
+            match self.hip.device_synchronize() {
+                Ok(()) => eprintln!("[launch] {func_name} <- sync ok"),
+                Err(e) => eprintln!("[launch] {func_name} <- SYNC FAILED code={} {}", e.code, e.message),
+            }
         }
+        launch_result
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
@@ -2050,9 +2152,64 @@ impl Gpu {
     }
 
     /// Upload raw bytes to GPU (for quantized weights).
+    ///
+    /// **Allocates outside [`GpuPool`], while [`Gpu::free_tensor`] frees back
+    /// INTO it.** For load-time uploads that is harmless — they are allocated
+    /// once and released at unload, when `pool.drain` returns everything to HIP.
+    /// For anything that *churns* it is a monotonic leak: each freed buffer
+    /// lands in a free-list the next `upload_raw` cannot see. Churning callers
+    /// (the weight pager's transports) must use [`Gpu::upload_raw_pooled`].
+    ///
+    /// This stays `&self` deliberately. Making it `&mut self` so it could reach
+    /// the pool would touch 693 call sites, many of which hold another borrow of
+    /// `Gpu` across the call — a far larger and riskier change than the bug
+    /// warrants, given the one-shot callers are not affected by it.
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
+        self.hip.memcpy_htod(&buf, data)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
+    }
+
+    /// `(total_new, total_reused)` from the buffer pool.
+    ///
+    /// Exposed so a paging workload can assert the property that matters: cold
+    /// loads must stop calling HIP once the working set is cached. A rising
+    /// `total_new` under steady-state churn means allocation and free are
+    /// hitting different allocators.
+    pub fn pool_counters(&self) -> (usize, usize) {
+        (self.pool.total_new, self.pool.total_reused)
+    }
+
+    /// A raw pooled device buffer of at least `len` bytes.
+    ///
+    /// For callers that do their own copy (async, offset, or from a pinned
+    /// staging slab) and so cannot use [`Gpu::upload_raw_pooled`]. Pairs with
+    /// [`Gpu::free_tensor`], which returns the buffer to the same pool.
+    pub fn pool_alloc(&mut self, len: usize) -> HipResult<DeviceBuffer> {
+        self.bind_thread()?;
+        self.pool.alloc(&self.hip, len)
+    }
+
+    /// [`Gpu::upload_raw`], but allocating from [`GpuPool`] so the buffer can be
+    /// reused after [`Gpu::free_tensor`] returns it there.
+    ///
+    /// This is the allocation/free symmetry the paging path needs. Without it,
+    /// a pager cycling expert modules through a bounded VRAM budget allocates
+    /// fresh from HIP on every cold load while every eviction accumulates in the
+    /// pool's free-list — VRAM grows in proportion to paging traffic, and the
+    /// symptom is a gradual slowdown long before it is an OOM.
+    ///
+    /// The pooled buffer may be *larger* than `data`, exactly as `alloc_tensor`
+    /// already allows: `shape` and `dtype` describe the payload, the copy moves
+    /// `data.len()` bytes, and nothing downstream reads past the shape.
+    pub fn upload_raw_pooled(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let buf = self.pool.alloc(&self.hip, data.len())?;
         self.hip.memcpy_htod(&buf, data)?;
         Ok(GpuTensor {
             buf,

@@ -36,6 +36,18 @@
 // Lane mapping is `col = tid * 4`, matching both the FP32 routed kernel and the
 // linear f16 kernel, so per-session results stay comparable element-for-element
 // across all four variants.
+// Deterministic dithered narrowing — see gated_delta_net_f16.hip for why the
+// dither hashes the value's own bits rather than using a counter or carried RNG
+// (the store stays a pure function of its input, so spec-decode snapshots still
+// restore exactly what they saved).
+__device__ __forceinline__ _Float16 f32_to_f16_dither(float x, unsigned int idx) {
+    unsigned int u = __float_as_uint(x);
+    unsigned int r = u ^ (idx * 2654435761u);
+    r ^= r >> 15; r *= 2246822519u; r ^= r >> 13; r *= 3266489917u; r ^= r >> 16;
+    unsigned int dithered = (u + (r & 0x1FFFu)) & 0xFFFFE000u;
+    return (_Float16)__uint_as_float(dithered);
+}
+
 extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_f16_routed_batch_seq(
     const float* __restrict__ q,                    // [batch_rows * n_heads * HD]
@@ -51,6 +63,7 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
     int batch_rows,
     int n_heads,
     int head_dim
+    ,int stochastic_round
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -117,6 +130,9 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
     }
 
     for (int i = tid; i < TILE_ROWS * HD; i += 32) {
-        S_global[i] = (_Float16)S_tile[i];
+        S_global[i] = stochastic_round
+            ? f32_to_f16_dither(S_tile[i], (unsigned int)i ^ ((unsigned int)blockIdx.x << 19)
+                                            ^ ((unsigned int)blockIdx.y << 7))
+            : (_Float16)S_tile[i];
     }
 }

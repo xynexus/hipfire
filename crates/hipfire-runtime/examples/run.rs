@@ -35,6 +35,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    let mut sampler_rng = sampler::SamplerRng::from_entropy();
     use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::sampler;
@@ -529,7 +530,10 @@ fn main() {
                 slot.forward(gpu, tok, start_pos + i).unwrap();
             }
             let logits = gpu.download_f32(&slot.scratch.logits).unwrap();
-            let token = sampler::sample_top_p(&logits, 0.0, top_p);
+            // A nested `fn` cannot capture main's RNG, and does not need to:
+            // temperature 0.0 takes the argmax branch and never draws.
+            let token =
+                sampler::sample_top_p(&logits, 0.0, top_p, &mut sampler::SamplerRng::from_seed(1));
             (token, logits_hash(&logits))
         }
 
@@ -648,7 +652,7 @@ fn main() {
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
         let mut logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
-        let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
+        let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng);
         let mut emitted: Vec<u32> = Vec::new();
         let mut conversation_tokens = new_tokens.clone();
         let t_decode = Instant::now();
@@ -682,7 +686,7 @@ fn main() {
                     sc.repeat_penalty,
                 );
             }
-            next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
+            next_token = sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng);
         }
         let decode_secs = t_decode.elapsed().as_secs_f64();
         let text = tokenizer.decode(&emitted);
@@ -943,7 +947,7 @@ fn main() {
         } else {
             // Target-only generation path (baseline, unchanged behavior).
             let mut logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
-            let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
+            let mut next_token = sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng);
             loop {
                 let stop = emit_token(
                     next_token,
@@ -974,7 +978,7 @@ fn main() {
                         sc.repeat_penalty,
                     );
                 }
-                next_token = sampler::sample_top_p(&logits, temp, sc.top_p);
+                next_token = sampler::sample_top_p(&logits, temp, sc.top_p, &mut sampler_rng);
             }
         }
 

@@ -41,6 +41,32 @@
 // Lane mapping matches `gated_delta_net_f32` (`col = tid * 4`) so the two are
 // directly comparable element-for-element; the only difference between them is
 // the state's storage format.
+// Deterministic dithered narrowing, f32 -> f16.
+//
+// Round-to-nearest on a RECURRENT accumulator is biased: the same value always
+// rounds the same way, so the error does not cancel across steps and the state
+// drifts. Measured on a 35B-A3B, FP16-vs-FP32 state divergence grew 13x over
+// 2.5x the tokens — superlinear, i.e. compounding rather than a fixed storage
+// cost.
+//
+// The dither is a hash of the VALUE'S OWN BITS and the element index, not a
+// counter or an RNG carried across calls. That matters: the result stays a pure
+// function of the input, so a spec-decode snapshot still restores exactly what
+// it saved — the determinism this path was built for (see the dispatcher doc,
+// which notes the Q8 path's stochastic rounding was removed for precisely that
+// reason). Because an accumulator's value changes every step, the dither changes
+// with it, which is what breaks the correlated bias.
+//
+// Adding the dither into the 13 mantissa bits f16 discards and then truncating
+// makes the narrowing exact, so there is no second rounding.
+__device__ __forceinline__ _Float16 f32_to_f16_dither(float x, unsigned int idx) {
+    unsigned int u = __float_as_uint(x);
+    unsigned int r = u ^ (idx * 2654435761u);
+    r ^= r >> 15; r *= 2246822519u; r ^= r >> 13; r *= 3266489917u; r ^= r >> 16;
+    unsigned int dithered = (u + (r & 0x1FFFu)) & 0xFFFFE000u;
+    return (_Float16)__uint_as_float(dithered);
+}
+
 extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_f16(
     const float* __restrict__ q,
@@ -52,7 +78,8 @@ __global__ void gated_delta_net_f16(
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
-    int head_dim
+    int head_dim,
+    int stochastic_round
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -112,5 +139,7 @@ __global__ void gated_delta_net_f16(
     // so repeated runs on identical input are bit-identical and a spec-decode
     // rollback restores exactly what it saved.
     for (int i = tid; i < TILE_ROWS * HD; i += 32)
-        S_global[i] = (_Float16)S_tile[i];
+        S_global[i] = stochastic_round
+            ? f32_to_f16_dither(S_tile[i], (unsigned int)(row_start * HD + i) ^ ((unsigned int)h << 19))
+            : (_Float16)S_tile[i];
 }

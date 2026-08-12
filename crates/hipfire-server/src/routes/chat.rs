@@ -221,9 +221,28 @@ fn load_params_for_model_config(
 ) -> ModelLoadParams {
     let resolved = cfg.resolve_for_model(model_arg);
     let mut params = load_params_from_config(&resolved);
+    // `max_seq` is a HARD CAP on context, not a floor to be inflated.
+    //
+    // This used to do `params.max_seq = min_viable` — silently raising the
+    // operator's context cap to `max_tokens + 1024`. With `max_tokens` unset it
+    // resolves to ~131072, so `--max-seq 512` became 132096 and every session
+    // allocated KV for a 132K context: measured at ~34 MiB per tensor, filling a
+    // 42 GiB device on the FIRST request and capping concurrency at 2. The
+    // operator's cap is exactly the knob for avoiding that, so it must win.
+    //
+    // A generation budget larger than the context is now the caller's problem to
+    // resolve (clamp `max_tokens`, or raise `max_seq` deliberately) rather than
+    // something silently paid for in KV.
     let min_viable = resolved.max_tokens.saturating_add(1024);
     if params.max_seq < min_viable {
-        params.max_seq = min_viable;
+        eprintln!(
+            "  NOTE: max_tokens={} would need {min_viable} context but max_seq={} — \
+             honouring max_seq. Requests generating past {} tokens will be truncated; \
+             raise --max-seq if you need the longer budget.",
+            resolved.max_tokens,
+            params.max_seq,
+            params.max_seq.saturating_sub(1024)
+        );
     }
     maybe_attach_dflash_draft(&resolved, model_path, &mut params);
     maybe_attach_cask_sidecar(&resolved, model_path, &mut params);
@@ -810,16 +829,36 @@ pub(crate) fn effective_request_max_tokens(default_max_tokens: u32, requested: O
     }
 }
 
+/// The context to load for a request. **`max_seq` is a hard cap: a request can
+/// never enlarge it.**
+///
+/// This used to return `max(default_max_seq, request_max_tokens + 1024 + …)`, so
+/// any client could inflate the operator's context — and every increase is paid
+/// in KV. Measured on the 35B: `--max-seq 512` with a request asking
+/// `max_tokens=2000` produced `max_seq=3024`, a ~6x inflation from a single
+/// remote parameter, on a box where per-session KV is what exhausts the device.
+/// That made the operator's cap unenforceable against untrusted callers.
+///
+/// A request whose budget exceeds the context now truncates instead of resizing
+/// the server. `request_max_tokens` and `has_image` are kept in the signature
+/// because callers pass them and because the shortfall is worth reporting.
 pub(crate) fn required_load_max_seq(
     default_max_seq: u32,
     request_max_tokens: u32,
     has_image: bool,
 ) -> u32 {
     let visual_headroom = if has_image { 1024_u64 } else { 0 };
-    let required = u64::from(request_max_tokens) + 1024 + visual_headroom;
-    u64::from(default_max_seq)
-        .max(required)
-        .min(u64::from(MAX_LOAD_MAX_SEQ)) as u32
+    let wanted = u64::from(request_max_tokens) + 1024 + visual_headroom;
+    let cap = u64::from(default_max_seq).min(u64::from(MAX_LOAD_MAX_SEQ));
+    if wanted > cap {
+        tracing::debug!(
+            request_max_tokens,
+            has_image,
+            max_seq = cap,
+            "request generation budget exceeds max_seq; truncating rather than enlarging context"
+        );
+    }
+    cap as u32
 }
 
 fn now_ms() -> u64 {
@@ -3317,8 +3356,22 @@ mod tests {
         assert!(env.dflash_ngram_block);
     }
 
+    /// `max_seq` is a HARD CAP and is no longer bumped to cover `max_tokens`.
+    ///
+    /// This assertion is inverted from what it was, and the inversion is
+    /// deliberate. It previously required `max_seq: 1024 + max_tokens: 4096 ->
+    /// 5120`, matching a reference server. That bump is defensible in isolation —
+    /// generating 4096 tokens in a 1024 context truncates confusingly — but it
+    /// silently overrides an explicit operator cap, and the cap is the only knob
+    /// for bounding KV.
+    ///
+    /// Measured consequence on `Qwen3.6-35B-A3B--oq4` with `--max-seq 512`:
+    /// `max_tokens` resolved to ~131072 in the serve path, so `max_seq` became
+    /// 132096 and each session allocated KV for a 132K context — filling a 42 GiB
+    /// device on the FIRST request. With the cap honoured, `max_seq` is 1028 and
+    /// four sequential requests succeed.
     #[test]
-    fn load_params_bump_max_seq_to_cover_generation_budget_like_bun() {
+    fn load_params_honour_max_seq_as_a_hard_cap() {
         let cfg = HipfireConfig {
             max_seq: 1024,
             max_tokens: 4096,
@@ -3327,7 +3380,10 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-0.8b-mq4", None);
 
-        assert_eq!(params.max_seq, 5120);
+        assert_eq!(
+            params.max_seq, 1024,
+            "an explicit max_seq must not be inflated by the generation budget"
+        );
     }
 
     #[test]
@@ -3633,12 +3689,19 @@ mod tests {
             512
         );
 
+        // A budget that fits changes nothing.
         assert_eq!(required_load_max_seq(4096, 512, false), 4096);
-        assert_eq!(required_load_max_seq(4096, 8192, false), 9216);
-        assert_eq!(required_load_max_seq(4096, 8192, true), 10240);
-        assert_eq!(
-            required_load_max_seq(4096, MAX_LOAD_MAX_SEQ, true),
-            MAX_LOAD_MAX_SEQ
-        );
+        // A budget that does NOT fit must not enlarge the context. These two
+        // previously asserted 9216 and 10240 — i.e. a client could grow the
+        // server's KV by asking for more tokens. Measured on the 35B:
+        // --max-seq 512 with max_tokens=2000 gave max_seq=3024.
+        assert_eq!(required_load_max_seq(4096, 8192, false), 4096);
+        assert_eq!(required_load_max_seq(4096, 8192, true), 4096);
+        // The adversarial case, and the reason this is a cap rather than a floor:
+        // a single request asking for the maximum token budget previously drove
+        // the load context all the way to MAX_LOAD_MAX_SEQ (524288). Every one of
+        // those slots is paid for in KV, so an untrusted caller could size the
+        // server's memory. The operator's 4096 must survive it.
+        assert_eq!(required_load_max_seq(4096, MAX_LOAD_MAX_SEQ, true), 4096);
     }
 }

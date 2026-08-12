@@ -400,6 +400,17 @@ pub enum DaemonRequest {
     /// often priority changed the outcome. Distinct from `ResourceStatus`, which
     /// reports memory rather than work.
     SchedulerStatus,
+    /// Dump the executor trace: dispatch boundaries, per-token timestamps and
+    /// VRAM samples, plus the derived inter-token-gap percentiles.
+    ///
+    /// Distinct from [`DaemonRequest::SchedulerStatus`], which counts frames.
+    /// This reports *time*, and it is the only honest source for it — replies to
+    /// different connections race through separate sockets, so a client
+    /// stopwatch measures its own thread wake order rather than what the daemon
+    /// ran. Off unless the daemon was started with `HIPFIRE_DAEMON_TRACE=1`, in
+    /// which case the reply says so rather than returning an empty window that
+    /// would read as "nothing happened".
+    ExecutorTrace,
     /// Set the daemon's memory budgets at runtime and re-apply the ballast
     /// reservation. Answers with the same payload as [`DaemonRequest::ResourceStatus`].
     ///
@@ -487,6 +498,7 @@ pub enum DaemonResponse {
     WorkerStatus(serde_json::Value),
     ResourceStatus(serde_json::Value),
     SchedulerStatus(serde_json::Value),
+    ExecutorTrace(serde_json::Value),
     UnloadWorkerDone(serde_json::Value),
     GenerateBatchPrefillReady {
         #[serde(flatten)]

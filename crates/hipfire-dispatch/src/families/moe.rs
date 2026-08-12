@@ -157,8 +157,53 @@ pub struct MoeResolution {
 }
 
 impl MoeResolution {
+    /// ⚠️ Applies the env switch with **no admission check** — no shape, no
+    /// k_top. That is fine for tests, which pass shapes they control, and wrong
+    /// for a dispatch site: both halves of [`oq_indexed_admissible`] exist
+    /// because omitting one produced non-finite output (sub-256 `mi`) and NaN
+    /// (top-k != 8). There is deliberately no production caller; the live path
+    /// uses `resolve_with_oq_indexed(.., oq_indexed_decode_active(..))`. Keep it
+    /// that way.
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
-        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode_enabled())
+        // origin/master's helper, not an inline env read: it accepts the same
+        // spellings the arch layer does. The inline `== Some("1")` this replaces
+        // is exactly the `=1` vs `=on` split the indexed-OQ handover called
+        // "guaranteed garbage".
+        let oq_indexed_decode = oq_indexed_decode_enabled();
+        let resolved = Self::resolve_with_oq_indexed(d, k, oq_indexed_decode);
+        // `HIPFIRE_MOE_RESOLVE_DEBUG=1` dumps the snapshot this verdict came from.
+        //
+        // The arch layer resolves the same question independently and traces its
+        // own answer, so the two can disagree while both look correct in
+        // isolation — that split has now produced two bugs: the routed-dtype
+        // marshalling defaulting to F32 under paged residency, and a silent
+        // drop to `run_moe_decode_cpu_fallback` (~160 s/layer on one core) while
+        // the arch trace still reported `use_gpu_topk=true`. THIS is the verdict
+        // that selects the path; the arch-side trace is not.
+        if std::env::var("HIPFIRE_MOE_RESOLVE_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[moe-resolve] k={k} oq_gate={oq_indexed_decode} router={:?} \
+                 shared(gate/eg/eu)={:?}/{:?}/{:?} routed(gu/dn)={:?}/{:?} \
+                 all_gu_mq4={} paro_shared={} => idx(mq4/mq6/paro/oq4/oq8)={}/{}/{}/{}/{} \
+                 use_gpu_topk={} needs_x_rot={}",
+                d.router,
+                d.shared_gate,
+                d.shared_expert_gate,
+                d.shared_expert_up,
+                d.routed_gate_up,
+                d.routed_down,
+                d.experts_all_gate_up_mq4,
+                d.has_paro_shared,
+                resolved.routed_indexable_mq4,
+                resolved.routed_indexable_mq6,
+                resolved.routed_indexable_paro,
+                resolved.routed_indexable_oq4,
+                resolved.routed_indexable_oq8,
+                resolved.use_gpu_topk,
+                resolved.needs_x_rot_local,
+            );
+        }
+        resolved
     }
 
     pub fn resolve_with_oq_indexed(d: &MoeDtypes, k: usize, oq_indexed_decode: bool) -> Self {
@@ -228,6 +273,41 @@ impl MoeResolution {
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
+/// Makes routed experts dereferenceable by the indexed MoE kernels under paged
+/// residency.
+///
+/// **Why a trait and not a field.** `WeightPager` lives in `hipfire-runtime`,
+/// which depends on *this* crate — so the pager cannot be held here directly
+/// without a dependency cycle. The provider is implemented on the runtime/arch
+/// side, where the pager already is, and passed in as a trait object.
+///
+/// **The contract is a safety property, not a convenience.** The indexed kernels
+/// do `A = expert_ptrs[topk_indices[..]]` and dereference `A` with no validation.
+/// An implementation that returns `Ok(())` while leaving any selected expert
+/// non-resident causes a GPU-side null dereference, which on gfx1103 is an
+/// `amdgpu` MES hang and a full device reset — it takes down every other process
+/// on the GPU and is not recoverable in-process. Returning `Err` is always
+/// preferable to returning `Ok` with incomplete residency.
+///
+/// **This does NOT patch the pointer table.** The pager maintains the table
+/// itself on every residency transition (push), so an implementation only has to
+/// make the experts resident and the slots follow. That split is deliberate: the
+/// previous design had each dispatch site patch after ensuring, and the
+/// default-ON lowered pipeline simply never did, leaving the table all-zero.
+pub trait ExpertResidency {
+    /// Make every expert in `selected` resident for `layer`.
+    ///
+    /// On `Ok(())` every expert named by `selected` MUST be resident, and hence
+    /// have a live slot in the pager-maintained pointer table. Experts not in
+    /// `selected` are not read by this dispatch.
+    fn ensure_resident(
+        &self,
+        gpu: &mut hipfire_rdna::Gpu,
+        layer: usize,
+        selected: &[u32],
+    ) -> Result<(), DispatchError>;
+}
+
 pub struct MoeParams<'a> {
     /// Index of the decoder layer this MoE block belongs to. Carried purely so
     /// the executor can attribute router-selection telemetry to a layer; the
@@ -280,6 +360,11 @@ pub struct MoeParams<'a> {
     /// per slot either way.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,
     pub expert_down_awq_ptrs: Option<&'a GpuTensor>,
+    /// Residency provider for paged experts. `None` means either fully resident
+    /// (the tables were filled at load from `MoeFfnWeights::experts`) or paged
+    /// with no provider — and `check_moe_decode_supported` refuses the latter
+    /// rather than dispatching against a table that is still all-zero.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
     /// True when resident routed experts sit in the `oq4_arch` COMBINED layout
     /// (the default for qt=34/37), so the OQ4 grouped kernel must skip past the
     /// split nibbles and split f32 scales to reach its interleaved block stream.

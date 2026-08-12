@@ -161,10 +161,15 @@ impl Qwen35RequestSessionState {
         let buffer_size = tensor.buf.size();
         gpu.bind_thread()
             .map_err(|e| format!("clone qwen35 checkpoint {label} bind gpu: {e:?}"))?;
-        let buf = gpu
-            .hip
-            .malloc(buffer_size)
-            .map_err(|e| format!("clone qwen35 checkpoint {label} alloc: {e:?}"))?;
+        let buf = gpu.hip.malloc(buffer_size).map_err(|e| {
+            // Include shape/dtype: a byte count alone cannot say whether an
+            // oversized clone is a geometry bug (wrong head count, wrong
+            // max_seq) or genuine pressure.
+            format!(
+                "clone qwen35 checkpoint {label} alloc: {e:?} (shape={:?} dtype={:?} bytes={})",
+                tensor.shape, tensor.dtype, buffer_size
+            )
+        })?;
         gpu.hip
             .memcpy_dtod_at(&buf, 0, &tensor.buf, 0, buffer_size)
             .map_err(|e| format!("clone qwen35 checkpoint {label} copy: {e:?}"))?;
@@ -1313,6 +1318,26 @@ pub fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
             qwen35::validate_paged_moe_decode_expert_cache(weights, config)?;
         }
     }
+    // KVarN reaches the fused body only while the gate allows it. Hoisting that
+    // to selection time is what makes the gate's kill switch safe: with the check
+    // living only inside the fused body, turning the gate off made batch >= 4
+    // requests FAIL ("must use Q8 KV state ...") instead of degrading to
+    // SerialReference the way batch 1-3 already does.
+    //
+    // Deliberately narrow. It rejects exactly the case that regressed — KVarN
+    // with the gate off — and leaves every other mode's routing untouched, so
+    // this cannot change which backend a Q8 or `auto` deployment selects.
+    if m.q35_kv_mode
+        .as_deref()
+        .is_some_and(|mode| mode.starts_with("kvarn"))
+        && !qwen35::qwen35_kvarn_fused_batch_enabled()
+    {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch is disabled for KVarN KV \
+             (HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0); routing to SerialReference"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1651,6 +1676,14 @@ pub fn qwen35_allocate_session_state(
         .q35_kv_mode
         .as_deref()
         .ok_or_else(|| "qwen35 KV mode missing; reload model before batch prefill".to_string())?;
+    // What this session is actually sized for. Printed unconditionally because
+    // the per-mode constructor banners are inconsistent — asym/q8 report
+    // `physical_cap=N / max_seq=N`, kvarn reports neither — so an over-sized KV
+    // was invisible on the mode operators are meant to use.
+    eprintln!(
+        "  session KV: mode={kv_mode} max_seq={} physical_cap={}",
+        m.max_seq, m.physical_cap
+    );
     let kv_cache = match kv_mode {
         "fp32" | "f32" => {
             let is_kv_layer = qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
@@ -1725,6 +1758,31 @@ pub fn qwen35_allocate_session_state(
                 config.head_dim
             ));
         }
+        // KVarN. Without this arm a kvarn-loaded model fell through to `other`
+        // (see below) — and note the kvarn constructor's own banner does NOT
+        // print physical_cap/max_seq the way the asym/q8 ones do, so without the
+        // trace above there is no way to see what context a kvarn session was
+        // sized for.
+        // and silently got an asym3 session cache — a DIFFERENT quant from the
+        // one it was loaded with, and one the load-time deprecation gate now
+        // refuses outright. That mismatch was visible in the log as two "KV
+        // cache:" lines per session (kvarn at load, asym3 here).
+        //
+        // There is no speed argument for resolving a second time: qwen35's
+        // batched-prefill chain takes kvarn as its FIRST arm and fuses attention
+        // into the KV write, so kvarn is batched here exactly as q8/asym are.
+        // The separate ladder is a leftover from when the choice was fp16 vs
+        // asym3 and only the rotated modes had a batched masked kernel.
+        "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" => kv::KvCache::new_gpu_kvarn_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+            crate::load::kvarn_bits_from_mode(kv_mode),
+        )
+        .map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
             kv::KvCache::new_gpu_asym3_capped(

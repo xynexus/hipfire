@@ -851,7 +851,47 @@ impl HipRuntime {
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
-        self.check(code, "hipMalloc")?;
+        // Attach the requested size. A bare "hipMalloc: out of memory" cannot
+        // distinguish a sizing bug (an absurd request) from genuine pressure or a
+        // pool-placement problem, and this allocator is the only place the size
+        // exists — the same reasoning as naming the kernel on a launch failure.
+        if code != 0 && std::env::var("HIPFIRE_MALLOC_BACKTRACE").ok().as_deref() == Some("1") {
+            // The size alone says whether a request is absurd; it does not say
+            // which buffer asked for it. Opt-in because capturing a backtrace on
+            // every failure would be noise on paths that recover by retrying
+            // smaller.
+            eprintln!(
+                "[hipMalloc FAILED] {size} bytes ({:.2} MiB), code={code}\n{}",
+                size as f64 / (1024.0 * 1024.0),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        if code != 0 {
+            // Report free/total at the moment of failure. Without it, an OOM on a
+            // modest request is unattributable: it could be genuine exhaustion,
+            // fragmentation, or the request landing in a pool smaller than the
+            // device's headline capacity. Those need different fixes.
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let info_code = unsafe { (self.fn_mem_get_info)(&mut free, &mut total) };
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            let where_ = if info_code == 0 {
+                format!(
+                    ", free={:.1} MiB of total={:.1} MiB",
+                    mib(free),
+                    mib(total)
+                )
+            } else {
+                String::new()
+            };
+            return Err(HipError::new(
+                code,
+                &format!(
+                    "hipMalloc({size} bytes = {:.2} MiB){where_}",
+                    mib(size)
+                ),
+            ));
+        }
         Ok(DeviceBuffer { ptr, size })
     }
 
@@ -1273,6 +1313,29 @@ impl HipRuntime {
             ptr::null_mut(),
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        if code != 0 {
+            // `hipModuleLaunchKernel: invalid argument` with no further detail is
+            // unattributable: `Function` is an opaque handle carrying no name, so
+            // the launch geometry is the only evidence available at this layer —
+            // and it is usually the answer, since the common causes are a zero
+            // dimension, a block over the 1024-thread limit, or shared memory
+            // above the per-block cap.
+            return self.check(
+                code,
+                &format!(
+                    "hipModuleLaunchKernel (grid={}x{}x{} block={}x{}x{} threads/block={} shared={}B params={})",
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    block[0] as u64 * block[1] as u64 * block[2] as u64,
+                    shared_mem,
+                    params.len(),
+                ),
+            );
+        }
         self.check(code, "hipModuleLaunchKernel")
     }
 

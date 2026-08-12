@@ -1815,7 +1815,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
         MoeDecodeIndexedRoutedPath::None
     };
     let routed_dtype_indexable = routed_path != MoeDecodeIndexedRoutedPath::None;
-    let use_gpu_topk = k_top == 8 && routed_dtype_indexable;
+    let use_gpu_topk = k_top == INDEXED_MOE_K_TOP && routed_dtype_indexable;
     let needs_x_rot_local = gate_side_mq4
         || routed_gate_up_mq4
         || routed_gate_up_mq6
@@ -1847,11 +1847,80 @@ fn moe_decode_dispatch_flags_for_dtypes(
     }
 }
 
-fn qwen35_moe_oq_indexed_decode_active(hidden: usize, mi: usize, k_top: usize) -> bool {
+/// K_TOP the indexed MoE kernels are built for. Every `*_k8_indexed*` kernel
+/// hard-codes an 8-deep top-k (the dispatchers launch `grid.y = 8`), so a model
+/// routing a different top-k cannot use them.
+///
+/// This constant exists because the value was previously written out twice, in
+/// two crates' worth of apart decisions that had to agree and did not: the
+/// dispatcher gated the indexed kernels on `k_top == 8`, while the loader
+/// repacked experts into those kernels' block layout on the env flag ALONE. A
+/// top-2 model therefore got kernel-layout weights that no kernel ever read,
+/// and the non-indexed fallback decoded them as canonical blocks — silent
+/// garbage. Both sites now read this.
+/// Re-bound from `hipfire_dispatch`, NOT redeclared: this comment's own point is
+/// that the value existed in two places that had to agree and did not. It now has
+/// one definition, next to the admission predicate that enforces it.
+pub(crate) const INDEXED_MOE_K_TOP: usize = hipfire_dispatch::families::moe::INDEXED_MOE_K_TOP;
+
+/// Admits KVarN KV to the fused grouped-MoE session batch, which used to
+/// hard-require Q8.
+///
+/// **Default ON since 2026-08-11**; `HIPFIRE_QWEN35_KVARN_FUSED_BATCH=0` (or
+/// `off`) is the kill switch. Opt-out rather than opt-in mirrors
+/// `HIPFIRE_FORWARD_LOWERED`.
+///
+/// This is what makes batched MoE decode reachable at all. Q8 is on
+/// `DEPRECATED_KV_MODES`, so while this defaulted off there was no supported KV
+/// mode that could fuse: below 4 sessions the auto path is serial by policy, and
+/// at 4+ it errored. Batching was effectively dead for every default deployment.
+///
+/// It defaulted off through bring-up because the failure mode is a corrupted K
+/// window — plausible output, no error. Flipped only after the checks that could
+/// have caught that all came back clean on `Qwen3.6-35B-A3B--oq4`:
+///
+/// - the routed window kernel is exact and touches nothing else, including under
+///   segmented writes (`parity_kvarn_window_routed`);
+/// - the block-flush path is actually exercised — 163-token generations cross the
+///   128-token boundary, so gather+quantize runs rather than being skipped;
+/// - fused-vs-serial divergence lands at byte-identical positions under KVarN and
+///   under Q8 (580 / 17 / 31 chars on 3 of 4 prompts), so the difference belongs
+///   to the shared fused machinery, not to this K format;
+/// - sessions are independent: a probe's output is byte-identical whether batched
+///   with one set of companions or a completely different set. No state leaks
+///   across rows.
+///
+/// What is still NOT established is absolute numerical correctness, because no
+/// logit-level oracle exists in this tree (`HIPFIRE_FORWARD_ORACLE` is advertised
+/// in `superop.rs` and implemented nowhere). The claim this default rests on is
+/// equivalence to the shipped Q8 path, not perfection.
+///
+/// **The kill switch does not restore working batching — it restores the pre-port
+/// FAILURE.** Verified: with `=0` and KVarN KV (the default mode), batch >= 4
+/// requests die with "must use Q8 KV state for the MQ4 control path" instead of
+/// degrading to `SerialReference` the way batch 1-3 does. That is the
+/// refuse-at-execution-instead-of-selection defect filed in BUGS.md, and it is
+/// what makes this switch sharp: setting it to 0 without also moving off KVarN
+/// turns working batching into failing requests. Fixing that fallback is what
+/// would make this a safe escape hatch.
+pub fn qwen35_kvarn_fused_batch_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_QWEN35_KVARN_FUSED_BATCH")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+pub(crate) fn qwen35_moe_oq_indexed_decode_active(hidden: usize, mi: usize, k_top: usize) -> bool {
     // Indexed routed-OQ decode: ON by default, HIPFIRE_QWEN35_MOE_OQ_INDEXED=0
     // opts out, AND the shape must admit the G256 FWHT rotates on both sides.
     // One shared predicate — this must agree with the loader's MoE-block repack
     // or the dispatch runs against un-repacked weights.
+    // `pub(crate)` because loading.rs calls it for the MoE-block repack. The
+    // k_top half lives INSIDE the shared predicate rather than being ANDed by
+    // each caller — same reasoning this branch gave for consolidating it, taken
+    // one step further so a caller cannot omit it.
     hipfire_dispatch::families::moe::oq_indexed_decode_active(hidden, mi, k_top)
 }
 
@@ -3210,6 +3279,11 @@ fn moe_ffn_dispatch(
     config: &Qwen35Config,
     s: &Qwen35Scratch,
     layer_idx: usize,
+    // Threaded through rather than hardcoded `None`, which is what kept the
+    // lowered path from ever paging: `moe_ffn_decode_impl` builds its residency
+    // provider from this, so a `None` here means the paged configuration is
+    // refused no matter what the pager and the pointer tables are doing.
+    pager: Option<&std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
 ) -> HipResult<()> {
     let r = if ffn_all_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
@@ -3219,10 +3293,10 @@ fn moe_ffn_dispatch(
             config.dim,
             config.norm_eps,
         )?;
-        moe_ffn_decode_with_scratch_prerotated(gpu, None, ffn, x, x, config, s, layer_idx)
+        moe_ffn_decode_with_scratch_prerotated(gpu, pager, ffn, x, x, config, s, layer_idx)
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_with_scratch(gpu, None, ffn, &s.tmp, x, config, s, layer_idx)
+        moe_ffn_decode_with_scratch(gpu, pager, ffn, &s.tmp, x, config, s, layer_idx)
     };
     r?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
@@ -3689,7 +3763,14 @@ mod tests {
         // it no longer SELECTS anything. The threshold that once chose Q8 above a
         // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-        assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
+        // FP32 unless HIPFIRE_DN_STATE_FP16 opts in. Guarded so a developer
+        // running with it exported does not see a false failure — the env is
+        // process-wide and this test cannot own it.
+        if hipfire_env::DN_STATE_FP16.flag() {
+            assert_eq!(default_state_quant(&cfg), StateQuant::FP16);
+        } else {
+            assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
+        }
     }
 
     #[test]
@@ -4210,6 +4291,11 @@ mod tests {
     /// written to protect and had been failing CI ever since.
     #[test]
     fn dense_prefill_bf16_is_batchable_in_qwen35() {
+        // gfx1151 is in this list deliberately. The BUG-001 guard that used to
+        // exclude it was removed with measured justification (see the BF16 arm of
+        // `is_batchable_la`): prefill 58.5 -> 1646.3 tok/s, PPL 24.0318 -> 24.0551,
+        // top-1 argmax agreeing at 99.36%. This test still asserted the old guard
+        // and so was red on every arch after that change landed.
         for arch in [
             "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
             "gfx942",
@@ -4315,6 +4401,7 @@ mod tests {
             kv_compact_offset: 0,
             kv_quantized: true,
             kv_quant_q8: true,
+            kv_quant_kvarn: false,
             kv_quant_asym2: false,
             kv_quant_asym3: false,
             kv_quant_asym4: false,
@@ -4688,7 +4775,7 @@ mod tests {
             dn_scale_layers: 0,
             dn_conv_layers: 0,
         };
-        let tables = dense_prefill_session_batch_pointer_table_plan(&ragged, route_shape, 3);
+        let tables = dense_prefill_session_batch_pointer_table_plan(&ragged, route_shape, 3, 0);
         assert_eq!(
             tables
                 .prefix_rows
@@ -4725,6 +4812,7 @@ mod tests {
                 kv_compact_offset: 0,
                 kv_quantized: false,
                 kv_quant_q8: false,
+                kv_quant_kvarn: false,
                 kv_quant_asym2: false,
                 kv_quant_asym3: false,
                 kv_quant_asym4: false,
@@ -4736,6 +4824,7 @@ mod tests {
                 kv_compact_offset: 0,
                 kv_quantized: false,
                 kv_quant_q8: false,
+                kv_quant_kvarn: false,
                 kv_quant_asym2: false,
                 kv_quant_asym3: false,
                 kv_quant_asym4: false,
@@ -4748,6 +4837,7 @@ mod tests {
             &config,
             &signatures,
             &plan,
+            false,
         )
         .expect("dense FP32-state prefix should be eligible");
     }
@@ -4776,6 +4866,7 @@ mod tests {
             kv_compact_offset: 0,
             kv_quantized: false,
             kv_quant_q8: false,
+            kv_quant_kvarn: false,
             kv_quant_asym2: false,
             kv_quant_asym3: false,
             kv_quant_asym4: false,
@@ -4787,6 +4878,7 @@ mod tests {
             &moe_config,
             &[fp32_sig, fp32_sig],
             &plan,
+            false,
         )
         .unwrap_err();
         assert!(moe_err.contains("dense Qwen35 only"));
@@ -4800,6 +4892,7 @@ mod tests {
                 &test_qwen35_config_with_layers(vec![LayerType::LinearAttention]),
                 &[compacted, compacted],
                 &plan,
+                false,
             )
             .unwrap_err();
         assert!(compact_err.contains("compacted KV offset"));
@@ -4840,6 +4933,7 @@ mod tests {
             kv_compact_offset: 0,
             kv_quantized: true,
             kv_quant_q8: true,
+            kv_quant_kvarn: false,
             kv_quant_asym2: false,
             kv_quant_asym3: false,
             kv_quant_asym4: false,
@@ -4852,6 +4946,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .expect("A3B MQ4 control path uses grouped MoE with Q8 state");
 
@@ -4864,8 +4959,54 @@ mod tests {
             &[fp32_sig, fp32_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .expect("grouped MoE uses its routed FP32 DeltaNet branch when sessions require it");
+
+        // KVarN is admitted ONLY when the caller opts in. Both directions matter:
+        // rejecting it while the port is gated off is what keeps KVarN KV out of
+        // the Q8 kernel, and that mis-route is silent corruption rather than an
+        // error, so it is asserted rather than assumed.
+        let kvarn_sig = DensePrefillSessionBatchStateSignature {
+            kv_quant_q8: false,
+            kv_quant_kvarn: true,
+            ..q8_sig
+        };
+        let err = validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[kvarn_sig, kvarn_sig],
+            &plan,
+            "gfx1151",
+            false,
+        )
+        .expect_err("KVarN must be refused while the fused KVarN batch is gated off");
+        assert!(err.contains("must use Q8"), "unexpected error: {err}");
+
+        validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[kvarn_sig, kvarn_sig],
+            &plan,
+            "gfx1151",
+            true,
+        )
+        .expect("KVarN is admitted once the caller opts in");
+
+        // Opting in must not smuggle in the modes that were never supported —
+        // the asym/fwht rejection is independent of the KVarN widening.
+        let asym_sig = DensePrefillSessionBatchStateSignature {
+            kv_quant_q8: false,
+            kv_quant_kvarn: false,
+            kv_quant_asym3: true,
+            ..q8_sig
+        };
+        validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[asym_sig, asym_sig],
+            &plan,
+            "gfx1151",
+            true,
+        )
+        .expect_err("allow_kvarn must not admit asym3");
     }
 
     #[test]
@@ -4894,6 +5035,7 @@ mod tests {
             kv_compact_offset: 0,
             kv_quantized: true,
             kv_quant_q8: true,
+            kv_quant_kvarn: false,
             kv_quant_asym2: false,
             kv_quant_asym3: false,
             kv_quant_asym4: false,
@@ -4906,6 +5048,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(dense_err.contains("requires Qwen35 MoE/A3B weights"));
@@ -4913,6 +5056,7 @@ mod tests {
         let fp32_kv = DensePrefillSessionBatchStateSignature {
             kv_quantized: false,
             kv_quant_q8: false,
+            kv_quant_kvarn: false,
             dn_quant: StateQuant::FP32,
             ..q8_sig
         };
@@ -4921,6 +5065,7 @@ mod tests {
             &[fp32_kv, fp32_kv],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(fp32_err.contains("must use Q8 KV state"));
@@ -4938,6 +5083,7 @@ mod tests {
             &[asym_kv, asym_kv],
             &plan,
             "gfx1151",
+            false,
         )
         .unwrap_err();
         assert!(asym_err.contains("unsupported KV quantization flags"));
@@ -4947,6 +5093,7 @@ mod tests {
             &[q8_sig, q8_sig],
             &plan,
             "gfx942",
+            false,
         )
         .unwrap_err();
         assert!(arch_err.contains("requires an RDNA grouped-MoE target"));
@@ -4981,7 +5128,7 @@ mod tests {
         .expect("valid dense session execution plan");
 
         assert_eq!(
-            dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3),
+            dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3, 0),
             DensePrefillSessionBatchPointerTableShape {
                 sessions: 3,
                 multi_state_prefix_rounds: 2,
@@ -4989,6 +5136,7 @@ mod tests {
                 max_rows_per_round: 3,
                 kv_k_ptrs: 12,
                 kv_v_ptrs: 12,
+                kv_win_ptrs: 0,
                 dn_s_ptrs: 6,
                 dn_scale_ptrs: 6,
                 dn_conv_ptrs: 6,
@@ -5028,7 +5176,7 @@ mod tests {
             8,
         )
         .expect("valid dense session execution plan");
-        let tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 3);
+        let tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 3, 0);
 
         assert_eq!(tables.kv_layer_slots.len(), 12);
         assert_eq!(
@@ -5120,7 +5268,7 @@ mod tests {
             8,
         )
         .expect("valid dense session execution plan");
-        let mut tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 2);
+        let mut tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 2, 0);
 
         tables.session_last_row_indices[0] = 1;
         let err = dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap_err();
@@ -5155,7 +5303,7 @@ mod tests {
         )
         .expect("valid dense session execution plan");
         let table_plan =
-            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
 
         let s0_k = vec![
             fake_tensor(0x1000),
@@ -5196,6 +5344,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s0_k,
                     v_gpu: &s0_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5211,6 +5360,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s1_k,
                     v_gpu: &s1_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5267,7 +5417,7 @@ mod tests {
         )
         .expect("valid dense session execution plan");
         let table_plan =
-            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
 
         let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
         let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
@@ -5287,6 +5437,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s0_k,
                     v_gpu: &s0_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5302,6 +5453,7 @@ mod tests {
                 kv: DensePrefillSessionKvStateRoute {
                     k_gpu: &s1_k,
                     v_gpu: &s1_v,
+                    k_window_gpu: &[],
                     physical_cap: 512,
                     compact_offset: 0,
                 },
@@ -5320,6 +5472,399 @@ mod tests {
         assert!(err.contains("DeltaNet scale slot references missing layer 0"));
     }
 
+    /// A KVarN route that forgets its windows must fail loudly at table build.
+    ///
+    /// This is why the builder gates on `shape.kv_win_ptrs != 0` rather than on
+    /// `k_window_gpu` being non-empty: gating on the slice would silently emit a
+    /// SHORT table, and `kv_cache_write_kvarn_window_routed_batched` indexes it
+    /// as `session * ptr_layer_stride + layer` with no bound to check against —
+    /// so a short table is an out-of-bounds device read, not an error.
+    #[test]
+    fn dense_session_prefill_host_pointer_tables_reject_missing_kvarn_window_route() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        // kv_window_layers = n_layers → KVarN.
+        let table_plan = dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            2,
+            config.n_layers,
+        );
+
+        let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let s0_dn_s = vec![fake_tensor(0x3000)];
+        let s0_dn_sc = vec![fake_tensor(0x4000)];
+        let s0_dn_conv = vec![fake_tensor(0x5000)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let s1_v = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let s1_w = vec![fake_tensor(0xE000), fake_tensor(0xE001)];
+        let s1_dn_s = vec![fake_tensor(0x9000)];
+        let s1_dn_sc = vec![fake_tensor(0xA000)];
+        let s1_dn_conv = vec![fake_tensor(0xB000)];
+        let s1_logits = fake_tensor(0xC000);
+
+        // Session 1 is complete; only session 0 is missing its windows, so the
+        // error must name the window slot rather than the session count.
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &s0_dn_sc,
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    k_window_gpu: &s1_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let err =
+            dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes).unwrap_err();
+        assert!(
+            err.contains("KVarN K-window slot references missing layer 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The window table must be session-major and layer-ordered exactly like
+    /// `kv_k_ptrs`, because both are indexed by the same
+    /// `session * ptr_layer_stride + layer_index` expression in the kernels.
+    /// A transposed table reads a real pointer belonging to the wrong layer,
+    /// which produces plausible attention rather than a fault.
+    #[test]
+    fn dense_session_prefill_kvarn_window_table_is_session_major_like_k() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan = dense_prefill_session_batch_pointer_table_plan(
+            &execution_plan,
+            route_shape,
+            2,
+            config.n_layers,
+        );
+
+        let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let s0_w = vec![fake_tensor(0xD000), fake_tensor(0xD001)];
+        let s0_dn_s = vec![fake_tensor(0x3000)];
+        let s0_dn_sc = vec![fake_tensor(0x4000)];
+        let s0_dn_conv = vec![fake_tensor(0x5000)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let s1_v = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let s1_w = vec![fake_tensor(0xE000), fake_tensor(0xE001)];
+        let s1_dn_s = vec![fake_tensor(0x9000)];
+        let s1_dn_sc = vec![fake_tensor(0xA000)];
+        let s1_dn_conv = vec![fake_tensor(0xB000)];
+        let s1_logits = fake_tensor(0xC000);
+
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    k_window_gpu: &s0_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &s0_dn_sc,
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    k_window_gpu: &s1_w,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let tables = dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes)
+            .expect("KVarN window table builds when windows are supplied");
+        assert_eq!(tables.kv_win_ptrs.len(), tables.kv_k_ptrs.len());
+        assert_eq!(
+            tables.kv_win_ptrs,
+            vec![0xD000u64, 0xD001, 0xE000, 0xE001],
+            "window table must be session-major, layer-ordered, like kv_k_ptrs"
+        );
+    }
+
+    /// Non-KVarN modes keep the table absent, not zero-filled — a zero-filled
+    /// table would be a null-pointer deref if anything ever dispatched against
+    /// it, whereas an empty one fails the shape check first.
+    #[test]
+    fn dense_session_prefill_non_kvarn_leaves_the_window_table_empty() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan =
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2, 0);
+        assert_eq!(table_plan.shape.kv_win_ptrs, 0);
+
+        let k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let dn_s = vec![fake_tensor(0x3000)];
+        let dn_sc = vec![fake_tensor(0x4000)];
+        let dn_conv = vec![fake_tensor(0x5000)];
+        let logits = fake_tensor(0x6000);
+        let k1 = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let v1 = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let dn_s1 = vec![fake_tensor(0x9000)];
+        let dn_sc1 = vec![fake_tensor(0xA000)];
+        let dn_conv1 = vec![fake_tensor(0xB000)];
+        let logits1 = fake_tensor(0xC000);
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &k,
+                    v_gpu: &v,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &dn_s,
+                    s_scales: &dn_sc,
+                    conv_states: &dn_conv,
+                    quant: StateQuant::FP32,
+                },
+                logits: &logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &k1,
+                    v_gpu: &v1,
+                    k_window_gpu: &[],
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &dn_s1,
+                    s_scales: &dn_sc1,
+                    conv_states: &dn_conv1,
+                    quant: StateQuant::FP32,
+                },
+                logits: &logits1,
+            },
+        ];
+
+        let tables = dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes)
+            .expect("non-KVarN table builds");
+        assert!(tables.kv_win_ptrs.is_empty());
+    }
+
+    fn kvarn_row(session_index: usize, position: usize) -> DensePrefillSessionBatchPrefixRowSlot {
+        DensePrefillSessionBatchPrefixRowSlot {
+            round_index: 0,
+            round_row_index: 0,
+            session_index,
+            token_index: 0,
+            token: 1,
+            position,
+        }
+    }
+
+    /// No completed block → one segment covering everything, nothing to flush.
+    #[test]
+    fn kvarn_block_flushes_are_empty_when_no_block_completes() {
+        let rows = vec![
+            kvarn_row(0, 0),
+            kvarn_row(1, 5),
+            kvarn_row(0, 1),
+            kvarn_row(1, 6),
+        ];
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, 128);
+        assert_eq!(splits, vec![4]);
+        assert_eq!(flushes.len(), 1);
+        assert!(flushes[0].is_empty());
+    }
+
+    /// A row landing on the last slot of a block must cut the launch right after
+    /// itself, so the window is drained before that session writes slot 0 again.
+    #[test]
+    fn kvarn_block_flush_splits_immediately_after_a_completing_row() {
+        let group = 128;
+        let rows = vec![
+            kvarn_row(0, 126),
+            kvarn_row(1, 10),
+            kvarn_row(0, 127), // completes session 0 block 0
+            kvarn_row(0, 128), // would land in slot 0 — must be in a later segment
+            kvarn_row(1, 11),
+        ];
+        let (splits, flushes) =
+            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        assert_eq!(splits, vec![3, 5]);
+        assert_eq!(
+            flushes[0],
+            vec![KvarnBlockFlush {
+                session_index: 0,
+                block_index: 0
+            }]
+        );
+        assert!(flushes[1].is_empty());
+        // The wrapping row is strictly after the split that drains the window.
+        assert!(splits[0] <= 3, "row at position 128 must not share a segment");
+    }
+
+    /// Block index is the session's own ordinal, not a row ordinal — the flush
+    /// writes `records[block_index]`, so an off-by-one here silently quantizes
+    /// into the wrong block and corrupts history rather than failing.
+    #[test]
+    fn kvarn_block_flush_reports_the_session_block_ordinal() {
+        let group = 128;
+        let rows = vec![
+            kvarn_row(2, 255),  // session 2, block 1
+            kvarn_row(1, 1023), // session 1, block 7
+        ];
+        let (splits, flushes) =
+            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        assert_eq!(splits, vec![1, 2]);
+        assert_eq!(flushes[0][0].block_index, 1);
+        assert_eq!(flushes[0][0].session_index, 2);
+        assert_eq!(flushes[1][0].block_index, 7);
+        assert_eq!(flushes[1][0].session_index, 1);
+    }
+
+    /// Every row must belong to exactly one segment, for any group size — this
+    /// is the property that makes the split list safe to drive a write loop.
+    #[test]
+    fn kvarn_block_flush_segments_partition_every_row() {
+        for group in [4usize, 8, 128] {
+            let rows: Vec<_> = (0..40)
+                .map(|i| kvarn_row(i % 3, (i / 3) + (i % 3) * 7))
+                .collect();
+            let (splits, flushes) =
+                grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+            assert_eq!(splits.len(), flushes.len(), "group={group}");
+            assert_eq!(*splits.last().unwrap(), rows.len(), "group={group}");
+            let mut prev = 0usize;
+            for &s in &splits {
+                assert!(s > prev, "group={group}: split {s} must advance past {prev}");
+                prev = s;
+            }
+        }
+    }
+
+    /// Walk the splits exactly as the layer body does and assert the segments
+    /// tile `[0, rows)` — contiguous, non-overlapping, nothing dropped. The loop
+    /// writes `[seg_start, split)` per segment, so a gap silently skips a K row
+    /// (attention then reads a stale window slot) and an overlap rewrites one.
+    #[test]
+    fn kvarn_segment_walk_tiles_the_batch_exactly() {
+        for group in [4usize, 16, 128] {
+            let rows: Vec<_> = (0..37)
+                .map(|i| kvarn_row(i % 4, (i / 4) + (i % 4) * 5))
+                .collect();
+            let (splits, flushes) =
+                grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+            assert_eq!(splits.len(), flushes.len());
+
+            let mut covered = vec![0usize; rows.len()];
+            let mut seg_start = 0usize;
+            for &split in &splits {
+                assert!(split >= seg_start, "group={group}: splits must not regress");
+                for slot in covered.iter_mut().take(split).skip(seg_start) {
+                    *slot += 1;
+                }
+                seg_start = split;
+            }
+            assert_eq!(seg_start, rows.len(), "group={group}: last split must end the batch");
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "group={group}: every row must be written exactly once, got {covered:?}"
+            );
+        }
+    }
+
     #[test]
     fn dense_session_prefill_pointer_table_indices_are_deterministic() {
         let shape = DensePrefillSessionBatchPointerTableShape {
@@ -5329,6 +5874,7 @@ mod tests {
             max_rows_per_round: 3,
             kv_k_ptrs: 12,
             kv_v_ptrs: 12,
+            kv_win_ptrs: 0,
             dn_s_ptrs: 6,
             dn_scale_ptrs: 6,
             dn_conv_ptrs: 6,
@@ -5692,18 +6238,103 @@ mod tests {
         assert!(flags.needs_x_rot_local);
     }
 
+    /// Inverted 2026-08-12 to follow the default. `0714f618e` made indexed
+    /// routed-OQ decode ON by default but left this test asserting the old
+    /// fallback, so it was RED on origin/master — verified by running it in a
+    /// worktree at pristine master, not inferred from the rebase.
+    ///
+    /// `moe_decode_dispatch_flags_for_dtypes` reads the env itself (its third
+    /// argument is `paro_shared_present`, not the indexed flag), so this asserts
+    /// the DEFAULT. The env-free half of the contract is
+    /// `oq_indexed_decode_enabled_from`, covered below.
     #[test]
-    fn moe_decode_keeps_oq_on_generic_fallback_by_default() {
+    fn moe_decode_takes_the_indexed_oq_path_by_default() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::Oq4G256);
         dtypes.router = DType::Q8_0;
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
 
         let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false, 2048, 768);
 
-        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
-        assert!(!flags.routed_dtype_indexable_oq4);
-        assert!(!flags.use_gpu_topk);
-        assert!(!flags.needs_x_rot_local);
+        // Guarded: the env is process-wide and this test cannot own it, so an
+        // operator running with the opt-out exported must not see a false
+        // failure.
+        if hipfire_dispatch::families::moe::oq_indexed_decode_enabled() {
+            assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Oq4);
+            assert!(flags.routed_dtype_indexable_oq4);
+        } else {
+            assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
+            assert!(!flags.routed_dtype_indexable_oq4);
+        }
+    }
+
+    /// The parse, without touching process-global env. Pins both directions of
+    /// the 2026-08-12 inversion: unset means ENABLED now.
+    #[test]
+    fn oq_indexed_decode_default_is_on_and_zero_opts_out() {
+        use hipfire_dispatch::families::moe::oq_indexed_decode_enabled_from as parse;
+        assert!(parse(None), "unset must mean enabled since 2026-08-12");
+        assert!(parse(Some("1")));
+        assert!(parse(Some("on")));
+        assert!(!parse(Some("0")));
+        assert!(!parse(Some("off")));
+    }
+
+    /// The loader repacks routed OQ experts into the indexed kernels' block
+    /// layout, and the dispatcher decides whether those kernels run. Both must
+    /// key on the SAME top-k, or the repack lands on a model that never reaches
+    /// the kernels and the non-indexed fallback decodes kernel-layout blocks as
+    /// canonical ones — silent garbage (non-finite KLD on every Opus cell).
+    ///
+    /// This pins the shared constant and the dispatch side of that contract. The
+    /// loader side reads `INDEXED_MOE_K_TOP` directly (`load_moe_ffn`), which is
+    /// what keeps the two from drifting apart again.
+    #[test]
+    fn indexed_moe_k_top_gates_oq_repack_and_dispatch_together() {
+        // Every indexed MoE kernel is `*_k8_indexed*` and is launched with
+        // grid.y = 8; this constant is that 8.
+        assert_eq!(INDEXED_MOE_K_TOP, 8);
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::Oq4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+
+        // (hidden, mi) = the 35B-A3B's, which `oq_indexed_shape_supported`
+        // admits (both % 256 == 0). Pinned to a PASSING shape on purpose: this
+        // test is about the k_top half of the predicate, so the shape half must
+        // not be what fails it — otherwise it would still pass with the k_top
+        // check deleted.
+        const OK_HIDDEN: usize = 2048;
+        const OK_MI: usize = 768;
+
+        // A top-k the kernels are not built for must NOT take the indexed path.
+        for k_top in [1usize, 2, 4, 6, 10] {
+            let flags =
+                moe_decode_dispatch_flags_for_dtypes(&dtypes, k_top, false, OK_HIDDEN, OK_MI);
+            assert!(
+                !flags.use_gpu_topk,
+                "k_top={k_top} != INDEXED_MOE_K_TOP must not admit the k8 kernels"
+            );
+        }
+
+        // And the constant is the only value that does.
+        let flags = moe_decode_dispatch_flags_for_dtypes(
+            &dtypes,
+            INDEXED_MOE_K_TOP,
+            false,
+            OK_HIDDEN,
+            OK_MI,
+        );
+        assert_eq!(flags.use_gpu_topk, flags.routed_dtype_indexable_oq4);
+
+        // The shape half is a real second gate, not decoration: the same dtypes
+        // and the admitted k_top must still be refused on the arch-6 toy MoE's
+        // `mi = 128`, which is what turned seven qwen3_5_moe OQ cells non-finite.
+        let flags =
+            moe_decode_dispatch_flags_for_dtypes(&dtypes, INDEXED_MOE_K_TOP, false, 768, 128);
+        assert!(
+            !flags.use_gpu_topk,
+            "mi=128 cannot be FWHT-rotated; the indexed k8 kernels must not be admitted"
+        );
     }
 
     #[test]

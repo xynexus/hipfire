@@ -1292,10 +1292,11 @@ fn decode_step_layers_and_head(
     let seq_len = position as usize + 1;
     let capture_postmixer = std::env::var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
 
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Skipped
-    // when capturing (the oracle dumper needs the per-layer hand path) — that path
-    // stays byte-identical. Default off (opt-in) until fleet byte-parity validated.
+    // #397 Ship 6 — forward-as-pipeline. The per-layer decode routes through the
+    // super-op executor (run_layer_program) BY DEFAULT; HIPFIRE_FORWARD_LOWERED=0
+    // opts back to the hand loop. Skipped when capturing (the oracle dumper needs
+    // the per-layer hand path) — that path stays byte-identical. Fleet byte-parity
+    // validated — see lfm2_forward_lowered_enabled.
     if lfm2_forward_lowered_enabled() && capture.is_none() {
         return decode_step_layers_and_head_lowered(cfg, weights, state, gpu, position);
     }
@@ -1595,10 +1596,11 @@ mod tests {
 //
 // LFM2 is the substrate's Conv super-op proving ground. Each layer lowers to a
 // short LayerProgram of coarse super-ops; the per-token executor (run_layer_
-// program) calls these arch handlers. ADDITIVE + opt-in (HIPFIRE_FORWARD_LOWERED,
-// default off) — the hand loop in decode_step_layers_and_head is untouched, so
-// the default path stays byte-identical; the lowered path is validated byte-
-// identical via the FORWARD_LOWERED=0-vs-=1 committed-token md5 A/B before flip.
+// program) calls these arch handlers. ADDITIVE and now DEFAULT-ON
+// (HIPFIRE_FORWARD_LOWERED=0 opts back out) — the hand loop in
+// decode_step_layers_and_head is untouched and stays reachable; the lowered path
+// was validated byte-identical via the FORWARD_LOWERED=0-vs-=1 committed-token
+// md5 A/B before the flip.
 //
 // Super-op map (pre-norm folded into each handler):
 //   Conv         = operator_norm + in_proj + conv1d_gated + out_proj(+resid)

@@ -3212,6 +3212,23 @@ pub const CONV1D_BIAS_SILU_SEQ_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_delta_net.hip");
 
+/// FP64-accumulate DeltaNet — the numerical ORACLE for the f32/f16 state paths,
+/// not a serving kernel. FP32 storage, `double` tile and arithmetic, so it
+/// isolates the error the f32 kernel accrues inside its own tile from any
+/// storage round-trip. Every FP16-vs-FP32 state figure so far is measured
+/// against `gated_delta_net.hip`, which is itself an unvalidated f32
+/// accumulator; this is what makes that reference checkable. fp64 is a small
+/// fraction of fp32 rate on consumer RDNA3, so it is measured offline behind
+/// `HIPFIRE_DN_STATE_F64_ORACLE=1`.
+pub const GATED_DELTA_NET_F64ACC_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f64acc.hip");
+
+/// Routed sibling of [`GATED_DELTA_NET_F64ACC_SRC`]. Needed because BATCHED
+/// decode dispatches the routed kernel, so a plain-kernel-only oracle would
+/// silently never run under a multi-session measurement.
+pub const GATED_DELTA_NET_F64ACC_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f64acc_routed_batch_seq.hip");
+
 /// Routed FP32 Gated Delta Net for independent request sessions. One block per
 /// session/head/S-tile scans round-major prefix rows and updates only that
 /// session's recurrent S state.
@@ -3326,6 +3343,14 @@ pub const KV_CACHE_WRITE_F32_ROUTED_BATCHED_SRC: &str =
 /// per-session Q8_0 cache pointers selected by row_session_indices.
 pub const KV_CACHE_WRITE_Q8_0_ROUTED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_routed_batched.hip");
+
+/// Routed batched KVarN K-window append: scatter `batch_size` K rows into the
+/// per-session f32 recent window at `positions[b] % group`. The block-complete
+/// flush (gather + quantize into 4-bit records) stays a per-session event on the
+/// existing `kvarn_gather_k_tiles` / `kvarn_quantize_tile` pair, because it fires
+/// once per `group` tokens rather than once per row.
+pub const KV_CACHE_WRITE_KVARN_WINDOW_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_kvarn_window_routed_batched.hip");
 
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
 /// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).

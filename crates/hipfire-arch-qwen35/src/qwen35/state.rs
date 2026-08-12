@@ -76,7 +76,7 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// Q8 ones are deleted, so tree replay runs at whichever precision the state is.
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
-/// is now FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
+/// is FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
 #[deprecated(note = "Q8 state was removed; precision is FP32 or opt-in FP16")]
 pub fn deltanet_state_fp32_below() -> usize {
     usize::MAX
@@ -119,16 +119,37 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     //     0.3317, max_freq 0.0450 vs 0.0458), against Q8's recorded signature
     //     of 0.625 -> 0.555 and 0.055 -> 0.078.
     //
-    // Both are one prompt on one or two models. Moving the default wants a
-    // teacher-forced FP32-vs-FP16 KLD run across more than that.
+    // Two measurements bear on the default and they point opposite ways, so
+    // both are kept — neither alone should move it:
+    //
+    //   * ACCURACY (teacher-forced, same weights, only state precision
+    //     differing): mean KLD 5.65e-05 on the dense 2B but 2.57e-03 on the
+    //     35B-A3B oq4.25++ — ~45x worse on the larger MoE model. FP16 state
+    //     costs MORE where it would be used most. This says FP32.
+    //   * CAPACITY: per-session state is 30 layers x 2 MiB = 60 MiB on the
+    //     35B-A3B, ~9x its KV, and it bounds concurrency — at width 64 FP32
+    //     state OOMs the GTT pool mid-prefill and only 19/64 sessions
+    //     complete, where FP16 gives 64/64 (BUGS.md).
+    //
+    // So FP16 is the right choice for a high-concurrency deployment and the
+    // wrong default. Opt in per-deployment; do not move the default on the
+    // capacity number alone, which one branch briefly did.
+    //
+    // Both accuracy points are one prompt on one or two models. Moving the
+    // default wants a teacher-forced FP32-vs-FP16 KLD sweep across more than
+    // that — and specifically ACROSS CONTEXT LENGTH, which is still unmeasured
+    // for this pair. The f32-vs-fp64 sweep that does exist came out flat
+    // (BUGS.md), but that is a different pair under teacher forcing and does
+    // not transfer: FP16 state is re-rounded every invocation with no error
+    // feedback, which is the mechanism that would compound.
     //
     // History worth not repeating: FP16 was made the default and REVERTED the
     // same day (2026-08-09). The Q8 dispatch functions had never been deleted,
     // only the `StateQuant` variants that selected them, so surviving `else`
     // arms still reached them unconditionally and half-size FP16 state faulted
-    // with `Memory Fault ... kernel: gated_delta_net_q8`. This branch is what
-    // finishes that removal — the kernels, their dispatch entry points and
-    // every caller are gone — so the blocker is cleared and the opt-in is real.
+    // with `Memory Fault ... kernel: gated_delta_net_q8`. The kernels, their
+    // dispatch entry points and every caller are now gone, so the blocker is
+    // cleared and the opt-in is real.
     //
     // Keeping FP32 one flag away also keeps the oracle: losing the ability to
     // diff against it is how quantized state hid for months.

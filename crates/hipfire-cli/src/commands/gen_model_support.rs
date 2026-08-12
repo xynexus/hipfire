@@ -623,8 +623,35 @@ fn render_projections(spec: &Spec) -> String {
     s.push_str("\n### Batched prefill: kv-mode (derived)\n\n");
     s.push_str(
         "Projection of the prefill axis over **kv-mode**, from `kv_mode_prefill_batchable`. \
-         Only Q8 and the rotated asym K modes have a batched flash-masked prefill kernel; \
-         fp32 and no-kv (SSM) fall back to per-token decode.\n\n",
+         Only Q8 and the rotated asym K modes have a batched **flash** (tiled) masked prefill \
+         kernel.\n\n\
+         **Scope — corrected 2026-08-10. This table is the LLaMA-family path, not a \
+         universal claim.** `kv_mode_prefill_batchable` has exactly three consumers: \
+         `llama_prefill_batchable`, an assertion in `llama.rs`, and this generator. \
+         **qwen35 does not consult it** and has its own fp32 arm: inside the batched \
+         prefill path, `prefill_chunk.rs` branches `if kv_cache.quant_q8 { \
+         attention_q8_0_kv_batched_masked } else { attention_f32_batched_masked }`, so \
+         fp32 KV takes a batched masked prefill kernel there rather than falling back to \
+         per-token. The earlier wording (\"fp32 and no-kv fall back to per-token decode\") \
+         read as universal and was wrong for arch 6.\n\n\
+         Two further gaps this axis does not show: **kvarn is absent from \
+         `kv_cache_prefill_mode` entirely**, so a kvarn cache is classified `Fp32` and \
+         reported non-batchable despite `attention_flash_kvarn_tile_batched` and \
+         `attention_kvarn_routed_batched` existing; and there is **no fp16/bf16 KV mode** \
+         in `KvQuantMode` at all, so those cannot batch because they cannot be selected.\n\n\
+         **Verified 2026-08-10 on arch 6: EVERY kv-mode batches there.** \
+         `prefill_chunk.rs`'s batched-prefill chain has an arm for each — kvarn first, \
+         then asym4/fwht4, asym3/fwht3, asym2/fwht2, several q8 variants, and fp32 as the \
+         final `else`. The dispatched kernels are `attention_flash_{asym3,asym4,fwht3,\
+         fwht4}_batched_masked`, `attention_q8_0_kv_batched_masked` and \
+         `attention_f32_batched_masked`. kvarn's arm is deliberately EMPTY: \
+         *\"KVarN did the fused write + causal flash in the write step above\"* — it fuses \
+         attention into the KV write, so it needs no separate masked-attention dispatch \
+         and is if anything more integrated than the modes this table marks batchable. \
+         Confirmed end to end: `kv_mode=kvarn` on `Qwen3.6-35B-A3B--oq4` loads, reports \
+         `KV cache: kvarn`, and generates coherent tokens.\n\n\
+         Also worth knowing before pruning modes: the **default** KV mode resolved for \
+         that artifact is `fp32`, not kvarn.\n\n",
     );
     s.push_str("| KV mode | Batched prefill |\n|---|---|\n");
     for (label, mode) in [

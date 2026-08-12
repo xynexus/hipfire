@@ -459,7 +459,11 @@ impl Transport for DirectH2DTransport {
         })?;
         let staging = self.staging.as_ref().expect("direct staging");
         let src = &staging.as_slice()[rel..rel + copy_len];
-        let buf = gpu.hip.malloc(len)?;
+        // Pooled, not `hip.malloc`: eviction returns this buffer to `GpuPool`
+        // via `free_tensor`, so allocating outside the pool would make every
+        // page-in a fresh HIP allocation while every page-out accumulated in a
+        // free-list nothing could reach. See `Gpu::upload_raw_pooled`.
+        let buf = gpu.pool_alloc(len)?;
         gpu.hip.memcpy_htod(&buf, src)?;
         Ok((
             GpuTensor {
@@ -507,7 +511,8 @@ impl Transport for PreadH2DTransport {
         // 2. GPU: alloc + memcpy_htod via the existing hipfire-rdna helper.
         //    `dtype: Raw` because the pager doesn't care about element layout
         //    — that interpretation belongs to `WeightTensor` at the call site.
-        let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
+        // Pooled — see the note in `DirectH2DTransport::fetch`.
+        let tensor = gpu.upload_raw_pooled(&self.staging[..len], &[len])?;
         Ok((tensor, self.next_handle()))
     }
 
@@ -541,7 +546,8 @@ impl Transport for PinnedH2DTransport {
                 &format!("pinned pread {} bytes at offset {}: {}", len, hfq_offset, e),
             )
         })?;
-        let buf = gpu.hip.malloc(len)?;
+        // Pooled — see the note in `DirectH2DTransport::fetch`.
+        let buf = gpu.pool_alloc(len)?;
         let src = &self
             .staging
             .as_ref()
@@ -616,7 +622,13 @@ fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightP
         )));
     };
     match quant_type {
-        QuantType::Oq4G256 => {
+        // Both resolve to the same resident length; they differ only in whether
+        // the bytes on disk are already in it. `Oq4G256` is canonical (130 B/group,
+        // f16 scale) and is transformed on page-in; `Oq4G256MoeBlocks` is stored
+        // pre-transformed (132 B/group, f32 scale) and is fetched verbatim —
+        // `module_requires_host_repack` deliberately does not list it, which is
+        // what removes the per-page-in CPU transform.
+        QuantType::Oq4G256 | QuantType::Oq4G256MoeBlocks => {
             let (m, k) = module_tensor_shape(tensor)?;
             oq4_moe_packed_len(m, k).map_err(WeightPagerError::InvalidModule)
         }
@@ -636,6 +648,121 @@ fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightP
             tensor.name
         ))),
         _ => Ok(tensor.data_size),
+    }
+}
+
+/// Env-gated phase timing for the paged routed-expert path.
+///
+/// `HIPFIRE_PAGER_TIMING=1` accumulates wall nanoseconds per phase and prints a
+/// cumulative summary every `HIPFIRE_PAGER_TIMING_EVERY` layer admissions
+/// (default 400).
+///
+/// This exists because the paged path is CPU-bound for reasons that were twice
+/// mis-attributed by reading the code — first to the host repack, which a
+/// pre-transformed artifact then disproved by pegging a core just as hard. A
+/// sampling profiler would be the right tool, but `perf_event_paranoid=4` and
+/// `ptrace_scope` block both `perf` and `gdb`/`eu-stack` attach on this box, so
+/// the process has to time itself.
+///
+/// Deliberately coarse: four phases that partition one `ensure_paged_experts_resident`
+/// call, so the answer is "which phase", not "which line". That is enough to
+/// choose where to look next, and it costs two `Instant::now()` per phase when
+/// enabled and one relaxed atomic load when not.
+pub mod page_timing {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Phase {
+        /// D2H readback of the router's top-k indices.
+        TopkReadback = 0,
+        /// Budget admission for the layer's expert set.
+        WouldFit = 1,
+        /// Page-in of the selected experts (fetch and/or host repack).
+        EnsureResident = 2,
+        /// Rewriting the device-side expert pointer table.
+        PatchPtrTable = 3,
+    }
+
+    const N: usize = 4;
+    static NANOS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("HIPFIRE_PAGER_TIMING").as_deref() == Ok("1"))
+    }
+
+    fn dump_every() -> u64 {
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("HIPFIRE_PAGER_TIMING_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(400)
+        })
+    }
+
+    pub fn record(phase: Phase, nanos: u64) {
+        if !enabled() {
+            return;
+        }
+        NANOS[phase as usize].fetch_add(nanos, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Call once per `ensure_paged_experts_resident`; prints on a cadence.
+    pub fn admission(experts_admitted: usize) {
+        if !enabled() {
+            return;
+        }
+        let n = ADMISSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % dump_every() != 0 {
+            return;
+        }
+        let vals: Vec<u64> = NANOS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let total: u64 = vals.iter().sum();
+        if total == 0 {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[pager-timing] no phase time recorded — is the paged path live?");
+            }
+            return;
+        }
+        let pct = |v: u64| (v as f64) * 100.0 / (total as f64);
+        eprintln!(
+            "[pager-timing] admissions={n} last_set={experts_admitted} total={:.2}s | \
+             topk_readback {:.2}s ({:.1}%) | would_fit {:.2}s ({:.1}%) | \
+             ensure_resident {:.2}s ({:.1}%) | patch_ptrs {:.2}s ({:.1}%)",
+            total as f64 / 1e9,
+            vals[0] as f64 / 1e9,
+            pct(vals[0]),
+            vals[1] as f64 / 1e9,
+            pct(vals[1]),
+            vals[2] as f64 / 1e9,
+            pct(vals[2]),
+            vals[3] as f64 / 1e9,
+            pct(vals[3]),
+        );
+    }
+
+    /// Time `f`, attributing its wall time to `phase`.
+    pub fn timed<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t = std::time::Instant::now();
+        let out = f();
+        record(phase, t.elapsed().as_nanos() as u64);
+        out
     }
 }
 
@@ -900,6 +1027,16 @@ pub struct WeightPager {
     resident_modules: HashMap<ExpertModuleKey, ResidentModule>,
     module_lru: VecDeque<ExpertModuleKey>,
     module_stats: ModulePagerStats,
+    /// Device expert-pointer tables, registered once per layer at load and then
+    /// maintained by the pager itself on every residency transition (push model).
+    ///
+    /// The alternative — having each dispatch site call
+    /// `patch_expert_module_ptr_table` after ensuring residency — is what the hand
+    /// decode path does, and it fails open: the default-ON lowered pipeline simply
+    /// never calls it, so the table stays all-zero and the indexed kernels
+    /// dereference null, wedging the GPU. Correctness must not depend on every
+    /// caller remembering, so residency changes update the table here instead.
+    expert_ptr_tables: HashMap<u16, ExpertPtrTables>,
     /// Transport implementation (v0.1: pread + H2D, future: io_uring + P2P).
     transport: Box<dyn Transport>,
     /// Construction-time config.
@@ -941,6 +1078,13 @@ struct Resident {
     bytes: u64,
 }
 
+/// Non-owning aliases of one layer's device expert-pointer tables. The arch owns
+/// the tensors; the pager writes 8-byte slots into them on residency transitions.
+struct ExpertPtrTables {
+    gate_up: hip_bridge::DeviceBuffer,
+    down: hip_bridge::DeviceBuffer,
+}
+
 struct ResidentModule {
     tensor: GpuTensor,
     bytes: u64,
@@ -967,6 +1111,7 @@ impl WeightPager {
             catalog: HashMap::new(),
             module_catalog: HashMap::new(),
             resident_modules: HashMap::new(),
+            expert_ptr_tables: HashMap::new(),
             module_lru: VecDeque::new(),
             module_stats: ModulePagerStats::default(),
             transport,
@@ -1230,15 +1375,22 @@ impl WeightPager {
         };
         let base = tensor.buf.as_ptr() as usize;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+        let gate_up_ptr = base.saturating_add(gate_up_rel) as u64;
+        let down_ptr = base.saturating_add(down_rel) as u64;
         self.resident_modules.insert(
             key,
             ResidentModule {
                 tensor,
                 bytes: need,
-                gate_up_ptr: base.saturating_add(gate_up_rel) as u64,
-                down_ptr: base.saturating_add(down_rel) as u64,
+                gate_up_ptr,
+                down_ptr,
             },
         );
+        // Push hook 1 of 3 — page-in. The slot must be live before any kernel can
+        // select this expert, and this is the only point at which it becomes
+        // selectable, so publishing here is what makes the table self-maintaining.
+        self.write_expert_ptr_slot(gpu, key, gate_up_ptr, down_ptr)
+            .map_err(WeightPagerError::Hip)?;
         self.module_lru.push_back(key);
         self.module_stats.module_cold_loads = self.module_stats.module_cold_loads.saturating_add(1);
         if self.config.trace {
@@ -1267,6 +1419,83 @@ impl WeightPager {
     /// `WeightId::Expert{layer, expert: idx, role: GateUp}` and
     /// `WeightId::Expert{layer, expert: idx, role: Down}` for every idx in
     /// `top_indices` — this method asserts that and panics on miss (loader bug).
+    ///
+    /// # THIS FUNCTION HAS NO CALLERS (verified 2026-08-10)
+    ///
+    /// Nothing in the workspace calls it, so under paged residency the expert
+    /// pointer tables are allocated and left **all zero**. The indexed MoE kernels
+    /// read `expert_ptrs[topk_indices[..]]` and dereference the result, so they
+    /// dereference null and wedge the GPU — an `amdgpu` MES hang and a full device
+    /// reset, observed on a 35B (BUGS.md, `gemv_oq4g256_moe_gate_up_k8_indexed_batched`,
+    /// HIP 719, measured `non_null=0/256` immediately before the launch).
+    ///
+    /// Being `pub` in a library crate is why rustc never flagged it: `dead_code`
+    /// does not fire on public items, so this sat unreferenced while two doc
+    /// comments in `hipfire-arch-qwen35/src/qwen35/layout.rs` described it as live
+    /// machinery.
+    ///
+    /// Wiring it up is not sufficient on its own: the **default** execution path is
+    /// the lowered super-op pipeline, whose `MoeParams` carries no pager, so it has
+    /// nothing to call this on. Fixing paged+indexed MoE means giving that path
+    /// pager access, or refusing the combination in backend selection.
+    /// Register the device pointer tables for `layer`. Call once at load, before
+    /// any expert of that layer can become resident.
+    ///
+    /// The pager keeps non-owning aliases: the arch owns the tensors, and the
+    /// pager only writes 8-byte slots into them. Registering a layer twice
+    /// replaces the aliases, which is what a model reload wants.
+    ///
+    /// A layer that is never registered is simply not maintained — page-ins for it
+    /// write nowhere. That is why `MoeFfnWeights` must register before dispatch,
+    /// and why `paged_ptr_tables_registered()` exists for selection to check.
+    pub fn register_expert_ptr_tables(
+        &mut self,
+        layer: u16,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+    ) {
+        self.expert_ptr_tables.insert(
+            layer,
+            ExpertPtrTables {
+                // SAFETY: non-owning aliases. The arch owns these tensors for the
+                // lifetime of the model; the pager only writes into them and never
+                // frees them.
+                gate_up: unsafe { gate_up_ptrs.buf.alias() },
+                down: unsafe { down_ptrs.buf.alias() },
+            },
+        );
+    }
+
+    /// True when `layer`'s tables are registered, i.e. the pager will keep them
+    /// consistent with residency. Backend selection uses this to decide whether
+    /// the indexed paged path is safe to admit.
+    pub fn expert_ptr_tables_registered(&self, layer: u16) -> bool {
+        self.expert_ptr_tables.contains_key(&layer)
+    }
+
+    /// Write one expert's slot in the registered tables. `(0, 0)` nulls it.
+    ///
+    /// Errors are propagated rather than swallowed: a failed write leaves the
+    /// table disagreeing with residency, and the kernels dereference it without
+    /// validation, so a silent failure here is a GPU wedge later.
+    fn write_expert_ptr_slot(
+        &self,
+        gpu: &mut Gpu,
+        key: ExpertModuleKey,
+        gate_up_ptr: u64,
+        down_ptr: u64,
+    ) -> HipResult<()> {
+        let Some(tables) = self.expert_ptr_tables.get(&key.layer) else {
+            return Ok(());
+        };
+        let offset = (key.expert as usize) * 8;
+        gpu.hip
+            .memcpy_htod_offset(&tables.gate_up, offset, &gate_up_ptr.to_le_bytes())?;
+        gpu.hip
+            .memcpy_htod_offset(&tables.down, offset, &down_ptr.to_le_bytes())?;
+        Ok(())
+    }
+
     pub fn patch_expert_ptr_table(
         &self,
         layer: u16,
@@ -1401,6 +1630,13 @@ impl WeightPager {
                     budget,
                 })?;
             if let Some(r) = self.resident_modules.remove(&key) {
+                // Push hook 2 of 3 — eviction. Null the slot BEFORE freeing the
+                // buffer: between the free and the null the table would name
+                // memory the pager no longer owns, and the indexed kernels read
+                // it without validation. A stale pointer is worse than a null one
+                // (null faults immediately; stale may silently read reused VRAM).
+                self.write_expert_ptr_slot(gpu, key, 0, 0)
+                    .map_err(WeightPagerError::Hip)?;
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
                 self.module_stats.module_evictions =
@@ -1431,6 +1667,17 @@ impl WeightPager {
     pub fn free_all(&mut self, gpu: &mut Gpu) {
         for (_id, r) in self.resident.drain() {
             let _ = gpu.free_tensor(r.tensor);
+        }
+        // Push hook 3 of 3 — bulk teardown. This is the one an explicit
+        // patch-at-the-call-site design misses: nothing here ever looked like a
+        // "dispatch", so no caller would have thought to re-patch, and every slot
+        // would name freed memory. Collect first because `drain()` borrows self.
+        let drained: Vec<ExpertModuleKey> = self.resident_modules.keys().copied().collect();
+        for key in drained {
+            // Best-effort: free_all is a teardown path and must not fail. A failed
+            // null here is still safer than the old behaviour, where the slot was
+            // never cleared at all.
+            let _ = self.write_expert_ptr_slot(gpu, key, 0, 0);
         }
         for (_key, r) in self.resident_modules.drain() {
             let _ = gpu.free_tensor(r.tensor);
@@ -1647,6 +1894,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An unregistered layer must be reported as unmaintained, and slot writes
+    /// for it must be a silent no-op rather than an error.
+    ///
+    /// This is the predicate backend selection keys on. If it ever returned true
+    /// for a layer the pager is not maintaining, selection would admit the indexed
+    /// paged path against a table nobody updates — which is precisely the null
+    /// dereference that wedges the GPU (BUGS.md, `non_null=0/256`). Getting a
+    /// false positive here is therefore a device-crash bug, not a logic slip.
+    #[test]
+    fn unregistered_layer_is_not_maintained_and_slot_writes_are_noops() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hipfire-pager-ptrtbl-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+
+        assert!(
+            !pager.expert_ptr_tables_registered(0),
+            "a layer nobody registered must never report as maintained"
+        );
+        assert!(!pager.expert_ptr_tables_registered(39));
+
+        // No GPU is touched: with no tables registered the write returns early,
+        // which is what makes a fully-resident model pay nothing for this path.
+        // (The device-write half is verified end to end with
+        // HIPFIRE_MOE_PTR_TABLE_DUMP on real hardware — a unit test cannot
+        // allocate device tables.)
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn register_then_get_returns_none_until_resident() {
         let dir = std::env::temp_dir();
@@ -1668,6 +1947,98 @@ mod tests {
         assert!(pager.get(id).is_none());
         // ensure_resident requires a real Gpu — exercised in integration tests.
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A routed expert whose tensors are stored in one quant type, sized so the
+    /// on-disk bytes match that type's real layout.
+    fn routed_module_qt(qt: u8, gate_up_len: usize, down_len: usize) -> HfqModuleRecord {
+        HfqModuleRecord {
+            module_id: "layers.0.experts.0".to_string(),
+            kind: HfqModuleKind::RoutedExpert,
+            layer: Some(0),
+            expert: Some(0),
+            placement_policy: Some("lazy_lru".to_string()),
+            data_offset: 4096,
+            data_size: gate_up_len + down_len,
+            tensors: vec![
+                crate::hfq_modules::HfqModuleTensor {
+                    name: "model.layers.0.mlp.experts.0.gate_up_proj.weight".to_string(),
+                    quant_type: qt,
+                    shape: vec![1024, 2048],
+                    group_size: 256,
+                    rel_offset: 0,
+                    data_size: gate_up_len,
+                },
+                crate::hfq_modules::HfqModuleTensor {
+                    name: "model.layers.0.mlp.experts.0.down_proj.weight".to_string(),
+                    quant_type: qt,
+                    shape: vec![2048, 512],
+                    group_size: 256,
+                    rel_offset: gate_up_len,
+                    data_size: down_len,
+                },
+            ],
+        }
+    }
+
+    /// The whole point of `Oq4G256MoeBlocks`: it is stored in the layout the
+    /// indexed kernels consume, so page-in is a verbatim fetch instead of a
+    /// per-module CPU transform. Canonical OQ4 must still repack.
+    #[test]
+    fn moe_blocks_storage_needs_no_host_repack_but_canonical_does() {
+        let groups_gu = 1024 * 2048 / 256;
+        let groups_dn = 2048 * 512 / 256;
+
+        let canonical = routed_module_qt(
+            QuantType::Oq4G256.code(),
+            groups_gu * 130,
+            groups_dn * 130,
+        );
+        assert!(
+            module_requires_host_repack(&canonical),
+            "canonical OQ4 is 130 B/group on disk and must be transformed on page-in"
+        );
+
+        let packed = routed_module_qt(
+            QuantType::Oq4G256MoeBlocks.code(),
+            groups_gu * 132,
+            groups_dn * 132,
+        );
+        assert!(
+            !module_requires_host_repack(&packed),
+            "pre-transformed OQ4 must be fetched verbatim — this predicate IS the CPU cost"
+        );
+    }
+
+    /// Both forms resolve to the SAME resident length; they differ only in what
+    /// is on disk. If these ever diverge the pager would size a slab wrong.
+    #[test]
+    fn moe_blocks_and_canonical_agree_on_resident_length() {
+        let groups_gu = 1024 * 2048 / 256;
+        let groups_dn = 2048 * 512 / 256;
+        let canonical = routed_module_qt(
+            QuantType::Oq4G256.code(),
+            groups_gu * 130,
+            groups_dn * 130,
+        );
+        let packed = routed_module_qt(
+            QuantType::Oq4G256MoeBlocks.code(),
+            groups_gu * 132,
+            groups_dn * 132,
+        );
+
+        for (tc, tp) in canonical.tensors.iter().zip(&packed.tensors) {
+            assert_eq!(
+                module_tensor_resident_len(tc).unwrap(),
+                module_tensor_resident_len(tp).unwrap(),
+                "resident length must not depend on which on-disk form was used"
+            );
+        }
+        // And the pre-transformed on-disk size IS the resident size.
+        assert_eq!(
+            module_tensor_resident_len(&packed.tensors[0]).unwrap(),
+            packed.tensors[0].data_size,
+        );
     }
 
     fn routed_module(layer: u16, expert: u16) -> HfqModuleRecord {

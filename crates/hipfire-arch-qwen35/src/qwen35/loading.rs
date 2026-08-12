@@ -3789,6 +3789,8 @@ pub fn collect_calibration_artifacts_job_with_residual_probe(
                     &plan,
                     expected_dense_prefill_session_state_route_shape(config),
                     inputs.len(),
+                    // Calibration streams FP32 KV, never KVarN.
+                    0,
                 );
                 if !resident_calibration_rows_match_frozen_schedule(
                     batch.sequence_start,
@@ -5077,6 +5079,35 @@ pub fn load_weights(
         gib(loaded_bytes),
     );
 
+    // Push residency: hand every MoE layer's device pointer tables to the pager
+    // so it can keep them consistent with residency on its own (page-in, evict,
+    // teardown). Must happen after the layer loop — the tables are allocated per
+    // layer inside it — and before the pager moves into `Qwen35Weights`.
+    //
+    // Registration is what makes `expert_ptr_tables_registered()` true, which is
+    // what lets backend selection admit the indexed paged path. A layer that is
+    // somehow not registered stays refused rather than dispatching against an
+    // unmaintained table.
+    if let Some(p) = pager.as_mut() {
+        let mut registered_tables = 0usize;
+        for layer in &layers {
+            let ffn = match layer {
+                LayerWeights::DeltaNetMoe(l) => Some(&l.ffn),
+                LayerWeights::FullAttnMoe(l) => Some(&l.ffn),
+                _ => None,
+            };
+            if let Some(ffn) = ffn {
+                p.register_expert_ptr_tables(
+                    ffn.layer_idx,
+                    &ffn.expert_gate_up_ptrs,
+                    &ffn.expert_down_ptrs,
+                );
+                registered_tables += 1;
+            }
+        }
+        eprintln!("  paged experts: registered {registered_tables} expert pointer tables");
+    }
+
     let slab_storage = slab_index.map(|idx| idx.storage);
     let rq_corrections = load_rq_corrections(hfq, gpu)?;
     Ok(Qwen35Weights {
@@ -6334,25 +6365,19 @@ fn load_moe_expert(
     name: &str,
     m: usize,
     k: usize,
-    config: &Qwen35Config,
+    oq_indexed_decode: bool,
 ) -> HipResult<WeightTensor> {
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    // Shared predicate — see `oq_indexed_decode_active`. The repack below and the
-    // dispatch predicate must never disagree on what enables this path.
-    //
-    // Both halves matter and both must come from the MODEL, not this tensor:
-    // (hidden, mi) rather than (m, k), or gate_up and down disagree within one
-    // expert; and `num_experts_per_tok`, because the repack produces the indexed
-    // kernels' BLOCK layout (132 B / 260 B) and those kernels only run at
-    // `k_top == 8`. Repacking for a top-2 model leaves the CPU fallback decoding
-    // block-layout bytes as canonical 130 B / 258 B ones — measured NaN.
-    let oq_indexed_decode = hipfire_dispatch::families::moe::oq_indexed_decode_active(
-        config.dim,
-        config.moe_intermediate_size,
-        config.num_experts_per_tok,
-    );
+    // `oq_indexed_decode` arrives as a PARAMETER, deliberately: computing it here
+    // would shadow the argument. The caller builds it from the single shared
+    // predicate, which carries BOTH halves — the shape (keyed off the MODEL's
+    // (hidden, mi), never this tensor's (m, k), or gate_up and down disagree
+    // within one expert) and `k_top == 8`, because the repack produces the
+    // indexed kernels' BLOCK layout (132 B / 260 B) and only those kernels read
+    // it. Repacking for a top-2 model leaves the CPU fallback decoding block
+    // bytes as canonical 130 B / 258 B ones — measured NaN.
     if !oq_indexed_decode
         && matches!(
             qt,
@@ -6454,6 +6479,18 @@ fn load_moe_ffn(
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
+    // Repack routed OQ experts into the indexed kernels' block layout ONLY when
+    // those kernels can actually run. They are `*_k8_indexed*` — the dispatcher
+    // admits them via `use_gpu_topk`, which requires `k_top == INDEXED_MOE_K_TOP`.
+    // Repacking on the env flag alone (as this did) hands kernel-layout weights
+    // to a model whose top-k keeps it on the NON-indexed fallback, which then
+    // decodes 132 B/260 B blocks as canonical 130 B/258 B ones — silent garbage,
+    // observed as non-finite KLD on every Opus cell of a top-2 fixture.
+    let oq_indexed_decode = super::qwen35_moe_oq_indexed_decode_active(
+        config.dim,
+        config.moe_intermediate_size,
+        config.num_experts_per_tok,
+    );
     for x in 0..n_exp {
         let gate_up = load_moe_expert(
             hfq,
@@ -6462,7 +6499,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi,
             config.dim,
-            config,
+            oq_indexed_decode,
         )?;
         let down = load_moe_expert(
             hfq,
@@ -6471,7 +6508,7 @@ fn load_moe_ffn(
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
             config.dim,
             mi,
-            config,
+            oq_indexed_decode,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }

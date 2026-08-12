@@ -200,6 +200,7 @@ pub fn check_moe_decode_supported(
     k: usize,
     n_exp: usize,
     routed_experts_resident: bool,
+    paged_residency_available: bool,
 ) -> Result<(), DispatchError> {
     // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
     // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
@@ -218,6 +219,35 @@ pub fn check_moe_decode_supported(
         return Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "decode-routed-dtype-unsupported-no-fallback",
+            arch: "",
+            quant: "",
+        });
+    }
+    // (c) paged residency + the indexed GPU-top-K path. This combination is
+    // ADMITTED BY DESIGN and BROKEN IN FACT, so it is refused by name until the
+    // pointer table is actually populated.
+    //
+    // The indexed kernels read `expert_ptrs[topk_indices[..]]` and dereference the
+    // result. That table is filled at load by iterating `MoeFfnWeights::experts`
+    // (`qwen35/loading.rs`), which is **empty by design under paging** — so
+    // `memcpy_htod` writes zero bytes and every slot stays null. The only function
+    // that would patch it per-token, `WeightPager::patch_expert_ptr_table`, has
+    // ZERO call sites workspace-wide.
+    //
+    // Measured on a 35B: `non_null=0/256` immediately before
+    // `gemv_oq4g256_moe_gate_up_k8_indexed_batched`, then HIP 719, an amdgpu MES
+    // hang, and a full GPU reset that takes down everything else on the device.
+    // This is dtype-agnostic — MQ4/MQ6/MQ2L/PARO/OQ4/OQ8 all read the same null
+    // table — so the refusal is deliberately broad rather than Opus-specific.
+    //
+    // `paged_residency_available` is the escape: a caller that supplies an
+    // `ExpertResidency` provider will have the table patched for the selected
+    // experts before the dispatch, so the combination becomes legal. Absent a
+    // provider it stays refused — the table is still all-zero.
+    if use_gpu_topk && !routed_experts_resident && !paged_residency_available {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "decode-paged-expert-ptr-table-unpopulated",
             arch: "",
             quant: "",
         });
@@ -256,6 +286,20 @@ fn moe_gemv_plain(
         .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+/// Mechanical bisection marker for the MoE decode path.
+///
+/// `HIPFIRE_MOE_STEP_DEBUG=1` prints a timestamped label at each step. This is a
+/// bounding instrument, not a hypothesis: six plausible causes for the paged
+/// ~160 s/layer stall were wrong, and the only progress came from localising
+/// where time went rather than guessing what consumed it.
+macro_rules! moe_step {
+    ($t:expr, $label:literal) => {
+        if std::env::var("HIPFIRE_MOE_STEP_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[moe-step] {:>8.1}ms {}", $t.elapsed().as_secs_f64() * 1e3, $label);
+        }
+    };
+}
+
 pub fn run_moe_decode(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -290,7 +334,16 @@ pub fn run_moe_decode(
     // deep `select_nth_unstable_by` panic in the fallback into a clean error.
     // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
+    let __step = std::time::Instant::now();
+    moe_step!(__step, "enter run_moe_decode");
+    check_moe_decode_supported(
+        res.use_gpu_topk,
+        p.k,
+        p.n_exp,
+        !p.routed_experts.is_empty(),
+        p.expert_residency.is_some(),
+    )?;
+    moe_step!(__step, "after check_moe_decode_supported");
 
     // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
     // routed-combine accumulate into that zeroed partial (all-reduced by the EP
@@ -336,6 +389,7 @@ pub fn run_moe_decode(
         None
     };
 
+    moe_step!(__step, "after x_rot_local block");
     // ── Gate-side GEMV ───────────────────────────────────────────────────────
     // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
@@ -386,6 +440,7 @@ pub fn run_moe_decode(
     // shared-expert down → generic per-expert routed loop, then returns. It
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
+    moe_step!(__step, "after gate-side GEMV");
     if !res.use_gpu_topk {
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
@@ -409,6 +464,7 @@ pub fn run_moe_decode(
         }
     }
     hip!(gpu.softmax_f32(p.router_logits))?;
+    moe_step!(__step, "after softmax_f32");
     hip!(gpu.moe_topk_renorm_k8(
         p.router_logits,
         p.topk_indices,
@@ -416,6 +472,43 @@ pub fn run_moe_decode(
         p.n_exp,
         p.norm_topk_prob
     ))?;
+    // Paged residency (option A): make the selected experts resident before the
+    // indexed kernels dereference their pointer-table slots.
+    //
+    // This costs a D2H sync per MoE layer per token, which this path otherwise
+    // avoids on purpose (see the histogram note directly below). That cost is
+    // accepted deliberately: without it the lowered path cannot know WHICH experts
+    // to page in, and a selected-but-non-resident expert reads a null slot — an
+    // MES hang and a full GPU reset, not a recoverable error. Correctness first;
+    // option (b) replaces this with speculative paging via `CpuRouter` so the
+    // sync can come back out.
+    //
+    // Only runs when a provider is attached, i.e. paged models. Fully-resident
+    // models keep top-K on-device and pay nothing.
+    if let Some(residency) = p.expert_residency {
+        hip!(gpu.bind_thread())?;
+        let mut idx = vec![0i32; p.k];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let selected: Vec<u32> = idx
+            .iter()
+            .filter(|v| **v >= 0 && (**v as usize) < p.n_exp)
+            .map(|v| *v as u32)
+            .collect();
+        // A router index outside [0, n_exp) means the top-k kernel produced
+        // garbage; dispatching would index the table out of bounds. Refuse by
+        // name rather than letting the kernel fault the device.
+        if selected.len() != idx.len() {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "decode-topk-index-out-of-range",
+                arch: "",
+                quant: "",
+            });
+        }
+        residency.ensure_resident(gpu, p.layer, &selected)?;
+    }
     // Feed the shared router histogram (see the CPU-fallback call below for why
     // this port was missing it). Gated on the histogram being armed because,
     // unlike the fallback, this path keeps top-K on-device — recording costs a
@@ -433,6 +526,7 @@ pub fn run_moe_decode(
         crate::moe_telemetry::record_moe_router_selection(p.layer, &indices, &weights);
     }
 
+    moe_step!(__step, "after topk + any host readback");
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
     // summed exactly once (computed on rank 0 only). Router + shared gate/up
@@ -494,6 +588,7 @@ pub fn run_moe_decode(
         }
     }
 
+    moe_step!(__step, "after shared-expert down");
     // ── Indexed routed experts ────────────────────────────────────────────────
     if res.routed_indexable_mq4 {
         hip!(gpu.ensure_mq_signs())?;
@@ -502,6 +597,7 @@ pub fn run_moe_decode(
     let gate_up_k = p.routed_gate_up_k;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
+    moe_step!(__step, "after routed geometry bind");
 
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
