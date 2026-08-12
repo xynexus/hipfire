@@ -33,9 +33,9 @@
 #include <hip/hip_runtime.h>
 
 #define HD 128
-#define TILE_ROWS 8
+#define TILE_ROWS 4
 
-extern "C" __launch_bounds__(32, 4)
+extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_f64acc(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -56,8 +56,11 @@ __global__ void gated_delta_net_f64acc(
     const int stride = n_heads * HD;
     const int row_start = tile * TILE_ROWS;
 
-    // 8 KiB (double), against 4 KiB for the f32 tile. Well inside the LDS
-    // budget at one block per 32 threads.
+    // TILE_ROWS(4) x 128 doubles = 4 KiB, against 2 KiB for the f32 tile.
+    // NOTE: TILE_ROWS MUST match gated_delta_net.hip — the dispatcher launches
+    // 128/TILE_ROWS blocks, so a mismatch silently overruns the row range. The
+    // f32 kernel's own comment says "TILE_ROWS x 128 floats = 4KB", which is
+    // stale (4x128x4 = 2KB) and is what made an earlier copy of this file use 8.
     __shared__ double S_tile[TILE_ROWS * HD];
 
     float* S_global = state + h * HD * HD + row_start * HD;

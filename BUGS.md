@@ -94,7 +94,7 @@ weights, the VL wrapper), each killed by measurement. The lesson is in the fix:
 other symptom is per-row launch counts and narrowing that means guessing at one
 predicate at a time.
 
-## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
+## [High, PROVISIONAL] The FP32 DeltaNet reference drifts more than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
 (`kernels/src/gated_delta_net_f64acc{,_routed_batch_seq}.hip`,
@@ -133,6 +133,38 @@ Caveat on reading these numbers: a recurrence amplifies any perturbation, so
 neither figure is "the error" in an absolute sense — both are trajectory
 divergence after 144 steps. The comparison is still apples-to-apples: swapping
 f32->f64 accumulation moves the state 7x more than swapping f16->f32 storage does.
+
+**Status 2026-08-12: the ORACLE ITSELF IS NOW VALIDATED, but only the PLAIN
+kernel — the 3.5% figure came from the ROUTED one and stays provisional.**
+
+`parity_gated_delta_net_f64acc` checks both GPU kernels against an independent f64
+CPU implementation of the recurrence:
+
+| kernel | rel L2 err vs f64 CPU reference |
+|---|---|
+| `gated_delta_net_f32` | 2.997e-7 |
+| `gated_delta_net_f64acc` | **2.497e-8** |
+
+The oracle sits at the FP32 STORAGE floor (~6e-8), which is its design point — it
+accumulates in double but still stores f32, so one narrowing at the end is
+unavoidable. It is 12x closer to truth than the f32 kernel, and that gap is the
+term it exists to isolate.
+
+Two things this caught, both mine:
+- The first oracle used `TILE_ROWS 8` where the kernel defines **4**, inferred
+  from a stale comment ("TILE_ROWS x 128 floats = 4KB"; 4x128x4 is 2KB) instead
+  of read from the `#define`. The dispatcher launches `128/TILE_ROWS` blocks, so
+  the blocks overran the row range: **relative error ~1.0, i.e. output unrelated
+  to the reference** — while still producing plausible aggregate numbers in a
+  serving run.
+- The acceptance bound was first set to 1e-15, which failed a CORRECT kernel.
+  The bound was wrong, not the kernel.
+
+The ROUTED oracle (`gated_delta_net_f64acc_routed_batch_seq`) was generated
+mechanically from its source and does carry the correct `TILE_ROWS 4`, so it was
+never subject to the first bug — but it has NOT been through this parity test,
+and it is what produced the 3.5%. Until it has an equivalent check against a
+routed CPU reference, treat that number as indicative, not established.
 
 ## [Medium] FP16 DeltaNet state error COMPOUNDS with sequence length — no bug, but the framing understates it
 

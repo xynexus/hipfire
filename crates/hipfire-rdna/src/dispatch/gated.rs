@@ -202,7 +202,7 @@ impl Gpu {
         );
         let n_tiles = (128 / 4) as u32;
         let result = self.launch_kernargs(
-            "gated_delta_net_f32",
+            entry,
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
