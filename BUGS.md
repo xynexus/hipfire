@@ -4,7 +4,35 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## [High] oq4.25++ encoder changed output at 8357081d3 — +93% KLD on the gemma4_moe fixture, real-model impact UNMEASURED
+## [Low — re-record the baseline] oq4.25++ encoder changed at 8357081d3: +93% KLD on the random-init fixture, but −26% KLD on a REAL model
+- **RESOLVED 2026-08-13, and it reverses the naive reading.** Measured on
+  Qwen3.5-0.8B (real weights, one Hessian reused across both sides, both scored
+  against one bf16-anchor reference):
+
+  | | ppl | mean KLD vs bf16 |
+  |---|---|---|
+  | bf16 anchor | 15.105 | — (4.0e-10 self-check) |
+  | **new selector (master)** | **15.740** | **0.030567** |
+  | old selector (`b05f74a79`) | 16.126 | 0.041126 |
+
+  KLD −25.7%, and the new selector recovers 38% of the quantization perplexity
+  gap. Two independent metrics agree: `8357081d3` is a genuine improvement.
+- **Action: re-record `gemma4_moe/kld:oq4.25++`. Do not revisit the selector.**
+  The fixture is seeded random-init, where there is no outlier structure for a
+  promotion-set search to find, so it moved the opposite way for a reason that
+  says nothing about real models.
+- Remaining gap: the model measured is dense (arch 5); the failing fixture is
+  MoE. A real MoE is unmeasured — an assumption, not a measurement.
+- Also established: `hipfire-quantize` IS deterministic (same binary + inputs →
+  byte-identical payload); only HFQ front-metadata/tail key ordering varies.
+- Method warning, because it produced a perfect-looking wrong answer first: an
+  A/B script that runs `./target/release/hipfire-quantize` without rebuilding
+  inherits whatever commit `git bisect` last left it at. Rebuild explicitly, and
+  treat an impossibly clean agreement (two weight sets, KLD identical to 18
+  digits) as a symptom rather than a result. Full write-up:
+  `docs/tiny-quant-gate-8-failures.md`.
+
+## [superseded, kept for the record] oq4.25++ encoder changed output at 8357081d3 — +93% KLD on the gemma4_moe fixture, real-model impact UNMEASURED
 - Category: Quantization / encode-side
 - Location: `crates/hipfire-quantize/src/codecs.rs` `mixed_clipsearch`,
   `crates/hipfire-quantize/src/ldlq.rs`; first bad commit `8357081d3`
