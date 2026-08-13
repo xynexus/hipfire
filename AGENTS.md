@@ -1,5 +1,18 @@
 # AGENTS.md - hipfire repo guidance
 
+## **DO NOT USE MMAP TO LOAD MODEL WEIGHTS!!**
+
+On a UMA APU the page cache and GPU memory are the SAME pool. An mmap'd
+artifact fills page cache that GTT cannot reclaim, so a later allocation fails
+with most of the machine apparently free. Observed on the paged 122B:
+`hipMalloc(9.15 MiB), free=7466.7 MiB of total=122880.0 MiB` — a 9 MiB
+expert page-in failed while `free -g` showed 118 GiB in buff/cache.
+
+Read weights with explicit, bounded reads (`pread`/O_DIRECT slab path) so the
+bytes are owned and freeable. `memmap2` is currently used by `hipfire-runtime`
+(`hfq.rs`), `hipfire-quantize`, `hipfire-model` and `hipfire-gguf`; do not add
+more, and prefer removing it from any load path you touch.
+
 This file is the repo-wide contract for agents. Keep it small: put
 subsystem-only rules in the nearest nested `AGENTS.md`, keep long procedures in
 skills or docs, and use the task prompt for one-off constraints.
