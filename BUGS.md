@@ -2043,3 +2043,35 @@ reproduction and the reasoning that led to the real cause are still useful.
   then treat these three artifacts as single-chunk.
 - Scope: Tooling / evidence integrity
 - Confidence: High (self-test is deterministic and reproduces on all 3 files)
+
+## [High] gemma4_moe `++` artifacts get NO LDLQ on every expert's gate_up_proj — and are still named `++`
+- Category: Correctness / Quantization (mislabelled artifact)
+- Location: `crates/hipfire-quantize/src/main.rs` `ldlq_hessian_for_tensor`
+  (L402) + `calibration_tensor_name_candidates` (L6425); capture side
+  `crates/hipfire-runtime/src/calibration/expert_capture.rs:777`
+- Measured 2026-08-13 on the tiny gemma4_moe fixture, `oq4++` / `oq4.25++` /
+  `oq8++`, all three identical: **16 of 54 LDLQ-eligible tensors skipped, and
+  they are EXACTLY the 16 routed-expert `gate_up_proj` weights** (2 layers x 8
+  experts, all of them). All 16 matching `down_proj` succeed.
+- So Hessian/LDLQ error feedback is applied to the down half of every expert and
+  none of the gate_up half — the larger half, since gate_up is 2x the
+  intermediate width — while the artifact still carries the `++` name. This is
+  the mislabelled-artifact failure the quantizer explicitly REFUSES `qtip3++`
+  over ("the second `+` would be a lie"), reached by another route and not
+  refused: `ldlq_report_and_validate` only enforces `success > 0`.
+- Mechanism is a name-lookup miss ("no Hessian entry"), not a computation
+  failure. `calibration_tensor_name_candidates` tries only the full name, the
+  name minus `.weight`, and a `model.language_model.` <-> `model.` swap.
+- LEAD, not a confirmed cause: the capture registers
+  `model.layers.{L}.mlp.experts.{E}.{gate_up,down}_proj` — an `.mlp.` segment no
+  candidate produces. That cannot be the whole story alone, since `down_proj` is
+  registered by the same code and DOES resolve.
+- `qwen3_5_moe` is unaffected (missing=0, 40/40), so this is family-specific,
+  not inherent to MoE.
+- Suggested fix, in order: (1) make `ldlq_report_and_validate` strict about
+  `missing > 0` for a `++` format, or refuse to emit the `++` name — a silent
+  partial application is undetectable downstream; (2) fix the name resolution.
+- Visible in `results.jsonl` as `ldlq_missing` / `ldlq_skipped` per calibrated
+  cell (`ba5f9612f`).
+- Confidence: High on the measurement (reproducible, all three `++` formats
+  agree); the naming cause is not yet pinned.
