@@ -67,3 +67,86 @@ And the failure set is *entirely* clearable: re-record the stale baselines, drop
 the three vacuous cells, drop the deprecated-format cells. Nothing here needs
 debugging. That is the strongest argument for doing it — the standing noise is
 not protecting against anything, it is only hiding whatever comes next.
+
+## Postscript, 2026-08-13: the 9th arrived, and it was hidden for six days
+
+The section above predicted that standing noise "is only hiding whatever comes
+next." That happened, and this is the record of it.
+
+Running the gate on merged master (`37eb5c464`) now reports **3** failures, not
+8 — the clearable set was largely re-recorded in the meantime. One of the three
+is new, real, and was never in the original eight:
+
+| cell | current | baseline | what it is |
+|---|---|---|---|
+| `gemma4_moe/kld:oq4.25++(calib)` | 0.005952 | 0.003077 | **regression, +93%, bisected** |
+| `qwen3_5_moe/kld:oq8+(calib)` | 0.005677 | 0.008147 | better — and **vacuous**, see below |
+| `qwen3_5_moe/kld:oq8++(calib)` | 0.005677 | 0.008147 | better — and **vacuous**, see below |
+
+### The regression: `gemma4_moe/kld:oq4.25++`
+
+Bisected over 549 commits (10 steps) to:
+
+    8357081d3  fix(opus): choose the mixed scale and promotion set jointly  (2026-08-06)
+
+The bisect tested the measured **value**, not the gate's pass/fail — the
+baseline file itself moves across that range, so a pass/fail bisect would have
+found "when the baseline was edited" instead of "when the number changed." The
+value is bit-identical 0.003077 at every commit before and 0.005952 at every
+commit after, so this is a deterministic step, not drift.
+
+**That commit predicted the opposite of what happened.** Its own message says:
+
+> At the shipped oq4.25++ default (N_out=3) this is a 0.6% SSE change; do
+> not expect a visible KLD move there.
+
+The move is +93% of baseline, on exactly that shipped default, against a ±25%
+budget. The commit changed `codecs.rs` and `ldlq.rs` and did **not** re-record
+`tests/tiny-quant-baselines.txt`, so the cell has been red ever since — absorbed
+into the standing-failure noise this document was written about.
+
+The commit's mathematical argument is not in question: for a fixed scale the
+top-N_out gain sort is the optimal promotion set, so sweeping the grid and
+recomputing the set inside the loop really is the joint argmin. The gap is that
+the argmin is over **group reconstruction SSE**, and the gate measures **KLD**.
+A 0.6% SSE change producing a 93% KLD change is that proxy/target gap stated
+numerically — a better weight-space optimum is not automatically a better
+output-space one.
+
+**What this does NOT establish.** The tiny fixtures are seeded random-init models
+over a synthetic token stream (`executor_tinyquant.rs:6-10`). On random weights
+there is no correct answer to move toward, so this is evidence that the encoder's
+output changed materially and deterministically — which is what the gate is for —
+and NOT evidence that real models quantize worse. **The real-model impact is
+unmeasured and is the question that decides what to do here**: re-record the
+baseline (if real models are unaffected or improve) or revisit the selector (if
+they regress). Deciding from the fixture alone would be reading a
+regression-detector as a quality metric.
+
+### The other two are one vacuous cell twice
+
+`qwen3_5_moe/kld:oq8+` and `kld:oq8++` report **0.005677 in the current run and
+0.008147 in the committed baseline — identical to six decimals in both**, across
+two formats that differ by whether Hessian/LDLQ error feedback runs. That is the
+same signature this document used to classify `mq6`/`mq4` as vacuous.
+
+The cross-check that makes it a property of this cell rather than of `++`
+generally: on `gfx1151`, `qwen3_5_moe_indexed` records **different** values for
+the two (`oq8+` 0.00307532, `oq8++` 0.00290585), so the second `+` is not
+inherently a no-op. Both moved in the better direction anyway.
+
+### Provenance of these numbers
+
+Reproduced at three commits with bit-identical results, so the merge under test
+introduced none of it:
+
+| commit | `gemma4_moe/oq4.25++` | `qwen3_5_moe/oq8+`, `oq8++` |
+|---|---|---|
+| `37eb5c464` (merge of PR #248) | 0.005952 | 0.005677 |
+| `1cc6868cb` (pre-merge master) | 0.005952 | 0.005677 |
+| `c958348c3` (before the routers-BF16 change) | 0.005952 | not run |
+| `753df2b27` (where the baseline was recorded) | **0.0031 — PASS** | not run |
+
+The `72cd1c10b` routers-lossless-BF16 change was the first suspect, since it is
+already documented above as having moved `qwen3_5_moe` values. It is not the
+cause: the failure reproduces at its parent.

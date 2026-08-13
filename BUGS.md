@@ -4,6 +4,29 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## [High] oq4.25++ encoder changed output at 8357081d3 — +93% KLD on the gemma4_moe fixture, real-model impact UNMEASURED
+- Category: Quantization / encode-side
+- Location: `crates/hipfire-quantize/src/codecs.rs` `mixed_clipsearch`,
+  `crates/hipfire-quantize/src/ldlq.rs`; first bad commit `8357081d3`
+  ("fix(opus): choose the mixed scale and promotion set jointly", 2026-08-06)
+- `tests/tiny-quant-gate.sh` cell `gemma4_moe/kld:oq4.25++(calib)` went
+  0.003077 -> 0.005952 (+93%, budget ±25%) and has been red since. Bisected
+  over 549 commits on the measured VALUE, not pass/fail — the baseline file
+  moves across that range. Bit-identical either side of the commit, so it is a
+  deterministic step, not drift.
+- **The commit predicted the opposite**: "At the shipped oq4.25++ default
+  (N_out=3) this is a 0.6% SSE change; do not expect a visible KLD move there."
+  It changed the encoder and did not re-record `tests/tiny-quant-baselines.txt`.
+- The joint-argmin argument is sound; it minimizes group reconstruction SSE
+  while the gate measures KLD. 0.6% SSE -> 93% KLD is the proxy/target gap.
+- **Do not act on the fixture alone.** Tiny fixtures are seeded random-init over
+  a synthetic token stream, so this shows the encoder's output changed
+  materially — what the gate is for — not that real models quantize worse.
+  The owed measurement is a real model quantized to oq4.25++ either side of
+  `8357081d3`, compared by KLD; that decides re-record vs revisit-the-selector.
+- Full write-up, provenance table and the two accompanying vacuous cells:
+  `docs/tiny-quant-gate-8-failures.md` postscript.
+
 ## [FIXED] down_proj gets no Hessian/imatrix on bf16 models — `gemv_bf16_xf32` never tapped
 - Category: Correctness / Calibration
 - Location: `crates/hipfire-rdna/src/dispatch/gemv.rs` `gemv_bf16_xf32`
