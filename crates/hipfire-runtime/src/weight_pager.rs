@@ -766,6 +766,29 @@ pub mod page_timing {
     }
 }
 
+/// Which expert-module slot a tensor fills, if any.
+///
+/// Must be an EXACT suffix match on the weight, never `contains`. An expert
+/// module also carries `<proj>.awq_scale.weight`, and
+/// `"gate_up_proj.awq_scale.weight".contains("gate_up_proj")` is true — so a
+/// `contains` test let the sidecar, which is stored second, overwrite the
+/// weight's offset. The expert pointer table then aimed the routed GEMV at a
+/// 512 B scale vector instead of a 399 KB weight matrix.
+///
+/// Symptom, in case it comes back: paged decode output that does not depend on
+/// the expert weights at all — three artifacts differing only in expert content
+/// produced one identical logit hash. Only artifacts WITH AWQ sidecars were
+/// affected, so plain `oq4` paged bit-exactly throughout and hid it.
+fn expert_module_tensor_role(name: &str) -> Option<ExpertRole> {
+    if name.ends_with("gate_up_proj.weight") {
+        Some(ExpertRole::GateUp)
+    } else if name.ends_with("down_proj.weight") {
+        Some(ExpertRole::Down)
+    } else {
+        None
+    }
+}
+
 fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
     module.tensors.iter().any(|tensor| {
         matches!(
@@ -871,11 +894,10 @@ fn prepare_expert_module(
             _ => source.to_vec(),
         };
         bytes.extend_from_slice(&transformed);
-        if tensor.name.contains("gate_up_proj") {
-            gate_up_rel = Some(resident_rel);
-        }
-        if tensor.name.contains("down_proj") {
-            down_rel = Some(resident_rel);
+        match expert_module_tensor_role(&tensor.name) {
+            Some(ExpertRole::GateUp) => gate_up_rel = Some(resident_rel),
+            Some(ExpertRole::Down) => down_rel = Some(resident_rel),
+            None => {}
         }
     }
 
@@ -1833,6 +1855,35 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sidecar must never claim the weight's slot. This is the exact bug that
+    /// made paged decode ignore its own expert weights on every calibrated
+    /// artifact; `contains` passes this list, `ends_with` does not.
+    #[test]
+    fn expert_module_sidecars_do_not_claim_the_weight_slot() {
+        use super::expert_module_tensor_role as role;
+        let p = "model.layers.0.mlp.experts.11.";
+        assert_eq!(
+            role(&format!("{p}gate_up_proj.weight")),
+            Some(ExpertRole::GateUp)
+        );
+        assert_eq!(
+            role(&format!("{p}down_proj.weight")),
+            Some(ExpertRole::Down)
+        );
+        for sidecar in [
+            "gate_up_proj.awq_scale.weight",
+            "down_proj.awq_scale.weight",
+            "gate_up_proj.scale.weight",
+        ] {
+            assert_eq!(
+                role(&format!("{p}{sidecar}")),
+                None,
+                "{sidecar} must not claim an expert weight slot"
+            );
+        }
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -1989,11 +2040,8 @@ mod tests {
         let groups_gu = 1024 * 2048 / 256;
         let groups_dn = 2048 * 512 / 256;
 
-        let canonical = routed_module_qt(
-            QuantType::Oq4G256.code(),
-            groups_gu * 130,
-            groups_dn * 130,
-        );
+        let canonical =
+            routed_module_qt(QuantType::Oq4G256.code(), groups_gu * 130, groups_dn * 130);
         assert!(
             module_requires_host_repack(&canonical),
             "canonical OQ4 is 130 B/group on disk and must be transformed on page-in"
@@ -2016,11 +2064,8 @@ mod tests {
     fn moe_blocks_and_canonical_agree_on_resident_length() {
         let groups_gu = 1024 * 2048 / 256;
         let groups_dn = 2048 * 512 / 256;
-        let canonical = routed_module_qt(
-            QuantType::Oq4G256.code(),
-            groups_gu * 130,
-            groups_dn * 130,
-        );
+        let canonical =
+            routed_module_qt(QuantType::Oq4G256.code(), groups_gu * 130, groups_dn * 130);
         let packed = routed_module_qt(
             QuantType::Oq4G256MoeBlocks.code(),
             groups_gu * 132,
