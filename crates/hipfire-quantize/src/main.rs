@@ -6057,6 +6057,53 @@ fn run_hfq_source_pipeline(
         total_params += n_elements;
         let tensor_override = tensor_format_override(tensor_overrides, &t.name);
         let tensor_format = tensor_override.map_or(format, |entry| entry.format);
+        // Already-quantized tensors are COPIED, not re-quantized. There is no
+        // path back to source precision, so the alternative is to refuse the
+        // whole file — which is what this did, and it made a targeted
+        // `--tensor-format` pass impossible on any real artifact: the first
+        // quantized tensor aborted the run.
+        //
+        // That pass is the cheap way to fix a mixed artifact in place. The 122B
+        // carries 644 routed experts left at BF16 by
+        // `--expert-coverage-policy preserve-undercovered`, which is what stops
+        // it paging; they are source precision, so they can be re-encoded to W8
+        // while the 11,644 OqPlusCompact experts are copied byte-for-byte. A
+        // full requantize from the safetensors source would touch all of them
+        // and take hours to reproduce bytes it already has.
+        //
+        // An override that TARGETS a quantized tensor still errors: the user
+        // asked for a re-encode that cannot be done, and silently copying would
+        // hand back an artifact that does not match the request.
+        // With overrides present the pass is SURGICAL: touch exactly what was
+        // targeted, copy everything else whatever its precision. Re-encoding the
+        // untargeted source-precision tensors would rewrite norms and — worse —
+        // the F16 AWQ sidecars, which `load_awq_scale_for` requires at qt 1.
+        //
+        // No overrides keeps the old rule (requantize source precision, refuse
+        // quantized input). Nothing working is lost either way: before this,
+        // HFQ input aborted on its first quantized tensor.
+        let surgical = !tensor_overrides.is_empty();
+        let is_source_precision = hfq_source_dtype(t.quant_type).is_some();
+        if tensor_override.is_none() && (surgical || !is_source_precision) {
+            eprintln!(
+                "    copied: {} {:?} (quant_type {}, {:.1} KB)",
+                t.name,
+                t.shape,
+                t.quant_type,
+                raw.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: t.name.clone(),
+                quant_type: QuantType::from_code(t.quant_type).ok_or_else(|| {
+                    format!("tensor {} has unknown quant_type {}", t.name, t.quant_type)
+                })?,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data: raw.to_vec(),
+                spilled_len: 0,
+            });
+            continue;
+        }
         let (data, qt, group_size, label) = quantize_hfq_source_tensor(
             &t.name,
             hfq.arch_id,

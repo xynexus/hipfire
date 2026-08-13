@@ -183,12 +183,12 @@ impl<'a> HfqComponentView<'a> {
         self.package.entry(stored_name)
     }
 
-    pub fn blob_data(&self, original_name: &str) -> Option<&'a [u8]> {
+    pub fn blob_data(&self, original_name: &str) -> Option<Vec<u8>> {
         let entry = self.entry(original_name)?;
         self.package.blob_data(&entry.name)
     }
 
-    pub fn opaque_bytes(&self) -> io::Result<Option<&'a [u8]>> {
+    pub fn opaque_bytes(&self) -> io::Result<Option<Vec<u8>>> {
         let Some(stored_name) = self.component.opaque_entry.as_deref() else {
             return Ok(None);
         };
@@ -275,7 +275,7 @@ impl<'a> HfqFileComponentView<'a> {
     pub fn tensor_data(
         &self,
         original_name: &str,
-    ) -> Option<(&'a hipfire_runtime::hfq::HfqTensorInfo, &'a [u8])> {
+    ) -> Option<(&'a hipfire_runtime::hfq::HfqTensorInfo, Vec<u8>)> {
         let stored_name = self
             .component
             .stored_entries
@@ -300,7 +300,7 @@ impl<'a> HfqFileComponentView<'a> {
         self.file.tensor_data_vec(stored_name)
     }
 
-    pub fn opaque_bytes(&self) -> io::Result<Option<&'a [u8]>> {
+    pub fn opaque_bytes(&self) -> io::Result<Option<Vec<u8>>> {
         let Some(stored_name) = self.component.opaque_entry.as_deref() else {
             return Ok(None);
         };
@@ -1929,8 +1929,8 @@ fn write_component_v2(
                 let bytes = pkg
                     .blob_data(stored_name)
                     .expect("entry was validated above");
-                validate_tria_v1(bytes)?;
-                out.write_all(bytes)?;
+                validate_tria_v1(&bytes)?;
+                out.write_all(&bytes)?;
             }
             "hfqm" => {
                 if component.stored_entries.len() != component.tensors.len() {
@@ -1939,10 +1939,12 @@ fn write_component_v2(
                         "HFQM component tensor map length does not match tensor list",
                     ));
                 }
-                #[derive(Clone, Copy)]
-                struct Range<'a> {
+                #[derive(Clone)]
+                // Owned: `blob_data` preads into a fresh buffer now that
+                // packages are not mmap'd, so there is nothing to borrow from.
+                struct Range {
                     offset: u64,
-                    bytes: &'a [u8],
+                    bytes: Vec<u8>,
                 }
                 let mut ranges = Vec::with_capacity(
                     component.stored_entries.len() + component.stored_segments.len(),
@@ -2027,7 +2029,7 @@ fn write_component_v2(
                 out.set_len(component.byte_len)?;
                 for range in ranges {
                     out.seek(SeekFrom::Start(range.offset))?;
-                    out.write_all(range.bytes)?;
+                    out.write_all(&range.bytes)?;
                 }
             }
             other => {
@@ -2106,7 +2108,7 @@ fn write_component_with_options(
             let data = pkg
                 .blob_data(&tensor_names[i])
                 .expect("tensor validated present above");
-            w.write_all(data)
+            w.write_all(&data)
         });
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temp);
@@ -2679,18 +2681,18 @@ mod tests {
         let pkg = HfqPackage::open(&bundle).unwrap();
         assert_eq!(
             pkg.blob_data("layers.0.self_attn.q_proj.weight"),
-            Some(&[1, 2][..])
+            Some(vec![1, 2])
         );
         assert_eq!(
             pkg.blob_data("__hipfire_component/dflash/1/layers.0.self_attn.q_proj.weight"),
-            Some(&[9, 8][..])
+            Some(vec![9, 8])
         );
         let manifest = compose_manifest(&pkg).unwrap().unwrap();
         let view = component_view(&pkg, &manifest, "dflash").unwrap().unwrap();
         assert_eq!(view.arch_id(), 20);
         assert_eq!(
             view.blob_data("layers.0.self_attn.q_proj.weight"),
-            Some(&[9, 8][..])
+            Some(vec![9, 8])
         );
 
         let out = dir.join("out");
@@ -2730,14 +2732,14 @@ mod tests {
         assert_eq!(manifest.components[1].source_format, "tria-v1");
         assert_eq!(
             pkg.blob_data(manifest.components[1].opaque_entry.as_deref().unwrap()),
-            Some(tria_bytes.as_slice())
+            Some(tria_bytes.clone())
         );
         let view = component_view(&pkg, &manifest, "triattn").unwrap().unwrap();
         assert_eq!(view.source_format(), "tria-v1");
-        assert_eq!(view.opaque_bytes().unwrap(), Some(tria_bytes.as_slice()));
+        assert_eq!(view.opaque_bytes().unwrap(), Some(tria_bytes.clone()));
         assert_eq!(
             hipfire_runtime::triattn::TriAttnCenters::from_bytes(
-                view.opaque_bytes().unwrap().unwrap()
+                &view.opaque_bytes().unwrap().unwrap()
             )
             .unwrap()
             .n_layers,
@@ -2861,10 +2863,10 @@ mod tests {
         let bundle = dir.join("bundle.hfq");
         compose_hfq(&[base.clone(), side.clone()], &bundle).unwrap();
         let pkg = HfqPackage::open(&bundle).unwrap();
-        assert_eq!(pkg.blob_data("dup"), Some(&[1][..]));
+        assert_eq!(pkg.blob_data("dup"), Some(vec![1]));
         assert_eq!(
             pkg.blob_data("__hipfire_component/sidecar/1/dup"),
-            Some(&[2][..])
+            Some(vec![2])
         );
         let out = dir.join("out");
         decompose_hfq(&bundle, &out).unwrap();
@@ -2958,7 +2960,7 @@ mod tests {
         runtime_tria.verify_digest().unwrap();
         assert_eq!(
             hipfire_runtime::triattn::TriAttnCenters::from_bytes(
-                runtime_tria.opaque_bytes().unwrap().unwrap()
+                &runtime_tria.opaque_bytes().unwrap().unwrap()
             )
             .unwrap()
             .n_layers,

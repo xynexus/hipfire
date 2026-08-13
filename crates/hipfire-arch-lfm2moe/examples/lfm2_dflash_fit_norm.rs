@@ -250,7 +250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let old_norm = read_tensor_as_f32(
         norm_entry.quant_type,
-        pkg.blob_data("norm.weight")
+        &pkg.blob_data("norm.weight")
             .ok_or("draft norm.weight blob missing")?,
     )?;
     if old_norm.len() != dump.hidden {
@@ -1623,7 +1623,7 @@ fn existing_logit_bias(
     let data = pkg
         .blob_data("logit_bias.weight")
         .ok_or("draft logit_bias.weight blob missing")?;
-    let bias = read_tensor_as_f32(entry.quant_type, data)?;
+    let bias = read_tensor_as_f32(entry.quant_type, &data)?;
     if bias.len() != vocab_size {
         return Err(format!(
             "logit_bias.weight values {} != vocab {vocab_size}",

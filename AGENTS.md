@@ -10,12 +10,13 @@ in system RAM on the way to the GPU, on any part.
   copy you did not need, and the transfer is driven by synchronous page faults
   instead of large sequential reads you control. A bounded read into a pinned
   buffer goes file → pinned → VRAM, one copy, fixed footprint.
-- **UMA/APU**: worse, because page cache and GPU memory are the SAME pool. The
-  mmap fills cache that GTT cannot reclaim, so a later allocation fails with the
-  machine apparently free — presenting as an allocator bug rather than a loader
-  choice. Observed on the paged 122B mid-generation:
-  `hipMalloc(9.15 MiB), free=7466.7 MiB of total=122880.0 MiB`, with `free -g`
-  showing 118 GiB in buff/cache.
+- **UMA/APU**: worse, because page cache and GPU memory are the SAME pool, so
+  every page the mapping touches is a page the GPU cannot have. Measured on the
+  122B: loading it mmap'd left ~118 GiB in buff/cache; the same load through
+  pread holds `buff/cache` at 1 GiB. The mapping also raced the slab loader's
+  O_DIRECT fd on the same inode into a kworker deadlock at 291 GiB (2026-06-11),
+  which is why the loader carried a 64 GiB "use pread instead" escape hatch
+  before this rule replaced it outright.
 
 Read weights with explicit, bounded reads (`pread` / the O_DIRECT slab path) so
 the bytes are owned, freeable, and land where they are going. `memmap2` is

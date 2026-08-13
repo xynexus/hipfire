@@ -13,7 +13,6 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use hipfire_quant_format::{storage, QuantType};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
-use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hasher;
@@ -52,8 +51,8 @@ pub struct HfqPackageEntry {
 }
 
 pub struct HfqPackage {
-    _file: File,
-    mmap: Mmap,
+    file: File,
+    file_len: usize,
     pub version: u32,
     pub arch_id: u32,
     pub metadata_json: String,
@@ -308,24 +307,44 @@ fn parse_hfqm_index(
 
 impl HfqPackage {
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        // Header + index by bounded reads; blobs by pread on demand. Never
+        // mmap'd — see the rule at the top of AGENTS.md.
         let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        if mmap.len() < 32 || &mmap[0..4] != HFQM_MAGIC {
+        let file_len = file.metadata()?.len() as usize;
+        if file_len < 32 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "not an HFQM package",
             ));
         }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let n_entries = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
-        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
-        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let mut header = [0u8; 32];
+        read_exact_at_portable(&file, &mut header, 0)?;
+        if &header[0..4] != HFQM_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not an HFQM package",
+            ));
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let n_entries = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
+        if metadata_offset > data_offset || data_offset > file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid HFQM offsets metadata={metadata_offset} data={data_offset}"),
+            ));
+        }
+        // `parse_hfqm_index` indexes from byte 0, so give it a prefix buffer
+        // covering the header + metadata index rather than the whole file.
+        let mut index = vec![0u8; data_offset];
+        read_exact_at_portable(&file, &mut index, 0)?;
         let (metadata_json, entries, entry_map) =
-            parse_hfqm_index(&mmap, 0, metadata_offset, data_offset, n_entries, version)?;
+            parse_hfqm_index(&index, 0, metadata_offset, data_offset, n_entries, version)?;
         Ok(Self {
-            _file: file,
-            mmap,
+            file,
+            file_len,
             version,
             arch_id,
             metadata_json,
@@ -342,9 +361,16 @@ impl HfqPackage {
         self.entry_map.get(name).map(|&idx| &self.entries[idx])
     }
 
-    pub fn blob_data(&self, name: &str) -> Option<&[u8]> {
+    /// Returns OWNED bytes — previously a borrow into the mapping.
+    pub fn blob_data(&self, name: &str) -> Option<Vec<u8>> {
         let entry = self.entry(name)?;
-        Some(&self.mmap[entry.data_offset..entry.data_offset + entry.data_size])
+        let end = entry.data_offset.checked_add(entry.data_size)?;
+        if end > self.file_len {
+            return None;
+        }
+        let mut buf = vec![0u8; entry.data_size];
+        read_exact_at_portable(&self.file, &mut buf, entry.data_offset as u64).ok()?;
+        Some(buf)
     }
 }
 
@@ -466,7 +492,6 @@ pub struct HfqStreamEntry {
     pub group_size: u32,
     pub data_len: u64,
 }
-
 
 /// Where every part of an HFQM package will land on disk.
 pub struct HfqmLayout {
@@ -895,7 +920,6 @@ pub struct HfqFile {
     /// and hipMalloc share physical RAM — keeping the mmap alive doubles
     /// memory consumption. Dropped after header/index parsing via
     /// `drop_mmap()`. When `None`, all tensor reads go through `pread`.
-    mmap: Option<Mmap>,
     pub arch_id: u32,
     pub metadata_json: String,
     tensors: Vec<HfqTensorInfo>,
@@ -1173,7 +1197,6 @@ impl HfqFile {
             ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: path.to_path_buf(),
-            mmap: None,
             arch_id,
             metadata_json,
             tensors,
@@ -1198,105 +1221,16 @@ impl HfqFile {
     /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
-        // For large standalone files, skip the full-file mmap entirely and use the
-        // pread-based index loader. The mmap is only useful when tensor data will be
-        // read via mmap slices (discrete GPU path); on UMA, drop_mmap() is called
-        // immediately in load_weights() before any tensor data is accessed, making the
-        // mmap a pure overhead cost. Beyond ~64 GiB the overhead becomes dangerous:
-        // mmap.advise(Sequential) triggers kernel readahead that races with the slab
-        // loader's O_DIRECT fd on the same inode → kworker deadlock → system hang
-        // (reproduced at 291 GiB on RDNA3.5 APU, 2026-06-11). Embedded containers
-        // (base_offset > 0) are always small relative to their host file and are
-        // unaffected by this check.
-        const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024 * 1024;
-        if base_offset == 0 {
-            let file_len = std::fs::metadata(path)?.len();
-            if file_len > LARGE_FILE_THRESHOLD {
-                return Self::open_index_only_at_offset(path, 0);
-            }
-        }
-
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        // Sequential access hint: helps the kernel prefetch pages and drop them sooner.
-        #[cfg(unix)]
-        {
-            mmap.advise(memmap2::Advice::Sequential).ok();
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-            }
-        }
-
-        let base = base_offset as usize;
-        assert!(
-            base + 32 <= mmap.len(),
-            "HfqFile::open_at_offset: base ({base}) + 32 > file size ({}); not enough bytes for header",
-            mmap.len(),
-        );
-
-        // Parse header (32 bytes) at base offset.
-        let magic = &mmap[base..base + 4];
-        assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
-        let version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
-        let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
-        let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
-        // Stored offsets are relative to the container start; rebase to absolute
-        // file offsets so all the existing mmap slicing below works unchanged.
-        let metadata_offset =
-            u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
-        let data_offset =
-            u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
-
-        let meta_index = &mmap[metadata_offset..data_offset];
-        let (metadata_json, tensors, tensor_map) = parse_hfqm_meta_index(
-            meta_index,
-            metadata_offset,
-            data_offset,
-            base,
-            n_tensors,
-            mmap.len(),
-            version,
-            |offset, size| {
-                let end = offset.checked_add(size).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM tail range overflow")
-                })?;
-                if end > mmap.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "HFQM tail range {offset}..{end} exceeds file size {}",
-                            mmap.len()
-                        ),
-                    ));
-                }
-                Ok(mmap[offset..end].to_vec())
-            },
-        )?;
-
-        let modules = parse_module_table(&metadata_json)?.unwrap_or_default();
-        if !modules.is_empty() {
-            validate_modules(&modules, mmap.len())?;
-        }
-
-        let mut tensors = tensors;
-        let bf16_packed = expand_bf16_index(&mut tensors);
-        Ok(Self {
-            ms_infos: std::cell::OnceCell::new(),
-            _file: file,
-            path: path.to_path_buf(),
-            mmap: Some(mmap),
-            arch_id,
-            metadata_json,
-            tensors,
-            tensor_map,
-            pread_buf: std::cell::RefCell::new(Vec::new()),
-            version,
-            modules,
-            st_source: None,
-            st_locs: Vec::new(),
-            bf16_packed,
-        })
+        // Weights are never mmap'd — see the rule at the top of AGENTS.md. This
+        // used to map the whole file and only fall back to the pread loader past
+        // 64 GiB; the two produce the same `HfqFile`, so there is one path now.
+        //
+        // The 64 GiB escape hatch was itself an admission: `mmap.advise(Sequential)`
+        // raced the slab loader's O_DIRECT fd on the same inode into a kworker
+        // deadlock at 291 GiB. The failure is not size-specific, only easier to
+        // hit when large — a 9 MiB expert page-in failed on the paged 122B with
+        // 118 GiB sitting in unreclaimable page cache.
+        Self::open_index_only_at_offset(path, base_offset)
     }
 
     /// Build an in-memory `HfqFile` directly over a HuggingFace safetensors
@@ -1409,7 +1343,6 @@ impl HfqFile {
             ms_infos: std::cell::OnceCell::new(),
             _file: file,
             path: dir.to_path_buf(),
-            mmap: None,
             arch_id,
             metadata_json,
             tensor_map,
@@ -1442,11 +1375,11 @@ impl HfqFile {
             // the weights; there is no separate HFQM mmap to drop.
             return;
         }
-        self.mmap = None;
-        // Cancel any in-flight readahead triggered by the Sequential advice at open
-        // time. On UMA systems the slab loader opens an O_DIRECT fd immediately after
-        // this call; without DONTNEED the readahead kworker may still hold an inode
-        // lock that O_DIRECT needs, causing a deadlock (see open_at_offset comment).
+        // Nothing to unmap any more — weights are read with pread. Kept as a
+        // no-op rather than deleted so the ~10 call sites that ask for it still
+        // express the intent, and because the FADV_DONTNEED below is still worth
+        // doing: it releases whatever page cache the index reads left behind
+        // before the slab loader opens its O_DIRECT fd on the same inode.
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -1649,33 +1582,16 @@ impl HfqFile {
     ///
     /// For metadata alone use [`Self::find_tensor_info`] — it needs no bytes and
     /// so does not care how the tensor is stored.
-    pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
-        let idx = self.resolve_idx(name)?;
-        let info = &self.tensors[idx];
-        // A BF16L3 tensor's bytes are compressed; there is no BF16 buffer in the
-        // file to borrow. Returning the packed bytes here would hand back
-        // garbage tagged as BF16, so refuse and make the caller use a decoding
-        // path (`tensor_data_cow` / `tensor_data_vec` / `tensor_data_pread`).
-        if self.bf16_packed[idx].is_some() {
-            debug_assert!(
-                false,
-                "tensor_data() on compressed-BF16 tensor {name} — use tensor_data_cow()"
-            );
-            return None;
-        }
-        if let Some(source) = &self.st_source {
-            let loc = self.st_locs[idx];
-            return Some((info, source.shard_bytes(loc.shard, loc.offset, loc.len)?));
-        }
-        debug_assert!(
-            self.mmap.is_some(),
-            "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
-        );
-        let mmap = self.mmap.as_ref()?;
-        Some((
-            info,
-            &mmap[info.data_offset..info.data_offset + info.data_size],
-        ))
+    /// Returns OWNED bytes. It used to borrow from the file mapping; weights are
+    /// no longer mmap'd (see the rule at the top of AGENTS.md), so there is
+    /// nothing to borrow and this is `tensor_data_vec` under its old name.
+    ///
+    /// Prefer [`Self::tensor_data_pread`] on a hot path — it reuses one buffer
+    /// instead of allocating per call. It is NOT a drop-in here: that buffer is
+    /// shared, so holding two tensors at once (loading.rs reads qweight, qzeros
+    /// and scales together) would have the second overwrite the first.
+    pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
+        self.tensor_data_vec(name)
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -1765,7 +1681,7 @@ impl HfqFile {
             return Some((info, std::borrow::Cow::Owned(bytes)));
         }
         let (info, bytes) = self.tensor_data(name)?;
-        Some((info, std::borrow::Cow::Borrowed(bytes)))
+        Some((info, std::borrow::Cow::Owned(bytes)))
     }
 
     /// Read tensor data using the best available path:
@@ -2187,8 +2103,13 @@ impl ModelSource for HfqFile {
         if is_packed_bf16(self.tensors.get(idx)?.quant_type) {
             return None;
         }
-        let (_, bytes) = HfqFile::tensor_data(self, name)?;
-        Some((self.ms_infos().get(idx)?, bytes))
+        // Nothing to borrow: weights are read with pread into owned buffers, so
+        // there is no mapping to hand a slice into. The trait spells this case
+        // out — a source with nowhere to put the decoded buffer MUST return
+        // `None` here and let consumers use `tensor()`, which this impl
+        // overrides with the Cow path. Declining is the contract, not a gap.
+        let _ = idx;
+        None
     }
 
     fn tensor(&self, name: &str) -> Option<(&TensorInfo, std::borrow::Cow<'_, [u8]>)> {

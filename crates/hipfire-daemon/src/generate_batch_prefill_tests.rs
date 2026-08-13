@@ -1847,18 +1847,21 @@ fn grouped_moe_decode_contract_admits_q8_state_batches_and_rejects_fallback_case
     }
 
     let fp32 = vec![fp32_decode_state_signature(); 2];
-    let err = validate_qwen35_grouped_moe_decode_session_signatures(&config, &fp32, 2, "gfx1151", false)
-        .unwrap_err();
+    let err =
+        validate_qwen35_grouped_moe_decode_session_signatures(&config, &fp32, 2, "gfx1151", false)
+            .unwrap_err();
     assert!(err.contains("must use Q8 KV state"));
 
     let dense = test_dense_qwen35_config();
     let q8 = vec![q8_decode_state_signature(); 2];
-    let err = validate_qwen35_grouped_moe_decode_session_signatures(&dense, &q8, 2, "gfx1151", false)
-        .unwrap_err();
+    let err =
+        validate_qwen35_grouped_moe_decode_session_signatures(&dense, &q8, 2, "gfx1151", false)
+            .unwrap_err();
     assert!(err.contains("requires Qwen35 MoE/A3B weights"));
 
-    let err = validate_qwen35_grouped_moe_decode_session_signatures(&config, &q8, 2, "gfx906", false)
-        .unwrap_err();
+    let err =
+        validate_qwen35_grouped_moe_decode_session_signatures(&config, &q8, 2, "gfx906", false)
+            .unwrap_err();
     assert!(err.contains("requires an RDNA grouped-MoE target"));
 }
 
@@ -1866,9 +1869,14 @@ fn grouped_moe_decode_contract_admits_q8_state_batches_and_rejects_fallback_case
 fn auto_grouped_moe_decode_stays_serial_when_native_route_is_unsupported() {
     let config = test_grouped_moe_qwen35_config();
     let signatures = vec![q8_decode_state_signature(); 8];
-    let unsupported =
-        validate_qwen35_grouped_moe_decode_session_signatures(&config, &signatures, 8, "gfx906", false)
-            .unwrap_err();
+    let unsupported = validate_qwen35_grouped_moe_decode_session_signatures(
+        &config,
+        &signatures,
+        8,
+        "gfx906",
+        false,
+    )
+    .unwrap_err();
     assert!(unsupported.contains("requires an RDNA grouped-MoE target"));
 
     let backend = select_qwen35_decode_batch_backend("auto", 6, 8).unwrap();

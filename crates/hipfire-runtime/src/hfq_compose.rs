@@ -155,7 +155,7 @@ impl<'a> HfqFileComponentView<'a> {
     pub fn tensor_data(
         &self,
         original_name: &str,
-    ) -> Option<(&'a crate::hfq::HfqTensorInfo, &'a [u8])> {
+    ) -> Option<(&'a crate::hfq::HfqTensorInfo, Vec<u8>)> {
         let stored_name = self
             .component
             .stored_entries
@@ -180,7 +180,7 @@ impl<'a> HfqFileComponentView<'a> {
         self.file.tensor_data_vec(stored_name)
     }
 
-    pub fn opaque_bytes(&self) -> io::Result<Option<&'a [u8]>> {
+    pub fn opaque_bytes(&self) -> io::Result<Option<Vec<u8>>> {
         let Some(stored_name) = self.component.opaque_entry.as_deref() else {
             return Ok(None);
         };
