@@ -1383,7 +1383,18 @@ impl WeightPager {
                 .transport
                 .read_host(module.data_offset, module.data_size, gpu)?;
             let prepared = prepare_expert_module(&module, &disk_bytes)?;
-            let tensor = gpu.upload_raw(&prepared.bytes, &[prepared.bytes.len()])?;
+            // POOLED, not `upload_raw`. Eviction returns the buffer via
+            // `free_tensor` -> `pool.free`, so allocating outside the pool means
+            // every cold load takes fresh GTT while every eviction piles into a
+            // free-list nothing draws from. `upload_raw_pooled` exists for this
+            // call site and its doc says so; the pager just never used it.
+            //
+            // Measured on the paged 122B: ~9.6 MB leaked per page-in, system
+            // memory climbing ~1.1 GB/s to 116 GB and then OOMing on a 9 MiB
+            // allocation — while the pager's own accounting sat correctly at its
+            // 8 GiB budget and the daemon's RSS stayed at 0 (it is GTT, so it
+            // never shows in RSS).
+            let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
             (tensor, prepared.gate_up_rel, prepared.down_rel)
         } else {
             let (tensor, _handle) =
