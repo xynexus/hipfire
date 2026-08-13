@@ -1,29 +1,5 @@
 # AGENTS.md - hipfire repo guidance
 
-## **DO NOT USE MMAP TO LOAD MODEL WEIGHTS!!**
-
-This is unconditional. It is not a UMA workaround — weights never want to land
-in system RAM on the way to the GPU, on any part.
-
-- **dGPU**: mmap stages the whole artifact through page cache, then copies to a
-  staging buffer, then DMAs to VRAM. That is host RAM you did not need and a
-  copy you did not need, and the transfer is driven by synchronous page faults
-  instead of large sequential reads you control. A bounded read into a pinned
-  buffer goes file → pinned → VRAM, one copy, fixed footprint.
-- **UMA/APU**: worse, because page cache and GPU memory are the SAME pool, so
-  every page the mapping touches is a page the GPU cannot have. Measured on the
-  122B: loading it mmap'd left ~118 GiB in buff/cache; the same load through
-  pread holds `buff/cache` at 1 GiB. The mapping also raced the slab loader's
-  O_DIRECT fd on the same inode into a kworker deadlock at 291 GiB (2026-06-11),
-  which is why the loader carried a 64 GiB "use pread instead" escape hatch
-  before this rule replaced it outright.
-
-Read weights with explicit, bounded reads (`pread` / the O_DIRECT slab path) so
-the bytes are owned, freeable, and land where they are going. `memmap2` is
-currently used by `hipfire-runtime` (`hfq.rs`), `hipfire-quantize`,
-`hipfire-model` and `hipfire-gguf`; do not add more, and prefer removing it from
-any load path you touch.
-
 This file is the repo-wide contract for agents. Keep it small: put
 subsystem-only rules in the nearest nested `AGENTS.md`, keep long procedures in
 skills or docs, and use the task prompt for one-off constraints.
