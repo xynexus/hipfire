@@ -166,6 +166,10 @@ fn merge_tail_metadata(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// `index` covers the header + metadata index only (bytes `0..data_offset`);
+/// `file_len` is the WHOLE file. The two were one value back when the caller
+/// mapped the entire file, and conflating them now would reject every entry
+/// whose payload lives past the index — `read_tail` exists for the same reason.
 fn parse_hfqm_index(
     mmap: &[u8],
     base: usize,
@@ -173,8 +177,10 @@ fn parse_hfqm_index(
     data_offset: usize,
     n_entries: usize,
     version: u32,
+    file_len: usize,
+    read_tail: impl Fn(usize, usize) -> std::io::Result<Vec<u8>>,
 ) -> std::io::Result<(String, Vec<HfqPackageEntry>, HashMap<String, usize>)> {
-    if metadata_offset > data_offset || data_offset > mmap.len() {
+    if metadata_offset > data_offset || data_offset > file_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid HFQM offsets metadata={metadata_offset} data={data_offset}"),
@@ -193,16 +199,13 @@ fn parse_hfqm_index(
             let end = offset.checked_add(size).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM tail range overflow")
             })?;
-            if end > mmap.len() {
+            if end > file_len {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "HFQM tail range {offset}..{end} exceeds file size {}",
-                        mmap.len()
-                    ),
+                    format!("HFQM tail range {offset}..{end} exceeds file size {file_len}"),
                 ));
             }
-            Ok(mmap[offset..end].to_vec())
+            read_tail(offset, size)
         })?;
     }
     let mut pos = metadata_offset + json_end;
@@ -281,7 +284,7 @@ fn parse_hfqm_index(
                 format!("HFQM entry {name} offset {data_offset} is not 32-byte aligned"),
             ));
         }
-        if data_offset + data_size > mmap.len() {
+        if data_offset + data_size > file_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
@@ -340,8 +343,20 @@ impl HfqPackage {
         // covering the header + metadata index rather than the whole file.
         let mut index = vec![0u8; data_offset];
         read_exact_at_portable(&file, &mut index, 0)?;
-        let (metadata_json, entries, entry_map) =
-            parse_hfqm_index(&index, 0, metadata_offset, data_offset, n_entries, version)?;
+        let (metadata_json, entries, entry_map) = parse_hfqm_index(
+            &index,
+            0,
+            metadata_offset,
+            data_offset,
+            n_entries,
+            version,
+            file_len,
+            |offset, size| {
+                let mut tail = vec![0u8; size];
+                read_exact_at_portable(&file, &mut tail, offset as u64)?;
+                Ok(tail)
+            },
+        )?;
         Ok(Self {
             file,
             file_len,

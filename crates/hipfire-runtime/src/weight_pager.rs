@@ -1205,8 +1205,8 @@ impl WeightPager {
         let expert = module.expert.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
         })?;
-        if find_module_tensor_rel_ptr(&module, "gate_up_proj").is_none()
-            || find_module_tensor_rel_ptr(&module, "down_proj").is_none()
+        if find_module_tensor_rel_ptr(&module, ExpertRole::GateUp).is_none()
+            || find_module_tensor_rel_ptr(&module, ExpertRole::Down).is_none()
         {
             return Err(WeightPagerError::InvalidModule(format!(
                 "module {} missing gate_up_proj or down_proj tensor",
@@ -1389,9 +1389,9 @@ impl WeightPager {
             let (tensor, _handle) =
                 self.transport
                     .fetch(module.data_offset, module.data_size, gpu)?;
-            let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
+            let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
+            let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
             (tensor, gate_up_rel, down_rel)
         };
@@ -1831,11 +1831,22 @@ impl From<hip_bridge::HipError> for WeightPagerError {
     }
 }
 
-fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: &str) -> Option<usize> {
+/// Offset of an expert module's weight tensor, for the verbatim (no host
+/// repack) page-in path.
+///
+/// Goes through [`expert_module_tensor_role`] for the same reason
+/// `prepare_expert_module` does: this used to be `t.name.contains(role)`, and
+/// `"gate_up_proj.awq_scale.weight".contains("gate_up_proj")` is true, so on any
+/// artifact carrying AWQ sidecars the FIRST match could be the sidecar and the
+/// pointer table would aim the routed GEMV at a scale vector. The repack path
+/// had the same defect and it made paged decode ignore its expert weights
+/// entirely; this path is only latent because nothing ships pre-transformed
+/// expert modules yet.
+fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: ExpertRole) -> Option<usize> {
     module
         .tensors
         .iter()
-        .find(|t| t.name.contains(role))
+        .find(|t| expert_module_tensor_role(&t.name) == Some(role))
         .map(|t| t.rel_offset)
 }
 
@@ -1882,6 +1893,55 @@ mod tests {
                 "{sidecar} must not claim an expert weight slot"
             );
         }
+    }
+
+    /// Both page-in paths must agree on which tensor is the weight: the repack
+    /// path via `prepare_expert_module`, and the verbatim path via
+    /// `find_module_tensor_rel_ptr`. They had the same `contains` bug; a fix to
+    /// one that missed the other would be silent, because only the repack path
+    /// is exercised by any shipping artifact today.
+    #[test]
+    fn verbatim_page_in_picks_the_weight_not_the_sidecar() {
+        use super::{find_module_tensor_rel_ptr, ExpertRole};
+        let t = |name: &str, rel: usize| HfqModuleTensor {
+            name: name.to_string(),
+            quant_type: 36,
+            shape: vec![2048, 3072],
+            group_size: 256,
+            rel_offset: rel,
+            data_size: 8,
+        };
+        let module = HfqModuleRecord {
+            module_id: "layers.0.experts.7".into(),
+            kind: crate::hfq_modules::HfqModuleKind::RoutedExpert,
+            layer: Some(0),
+            expert: Some(7),
+            placement_policy: None,
+            data_offset: 0,
+            data_size: 64,
+            // Sidecars interleaved exactly as the writer emits them: each
+            // weight is immediately followed by its scale.
+            tensors: vec![
+                t("model.layers.0.mlp.experts.7.gate_up_proj.weight", 0),
+                t(
+                    "model.layers.0.mlp.experts.7.gate_up_proj.awq_scale.weight",
+                    16,
+                ),
+                t("model.layers.0.mlp.experts.7.down_proj.weight", 32),
+                t(
+                    "model.layers.0.mlp.experts.7.down_proj.awq_scale.weight",
+                    48,
+                ),
+            ],
+        };
+        assert_eq!(
+            find_module_tensor_rel_ptr(&module, ExpertRole::GateUp),
+            Some(0)
+        );
+        assert_eq!(
+            find_module_tensor_rel_ptr(&module, ExpertRole::Down),
+            Some(32)
+        );
     }
 
     use super::*;
