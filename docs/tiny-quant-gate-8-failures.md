@@ -150,3 +150,56 @@ introduced none of it:
 The `72cd1c10b` routers-lossless-BF16 change was the first suspect, since it is
 already documented above as having moved `qwen3_5_moe` values. It is not the
 cause: the failure reproduces at its parent.
+
+## Resolved 2026-08-13: on a REAL model the change is a 26% IMPROVEMENT — re-record, do not revert
+
+The section above said the fixture alone could not decide this and that a real
+model had to be measured. It was, and it reverses the naive reading.
+
+Protocol: Qwen3.5-0.8B from safetensors, quantized to `oq4.25++` on both sides of
+the bisect boundary with **one Hessian generated once and reused**, so the
+encoder is the only variable, and both artifacts scored against **one KLD
+reference built from the bf16 anchor of the same weights**.
+
+| | perplexity | mean KLD vs bf16 | ppl gap to bf16 |
+|---|---|---|---|
+| bf16 anchor | 15.105 | — (4.0e-10 self-check) | — |
+| **`8357081d3`+ (new selector)** | **15.740** | **0.030567** | **0.635** |
+| `b05f74a79` (old selector) | 16.126 | 0.041126 | 1.022 |
+
+**KLD −25.7%, and the new selector recovers 38% of the quantization perplexity
+gap.** Two independent metrics agree. The commit is a real improvement on real
+weights; the fixture's +93% is an artifact of seeded random-init weights, where
+there is no outlier structure for a promotion-set search to find and the choice
+is near-degenerate.
+
+**So the action is to re-record `gemma4_moe/kld:oq4.25++`, not to revisit the
+selector.** The cell is measuring a genuine encoder change, in the wrong
+direction for the wrong reason.
+
+**Remaining gap, stated rather than papered over:** the model measured is dense
+(arch 5) and the failing fixture is MoE. A real MoE has not been measured. The
+burden has shifted — the change demonstrably helps a real dense model — but
+"MoE behaves the same" is an assumption here, not a measurement.
+
+### The trap this run fell into first, recorded because it produced a perfect-looking wrong answer
+
+The first A/B reported the two sides as **identical to 18 significant digits**
+(0.041125837713479996 both), with byte-identical quantized payloads. That was
+wrong, and it looked clean.
+
+Cause: the driver script invoked `./target/release/hipfire-quantize` for the
+master side **without rebuilding it first**, and an earlier `git bisect run` had
+left that binary built at `b05f74a79` — the GOOD side. So "master vs
+`b05f74a79`" was really "`b05f74a79` vs `b05f74a79`", and of course it matched.
+
+What exposed it: two different weight sets cannot produce a bit-identical mean
+KLD over 1023 tokens. The confirming test was re-quantizing at the same commit
+and comparing payloads — which also establishes, as a by-product, that
+`hipfire-quantize` **is** deterministic: same binary and inputs give a
+byte-identical payload, and only the HFQ front-metadata and tail key ordering
+varies between runs (~13 MB of a 647 MB artifact, no weight bytes).
+
+Two standing lessons: **rebuild explicitly before an A/B that depends on which
+commit built the binary** — `git bisect` leaves the tree's binary at an arbitrary
+commit — and **treat an impossibly clean agreement as a symptom, not a result.**
