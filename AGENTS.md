@@ -2,16 +2,26 @@
 
 ## **DO NOT USE MMAP TO LOAD MODEL WEIGHTS!!**
 
-On a UMA APU the page cache and GPU memory are the SAME pool. An mmap'd
-artifact fills page cache that GTT cannot reclaim, so a later allocation fails
-with most of the machine apparently free. Observed on the paged 122B:
-`hipMalloc(9.15 MiB), free=7466.7 MiB of total=122880.0 MiB` — a 9 MiB
-expert page-in failed while `free -g` showed 118 GiB in buff/cache.
+This is unconditional. It is not a UMA workaround — weights never want to land
+in system RAM on the way to the GPU, on any part.
 
-Read weights with explicit, bounded reads (`pread`/O_DIRECT slab path) so the
-bytes are owned and freeable. `memmap2` is currently used by `hipfire-runtime`
-(`hfq.rs`), `hipfire-quantize`, `hipfire-model` and `hipfire-gguf`; do not add
-more, and prefer removing it from any load path you touch.
+- **dGPU**: mmap stages the whole artifact through page cache, then copies to a
+  staging buffer, then DMAs to VRAM. That is host RAM you did not need and a
+  copy you did not need, and the transfer is driven by synchronous page faults
+  instead of large sequential reads you control. A bounded read into a pinned
+  buffer goes file → pinned → VRAM, one copy, fixed footprint.
+- **UMA/APU**: worse, because page cache and GPU memory are the SAME pool. The
+  mmap fills cache that GTT cannot reclaim, so a later allocation fails with the
+  machine apparently free — presenting as an allocator bug rather than a loader
+  choice. Observed on the paged 122B mid-generation:
+  `hipMalloc(9.15 MiB), free=7466.7 MiB of total=122880.0 MiB`, with `free -g`
+  showing 118 GiB in buff/cache.
+
+Read weights with explicit, bounded reads (`pread` / the O_DIRECT slab path) so
+the bytes are owned, freeable, and land where they are going. `memmap2` is
+currently used by `hipfire-runtime` (`hfq.rs`), `hipfire-quantize`,
+`hipfire-model` and `hipfire-gguf`; do not add more, and prefer removing it from
+any load path you touch.
 
 This file is the repo-wide contract for agents. Keep it small: put
 subsystem-only rules in the nearest nested `AGENTS.md`, keep long procedures in
