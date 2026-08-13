@@ -165,8 +165,29 @@ static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 /// once when `--hessian` is first resolved; absent for RTN/data-free formats.
 static CALIB_PROVENANCE: OnceLock<serde_json::Value> = OnceLock::new();
 static CALIB_PRESERVE_EXPERTS: OnceLock<HashSet<(usize, usize)>> = OnceLock::new();
+static FORCED_PRESERVE_EXPERTS: OnceLock<HashSet<(usize, usize)>> = OnceLock::new();
+
+/// `HIPFIRE_FORCE_PRESERVE_EXPERTS`, parsed once. Silently ignores malformed
+/// entries rather than failing a long quantize over a debug knob.
+fn forced_preserve_experts() -> HashSet<(usize, usize)> {
+    let Some(spec) = hipfire_env::FORCE_PRESERVE_EXPERTS.get() else {
+        return HashSet::new();
+    };
+    spec.split(',')
+        .filter_map(|pair| {
+            let (layer, expert) = pair.trim().split_once(':')?;
+            Some((layer.trim().parse().ok()?, expert.trim().parse().ok()?))
+        })
+        .collect()
+}
 
 fn calibration_preserves_expert(layer: usize, expert: usize) -> bool {
+    if FORCED_PRESERVE_EXPERTS
+        .get_or_init(forced_preserve_experts)
+        .contains(&(layer, expert))
+    {
+        return true;
+    }
     CALIB_PRESERVE_EXPERTS
         .get()
         .is_some_and(|experts| experts.contains(&(layer, expert)))
@@ -10636,6 +10657,13 @@ fn main() {
                 use_oq8_plus,
                 opus_mixed_spec.map(|s| s.group).unwrap_or(256),
             );
+            // Undercovered experts go to W8 rather than source precision, but
+            // only where an OQ expert target is actually in play — under a
+            // BF16/F16/MQ target there is no pageability to protect and the old
+            // fallback is still the right answer. See the branch below.
+            let undercovered_experts_w8 = stacked_oq_format.is_some()
+                && supports_g256
+                && !hipfire_env::UNDERCOVERED_EXPERTS_SOURCE.flag();
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -10701,7 +10729,52 @@ fn main() {
                     };
                     let m_expert = inner_shape_clone[0] as usize;
                     let mut oq_sidecar_scales: Option<Vec<f32>> = None;
-                    let (quantized, qt, gs) = if preserve_source_precision && dtype == "BF16" {
+                    let (quantized, qt, gs) = if preserve_source_precision
+                        && undercovered_experts_w8
+                    {
+                        // Undercovered experts under an Opus expert target get
+                        // W8 (qt 35), not source precision.
+                        //
+                        // The policy's intent is "spend more bits where the
+                        // corpus gave us no evidence", and BF16 is only one way
+                        // to spend them. It is also the one way that makes the
+                        // artifact UNPAGEABLE: `paged_moe_dtype_for_quant` takes
+                        // only OQ routed dtypes and hard-errors at load on qt 16,
+                        // which is what stops the 122B (644 such experts) from
+                        // paging — and paging is mandatory for it, since
+                        // OqPlusCompact expands to int8 in VRAM and the artifact
+                        // needs ~130 GB resident.
+                        //
+                        // Oq8G256 and the OqPlusCompact majority resolve to the
+                        // SAME runtime dtype and the SAME resident byte length
+                        // (`oq_gpu_dtype_for_quant_type`,
+                        // `module_tensor_resident_len`), each with its own
+                        // page-in transform. So the on-disk forms may differ per
+                        // expert while the layer stays `Uniform(Oq8G256)` — which
+                        // is the uniformity the indexed kernels actually require.
+                        //
+                        // `oq8_for_matrix_cols` picks qt 35 only when
+                        // `cols % 256 == 0`, and that is the same constraint
+                        // `oq_indexed_admissible` imposes, so a pageable artifact
+                        // never lands on the row-padded qt 43 here.
+                        let f32_bytes: Vec<u8> = f32_slice
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        let (q, qt, gs, _label) = quantize_hfq_source_tensor(
+                            &expert_name,
+                            arch_id,
+                            &f32_bytes,
+                            QuantType::F32 as u8,
+                            &inner_shape_clone,
+                            HfqInputFormat::Oq8,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("undercovered W8 expert quantize {expert_name}: {error}")
+                        });
+                        oq_sidecar_scales = OQ4_AWQ_SIDECAR.with(|cell| cell.borrow_mut().take());
+                        (q, qt, gs)
+                    } else if preserve_source_precision && dtype == "BF16" {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if preserve_source_precision && dtype == "F16" {
                         (slice.to_vec(), QuantType::F16, 0u32)
@@ -10719,8 +10792,15 @@ fn main() {
                         // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
                         // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
                         // (int4 bulk + top-frac int8 → Oq8G256 at load, default 1%,
-                        // `--w8-top` overrides). Uniform across experts (indexed kernels
-                        // require it), so kmap MQ-promotion is intentionally NOT applied.
+                        // `--w8-top` overrides).
+                        //
+                        // The uniformity the indexed kernels require is at the
+                        // RUNTIME dtype, not the on-disk form: `Oq8G256` and
+                        // `OqPlusCompact` both resolve to `DType::Oq8G256` with the
+                        // same resident length, so they may be mixed per expert
+                        // (see the undercovered-W8 branch above). What must not
+                        // vary within a layer is the resolved dtype — which is why
+                        // kmap MQ-promotion is intentionally NOT applied here.
                         // Route through the shared HFQ-source quantizer so calibrated
                         // mixed OQ (`oq4.25++`) applies AWQ/LDLQ and contributes to
                         // strict Hessian validation like ordinary 2D weights.

@@ -410,4 +410,35 @@ mod tests {
             .sqrt();
         assert!(dot / (decoded_norm * original_norm) > 0.99);
     }
+
+    /// The undercovered-expert W8 policy (hipfire-quantize) puts `Oq8G256` and
+    /// `OqPlusCompact` experts side by side in ONE layer. That is only sound
+    /// while the two on-disk forms are interchangeable at runtime: same dtype,
+    /// so `classify_routed_expert_dtypes` still sees `Uniform` and the indexed
+    /// kernels are admitted; same resident length, so the pager's per-module
+    /// capacity math holds. Verified end to end on a fixture mixing the two.
+    ///
+    /// If a future layout change breaks either, that policy silently produces
+    /// artifacts whose layers classify as `Invalid` (no dispatch path) or whose
+    /// paged modules fail their capacity assert. Pin both here.
+    #[test]
+    fn oq8_and_oqplus_compact_are_interchangeable_per_expert() {
+        use crate::oq_moe::oq8_moe_packed_len;
+        use hipfire_quant_format::QuantType as Q;
+
+        let plain = oq_gpu_dtype_for_quant_type(Q::Oq8G256 as u8);
+        let compact = oq_gpu_dtype_for_quant_type(Q::OqPlusCompact as u8);
+        assert_eq!(plain, Some(hipfire_rdna::DType::Oq8G256));
+        assert_eq!(plain, compact, "mixing the two would classify as Invalid");
+
+        // Both are sized by the same resident-length function, so a per-expert
+        // mix costs the pager nothing. (122B expert shapes.)
+        for (m, k) in [(2048usize, 3072usize), (3072, 1024)] {
+            assert!(oq8_moe_packed_len(m, k).is_ok());
+        }
+
+        // Oq4 must NOT be interchangeable with them — an oq4 + oq8 layer really
+        // is two dtypes and really is unsupported.
+        assert_ne!(plain, oq_gpu_dtype_for_quant_type(Q::Oq4G256 as u8));
+    }
 }
