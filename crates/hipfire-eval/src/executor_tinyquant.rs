@@ -439,13 +439,17 @@ fn explicit_blocked_oq_cells(family: &str) -> &'static [(&'static str, bool)] {
 /// every routed expert passes that check silently, and a `++` artifact whose
 /// experts never got error feedback is indistinguishable downstream from one
 /// where they did. `missing` is the counter that tells them apart.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct LdlqReport {
     success: u64,
     attempts: u64,
     missing: u64,
     k_mismatch: u64,
     pack_failed: u64,
+    /// Tensors the quantizer reported skipping, with its stated reason. A count
+    /// says coverage is incomplete; these say WHICH, which is the difference
+    /// between "LDLQ missed a few norms" and "no routed expert got feedback".
+    skipped: Vec<String>,
 }
 
 /// Parse `  LDLQ tensors:  success=N attempts=N missing=N k_mismatch=N pack_failed=N`.
@@ -458,12 +462,20 @@ fn parse_ldlq_report(stderr: &str) -> Option<LdlqReport> {
             .find_map(|t| t.strip_prefix(key).and_then(|v| v.parse::<u64>().ok()))
             .unwrap_or(0)
     };
+    // `  ldlq: skip <name> (<reason>)` — one per skipped tensor, emitted next to
+    // the counters this parses.
+    let skipped: Vec<String> = stderr
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ldlq: skip "))
+        .map(|s| s.trim().to_string())
+        .collect();
     Some(LdlqReport {
         success: field("success="),
         attempts: field("attempts="),
         missing: field("missing="),
         k_mismatch: field("k_mismatch="),
         pack_failed: field("pack_failed="),
+        skipped,
     })
 }
 
@@ -964,12 +976,15 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                     // Coverage, not quality: `success` alone cannot distinguish
                     // "LDLQ reached every tensor" from "it reached the dense
                     // ones and skipped every routed expert". `missing` can.
-                    if let Some(r) = ldlq {
+                    if let Some(r) = ldlq.as_ref() {
                         m.insert("ldlq_success".into(), json!(r.success));
                         m.insert("ldlq_attempts".into(), json!(r.attempts));
                         m.insert("ldlq_missing".into(), json!(r.missing));
                         m.insert("ldlq_k_mismatch".into(), json!(r.k_mismatch));
                         m.insert("ldlq_pack_failed".into(), json!(r.pack_failed));
+                        if !r.skipped.is_empty() {
+                            m.insert("ldlq_skipped".into(), json!(r.skipped));
+                        }
                     }
                     push(fam, &format!("kld:{fmt}(calib)"), st, rs, m, &mut rows);
                 }
