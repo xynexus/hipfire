@@ -4345,36 +4345,47 @@ fn collect_calibration_artifacts_sequences(
     .map_err(|e| HipError::new(0, &e))
 }
 
-/// Q8F16 on the qwen3.5 attention / DeltaNet projection path is BROKEN. Refuse
-/// to load such an artifact instead of serving incoherent text.
+/// Refuse an artifact that mixes Q8F16 attention/DeltaNet/lm_head with
+/// OQ-quantized routed experts. That COMBINATION produces incoherent output.
 ///
-/// EVIDENCE. `Qwen3.5-122B-A10B--oq4.25++` stored Q8F16 on all 48 routers, 48
-/// shared-expert gates, 180 DeltaNet projections, 48 attention projections and
-/// lm_head. It generated `6 - - 7 4 1 1 4 , 1 The` for "The capital of France
-/// is". Re-encoding exactly those tensors from source (attention / DeltaNet /
-/// lm_head to oq4.25++, routers to BF16) and changing NOTHING else produced
-/// `<think> ... The user's query is incomplete and` from the same artifact,
-/// prompt and code. `Qwen3.5-35B-A3B--oq4.25++`, which is coherent, carries
-/// Q8F16 on routers ONLY — so this artifact was the only one exercising the
-/// path, which is why nothing else caught it.
+/// EVIDENCE. `Qwen3.5-122B-A10B--oq4.25++` stored Q8F16 on 229 attention /
+/// DeltaNet / lm_head tensors alongside OqPlusCompact experts, and generated
+/// `6 - - 7 4 1 1 4 , 1 The` for "The capital of France is". Re-encoding exactly
+/// those tensors from source, changing nothing else, produced
+/// `<think> ... The user's query is incomplete and`.
 ///
-/// WHAT IS NOT KNOWN. Those tensor classes were replaced in one pass, so the
-/// culprit is somewhere in {attention, DeltaNet, lm_head}, not pinned further.
-/// Q8F16 is near-lossless as a FORMAT — a 5% quality story cannot produce digit
-/// soup — so the defect is in how this path reads or dispatches Q8F16, and it is
-/// UNDIAGNOSED. Routers are excluded from the gate: the 35B serves coherently
-/// with Q8F16 routers, so they are demonstrably fine.
+/// IT IS THE MIX, NOT Q8. A UNIFORM q8f16 qwen3.5 artifact — every tensor Q8,
+/// DeltaNet and full attention included — measures ~0.0005 mean KLD against its
+/// fp16 anchor in `tiny_quant`, i.e. near-lossless. So Q8F16 on this path is
+/// fine on its own; it breaks when the routed experts are OQ. That is why the
+/// tiny tier never caught it: its q8f16 cells are uniform Q8 and its OQ cells
+/// are uniform OQ, so nothing builds the mixed shape a real calibrated MoE has.
+/// Gating on Q8-attention alone rejected those legitimate fixtures.
 ///
-/// Set `HIPFIRE_ALLOW_Q8_ATTENTION=1` to load anyway — which is exactly what
-/// diagnosing the underlying bug requires, since this gate otherwise makes the
-/// only known reproducer unloadable.
+/// WHAT IS NOT KNOWN. The 229 tensors were replaced in one pass, so the culprit
+/// is somewhere in {attention, DeltaNet, lm_head} and is not pinned further, and
+/// the mechanism is UNDIAGNOSED. Q8F16 is near-lossless as a format, so this is
+/// a code defect — plausibly a dispatch or layout assumption that holds only
+/// when the whole model shares one family. Routers are excluded: the coherent
+/// 35B carries Q8F16 routers next to OQ experts, so that pairing demonstrably
+/// works.
+///
+/// Set `HIPFIRE_ALLOW_Q8_ATTENTION=1` to load anyway — required to debug this,
+/// since the gate otherwise makes the only known reproducer unloadable.
 fn reject_q8_attention(hfq: &HfqFile) -> HipResult<()> {
     const Q8F16: u8 = 3;
     if hipfire_env::ALLOW_Q8_ATTENTION.flag() {
         eprintln!(
             "  warning: HIPFIRE_ALLOW_Q8_ATTENTION=1 — loading Q8F16 attention/DeltaNet \
-             weights, which are known to produce incoherent output"
+             weights beside OQ experts, a combination known to produce incoherent output"
         );
+        return Ok(());
+    }
+    let has_oq_experts = hfq.tensors().iter().any(|t| {
+        t.name.contains(".mlp.experts.")
+            && hipfire_runtime::quant::oq_gpu_dtype_for_quant_type(t.quant_type).is_some()
+    });
+    if !has_oq_experts {
         return Ok(());
     }
     let mut offenders: Vec<&str> = hfq
@@ -4400,9 +4411,9 @@ fn reject_q8_attention(hfq: &HfqFile) -> HipResult<()> {
         0,
         &format!(
             "this artifact stores {} attention/DeltaNet/lm_head tensor(s) as Q8F16 (quant_type \
-             3), which produces incoherent output on the qwen3.5 path — e.g. {}{}. The root \
-             cause is not yet diagnosed; the format is near-lossless, so this is a code defect, \
-             not a precision limit. Re-encode those tensors from the source archive:\n  \
+             3) alongside OQ-quantized routed experts — e.g. {}{}. That COMBINATION produces \
+             incoherent output on the qwen3.5 path (uniform Q8 is fine; the mix is not). Root \
+             cause undiagnosed. Re-encode those tensors from the source archive:\n  \
              hipfire-quantize --input <this.hfq> --output <fixed.hfq> --format oq8 \
              --tensor-source <model.hfa> --hessian <model.calib.hfq> \
              --tensor-format '*self_attn.q_proj.weight=oq4.25++' (and k/v/o, \
@@ -4427,11 +4438,45 @@ mod q8_attention_gate_tests {
     /// broken path — and NOT the routers, which the coherent 35B proves are
     /// fine. An earlier version used `ends_with("_proj.weight")` and silently
     /// missed every `in_proj_*`: 85 of 229.
+    ///
+    /// Name matching alone is not the whole gate: it fires only when the
+    /// artifact ALSO has OQ routed experts, because a uniform q8f16 qwen3.5
+    /// model is near-lossless and the tiny tier builds those.
     fn gated(name: &str) -> bool {
         name.ends_with("lm_head.weight")
             || name.contains(".self_attn.")
             || (name.contains(".linear_attn.")
                 && (name.contains(".in_proj") || name.contains(".out_proj")))
+    }
+
+    /// The gate is an AND: broken-class name *and* OQ routed experts present.
+    /// Dropping the second half rejected the tiny tier's uniform q8f16 qwen3.5
+    /// fixtures, which measure ~0.0005 KLD — near-lossless, and legitimate.
+    fn has_oq_experts(quant_types: &[(&str, u8)]) -> bool {
+        quant_types.iter().any(|(name, qt)| {
+            name.contains(".mlp.experts.")
+                && hipfire_runtime::quant::oq_gpu_dtype_for_quant_type(*qt).is_some()
+        })
+    }
+
+    #[test]
+    fn uniform_q8_model_is_not_gated_only_the_mix_is() {
+        const Q8F16: u8 = 3;
+        const OQ_PLUS_COMPACT: u8 = 36;
+        let attn = "model.layers.0.self_attn.q_proj.weight";
+        // Uniform Q8: experts are Q8 too, so nothing to mix with.
+        assert!(!has_oq_experts(&[
+            (attn, Q8F16),
+            ("model.layers.0.mlp.experts.0.gate_up_proj.weight", Q8F16),
+        ]));
+        // The 122B's shape: Q8 attention beside OQ experts.
+        assert!(has_oq_experts(&[
+            (attn, Q8F16),
+            (
+                "model.layers.0.mlp.experts.0.gate_up_proj.weight",
+                OQ_PLUS_COMPACT
+            ),
+        ]));
     }
 
     #[test]
