@@ -76,9 +76,9 @@ pub(crate) fn forward_scratch_layers(
                 // The hand path owns this stage. Prepare the shared normalized
                 // input once; the lowered bridge is a complete alternative,
                 // not a prelude to the manual projections below.
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wqkv,
+                    &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -947,9 +947,9 @@ pub(crate) fn forward_scratch_layers(
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
                 // Fused rmsnorm + FWHT rotation for wq/wk/wv (all share input).
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wq,
+                    &[&layer.wq, &layer.wk, &layer.wv],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -1609,9 +1609,9 @@ pub(crate) fn forward_scratch_layers(
                 // for full-attention layers (post-attn residual feeding ffn_norm).
                 dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.w_gate,
+                    &[&layer.w_gate, &layer.w_up],
                     &s.x,
                     &layer.ffn_norm,
                     &s.tmp,
@@ -1818,9 +1818,9 @@ pub(crate) fn forward_scratch_layers(
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wqkv,
+                    &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -2151,9 +2151,9 @@ pub(crate) fn forward_scratch_layers(
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
                 trace_stage_if_enabled(&format!("layer {layer_idx} FullAttnMoe enter"));
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wq,
+                    &[&layer.wq, &layer.wk, &layer.wv],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,

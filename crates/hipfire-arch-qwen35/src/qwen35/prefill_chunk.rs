@@ -7942,9 +7942,9 @@ fn run_fa_layer_body(
     };
 
     // Fused rmsnorm + FWHT rotation for wq/wk/wv (MQ-family).
-    let x_rot = fused_rmsnorm_rotate_for_mq(
+    let x_rot = fused_rmsnorm_prepare_bases(
         gpu,
-        &layer.wq,
+        &[&layer.wq, &layer.wk, &layer.wv],
         &s.x,
         &layer.attn_norm,
         &s.tmp,
@@ -8452,9 +8452,9 @@ fn run_fa_layer_body(
     }
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
-    let x_rot = fused_rmsnorm_rotate_for_mq(
+    let x_rot = fused_rmsnorm_prepare_bases(
         gpu,
-        &layer.w_gate,
+        &[&layer.w_gate, &layer.w_up],
         &s.x,
         &layer.ffn_norm,
         &s.tmp,

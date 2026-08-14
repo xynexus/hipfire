@@ -28,7 +28,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weights::{
-    fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
+    fused_rmsnorm_prepare_bases, fused_rmsnorm_rotate_for_paro,
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
