@@ -844,13 +844,19 @@ pub fn grouped_moe_prefill_session_batch_kvarn_flush_layer(
         let window = route.kv.k_window_gpu.get(layer_index).ok_or_else(|| {
             hip_bridge::HipError::new(
                 0,
-                &format!("KVarN flush session {} has no window for layer {layer_index}", flush.session_index),
+                &format!(
+                    "KVarN flush session {} has no window for layer {layer_index}",
+                    flush.session_index
+                ),
             )
         })?;
         let records = route.kv.k_gpu.get(layer_index).ok_or_else(|| {
             hip_bridge::HipError::new(
                 0,
-                &format!("KVarN flush session {} has no records for layer {layer_index}", flush.session_index),
+                &format!(
+                    "KVarN flush session {} has no records for layer {layer_index}",
+                    flush.session_index
+                ),
             )
         })?;
         // window [group, kv_dim] token-major -> tiles [n_kv_heads, head_dim*group]
@@ -858,13 +864,7 @@ pub fn grouped_moe_prefill_session_batch_kvarn_flush_layer(
         gpu.kvarn_gather_k_tiles(window, ctx.tiles, 1, n_kv_heads, head_dim, ctx.group)?;
         let rec_view = records.sub_offset(flush.block_index * tile_elems, tile_elems);
         gpu.kvarn_quantize_tile(
-            ctx.tiles,
-            &rec_view,
-            n_kv_heads,
-            head_dim,
-            ctx.group,
-            rec_bytes,
-            ctx.bits,
+            ctx.tiles, &rec_view, n_kv_heads, head_dim, ctx.group, rec_bytes, ctx.bits,
         )?;
     }
     Ok(())
@@ -3253,12 +3253,18 @@ fn forward_prefill_dense_session_batch_impl(
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     // Uniform rows (state-signature contract), so row 0 decides for the batch.
     let kvarn_batch = qwen35_kvarn_fused_batch_enabled()
-        && contract_signatures.first().is_some_and(|s| s.kv_quant_kvarn);
+        && contract_signatures
+            .first()
+            .is_some_and(|s| s.kv_quant_kvarn);
     let pointer_table_plan = dense_prefill_session_batch_pointer_table_plan(
         &execution_plan,
         route_shape,
         rows.len(),
-        if kvarn_batch { route_shape.kv_k_layers } else { 0 },
+        if kvarn_batch {
+            route_shape.kv_k_layers
+        } else {
+            0
+        },
     );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
@@ -4656,15 +4662,18 @@ pub fn forward_prefill_grouped_moe_session_batch(
         .map(|signature| matches!(signature.dn_quant, StateQuant::FP16))
         .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
-    let pointer_table_plan =
-        dense_prefill_session_batch_pointer_table_plan(
-            &execution_plan,
-            route_shape,
-            rows.len(),
-            // KVarN needs a window pointer per layer per session; every other
-            // mode keeps one K buffer and wants the table absent.
-            if kvarn_batch { route_shape.kv_k_layers } else { 0 },
-        );
+    let pointer_table_plan = dense_prefill_session_batch_pointer_table_plan(
+        &execution_plan,
+        route_shape,
+        rows.len(),
+        // KVarN needs a window pointer per layer per session; every other
+        // mode keeps one K buffer and wants the table absent.
+        if kvarn_batch {
+            route_shape.kv_k_layers
+        } else {
+            0
+        },
+    );
     if execution_plan.multi_state_prefix_rows > pbs.max_batch {
         return Err(hip_bridge::HipError::new(
             0,

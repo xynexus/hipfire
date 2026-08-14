@@ -130,8 +130,7 @@ pub(crate) fn lower_variant(v: Q35Variant) -> LayerProgram {
 pub(crate) struct Qwen35Bindings<'a> {
     /// Weight pager, `Some` only for paged-expert models. `run_moe` forwards it
     /// so the lowered path can make selected experts resident before dispatch.
-    pub(crate) pager:
-        Option<&'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
+    pub(crate) pager: Option<&'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     pub(crate) layer: &'a LayerWeights,
     pub(crate) s: &'a Qwen35Scratch,
     pub(crate) config: &'a Qwen35Config,
@@ -508,8 +507,17 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s, self.layer_idx, self.pager)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
+        moe_ffn_dispatch(
+            gpu,
+            ffn,
+            &s.x,
+            ffn_norm,
+            config,
+            s,
+            self.layer_idx,
+            self.pager,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
     fn run_moe_ep(

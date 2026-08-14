@@ -2865,6 +2865,49 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
 /// dispatch (including ParoQ4G128 which does individual Givens-rotated GEMV calls).
 /// Replaces rmsnorm_rotate_dispatch + fused_qkvza_dispatch.
 #[allow(clippy::too_many_arguments)]
+/// Rotation plan for a projection GROUP that will share ONE activation basis.
+///
+/// The `*_via_execute_steps` pipelines emit a single `Step::RmsnormAutomatic`
+/// and hand its output to every `Step::Gemv` in the group. That is only sound
+/// while the members agree on the basis, so this requires agreement instead of
+/// sampling one member — which is what the callers used to do
+/// (`dtype_rotation_plan(wqkv.gpu_dtype)` deciding for wqkv, wz, w_beta and
+/// w_alpha alike).
+///
+/// A mixed group cannot be served at all today: `RotationVariant::WithRmsnorm`
+/// accepts an `x_plain` buffer and never writes it — every one of its kernels
+/// emits only `x_rot` — so there is no second basis for the unrotated members to
+/// read. Feeding them the rotated one is silent corruption, and it is
+/// measurable: on a 2-layer fixture, one DeltaNet input projection at Q8F16
+/// beside OQ4 siblings scored 0.848 mean KLD against 0.206 for the uniform
+/// group, while the whole group at Q8 scored 0.061. The error tracks group
+/// agreement, not bit width.
+///
+/// So this refuses. Serving mixed groups needs the rotated path to also produce
+/// the plain basis (`fused_rmsnorm_rotate_mq_plain` already does, for the
+/// non-AWQ case) and each `Gemv` to select by its own dtype. Every artifact in
+/// the tree today is uniform within these groups, including the tiny MoE
+/// fixtures whose DeltaNet projections are all Q8F16 fallbacks.
+fn group_rotation_plan(group: &[&WeightTensor], what: &str) -> HipResult<RotationPlan> {
+    let plan = dtype_rotation_plan(group[0].gpu_dtype);
+    for w in &group[1..] {
+        let other = dtype_rotation_plan(w.gpu_dtype);
+        if other != plan {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{what}: projections in one group need different activation bases \
+                     ({:?} wants {plan:?}, {:?} wants {other:?}), and they share a single \
+                     rmsnorm output. Requantize so the group agrees — a mixed group is \
+                     silently wrong, not merely slower.",
+                    group[0].gpu_dtype, w.gpu_dtype
+                ),
+            ));
+        }
+    }
+    Ok(plan)
+}
+
 fn qkvza_via_execute_steps(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -2882,7 +2925,7 @@ fn qkvza_via_execute_steps(
     dn_alpha: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
-    let rotation = dtype_rotation_plan(wqkv.gpu_dtype);
+    let rotation = group_rotation_plan(&[wqkv, wz, w_beta, w_alpha], "DeltaNet in_proj group")?;
     if rotation == RotationPlan::Givens {
         // ParoQ4G128: plain rmsnorm, then per-weight Givens rotation inside run_auto.
         let wr_qkv = WeightRef {
@@ -3050,7 +3093,7 @@ fn qkv_via_execute_steps(
     fa_v: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
-    let rotation = dtype_rotation_plan(wq.gpu_dtype);
+    let rotation = group_rotation_plan(&[wq, wk, wv], "attention qkv group")?;
     if rotation == RotationPlan::Givens {
         let wrq = WeightRef {
             buf: &wq.buf,
@@ -3182,7 +3225,7 @@ fn gate_up_via_execute_steps(
     up_out: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
-    let rotation = dtype_rotation_plan(w_gate.gpu_dtype);
+    let rotation = group_rotation_plan(&[w_gate, w_up], "dense FFN gate/up group")?;
     if rotation == RotationPlan::Givens {
         let wrg = WeightRef {
             buf: &w_gate.buf,
@@ -5780,8 +5823,7 @@ mod tests {
             kvarn_row(0, 128), // would land in slot 0 — must be in a later segment
             kvarn_row(1, 11),
         ];
-        let (splits, flushes) =
-            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
         assert_eq!(splits, vec![3, 5]);
         assert_eq!(
             flushes[0],
@@ -5792,7 +5834,10 @@ mod tests {
         );
         assert!(flushes[1].is_empty());
         // The wrapping row is strictly after the split that drains the window.
-        assert!(splits[0] <= 3, "row at position 128 must not share a segment");
+        assert!(
+            splits[0] <= 3,
+            "row at position 128 must not share a segment"
+        );
     }
 
     /// Block index is the session's own ordinal, not a row ordinal — the flush
@@ -5805,8 +5850,7 @@ mod tests {
             kvarn_row(2, 255),  // session 2, block 1
             kvarn_row(1, 1023), // session 1, block 7
         ];
-        let (splits, flushes) =
-            grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
+        let (splits, flushes) = grouped_moe_prefill_session_batch_kvarn_block_flushes(&rows, group);
         assert_eq!(splits, vec![1, 2]);
         assert_eq!(flushes[0][0].block_index, 1);
         assert_eq!(flushes[0][0].session_index, 2);
@@ -5828,7 +5872,10 @@ mod tests {
             assert_eq!(*splits.last().unwrap(), rows.len(), "group={group}");
             let mut prev = 0usize;
             for &s in &splits {
-                assert!(s > prev, "group={group}: split {s} must advance past {prev}");
+                assert!(
+                    s > prev,
+                    "group={group}: split {s} must advance past {prev}"
+                );
                 prev = s;
             }
         }
@@ -5857,7 +5904,11 @@ mod tests {
                 }
                 seg_start = split;
             }
-            assert_eq!(seg_start, rows.len(), "group={group}: last split must end the batch");
+            assert_eq!(
+                seg_start,
+                rows.len(),
+                "group={group}: last split must end the batch"
+            );
             assert!(
                 covered.iter().all(|&c| c == 1),
                 "group={group}: every row must be written exactly once, got {covered:?}"
