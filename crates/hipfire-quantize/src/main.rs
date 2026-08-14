@@ -495,9 +495,7 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
             "LDLQ covered {success}/{attempts} eligible tensors \
              (missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
         );
-        let refuse = std::env::var("HIPFIRE_LDLQ_STRICT")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"));
+        let refuse = hipfire_env::LDLQ_STRICT.flag();
         if refuse {
             return Err(format!(
                 "{detail}. A `++` format promises Hessian/LDLQ error feedback on every \
