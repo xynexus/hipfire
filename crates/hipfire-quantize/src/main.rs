@@ -473,6 +473,45 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
             "calibrated plus format requested, but LDLQ applied to zero tensors (attempts={attempts}, missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
         ));
     }
+    // A PARTIAL application is the dangerous case, not the empty one. `success >
+    // 0` above passes a build that covered the dense tensors and skipped every
+    // routed expert, and the artifact still gets written with the `++` name
+    // promising Hessian/LDLQ feedback it only partly received. Downstream that
+    // is undetectable — the same mislabelled-artifact failure this binary
+    // already refuses `qtip3++` over, reached by a different route.
+    //
+    // WARN by default, refuse under `HIPFIRE_LDLQ_STRICT=1`. Refusing outright
+    // is the principled position and matches the `qtip3++` precedent, but it is
+    // NOT the default here yet: turning it on failed 11 further cells across the
+    // tiny matrix (llama, minimax and others each sit at missing=1), and those
+    // are tensors whose absence has never been explained. Hard-failing every
+    // `++` build on this box to enforce a rule nobody has justified per-family
+    // would be imposing a policy, not fixing a bug. Surfacing it loudly gets the
+    // information out — which was the actual defect, since a partial pass was
+    // previously silent — and leaves the policy call to whoever explains those
+    // tensors. Flip the default once missing=1 is understood.
+    if strict && (missing > 0 || k_mismatch > 0 || pack_failed > 0) {
+        let detail = format!(
+            "LDLQ covered {success}/{attempts} eligible tensors \
+             (missing={missing}, k_mismatch={k_mismatch}, pack_failed={pack_failed})"
+        );
+        let refuse = std::env::var("HIPFIRE_LDLQ_STRICT")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"));
+        if refuse {
+            return Err(format!(
+                "{detail}. A `++` format promises Hessian/LDLQ error feedback on every \
+                 eligible tensor; a partial pass ships an artifact whose name overstates \
+                 what it got and which is indistinguishable downstream from a complete \
+                 one. The skipped tensors are listed above."
+            ));
+        }
+        eprintln!(
+            "  LDLQ PARTIAL:     {detail} — this artifact is named `++` but did NOT get \
+             error feedback on every eligible tensor (skipped tensors listed above). \
+             HIPFIRE_LDLQ_STRICT=1 to refuse instead."
+        );
+    }
     Ok(())
 }
 
@@ -6441,6 +6480,28 @@ fn calibration_tensor_name_candidates(name: &str) -> Vec<String> {
             push_unique(&mut names, format!("model.{rest}"));
         } else if let Some(rest) = base.strip_prefix("model.") {
             push_unique(&mut names, format!("model.language_model.{rest}"));
+        }
+    }
+
+    // FUSED -> SPLIT fallback. An artifact may fuse gate and up into one
+    // `gate_up_proj` while the calibration that produced the Hessian saw them as
+    // separate `gate_proj` / `up_proj` linears — which is the case whenever the
+    // runtime model holds them apart and the quantizer packs them together.
+    //
+    // Falling back is not an approximation: gate_proj, up_proj and the fused
+    // gate_up_proj all consume the SAME layer input, so the input-activation
+    // Hessian (sum of x x^T over that input) is the same matrix for all three.
+    // Its K is the shared input width, so the existing `hk != k` check still
+    // validates the match rather than trusting this reasoning — a genuine
+    // mismatch is reported as k_mismatch instead of being silently accepted.
+    //
+    // Appended AFTER the direct candidates so an exact fused entry always wins.
+    for base in names.clone() {
+        if let Some(idx) = base.rfind("gate_up_proj") {
+            let (head, tail) = base.split_at(idx);
+            let rest = &tail["gate_up_proj".len()..];
+            push_unique(&mut names, format!("{head}gate_proj{rest}"));
+            push_unique(&mut names, format!("{head}up_proj{rest}"));
         }
     }
     names
@@ -16062,6 +16123,33 @@ mod tests {
         assert_eq!(normalize_format_flag(" BF16 "), "bf16");
         assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
         assert_eq!(normalize_format_flag("OQ4+"), "oq4+");
+    }
+
+    /// A fused `gate_up_proj` must also look for the SPLIT `gate_proj` /
+    /// `up_proj` a calibration may have captured, since all three consume the
+    /// same layer input and therefore share one input-activation Hessian.
+    /// Without this, every routed expert on an arch that fuses in the artifact
+    /// but splits at runtime silently gets no LDLQ (measured: gemma4_moe, 16 of
+    /// 54 tensors, all of them expert gate_up).
+    #[test]
+    fn fused_gate_up_falls_back_to_split_hessian_names() {
+        let c = calibration_tensor_name_candidates(
+            "model.language_model.layers.0.experts.7.gate_up_proj.weight",
+        );
+        // The exact fused name still comes FIRST — the fallback must never
+        // shadow a real fused entry.
+        assert_eq!(c[0], "model.language_model.layers.0.experts.7.gate_up_proj.weight");
+        for want in [
+            "model.language_model.layers.0.experts.7.gate_proj",
+            "model.language_model.layers.0.experts.7.up_proj",
+            // and through the short-prefix variant the collector may have used
+            "model.layers.0.experts.7.gate_proj",
+        ] {
+            assert!(c.iter().any(|x| x == want), "missing candidate {want}; got {c:?}");
+        }
+        // A name with no fused segment gains no split variants.
+        let d = calibration_tensor_name_candidates("model.layers.0.experts.7.down_proj.weight");
+        assert!(!d.iter().any(|x| x.contains("gate_proj")), "{d:?}");
     }
 
     #[test]
