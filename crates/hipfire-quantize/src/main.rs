@@ -5769,6 +5769,7 @@ fn run_hfq_source_pipeline(
     tensor_overrides: &[TensorFormatOverride],
     mixed_bpw_target: Option<f64>,
     tensor_source: Option<&Path>,
+    copy_untargeted: bool,
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
     // `--tensor-source`: where TARGETED tensors are re-read from at source
@@ -6095,15 +6096,20 @@ fn run_hfq_source_pipeline(
         // An override that TARGETS a quantized tensor still errors: the user
         // asked for a re-encode that cannot be done, and silently copying would
         // hand back an artifact that does not match the request.
-        // With overrides present the pass is SURGICAL: touch exactly what was
-        // targeted, copy everything else whatever its precision. Re-encoding the
-        // untargeted source-precision tensors would rewrite norms and — worse —
-        // the F16 AWQ sidecars, which `load_awq_scale_for` requires at qt 1.
+        // `--copy-untargeted` makes the pass SURGICAL: touch exactly what was
+        // targeted, copy everything else whatever its precision. That is what
+        // repairing an existing artifact wants — re-encoding the untargeted
+        // source-precision tensors would rewrite norms and, worse, the F16 AWQ
+        // sidecars `load_awq_scale_for` requires at qt 1.
         //
-        // No overrides keeps the old rule (requantize source precision, refuse
-        // quantized input). Nothing working is lost either way: before this,
-        // HFQ input aborted on its first quantized tensor.
-        let surgical = !tensor_overrides.is_empty();
+        // It is a FLAG rather than "overrides are present", which is what this
+        // inferred before. The inference made the other use case impossible:
+        // building a MIXED artifact from a source-precision .hfq — base format
+        // for most tensors, an override for a few — silently copied everything
+        // instead. That shape is exactly what the tiny tier lacks and what the
+        // Q8-attention/OQ-expert bug lives in, so the tool could not construct
+        // its own reproducer.
+        let surgical = copy_untargeted;
         let is_source_precision = hfq_source_dtype(t.quant_type).is_some();
         // Targeted but already quantized: re-read the ORIGINAL from
         // `--tensor-source` rather than refusing. This is the whole point of the
@@ -7256,6 +7262,9 @@ OPTIONS:
     --tensor-source <PATH>     .hfa archive to re-read TARGETED tensors from at source
                                precision, so an already-quantized tensor can be replaced
                                without requantizing the whole model
+    --copy-untargeted          copy every tensor no --tensor-format glob matched, verbatim,
+                               instead of applying --format to it. Use when REPAIRING an
+                               artifact; omit to build a mixed one from a bf16 .hfq
     --include-vision           include vision-tower tensors (default: skipped)
     --vision-quant <FMT>       format for vision tensors when --include-vision is set
 
@@ -7460,6 +7469,7 @@ fn main() {
     }
     let tensor_source: Option<std::path::PathBuf> =
         arg_value(&args, "--tensor-source").map(std::path::PathBuf::from);
+    let copy_untargeted = args.iter().any(|a| a == "--copy-untargeted");
     let tensor_format_overrides = parse_tensor_format_overrides(&args).unwrap_or_else(|error| {
         eprintln!("error: {error}");
         std::process::exit(2);
@@ -8624,6 +8634,7 @@ fn main() {
                 &tensor_format_overrides,
                 mixed_bpw_target,
                 tensor_source.as_deref(),
+                copy_untargeted,
             ) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
