@@ -450,6 +450,11 @@ struct LdlqReport {
     /// says coverage is incomplete; these say WHICH, which is the difference
     /// between "LDLQ missed a few norms" and "no routed expert got feedback".
     skipped: Vec<String>,
+    /// Routed-expert tensors that resolved to a LAYER-POOLED donor Hessian
+    /// rather than their own. Counted separately because a pooled build and a
+    /// per-expert one are different experiments, and a `success` that came from
+    /// pooling is not the same evidence as a direct hit.
+    pooled: u64,
 }
 
 /// Parse `  LDLQ tensors:  success=N attempts=N missing=N k_mismatch=N pack_failed=N`.
@@ -469,6 +474,16 @@ fn parse_ldlq_report(stderr: &str) -> Option<LdlqReport> {
         .filter_map(|l| l.trim().strip_prefix("ldlq: skip "))
         .map(|s| s.trim().to_string())
         .collect();
+    // `  LDLQ pooled:      N routed-expert tensor(s) used a LAYER-POOLED Hessian`
+    // — printed only when N > 0, so absence means zero.
+    let pooled = stderr
+        .lines()
+        .find(|l| l.contains("LDLQ pooled:"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|t| t.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
     Some(LdlqReport {
         success: field("success="),
         attempts: field("attempts="),
@@ -476,6 +491,7 @@ fn parse_ldlq_report(stderr: &str) -> Option<LdlqReport> {
         k_mismatch: field("k_mismatch="),
         pack_failed: field("pack_failed="),
         skipped,
+        pooled,
     })
 }
 
@@ -982,6 +998,7 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                         m.insert("ldlq_missing".into(), json!(r.missing));
                         m.insert("ldlq_k_mismatch".into(), json!(r.k_mismatch));
                         m.insert("ldlq_pack_failed".into(), json!(r.pack_failed));
+                        m.insert("ldlq_pooled".into(), json!(r.pooled));
                         if !r.skipped.is_empty() {
                             m.insert("ldlq_skipped".into(), json!(r.skipped));
                         }

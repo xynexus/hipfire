@@ -2044,34 +2044,44 @@ reproduction and the reasoning that led to the real cause are still useful.
 - Scope: Tooling / evidence integrity
 - Confidence: High (self-test is deterministic and reproduces on all 3 files)
 
-## [High] gemma4_moe `++` artifacts get NO LDLQ on every expert's gate_up_proj — and are still named `++`
-- Category: Correctness / Quantization (mislabelled artifact)
-- Location: `crates/hipfire-quantize/src/main.rs` `ldlq_hessian_for_tensor`
-  (L402) + `calibration_tensor_name_candidates` (L6425); capture side
-  `crates/hipfire-runtime/src/calibration/expert_capture.rs:777`
-- Measured 2026-08-13 on the tiny gemma4_moe fixture, `oq4++` / `oq4.25++` /
-  `oq8++`, all three identical: **16 of 54 LDLQ-eligible tensors skipped, and
-  they are EXACTLY the 16 routed-expert `gate_up_proj` weights** (2 layers x 8
-  experts, all of them). All 16 matching `down_proj` succeed.
-- So Hessian/LDLQ error feedback is applied to the down half of every expert and
-  none of the gate_up half — the larger half, since gate_up is 2x the
-  intermediate width — while the artifact still carries the `++` name. This is
-  the mislabelled-artifact failure the quantizer explicitly REFUSES `qtip3++`
-  over ("the second `+` would be a lie"), reached by another route and not
-  refused: `ldlq_report_and_validate` only enforces `success > 0`.
-- Mechanism is a name-lookup miss ("no Hessian entry"), not a computation
-  failure. `calibration_tensor_name_candidates` tries only the full name, the
-  name minus `.weight`, and a `model.language_model.` <-> `model.` swap.
-- LEAD, not a confirmed cause: the capture registers
-  `model.layers.{L}.mlp.experts.{E}.{gate_up,down}_proj` — an `.mlp.` segment no
-  candidate produces. That cannot be the whole story alone, since `down_proj` is
-  registered by the same code and DOES resolve.
-- `qwen3_5_moe` is unaffected (missing=0, 40/40), so this is family-specific,
-  not inherent to MoE.
-- Suggested fix, in order: (1) make `ldlq_report_and_validate` strict about
-  `missing > 0` for a `++` format, or refuse to emit the `++` name — a silent
-  partial application is undetectable downstream; (2) fix the name resolution.
-- Visible in `results.jsonl` as `ldlq_missing` / `ldlq_skipped` per calibrated
-  cell (`ba5f9612f`).
-- Confidence: High on the measurement (reproducible, all three `++` formats
-  agree); the naming cause is not yet pinned.
+## [Low — harness limitation, NOT a shipped-artifact bug] tiny-quant `++` cells cover no routed expert
+- Category: Test coverage / Quantization evidence
+- **Filed 2026-08-13 as [High] claiming shipped gemma4_moe `++` artifacts skip
+  LDLQ on every expert `gate_up_proj`. That was wrong and is corrected here.**
+- What is actually measured, on the tiny fixture:
+
+      gemma4_moe   success=38  attempts=54  missing=16  pooled=0
+      qwen3_5_moe  success=40  attempts=40  missing=0   pooled=0
+
+  The 16 missing are exactly the routed-expert `gate_up_proj` weights (2 layers
+  x 8 experts), and NO `down_proj` appears in the skip list.
+- The correction: `crates/hipfire-serving-core/src/tiny_harness.rs:1370` says it
+  outright — "Routed experts (if any) would be imatrix-only, but we don't name
+  them, so a plain collector suffices — only the named dense linears are
+  captured." **The tiny harness deliberately captures no routed-expert
+  Hessians.** So no routed expert can get LDLQ in these cells, and `pooled=0`
+  rules out the donor fallback that would otherwise explain `down_proj`. The 38
+  successes are the DENSE tensors; expert `down_proj` is never attempted, and
+  `qwen3_5_moe`'s `missing=0` is the control — its experts are not attempted
+  either, or they would miss for the same reason.
+- So the earlier "down half covered, gate_up half not" reading was wrong. The
+  real asymmetry is narrower and duller: gemma4_moe's fused `gate_up_proj` is
+  ATTEMPTED (and correctly reported missing), while other expert tensors are not
+  attempted at all.
+- **Production impact: untested, and probably none.** The real calibration engine
+  DOES register expert tensors (`calibration/expert_capture.rs:777`), and a real
+  dense model calibrated through it came back `missing=0, 186/186`. A real MoE
+  through the real engine has not been measured — that is the open question, and
+  it cannot be answered from this harness.
+- What survives as a genuine hardening gap: `ldlq_report_and_validate`
+  (`hipfire-quantize/src/main.rs:444`) enforces only `success > 0`, so a build
+  that skipped every routed expert would still emit an artifact named `++`. That
+  is the mislabelled-artifact failure the quantizer explicitly refuses `qtip3++`
+  over, and it would be invisible downstream. Making it strict about
+  `missing > 0` for a `++` format is cheap insurance whether or not it fires
+  today.
+- Also: these `++` cells test LDLQ on dense tensors only, which compounds the
+  random-init insensitivity documented in `docs/tiny-quant-gate-8-failures.md` —
+  a second, independent reason the calibrated block is low-information.
+- Visible per calibrated cell in `results.jsonl` as `ldlq_{success,attempts,
+  missing,k_mismatch,pack_failed,pooled}` and `ldlq_skipped`.
