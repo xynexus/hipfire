@@ -2044,44 +2044,50 @@ reproduction and the reasoning that led to the real cause are still useful.
 - Scope: Tooling / evidence integrity
 - Confidence: High (self-test is deterministic and reproduces on all 3 files)
 
-## [Low — harness limitation, NOT a shipped-artifact bug] tiny-quant `++` cells cover no routed expert
-- Category: Test coverage / Quantization evidence
-- **Filed 2026-08-13 as [High] claiming shipped gemma4_moe `++` artifacts skip
-  LDLQ on every expert `gate_up_proj`. That was wrong and is corrected here.**
-- What is actually measured, on the tiny fixture:
+## [Medium] tiny-quant `++` cells: gemma4_moe expert gate_up gets no Hessian — a hand-rolled capture map names it SPLIT while the artifact FUSES it
+- Category: Test coverage / calibration name resolution
+- Location: `crates/hipfire-serving-core/src/tiny_harness.rs` `capture_names()`
+  Gemma4 arm (L1067); `crates/hipfire-quantize/src/main.rs`
+  `calibration_tensor_name_candidates` (L6425)
+- **This entry has been wrong twice. The mechanism below is established by
+  name-level comparison, not inference.** First filed [High] with the right
+  symptom and a guessed mechanism; then retracted on a stale code comment
+  ("routed experts ... we don't name them") that does not describe what the
+  Gemma4 arm actually does. It names them — under the wrong names.
+- The capture map registers, per expert:
 
-      gemma4_moe   success=38  attempts=54  missing=16  pooled=0
-      qwen3_5_moe  success=40  attempts=40  missing=0   pooled=0
+      model.language_model.layers.{L}.experts.{E}.gate_proj    <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.up_proj      <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.down_proj
 
-  The 16 missing are exactly the routed-expert `gate_up_proj` weights (2 layers
-  x 8 experts), and NO `down_proj` appears in the skip list.
-- The correction: `crates/hipfire-serving-core/src/tiny_harness.rs:1370` says it
-  outright — "Routed experts (if any) would be imatrix-only, but we don't name
-  them, so a plain collector suffices — only the named dense linears are
-  captured." **The tiny harness deliberately captures no routed-expert
-  Hessians.** So no routed expert can get LDLQ in these cells, and `pooled=0`
-  rules out the donor fallback that would otherwise explain `down_proj`. The 38
-  successes are the DENSE tensors; expert `down_proj` is never attempted, and
-  `qwen3_5_moe`'s `missing=0` is the control — its experts are not attempted
-  either, or they would miss for the same reason.
-- So the earlier "down half covered, gate_up half not" reading was wrong. The
-  real asymmetry is narrower and duller: gemma4_moe's fused `gate_up_proj` is
-  ATTEMPTED (and correctly reported missing), while other expert tensors are not
-  attempted at all.
-- **Production impact: untested, and probably none.** The real calibration engine
-  DOES register expert tensors (`calibration/expert_capture.rs:777`), and a real
-  dense model calibrated through it came back `missing=0, 186/186`. A real MoE
-  through the real engine has not been measured — that is the open question, and
-  it cannot be answered from this harness.
-- What survives as a genuine hardening gap: `ldlq_report_and_validate`
-  (`hipfire-quantize/src/main.rs:444`) enforces only `success > 0`, so a build
-  that skipped every routed expert would still emit an artifact named `++`. That
-  is the mislabelled-artifact failure the quantizer explicitly refuses `qtip3++`
-  over, and it would be invisible downstream. Making it strict about
-  `missing > 0` for a `++` format is cheap insurance whether or not it fires
-  today.
-- Also: these `++` cells test LDLQ on dense tensors only, which compounds the
-  random-init insensitivity documented in `docs/tiny-quant-gate-8-failures.md` —
-  a second, independent reason the calibrated block is low-information.
+  while the quantized fixture FUSES gate and up, so the quantizer resolves
+  `...experts.{E}.gate_up_proj.weight`. `down_proj` matches; `gate_up_proj`
+  matches nothing. Hence exactly 16 missing (2 layers x 8 experts) with
+  `pooled=0`, and 16 expert `down_proj` among the successes. The arithmetic
+  closes: 22 dense + 16 down + 16 gate_up = 54 attempts, 38 success.
+- `qwen3_5_moe` is the control and the fix in miniature: its arm calls the arch's
+  REAL walker (`qwen35::build_capture_names`), the names agree, `missing=0`.
+- **Root cause is the divergence, not the names.** The harness hand-rolls capture
+  maps for 7 families (Qwen2, DotsOcr, Deepseek4, Gemma3, Gemma3Vl, MiniMax,
+  Gemma4) while 4 use the arch's real walker. Gemma3 and MiniMax hand-roll even
+  though `hipfire-arch-gemma3/src/calibration.rs:38` and
+  `hipfire-arch-minimax/src/calibration.rs:37` exist. Gemma4 has no walker at
+  all. The harness is meant to reuse real hipfire; every hand-rolled map is a
+  second source of truth that can drift from the artifact layout, and this is
+  that drift.
+- Note the genuine subtlety before "just fix the names": at runtime the Gemma4
+  model holds gate and up as SEPARATE tensors (captured by pointer), while the
+  artifact fuses them. So the capture cannot simply emit the fused name — one
+  name, two pointers. Either `calibration_tensor_name_candidates` learns the
+  fused<->split correspondence, or the collector combines the two captures.
+- Fix order: (1) give gemma4 a real `build_capture_names` in its arch crate and
+  switch Gemma3/MiniMax to theirs, so there is one source of truth; (2) resolve
+  fused<->split in the candidate list; (3) make `ldlq_report_and_validate`
+  strict about `missing > 0` for a `++` format — a partial application currently
+  emits an artifact named `++` regardless, which is the mislabelled-artifact
+  failure the quantizer refuses `qtip3++` over.
+- Shipped-artifact impact still UNMEASURED: real models calibrate through the
+  real engine (`calibration/expert_capture.rs:777`), not this map. A real dense
+  model returned `missing=0, 186/186`; a real MoE has not been run.
 - Visible per calibrated cell in `results.jsonl` as `ldlq_{success,attempts,
   missing,k_mismatch,pack_failed,pooled}` and `ldlq_skipped`.
