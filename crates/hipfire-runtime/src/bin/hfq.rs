@@ -166,6 +166,45 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("");
     match cmd {
+        // Decode every tensor and report the ones that fail, without retaining
+        // any of them. `extract` cannot answer this: `load_all` materialises the
+        // WHOLE file before filtering, so on a large artifact it either exhausts
+        // memory or panics anonymously on the first bad tensor — which is how a
+        // 122B decode failure showed up as `.expect("tensor data")` with no name.
+        "verify" => {
+            let path = argv.get(2).expect("usage: hfq verify <file>");
+            let hfq = HfqFile::open(Path::new(path)).expect("open");
+            let names: Vec<(String, u8, usize)> = hfq
+                .tensors()
+                .iter()
+                .map(|t| (t.name.clone(), t.quant_type, t.data_size))
+                .collect();
+            println!("verifying {} tensors in {path}", names.len());
+            let mut bad = 0usize;
+            for (name, qt, size) in &names {
+                match hfq.tensor_data_cow(name) {
+                    Some((_, bytes)) => {
+                        if bytes.len() != *size {
+                            println!(
+                                "  SHORT {name} (qt {qt}): {} bytes, index says {size}",
+                                bytes.len()
+                            );
+                            bad += 1;
+                        }
+                    }
+                    None => {
+                        println!("  FAIL  {name} (qt {qt}, {size} bytes): decode returned None");
+                        bad += 1;
+                    }
+                }
+            }
+            if bad == 0 {
+                println!("all {} tensors decode", names.len());
+            } else {
+                println!("{bad} tensor(s) failed");
+                std::process::exit(1);
+            }
+        }
         "list" => {
             let path = argv.get(2).expect("usage: hfq list <file>");
             let hfq = HfqFile::open(Path::new(path)).expect("open");
@@ -327,7 +366,8 @@ fn main() {
         _ => {
             eprintln!(
                 "hfq — HFQ container tool\n\
-                 usage:\n  hfq list <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
+                 usage:\n  hfq list <file>
+  hfq verify <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
                  \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)\n\
                  \x20 hfq meta-get <file> [--key <k>]\n\
                  \x20 hfq rearch <in> <out> --arch-id <id>"
