@@ -5768,8 +5768,29 @@ fn run_hfq_source_pipeline(
     awq_alpha_explicit: Option<f32>,
     tensor_overrides: &[TensorFormatOverride],
     mixed_bpw_target: Option<f64>,
+    tensor_source: Option<&Path>,
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
+    // `--tensor-source`: where TARGETED tensors are re-read from at source
+    // precision. Without it a surgical pass can only re-encode tensors the .hfq
+    // still holds unquantized, which excludes exactly the ones worth replacing —
+    // an already-quantized tensor has no path back to source.
+    let source_archive = match tensor_source {
+        Some(path) => {
+            let archive = hipfire_quantize::hfa::HfaArchive::open(path)
+                .map_err(|e| format!("open --tensor-source {}: {e}", path.display()))?;
+            let index = archive
+                .tensor_index()
+                .map_err(|e| format!("index --tensor-source {}: {e}", path.display()))?;
+            eprintln!(
+                "tensor-source: {} ({} tensors available)",
+                path.display(),
+                index.len()
+            );
+            Some((archive, index))
+        }
+        None => None,
+    };
     eprintln!(
         "HFQ input: arch_id={} tensors={} format={format:?}",
         hfq.arch_id,
@@ -6084,6 +6105,67 @@ fn run_hfq_source_pipeline(
         // HFQ input aborted on its first quantized tensor.
         let surgical = !tensor_overrides.is_empty();
         let is_source_precision = hfq_source_dtype(t.quant_type).is_some();
+        // Targeted but already quantized: re-read the ORIGINAL from
+        // `--tensor-source` rather than refusing. This is the whole point of the
+        // flag — replacing a tensor that was quantized with the wrong format,
+        // without redoing the 58 GB of expert work in the same file.
+        if tensor_override.is_some() && !is_source_precision {
+            let Some((archive, index)) = source_archive.as_ref() else {
+                return Err(format!(
+                    "tensor {} is {} (already quantized) and cannot be re-encoded from this .hfq; \
+                     pass --tensor-source <model.hfa> to read it at source precision",
+                    t.name, t.quant_type
+                ));
+            };
+            let shard = index.get(&t.name).ok_or_else(|| {
+                format!(
+                    "--tensor-source has no tensor {} (checked {} names)",
+                    t.name,
+                    index.len()
+                )
+            })?;
+            let (src_bytes, src_dtype, src_shape) = archive
+                .tensor_bytes(shard, &t.name)
+                .map_err(|e| format!("read {} from --tensor-source: {e}", t.name))?;
+            let src_qt = match src_dtype.as_str() {
+                "BF16" => QuantType::BF16,
+                "F16" => QuantType::F16,
+                "F32" => QuantType::F32,
+                other => {
+                    return Err(format!(
+                        "--tensor-source {} has dtype {other}; only BF16/F16/F32 sources quantize",
+                        t.name
+                    ))
+                }
+            };
+            let shape_u32: Vec<u32> = src_shape.iter().map(|d| *d as u32).collect();
+            let (data, qt, group_size, label) = quantize_hfq_source_tensor(
+                &t.name,
+                hfq.arch_id,
+                &src_bytes,
+                src_qt as u8,
+                &shape_u32,
+                tensor_format,
+            )?;
+            eprintln!(
+                "  {label:>8}: {} {:?} (from source, was quant_type {}, {:.1} KB -> {:.1} KB)",
+                t.name,
+                src_shape,
+                t.quant_type,
+                src_bytes.len() as f64 / 1024.0,
+                data.len() as f64 / 1024.0
+            );
+            quantized_params += n_elements;
+            hfq_tensors.push(HfqTensor {
+                name: t.name.clone(),
+                quant_type: qt,
+                shape: shape_u32,
+                group_size,
+                data,
+                spilled_len: 0,
+            });
+            continue;
+        }
         if tensor_override.is_none() && (surgical || !is_source_precision) {
             eprintln!(
                 "    copied: {} {:?} (quant_type {}, {:.1} KB)",
@@ -7171,6 +7253,9 @@ OPTIONS:
     --include-prefix <P>       ingest ONLY tensors whose name starts with <P> (build sidecars, e.g. mtp.)
     --tensor-format <GLOB=FMT> override selected tensor formats during HFQ requantization;
                                repeatable, with later matches taking precedence
+    --tensor-source <PATH>     .hfa archive to re-read TARGETED tensors from at source
+                               precision, so an already-quantized tensor can be replaced
+                               without requantizing the whole model
     --include-vision           include vision-tower tensors (default: skipped)
     --vision-quant <FMT>       format for vision tensors when --include-vision is set
 
@@ -7373,6 +7458,8 @@ fn main() {
         print_help();
         std::process::exit(0);
     }
+    let tensor_source: Option<std::path::PathBuf> =
+        arg_value(&args, "--tensor-source").map(std::path::PathBuf::from);
     let tensor_format_overrides = parse_tensor_format_overrides(&args).unwrap_or_else(|error| {
         eprintln!("error: {error}");
         std::process::exit(2);
@@ -8536,6 +8623,7 @@ fn main() {
                 awq_alpha_explicit,
                 &tensor_format_overrides,
                 mixed_bpw_target,
+                tensor_source.as_deref(),
             ) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
