@@ -4345,12 +4345,137 @@ fn collect_calibration_artifacts_sequences(
     .map_err(|e| HipError::new(0, &e))
 }
 
+/// Q8F16 on the qwen3.5 attention / DeltaNet projection path is BROKEN. Refuse
+/// to load such an artifact instead of serving incoherent text.
+///
+/// EVIDENCE. `Qwen3.5-122B-A10B--oq4.25++` stored Q8F16 on all 48 routers, 48
+/// shared-expert gates, 180 DeltaNet projections, 48 attention projections and
+/// lm_head. It generated `6 - - 7 4 1 1 4 , 1 The` for "The capital of France
+/// is". Re-encoding exactly those tensors from source (attention / DeltaNet /
+/// lm_head to oq4.25++, routers to BF16) and changing NOTHING else produced
+/// `<think> ... The user's query is incomplete and` from the same artifact,
+/// prompt and code. `Qwen3.5-35B-A3B--oq4.25++`, which is coherent, carries
+/// Q8F16 on routers ONLY — so this artifact was the only one exercising the
+/// path, which is why nothing else caught it.
+///
+/// WHAT IS NOT KNOWN. Those tensor classes were replaced in one pass, so the
+/// culprit is somewhere in {attention, DeltaNet, lm_head}, not pinned further.
+/// Q8F16 is near-lossless as a FORMAT — a 5% quality story cannot produce digit
+/// soup — so the defect is in how this path reads or dispatches Q8F16, and it is
+/// UNDIAGNOSED. Routers are excluded from the gate: the 35B serves coherently
+/// with Q8F16 routers, so they are demonstrably fine.
+///
+/// Set `HIPFIRE_ALLOW_Q8_ATTENTION=1` to load anyway — which is exactly what
+/// diagnosing the underlying bug requires, since this gate otherwise makes the
+/// only known reproducer unloadable.
+fn reject_q8_attention(hfq: &HfqFile) -> HipResult<()> {
+    const Q8F16: u8 = 3;
+    if hipfire_env::ALLOW_Q8_ATTENTION.flag() {
+        eprintln!(
+            "  warning: HIPFIRE_ALLOW_Q8_ATTENTION=1 — loading Q8F16 attention/DeltaNet \
+             weights, which are known to produce incoherent output"
+        );
+        return Ok(());
+    }
+    let mut offenders: Vec<&str> = hfq
+        .tensors()
+        .iter()
+        .filter(|t| t.quant_type == Q8F16)
+        .map(|t| t.name.as_str())
+        .filter(|n| {
+            n.ends_with("lm_head.weight")
+                || n.contains(".self_attn.")
+                // `in_proj_qkv/z/a/b` and `out_proj` — NOT `ends_with("_proj.weight")`,
+                // which silently misses every `in_proj_*` (85 of 229 matched).
+                || (n.contains(".linear_attn.")
+                    && (n.contains(".in_proj") || n.contains(".out_proj")))
+        })
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    offenders.sort_unstable();
+    let shown: Vec<&str> = offenders.iter().take(3).copied().collect();
+    Err(HipError::new(
+        0,
+        &format!(
+            "this artifact stores {} attention/DeltaNet/lm_head tensor(s) as Q8F16 (quant_type \
+             3), which produces incoherent output on the qwen3.5 path — e.g. {}{}. The root \
+             cause is not yet diagnosed; the format is near-lossless, so this is a code defect, \
+             not a precision limit. Re-encode those tensors from the source archive:\n  \
+             hipfire-quantize --input <this.hfq> --output <fixed.hfq> --format oq8 \
+             --tensor-source <model.hfa> --hessian <model.calib.hfq> \
+             --tensor-format '*self_attn.q_proj.weight=oq4.25++' (and k/v/o, \
+             linear_attn.in_proj_*, linear_attn.out_proj, lm_head)\nRun that BEFORE converting \
+             undercovered experts to W8 — --hessian re-checks coverage admission and requires \
+             them still at BF16/F16. Set HIPFIRE_ALLOW_Q8_ATTENTION=1 to load anyway (needed to \
+             debug the underlying bug).",
+            offenders.len(),
+            shown.join(", "),
+            if offenders.len() > shown.len() {
+                format!(", ... ({} more)", offenders.len() - shown.len())
+            } else {
+                String::new()
+            }
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod q8_attention_gate_tests {
+    /// The predicate must catch every class the 122B stored as Q8F16 on the
+    /// broken path — and NOT the routers, which the coherent 35B proves are
+    /// fine. An earlier version used `ends_with("_proj.weight")` and silently
+    /// missed every `in_proj_*`: 85 of 229.
+    fn gated(name: &str) -> bool {
+        name.ends_with("lm_head.weight")
+            || name.contains(".self_attn.")
+            || (name.contains(".linear_attn.")
+                && (name.contains(".in_proj") || name.contains(".out_proj")))
+    }
+
+    #[test]
+    fn gate_covers_attention_deltanet_and_lm_head_but_not_routers() {
+        let p = "model.language_model.layers.0.";
+        for broken in ["lm_head.weight", "model.language_model.lm_head.weight"] {
+            assert!(gated(broken), "{broken} must be gated");
+        }
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            assert!(gated(&format!("{p}self_attn.{proj}.weight")));
+        }
+        for proj in [
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_a",
+            "in_proj_b",
+            "out_proj",
+        ] {
+            let n = format!("{p}linear_attn.{proj}.weight");
+            assert!(gated(&n), "{n} must be gated");
+        }
+        // The 35B serves coherently with Q8F16 here, so gating them would
+        // refuse a model that demonstrably works.
+        for fine in [
+            "mlp.gate.weight",
+            "mlp.shared_expert_gate.weight",
+            "mlp.experts.0.gate_up_proj.weight",
+            "input_layernorm.weight",
+            "linear_attn.conv1d.weight",
+            "linear_attn.dt_bias",
+        ] {
+            let n = format!("{p}{fine}");
+            assert!(!gated(&n), "{n} must NOT be gated");
+        }
+    }
+}
+
 pub fn load_weights(
     hfq: &mut HfqFile,
     config: &Qwen35Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen35Weights> {
     validate_ffn_bf16_hfq_load(config)?;
+    reject_q8_attention(hfq)?;
     let load_t0 = std::time::Instant::now();
     let file_payload_bytes: usize = hfq.tensors().iter().map(|t| t.data_size).sum();
     let mut loaded_bytes = 0usize;

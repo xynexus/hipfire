@@ -270,6 +270,15 @@ env_vars! {
          dtype as the OqPlusCompact majority, so the layer stays uniform. This \
          is the A/B knob for the quality half of that trade.";
 
+    ALLOW_Q8_ATTENTION = "HIPFIRE_ALLOW_Q8_ATTENTION", Developer,
+        "Set 1 to load a qwen3.5 artifact whose attention / DeltaNet / lm_head \
+         weights are stored Q8F16, which the loader otherwise refuses. That path \
+         produces incoherent output — a 122B storing Q8F16 there emitted digit \
+         soup, and re-encoding exactly those tensors to oq4.25++ fixed it with no \
+         other change. The defect is UNDIAGNOSED and the format is near-lossless, \
+         so it is a code bug, not a precision limit. This override exists because \
+         the gate otherwise makes the only known reproducer unloadable.";
+
     NO_EXPERT_AWQ = "HIPFIRE_NO_EXPERT_AWQ", Developer,
         "Set 1 to suppress per-expert AWQ smoothing so routed experts fall back \
          to plain MQ4/MQ8. An A/B knob for measuring the expert-AWQ quality \
