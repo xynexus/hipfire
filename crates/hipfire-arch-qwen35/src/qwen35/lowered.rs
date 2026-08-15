@@ -695,6 +695,11 @@ pub(crate) fn forward_scratch_layers_lowered(
     // gfx1103 per rocprof). Without this, the lowered path ignored the caller's
     // no-logits request and computed lm_head every token.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    // The vector the lm_head actually scores. Per-layer "pertoken" dumps stop
+    // before the final norm, so a coarse-tier / lm_head study had no way to get
+    // the real query distribution. `config.n_layers` as the layer index keeps it
+    // ordered after every layer dump.
+    dump_hidden_localize(gpu, &s.tmp, 1, pos, config.dim, config.n_layers, "fnorm");
     if needs_logits {
         // Two-stage lm_head (coarse shortlist + exact rescore) when it is both
         // enabled and applicable; otherwise fall through to the normal lowered
