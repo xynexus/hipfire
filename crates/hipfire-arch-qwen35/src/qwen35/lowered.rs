@@ -696,6 +696,14 @@ pub(crate) fn forward_scratch_layers_lowered(
     // no-logits request and computed lm_head every token.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
     if needs_logits {
+        // Two-stage lm_head (coarse shortlist + exact rescore) when it is both
+        // enabled and applicable; otherwise fall through to the normal lowered
+        // GEMV so the default path is unchanged. This is the LIVE lm_head site —
+        // `decode_layers.rs` is the hand path and is off by default.
+        if hipfire_runtime::llama::lmhead_twostage_applies(&weights.output) {
+            hipfire_runtime::llama::lmhead_project(gpu, &weights.output, &s.tmp, &s.logits)?;
+            return Ok(());
+        }
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {

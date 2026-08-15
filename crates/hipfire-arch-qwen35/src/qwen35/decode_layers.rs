@@ -2771,7 +2771,15 @@ pub(crate) fn forward_scratch_layers(
             // (it needs runtime int4 activation quant), so route through the
             // dedicated weight_gemv Oq4 arm (rotate → quantize_act_oq4 → grouped
             // iu4 GEMM). Same treatment the layer projections get.
-            weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+            // Two-stage lm_head when HIPFIRE_LMHEAD_TWOSTAGE is set and the head
+            // is BF16: a coarse Q4 pass shortlists top-K, then an exact pass
+            // rescores just those. Falls back to the exact GEMV otherwise, so
+            // this is a no-op for every artifact that does not opt in.
+            //
+            // qwen35 called `weight_gemv` directly and so could never reach it —
+            // the path existed in llama.rs and arch-zaya only, which is why the
+            // 35B's CoarseQ4Row tensor was dead weight for qwen35 serving.
+            hipfire_runtime::llama::lmhead_project(gpu, &weights.output, &s.tmp, &s.logits)?;
         } else {
             let ctx = DispatchCtx::new(gpu);
             let wr = weights.output.dispatch_ref();

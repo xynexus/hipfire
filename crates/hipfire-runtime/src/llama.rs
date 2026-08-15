@@ -55,13 +55,26 @@ fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
     Some((bits, k))
 }
 
+/// True when `lmhead_project` would take the two-stage path for this weight,
+/// i.e. the env is set AND the head is bf16. Callers that otherwise emit their
+/// own lm_head GEMV (the lowered `Step::Gemv` pipeline) use this to divert only
+/// when the fast path is really available, leaving the default path untouched.
+pub fn lmhead_twostage_applies(w: &WeightTensor) -> bool {
+    lmhead_twostage_cfg().is_some() && w.gpu_dtype == DType::BF16
+}
+
 /// lm_head projection with an optional coarse-shortlist + fine-rescore fast path
 /// gated by `HIPFIRE_LMHEAD_TWOSTAGE`. Falls back to the exact `weight_gemv` when
 /// the env is unset or the head is not bf16. The two-stage path is **greedy-exact**
 /// (recall@1 = 1.0 at K=32 on real lm_heads) but truncates the tail to the
 /// shortlist, so it is a decode/argmax fast path — the eval/scoring paths simply
 /// leave the env unset to keep full-distribution logits.
-fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+pub fn lmhead_project(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
     if let Some((bits, topk)) = lmhead_twostage_cfg() {
         if w.gpu_dtype == DType::BF16 {
             let (vocab, hidden) = (w.m, w.k);
@@ -70,6 +83,9 @@ fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor)
             if stale {
                 let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                eprintln!(
+                    "[lmhead] two-stage active: coarse q{bits} tier built for [{vocab}, {hidden}], top-K={topk}"
+                );
                 LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
             }
             return LMHEAD_COARSE.with(|c| {

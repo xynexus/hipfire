@@ -4515,13 +4515,22 @@ pub fn load_weights(
                 awq_scale: None,
             }
         } else {
-            load_weight_tensor_raw(
-                gpu,
-                lm_info.quant_type,
-                &lm_data,
-                config.vocab_size,
-                config.dim,
-            )?
+            // `HIPFIRE_QWEN35_BF16_HEAD=1` (or a non-256 dim) lands here. The
+            // bytes are still LUT3-PACKED — `expand_bf16_index` leaves head
+            // tensors packed on purpose — and `load_weight_tensor_raw` rejects
+            // qt 49, so the flag could never actually load a qt-49 head. Decode
+            // to plain bf16 first; that is exactly what the flag is asking for.
+            let n_elems = config.vocab_size * config.dim;
+            let (qt, bytes) = if lm_info.quant_type == 49 {
+                let decoded =
+                    hipfire_primitives::bf16_lut3::decode(&lm_data, n_elems).ok_or_else(|| {
+                        HipError::new(0, "lm_head: Bf16Lut3 payload is corrupt or truncated")
+                    })?;
+                (16u8, std::borrow::Cow::Owned(decoded))
+            } else {
+                (lm_info.quant_type, std::borrow::Cow::Borrowed(&lm_data[..]))
+            };
+            load_weight_tensor_raw(gpu, qt, &bytes, config.vocab_size, config.dim)?
         }
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
