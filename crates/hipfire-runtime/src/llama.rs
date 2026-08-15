@@ -33,17 +33,30 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q4` / `1` =
-/// 4-bit coarse, K=32; `q2` = 2-bit, K=2048. Append `:<K>` to override K
+/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q2` / `1` =
+/// 2-bit coarse, K=128; `q4` = 4-bit, K=32. Append `:<K>` to override K
 /// (e.g. `q4:64`). Absent → the exact full lm_head. OFF by default.
+///
+/// `q2` used to default to K=2048 on the assumption that 2-bit codes rank
+/// poorly. Measured, they do not — the true argmax's worst rank at the shipped
+/// clip was 24 over 630 decode states on Qwen3.5-35B-A3B (head [248320, 2048])
+/// and 26 over 122 states on the 122B (head [248320, 3072]), so 2 bits ranks
+/// as well as 4 for shortlist purposes and the tier halves, 0.5 → 0.25 B/weight.
+/// See `examples/lmhead_coarse_bits_study.rs`.
+///
+/// K=128 rather than the 32 those maxima would allow: the fine pass is
+/// measurably free (K=32 and K=256 decode within noise of each other), so the
+/// margin costs nothing, and a worst observed rank of ~25 is uncomfortably close
+/// to 32 on query sets this size. 1-bit is genuinely too coarse — its worst
+/// rank was 1964 on the 122B, only 93.4% recall at K=32.
 fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
     let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
     let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
-        (2usize, 2048usize, r)
+        (2usize, 128usize, r)
     } else if let Some(r) = v.strip_prefix("q4") {
         (4, 32, r)
     } else if v == "1" {
-        (4, 32, "")
+        (2, 128, "")
     } else {
         return None;
     };
