@@ -5426,6 +5426,106 @@ impl Gpu {
         )
     }
 
+    /// Compact-resident Opus decode GEMV (batch=1), reading OqPlusCompact
+    /// blocks as they sit on disk. The per-group weight scale leads each block,
+    /// so unlike the expanded path there is no separate scale plane to pass.
+    pub fn gemv_oq_compact_grouped(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            group == 256 || group == 128,
+            "gemv_oq_compact_grouped: compact group must be 256 or 128 (got {group})"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "gemv_oq_compact_grouped: K must be a multiple of group"
+        );
+        // Each lane owns a whole number of nibble bytes: (group/2) % 32 == 0.
+        assert_eq!(
+            (group / 2) % 32,
+            0,
+            "gemv_oq_compact_grouped: group/2 must be a multiple of 32 (got {group})"
+        );
+        let header = 2 + group / 2;
+        assert!(
+            block_stride >= header + 2 && (block_stride - header) % 2 == 0,
+            "gemv_oq_compact_grouped: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_grouped",
+            kernels::GEMV_OQ_COMPACT_GROUPED_SRC,
+            "gemv_oq_compact_grouped",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
+    /// Compact-resident Opus decode GEMV, v2 fast path where it applies.
+    ///
+    /// v2 needs group 256 and an even group count; anything else (short router
+    /// GEMVs, G=128 artifacts) routes to v1, exactly as the oq8 pair does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_grouped_auto(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        if group != 256 || (k / 256) % 2 != 0 {
+            return self.gemv_oq_compact_grouped(w_blocks, x_f32, y_f32, m, k, group, block_stride);
+        }
+        self.bind_thread()?;
+        let header = 2 + group / 2;
+        assert!(
+            block_stride >= header + 2 && (block_stride - header) % 2 == 0,
+            "gemv_oq_compact_grouped_v2: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_grouped_v2",
+            kernels::GEMV_OQ_COMPACT_GROUPED_V2_SRC,
+            "gemv_oq_compact_grouped_v2",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_grouped_v2",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
     /// OQ4+ W4A16 decode GEMV with fused residual add (`y += W*x`).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4_grouped_residual(
