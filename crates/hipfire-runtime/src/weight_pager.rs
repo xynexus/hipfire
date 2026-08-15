@@ -1361,7 +1361,16 @@ impl WeightPager {
                 .transport
                 .read_host(module.data_offset, module.data_size, gpu)?;
             let prepared = prepare_expert_module(&module, &disk_bytes)?;
-            let tensor = gpu.upload_raw(&prepared.bytes, &[prepared.bytes.len()])?;
+            // Pooled, for the reason spelled out at the direct-staging site
+            // above: eviction returns this buffer to `GpuPool` via
+            // `free_tensor`, so a plain `upload_raw` here made every page-in a
+            // fresh `hipMalloc` while every page-out piled into a free-list that
+            // only pooled allocations can draw from. This is the host-repack
+            // branch — `module_requires_host_repack` is true for exactly
+            // Oq4G256 / Oq8G256 / OqPlusCompact, i.e. every Opus artifact — so
+            // it is the branch a paging Opus MoE actually takes, and its sibling
+            // `else` was already pooled.
+            let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
             (tensor, prepared.gate_up_rel, prepared.down_rel)
         } else {
             let (tensor, _handle) =
