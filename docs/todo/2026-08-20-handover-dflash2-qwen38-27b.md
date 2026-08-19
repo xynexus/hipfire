@@ -88,3 +88,50 @@ FIRST, confirm verify amortizes there, and only then judge DFlash2 on merit.
 `replay` also scales WITH acceptance at ~28ms/accepted token (accept=0 -> 27ms,
 accept=14 -> 402ms, accept=15 -> 0ms), i.e. accepted tokens are paid for twice.
 Independent of the MoE economics and worth fixing on its own.
+
+## DFlash2 semantics — what the tensors mean
+
+Sourced from the z-lab model card + tensor shapes, NOT guessed. Reference
+implementation: https://github.com/z-lab/dflash (no modeling code ships with
+the checkpoint — config.json + model.safetensors only, no `auto_map`, so the
+semantics live in transformers 5.15 / sglang / vllm). READ THAT BEFORE
+IMPLEMENTING: a parity test written against a guess validates nothing.
+
+Card: "block-diffusion drafter ... predicts a whole block in a single pass and
+keeps the top candidates at every position. A lightweight selector then traces
+one coherent path through them. Two-tap dynamic convolutions in the backbone
+keep the draft from decaying toward the end of the block. Decoding is lossless."
+
+Mapping to what `dflash_convert` already carries:
+
+* `layers.N.attention_conv.base_kernel [2, 2, 5120]`
+  `layers.N.mlp_conv.base_kernel      [2, 2, 5120]`
+  `layers.N.*_conv.kernel_projection.weight [1280, 5120]`
+  -> the "two-tap DYNAMIC convolution". kernel_size=2 (two taps), and dynamic
+  = the per-position kernel is PROJECTED FROM THE HIDDEN STATE via
+  kernel_projection, then combined with base_kernel. conv_group_size=16, and
+  1280 = 5120/4, so the projection is grouped/low-rank rather than per-channel.
+  Purpose per the card: stop draft quality decaying at the tail of the block.
+
+* `candidate_selector.hidden_projection.weight [256, 5120]`
+  `candidate_selector.predecessor_codebook     [248320, 256]`
+  `candidate_selector.successor_codebook       [248320, 256]`
+  with `selector_rank=256`, `selector_top_k=16`
+  -> the path selector. Project hidden to rank 256; the two vocab-sized
+  codebooks give each token a predecessor and a successor embedding, so the
+  score of following candidate `a` at position i with candidate `b` at i+1 is a
+  rank-256 inner product <successor[a], predecessor[b]> (plus the hidden term).
+  That is a TRANSITION score, i.e. the selector is a Viterbi-style trace over a
+  [block_size x top_k] = [8 x 16] lattice — cheap, and the reason the codebooks
+  are two-sided rather than one embedding table.
+
+Implementation order that does not depend on the open bug:
+1. CPU reference port of conv + selector from the z-lab repo.
+2. `parity_dflash2_conv.rs` / `parity_dflash2_selector.rs` against that
+   reference (shape: `crates/hipfire-rdna/examples/parity_gemm_oq_compact.rs`).
+3. Only then wire into the drafter forward and drop the load-time refusal in
+   `DflashConfig::from_source`.
+
+Note the block size differs: DFlash2 uses block_size=8 (7 draft tokens per
+verify) where our DFlash1 drafters use 16. Smaller blocks also directly reduce
+the verify cost that dominates the economics above.
