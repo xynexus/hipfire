@@ -7475,6 +7475,20 @@ pub fn spec_step_dflash(
         .as_ref()
         .map(|pbs| pbs.moe_router_logits_batch.is_some())
         .unwrap_or(true);
+    // `prefill_batch_pbs_eligible` alone is NOT what the forward gates on.
+    // `forward_prefill_batch_with_pbs_opts` additionally requires a batched-
+    // capable KV tier (`!kv_f32`, plus no asym2+tree), and on a miss it drops to
+    // the tape-less per-token loop "leaving any passed tape stale" — its words.
+    // Consulting only the base predicate here made spec-decode believe a tape
+    // had been captured when none was, and replay a STALE one.
+    //
+    // That is the dense-Opus garbage: Qwen3.8-27B runs fp32 KV, so base=true but
+    // final=false, the two disagreed, and committed tokens came off a stale GDN
+    // tape ('嘟 plain' at 0.34 tok/s). Qwen3.5-35B-A3B is correct because it
+    // reports base=false — the predicates happen to AGREE there, not because MoE
+    // is special. Mirror the forward's condition so they cannot diverge again.
+    let kv_batched_capable =
+        target.kv_cache.quantized || target.kv_cache.quant_q8 || target.kv_cache.quant_hfq4;
     let verify_populates_tape = qwen35::prefill_batch_pbs_eligible(
         &target.weights,
         &target.config,
@@ -7482,7 +7496,7 @@ pub fn spec_step_dflash(
         b,
         gpu.arch.as_str(),
         moe_router_logits_present,
-    );
+    ) && kv_batched_capable;
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
     let trace_position = dflash_trace_position_from_env();
