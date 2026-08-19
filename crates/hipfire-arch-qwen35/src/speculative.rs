@@ -262,6 +262,12 @@ fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
             | hipfire_rdna::DType::MQ3G256
             | hipfire_rdna::DType::HFQ6G256
             | hipfire_rdna::DType::MQ6G256
+            // Opus Quant: every oq* artifact resolves to one of these three
+            // after `oq8_arch_load`, and `dflash_enqueue_verify_lm_head` now
+            // has arms for all of them.
+            | hipfire_rdna::DType::Oq8G256
+            | hipfire_rdna::DType::OqCompactG256
+            | hipfire_rdna::DType::OqCompactG128
     )
 }
 
@@ -365,6 +371,95 @@ fn dflash_enqueue_verify_lm_head(
                 w_out.m,
                 w_out.k,
                 b,
+            )?;
+        }
+        // Opus Quant W8A8 lm_head. Same three steps `weight_gemm` runs for
+        // these dtypes — AWQ-aware FWHT rotate, int8 activation quantize,
+        // grouped-iu8 WMMA — but against VerifyScratch buffers, because this
+        // enqueues into a CAPTURED graph and `weight_gemm` allocates xq/xs per
+        // call. Every Opus artifact (oq4/oq4.25/oq8, ++ variants) lands on one
+        // of these two dtypes after `oq8_arch_load`, so this is what unblocks
+        // DFlash on the whole family; before it they fell to the per-row GEMV
+        // that hangs verify.
+        hipfire_rdna::DType::Oq8G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(
+                w_out.k % GROUP,
+                0,
+                "Oq8G256 verify lm_head: K must be % 256"
+            );
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch undersized for Opus lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let ng = w_out.k / GROUP;
+            gpu.ensure_mq_signs()?;
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            let xq = verify_scratch.act_q.sub_offset(0, b * w_out.k);
+            let xs = verify_scratch.act_s.sub_offset(0, b * ng);
+            weights::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.quantize_act_oq8(&rot, &xq, &xs, b, w_out.k, GROUP)?;
+            let ws = w_out.buf.sub_offset(w_out.m * w_out.k, w_out.m * ng * 4);
+            gpu.gemm_oq8_grouped_wmma(
+                &w_out.buf,
+                &ws,
+                &xq,
+                &xs,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+                GROUP,
+            )?;
+        }
+        // Compact-resident Opus: identical math, but the weight stays in
+        // OqPlusCompact blocks and the kernel decodes nibbles + sparse overlay
+        // per tile. `block_stride` is derived from the buffer, as in the GEMV
+        // dispatch arm.
+        hipfire_rdna::DType::OqCompactG256 | hipfire_rdna::DType::OqCompactG128 => {
+            let group = if w_out.gpu_dtype == hipfire_rdna::DType::OqCompactG256 {
+                256usize
+            } else {
+                128usize
+            };
+            assert_eq!(
+                w_out.k % group,
+                0,
+                "compact verify lm_head: K must be % group"
+            );
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch undersized for compact Opus lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let ng = w_out.k / group;
+            let blocks = w_out.m * ng;
+            if blocks == 0 || w_out.buf.byte_size() % blocks != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "compact verify lm_head: buffer length is not a whole number of blocks",
+                ));
+            }
+            let block_stride = w_out.buf.byte_size() / blocks;
+            gpu.ensure_mq_signs()?;
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            let xq = verify_scratch.act_q.sub_offset(0, b * w_out.k);
+            let xs = verify_scratch.act_s.sub_offset(0, b * ng);
+            weights::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.quantize_act_oq8(&rot, &xq, &xs, b, w_out.k, group)?;
+            gpu.gemm_oq_compact_grouped_wmma(
+                &w_out.buf,
+                &xq,
+                &xs,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+                group,
+                block_stride,
             )?;
         }
         other => {
@@ -5398,6 +5493,14 @@ pub struct VerifyScratch {
     /// FWHT-rotated hidden for MQ4 lm_head path, [max_n × hidden_k] F32.
     /// Allocated unconditionally; unused on non-MQ4 targets.
     pub rot: GpuTensor,
+    /// int8 activations for the Opus (W8A8) lm_head path, [max_n × hidden_k].
+    /// Preallocated for the same reason as `rot`: the verify lm_head runs
+    /// inside a captured graph, so `weight_gemm`'s per-call `alloc_tensor` for
+    /// xq/xs cannot be used here. Unused on non-Opus targets.
+    pub act_q: GpuTensor,
+    /// Per-group activation scales for the Opus lm_head path, [max_n × ng] F32
+    /// where ng = hidden_k / 256.
+    pub act_s: GpuTensor,
     /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
     pub argmax: GpuTensor,
     /// Persistent per-layer batch scratch for `qwen35::forward_prefill_batch`.
@@ -5426,6 +5529,9 @@ impl VerifyScratch {
             final_hidden: gpu.alloc_tensor(&[max_n * dim], hipfire_rdna::DType::F32)?,
             logits: gpu.alloc_tensor(&[max_n * vocab], hipfire_rdna::DType::F32)?,
             rot: gpu.alloc_tensor(&[max_n * hidden_k], hipfire_rdna::DType::F32)?,
+            act_q: gpu.alloc_tensor(&[max_n * hidden_k], hipfire_rdna::DType::Raw)?,
+            act_s: gpu
+                .alloc_tensor(&[max_n * (hidden_k / 256).max(1)], hipfire_rdna::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], hipfire_rdna::DType::F32)?,
             prefill_batch: None,
         })
@@ -5453,6 +5559,8 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.final_hidden);
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
+        let _ = gpu.free_tensor(self.act_q);
+        let _ = gpu.free_tensor(self.act_s);
         let _ = gpu.free_tensor(self.argmax);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);

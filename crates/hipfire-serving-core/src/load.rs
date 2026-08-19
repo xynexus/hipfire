@@ -852,6 +852,29 @@ pub fn load_model(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            // Opus Quant (qt 33 OqPlusG256, 34 Oq4G256, 35 Oq8G256, 36
+            // OqPlusCompact, 38 Oq3G256, 52 OqPlusCompactG128) all resolve
+            // through `oq8_arch_load` to Oq8G256 / OqCompactG256 / G128, and
+            // `dflash_enqueue_verify_lm_head` now carries arms for those three
+            // (AWQ-aware rotate + quantize_act_oq8 + grouped-iu8 WMMA, on
+            // VerifyScratch buffers so it stays graph-capturable). Without
+            // these codes every oq* target — i.e. every model we now induct —
+            // refused to load with a draft attached.
+            // NOTE ON OPUS (qt 33/34/35/36/38/52): the batched lm_head half is
+            // DONE — `dflash_enqueue_verify_lm_head` now has Oq8G256 /
+            // OqCompactG256 / OqCompactG128 arms (AWQ-aware rotate +
+            // quantize_act_oq8 + grouped-iu8 WMMA on VerifyScratch buffers, so
+            // it stays graph-capturable) and `dflash_batched_lm_head_supported`
+            // admits them.
+            //
+            // They stay REFUSED here anyway, because this gate turns out to be
+            // load-bearing for more than its name says. Admitting qt=36 on
+            // Qwen3.8-27B (dense, oq4.25++ + CASK) loads and engages DFlash
+            // — "DFlash draft loaded: layers=5 block=16" — and then emits
+            // garbage ('嘟 plain') at 0.34 tok/s. So something in the batched
+            // VERIFY BODY, not the lm_head, is still MQ4/HFQ4-shaped. Until
+            // that is found and fixed, refusing is the honest behaviour:
+            // silently serving garbage is worse than declining the draft.
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
@@ -866,7 +889,10 @@ pub fn load_model(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
                      ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                     always; MQ3G256 (qt=17) on gfx11 only. Opus oq* \
+                     (qt=33/34/35/36/38/52) has its batched lm_head arms wired \
+                     but the batched verify BODY still mis-computes, so it stays \
+                     refused. Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
