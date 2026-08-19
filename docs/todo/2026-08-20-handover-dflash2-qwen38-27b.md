@@ -60,6 +60,10 @@ ELIMINATED, each by measurement — do not re-test:
 6. Stale GDN tape replay — fixed in `2ba31acd3`, output unchanged.
 7. `prefill_batch.rs`'s batched DeltaNet/DeltaNetMoe arms — instrumented, NEITHER
    FIRES for either model, draft or not. That file is the wrong place to look.
+8. KV eviction / physical_cap. Loading with max_seq=896 so physical_cap ==
+   max_seq (no capacity-driven eviction) still garbles. Eviction is driven by
+   the CASK/TriAttention config, not by physical_cap < max_seq, and the earlier
+   CASK-parked run garbled too — so neither eviction nor a short KV ring is it.
 
 START HERE: `HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1` shows BOTH models take the
 per-token fallback (`final=false`), dense via `base=true kv_f32=true`, MoE via
