@@ -867,14 +867,36 @@ pub fn load_model(
             // it stays graph-capturable) and `dflash_batched_lm_head_supported`
             // admits them.
             //
-            // They stay REFUSED here anyway, because this gate turns out to be
-            // load-bearing for more than its name says. Admitting qt=36 on
-            // Qwen3.8-27B (dense, oq4.25++ + CASK) loads and engages DFlash
-            // — "DFlash draft loaded: layers=5 block=16" — and then emits
-            // garbage ('嘟 plain') at 0.34 tok/s. So something in the batched
-            // VERIFY BODY, not the lm_head, is still MQ4/HFQ4-shaped. Until
-            // that is found and fixed, refusing is the honest behaviour:
-            // silently serving garbage is worse than declining the draft.
+            // They stay REFUSED here anyway, for two SEPARATE measured reasons.
+            //
+            // 1. DENSE targets miscompute. Admitting qt=36 on Qwen3.8-27B
+            //    (dense, oq4.25++ + CASK) loads and engages DFlash — "DFlash
+            //    draft loaded: layers=5 block=16" — then emits garbage
+            //    ('嘟 plain') at 0.34 tok/s against 7.5 plain. The lm_head arms
+            //    are NOT the cause: forcing the non-batched route with
+            //    HIPFIRE_DFLASH_NO_BATCHED_LMHEAD=1 gives byte-identical
+            //    garbage. Also ruled out: CASK (same with the sidecar parked),
+            //    graph capture (same with HIPFIRE_VERIFY_GRAPH=0), and the Opus
+            //    batched GEMMs (parity_oq8_gemm 45 dB SQNR, parity_gemm_oq_compact
+            //    bit-identical). MoE Opus is fine, so the fault is specific to
+            //    the dense `LayerWeights::DeltaNet` batched arm.
+            //
+            // 2. MoE targets are CORRECT but unprofitable. Qwen3.5-35B-A3B
+            //    oq4.25++ + CASK + a DFlash1 drafter serves coherently, and
+            //    slower: 8.17 tok/s against a 35.7 baseline. HIPFIRE_SPEC_PHASES=1
+            //    says why — per B=16 cycle, verify=540ms, draft=47ms, and the
+            //    35.7 tok/s baseline is 28ms/token, so verifying 17 positions
+            //    costs ~17 serial decodes. On an A3B each position picks its own
+            //    top-8 of 128 experts, so batched verify reads ~17x the expert
+            //    bytes one decode does and amortizes NOTHING. Speculation cannot
+            //    win there. (`replay` also scales with acceptance at ~28ms per
+            //    accepted token — one decode step each — so accepted tokens are
+            //    paid for twice; worth fixing regardless.)
+            //
+            // So the payoff is on DENSE targets, where the weights are shared
+            // across the block and batched verify genuinely amortizes — which is
+            // exactly the case that is broken. Fix (1), then re-measure.
+            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work.
             let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
