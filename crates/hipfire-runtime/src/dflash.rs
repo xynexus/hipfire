@@ -257,6 +257,31 @@ impl DflashConfig {
             .get("rope_theta")
             .and_then(|v| v.as_f64())
             .unwrap_or(10_000_000.0) as f32;
+        // DFlash2 refuses HERE rather than loading as DFlash1. Its checkpoint
+        // converts cleanly and every tensor is carried, but the drafter body
+        // additionally needs per-layer attention_conv/mlp_conv and the low-rank
+        // candidate_selector (rank 256, top-k 16) that this runtime does not yet
+        // implement. Loading it as DFlash1 silently drops 23 tensors: spec-decode
+        // stays CORRECT because the target verifies every token, so the only
+        // symptom would be a mysteriously poor acceptance rate. Fail loudly
+        // instead. Remove this once the conv + selector path lands.
+        if df
+            .get("dflash_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            >= 2
+            || df.get("selector_rank").is_some_and(|v| !v.is_null())
+        {
+            eprintln!(
+                "  DFlash draft REFUSED: this is a DFlash2 drafter (selector_rank={:?}, \
+                 conv_kernel_size={:?}). Its conv + candidate-selector are not implemented \
+                 in the runtime yet; loading it as DFlash1 would drop those tensors and \
+                 quietly tank the acceptance rate. Use a DFlash1 drafter for now.",
+                df.get("selector_rank"),
+                df.get("conv_kernel_size"),
+            );
+            return None;
+        }
         let block_size = df.get("block_size").and_then(|v| v.as_u64())? as usize;
         let mask_token_id = df.get("mask_token_id").and_then(|v| v.as_u64())? as u32;
         let target_layer_ids: Vec<usize> = df

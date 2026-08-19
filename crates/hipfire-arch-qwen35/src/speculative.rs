@@ -254,6 +254,11 @@ fn dflash_moe_draft_ffn_graph_eligible(
 }
 
 fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
+    // Bisection hook: force the non-batched lm_head route to separate a bad
+    // batched-lm_head arm from a bad batched verify BODY.
+    if std::env::var("HIPFIRE_DFLASH_NO_BATCHED_LMHEAD").as_deref() == Ok("1") {
+        return false;
+    }
     matches!(
         dtype,
         hipfire_rdna::DType::Q8_0

@@ -957,9 +957,18 @@ fn main() {
     let is_dflash = architectures
         .iter()
         .any(|v| v.as_str() == Some("DFlashDraftModel"));
-    if !is_dflash {
+    // DFlash2 (z-lab's newer drafters) is the same 5-layer body plus per-layer
+    // attention_conv/mlp_conv and a low-rank candidate_selector. Its tensors and
+    // config convert through this path unchanged — the bytes are all carried —
+    // so recognize it rather than warning, and RECORD the distinguishing fields
+    // below so the runtime can tell the two apart instead of loading a DFlash2
+    // artifact as a DFlash1 one and silently ignoring 23 tensors.
+    let is_dflash2 = architectures
+        .iter()
+        .any(|v| v.as_str() == Some("DFlash2DraftModel"));
+    if !is_dflash && !is_dflash2 {
         eprintln!(
-            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel"
+            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel or DFlash2DraftModel"
         );
     }
 
@@ -1038,6 +1047,16 @@ fn main() {
             "block_size": block_size,
             "mask_token_id": mask_token_id,
             "target_layer_ids": target_layer_ids,
+            // DFlash generation + the DFlash2-only geometry. `DflashConfig::
+            // from_source` keys off `dflash_version` to refuse a DFlash2 artifact
+            // until the conv + candidate-selector runtime exists; without these
+            // the metadata describes a perfectly valid DFlash1 drafter and the
+            // extra tensors are dropped on the floor at load.
+            "dflash_version": if is_dflash2 { 2 } else { 1 },
+            "selector_rank": dflash_cfg.get("selector_rank").and_then(|v| v.as_u64()),
+            "selector_top_k": dflash_cfg.get("selector_top_k").and_then(|v| v.as_u64()),
+            "conv_kernel_size": dflash_cfg.get("conv_kernel_size").and_then(|v| v.as_u64()),
+            "conv_group_size": dflash_cfg.get("conv_group_size").and_then(|v| v.as_u64()),
             "num_target_layers": num_target_layers,
             "num_hidden_layers": num_hidden_layers,
             "hidden_size": hidden_size,

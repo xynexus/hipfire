@@ -875,9 +875,13 @@ pub fn load_model(
             // VERIFY BODY, not the lm_head, is still MQ4/HFQ4-shaped. Until
             // that is found and fixed, refusing is the honest behaviour:
             // silently serving garbage is worse than declining the draft.
+            let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
+                // Opt-in while the batched verify body is being bisected; see
+                // the note above. Default stays refused.
+                Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
                 _ => false,
             };
             if !supported {
