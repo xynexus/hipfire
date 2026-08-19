@@ -878,8 +878,20 @@ pub fn load_model(
             //    garbage. Also ruled out: CASK (same with the sidecar parked),
             //    graph capture (same with HIPFIRE_VERIFY_GRAPH=0), and the Opus
             //    batched GEMMs (parity_oq8_gemm 45 dB SQNR, parity_gemm_oq_compact
-            //    bit-identical). MoE Opus is fine, so the fault is specific to
-            //    the dense `LayerWeights::DeltaNet` batched arm.
+            //    bit-identical). MoE Opus is fine, so the fault is DENSE-specific.
+            //    Reproduced on a SECOND dense model (Qwen3.6-27B oq4.25++) with
+            //    z-lab's own MATCHED DFlash1 drafter -> 'extr' at 0.41 tok/s, so
+            //    it is neither the 3.8 artifact nor the heretic-lineage drafter.
+            //    Two things narrow it further. `forward_prefill_batch`'s
+            //    DeltaNet/DeltaNetMoe arms are DEAD for these models -- both were
+            //    instrumented and neither fires, with or without a draft -- so
+            //    that file is the wrong place to look. And an rocprofv3 kernel
+            //    diff shows the draft run adds only DRAFTER kernels
+            //    (gemm_dflash_oq4_plain_dp4a_staged_8w, quantize_dflash_act_g256,
+            //    attention_dflash_f32) plus the lm_head arm; the target body
+            //    reuses the plain-decode kernels. So the divergence is in how
+            //    verify DRIVES that shared body -- state or position handling
+            //    across the block -- not in a separate dtype-specific arm.
             //
             // 2. MoE targets are CORRECT but unprofitable. Qwen3.5-35B-A3B
             //    oq4.25++ + CASK + a DFlash1 drafter serves coherently, and
