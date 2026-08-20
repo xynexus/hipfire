@@ -88,18 +88,17 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_grouped_v2(
            + (float)OQCV2_LO(w1, 3) * x3.z + (float)OQCV2_HI(w1, 3) * x3.w;
 
         // Overlays REPLACE the bulk nibble, so add the difference, applied by
-        // whichever lane owns the position. Corrections sum, so an index a later
-        // entry supersedes must be skipped or it would land on v1+v2-bulk
-        // instead of the oracle's v2 (N_out is 3 at oq4.25++, so this is cheap).
+        // whichever lane owns the position. Duplicate indices are resolved at
+        // LOAD (`normalize_compact_overlays`) rather than rescanned here — the
+        // rescan was O(N_out^2) and divergent, and measured as the thing holding
+        // this kernel off the memory wall (1 -> 8 corrections cost ~4x).
         const uint8_t* table = blk + 130;
         for (int e = 0; e < n_ov; ++e) {
             const int idx = (int)table[2 * e];
             if ((idx >> 4) != lig) continue;
-            bool superseded = false;
-            for (int e2 = e + 1; e2 < n_ov; ++e2) {
-                if ((int)table[2 * e2] == idx) { superseded = true; break; }
-            }
-            if (superseded) continue;
+            // No supersede rescan: duplicate indices are resolved at load by
+            // `normalize_compact_overlays`, which neutralises a superseded entry
+            // (value := the bulk nibble under it, so the difference is zero).
             const int slot = idx & 15;
             const int j    = slot >> 1;
             const uint32_t word = (j < 4) ? w0 : w1;

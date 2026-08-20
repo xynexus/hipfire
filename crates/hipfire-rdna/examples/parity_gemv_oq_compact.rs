@@ -91,6 +91,41 @@ fn expand(
     (w, ws)
 }
 
+/// Mirror of `hipfire_runtime::oq8_arch::normalize_compact_overlays`: resolve
+/// duplicate overlay indices by neutralising the superseded entry (value := the
+/// bulk nibble under it, so its difference is zero). The GEMV kernels rely on the
+/// loader having done this, so the fixture must do it too. Duplicated rather than
+/// imported because hipfire-rdna cannot depend on hipfire-runtime.
+fn normalize_overlays(
+    blocks: &mut [u8],
+    n_blocks: usize,
+    stride: usize,
+    group: usize,
+    n_out: usize,
+) {
+    if n_out < 2 {
+        return;
+    }
+    let header = 2 + group / 2;
+    for b in 0..n_blocks {
+        let base = b * stride;
+        let tbl = base + header;
+        for e in 0..n_out - 1 {
+            let idx = blocks[tbl + 2 * e] as usize;
+            if !(e + 1..n_out).any(|e2| blocks[tbl + 2 * e2] as usize == idx) {
+                continue;
+            }
+            let byte = blocks[base + 2 + idx / 2];
+            let bulk = if idx % 2 == 0 {
+                ((byte & 0xf) as i8) << 4 >> 4
+            } else {
+                ((byte >> 4) as i8) << 4 >> 4
+            };
+            blocks[tbl + 2 * e + 1] = bulk as u8;
+        }
+    }
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
     const GROUP: usize = 256;
@@ -132,6 +167,7 @@ fn main() {
                 }
             }
         }
+        normalize_overlays(&mut blocks, m * ng, block_stride, GROUP, N_OUT);
         let x: Vec<f32> = (0..k).map(|_| (rnd() % 2000) as f32 * 1e-3 - 1.0).collect();
         let (w, ws) = expand(&blocks, m, k, block_stride, GROUP);
 

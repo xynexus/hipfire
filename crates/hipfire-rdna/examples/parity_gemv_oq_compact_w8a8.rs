@@ -54,6 +54,32 @@ fn f16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Mirror of `hipfire_runtime::oq8_arch::normalize_compact_overlays`. Duplicated
+/// rather than imported because hipfire-rdna cannot depend on hipfire-runtime;
+/// the runtime crate owns the authoritative version and its own unit tests.
+fn normalize_overlays(blocks: &mut [u8], m: usize, ng: usize, stride: usize, n_out: usize) {
+    if n_out < 2 {
+        return;
+    }
+    for b in 0..m * ng {
+        let base = b * stride;
+        let tbl = base + 130;
+        for e in 0..n_out - 1 {
+            let idx = blocks[tbl + 2 * e] as usize;
+            if !(e + 1..n_out).any(|e2| blocks[tbl + 2 * e2] as usize == idx) {
+                continue;
+            }
+            let byte = blocks[base + 2 + idx / 2];
+            let bulk = if idx % 2 == 0 {
+                ((byte & 0xf) as i8) << 4 >> 4
+            } else {
+                ((byte >> 4) as i8) << 4 >> 4
+            };
+            blocks[tbl + 2 * e + 1] = bulk as u8;
+        }
+    }
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
     // Real oq4.25++ is N_out=3. OQC8_NOUT sweeps it: if the A8 deficit tracks the
@@ -96,6 +122,10 @@ fn main() {
                 }
             }
         }
+        // Resolve duplicate overlay indices exactly as `oq8_arch_load` does before
+        // upload — the kernels are allowed to assume it, so the fixture must too.
+        normalize_overlays(&mut blocks, m, ng, block_stride, n_out);
+
         // int8 activation + per-group f32 scales, exactly what the decode path
         // hands the kernel after rotate + quantize_act_oq8.
         let xq: Vec<i8> = (0..k).map(|_| ((rnd() % 255) as i32 - 127) as i8).collect();

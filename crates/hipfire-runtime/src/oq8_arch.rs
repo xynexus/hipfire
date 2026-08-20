@@ -164,6 +164,61 @@ pub fn oq3_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// is derived from the byte length (uniform per tensor). Sign-extend the int4
 /// bulk into int8, then overlay the sparse int8 outliers at their in-group
 /// indices → the same combined `[int8 m*k][f32 scales m*ng]` layout.
+/// Resolve duplicate overlay indices in OqPlusCompact blocks, in place.
+///
+/// The sparse overlay REPLACES the bulk nibble, and a repeated index means the
+/// LAST entry wins. Honouring that in the kernel costs an inner rescan of the
+/// remaining table per correction — `O(N_out^2)`, and divergent, because the
+/// ownership test is a `continue` so every lane of a group pays for every
+/// iteration. Measured, that rescan is what holds the compact decode GEMV off
+/// the memory wall: 1 -> 8 corrections costs ~4x on both the A16 and A8 kernels,
+/// while at N_out=1 the A8 kernel reaches 94% of pure-read stream bandwidth.
+///
+/// Resolving it here instead lets the kernels apply every entry unconditionally.
+/// The table stays its declared size — a superseded entry is neutralised rather
+/// than removed, by setting its value to the bulk nibble it sits on, so its
+/// `val - bulk` difference is exactly zero. That keeps `block_stride` (and hence
+/// every offset derived from it) untouched, and leaves the expansion path's
+/// last-wins semantics unchanged: the no-op writes the value already there.
+///
+/// Idempotent, so running it on an already-clean artifact is a no-op.
+pub fn normalize_compact_overlays(data: &mut [u8], m: usize, k: usize, group: usize) {
+    let ng = k / group;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return;
+    }
+    let block_bytes = data.len() / n_groups;
+    let header = 2 + group / 2;
+    if block_bytes < header + 2 || (block_bytes - header) % 2 != 0 {
+        return;
+    }
+    let n_out = (block_bytes - header) / 2;
+    if n_out < 2 {
+        return; // a single entry cannot be superseded
+    }
+    for b in 0..n_groups {
+        let base = b * block_bytes;
+        let tbl = base + header;
+        for e in 0..n_out - 1 {
+            let idx = data[tbl + 2 * e] as usize;
+            // Superseded by any LATER entry on the same index?
+            let superseded = (e + 1..n_out).any(|e2| data[tbl + 2 * e2] as usize == idx);
+            if !superseded {
+                continue;
+            }
+            // Neutralise: value := the bulk nibble under this index.
+            let byte = data[base + 2 + idx / 2];
+            let bulk = if idx % 2 == 0 {
+                ((byte & 0xf) as i8) << 4 >> 4
+            } else {
+                ((byte >> 4) as i8) << 4 >> 4
+            };
+            data[tbl + 2 * e + 1] = bulk as u8;
+        }
+    }
+}
+
 pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     oqplus_compact_to_oq8_combined_g(data, m, k, 256)
 }
@@ -317,10 +372,14 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // shape is the handle because this hook never sees the tensor name.
     if compact_resident_enabled() && compact_shape_selected(m, k) {
         if qt == QuantType::OqPlusCompact.code() {
-            return Some((data.to_vec(), DType::OqCompactG256));
+            let mut owned = data.to_vec();
+            normalize_compact_overlays(&mut owned, m, k, 256);
+            return Some((owned, DType::OqCompactG256));
         }
         if qt == QuantType::OqPlusCompactG128.code() {
-            return Some((data.to_vec(), DType::OqCompactG128));
+            let mut owned = data.to_vec();
+            normalize_compact_overlays(&mut owned, m, k, 128);
+            return Some((owned, DType::OqCompactG128));
         }
     }
     let bytes = match qt {
@@ -504,5 +563,86 @@ mod tests {
         assert_eq!(out[5] as i8, -100); // outlier overlaid
         assert_eq!(out[6] as i8, 1); // still bulk
         assert_eq!(&out[256..260], &one_le());
+    }
+}
+
+#[cfg(test)]
+mod overlay_normalize_tests {
+    use super::{normalize_compact_overlays, oqplus_compact_to_oq8_combined};
+
+    /// Neutralising a superseded entry must not change what the block DECODES to.
+    /// The expansion is the oracle: it applies the table in order, so last-wins is
+    /// already correct there, and normalization must leave its output identical.
+    #[test]
+    fn normalize_preserves_decoded_weights() {
+        const G: usize = 256;
+        let (m, k, n_out) = (3usize, G, 4usize);
+        let stride = 2 + G / 2 + 2 * n_out;
+        let mut blocks = vec![0u8; m * (k / G) * stride];
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for b in 0..m {
+            let off = b * stride;
+            blocks[off] = 0x00;
+            blocks[off + 1] = 0x3c; // f16 1.0
+            for i in 0..G / 2 {
+                blocks[off + 2 + i] = rnd();
+            }
+            // Deliberately collide: only two distinct indices across four entries.
+            for e in 0..n_out {
+                blocks[off + 2 + G / 2 + 2 * e] = if e % 2 == 0 { 7 } else { 200 };
+                blocks[off + 2 + G / 2 + 2 * e + 1] = rnd();
+            }
+        }
+        let before = oqplus_compact_to_oq8_combined(&blocks, m, k);
+        let mut norm = blocks.clone();
+        normalize_compact_overlays(&mut norm, m, k, G);
+        let after = oqplus_compact_to_oq8_combined(&norm, m, k);
+        assert_eq!(before, after, "normalization changed the decoded weights");
+        assert_ne!(blocks, norm, "fixture had no duplicates to resolve");
+
+        // And after normalization every surviving index is unique — which is the
+        // property the kernels are allowed to rely on.
+        for b in 0..m {
+            let tbl = b * stride + 2 + G / 2;
+            let mut seen: Vec<u8> = Vec::new();
+            for e in 0..n_out {
+                let idx = norm[tbl + 2 * e];
+                let val = norm[tbl + 2 * e + 1];
+                let byte = norm[b * stride + 2 + idx as usize / 2];
+                let bulk = if idx % 2 == 0 {
+                    ((byte & 0xf) as i8) << 4 >> 4
+                } else {
+                    ((byte >> 4) as i8) << 4 >> 4
+                };
+                // Either a live correction on a fresh index, or a neutralised no-op.
+                if val as i8 != bulk {
+                    assert!(!seen.contains(&idx), "duplicate live index {idx} survived");
+                    seen.push(idx);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_is_idempotent_and_safe_on_clean_blocks() {
+        const G: usize = 256;
+        let (m, k, n_out) = (2usize, G, 3usize);
+        let stride = 2 + G / 2 + 2 * n_out;
+        let mut blocks = vec![0x11u8; m * stride];
+        for b in 0..m {
+            for e in 0..n_out {
+                blocks[b * stride + 2 + G / 2 + 2 * e] = (e * 9) as u8; // all distinct
+            }
+        }
+        let mut once = blocks.clone();
+        normalize_compact_overlays(&mut once, m, k, G);
+        assert_eq!(blocks, once, "clean blocks must be untouched");
+        let mut twice = once.clone();
+        normalize_compact_overlays(&mut twice, m, k, G);
+        assert_eq!(once, twice, "not idempotent");
     }
 }

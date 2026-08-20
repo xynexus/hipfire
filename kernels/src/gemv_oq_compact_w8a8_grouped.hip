@@ -134,11 +134,11 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_w8a8_grouped(
         for (int e = 0; e < n_ov; ++e) {
             const int idx = (int)table[2 * e];
             if ((idx >> 4) != lig) continue;
-            bool superseded = false;
-            for (int e2 = e + 1; e2 < n_ov; ++e2) {
-                if ((int)table[2 * e2] == idx) { superseded = true; break; }
-            }
-            if (superseded) continue;
+            // No supersede rescan: `normalize_compact_overlays` resolves duplicate
+            // indices at load, neutralising a superseded entry by setting its value
+            // to the bulk nibble under it, so its difference is exactly zero and it
+            // can be applied unconditionally. That rescan was O(N_out^2) and
+            // divergent, and it is what held this kernel off the memory wall.
             const int slot = idx & 15;
             const int j    = slot >> 1;
             const uint32_t word = (j < 4) ? w0 : w1;
