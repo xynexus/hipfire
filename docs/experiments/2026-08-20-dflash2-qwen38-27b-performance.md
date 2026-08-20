@@ -69,11 +69,25 @@ is the DeltaNet recurrence. Both are cases where the batch dimension buys nothin
    Mamba-2 is the shape of the answer — a block-scan formulation instead of a
    per-token loop.
 2. **Kill `replay`.** 131 ms per accepted token, a full serial decode each, purely
-   to re-advance DeltaNet state over tokens verify already ran.
-   `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` is meant to replace it with a GDN tape
-   replay; measured here it changes nothing (τ and tok/s identical to the digit),
-   so `verify_populates_tape` is still not satisfied on this path. Worth chasing —
-   at accept=4 replay is 40 % of the cycle.
+   to re-advance DeltaNet state over tokens verify already ran. At accept=4 that is
+   40 % of the cycle.
+
+   `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` measured as an exact no-op here (τ and
+   tok/s identical to the digit) for a reason that has nothing to do with the tape
+   being populated: the arm carries `&& !gpu.arch_caps.is_rdna3p5()`, and halo is
+   gfx1151, so on this machine the flag can never take effect. Do not read that
+   no-op as evidence about the tape.
+
+   It would not have helped anyway. The serial-tape arm loops
+   `forward_scratch_capture_gdn_tape` over the accepted prefix — one full serial
+   forward per accepted token, the same cost as the replay it replaces, just
+   capturing a tape while it goes. `PrefixVerify` runs a whole extra verify. Every
+   implemented rollback mechanism pays a forward per accepted token.
+
+   So killing replay is not a matter of picking a different existing arm. It needs
+   DeltaNet state to be *checkpointed per position during verify* (verify already
+   walks those positions) so rollback is a restore instead of a re-run. That is the
+   same batched-recurrence work as (1), which is a reason to do (1) first.
 3. **The candidate selector**, for τ. Cheap relative to the above and it is the
    drafter this checkpoint actually describes — but per the ceiling arithmetic it
    improves the numerator of a fraction whose denominator is the problem.
