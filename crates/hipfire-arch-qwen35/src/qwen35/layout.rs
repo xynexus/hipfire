@@ -408,6 +408,33 @@ impl Qwen35Weights {
             self.pager.is_none(),
             "free_gpu_multi: pager must be None on pp>1 path"
         );
+        // A HARD assert, not a debug_assert like its neighbour above, because
+        // the failure it prevents is silent weight corruption rather than a
+        // leak — and a panic is strictly better than that.
+        //
+        // Every free below is a bare `free_tensor`: this whole path has no slab
+        // awareness at all, unlike `free_gpu`, which routes through
+        // `free_tensor_maybe_slab`. A slab-backed tensor here would put a
+        // mid-slab pointer on `GpuPool`'s free list and the next `pool.alloc`
+        // would hand it out as scratch, writing over live weights. That exact
+        // bug was live in `shard_moe_experts` until it was fixed.
+        //
+        // Safe TODAY only because `load_weights_multi` hardcodes
+        // `slab_storage: None` — safe by DATA, not by type, and one loader
+        // change from being live. Guarding the two `free_moe_ffn` calls alone
+        // would be worse than this: it would look like the path had been made
+        // slab-safe while ~40 other frees stayed exposed. Making the path
+        // genuinely slab-safe means threading `slabs` through all of them,
+        // which is a real change and wants its own reasoning; asserting the
+        // assumption is the honest interim.
+        assert!(
+            self.slab_storage.is_none(),
+            "free_gpu_multi: slab-backed weights on the pp>1 path. Every free here \
+             is unguarded, so freeing a slab alias would corrupt live weights. \
+             Either route this path through free_tensor_maybe_slab (threading \
+             slabs through every free), or keep load_weights_multi's \
+             slab_storage: None."
+        );
         let _ = gpus.devices[0].free_tensor(self.token_embd);
         let out_dev = gpus.output_device;
         let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
@@ -501,7 +528,26 @@ pub fn validate_paged_moe_decode_expert_cache(
         .map_err(|e| format!("paged Qwen35-MoE decode expert cache too small: {e}"))
 }
 
+/// Unguarded MoE-FFN teardown for the `pp > 1` path ONLY.
+///
+/// The guarded version is [`free_moe_ffn_maybe_slab`]; use that one unless you
+/// are `free_gpu_multi`, which asserts `slab_storage.is_none()` precisely so
+/// this is sound. Two aliasing sources make the distinction matter, and neither
+/// is checked here:
+///
+/// * slab-backed tensors — non-owning aliases into a weight slab;
+/// * `raw_expert_storage` — expert buffers that are interior slices of one
+///   stacked allocation, which `free_moe_ffn_maybe_slab` `mem::forget`s.
+///
+/// `paro_shared` IS handled below, which is the tell that the other two were
+/// oversights rather than deliberate: the same function already knows that
+/// freeing a non-owning view is wrong.
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    debug_assert!(
+        ffn.raw_expert_storage.is_none(),
+        "free_moe_ffn: raw_expert_storage aliases would be double-freed here; \
+         use free_moe_ffn_maybe_slab"
+    );
     let _ = gpu.free_tensor(ffn.router.buf);
     let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
@@ -551,7 +597,7 @@ impl ModelGpuStorage {
     }
 }
 
-fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor: GpuTensor) {
+pub(super) fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor: GpuTensor) {
     if slabs.is_some_and(|s| s.contains_tensor(&tensor)) {
         std::mem::forget(tensor);
     } else {
@@ -559,7 +605,7 @@ fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor
     }
 }
 
-fn free_weight_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, wt: WeightTensor) {
+pub(super) fn free_weight_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, wt: WeightTensor) {
     if let Some(scale) = wt.awq_scale {
         let _ = gpu.free_tensor(scale);
     }
