@@ -388,3 +388,54 @@ tau/B proof is not the whole story. THREE things must land together:
 
 Doing (1) or (2) alone is measurably not enough, which is the point of recording
 both numbers.
+
+## FINAL Phase 2 accounting — why spec-decode still loses, precisely
+
+After the N-blocking fix (compact GEMM 42x -> ~5x redundant, prefill 15.2 -> 42.4
+tok/s), spec-decode was re-measured with the verify forced to batch:
+
+    verify per-token   4.52 tok/s   tau 3.375   accept 0.482
+    verify BATCHED     5.56         tau 2.000   accept 0.286   (+23%, was +7.8%)
+
+Still 2.7x below plain decode's 15.1. The phase breakdown says why:
+
+    B=8 cycle: draft 64,000us  verify 511,000us  replay 203,000us
+
+**verify = 511 ms for 8 tokens = 64 us per draft token, against plain decode's
+66 us.** Verify is barely cheaper PER TOKEN than simply decoding, even batched
+and even with the faster GEMM.
+
+The reason is structural and is the real answer to Phase 2: the WMMA GEMM tiles
+B by 16, so at spec-decode's verify width (B = K+1, typically 8) it computes a
+16-wide tile for 8 useful columns AND has no N to amortize the int4 decode +
+overlay scan over. **Spec-decode's batch size is exactly where this kernel is
+worst.** N-blocking helps prefill (B in the hundreds) enormously and the verify
+barely at all, which is why prefill went 2.8x and spec-decode went 23%.
+
+### The fix, and an attempt at it that FAILED
+
+The right kernel for B <= 16 is not the WMMA GEMM but a MULTI-COLUMN GEMV: read
+each weight row once, exactly like the decode GEMV, and accumulate B columns
+against it. Weight traffic becomes ONE sweep for all B tokens instead of one per
+token. With verify at ~one sweep (~66 ms) and tau 3.375:
+
+    cycle ~= 64 (draft) + 66 (verify) = 130 ms for 3.375 tokens ~= 26 tok/s
+
+which would finally beat plain decode's 15.1.
+
+I wrote that kernel (`gemv_oq_compact_multicol`, modelled on the v3 decode GEMV,
+consuming the same int8 activation plane as the WMMA GEMM so it drops in at
+small B) and it FAILED parity on every G=256 shape — including ones with no
+ragged tail and B=1, so a fundamental error rather than an edge case. Two real
+bugs were found and fixed along the way and are worth knowing for the next
+attempt:
+
+  * `ng` need not be a multiple of 4 (K=256 gives ng=1), so lanes with gir>0
+    read past the end;
+  * with 8 lanes per group, only overlay entry `lig` is applied — N_out > 8
+    needs the striding residual loop the v3 kernel has.
+
+Neither was the root cause. The kernel was REVERTED rather than shipped broken;
+the tree is green (parity_gemm_oq_compact and parity_gemv_oq_compact PASS). The
+design above is sound and the payoff is quantified — it needs someone to find
+the remaining defect with a numerical single-shape dump rather than by reading.
