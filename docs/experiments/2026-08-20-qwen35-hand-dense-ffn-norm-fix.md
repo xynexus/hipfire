@@ -89,6 +89,25 @@ Before the fix, the same two dense artifacts produced
 `'  0\n;\n    0\n; ( 0)s0;0\n    0;\n'` and
 `' How to the answer is the 1.\n\n with a 格式 10 10: 10'`.
 
+## Is the bug class anywhere else? No — swept
+
+qwen35 has four sibling implementations of the decoder layer loop. Every
+`fused_gate_up_*` / `run_fused_gate_up_key` call site was checked for the same
+defect (a gate_up consuming a buffer normalized with `attn_norm` rather than
+`ffn_norm`):
+
+| site | DeltaNet dense | FullAttn dense | MoE arms |
+|---|---|---|---|
+| `decode_layers.rs` (hand decode) | **was missing** | ok (`:1617`) | ok |
+| `ep.rs` (expert-parallel, multi-GPU) | ok (`:730`) | ok (`:1250`) | ok |
+| `prefill_chunk.rs` | ok (`:3479`) | ok (`:5613`) | ok (`:6874`, `:7861`) |
+| `moe_decode.rs` | n/a | n/a | ok (callers normalize) |
+
+So this was a single-site defect, not a systemic pattern, and the fix is complete
+for the class. `ep.rs` is worth noting: it is close to a copy of the same layer
+loop and it applies `ffn_norm` correctly in both dense arms — the hand decode arm
+was the lone outlier among four.
+
 ## Why no gate caught it
 
 The tiny gates exercise only the default (lowered) path. Running the full
