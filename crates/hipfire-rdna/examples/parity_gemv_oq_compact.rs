@@ -186,6 +186,7 @@ fn main() {
             want[r] = acc;
         }
 
+        let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
         let d_blocks = gpu.upload_raw(&blocks, &[blocks.len()]).expect("blocks");
         let d_x = gpu.upload_f32(&x, &[k]).expect("x");
         let d_y = gpu.alloc_tensor(&[m], DType::F32).expect("y");
@@ -193,8 +194,60 @@ fn main() {
             .expect("gemv");
         let got = gpu.download_f32(&d_y).expect("dl");
 
+        // Multi-wave widths: every one must produce the same answer, and the
+        // bandwidth column is what says whether occupancy was the limiter.
+        let bytes = m * ng * block_stride;
+        let mut mw = String::new();
+        for &waves in &[1usize, 2, 4, 8] {
+            gpu.gemv_oq_compact_grouped_mw(&d_blocks, &d_x, &d_y, m, k, GROUP, block_stride, waves)
+                .expect("mw gemv");
+            let g2 = gpu.download_f32(&d_y).expect("dl mw");
+            let worst_mw = g2
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| ((*a - *b).abs()) as f64)
+                .fold(0.0f64, f64::max);
+            for _ in 0..3 {
+                gpu.gemv_oq_compact_grouped_mw(
+                    &d_blocks,
+                    &d_x,
+                    &d_y,
+                    m,
+                    k,
+                    GROUP,
+                    block_stride,
+                    waves,
+                )
+                .unwrap();
+            }
+            gpu.device_synchronize().unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..10 {
+                let t = std::time::Instant::now();
+                gpu.gemv_oq_compact_grouped_mw(
+                    &d_blocks,
+                    &d_x,
+                    &d_y,
+                    m,
+                    k,
+                    GROUP,
+                    block_stride,
+                    waves,
+                )
+                .unwrap();
+                gpu.device_synchronize().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let gbs = bytes as f64 / best / 1e9;
+            let bad = worst_mw / scale as f64 > 2e-3;
+            if bad {
+                fail += 1;
+            }
+            mw.push_str(&format!(" w{waves}={gbs:.0}{}", if bad { "!" } else { "" }));
+        }
+        println!("    multi-wave GB/s:{mw}");
+
         let (mut worst, mut at) = (0f32, 0usize);
-        let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
         for r in 0..m {
             let d = (got[r] - want[r]).abs();
             if d > worst {

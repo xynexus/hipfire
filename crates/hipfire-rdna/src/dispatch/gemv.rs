@@ -5499,6 +5499,35 @@ impl Gpu {
         if group != 256 || (k / 256) % 2 != 0 {
             return self.gemv_oq_compact_grouped(w_blocks, x_f32, y_f32, m, k, group, block_stride);
         }
+        // Waves per workgroup. DEFAULT 2: same math, packed so RDNA's
+        // workgroup-per-CU cap does not leave waves unused. Measured end-to-end on
+        // Qwen3.8-27B oq4.25++ decode (q8 KV, 64 tokens, reproducible to the
+        // digit): 1 -> 10.40 tok/s, 2 -> 11.00, 4 -> 10.60, 8 -> 10.70. MoE
+        // Qwen3.5-35B-A3B: 51.80 -> 52.70. Wider than 2 gives the loads less to
+        // interleave per workgroup and falls back.
+        //
+        // ponytail: tuned on gfx1151. HIPFIRE_OQ_COMPACT_GEMV_WAVES re-tunes it;
+        // 1 selects the original one-wave-per-workgroup kernel.
+        static MW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let waves = *MW.get_or_init(|| {
+            std::env::var("HIPFIRE_OQ_COMPACT_GEMV_WAVES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|w| (1..=8).contains(w))
+                .unwrap_or(2)
+        });
+        if waves > 1 {
+            return self.gemv_oq_compact_grouped_mw(
+                w_blocks,
+                x_f32,
+                y_f32,
+                m,
+                k,
+                group,
+                block_stride,
+                waves,
+            );
+        }
         self.bind_thread()?;
         let header = 2 + group / 2;
         assert!(
@@ -5780,6 +5809,46 @@ impl Gpu {
     /// per-group scales on both sides, `sdot4` int32 dot. `xq_i8`/`xs` are the
     /// shared pre-quantized (FWHT-rotated) activation from `quantize_act_oq8`.
     #[allow(clippy::too_many_arguments)]
+    /// Multi-wave compact decode GEMV. `waves` waves per workgroup, one output
+    /// row each; `waves == 1` is the original one-wave-per-workgroup shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_grouped_mw(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+        waves: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            (1..=8).contains(&waves),
+            "gemv_oq_compact_grouped_mw: waves 1..8"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_grouped_mw",
+            kernels::GEMV_OQ_COMPACT_GROUPED_MW_SRC,
+            "gemv_oq_compact_grouped_mw",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_grouped_mw",
+            [m.div_ceil(waves) as u32, 1, 1],
+            [(waves * 32) as u32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
     /// Compact-resident Opus W4A8 decode GEMV. `w_blocks` holds OqPlusCompact
     /// blocks as they sit on disk; `xq_i8`/`xs` are the int8 activation and its
     /// per-group scales. Numerics match [`Self::gemv_oq_compact_grouped_auto`]
