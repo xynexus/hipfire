@@ -439,3 +439,41 @@ Neither was the root cause. The kernel was REVERTED rather than shipped broken;
 the tree is green (parity_gemm_oq_compact and parity_gemv_oq_compact PASS). The
 design above is sound and the payoff is quantified — it needs someone to find
 the remaining defect with a numerical single-shape dump rather than by reading.
+
+## Where the spec-decode time ACTUALLY is, after the multicol kernel
+
+`gemv_oq_compact_multicol` (bit-identical, B <= 16) took the verify from 613 ->
+407 ms and spec-decode from 4.49 -> 6.87 tok/s. Profiling the run then shows the
+verify GEMM is no longer the problem:
+
+    gemm_oq_compact_grouped_wmma   304 calls   419.6 ms   33%   <- SEED prefill
+    gemv_oq_compact_grouped_v3    2523        320.1      25%   <- ROLLBACK re-prefill
+    gemm_qkvza_hfq4g256_wmma        96        225.4      18%   <- the DRAFT model
+    gemv_oq_compact_multicol       193        193.4      15%   <- verify, ~48 ms/cycle
+
+**The verify GEMM is now 48 ms per cycle.** The remaining costs are the DRAFT
+(~64 ms/cycle) and ROLLBACK, which re-runs a full target prefill per rejection —
+2523 GEMV calls is roughly five whole target forwards. `replay_gdn_tape=0`
+throughout: the cheap tape replay never engages.
+
+### The arithmetic now favours spec-decode, if replay is fixed
+
+    cycle = 64 (draft) + 48 (verify) + ~0 (tape replay) = 112 ms
+    at tau 2.00 (today, KV-fork-degraded)  ->  17.9 tok/s
+    at tau 3.375 (KV fork fixed)           ->  30.1 tok/s
+
+against plain decode's 15.1. So for the first time the cycle budget CLEARS the
+bar — the blocker is no longer the GEMM or the tau/B arithmetic, it is that
+every rejection pays a full re-prefill.
+
+### What is still gating the tape
+
+`dflash_use_gdn_tape_replay(caller_supplied_tape, verify_populates_tape)`. The
+demo DOES allocate a `GdnTape`, and forcing `verify_populates_tape` true (probe)
+still leaves `replay_gdn_tape=0`, so a further term gates it —
+`kv_batched_capable` or one of the eight conditions inside
+`prefill_batch_pbs_eligible`. That is the next thing to isolate, and it is a
+one-predicate question rather than a kernel project.
+
+Probes used for these measurements were reverted; `HIPFIRE_PROBE_COMPACT_HIDDEN`
+remains (documented, measurement-only, default off).
