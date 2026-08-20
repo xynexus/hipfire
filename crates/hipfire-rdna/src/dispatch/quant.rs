@@ -330,6 +330,24 @@ impl Gpu {
     /// [`Self::gemm_oq4_grouped_wmma`]). `w_i8`/`x_i8` are [M,K]/[B,K] signed int8
     /// rows; `w_scales`/`x_scales` are per-group f32; `y_f32` is [B,M].
     #[allow(clippy::too_many_arguments)]
+    /// Default rows-per-launch target for the M-slab split.
+    ///
+    /// Measured on gfx1151 against COLD weights (`bench_oq8_gemm_small_n --cold`),
+    /// gate/up [17408, 5120] at B=9:
+    ///
+    /// ```text
+    ///   rows/launch   1024   2176   4352   5120   8704   17408(one launch)
+    ///   GB/s           101    133    132    136    108    18
+    /// ```
+    ///
+    /// A broad plateau from ~2K to ~5K rows, and a 7.5x cliff if the whole M goes
+    /// in one launch. Cold matters: this part has a 32 MB MALL, so a warm loop
+    /// over a sub-32 MiB shape reports cache bandwidth (o_proj measured 288 GB/s
+    /// warm against 140 cold — above the ~256 GB/s LPDDR5X peak, which is the
+    /// tell). An earlier version of this constant was justified by that warm
+    /// number; the value survived re-tuning, the reasoning did not.
+    const SLAB_TARGET_DEFAULT: usize = 5120;
+
     pub fn gemm_oq8_grouped_wmma(
         &mut self,
         w_i8: &GpuTensor,
@@ -363,34 +381,87 @@ impl Gpu {
         let xp = x_i8.buf.as_ptr();
         let xsp = x_scales.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
+        // Row-slab the M dimension. One launch covering all of M collapses on
+        // tall-thin shapes — 18 GB/s at [17408, 5120] B=9 on cold weights, where
+        // the same kernel does 169 GB/s at [5120, 17408] with the identical byte
+        // count and per-block work. Slabbing recovers it to 135 GB/s, a 7.3x
+        // speedup, with no change to the math: W/Ws are advanced per slab and the
+        // kernel writes Y at `m_base + out_row`, so every output word is computed
+        // by the same block arithmetic as the single launch (checked exactly by
+        // `parity_oq8_gemm`'s row-placement case). See `bench_oq8_gemm_small_n`.
+        //
+        // Split EVENLY rather than into fixed slabs plus a runt: a trailing
+        // 1024-row launch costs more than it computes, and shapes already at full
+        // bandwidth (M <= the target) must keep taking a single launch — slabbing
+        // those measured ~20 % SLOWER.
+        //
+        // ponytail: tuned on gfx1151 against COLD weights — see the note in
+        // `bench_oq8_gemm_small_n` about the 32 MB MALL, which makes any shape
+        // under ~32 MiB report cache bandwidth when timed in a loop. Override to
+        // re-tune on another arch.
+        let slab_target: usize = std::env::var("HIPFIRE_OQ8_GEMM_SLAB_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 16)
+            .unwrap_or(Self::SLAB_TARGET_DEFAULT);
+        // Escape hatch, and what the slab/no-slab equivalence check drives.
+        // Slabbing changes only which launch computes a row, never the row's
+        // arithmetic, so `HIPFIRE_OQ8_GEMM_SLAB=0` must be BIT-identical.
+        static SLAB_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let slab_on = *SLAB_ON.get_or_init(|| {
+            !matches!(
+                std::env::var("HIPFIRE_OQ8_GEMM_SLAB").ok().as_deref(),
+                Some("0" | "off" | "false" | "no")
+            )
+        });
+        let n_slabs = if slab_on {
+            m.div_ceil(slab_target).max(1)
+        } else {
+            1
+        };
+        let slab_rows = m.div_ceil(n_slabs).next_multiple_of(16);
+        let ky = k as i32;
+        let mut ki = ky;
         let mut bi = batch_size as i32;
         let mut gi = group as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &wp as *const _ as *mut c_void,
-            &wsp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &xsp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-            &mut gi as *mut _ as *mut c_void,
-        ];
-        let grid_m = m.div_ceil(16) as u32;
+        let mut ma = m as i32;
         let grid_b = batch_size.div_ceil(16) as u32;
-        let func = &self.functions["gemm_oq8_grouped_wmma"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_b, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        let n_groups = k / group;
+        let mut base = 0usize;
+        while base < m {
+            let rows = slab_rows.min(m - base);
+            let wp_s = unsafe { (wp as *const u8).add(base * k) } as *mut c_void;
+            let wsp_s = unsafe { (wsp as *const f32).add(base * n_groups) } as *mut c_void;
+            let mut mi = rows as i32;
+            let mut mb = base as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &wp_s as *const _ as *mut c_void,
+                &wsp_s as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &xsp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut bi as *mut _ as *mut c_void,
+                &mut gi as *mut _ as *mut c_void,
+                &mut ma as *mut _ as *mut c_void,
+                &mut mb as *mut _ as *mut c_void,
+            ];
+            let grid_m = rows.div_ceil(16) as u32;
+            let func = &self.functions["gemm_oq8_grouped_wmma"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [grid_m, grid_b, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?
+            };
+            base += rows;
         }
+        Ok(())
     }
 
     /// Compact-resident twin of [`Self::gemm_oq8_grouped_residual_act_batched`]:

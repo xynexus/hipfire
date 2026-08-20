@@ -4,7 +4,15 @@
 hand-decode-path fix (`b7b7a9ae5`) made dense spec-decode correct at all.
 **Verdict:** DFlash2 is **2.3× better than DFlash1** and still a **3.7×
 regression against plain decode**. The ceiling is structural, not drafter
-quality — see the arithmetic below.
+quality.
+
+> ⚠️ **The MECHANISM below is retracted; the numbers stand.** A rocprofv3 trace
+> (`2026-08-20-dflash-verify-profile.md`) shows DeltaNet is **0.7 %** of GPU time,
+> not the bottleneck this document blames. 69 % is `gemm_oq8_grouped_wmma`, the
+> batched Opus GEMM, running at 47 GB/s where the decode GEMV gets 215 GB/s on
+> the same weights. The true ceiling is **1.0×**, not the 1.22× computed here.
+> Read the profile doc for the corrected analysis; everything below the "Numbers"
+> table is superseded.
 
 All three configurations emit **byte-identical text** to the no-draft baseline,
 which is the losslessness spec-decode is supposed to have and is the first time

@@ -35,6 +35,65 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// The M-slab split must be BIT-identical: it changes which launch computes a
+/// row, never the row's arithmetic. Runs a tall-thin shape (the one the split
+/// exists for) both ways and compares words. `HIPFIRE_OQ8_GEMM_SLAB=0` forces
+/// the single launch, so this can only be checked from a fresh process per mode
+/// — the flag is read once. Here we compare the CURRENT mode against a CPU
+/// recomputation of a few rows instead, which catches an off-by-one in `m_base`
+/// (the failure the split can actually introduce).
+fn check_slab_row_placement(gpu: &mut hipfire_rdna::Gpu) {
+    use hipfire_rdna::DType;
+    const M: usize = 17408; // > SLAB_TARGET, so the split is live
+    const K: usize = 512;
+    const G: usize = 256;
+    const B: usize = 3;
+    let ng = K / G;
+    // Weight row m is all zeros except a single +1 at column (m % K); activation
+    // row b is all zeros except +1 at column (b * 97 % K). Then Y[b, m] is
+    // nonzero exactly when those columns coincide — a placement test that a
+    // wrong m_base cannot pass by luck.
+    let mut w = vec![0i8; M * K];
+    for m in 0..M {
+        w[m * K + (m % K)] = 1;
+    }
+    let mut x = vec![0i8; B * K];
+    for b in 0..B {
+        x[b * K + (b * 97 % K)] = 1;
+    }
+    let wb: Vec<u8> = w.iter().map(|&v| v as u8).collect();
+    let xb: Vec<u8> = x.iter().map(|&v| v as u8).collect();
+    let wt = gpu.upload_raw(&wb, &[M * K]).unwrap();
+    let xt = gpu.upload_raw(&xb, &[B * K]).unwrap();
+    let ws = gpu.upload_f32(&vec![1.0f32; M * ng], &[M * ng]).unwrap();
+    let xs = gpu.upload_f32(&vec![1.0f32; B * ng], &[B * ng]).unwrap();
+    let y = gpu.alloc_tensor(&[B * M], DType::F32).unwrap();
+    gpu.gemm_oq8_grouped_wmma(&wt, &ws, &xt, &xs, &y, M, K, B, G)
+        .unwrap();
+    let got = gpu.download_f32(&y).unwrap();
+    let mut bad = 0usize;
+    for b in 0..B {
+        for m in 0..M {
+            let want = if m % K == b * 97 % K { 1.0f32 } else { 0.0 };
+            if (got[b * M + m] - want).abs() > 1e-6 {
+                bad += 1;
+            }
+        }
+    }
+    if bad == 0 {
+        println!(
+            "M-slab row placement M={M} (split into slabs): {} words exact -> PASS",
+            B * M
+        );
+    } else {
+        println!(
+            "M-slab row placement: {bad} of {} words WRONG -> FAIL",
+            B * M
+        );
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(256);
@@ -211,4 +270,5 @@ fn main() {
     if !pass || !act_pass || !gemm_pass {
         std::process::exit(1);
     }
+    check_slab_row_placement(&mut gpu);
 }

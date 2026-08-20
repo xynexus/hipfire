@@ -76,8 +76,7 @@ fn cpu_reference(
                     let delta = (v[base + r] as f64 - alpha * kv) * beta_v;
                     let mut acc = 0.0f64;
                     for c in 0..HD {
-                        s[sess][row + c] =
-                            alpha * s[sess][row + c] + k[base + c] as f64 * delta;
+                        s[sess][row + c] = alpha * s[sess][row + c] + k[base + c] as f64 * delta;
                         acc += s[sess][row + c] * q[base + c] as f64;
                     }
                     out[base + r] = acc;

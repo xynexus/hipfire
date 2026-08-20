@@ -162,7 +162,10 @@ fn main() {
         .iter()
         .map(|s| s.iter().filter(|e| e.is_some()).count())
         .sum();
-    println!("sessions={} rows={n_rows} written_slots={written_slots}", bases.len());
+    println!(
+        "sessions={} rows={n_rows} written_slots={written_slots}",
+        bases.len()
+    );
     println!("  max |delta| on written slots : {max_abs:e}  (mismatched elems {bad_written})");
     println!("  clobbered sentinel elems     : {bad_sentinel}");
 
