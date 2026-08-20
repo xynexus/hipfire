@@ -21,7 +21,7 @@
 //!
 //! gfx1151 (Strix Halo, Ryzen AI MAX+ 395) is LPDDR5X on a 256-bit bus. The
 //! commonly quoted figure is 8533 MT/s x 32 B = **273 GB/s**, and that is what
-//! `PEAK_GBPS` reports against. But this unit's `pp_dpm_mclk` tops out at
+//! `peak_gbps()` reports against. But this unit's `pp_dpm_mclk` tops out at
 //! **937 MHz**, and 937 MHz x 8 x 32 B = **240 GB/s** — which is exactly the
 //! ceiling observed on this box by other means. So 273 is plausibly the spec for
 //! a higher memory bin than this part runs.
@@ -56,7 +56,17 @@ use hipfire_rdna::{DType, Gpu};
 use std::ffi::c_void;
 use std::time::Instant;
 
-const PEAK_GBPS: f64 = 273.0;
+/// Peak to report against. Defaults to the **240 GB/s** this box is actually
+/// capped at, not the 273 GB/s the silicon supports — see the header. Override
+/// with `HIPFIRE_DRAM_peak_gbps()=273` once the BIOS memory setting is raised, so
+/// the percentages stay honest without editing code.
+fn peak_gbps() -> f64 {
+    std::env::var("HIPFIRE_DRAM_peak_gbps()")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(240.0)
+}
 
 /// Pure-read streaming kernels. Every variant walks the buffer with a grid-stride
 /// loop so consecutive lanes always touch consecutive addresses — the access
@@ -242,7 +252,7 @@ fn size_sweep(gpu: &mut Gpu) {
         }
         println!(
             "  {mib:>5} MiB   blocks={blocks:<6} {best:7.1} GB/s  {:5.1}% of peak",
-            100.0 * best / PEAK_GBPS
+            100.0 * best / peak_gbps()
         );
         let _ = gpu.free_tensor(src);
     }
@@ -288,7 +298,7 @@ fn main() {
                     println!(
                         "   block={block:<5} blocks={blocks:<7} {per:4.1} x4/thread  \
                          {best:7.1} GB/s  {:5.1}%",
-                        100.0 * best / PEAK_GBPS
+                        100.0 * best / peak_gbps()
                     );
                 }
             }
@@ -326,7 +336,7 @@ fn main() {
         gpu.arch,
         bytes >> 20
     );
-    println!("  peak for this part: {PEAK_GBPS:.0} GB/s (LPDDR5X-8533, 256-bit)\n");
+    println!("  peak for this part: {:.0} GB/s\n", peak_gbps());
 
     let mut best = (0.0f64, String::new());
     for (name, elem_bytes) in [
@@ -361,7 +371,7 @@ fn main() {
                     let gbps = bytes as f64 / t.elapsed().as_secs_f64() / 1e9;
                     best_gbps = best_gbps.max(gbps);
                 }
-                let pct = 100.0 * best_gbps / PEAK_GBPS;
+                let pct = 100.0 * best_gbps / peak_gbps();
                 println!("   block={block:<4} blocks={blocks:<6} {best_gbps:7.1} GB/s  {pct:5.1}% of peak");
                 if best_gbps > best.0 {
                     best = (best_gbps, format!("{name} block={block} blocks={blocks}"));
@@ -371,9 +381,10 @@ fn main() {
         println!();
     }
     println!(
-        "BEST: {:.1} GB/s ({:.1}% of {PEAK_GBPS:.0}) via {}",
+        "BEST: {:.1} GB/s ({:.1}% of {:.0}) via {}",
         best.0,
-        100.0 * best.0 / PEAK_GBPS,
+        100.0 * best.0 / peak_gbps(),
+        peak_gbps(),
         best.1
     );
 }
