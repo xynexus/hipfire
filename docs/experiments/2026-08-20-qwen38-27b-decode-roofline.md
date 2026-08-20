@@ -99,3 +99,45 @@ loads for "4x fewer memory instructions". Porting v2's load strategy into
 `fused_gate_up_oq8_gemv` and `fused_qkvza_oq8_gemv` is the obvious next
 experiment on the expanded path, and the same lever likely applies to the compact
 GEMV's 59 %.
+
+## Root-causing `down_proj` — the kernel is innocent
+
+`parity_gemv_oq_compact` (new; the decode GEMV had **no** parity coverage at all —
+`parity_gemm_oq_compact` covers the batched GEMM prefill uses) runs
+`gemv_oq_compact_grouped_auto` against an f32 reference over the same expansion
+`oq8_arch_load` performs, on the real Qwen3.8-27B projection classes:
+
+    gate/up   [17408, 5120]  ng=20   rel=4.37e-7  PASS
+    qkv       [10240, 5120]  ng=20   rel=4.37e-7  PASS
+    lm_head  [248320, 5120]  ng=20   rel=4.37e-7  PASS
+    attn_out  [5120,  6144]  ng=24   rel=4.34e-7  PASS
+    down      [5120, 17408]  ng=68   rel=4.42e-7  PASS
+    down x2   [5120, 34816]  ng=136  rel=4.39e-7  PASS
+
+**The compact GEMV is correct at `down_proj`'s exact geometry**, and at double its
+K. So the fault is in how `down_proj` is DRIVEN, not in the kernel.
+
+Narrowing from there, all confirmed by reading the dispatch:
+
+* rotation is not it — `dtype_post_rotation_variant` puts **both** `Oq8G256` and
+  `OqCompactG256` in `GemvVariant::Prerotated`, identical treatment;
+* the block layout is not it — `down_proj` and `gate_proj` are both 47.35 MB over
+  348,160 blocks at a uniform 136 B stride, so the dispatcher's
+  `block_stride = byte_size / (m*ng)` is exact for both;
+* the auto-selector is not it — `ng` is even for both (68 and 20), so both take
+  the v2 kernel.
+
+What IS specific to `down_proj`: it is the only projection reached through
+`weight_gemv_swiglu_residual` (`weights.rs:1285`, called from the live lowered
+decode path at `lowered.rs:308`). `dense_swiglu_residual_route` classifies only
+`MQ6G256`; every Opus dtype falls to `Unclassified` and shares a generic
+fallback, and there is **no `GemvOqCompact*Residual` kernel key** where MQ4, MQ3,
+HFQ4, HFQ6, Qtip and the Lloyd variants all have one.
+
+**Next step: instrument `weight_gemv_swiglu_residual` for `OqCompactG256` vs
+`Oq8G256` on the same input.** The failure mode to look for first is a double
+rotation — `weight_gemv`'s own tail warns that routing a prerotated dtype through
+`run_auto` "would re-rotate ... double-applying the involutory FWHT and feeding
+effectively-unrotated activations to the prerotated kernel (garbage logits)",
+which matches the symptom exactly: finite, wrong, and only on the one projection
+whose activation the caller has already rotated.
