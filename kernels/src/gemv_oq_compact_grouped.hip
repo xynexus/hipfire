@@ -76,20 +76,25 @@ extern "C" __global__ void gemv_oq_compact_grouped(
     const int per_lane = group >> 5;        // positions per lane: 8 (G256), 4 (G128)
     const int bpl      = per_lane >> 1;     // nibble bytes per lane: 4 or 2
 
-    const uint8_t* w_row = W + (long long)row * ng * (long long)block_stride;
+    // SPLIT PLANES: all nibble groups first, then all [f16 scale][overlay table]
+    // side records — see `hipfire_runtime::oq8_arch::split_compact_planes`.
+    // Row-start alignment is what it buys, worth ~3.7% of achieved bandwidth.
+    const int nib_bytes   = group >> 1;
+    const int side_stride = block_stride - nib_bytes;
+    const uint8_t* n_row = W + (long long)row * ng * (long long)nib_bytes;
+    const uint8_t* s_row = W + (long long)M * ng * (long long)nib_bytes
+                             + (long long)row * ng * (long long)side_stride;
 
     float facc = 0.0f;
     for (int g = 0; g < ng; ++g) {
-        const uint8_t* blk     = w_row + (long long)g * block_stride;
-        const uint8_t* nibbles = blk + 2;
-        const uint8_t* table   = blk + header;
+        const uint8_t* nibbles = n_row + (long long)g * nib_bytes;
+        const uint8_t* sb      = s_row + (long long)g * side_stride;
+        const uint8_t* table   = sb + 2;
 
         // The block's f16 scale: ONE load per group for the whole wave, not one
         // per lane per output row as the WMMA path needed.
-        const float sw = oqcg_f16(blk);
+        const float sw = oqcg_f16(sb);
 
-        // `nibbles` is blk+2, so this is 2 mod 4 — state the width and let the
-        // ISA handle the unaligned load rather than falling back to byte reads.
         uint32_t wv = 0;
         __builtin_memcpy(&wv, nibbles + lane * bpl, bpl);
 

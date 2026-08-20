@@ -86,6 +86,26 @@ fn expand(
     (w, ws)
 }
 
+/// Mirror of `hipfire_runtime::oq8_arch::split_compact_planes`: the device
+/// layout is ALL nibble groups first, then all `[f16 scale][overlay table]`
+/// side records, so every nibble row starts 128-byte aligned. The loader does
+/// this before any kernel sees the weight, so the fixture must too. Duplicated
+/// rather than imported because hipfire-rdna cannot depend on hipfire-runtime.
+fn split_planes(data: &[u8], n_groups: usize, block_stride: usize, group: usize) -> Vec<u8> {
+    let nib = group / 2;
+    let side = block_stride - nib;
+    let mut out = vec![0u8; data.len()];
+    let side_base = n_groups * nib;
+    for b in 0..n_groups {
+        let src = b * block_stride;
+        out[b * nib..(b + 1) * nib].copy_from_slice(&data[src + 2..src + 2 + nib]);
+        let d = side_base + b * side;
+        out[d..d + 2].copy_from_slice(&data[src..src + 2]);
+        out[d + 2..d + side].copy_from_slice(&data[src + 2 + nib..src + block_stride]);
+    }
+    out
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
     eprintln!("GPU: {}", gpu.arch);
@@ -176,7 +196,10 @@ fn main() {
                     let (w_dense, w_scales) = expand(&blocks, m, k, block_stride, group);
 
                     let d_blocks = gpu
-                        .upload_raw(&blocks, &[blocks.len()])
+                        .upload_raw(
+                            &split_planes(&blocks, m * (k / group), block_stride, group),
+                            &[blocks.len()],
+                        )
                         .expect("upload blocks");
                     let d_wdense = gpu
                         .upload_raw(

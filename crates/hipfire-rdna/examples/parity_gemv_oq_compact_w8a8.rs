@@ -85,6 +85,26 @@ fn normalize_overlays(
     }
 }
 
+/// Mirror of `hipfire_runtime::oq8_arch::split_compact_planes`: the device
+/// layout is ALL nibble groups first, then all `[f16 scale][overlay table]`
+/// side records, so every nibble row starts 128-byte aligned. The loader does
+/// this before any kernel sees the weight, so the fixture must too. Duplicated
+/// rather than imported because hipfire-rdna cannot depend on hipfire-runtime.
+fn split_planes(data: &[u8], n_groups: usize, block_stride: usize, group: usize) -> Vec<u8> {
+    let nib = group / 2;
+    let side = block_stride - nib;
+    let mut out = vec![0u8; data.len()];
+    let side_base = n_groups * nib;
+    for b in 0..n_groups {
+        let src = b * block_stride;
+        out[b * nib..(b + 1) * nib].copy_from_slice(&data[src + 2..src + 2 + nib]);
+        let d = side_base + b * side;
+        out[d..d + 2].copy_from_slice(&data[src..src + 2]);
+        out[d + 2..d + side].copy_from_slice(&data[src + 2 + nib..src + block_stride]);
+    }
+    out
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
     // Real oq4.25++ is N_out=3. OQC8_NOUT sweeps it: if the A8 deficit tracks the
@@ -165,7 +185,8 @@ fn main() {
             want[r] = acc;
         }
 
-        let d_blocks = gpu.upload_raw(&blocks, &[blocks.len()]).expect("blocks");
+        let dev = split_planes(&blocks, m * ng, block_stride, GROUP);
+        let d_blocks = gpu.upload_raw(&dev, &[dev.len()]).expect("blocks");
         let xq_u: Vec<u8> = xq.iter().map(|&v| v as u8).collect();
         let d_xq = gpu.upload_raw(&xq_u, &[k]).expect("xq");
         let d_xs = gpu.upload_f32(&xs, &[ng]).expect("xs");

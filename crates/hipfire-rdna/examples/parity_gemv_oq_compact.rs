@@ -122,6 +122,26 @@ fn normalize_overlays(
     }
 }
 
+/// Mirror of `hipfire_runtime::oq8_arch::split_compact_planes`: the device
+/// layout is ALL nibble groups first, then all `[f16 scale][overlay table]`
+/// side records, so every nibble row starts 128-byte aligned. The loader does
+/// this before any kernel sees the weight, so the fixture must too. Duplicated
+/// rather than imported because hipfire-rdna cannot depend on hipfire-runtime.
+fn split_planes(data: &[u8], n_groups: usize, block_stride: usize, group: usize) -> Vec<u8> {
+    let nib = group / 2;
+    let side = block_stride - nib;
+    let mut out = vec![0u8; data.len()];
+    let side_base = n_groups * nib;
+    for b in 0..n_groups {
+        let src = b * block_stride;
+        out[b * nib..(b + 1) * nib].copy_from_slice(&data[src + 2..src + 2 + nib]);
+        let d = side_base + b * side;
+        out[d..d + 2].copy_from_slice(&data[src..src + 2]);
+        out[d + 2..d + side].copy_from_slice(&data[src + 2 + nib..src + block_stride]);
+    }
+    out
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
     const GROUP: usize = 256;
@@ -183,7 +203,10 @@ fn main() {
         }
 
         let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
-        let d_blocks = gpu.upload_raw(&blocks, &[blocks.len()]).expect("blocks");
+        // The CPU reference above reads the INTERLEAVED blocks (that is the
+        // on-disk form); the device gets the split-plane form the loader emits.
+        let dev = split_planes(&blocks, m * ng, block_stride, GROUP);
+        let d_blocks = gpu.upload_raw(&dev, &[dev.len()]).expect("blocks");
         let d_x = gpu.upload_f32(&x, &[k]).expect("x");
         let d_y = gpu.alloc_tensor(&[m], DType::F32).expect("y");
         gpu.gemv_oq_compact_grouped_auto(&d_blocks, &d_x, &d_y, m, k, GROUP, block_stride)

@@ -226,6 +226,88 @@ pub fn normalize_compact_overlays(data: &mut [u8], m: usize, k: usize, group: us
     }
 }
 
+/// Re-lay-out `OqPlusCompact` blocks for the device: ALL nibble groups first,
+/// then all `[f16 scale][overlay table]` side records. Same bytes, same order,
+/// same 4.25 bits — only where they sit changes.
+///
+/// WHY: the interleaved block is `130 + 2*N_out` = 136 bytes at the shipped
+/// N_out=3, which is not a power of two, so a row of `ng` blocks is 2720 bytes
+/// and only every fourth row starts on a 128-byte line. A synthetic sweep over
+/// the decode GEMV's exact access pattern (`hipfire-rdna` example
+/// `bench_oq_layout`, M=69632 K=5120, ~4x the 32 MiB MALL) prices that:
+///
+///     flat dwordx4 stream (upper bound)      243.1 GB/s   100.0%
+///     interleaved 136 + side reads           226.4         93.1%
+///     interleaved 136, nibbles only          229.3         94.3%
+///     128-byte stride, same instructions     235.6         96.9%
+///     SPLIT PLANES                           234.7         96.6%
+///
+/// The nibble plane makes every row start `ng * (group/2)` bytes in, a multiple
+/// of 128 at G=256, so every row is aligned. Splitting per ROW instead was tried
+/// and does NOT work — 229.3 GB/s, no better than interleaved — because the row
+/// stride is still 2720. It is row-start ALIGNMENT that pays, not within-row
+/// contiguity, and only a tensor-wide split delivers it.
+///
+/// One allocation, not two: the side base is `m * ng * (group/2)`, derivable
+/// from values every kernel already has, so no dispatch signature changes.
+///
+/// Run this AFTER [`normalize_compact_overlays`] — that one reads the
+/// interleaved form.
+pub fn split_compact_planes(data: &[u8], m: usize, k: usize, group: usize) -> Vec<u8> {
+    let ng = k / group;
+    let n_groups = m * ng;
+    let nib = group / 2;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return data.to_vec();
+    }
+    let block_bytes = data.len() / n_groups;
+    let header = 2 + nib;
+    if block_bytes < header + 2 || (block_bytes - header) % 2 != 0 {
+        return data.to_vec();
+    }
+    let side = block_bytes - nib; // f16 scale + 2*N_out table bytes
+    let mut out = vec![0u8; data.len()];
+    let side_base = n_groups * nib;
+    for b in 0..n_groups {
+        let src = b * block_bytes;
+        out[b * nib..(b + 1) * nib].copy_from_slice(&data[src + 2..src + 2 + nib]);
+        let d = side_base + b * side;
+        // scale, then the overlay table, contiguous.
+        out[d..d + 2].copy_from_slice(&data[src..src + 2]);
+        out[d + 2..d + side].copy_from_slice(&data[src + header..src + block_bytes]);
+    }
+    out
+}
+
+/// Inverse of [`split_compact_planes`]: rebuild the interleaved on-disk block
+/// order from the device's split planes. Anything that DOWNLOADS a resident
+/// compact weight and wants to decode it (the two-stage lm_head's coarse tier
+/// builder is the live caller) has to come back through here first, because
+/// `oqplus_compact_to_oq8_combined_g` reads the interleaved form.
+pub fn unsplit_compact_planes(data: &[u8], m: usize, k: usize, group: usize) -> Vec<u8> {
+    let ng = k / group;
+    let n_groups = m * ng;
+    let nib = group / 2;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return data.to_vec();
+    }
+    let block_bytes = data.len() / n_groups;
+    if block_bytes < nib + 4 {
+        return data.to_vec();
+    }
+    let side = block_bytes - nib;
+    let side_base = n_groups * nib;
+    let mut out = vec![0u8; data.len()];
+    for b in 0..n_groups {
+        let dst = b * block_bytes;
+        let sb = side_base + b * side;
+        out[dst..dst + 2].copy_from_slice(&data[sb..sb + 2]);
+        out[dst + 2..dst + 2 + nib].copy_from_slice(&data[b * nib..(b + 1) * nib]);
+        out[dst + 2 + nib..dst + block_bytes].copy_from_slice(&data[sb + 2..sb + side]);
+    }
+    out
+}
+
 pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     oqplus_compact_to_oq8_combined_g(data, m, k, 256)
 }
@@ -381,12 +463,14 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
         if qt == QuantType::OqPlusCompact.code() {
             let mut owned = data.to_vec();
             normalize_compact_overlays(&mut owned, m, k, 256);
-            return Some((owned, DType::OqCompactG256));
+            let split = split_compact_planes(&owned, m, k, 256);
+            return Some((split, DType::OqCompactG256));
         }
         if qt == QuantType::OqPlusCompactG128.code() {
             let mut owned = data.to_vec();
             normalize_compact_overlays(&mut owned, m, k, 128);
-            return Some((owned, DType::OqCompactG128));
+            let split = split_compact_planes(&owned, m, k, 128);
+            return Some((split, DType::OqCompactG128));
         }
     }
     let bytes = match qt {
@@ -666,6 +750,68 @@ mod overlay_normalize_tests {
     /// A single-entry table has nothing to dedupe but still needs its bulk
     /// zeroed — the old normalizer bailed at `n_out < 2` and would have left the
     /// kernel adding `val` on top of a live nibble.
+    /// The split layout must carry exactly the same information: decode every
+    /// block back out of it and compare against the interleaved decode. Byte
+    /// count is unchanged, so this also pins that no padding crept in.
+    #[test]
+    fn split_planes_preserve_every_block() {
+        use super::split_compact_planes;
+        const G: usize = 256;
+        let (m, k, n_out) = (5usize, 2 * G, 3usize);
+        let ng = k / G;
+        let stride = 2 + G / 2 + 2 * n_out;
+        let mut blocks = vec![0u8; m * ng * stride];
+        let mut seed = 0xC0FF_EE11u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for b in blocks.iter_mut() {
+            *b = rnd();
+        }
+        let split = split_compact_planes(&blocks, m, k, G);
+        assert_eq!(split.len(), blocks.len(), "split changed the byte count");
+        let nib = G / 2;
+        let side = stride - nib;
+        let side_base = m * ng * nib;
+        for b in 0..m * ng {
+            let src = b * stride;
+            assert_eq!(
+                &split[b * nib..(b + 1) * nib],
+                &blocks[src + 2..src + 2 + nib],
+                "nibbles moved wrong for block {b}"
+            );
+            let d = side_base + b * side;
+            assert_eq!(&split[d..d + 2], &blocks[src..src + 2], "scale wrong {b}");
+            assert_eq!(
+                &split[d + 2..d + side],
+                &blocks[src + 2 + nib..src + stride],
+                "overlay table wrong for block {b}"
+            );
+        }
+    }
+
+    /// split -> unsplit must be the identity, or anything that downloads a
+    /// resident compact weight decodes garbage.
+    #[test]
+    fn split_planes_round_trip() {
+        use super::{split_compact_planes, unsplit_compact_planes};
+        for (group, k) in [(256usize, 512usize), (128, 384)] {
+            let (m, n_out) = (4usize, 3usize);
+            let ng = k / group;
+            let stride = 2 + group / 2 + 2 * n_out;
+            let mut blocks = vec![0u8; m * ng * stride];
+            let mut seed = 0x1357_9BDFu32;
+            for b in blocks.iter_mut() {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                *b = (seed >> 16) as u8;
+            }
+            let split = split_compact_planes(&blocks, m, k, group);
+            let back = unsplit_compact_planes(&split, m, k, group);
+            assert_eq!(back, blocks, "split/unsplit not an identity at G={group}");
+        }
+    }
+
     #[test]
     fn normalize_handles_n_out_one() {
         const G: usize = 256;

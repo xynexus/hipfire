@@ -32,26 +32,32 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_gather_f32(
     const unsigned int* __restrict__ idx,
     const float* __restrict__ X,
     float* __restrict__ out,
-    int K_sel, int K, int block_stride
+    int K_sel, int V, int K, int block_stride
 ) {
     const int lane = threadIdx.x;   // wave32
     const int ng   = K / 256;
     const int n_ov = (block_stride - 130) >> 1;
     const int elt  = lane * 8;      // this lane's 8 weights within the group
+    // Split layout: all nibble groups, then all side records. `V` (the vocab)
+    // is what locates the boundary — the streaming kernels get it as `M`.
+    const int side_stride = block_stride - 128;
+    const long long side_base = (long long)V * ng * 128LL;
 
     for (int s = blockIdx.x; s < K_sel; s += gridDim.x) {
         const unsigned int row = idx[s];
         if (row == 0xFFFFFFFFu) continue;   // sentinel: top-K over-allocates
 
-        const uint8_t* w_row = W + (long long)row * ng * (long long)block_stride;
+        const uint8_t* n_row = W + (long long)row * ng * 128LL;
+        const uint8_t* s_row = W + side_base
+                                 + (long long)row * ng * (long long)side_stride;
         float facc = 0.0f;
 
         for (int g = 0; g < ng; ++g) {
-            const uint8_t* blk = w_row + (long long)g * block_stride;
-            const float sw = (float)(*(const _Float16*)blk);
+            const uint8_t* sb = s_row + (long long)g * side_stride;
+            const float sw = (float)(*(const _Float16*)sb);
 
             uint32_t w0;
-            __builtin_memcpy(&w0, blk + 2 + lane * 4, 4);
+            __builtin_memcpy(&w0, n_row + (long long)g * 128 + lane * 4, 4);
 
             const int xoff = g * 256 + elt;
             const float4 x0 = *(const float4*)(X + xoff);
@@ -66,7 +72,7 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_gather_f32(
             // the bulk nibble under each entry, so a correction is val*x[idx].
             // Branchless for the same reason it is there — the divergent guard,
             // not the loads, is what the overlay costs.
-            const uint8_t* table = blk + 130;
+            const uint8_t* table = sb + 2;
             {
                 const int e   = (lane < n_ov) ? lane : 0;
                 const int oi  = (int)table[2 * e];

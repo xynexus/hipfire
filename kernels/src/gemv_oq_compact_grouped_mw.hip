@@ -53,7 +53,7 @@
 // words as arguments is what lets the caller issue several groups' loads before
 // any of them is consumed.
 __device__ __forceinline__ float oqc_group(
-    uint32_t w0, uint32_t w1, const uint8_t* __restrict__ blk,
+    uint32_t w0, uint32_t w1, const uint8_t* __restrict__ sb,
     const float* __restrict__ X, int gi, int elt, int lig, int n_ov
 ) {
     const int xoff = gi * 256 + elt;
@@ -84,7 +84,7 @@ __device__ __forceinline__ float oqc_group(
     // were all tried against this same cost and all LOST; the branch was the
     // thing. Entries beyond one per lane fall to the residual loop, whose
     // bound is wave-uniform.
-    const uint8_t* table = blk + 130;
+    const uint8_t* table = sb + 2;
     {
         const int e   = (lig < n_ov) ? lig : 0;
         const int idx = (int)table[2 * e];
@@ -117,30 +117,40 @@ __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_grouped_mw(
     const int n_ov = (block_stride - 130) >> 1;
     const int elt  = lig * 16;
 
-    const uint8_t* w_row = W + (long long)row * ng * (long long)block_stride;
+    // SPLIT PLANES: this tensor holds ALL nibble groups first, then all
+    // [f16 scale][overlay table] side records — see
+    // `hipfire_runtime::oq8_arch::split_compact_planes`. Same bytes, same 4.25
+    // bits; what it buys is that a nibble row starts at ng*(group/2), a multiple
+    // of 128 at G=256, so EVERY row is cache-line aligned. The interleaved
+    // 136-byte block left only every fourth row aligned, worth ~3.7% of achieved
+    // bandwidth (examples/bench_oq_layout: 226.4 -> 234.8 GB/s).
+    const int side_stride = block_stride - 128;
+    const uint8_t* n_row = W + (long long)row * ng * 128LL;
+    const uint8_t* s_row = W + (long long)M * ng * 128LL
+                             + (long long)row * ng * (long long)side_stride;
 
     float facc = 0.0f;
     int r = 0;
     for (; r + 4 <= ng; r += 4) {
         const int gA = r + gir, gB = r + 2 + gir;
-        const uint8_t* blkA = w_row + (long long)gA * block_stride;
-        const uint8_t* blkB = w_row + (long long)gB * block_stride;
+        const uint8_t* sA = s_row + (long long)gA * side_stride;
+        const uint8_t* sB = s_row + (long long)gB * side_stride;
         // Both weight loads issued before either is consumed.
         uint32_t a[2], b[2];
-        __builtin_memcpy(a, blkA + 2 + lig * 8, 8);
-        __builtin_memcpy(b, blkB + 2 + lig * 8, 8);
-        const float swA = (float)(*(const _Float16*)blkA);
-        const float swB = (float)(*(const _Float16*)blkB);
-        facc += oqc_group(a[0], a[1], blkA, X, gA, elt, lig, n_ov) * swA;
-        facc += oqc_group(b[0], b[1], blkB, X, gB, elt, lig, n_ov) * swB;
+        __builtin_memcpy(a, n_row + (long long)gA * 128 + lig * 8, 8);
+        __builtin_memcpy(b, n_row + (long long)gB * 128 + lig * 8, 8);
+        const float swA = (float)(*(const _Float16*)sA);
+        const float swB = (float)(*(const _Float16*)sB);
+        facc += oqc_group(a[0], a[1], sA, X, gA, elt, lig, n_ov) * swA;
+        facc += oqc_group(b[0], b[1], sB, X, gB, elt, lig, n_ov) * swB;
     }
     for (; r < ng; r += 2) {
         const int gi = r + gir;
-        const uint8_t* blk = w_row + (long long)gi * block_stride;
+        const uint8_t* sb = s_row + (long long)gi * side_stride;
         uint32_t v[2];
-        __builtin_memcpy(v, blk + 2 + lig * 8, 8);
-        const float sw = (float)(*(const _Float16*)blk);
-        facc += oqc_group(v[0], v[1], blk, X, gi, elt, lig, n_ov) * sw;
+        __builtin_memcpy(v, n_row + (long long)gi * 128 + lig * 8, 8);
+        const float sw = (float)(*(const _Float16*)sb);
+        facc += oqc_group(v[0], v[1], sb, X, gi, elt, lig, n_ov) * sw;
     }
 
     for (int off = 16; off > 0; off >>= 1) facc += __shfl_down(facc, off);

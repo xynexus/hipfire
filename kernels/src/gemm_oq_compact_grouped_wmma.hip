@@ -94,11 +94,16 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
 
     float8_t facc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
+    // SPLIT PLANES: all nibble groups first, then all [f16 scale][overlay table]
+    // side records — see `hipfire_runtime::oq8_arch::split_compact_planes`.
+    const int nib_bytes   = group >> 1;
+    const int side_stride = block_stride - nib_bytes;
+    const long long side_base = (long long)M * n_groups * nib_bytes;
     for (int g = 0; g < n_groups; ++g) {
-        const uint8_t* blk =
-            W + ((long long)safe_a * n_groups + g) * (long long)block_stride;
-        const uint8_t* nibbles = blk + 2;
-        const uint8_t* table   = blk + header;
+        const long long bi = (long long)safe_a * n_groups + g;
+        const uint8_t* nibbles = W + bi * nib_bytes;
+        const uint8_t* sb      = W + side_base + bi * side_stride;
+        const uint8_t* table   = sb + 2;
 
         // Hoist this group's overlay table into registers once, rather than
         // re-reading it inside every one of the 16 K-tiles.
@@ -144,9 +149,10 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
             const int m_row = row_start + 2 * j + (tid >> 4);
             float sw = 0.f;
             if (m_row < M) {
-                const uint8_t* jblk =
-                    W + ((long long)m_row * n_groups + g) * (long long)block_stride;
-                sw = oqc_f16_scale(jblk);
+                // Split layout: this row's scale lives in the side plane.
+                sw = oqc_f16_scale(
+                    W + side_base
+                      + ((long long)m_row * n_groups + g) * (long long)side_stride);
             }
             facc[j] += (float)iacc[j] * sw * sx;
         }

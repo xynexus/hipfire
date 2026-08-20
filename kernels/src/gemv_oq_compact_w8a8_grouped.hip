@@ -81,18 +81,26 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_w8a8_grouped(
     const int n_ov = (block_stride - 130) >> 1;
     const int elt  = lig * 16;      // weight/activation offset within the group
 
-    const uint8_t* w_row = W + (long long)row * ng * (long long)block_stride;
+    // SPLIT PLANES: this tensor holds ALL nibble groups first, then all
+    // [f16 scale][overlay table] side records — see
+    // `hipfire_runtime::oq8_arch::split_compact_planes`. Same bytes, same 4.25
+    // bits; what it buys is that a nibble row starts at ng*(group/2), a multiple
+    // of 128 at G=256, so EVERY row is cache-line aligned. The interleaved
+    // 136-byte block left only every fourth row aligned, worth ~3.7% of achieved
+    // bandwidth (examples/bench_oq_layout: 226.4 -> 234.8 GB/s).
+    const int side_stride = block_stride - 128;
+    const uint8_t* n_row = W + (long long)row * ng * 128LL;
+    const uint8_t* s_row = W + (long long)M * ng * 128LL
+                             + (long long)row * ng * (long long)side_stride;
 
     float facc = 0.0f;
     for (int r = 0; r < ng; r += 2) {
         const int gi = r + gir;
-        const uint8_t* blk = w_row + (long long)gi * block_stride;
-        const float sw = (float)(*(const _Float16*)blk);
+        const uint8_t* sb = s_row + (long long)gi * side_stride;
+        const float sw = (float)(*(const _Float16*)sb);
 
-        // 8 bytes of nibbles = this lane's 16 weights. Offset is 2 mod 8; gfx11
-        // takes the unaligned load natively rather than decaying to byte reads.
         uint32_t wv[2];
-        __builtin_memcpy(wv, blk + 2 + lig * 8, 8);
+        __builtin_memcpy(wv, n_row + (long long)gi * 128 + lig * 8, 8);
         const uint32_t w0 = wv[0], w1 = wv[1];
 
         // SWAR-widen into even/odd halves. That leaves the weights INTERLEAVED
@@ -130,7 +138,7 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_w8a8_grouped(
 
         // Overlay corrections stay INTEGER — (val - bulk) * xq is exact in i32,
         // so the whole group still needs only one f32 rescale.
-        const uint8_t* table = blk + 130;
+        const uint8_t* table = sb + 2;
         for (int e = 0; e < n_ov; ++e) {
             const int idx = (int)table[2 * e];
             if ((idx >> 4) != lig) continue;

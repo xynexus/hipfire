@@ -4998,6 +4998,7 @@ impl Gpu {
         x: &GpuTensor,
         out: &GpuTensor,
         k_sel: usize,
+        vocab: usize,
         k: usize,
         block_stride: usize,
     ) -> HipResult<()> {
@@ -5013,14 +5014,14 @@ impl Gpu {
             x.buf.as_ptr(),
             out.buf.as_ptr(),
         );
-        let (sv, kv, bs) = (k_sel as i32, k as i32, block_stride as i32);
+        let (sv, vv, kv, bs) = (k_sel as i32, vocab as i32, k as i32, block_stride as i32);
         let grid = (k_sel as u32).clamp(1, 8192);
         self.launch_kernargs(
             "gemv_oq_compact_gather_f32",
             [grid, 1, 1],
             [32, 1, 1],
             0,
-            &kernargs![ptr wp, ptr ip, ptr xp, ptr op, i32 sv, i32 kv, i32 bs],
+            &kernargs![ptr wp, ptr ip, ptr xp, ptr op, i32 sv, i32 vv, i32 kv, i32 bs],
         )
     }
     pub fn gemv_bf16_gather_f32(

@@ -55,21 +55,29 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_grouped_v3(
     const int n_ov = (block_stride - 130) >> 1;
     const int elt  = lig * 32;      // weight/activation offset within the group
 
-    const uint8_t* w_row = W + (long long)row * ng * (long long)block_stride;
+    // SPLIT PLANES: this tensor holds ALL nibble groups first, then all
+    // [f16 scale][overlay table] side records — see
+    // `hipfire_runtime::oq8_arch::split_compact_planes`. Same bytes, same 4.25
+    // bits; what it buys is that a nibble row starts at ng*(group/2), a multiple
+    // of 128 at G=256, so EVERY row is cache-line aligned. The interleaved
+    // 136-byte block left only every fourth row aligned, worth ~3.7% of achieved
+    // bandwidth (examples/bench_oq_layout: 226.4 -> 234.8 GB/s).
+    const int side_stride = block_stride - 128;
+    const uint8_t* n_row = W + (long long)row * ng * 128LL;
+    const uint8_t* s_row = W + (long long)M * ng * 128LL
+                             + (long long)row * ng * (long long)side_stride;
 
     float facc = 0.0f;
     for (int r = 0; r < ng; r += 4) {
         const int gi = r + gir;
-        const uint8_t* blk = w_row + (long long)gi * block_stride;
+        const uint8_t* sb = s_row + (long long)gi * side_stride;
 
-        const float sw = (float)(*(const _Float16*)blk);
+        const float sw = (float)(*(const _Float16*)sb);
 
-        // 16 bytes = 32 weights per lane. The window is 2 mod 16, so state the
-        // width and let the ISA take the unaligned load — measured neutral here
-        // (an 8-byte-ALIGNED ablation of v2 scored 74.08 ms against 74.41, i.e.
-        // alignment is worth nothing on this access pattern).
+        // 16 bytes = 32 weights per lane, now 16-byte aligned within a
+        // 128-byte-aligned row.
         uint32_t wv[4];
-        __builtin_memcpy(wv, blk + 2 + lig * 16, 16);
+        __builtin_memcpy(wv, n_row + (long long)gi * 128 + lig * 16, 16);
 
         const int xoff = gi * 256 + elt;
         const float4 x0 = *(const float4*)(X + xoff);
@@ -96,7 +104,7 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_grouped_v3(
         // were all tried against this same cost and all LOST; the branch was the
         // thing. Entries beyond one per lane fall to the residual loop, whose
         // bound is wave-uniform.
-        const uint8_t* table = blk + 130;
+        const uint8_t* table = sb + 2;
         {
             const int e   = (lig < n_ov) ? lig : 0;
             const int idx = (int)table[2 * e];

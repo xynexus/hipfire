@@ -289,6 +289,7 @@ pub fn lmhead_twostage_serve_compact(
             x_rot,
             logits_out,
             count,
+            vocab,
             hidden,
             block_stride,
         )

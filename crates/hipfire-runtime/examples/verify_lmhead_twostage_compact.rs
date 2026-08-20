@@ -21,7 +21,7 @@ use hipfire_rdna::lmhead_twostage::lmhead_twostage_serve_compact;
 use hipfire_rdna::{DType, Gpu};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::build_coarse_from_compact;
-use hipfire_runtime::oq8_arch::normalize_compact_overlays;
+use hipfire_runtime::oq8_arch::{normalize_compact_overlays, split_compact_planes};
 use std::path::Path;
 
 fn argmax(v: &[f32]) -> (usize, f32) {
@@ -67,6 +67,7 @@ fn main() {
     // Exactly what the loader does before the weight reaches any kernel.
     let mut owned = bytes.to_vec();
     normalize_compact_overlays(&mut owned, vocab, hidden, 256);
+    let owned = split_compact_planes(&owned, vocab, hidden, 256);
     let mut buf = gpu.upload_raw(&owned, &[owned.len()]).expect("upload");
     buf.dtype = DType::OqCompactG256;
     drop(owned);

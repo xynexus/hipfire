@@ -141,6 +141,9 @@ pub fn build_coarse_from_compact(
     let bytes = gpu
         .download_raw(w, w.byte_size())
         .map_err(|e| format!("lmhead compact download: {e:?}"))?;
+    // The RESIDENT buffer is in split-plane order; the expansion below reads the
+    // interleaved on-disk order, so come back through the inverse first.
+    let bytes = crate::oq8_arch::unsplit_compact_planes(&bytes, vocab, hidden, GROUP);
     // [int8 vocab*hidden][f32 scales vocab*ng]
     let combined = crate::oq8_arch::oqplus_compact_to_oq8_combined_g(&bytes, vocab, hidden, GROUP);
     drop(bytes);
