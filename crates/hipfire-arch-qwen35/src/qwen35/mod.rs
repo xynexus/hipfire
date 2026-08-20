@@ -1183,6 +1183,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // versus per-token in the fallback — not accumulating drift. Anything
         // that needs the two to agree bit-for-bit must pin the path explicitly.
         | DType::BF16
+        | DType::OqCompactG256
     );
     if always_ok {
         return true;

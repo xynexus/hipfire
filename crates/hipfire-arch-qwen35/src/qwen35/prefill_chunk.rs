@@ -2444,6 +2444,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
@@ -3213,6 +3214,10 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
+                        // Compact-resident Opus is the same W8A8 math reading the
+                        // on-disk blocks in-kernel, so it needs the rotation too.
+                        | DType::OqCompactG256
                 );
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -3259,6 +3264,19 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wo.m,
                         layer.wo.k,
                         n,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus o_proj: identical W8A8 math to the oq8
+                    // arm below, decoding the OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
                     )?;
                 } else if wo_is_oq8 {
                     // Opus W8A8 o_proj: grouped int8-WMMA GEMM into scratch +
@@ -3460,6 +3478,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3667,6 +3686,22 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else if ffn_is_oq8 {
                     // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
                     // same buffers the fused kernel writes; downstream silu_mul
@@ -3826,6 +3861,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3885,6 +3921,19 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_down.m,
                         layer.w_down.k,
                         n,
+                    )?;
+                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                        bs,
                     )?;
                 } else if w_down_is_oq8 {
                     // Opus W8A8 down: grouped int8-WMMA GEMM + residual add.
@@ -4095,6 +4144,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
@@ -4252,6 +4302,18 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wq.k,
                         n,
                     )?;
+                } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+                    for (w, y) in [
+                        (&layer.wq, &pbs.fa_q_full_batch),
+                        (&layer.wk, &pbs.fa_k_batch),
+                        (&layer.wv, &pbs.fa_v_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else if qkv_is_oq8 && qkv_same_dtype {
                     // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
                     // off the shared FWHT-rotated activation.
@@ -5397,6 +5459,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -5432,6 +5495,19 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wo.m,
                         layer.wo.k,
                         n,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
                     )?;
                 } else if fa_wo_is_oq8 {
                     // Opus W8A8: fa_wo_input is FWHT-rotated above.
@@ -5593,6 +5669,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let fa_ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5645,6 +5722,22 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else if fa_ffn_is_oq8 {
                     // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
                     gpu.quantize_act_oq8_batched(
@@ -5842,6 +5935,7 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
+                        | DType::OqCompactG256
                 );
                 let fa_w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5879,6 +5973,19 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_down.m,
                         layer.w_down.k,
                         n,
+                    )?;
+                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                        bs,
                     )?;
                 } else if fa_w_down_is_oq8 {
                     // Opus W8A8: ffn_hidden_batch is FWHT-rotated above.

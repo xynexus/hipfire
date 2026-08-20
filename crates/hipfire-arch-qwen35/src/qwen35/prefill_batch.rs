@@ -5317,7 +5317,9 @@ pub(crate) fn gemm_raw_x_f32_residual_batched_auto(
 /// Byte stride of one OqPlusCompact block for `weight`, derived from the buffer
 /// rather than carried as metadata: the weight is `[M, K/256]` blocks of
 /// `130 + 2*N_out` bytes, so the stride falls out of the allocation size.
-fn oq_compact_block_stride(weight: &WeightTensor) -> Result<usize, hip_bridge::HipError> {
+pub(crate) fn oq_compact_block_stride(
+    weight: &WeightTensor,
+) -> Result<usize, hip_bridge::HipError> {
     const GROUP: usize = 256;
     let blocks = weight.m * (weight.k / GROUP);
     if blocks == 0 || weight.k % GROUP != 0 {

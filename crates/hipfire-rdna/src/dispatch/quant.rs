@@ -1023,6 +1023,37 @@ impl Gpu {
     /// the oq8 scratch by [`Self::quantize_act_oq8_batched`]. The caller must have
     /// quantized with the SAME `n`/`k` — the scratch is only grown, never shrunk,
     /// so a later call with a larger `m` cannot invalidate the quantized data.
+    /// Compact-resident twin of [`Self::gemm_oq8_grouped_prequant`]: run the
+    /// compact GEMM against an activation ALREADY quantized into the shared oq8
+    /// batch scratch by `quantize_act_oq8_batched`. Lets several projections off
+    /// one activation (gate+up, q/k/v) share a single quantize pass instead of
+    /// re-quantizing per output the way `gemm_oq_compact_act_batched` would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_grouped_prequant(
+        &mut self,
+        w_blocks: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        self.gemm_oq_compact_grouped_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)
+    }
+
     pub fn gemm_oq8_grouped_prequant(
         &mut self,
         w_combined: &GpuTensor,
