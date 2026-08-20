@@ -28,8 +28,9 @@ pub(crate) fn forward_scratch_layers(
     // #397 Ship 6 — forward-as-pipeline. Single-GPU decode routes through the
     // lowered super-op executor BY DEFAULT (see forward_lowered_enabled);
     // HIPFIRE_FORWARD_LOWERED=0 opts back to the hand arms below. Skipped when
-    // GDN tape capture is active, and when a steer session is live — so the hand
-    // arms below are the exception path, not the default one.
+    // GDN tape capture is active, and (by default, see `steer_forces_hand`
+    // below) when a steer session is live — so the hand arms below are the
+    // exception path, not the default one.
     //
     // `hidden_rb` USED to force the hand path too, which is what routed DFlash
     // verify onto arms that miscompute on dense models — the whole of
@@ -45,12 +46,30 @@ pub(crate) fn forward_scratch_layers(
     // coherent. The correction stack stays as a proven, dormant foundation.
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
+    // An active steer/capture session needs the per-layer block-boundary hook.
+    // The lowered executor now carries that hook too (P2/M1), but the escape
+    // stays ON BY DEFAULT until parity has actually been demonstrated (M2) and
+    // per-stream state has landed (M3) — M4 deletes it. `HIPFIRE_STEER_LOWERED=1`
+    // bypasses it so the two paths can be run against each other at all; with the
+    // flag unset behaviour here is unchanged.
+    let steer_forces_hand = hipfire_steer::is_active() && !steer_lowered_enabled();
+    if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE").ok().as_deref() == Some("1")
+        && hipfire_steer::is_active()
+    {
+        eprintln!(
+            "  [decode] steer session active → {} path{}",
+            if steer_forces_hand { "hand" } else { "lowered" },
+            if steer_forces_hand {
+                ""
+            } else {
+                " (HIPFIRE_STEER_LOWERED=1)"
+            }
+        );
+    }
     if forward_lowered_enabled()
         && gdn_tape_capture.is_none()
         && !rq_hand_optin
-        // An active steer/capture session needs the per-layer block-boundary
-        // hook, which only the hand arms below carry — force the hand path.
-        && !hipfire_steer::is_active()
+        && !steer_forces_hand
     {
         return forward_scratch_layers_lowered(
             gpu,
