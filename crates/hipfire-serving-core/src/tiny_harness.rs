@@ -1045,21 +1045,14 @@ impl TinyModel {
                 }
                 m
             }
-            Self::MiniMax { weights, .. } => {
-                let mut m = HashMap::new();
-                let mut put = |w: &WeightTensor, n: String| {
-                    m.insert(w.buf.buf.as_ptr() as usize, n);
-                };
-                for (i, l) in weights.layers.iter().enumerate() {
-                    let p = format!("model.layers.{i}");
-                    put(&l.wq, format!("{p}.self_attn.q_proj"));
-                    put(&l.wk, format!("{p}.self_attn.k_proj"));
-                    put(&l.wv, format!("{p}.self_attn.v_proj"));
-                    put(&l.wo, format!("{p}.self_attn.o_proj"));
-                    put(&l.router, format!("{p}.block_sparse_moe.gate"));
-                }
-                m
-            }
+            // The arch's own walker, not a copy of it. The copy this replaces
+            // was identical except that it omitted `lm_head`, which the real
+            // walker captures — and lm_head is LDLQ-eligible, so the omission
+            // showed up as a permanent `missing=1` in the calibrated cells: the
+            // harness was scoring `++` formats against a Hessian set it had
+            // silently narrowed. That is the whole argument against hand-rolled
+            // capture maps in one instance, so use the walker.
+            Self::MiniMax { weights, .. } => minimax::calibration::build_capture_names(weights),
             Self::NemotronH { model } | Self::Mamba2 { model } => model.build_capture_names(),
             Self::Zaya { model } => zaya_gpu::build_capture_names(model.weights()),
             #[cfg(feature = "arch-lfm2moe")]
@@ -1107,22 +1100,16 @@ impl TinyModel {
                 }
                 m
             }
+            // The arch's own walker over the full layer range. The copy this
+            // replaces was textually identical to it — no drift had happened
+            // yet, which is the argument for switching before it does rather
+            // than after.
             Self::Llama { weights, .. } => {
-                let mut m = HashMap::new();
-                let mut put = |w: &WeightTensor, n: String| {
-                    m.insert(w.buf.buf.as_ptr() as usize, n);
-                };
-                for (i, l) in weights.layers.iter().enumerate() {
-                    let p = format!("model.layers.{i}");
-                    put(&l.wq, format!("{p}.self_attn.q_proj"));
-                    put(&l.wk, format!("{p}.self_attn.k_proj"));
-                    put(&l.wv, format!("{p}.self_attn.v_proj"));
-                    put(&l.wo, format!("{p}.self_attn.o_proj"));
-                    put(&l.w_gate, format!("{p}.mlp.gate_proj"));
-                    put(&l.w_up, format!("{p}.mlp.up_proj"));
-                    put(&l.w_down, format!("{p}.mlp.down_proj"));
-                }
-                m
+                hipfire_runtime::llama_calibration::build_capture_names_for_layers(
+                    weights,
+                    0,
+                    weights.layers.len(),
+                )
             }
         }
     }
