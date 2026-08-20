@@ -5780,6 +5780,58 @@ impl Gpu {
     /// per-group scales on both sides, `sdot4` int32 dot. `xq_i8`/`xs` are the
     /// shared pre-quantized (FWHT-rotated) activation from `quantize_act_oq8`.
     #[allow(clippy::too_many_arguments)]
+    /// Compact-resident Opus W4A8 decode GEMV. `w_blocks` holds OqPlusCompact
+    /// blocks as they sit on disk; `xq_i8`/`xs` are the int8 activation and its
+    /// per-group scales. Numerics match [`Self::gemv_oq_compact_grouped_auto`]
+    /// modulo activation quantization — see `parity_gemv_oq_compact_w8a8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_w8a8_grouped(
+        &mut self,
+        w_blocks: &GpuTensor,
+        xq_i8: &GpuTensor,
+        xs: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            group, 256,
+            "gemv_oq_compact_w8a8_grouped: group must be 256"
+        );
+        assert_eq!(
+            (k / 256) % 2,
+            0,
+            "gemv_oq_compact_w8a8_grouped: needs an even group count (K % 512 == 0)"
+        );
+        assert!(
+            block_stride >= 132 && (block_stride - 130) % 2 == 0,
+            "gemv_oq_compact_w8a8_grouped: block_stride {block_stride} invalid (expected 130 + 2*N_out)"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_w8a8_grouped",
+            kernels::GEMV_OQ_COMPACT_W8A8_GROUPED_SRC,
+            "gemv_oq_compact_w8a8_grouped",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xqp = xq_i8.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_w8a8_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xqp, ptr xsp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
     pub fn gemv_oq8_w8a8_grouped(
         &mut self,
         w_i8: &GpuTensor,

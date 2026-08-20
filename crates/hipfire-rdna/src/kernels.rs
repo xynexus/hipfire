@@ -4334,6 +4334,12 @@ pub const GEMV_OQ8_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_o
 /// Requires K % 512 == 0. See `kernels/src/gemv_oq8_grouped_v2.hip`.
 pub const GEMV_OQ8_GROUPED_V2_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq8_grouped_v2.hip");
+/// Compact-resident Opus W4A8 decode GEMV — the A8 twin of
+/// `GEMV_OQ_COMPACT_GROUPED_V2_SRC`. Same numerics and same overlay contract;
+/// the activation arrives int8 and the dot runs on `V_DOT4_I32_IU8`.
+pub const GEMV_OQ_COMPACT_W8A8_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_w8a8_grouped.hip");
+
 pub const GEMV_OQ8_W8A8_GROUPED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq8_w8a8_grouped.hip");
 

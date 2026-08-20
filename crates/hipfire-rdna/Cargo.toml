@@ -33,3 +33,7 @@ required-features = ["deltanet"]
 [[example]]
 name = "parity_gdn_chunk"
 required-features = ["deltanet"]
+
+[[example]]
+name = "parity_gemv_oq_compact_w8a8"
+required-features = ["deltanet"]
