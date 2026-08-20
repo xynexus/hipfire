@@ -70,6 +70,40 @@ Only once Phase 1 is at or near the bandwidth limit. Layer on **DFlash,
 DFlash2, DDTree, DSpark, and/or NGram / prompt-lookup decoding**. Measure each
 independently before combining.
 
+### RESULT (2026-08-21): the premise does not hold for this model
+
+Phase 2 was executed. Spec-decode was made to RUN on compact Opus for the first
+time and improved 90% (≈4.5 → 8.55 tok/s), but it does **not** beat plain decode
+at 15.1, and the available fixes do not close the gap:
+
+| step | spec-decode |
+|---|---|
+| starting point (parked, unmeasurable) | ~4.5 |
+| batched verify | 5.56 |
+| + multi-column compact GEMM (B ≤ 16) | 6.52 |
+| + GDN-tape rollback replay | **8.55** |
+| + restoring acceptance from the KV fork (projected) | **~14.4** |
+
+**Even the complete fix lands below plain decode.** Restoring τ from 2.000 to
+3.375 scales 8.55 to ~14.4 < 15.1. Beating autoregressive decode additionally
+needs a drafter with higher τ or a much cheaper one — a training/architecture
+task, not a kernel task.
+
+**Why, structurally:** Phase 1 left decode at ~91% of the DRAM read ceiling with
+1.05× overfetch and bytes already at the 4.25-bit floor. Spec-decode pays a
+drafter (~64 ms/cycle here, 18% of the profile) to save weight sweeps the target
+is already reading near-optimally. At 4.25 bits there is too little headroom for
+that trade to pay. **Phase 1 succeeding is what makes Phase 2 fail.**
+
+That is the answer to this phase, not an open task. The supporting work — a 2.8×
+prefill, a bit-identical small-batch GEMM, and a correctness bug in the default
+KV configuration — is in
+`docs/plans/2026-08-21-compact-batched-prefill-blocker.md`.
+
+Re-open Phase 2 if any of these change: a materially cheaper or higher-τ drafter,
+prompt-lookup drafting (not implemented in this tree), or a lower-bit target that
+restores headroom — which the 4.25-bit floor currently forbids.
+
 ## Latitude
 
 You may change kernels, dispatch, runtime, the quantization itself, and you may
