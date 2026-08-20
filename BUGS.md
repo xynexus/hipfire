@@ -2043,3 +2043,51 @@ reproduction and the reasoning that led to the real cause are still useful.
   then treat these three artifacts as single-chunk.
 - Scope: Tooling / evidence integrity
 - Confidence: High (self-test is deterministic and reproduces on all 3 files)
+
+## [Medium] tiny-quant `++` cells: gemma4_moe expert gate_up gets no Hessian — a hand-rolled capture map names it SPLIT while the artifact FUSES it
+- Category: Test coverage / calibration name resolution
+- Location: `crates/hipfire-serving-core/src/tiny_harness.rs` `capture_names()`
+  Gemma4 arm (L1067); `crates/hipfire-quantize/src/main.rs`
+  `calibration_tensor_name_candidates` (L6425)
+- **This entry has been wrong twice. The mechanism below is established by
+  name-level comparison, not inference.** First filed [High] with the right
+  symptom and a guessed mechanism; then retracted on a stale code comment
+  ("routed experts ... we don't name them") that does not describe what the
+  Gemma4 arm actually does. It names them — under the wrong names.
+- The capture map registers, per expert:
+
+      model.language_model.layers.{L}.experts.{E}.gate_proj    <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.up_proj      <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.down_proj
+
+  while the quantized fixture FUSES gate and up, so the quantizer resolves
+  `...experts.{E}.gate_up_proj.weight`. `down_proj` matches; `gate_up_proj`
+  matches nothing. Hence exactly 16 missing (2 layers x 8 experts) with
+  `pooled=0`, and 16 expert `down_proj` among the successes. The arithmetic
+  closes: 22 dense + 16 down + 16 gate_up = 54 attempts, 38 success.
+- `qwen3_5_moe` is the control and the fix in miniature: its arm calls the arch's
+  REAL walker (`qwen35::build_capture_names`), the names agree, `missing=0`.
+- **Root cause is the divergence, not the names.** The harness hand-rolls capture
+  maps for 7 families (Qwen2, DotsOcr, Deepseek4, Gemma3, Gemma3Vl, MiniMax,
+  Gemma4) while 4 use the arch's real walker. Gemma3 and MiniMax hand-roll even
+  though `hipfire-arch-gemma3/src/calibration.rs:38` and
+  `hipfire-arch-minimax/src/calibration.rs:37` exist. Gemma4 has no walker at
+  all. The harness is meant to reuse real hipfire; every hand-rolled map is a
+  second source of truth that can drift from the artifact layout, and this is
+  that drift.
+- Note the genuine subtlety before "just fix the names": at runtime the Gemma4
+  model holds gate and up as SEPARATE tensors (captured by pointer), while the
+  artifact fuses them. So the capture cannot simply emit the fused name — one
+  name, two pointers. Either `calibration_tensor_name_candidates` learns the
+  fused<->split correspondence, or the collector combines the two captures.
+- Fix order: (1) give gemma4 a real `build_capture_names` in its arch crate and
+  switch Gemma3/MiniMax to theirs, so there is one source of truth; (2) resolve
+  fused<->split in the candidate list; (3) make `ldlq_report_and_validate`
+  strict about `missing > 0` for a `++` format — a partial application currently
+  emits an artifact named `++` regardless, which is the mislabelled-artifact
+  failure the quantizer refuses `qtip3++` over.
+- Shipped-artifact impact still UNMEASURED: real models calibrate through the
+  real engine (`calibration/expert_capture.rs:777`), not this map. A real dense
+  model returned `missing=0, 186/186`; a real MoE has not been run.
+- Visible per calibrated cell in `results.jsonl` as `ldlq_{success,attempts,
+  missing,k_mismatch,pack_failed,pooled}` and `ldlq_skipped`.

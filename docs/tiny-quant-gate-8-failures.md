@@ -203,3 +203,47 @@ varies between runs (~13 MB of a 647 MB artifact, no weight bytes).
 Two standing lessons: **rebuild explicitly before an A/B that depends on which
 commit built the binary** — `git bisect` leaves the tree's binary at an arbitrary
 commit — and **treat an impossibly clean agreement as a symptom, not a result.**
+
+## Correction 2026-08-13: the `+`/`++` "no-op" is NOT established
+
+An earlier note here (and PR #252's description) read the identical `+`/`++`
+baseline rows as a silent no-op — "ask for `++`, get `+` output." **That claim
+was overstated and the evidence does not support it.**
+
+**What the direct test shows.** Qwen3.5-0.8B (real weights, dense, arch 5)
+quantized to `oq8+` and `oq8++` from the same source with the same Hessian:
+
+    oq8+   quantization_hash = 3ae1a4908e56c478
+    oq8++  quantization_hash = 3b1ad88133127973
+    oq8++  LDLQ tensors: success=186 attempts=186 missing=0 k_mismatch=0 pack_failed=0
+
+LDLQ is applied to every eligible tensor and the quantized payload genuinely
+differs. **`++` is not a no-op.**
+
+**Why the rows looked identical.** `tests/tiny-quant-baselines.txt` stores 8
+decimal places and `results.jsonl` rounds to ~6 significant figures, so any
+difference below that is invisible. "Identical in the baseline file" therefore
+cannot distinguish *no change* from *a change smaller than the recorded
+precision*, and I read it as the former.
+
+**What remains true, and is the more useful conclusion.** On the tiny fixtures
+`++` produces no *resolvable* KLD change, while `gfx1151`
+`qwen3_5_moe_indexed` records `oq8+` 0.00307532 against `oq8++` 0.00290585 — a
+~5% gap, clearly visible. The unified explanation also covers the `oq4.25++`
+inversion documented above: **seeded random-init fixtures cannot resolve
+calibrated-format quality differences.** Random weights have no outlier or
+correlation structure for AWQ scaling or Hessian error feedback to exploit, so
+the calibrated cells measure almost nothing on them — which is exactly why the
+fixture moved *opposite* to the real model on `oq4.25++`.
+
+So these `+`/`++` cells are weak tests, not evidence of a bug. Treat the whole
+calibrated block on random-init fixtures as low-information.
+
+**Genuinely open, stated narrowly:** whether LDLQ reaches *routed expert*
+tensors on the MoE path. `ldlq_report_and_validate` only enforces
+`success > 0`, so a build where LDLQ covered the dense tensors and skipped every
+routed expert would pass silently. The counter that answers it
+(`LDLQ_MISSING`) is printed to the quantizer's stderr, which the tiny harness
+discards. Answering it needs either that stderr surfaced or one real MoE
+quantized to `oq8+` and `oq8++` with payload hashes compared — the same
+technique used above.

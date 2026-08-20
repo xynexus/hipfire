@@ -284,6 +284,15 @@ env_vars! {
          many, and KLD references are built at n_ctx=2048, so 2048 matches the \
          evaluation distribution. Unset keeps the single-sequence behaviour.";
 
+    LDLQ_STRICT = "HIPFIRE_LDLQ_STRICT", Developer,
+        "Set 1 to REFUSE to emit a `++` artifact whose LDLQ pass did not cover \
+         every eligible tensor, instead of warning. A `++` name promises \
+         Hessian/LDLQ error feedback throughout, and a partial pass is \
+         indistinguishable downstream from a complete one — the same \
+         mislabelled-artifact failure `qtip3++` is refused over. Default is warn \
+         only because several tiny-matrix families sit at missing=1 on tensors \
+         nobody has explained yet; flip it once they are understood.";
+
     LDLQ_SKIP_EXPERT_LEAVES = "HIPFIRE_LDLQ_SKIP_EXPERT_LEAVES", Developer,
         "Comma-separated routed-expert leaf names (e.g. `down_proj,w2`) whose \
          tensors skip `--ldlq` even when the calibration carries a Hessian for \
