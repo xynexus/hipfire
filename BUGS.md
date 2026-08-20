@@ -2156,12 +2156,36 @@ which PR #252 patched at the quantizer (fused -> split Hessian fallback). The
 durable fix is a walker in the arch crate; the harness arm then follows the
 other four.
 
-### 3. Real-MoE oq4.25++ is still unmeasured — and is now tractable
-PR #251 established that `8357081d3` improves oq4.25++ by 25.7% KLD on a real
-DENSE model (Qwen3.5-0.8B), leaving the MoE case assumed. The blocker was size —
-the local MoE artifacts are 17.8 GB (35B-A3B) and 155 GB (122B).
-**`/srv/hipfire/models/models--LiquidAI--LFM2.5-8B-A1B.hfa` is 10.5 GB**, small
-enough to quantize twice plus a Hessian inside the current ~75 GB headroom.
+### 3. Real-MoE oq4.25++ is still unmeasured, and is NOT tractable on this box
+**Attempted 2026-08-20; the "tractable" claim in the first version of this entry
+was wrong.** I sized LFM2.5-8B-A1B (10.5 GB) and never checked whether its arch
+can be calibrated at all. It cannot:
+
+    InvalidSourcePlan("no native calibration adapter is registered for architecture 11")
+
+**Only five arches register a calibration adapter** — qwen35, gemma3, zaya,
+gemma4, cohere2 (`register_calibration_adapter!`). lfm2moe is not one, so no
+Hessian can be produced for it through the production path, and `oq4.25++`
+without a Hessian is not the format under test.
+
+The smallest real MoE on a supported arch is `Qwen3.5-35B-A3B` at ~44 GB. The
+measurement needs an HF restore (~44 GB, because `calibrate` accepts ONLY an HF
+snapshot — not `.hfa`, not `.hfq`; use `hipfire-coexistence repack` to restore)
+plus a bf16 anchor (~44 GB), a Hessian, and two `oq4.25++` artifacts (~19 GB
+each): **~170 GB of working space against 65 GB free.** Not feasible here.
+It needs a bigger box, or a small real MoE on one of those five arches.
+
+### 3b. The tiny harness calibrates families production cannot
+Falling out of the above, and pointing the same way as the capture-map drift:
+the tiny gate runs five calibrated cells for `lfm2_moe` (`oq4+`, `oq4++`,
+`oq4.25++`, `oq8+`, `oq8++`) while the production `calibrate` CLI refuses arch 11
+outright. It can do that because the harness uses its own `CalibCollector` +
+`capture_names()` rather than the `layer_stream` adapter registry.
+
+So a family can look **calibration-covered in the gate while being
+uncalibratable in production** — the harness/production divergence again, but
+inverted: here the harness does MORE than the real path, which is the direction
+that manufactures false confidence rather than false alarms.
 
 ### The shared root
 (1) and (3) are the same question — *does a calibration/encoder change help real
