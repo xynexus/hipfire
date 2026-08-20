@@ -8,6 +8,7 @@ pub mod arch_caps;
 mod compiler;
 mod dispatch;
 pub mod feature_flags;
+pub mod gdn_chunk;
 pub mod generic_warn;
 pub mod gtt_share;
 pub mod kernel_trace;

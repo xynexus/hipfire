@@ -181,6 +181,24 @@ impl Qwen35ModelExt for () {
         // Both precisions have a real batched kernel now, so the old
         // "loop the single-token kernel" fallback is gone. It existed because
         // Q4 had no batch variant.
+        // Chunkwise-parallel when opted in: resolves the batch's tokens together
+        // rather than one at a time, which is what lets a batched prefill (and
+        // spec-decode verify) amortize on a DeltaNet-heavy stack. Same
+        // recurrence, different summation order — see `hipfire_rdna::gdn_chunk`.
+        if matches!(params.quant, StateQuant::FP32) && hipfire_rdna::gdn_chunk::chunk_enabled() {
+            return gpu.gated_delta_net_f32_chunk(
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.state,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
+            );
+        }
         match params.quant {
             StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
                 params.q_batch,

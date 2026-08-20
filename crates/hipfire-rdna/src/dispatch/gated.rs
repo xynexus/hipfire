@@ -158,7 +158,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
-// Oracle swap, same as the routed sibling: identical signature and lane
+        // Oracle swap, same as the routed sibling: identical signature and lane
         // mapping, `double` tile and arithmetic. Single-session decode takes
         // THIS kernel while batched decode takes the routed one, so both need
         // the swap or an oracle run silently measures nothing.
@@ -213,6 +213,108 @@ impl Gpu {
         }
         result
     }
+    /// Chunkwise-parallel gated DeltaNet.
+    ///
+    /// Drop-in for [`Self::gated_delta_net_f32_batch_seq`] — same inputs, same
+    /// outputs, same in-place state advance — but the tokens inside a chunk are
+    /// resolved together instead of one at a time. The serial kernel makes a
+    /// batched prefill of N tokens cost N serial decodes, which is what stops
+    /// speculative verify from amortizing on a stack that is mostly DeltaNet.
+    ///
+    /// Longer inputs are split into back-to-back chunks of `CMAX` (16); the
+    /// serial depth drops by that factor rather than to one. `scratch` holds the
+    /// pass-1 pair scalars and must be at least
+    /// `n_heads * (2 * CMAX * CMAX + CMAX)` floats — see
+    /// [`Self::gdn_chunk_scratch_floats`].
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_chunk(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state: &GpuTensor,
+        output: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        const CMAX: usize = 16;
+        let scratch_floats = Self::gdn_chunk_scratch_floats(n_heads);
+        let needed = scratch_floats * 4;
+        if self.gdn_chunk_scratch_bytes < needed {
+            let displaced = self.gdn_chunk_scratch.take();
+            self.retain_displaced_staging_scratch(displaced);
+            self.gdn_chunk_scratch = Some(self.hip.malloc(needed)?);
+            self.gdn_chunk_scratch_bytes = needed;
+        }
+        let scratch_ptr = self.gdn_chunk_scratch.as_ref().unwrap().as_ptr();
+        self.ensure_kernel(
+            "gdn_chunk_pairs",
+            kernels::GATED_DELTA_NET_CHUNK_SRC,
+            "gdn_chunk_pairs",
+        )?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_chunk",
+            kernels::GATED_DELTA_NET_CHUNK_SRC,
+            "gated_delta_net_f32_chunk",
+        )?;
+
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_f32_chunk", bytes);
+        let result = (|| -> HipResult<()> {
+            let mut t0 = 0usize;
+            while t0 < n_tokens {
+                let c = CMAX.min(n_tokens - t0);
+                // Scratch is laid out kk | kq | lcum, each sized for the WIDEST
+                // chunk so the offsets never move between sub-chunks.
+                let kkp = scratch_ptr;
+                let kqp = unsafe { (scratch_ptr as *mut f32).add(n_heads * CMAX * CMAX) }
+                    as *mut std::ffi::c_void;
+                let lcp = unsafe { (scratch_ptr as *mut f32).add(2 * n_heads * CMAX * CMAX) }
+                    as *mut std::ffi::c_void;
+                let (qp, kp, vp) = (q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr());
+                let (gp, bp) = (gate.buf.as_ptr(), beta.buf.as_ptr());
+                let (sp, op) = (state.buf.as_ptr(), output.buf.as_ptr());
+                let (t0i, ci) = (t0 as i32, c as i32);
+                let (nh, hd) = (n_heads as i32, head_dim as i32);
+                self.launch_kernargs(
+                    "gdn_chunk_pairs",
+                    [n_heads as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    &kernargs![ptr qp, ptr kp, ptr gp, ptr kkp, ptr kqp, ptr lcp,
+                               i32 t0i, i32 ci, i32 nh, i32 hd],
+                )?;
+                self.launch_kernargs(
+                    "gated_delta_net_f32_chunk",
+                    [n_heads as u32, (128 / 4) as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    &kernargs![ptr qp, ptr kp, ptr vp, ptr bp, ptr kkp, ptr kqp, ptr lcp,
+                               ptr sp, ptr op, i32 t0i, i32 ci, i32 nh, i32 hd],
+                )?;
+                t0 += c;
+            }
+            Ok(())
+        })();
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Float count [`Self::gated_delta_net_f32_chunk`] needs for `scratch`.
+    pub fn gdn_chunk_scratch_floats(n_heads: usize) -> usize {
+        const CMAX: usize = 16;
+        n_heads * (2 * CMAX * CMAX + CMAX)
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_f32_routed_batch_seq(
         &mut self,
@@ -505,7 +607,9 @@ impl Gpu {
         static SR_ROUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sr = *SR_ROUTED.get_or_init(|| {
             matches!(
-                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER").ok().as_deref(),
+                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER")
+                    .ok()
+                    .as_deref(),
                 Some("1") | Some("on") | Some("true") | Some("yes")
             )
         }) as i32;
@@ -593,7 +697,9 @@ impl Gpu {
         static SR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sr = *SR.get_or_init(|| {
             matches!(
-                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER").ok().as_deref(),
+                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER")
+                    .ok()
+                    .as_deref(),
                 Some("1") | Some("on") | Some("true") | Some("yes")
             )
         }) as i32;

@@ -30,11 +30,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// throughput — a bisection tool, not something to leave on.
 fn launch_trace_level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| match std::env::var("HIPFIRE_LAUNCH_TRACE").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
-    })
+    *LEVEL.get_or_init(
+        || match std::env::var("HIPFIRE_LAUNCH_TRACE").ok().as_deref() {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        },
+    )
 }
 
 /// `HIPFIRE_MOE_PTR_TABLE_DUMP=1` — dump an indexed-MoE expert pointer table and
@@ -591,6 +593,12 @@ pub struct Gpu {
     /// like `fp16_x_scratch`.
     bf16_x_scratch: Option<hip_bridge::DeviceBuffer>,
     bf16_x_scratch_bytes: usize,
+    /// Pair scalars for the chunkwise gated DeltaNet (`kk | kq | lcum`). Grown
+    /// on demand and never freed under a live graph, same contract as
+    /// `bf16_x_scratch`, so the chunk kernel can be enqueued inside a captured
+    /// verify graph without allocating.
+    gdn_chunk_scratch: Option<hip_bridge::DeviceBuffer>,
+    gdn_chunk_scratch_bytes: usize,
     bf16_x_source_ptr: *mut c_void,
     /// Displaced FP16/BF16 activation-staging buffers that may still be
     /// referenced by captured graph nodes.
@@ -993,6 +1001,8 @@ impl Gpu {
             fp16_x_source_ptr: std::ptr::null_mut(),
             bf16_x_scratch: None,
             bf16_x_scratch_bytes: 0,
+            gdn_chunk_scratch: None,
+            gdn_chunk_scratch_bytes: 0,
             bf16_x_source_ptr: std::ptr::null_mut(),
             capture_staging_scratch: Vec::new(),
             fp8_x_scratch: None,
@@ -1567,7 +1577,10 @@ impl Gpu {
         if trace >= 2 {
             match self.hip.device_synchronize() {
                 Ok(()) => eprintln!("[launch] {func_name} <- sync ok"),
-                Err(e) => eprintln!("[launch] {func_name} <- SYNC FAILED code={} {}", e.code, e.message),
+                Err(e) => eprintln!(
+                    "[launch] {func_name} <- SYNC FAILED code={} {}",
+                    e.code, e.message
+                ),
             }
         }
         launch_result

@@ -3063,6 +3063,25 @@ pub(crate) fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
+                } else if matches!(dn_state.quant, StateQuant::FP32)
+                    && hipfire_rdna::gdn_chunk::chunk_enabled()
+                {
+                    // Chunkwise-parallel: the tokens in this batch are resolved
+                    // together instead of one at a time. Same recurrence (see
+                    // `hipfire_rdna::gdn_chunk`), different summation order, so
+                    // it is NOT bit-identical to the serial arm below.
+                    gpu.gated_delta_net_f32_chunk(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
                 } else if matches!(dn_state.quant, StateQuant::FP32) {
                     gpu.gated_delta_net_f32_batch_seq(
                         &pbs.dn_q_batch,
@@ -6551,6 +6570,21 @@ pub(crate) fn forward_prefill_chunk(
                         &dn_state.s_matrices[delta_layer_idx],
                         tape,
                         parents,
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                } else if matches!(dn_state.quant, StateQuant::FP32)
+                    && hipfire_rdna::gdn_chunk::chunk_enabled()
+                {
+                    gpu.gated_delta_net_f32_chunk(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,

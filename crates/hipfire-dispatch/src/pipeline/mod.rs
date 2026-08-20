@@ -295,7 +295,11 @@ fn moe_gemv_plain(
 macro_rules! moe_step {
     ($t:expr, $label:literal) => {
         if std::env::var("HIPFIRE_MOE_STEP_DEBUG").as_deref() == Ok("1") {
-            eprintln!("[moe-step] {:>8.1}ms {}", $t.elapsed().as_secs_f64() * 1e3, $label);
+            eprintln!(
+                "[moe-step] {:>8.1}ms {}",
+                $t.elapsed().as_secs_f64() * 1e3,
+                $label
+            );
         }
     };
 }
@@ -488,8 +492,7 @@ pub fn run_moe_decode(
     if let Some(residency) = p.expert_residency {
         hip!(gpu.bind_thread())?;
         let mut idx = vec![0i32; p.k];
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
         hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
         let selected: Vec<u32> = idx
             .iter()
