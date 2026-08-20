@@ -144,3 +144,65 @@ tick imply more than it did.
 Between items, re-read the parent plan's status section: three Tier-1 blockers
 cleared themselves through other people's work during a single session, and the
 cheapest way to do unnecessary work here is to not notice that again.
+
+---
+
+## P2 sequencing decision, 2026-08-20: **(b) — do it with M2b, not before**
+
+The plan above posed the choice and declined to pick. Decided here, with the
+evidence that settles it.
+
+### Why (a) is worth less than "half the value" — it is worth ~nothing observable
+
+Option (a) was "make steer per-stream now, leave the hand-path escape for M2b".
+The escape reads (`qwen35/decode_layers.rs`):
+
+> An active steer/capture session needs the per-layer block-boundary hook, which
+> only the hand arms below carry — force the hand path.
+
+So a steering stream **leaves the lowered march entirely**. Per-stream steer
+state is therefore unobservable while the escape stands: two streams cannot
+steer differently within one march, because a steering stream is not in the march
+at all. (a) buys state hygiene with no behavioural change anyone can test —
+which fails this plan's own bar that a stage exits on a measurement.
+
+### Why (b) is cheaper than assumed — the hook already exists
+
+The plan assumed wiring steer into the lowered path was the expensive half. It
+is not, because the precedent is already live: `qwen35/lowered.rs:651` takes
+`hidden_rb: Option<&HiddenStateRingBuffer>` and acts on it at the layer boundary
+(`:690-696`), for spec-decode per-position hidden extraction. **The lowered
+executor already accepts an optional per-layer boundary hook and fires it.**
+`hidden_rb` used to force the hand path for exactly the reason steer does today,
+and it was retired by giving the lowered path the hook rather than by keeping the
+escape.
+
+Steer needs the same shape, and the coupling is the argument for doing both at
+once: the lowered hook must know *which stream's* spec to apply, which is
+precisely the per-stream state (a) would have added blind. Doing them together
+means the state has a consumer that proves it works.
+
+### Consequences to accept before starting
+
+* **This crosses two of this plan's stop lines** — it retires a fallback (the
+  escape) and it touches the forward path for steering users. It is authorised
+  as a decision, not as a licence to skip verification: the exit is
+  **lowered-path steering matching hand-path steering**, asserted on output,
+  before the escape is removed. Retire the escape only after parity holds.
+* Non-steering numerics must not move at all. `HIPFIRE_FORWARD_LOWERED=0` stays
+  as the general opt-out.
+* `APPLY_CACHE` is a `thread_local` holding `GpuTensor` because it is `!Sync`.
+  Per-stream state does not change that — it changes what the epoch invalidates
+  against. Do not try to move it into the shared state.
+
+### Found while deciding: a stale comment that says the opposite
+
+`qwen35/lowered.rs:28` claims "hidden_rb engages only the hand path". Lines
+651 and 690-696 of the same file are the lowered path doing exactly that
+extraction, and `decode_layers.rs` says so too ("the lowered executor extracts
+per-layer hidden itself now").
+
+Worth fixing on the way past, and worth noting as a pattern: a stale comment in
+this tree already caused one correct finding to be retracted wrongly during the
+session that produced this plan. The parent plan opens by fixing two comments
+that claim the lowered path is off by default. This is a third.
