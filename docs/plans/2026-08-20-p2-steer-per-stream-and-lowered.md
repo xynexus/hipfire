@@ -81,13 +81,24 @@ steering, not of the bug that was fixed, and is undiminished by the fix.
 | assertion | result |
 |---|---|
 | 1 — identity anchor | **PASSES** both paths: `strength 0.0` byte-identical to the unsteered baseline over 126 tokens |
-| 2 — oracle | **not run** — needs `gpu_validate.rs` extended to the lowered call site |
+| 2 — oracle | **PASSES**: `gpu_validate` ALL PASS on gfx1103 — Steer and Ablate × 4 layers × 2 strengths, worst `max_abs_err` 1.79e-7 against 1e-4 / 2e-3 tolerances, plus a 256× Ablate sync-stress (6.11e-7) and the capture→derive round-trip |
 | 3 — graceful degradation | **PASSES**: smooth across `{0, 0.1, 0.25, 0.5, 1.0}`, 3/3 identical md5 per point on both paths |
 | parity (corroborating) | **PASSES** 5/5 strengths, same md5 across paths |
 
-So M2 is satisfied except assertion 2, which is real implementation work rather
-than a measurement. The `Capturing` caveat below still applies and is unaffected
-by the hand-path fix.
+**M2 is satisfied.** M3 is unblocked.
+
+*Correction to assertion 2 as first written.* It said to "extend `gpu_validate.rs`
+to the lowered call site". **There is no such thing to extend to**, and following
+that instruction would have been wasted work. `gpu_validate` calls
+`maybe_steer_block` directly on a synthetic tensor, and the hand and lowered paths
+call that *same function* — the paths differ in WHERE the hook is invoked within
+the layer, not in the apply math it performs. So the existing oracle already
+covers both; running it is the whole of assertion 2. The boundary difference is
+what assertions 1 and 3 cover, which is the right division.
+
+The `Capturing` caveat below still applies and is unaffected by the hand-path fix
+— note `gpu_validate` does exercise capture→derive, but not the decode-path
+capture boundary.
 
 *Exit:* all three hold, same model, greedy.
 
@@ -97,11 +108,17 @@ by the hand-path fix.
    than defined as "whatever the other path did". Both paths pass it as of
    `1f7c2eeba`; before that fix the lowered path passed and the hand path failed,
    which is what exposed the bug.
-2. **Oracle.** The on-GPU decode apply matches `hipfire-steer`'s host-side
-   `apply_stack_host` within f32 tolerance, per layer, for both `steer` and
-   `ablate`. `hipfire-steer/examples/gpu_validate.rs` already performs exactly
-   this cross-check — extend it to the lowered call site rather than authoring a
-   second oracle.
+2. **Oracle.** The on-GPU apply inside `maybe_steer_block` matches
+   `hipfire-steer`'s host reference within f32 tolerance, per layer, for both
+   `steer` and `ablate`. Run `hipfire-steer/examples/gpu_validate.rs` — it already
+   performs exactly this cross-check, and because both decode paths call the same
+   `maybe_steer_block`, it covers both. Do not author a second oracle, and do not
+   try to "extend it to the lowered call site": there isn't one.
+
+   ```sh
+   hipfire lock acquire steer-validate && \
+     cargo run --release -p hipfire-steer --example gpu_validate; hipfire lock release
+   ```
 3. **Graceful degradation.** Sweep `strength` over `{0, 0.1, 0.25, 0.5, 1.0}`:
    output degrades smoothly, and each point is deterministic across ≥3 runs. No
    cliff, no instant EOS.
