@@ -597,3 +597,13 @@ batched path is faithful (1.6e-2). So acceptance drops even when the batched
 capture is accurate — the drafter is sensitive to WHICH capture it gets, not only
 to how accurate it is. The KVarN bug and the acceptance loss are two separate
 problems that happened to surface together.
+
+## One more negative, so it is not re-tried
+
+Enabling the two-stage lm_head during spec-decode (`HIPFIRE_LMHEAD_TWOSTAGE=q2`,
+which is worth 2.1x on the lm_head in ordinary decode) moved spec-decode 8.53 ->
+8.55 tok/s, i.e. nothing. The verify's per-position lm_head is not where its
+370 ms goes. Combined with the kernel profile — `gemv_oq_compact_multicol` is
+only ~48 ms/cycle of that 370 — the remainder is the rest of the verify forward
+plus this harness's rollback parity check, and it is NOT any single kernel that
+has been tried.
