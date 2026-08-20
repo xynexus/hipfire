@@ -42,36 +42,29 @@ calib artifact is reusable.
   recommended way in, since it does not depend on the verify path.
 * Any Qwen3.8-27B DFlash performance number.
 
-## The open bug
+## The open bug — ROOT-CAUSED 2026-08-20
 
-Dense + Opus + DFlash miscomputes: `'嘟 plain'` at 0.34-0.40 tok/s vs 7.5 plain.
-Reproduce with `HIPFIRE_DFLASH_ALLOW_OPUS=1` and a drafter un-parked.
+Not a DFlash bug, and not an Opus bug. The hand-written decode arms in
+`crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs` miscompute on DENSE
+qwen3.5-family models, and DFlash verify is the only caller left that forces
+them: `forward_scratch_layers` routes to the lowered super-op executor unless
+`hidden_rb` or `gdn_tape_capture` is `Some`, which verify always passes.
 
-Reproduced on TWO dense models (Qwen3.8-27B, Qwen3.6-27B) with TWO drafters
-(heretic jfan, matched z-lab). Qwen3.5-35B-A3B (MoE, same qt=36 lm_head, same
-Opus DeltaNet projections with AWQ sidecars, same CASK) is CORRECT.
+Reproduces with no drafter, no Opus, in ~10s on `qwen3.5-2b--bf16.hfq`:
 
-ELIMINATED, each by measurement — do not re-test:
-1. Opus lm_head arms — `HIPFIRE_DFLASH_NO_BATCHED_LMHEAD=1` gives identical garbage.
-2. CASK/TriAttention — identical with the sidecar parked.
-3. Verify graph capture — identical with `HIPFIRE_VERIFY_GRAPH=0`.
-4. Opus batched GEMM kernels — `parity_oq8_gemm` 45.15 dB, `parity_gemm_oq_compact` bit-identical.
-5. Drafter lineage — matched z-lab drafter garbles too, on a second dense model.
-6. Stale GDN tape replay — fixed in `2ba31acd3`, output unchanged.
-7. `prefill_batch.rs`'s batched DeltaNet/DeltaNetMoe arms — instrumented, NEITHER
-   FIRES for either model, draft or not. That file is the wrong place to look.
-8. KV eviction / physical_cap. Loading with max_seq=896 so physical_cap ==
-   max_seq (no capacity-driven eviction) still garbles. Eviction is driven by
-   the CASK/TriAttention config, not by physical_cap < max_seq, and the earlier
-   CASK-parked run garbled too — so neither eviction nor a short KV ring is it.
+    HIPFIRE_FORWARD_LOWERED=0 → '...\n0...  ,0...  $ $0...$0...$0...'
+    default (lowered)         → coherent
 
-START HERE: `HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1` shows BOTH models take the
-per-token fallback (`final=false`), dense via `base=true kv_f32=true`, MoE via
-`base=false`. Same fallback path, opposite outcomes. That asymmetry is the
-unexplained core. An rocprofv3 draft-vs-plain kernel diff shows the draft run
-adds only DRAFTER kernels plus the lm_head arm — the target body reuses the
-plain-decode kernels — so the divergence is in how verify DRIVES that shared
-body (state or position handling across the block).
+MoE stays correct under the same flag (35B-A3B bf16, `LOWERED=0`, coherent, τ
+4.33 with its drafter), so the fault is in the DENSE arms specifically — which
+is the whole dense-vs-MoE asymmetry that made this look like a DFlash bug.
+
+Full writeup, evidence table, and the slot-0 probe:
+`docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md`.
+
+NEXT: prefer teaching the lowered executor to populate `hidden_rb` + the GDN
+tape and deleting the hand arms, over repairing a second forward path that
+nothing else exercises. Bisect on the 2B.
 
 ## Measured economics — read before optimizing anything
 

@@ -916,6 +916,13 @@ pub fn load_model(
                 // Opt-in while the batched verify body is being bisected; see
                 // the note above. Default stays refused.
                 Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
+                // Unquantized heads. BF16 (16) resolves to DType::BF16; the
+                // losslessly recoded pair (Bf16Lut3=49, Bf16Huff=50) keeps the
+                // head PACKED as DType::Bf16L3. `dflash_enqueue_verify_lm_head`
+                // has arms for both. This is what makes a bf16 dense target
+                // runnable, which is the control that separates "dense" from
+                // "Opus" in the dense-Opus miscompute.
+                Some(16 | 49 | 50) => true,
                 _ => false,
             };
             if !supported {

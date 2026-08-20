@@ -273,6 +273,12 @@ fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
             | hipfire_rdna::DType::Oq8G256
             | hipfire_rdna::DType::OqCompactG256
             | hipfire_rdna::DType::OqCompactG128
+            // Unquantized targets. These are the reference dtype for the
+            // verify body, which makes a bf16 dense target the control that
+            // separates "dense" from "Opus" in the dense-Opus miscompute
+            // (docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md).
+            | hipfire_rdna::DType::BF16
+            | hipfire_rdna::DType::Bf16L3
     )
 }
 
@@ -466,6 +472,34 @@ fn dflash_enqueue_verify_lm_head(
                 group,
                 block_stride,
             )?;
+        }
+        // BF16 / Bf16L3 lm_head. No rotation, no activation quantize — the
+        // same two calls `weight_gemm` makes, and the f32->bf16 staging buffer
+        // they share is scratch-resident (grown, never freed under a live
+        // graph), so this stays capture-safe.
+        hipfire_rdna::DType::BF16 => {
+            gpu.gemm_bf16_x_bf16_wmma(
+                &w_out.buf,
+                final_hidden,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        hipfire_rdna::DType::Bf16L3 => {
+            if b >= 16 {
+                gpu.gemm_bf16l3_wmma_coop(
+                    &w_out.buf,
+                    final_hidden,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            } else {
+                gpu.gemm_bf16l3_xf32(&w_out.buf, final_hidden, &logits_batch, w_out.m, w_out.k, b)?;
+            }
         }
         other => {
             return Err(hip_bridge::HipError::new(
@@ -6725,6 +6759,20 @@ fn verify_dflash_block_inner(
             b,
             vg_mode.as_str(),
             t0.elapsed().as_micros()
+        );
+    }
+
+    // HIPFIRE_DFLASH_VERIFY_DEBUG=1: the block's inputs and its per-position
+    // argmax, side by side. Slot 0's argmax is the target's OWN next token for
+    // the already-committed prefix — it is what plain decode would emit at
+    // `start_pos`, so a mismatch there localizes the dense-DFlash miscompute to
+    // the verify forward itself rather than to acceptance or rollback.
+    if std::env::var("HIPFIRE_DFLASH_VERIFY_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[verify-dbg] start_pos={start_pos} b={b} mode={} in={:?} argmax={:?}",
+            vg_mode.as_str(),
+            &draft_tokens[..b.min(8)],
+            &argmax_per_pos[..argmax_per_pos.len().min(8)],
         );
     }
 
