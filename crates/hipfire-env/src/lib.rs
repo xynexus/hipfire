@@ -337,12 +337,13 @@ env_vars! {
 
     // ── Opus compact residency (hipfire-runtime) ────────────────────────────
     OQ_COMPACT_RESIDENT = "HIPFIRE_OQ_COMPACT_RESIDENT", Developer,
-        "Keep OqPlusCompact (qt=36) weights compact in VRAM instead of expanding \
-         them to one int8 per weight at load. oq4.25++ is ~4.25 bits/weight on \
-         disk but 8 bits resident without this, so the format's VRAM win is lost. \
-         Set 1 to opt in while the compact-resident path is validated; the \
-         default stays on the expanded path.";
-
+        "Keep OqPlusCompact (qt=36) weights compact in VRAM. DEFAULT ON as of \
+         2026-08-20: oq4.25++ is a mixed-precision format (4-bit bulk + sparse \
+         int8 outlier overlay, one kernel decodes both), so expanding it to one \
+         int8 per weight at load doubles the bytes every decode streams and \
+         changes no weight value. Set 0/off to opt back out to the expansion — \
+         needed only if a call site has no compact arm, which refuses loudly \
+         rather than corrupting.";
     OQ_COMPACT_RESIDENT_ONLY_K = "HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K", Developer,
         "Diagnostic bisection filter for HIPFIRE_OQ_COMPACT_RESIDENT. Comma-separated \
          list of K (input-dim) values; when set, ONLY tensors whose K appears in the \

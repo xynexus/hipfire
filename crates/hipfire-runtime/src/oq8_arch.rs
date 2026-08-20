@@ -266,6 +266,34 @@ fn dim_selected(var: &hipfire_env::EnvVar, value: usize) -> bool {
 /// so setting both narrows to a single (M, K) projection class — which is as
 /// fine-grained as this hook can get, since it is handed the shape but never the
 /// tensor name.
+/// Compact residency is the DEFAULT as of 2026-08-20.
+///
+/// oq4.25++ IS a mixed-precision format — 4-bit bulk plus a sparse int8 outlier
+/// overlay, decoded together by one kernel. That is the point of Opus. Unpacking
+/// it into uniform int8 containers at load doubles the bytes every decode step
+/// streams and changes not one weight value (`parity_gemm_oq_compact` and
+/// `parity_gemv_oq_compact` both check the compact kernels against that exact
+/// expansion). Both decode paths are W4A16, so the activation precision is the
+/// same too; only the f32 accumulation order differs.
+///
+/// Measured, q8 KV, 64 tokens:
+///   Qwen3.8-27B    dense  8.00 -> 9.10 tok/s (+14%), peak RSS 30 -> 21 GiB
+///   Qwen3.5-35B-A3B MoE  36.80 -> 48.30 tok/s (+31%)
+///
+/// `HIPFIRE_OQ_COMPACT_RESIDENT=0` opts back out to the expansion. Keep that
+/// escape hatch: a call site with no compact arm REFUSES loudly (see the
+/// OqCompactG256 guards in qwen35), so an unwired path fails visibly rather than
+/// corrupting, and unsetting is the documented workaround.
+fn compact_resident_enabled() -> bool {
+    !matches!(
+        hipfire_env::OQ_COMPACT_RESIDENT
+            .get()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
 fn compact_shape_selected(m: usize, k: usize) -> bool {
     dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_K, k)
         && dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_M, m)
@@ -278,16 +306,16 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // applies the sparse overlay per tile, bit-identically to this expansion
     // (see hipfire-rdna examples/parity_gemm_oq_compact.rs).
     //
-    // Opt-in while the end-to-end path is validated; once every consumer of
-    // DType::OqCompactG256 is wired this becomes the default and the expansion
-    // below can go — along with its two siblings in lfm2moe and minimax.
+    // DEFAULT as of 2026-08-20 (see `compact_resident_enabled`). The expansion
+    // below is now the opt-out path and should eventually go, along with its two
+    // siblings in lfm2moe and minimax.
     //
     // HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_K / _ONLY_M narrow this to chosen K and M
     // values so the compact-vs-expanded logit divergence can be bisected down to
     // a single (M, K) projection class. Purely diagnostic: unset (the normal
     // case) keeps every OqPlusCompact tensor compact, exactly as before. The
     // shape is the handle because this hook never sees the tensor name.
-    if hipfire_env::OQ_COMPACT_RESIDENT.flag() && compact_shape_selected(m, k) {
+    if compact_resident_enabled() && compact_shape_selected(m, k) {
         if qt == QuantType::OqPlusCompact.code() {
             return Some((data.to_vec(), DType::OqCompactG256));
         }
