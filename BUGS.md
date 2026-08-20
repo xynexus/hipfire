@@ -408,6 +408,32 @@ how the earlier note in this file described it. It is a leak proportional to
 paging traffic, and the three-point cache sweep above is the cheapest reproducer
 found so far. Worth attaching to that filing rather than leaving it here.
 
+
+**FIXED 2026-08-15.** `WeightPager::ensure_expert_module_resident` had two
+allocation branches; the `module_requires_host_repack` one used the unpooled
+`gpu.upload_raw` while its sibling used the pooled path, and BOTH free through
+`gpu.free_tensor` into `GpuPool`. `module_requires_host_repack` is true for
+exactly `Oq4G256` / `Oq8G256` / `OqPlusCompact` — every Opus artifact — so a
+paging Opus MoE took the leaking branch on every cold load. Switched to
+`upload_raw_pooled`.
+
+Verified end to end on the reproducer above: the 32768-chunk score at a 6144 MB
+cache, which died in ~1 minute, now runs 1h49m to completion and returns
+`mean_kld = 1.360282858575701e-10` — **bit-identical to the pager-off run**, so
+the fix removes the failure without moving numerics.
+
+Quantified by `cargo run --release -p hipfire-rdna --example
+pool_churn_upload_raw` (the M1a exit measurement):
+
+    pooled    4000 cycles:  total_new += 0,  total_reused += 4000,  VRAM +0 B
+    unpooled   200 cycles:  VRAM +419,430,400 B  = 400 MiB stranded
+
+200 unpooled cycles strand 400 MiB; 4000 pooled cycles strand nothing.
+
+Note the tiny gates cannot cover this — `tiny-affected-gate.sh
+--require-coverage` reports "no tiny coverage selected for changed paths",
+because the tiny fixtures do not page experts. The evidence above is the
+coverage.
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
