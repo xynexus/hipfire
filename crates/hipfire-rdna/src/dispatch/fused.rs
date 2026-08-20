@@ -848,7 +848,17 @@ impl Gpu {
         // 2's 20 FWHT groups from three serial rounds over 8 warps into one
         // round over 32. Measured on Qwen3.8-27B decode: 12.2 -> 6.2 us/call,
         // 1.567 -> 0.790 ms/token, and 70.94 -> 69.76 ms/token end-to-end.
-        let block_size = if k >= 2048 { 1024u32 } else { 256u32 };
+        //
+        // HIPFIRE_RMSNORM_ROTATE_BLOCK pins the width. It exists so the two
+        // widths can be compared on identical input — see
+        // examples/parity_rmsnorm_rotate_awq_width.rs. The tiny-quant fixtures
+        // are hidden=256 and never reach the k >= 2048 branch, so they give this
+        // change ZERO coverage; that parity example is the only thing that does.
+        let block_size = std::env::var("HIPFIRE_RMSNORM_ROTATE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|b| matches!(b, 64 | 128 | 256 | 512 | 1024))
+            .unwrap_or(if k >= 2048 { 1024u32 } else { 256u32 });
         let shared_mem = ((k + block_size as usize) * 4) as u32;
         // Bandwidth: read x + weight + awq_scale + signs + write x_rot.
         let bytes = k * 4 * 4 + 2 * 256 * 4;
