@@ -53,7 +53,10 @@ pub(crate) fn forward_scratch_layers(
     // bypasses it so the two paths can be run against each other at all; with the
     // flag unset behaviour here is unchanged.
     let steer_forces_hand = hipfire_steer::is_active() && !steer_lowered_enabled();
-    if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE").ok().as_deref() == Some("1")
+    if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
         && hipfire_steer::is_active()
     {
         eprintln!(
