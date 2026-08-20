@@ -210,3 +210,42 @@ has been an arithmetic estimate off measured phases rather than a guess.
 3. Only then evaluate JetSpec / DFlare / DART / SSD — every one of them assumes
    K-token verify costs about one weight read, which is precisely what item 1
    buys.
+
+## Why spec-decode cannot win with per-token verify — a proof, not an estimate
+
+Let B be the draft width and tau the accepted tokens per cycle. With verify
+running one full weight sweep PER DRAFT TOKEN, a cycle costs B sweeps (plus the
+draft) and yields tau tokens, so throughput is `tau / B` tokens per sweep against
+plain decode's `1`. Since `tau <= B` always, spec-decode is at best equal and in
+practice far worse. Measured here: tau 3.38 at B=8 gives 0.42 tokens/sweep, i.e.
+4.45 tok/s against 15.1.
+
+No choice of B, drafter, or acceptance rate escapes this. Batching the verify is
+not an optimisation of the current design — it is the precondition for the
+design to make sense at all. That is why the four candidate methods (JetSpec,
+DFlare, DART, SSD) cannot be evaluated on this family yet.
+
+## Where the remaining bug actually is
+
+Admitting compact to the hidden-EXPORTING forward reproducibly breaks the
+drafter (accept_rate 0.468 -> 0.000, random vocab ids with a repeating cycle).
+The obvious suspects were ruled out by inspection and are NOT the cause:
+
+- all five `hidden_rb` per-layer captures read `pbs.x_batch` AFTER the layer
+  completes and sit outside every dtype arm;
+- `per_token_hidden_out` is a plain `rmsnorm_batched` over `pbs.x_batch`,
+  likewise dtype-independent;
+- both ring-commit sites (`prefill_batch.rs` chunk loop, `speculative.rs` graph
+  path) handle their own `n`;
+- batched-vs-per-token prefill produces CHARACTER-IDENTICAL text, which means
+  `pbs.x_batch` is correct at every position, not just the last — each
+  position's output feeds the KV the next one reads.
+
+So the defect is subtler than a missing arm: something about chunking, staging
+size, or ring-head alignment on the seed path. Root-causing it needs a numerical
+diff of the exported per-position hidden states between the two paths, which is
+the next concrete step — not another round of code reading.
+
+Until then compact declines the exporting forward (`allow_compact`), which keeps
+spec-decode correct at its historical numbers and costs only the verify batching
+that was never working anyway.
