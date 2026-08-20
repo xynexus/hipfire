@@ -71,13 +71,13 @@ fn main() {
     let tokens: Vec<u32> = (0..n).map(|i| (1000 + i * 7) as u32).collect();
     let kv_max = n + 16;
 
-    let run = |gpu: &mut hipfire_rdna::Gpu, batched: bool| -> Vec<Vec<f32>> {
+    let run = |gpu: &mut hipfire_rdna::Gpu, batched: bool, kv_mode: &str| -> Vec<Vec<f32>> {
         if batched {
             std::env::remove_var("HIPFIRE_PREFILL_BATCHED");
         } else {
             std::env::set_var("HIPFIRE_PREFILL_BATCHED", "0");
         }
-        let mut kv_cache = match kv_mode.as_str() {
+        let mut kv_cache = match kv_mode {
             "kvarn" => KvCache::new_gpu_kvarn(
                 gpu,
                 config.n_layers,
@@ -142,9 +142,19 @@ fn main() {
     };
 
     eprintln!("-- batched --");
-    let a = run(&mut gpu, true);
+    let a = run(&mut gpu, true, &kv_mode);
     eprintln!("-- per-token --");
-    let b = run(&mut gpu, false);
+    let b = run(&mut gpu, false, &kv_mode);
+    // WHICH PATH IS RIGHT? Unquantized KV is the reference: both paths agree
+    // EXACTLY there (measured 0.00e0), so it is the only fixed point available.
+    // Comparing each quantized arm against it says which one the fix should make
+    // canonical, instead of leaving that a judgement call.
+    let reference = if kv_mode == "fp32" {
+        None
+    } else {
+        eprintln!("-- reference: per-token, fp32 KV --");
+        Some(run(&mut gpu, false, "fp32"))
+    };
 
     let dim = config.dim;
     println!("\n  layer   worst|rel|   at row   nonfinite(batched)");
@@ -184,5 +194,35 @@ fn main() {
     match first_bad {
         Some(l) => println!("\nFIRST DIVERGING LAYER: {l}   (worst overall {worst_all:.2e})"),
         None => println!("\nIDENTICAL across all layers (worst {worst_all:.2e})"),
+    }
+
+    if let Some(r) = reference {
+        let dist = |x: &Vec<Vec<f32>>| -> f32 {
+            let mut w = 0f32;
+            for (l, (p, q)) in x.iter().zip(&r).enumerate() {
+                let _ = l;
+                let rows = (p.len() / dim).min(q.len() / dim).min(n);
+                for row in 0..rows {
+                    let (ps, qs) = (
+                        &p[row * dim..(row + 1) * dim],
+                        &q[row * dim..(row + 1) * dim],
+                    );
+                    if ps.iter().any(|v| !v.is_finite()) {
+                        continue;
+                    }
+                    let sc = qs.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                    w = w.max(
+                        ps.iter()
+                            .zip(qs)
+                            .fold(0f32, |m, (u, v)| m.max((u - v).abs()))
+                            / sc,
+                    );
+                }
+            }
+            w
+        };
+        println!("\nagainst the fp32-KV reference (lower is more faithful):");
+        println!("  batched   {:.3e}", dist(&a));
+        println!("  per-token {:.3e}", dist(&b));
     }
 }

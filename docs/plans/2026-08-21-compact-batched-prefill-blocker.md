@@ -552,3 +552,48 @@ Spec-decode does not beat autoregressive decode on this family. The remaining
 terms are measured, not modelled: acceptance halved by the KV-tier prefill fork
 (restoring tau 3.375 scales 8.55 to ~14.4), and the drafter at ~64 ms/cycle.
 Both must land; neither alone clears 15.1.
+
+## SEPARATE BUG FOUND: batched prefill + KVarN is badly wrong
+
+Not a compact issue and not a spec-decode issue — this affects every model that
+batches prefill with the sanctioned default KV family.
+
+Unquantized KV is the reference (both prefill paths agree EXACTLY there), so
+`compare_prefill_hidden_paths` now measures each quantized arm against it.
+qwen3.5-2b bf16, 48 positions:
+
+    KV = q8      batched 1.615e-2   per-token 2.392e-2
+    KV = kvarn   batched 9.334e-1   per-token 1.633e-2
+
+Under q8 both paths are faithful and the batched one is slightly BETTER. Under
+KVarN the batched path is **57x worse than per-token**, while per-token KVarN is
+as accurate as q8. That is not a granularity difference — per-token KVarN proves
+the tier itself is fine — it is a defect in the BATCHED KVarN attention.
+
+Reproducible across sizes: n=16 -> 9.328e-1, n=48 -> 9.334e-1, n=64 -> 1.029e0,
+against a per-token arm pinned at 1.633e-2 throughout.
+
+CAVEAT, so the table is not over-read: running the same comparison on
+Qwen3.8-27B oq4.25++ reports batched == per-token == 1.203e-2, which is NOT
+evidence that compact is fine. Compact declines the hidden-exporting forward by
+design (`allow_compact`), so BOTH arms ran per-token there — the test does not
+exercise the batched path on that model. The defect is demonstrated on a dtype
+that actually batches.
+
+### Why this matters beyond this branch
+
+- KVarN is the sanctioned default and q8 is deprecated, so the default
+  configuration is the broken one.
+- It plausibly degrades any DFlash drafter on a model that DOES batch prefill —
+  the drafter is handed a capture that is ~1.0 relative error from the truth.
+- It is upstream of the whole spec-decode question here: fixing it is what would
+  let compact batch a hidden-exporting forward at all.
+
+### Not the whole acceptance story
+
+Worth stating so the next person does not over-attribute: the spec-decode
+acceptance loss measured here (0.482 -> 0.286) was under **q8** KV, where the
+batched path is faithful (1.6e-2). So acceptance drops even when the batched
+capture is accurate — the drafter is sensitive to WHICH capture it gets, not only
+to how accurate it is. The KVarN bug and the acceptance loss are two separate
+problems that happened to surface together.
