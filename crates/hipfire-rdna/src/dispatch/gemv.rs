@@ -5616,10 +5616,19 @@ impl Gpu {
         let ki = k as i32;
         let gi = group as i32;
         let bs = block_stride as i32;
+        // v3 is persistent: a fixed wide grid whose waves stride over rows. 2048
+        // x 256 measured 239.0 GB/s against 234.5 for one workgroup per row on
+        // the synthetic sweep (examples/bench_oq_layout). Capped at the row count
+        // so small M does not launch idle waves. v2 keeps one row per workgroup.
+        let (grid, tpb) = if v3 {
+            (((m as u32).div_ceil(8)).clamp(1, 2048), 256u32)
+        } else {
+            (m as u32, 32u32)
+        };
         self.launch_kernargs(
             kname,
-            [m as u32, 1, 1],
-            [32, 1, 1],
+            [grid, 1, 1],
+            [tpb, 1, 1],
             0,
             &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
         )

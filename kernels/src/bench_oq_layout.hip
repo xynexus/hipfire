@@ -156,3 +156,36 @@ extern "C" __global__ void bwl_tsplit(
     if (lane == 0xffff) Y[row] = (float)acc;
     else if (acc == 0xdeadbeefu) Y[row] = 1.0f;
 }
+
+// (8) PERSISTENT: same split-plane addressing as (7), but a FIXED wide grid whose
+// waves grid-stride over rows, instead of one 32-thread workgroup per row. The
+// flat stream in (1) reaches its number with 4096 wide workgroups; the GEMV
+// dispatches one tiny workgroup per output row — 248320 of them for lm_head —
+// and this asks whether that dispatch shape is itself costing bandwidth.
+extern "C" __global__ void bwl_persist(
+    const uint8_t* __restrict__ W, float* __restrict__ Y,
+    int M, int ng, int side_stride
+) {
+    const int lane  = threadIdx.x & 31;
+    const int wave  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int waves = (gridDim.x * blockDim.x) >> 5;
+    const int gir = lane >> 3;
+    const int lig = lane & 7;
+    const long long side_base = (long long)M * ng * 128LL;
+    uint32_t acc = 0;
+    for (int row = wave; row < M; row += waves) {
+        const uint8_t* n_row = W + (long long)row * ng * 128LL;
+        const uint8_t* s_row = W + side_base + (long long)row * ng * (long long)side_stride;
+        for (int r = 0; r < ng; r += 4) {
+            const int g = r + gir;
+            uint32_t v[4];
+            __builtin_memcpy(v, n_row + (long long)g * 128 + lig * 16, 16);
+            acc ^= v[0] ^ v[1] ^ v[2] ^ v[3];
+            const uint8_t* sb = s_row + (long long)g * side_stride;
+            acc ^= (uint32_t)(*(const uint16_t*)sb);
+            acc ^= (uint32_t)(*(const uint16_t*)(sb + 2 + 2 * (lig & 2)));
+        }
+    }
+    if (lane == 0xffff) Y[0] = (float)acc;
+    else if (acc == 0xdeadbeefu) Y[0] = 1.0f;
+}

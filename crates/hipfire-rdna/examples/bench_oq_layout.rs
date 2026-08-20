@@ -66,6 +66,7 @@ fn main() {
         "bwl_split",
         "bwl_rowsplit",
         "bwl_tsplit",
+        "bwl_persist",
     ] {
         gpu.ensure_kernel_public("bench_oq_layout", SRC, f)
             .expect("compile");
@@ -168,4 +169,18 @@ fn main() {
         g.launch_kernel_blob("bwl_tsplit", [m as u32, 1, 1], [32, 1, 1], 0, &mut kb.0)
             .expect("tsplit");
     });
+
+    for (blocks, tpb) in [(512u32, 256u32), (2048, 256), (8192, 64)] {
+        let name = format!("persist/{blocks}x{tpb}");
+        bench(&mut gpu, &name, n136, &|g: &Gpu| {
+            let mut kb = Blob::new();
+            kb.ptr(wp as *const c_void)
+                .ptr(ynp as *const c_void)
+                .i32v(m as i32)
+                .i32v(ng as i32)
+                .i32v(8);
+            g.launch_kernel_blob("bwl_persist", [blocks, 1, 1], [tpb, 1, 1], 0, &mut kb.0)
+                .expect("persist");
+        });
+    }
 }
