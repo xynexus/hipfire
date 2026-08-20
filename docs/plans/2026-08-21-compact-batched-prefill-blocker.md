@@ -477,3 +477,44 @@ one-predicate question rather than a kernel project.
 
 Probes used for these measurements were reverted; `HIPFIRE_PROBE_COMPACT_HIDDEN`
 remains (documented, measurement-only, default off).
+
+## The last term: rollback replay is disabled REPO-WIDE, not by compact
+
+`replay_gdn_tape=0` is not a compact problem and not something this branch
+introduced. `dflash_force_serial_rollback_replay` defaults ON for every model:
+
+> Conservative default while proving rollback parity: replay committed tokens
+> through the same serial target path as AR. Fast GDN-tape replay remains
+> diagnostic-only because one-step production replay and multi-step fast tape
+> rows still lack parity.
+
+`HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0` opts out. Measured with it off (plus
+the compact tape/hidden probes so compact can populate the tape at all):
+
+    serial replay (default)   replay_full_prefill=1  8.55 -> n/a   6.89 tok/s
+    GDN-tape replay           replay_gdn_tape=1                    8.55 tok/s   +24%
+
+That default was NOT changed here. It is a documented correctness-pending
+decision about rollback parity, and flipping it is the tape-parity project's
+call, not a perf change.
+
+## Session progression, and what is still missing
+
+    spec-decode   4.49 -> 5.56 -> 6.52 -> 6.87 -> 8.55 tok/s   (+90%)
+                  batched   multicol   tape-probe   tape replay
+                  verify    verify
+
+against plain decode's 15.1. Every remaining term is now identified and priced:
+
+1. **Acceptance is halved** — 0.482 -> 0.286, tau 3.375 -> 2.000 — by the
+   KV-tier prefill-path fork. Restoring it alone scales 8.55 by 3.375/2.000 to
+   ~14.4, which still does not clear 15.1 but is within noise of it.
+2. **The draft costs ~64 ms/cycle** (`gemm_qkvza_hfq4g256_wmma`, 18% of the
+   profile). At tau 3.375 that is ~19 ms per accepted token against the target's
+   66 — the drafter is no longer negligible once the target side is fixed.
+3. Verify is ~48 ms/cycle and no longer the binding term.
+
+So spec-decode on this family needs BOTH the KV-granularity fix and a cheaper
+drafter to beat autoregressive decode. That is a materially different conclusion
+from where this started ("the drafters are bad" / "verify cannot amortize"), and
+every number above is measured rather than modelled.
