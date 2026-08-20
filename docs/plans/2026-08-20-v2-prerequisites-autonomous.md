@@ -103,21 +103,47 @@ invalidation still holds per stream.
 *Do not start P2 until P1 has landed* — they touch different subsystems, and
 bundling them makes the steer sequencing question harder to see.
 
-### P3 — `upload_raw` fixed-frame slabs
+### P3 — `upload_raw` fixed-frame slabs — **re-scoped 2026-08-20, it is bigger than written**
 
-The API asymmetry survives even though the paged call sites are fixed:
-`Gpu::upload_raw` calls `hip.malloc` directly (`dispatch/mod.rs:2169`) while
-`upload_raw_pooled` (`:2212`) uses the pool, and both free through
-`free_tensor` into `GpuPool`. Any **new** caller reintroduces the leak.
+The original entry called this a structural fix and implied it was localized. It
+is not, and the measurement that says so is cheap: **`upload_raw` has ~757 call
+sites**, and the asymmetry is a BORROW CONSTRAINT rather than an oversight.
 
-The parent plan's structural fix is fixed-frame slabs — `ExpertShape` already
-establishes that every routed expert in a layer is the same size, so admission
-becomes `free.pop()` and eviction `free.push()`.
+    Gpu::upload_raw(&self, ...)          -> hip.malloc directly
+    Gpu::upload_raw_pooled(&mut self,..) -> pool.alloc
+    GpuPool::alloc(&mut self, ...)
+    Gpu { pool: GpuPool }                 // held by value
 
-*Exit:* the existing M1a example (`pool_churn_upload_raw`) still passes, and a
-new caller using the plain `upload_raw` cannot strand memory — demonstrated, not
-argued. Current baseline for comparison: 200 unpooled cycles strand 400 MiB;
-4000 pooled cycles strand nothing.
+A pooled upload cannot be offered behind `&self` because `GpuPool::alloc` needs
+`&mut`. So unifying them means one of:
+
+* change `upload_raw` to `&mut self` — touches ~757 call sites, many in arch
+  crates that hold `&Gpu` deliberately;
+* give `GpuPool` interior mutability — a `RefCell` is arguably redundant (the
+  daemon threads `Gpu` as `&mut` anyway) and a `Mutex` puts a lock on an
+  allocation hot path. Either changes the allocator's aliasing story.
+
+Neither is a small change, and **rushing an allocator refactor is exactly how the
+leak class this exists to prevent gets reintroduced.** Treat P3 as its own
+project with its own plan, not as a queue item to be worked between others.
+
+Also worth carrying into that plan: `GpuPool` buckets its free lists by
+**power-of-two rounded size** (`free_lists: HashMap<usize, Vec<DeviceBuffer>>`),
+so a 1.59 MiB routed expert occupies a 2 MiB bucket — ~26% waste. Fixed-frame
+slabs would address that as well as the asymmetry, which strengthens the case for
+doing it properly rather than by patching `upload_raw`.
+
+**Landed in the meantime (zero risk, no behaviour change):** a warning on
+`upload_raw` naming the hazard, the pairing that causes it, the two incidents it
+has already caused, and the `pool_churn_upload_raw` bound. The danger the parent
+plan identifies is *"any new caller reintroduces the leak"*, and a new caller
+reads the doc comment — so this addresses the live risk without touching
+allocation.
+
+*Exit (unchanged, for whenever it is done properly):* `pool_churn_upload_raw`
+still passes, and a caller using the plain `upload_raw` cannot strand memory —
+demonstrated, not argued. Baseline: 200 unpooled cycles strand 400 MiB; 4000
+pooled cycles strand nothing.
 
 ### Not in this queue
 

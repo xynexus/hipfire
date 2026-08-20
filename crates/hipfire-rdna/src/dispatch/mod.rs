@@ -2177,6 +2177,25 @@ impl Gpu {
     /// the pool would touch 693 call sites, many of which hold another borrow of
     /// `Gpu` across the call — a far larger and riskier change than the bug
     /// warrants, given the one-shot callers are not affected by it.
+    /// Upload bytes to a FRESH `hipMalloc` allocation, outside `GpuPool`.
+    ///
+    /// **If the result will be freed with [`Gpu::free_tensor`] and re-allocated
+    /// in a loop, use [`Gpu::upload_raw_pooled`] instead.** `free_tensor` returns
+    /// the buffer to `GpuPool`, so pairing it with this constructor means every
+    /// allocation is fresh while every free piles into a list nothing draws from
+    /// — VRAM growth proportional to churn, invisible in RSS on UMA because it is
+    /// GTT. That exact pairing in the expert pager leaked ~9.6 MB per page-in and
+    /// OOM'd a 122B mid-generation, and separately turned a 32768-token KLD run
+    /// into a 1-minute failure; see `pool_churn_upload_raw` for the bound (200
+    /// unpooled cycles strand 400 MiB).
+    ///
+    /// This constructor is correct for load-once/free-at-unload weights, which is
+    /// what the great majority of its ~757 call sites are.
+    ///
+    /// The asymmetry is a borrow constraint, not an oversight: `GpuPool::alloc`
+    /// takes `&mut self`, so a pooled upload cannot be offered behind `&self`.
+    /// Unifying them is a workspace-wide change — see the P3 entry in
+    /// `docs/plans/2026-08-20-v2-prerequisites-autonomous.md`.
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
