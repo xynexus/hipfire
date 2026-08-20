@@ -55,30 +55,48 @@ hook fires. No parity claim yet — only that both paths are now reachable.
 
 ### M2 — correctness, and it is the whole point
 
-**This exit was rewritten on 2026-08-20. The hand path cannot be the reference.**
-Measured while probing M1's hook
+**This exit was rewritten on 2026-08-20, because at the time the hand path could
+not be the reference.** Measured while probing M1's hook
 (`docs/experiments/2026-08-20-p2-m2-hand-path-is-a-broken-reference.md`): the
-qwen35 hand decode forward is broken *independently of steering*. At
-`strength = 0.0`, where steering is the identity `x += 0·v`, it does not
-reproduce the unsteered baseline — and its output there is byte-identical to what
-it emits with no steer session at all. Reproduced on both Opus artifacts on disk
-(`oq8`, `oq4++`); bf16 is untested for want of a qwen3.5 bf16 artifact, though the
-in-tree comment in `decode_layers.rs` reports bf16 self-KLD 13.89 vs lowered
-0.000.
+qwen35 hand decode forward was broken *independently of steering*. At
+`strength = 0.0`, where steering is the identity `x += 0·v`, it did not reproduce
+the unsteered baseline — its output there was byte-identical to what it emitted
+with no steer session at all.
 
-So the original exit — byte-identical token streams between the two paths — is
-unsatisfiable, and **meeting it would be a regression**, because it would mean
-making the lowered path reproduce a broken forward. The replacement asserts that
-lowered steering is *correct*, not that it is *equal to the hand path*. No
-assertion below references the hand path.
+**That cause is now FIXED on master** (`1f7c2eeba`): the dense DeltaNet arm never
+applied `ffn_norm`, so its FFN consumed the attention-normalized, pre-attention
+residual. Hand and lowered now agree — self-KLD 5.3e-10, see
+`docs/experiments/2026-08-20-qwen35-hand-dense-ffn-norm-fix.md`.
+
+**The rewritten exit below still stands, and should not be reverted to the
+original.** Parity with the hand path is now *available*, but it remains the
+weaker assertion: it is defined as "whatever the other path did", whereas the
+identity anchor has an independently known correct answer. Parity is worth
+keeping as a corroborating check, not as the exit. The trap documented further
+down — the two paths agreeing at high strength *on garbage* — is a property of
+steering, not of the bug that was fixed, and is undiminished by the fix.
+
+*Measured status (2026-08-20, post-fix, `Qwen3.5-0.8B-Base--oq8`, 24L/dim 1024):*
+
+| assertion | result |
+|---|---|
+| 1 — identity anchor | **PASSES** both paths: `strength 0.0` byte-identical to the unsteered baseline over 126 tokens |
+| 2 — oracle | **not run** — needs `gpu_validate.rs` extended to the lowered call site |
+| 3 — graceful degradation | **PASSES**: smooth across `{0, 0.1, 0.25, 0.5, 1.0}`, 3/3 identical md5 per point on both paths |
+| parity (corroborating) | **PASSES** 5/5 strengths, same md5 across paths |
+
+So M2 is satisfied except assertion 2, which is real implementation work rather
+than a measurement. The `Capturing` caveat below still applies and is unaffected
+by the hand-path fix.
 
 *Exit:* all three hold, same model, greedy.
 
 1. **Identity anchor.** `strength = 0.0`, ≥128 tokens: byte-identical to the
    unsteered baseline (same prompt, no session). This is the load-bearing one —
    it is the only assertion whose correct answer is known independently rather
-   than defined as "whatever the other path did". The lowered path passes it
-   today; the hand path fails it.
+   than defined as "whatever the other path did". Both paths pass it as of
+   `1f7c2eeba`; before that fix the lowered path passed and the hand path failed,
+   which is what exposed the bug.
 2. **Oracle.** The on-GPU decode apply matches `hipfire-steer`'s host-side
    `apply_stack_host` within f32 tolerance, per layer, for both `steer` and
    `ablate`. `hipfire-steer/examples/gpu_validate.rs` already performs exactly

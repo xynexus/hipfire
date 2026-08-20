@@ -1,6 +1,18 @@
 # P2/M2: the hand path is a broken reference — parity is the wrong exit
 
-**Status:** M2 blocked on a plan decision, not on code.
+> **RESOLVED 2026-08-20 — the cause found here is fixed on master (`1f7c2eeba`).**
+> The dense DeltaNet arm never applied `ffn_norm`. Root cause, fix, and evidence:
+> `2026-08-20-qwen35-hand-dense-ffn-norm-fix.md`. Post-fix, hand and lowered agree
+> at every strength measured (5/5, same md5), and both pass the `strength = 0.0`
+> identity anchor.
+>
+> This document is kept as the record of how the breakage was found and why M2's
+> exit was rewritten. **The rewritten exit stands** — parity is now available but
+> is still the weaker assertion, and the high-strength "agreement on garbage" trap
+> below is a property of steering, untouched by the fix. Everything below
+> describes the pre-fix state.
+
+**Status:** superseded — was "M2 blocked on a plan decision, not on code".
 **Measured on:** nix1 / gfx1103, `Qwen3.5-0.8B-Base--oq8.hfq` and
 `qwen3.5-0.8b--oq4++.hfq` (arch `qwen3_5`, 24L, dim 1024), release daemon at
 `edc13da5c` (P2/M1).
