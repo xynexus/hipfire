@@ -815,5 +815,22 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             // Opus W8A8: weight_gemv's Oq8G256 arm does the FWHT + int8 act-quant
             // itself; same rationale as Oq4G256 above.
             | Oq8G256
+            // Compact-RESIDENT Opus (HIPFIRE_OQ_COMPACT_RESIDENT). Same artifact
+            // as Oq8G256, just left in 4.25 b/w blocks instead of expanded at
+            // load, so it needs the same FWHT + AWQ divide. Omitting it made
+            // this return false and took weight_gemv's no-rotation early return
+            // into run_auto, handing an UNROTATED, un-AWQ-divided activation to
+            // a Prerotated kernel — while dtype_rotation_plan,
+            // dtype_post_rotation_variant and supports_awq_sidecar all listed
+            // the compact dtypes, so the four were inconsistent. Exactly the
+            // Qtip3G256I3 failure recorded above.
+            //
+            // It only broke down_proj: every other projection reaches its GEMV
+            // with x already rotated upstream (the fused rmsnorm+rotate, or the
+            // fused gate/up and qkvza kernels), so the missing rotation here was
+            // invisible. down_proj is the one that relies on weight_gemv to
+            // rotate for it.
+            | OqCompactG256
+            | OqCompactG128
     )
 }
