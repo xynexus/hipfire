@@ -242,9 +242,26 @@ The obvious suspects were ruled out by inspection and are NOT the cause:
   position's output feeds the KV the next one reads.
 
 So the defect is subtler than a missing arm: something about chunking, staging
-size, or ring-head alignment on the seed path. Root-causing it needs a numerical
-diff of the exported per-position hidden states between the two paths, which is
-the next concrete step — not another round of code reading.
+size, or ring-head alignment on the seed path.
+
+THE OBVIOUS DIAGNOSTIC DOES NOT WORK, and the trap is worth naming. Dumping with
+`HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1` and diffing batched against per-token appears
+to show divergence from LAYER 0 at ~5.0 relative error. That reading is FALSE:
+the two paths dump under DIFFERENT TAGS — `{prefix}.batched.L{i}` versus
+`{prefix}.pertoken.L{i}` — which are different call sites capturing different
+quantities, so the comparison is apples-to-oranges. The giveaway is that it
+contradicts a stronger measurement: batched and per-token prefill generate
+CHARACTER-IDENTICAL text, which cannot be true if layer 0 diverged by 500%.
+
+Likewise `{prefix}.fnorm` is emitted once per forward (the last token) unless
+per-token hidden output is requested, and in the batched path it reads a scratch
+buffer that path never fills — it dumps 5120/5120 NaN. That NaN is a DUMP
+artifact, not the model state; the same run's text is correct.
+
+A valid comparison has to capture the SAME buffer at the SAME point in both
+paths — most directly `per_token_hidden_out` itself, which is what the drafter
+actually consumes. That instrumentation does not exist yet and is the real next
+step.
 
 Until then compact declines the exporting forward (`allow_compact`), which keeps
 spec-decode correct at its historical numbers and costs only the verify batching
