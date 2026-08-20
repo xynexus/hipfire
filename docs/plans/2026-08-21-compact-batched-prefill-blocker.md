@@ -607,3 +607,21 @@ which is worth 2.1x on the lm_head in ordinary decode) moved spec-decode 8.53 ->
 only ~48 ms/cycle of that 370 — the remainder is the rest of the verify forward
 plus this harness's rollback parity check, and it is NOT any single kernel that
 has been tried.
+
+## NGram / prompt-lookup does not exist in this tree
+
+The goal doc lists "NGram / prompt-lookup decoding" as a Phase 2 option, and it
+is the one that would remove the largest remaining cost outright — the drafter's
+~64 ms/cycle, 18% of the profile — because a suffix lookup costs nothing.
+
+It is not implemented. The n-gram machinery that exists is unrelated:
+`HIPFIRE_DFLASH_NGRAM_BLOCK` is a repetition BLOCKER (anti-loop) and
+`HIPFIRE_NGRAM_LOOP_THRESHOLD` / `HIPFIRE_NGRAM_WINDOW` are loop detection.
+Neither proposes draft tokens.
+
+Building it is a new feature rather than a fix: maintain the committed token
+list, match the last k tokens against earlier occurrences, propose the following
+B, and feed the EXISTING verify path (which this branch made cheap). Worth doing
+— but note it pays off on code and structured or repetitive output, not on the
+fresh explanatory prose this benchmark uses, so it would not demonstrate a win
+on THIS prompt even if it worked well.
