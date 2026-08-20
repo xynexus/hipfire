@@ -560,6 +560,49 @@ impl Gpu {
     /// `[f16 scale | 128 packed int4 | N_out * (u8 idx, i8 val)]`, so
     /// `block_stride == 130 + 2 * N_out`. There is no separate weight-scale
     /// plane — the scale lives in the block.
+    /// Small-batch twin of [`Self::gemm_oq_compact_grouped_wmma`]: same inputs
+    /// and same output layout, but reads each weight row ONCE and accumulates B
+    /// columns instead of tiling B by 16. For B <= 16 (spec-decode verify) the
+    /// WMMA path cannot amortize the int4 decode; this can.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_multicol(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            batch_size <= 16,
+            "gemv_oq_compact_multicol: B must be <= 16"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_multicol",
+            kernels::GEMV_OQ_COMPACT_MULTICOL_SRC,
+            "gemv_oq_compact_multicol",
+        )?;
+        let (wp, xp, xsp, yp) = (
+            w_blocks.buf.as_ptr(),
+            x_i8.buf.as_ptr(),
+            x_scales.buf.as_ptr(),
+            y_f32.buf.as_ptr(),
+        );
+        let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
+        let grid = ((m as u32).div_ceil(8)).clamp(1, 2048);
+        self.launch_kernargs(
+            "gemv_oq_compact_multicol",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr xsp, ptr yp, i32 mi, i32 ki, i32 bi, i32 bs],
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_oq_compact_grouped_wmma(
         &mut self,
@@ -597,6 +640,25 @@ impl Gpu {
         );
         // The kernel holds the overlay table in registers; refuse rather than
         // silently clip a block carrying more outliers than it can keep.
+        // SMALL BATCH -> multi-column GEMV. This kernel tiles B by 16, so at
+        // spec-decode's verify width (B = K+1, typically 8) it computes a 16-wide
+        // WMMA tile for 8 useful columns with no N to amortize the int4 decode
+        // over — measured at 64 us per draft token against plain decode's 66.
+        // `gemv_oq_compact_multicol` reads each weight row ONCE and accumulates
+        // B columns, so verify costs one weight sweep for all B tokens.
+        if batch_size <= 16 && group == 256 {
+            return self.gemv_oq_compact_multicol(
+                w_blocks,
+                x_i8,
+                x_scales,
+                y_f32,
+                m,
+                k,
+                batch_size,
+                block_stride,
+            );
+        }
+
         const MAX_OVERLAYS: usize = 32;
         let overlays = (block_stride - header) / 2;
         assert!(

@@ -91,6 +91,39 @@ fn expand(
 /// side records, so every nibble row starts 128-byte aligned. The loader does
 /// this before any kernel sees the weight, so the fixture must too. Duplicated
 /// rather than imported because hipfire-rdna cannot depend on hipfire-runtime.
+/// Mirror of `hipfire_runtime::oq8_arch::normalize_compact_overlays`: resolve
+/// duplicate overlay indices (loser's value := 0) and ZERO the bulk nibble under
+/// every overlay index. The loader ALWAYS does this before a weight reaches any
+/// kernel, so a fixture that skips it models a state that never occurs — and it
+/// hides the difference between a kernel that REPLACES the bulk (this WMMA GEMM)
+/// and one that ADDS a correction to a zeroed bulk (the decode GEMV and
+/// `gemv_oq_compact_multicol`). Both are correct against normalized blocks; only
+/// the first is correct against un-normalized ones.
+fn normalize_overlays(
+    blocks: &mut [u8],
+    n_blocks: usize,
+    stride: usize,
+    group: usize,
+    n_out: usize,
+) {
+    let header = 2 + group / 2;
+    for b in 0..n_blocks {
+        let base = b * stride;
+        let tbl = base + header;
+        for e in 0..n_out {
+            let idx = blocks[tbl + 2 * e] as usize;
+            if idx >= group {
+                continue;
+            }
+            if (e + 1..n_out).any(|e2| blocks[tbl + 2 * e2] as usize == idx) {
+                blocks[tbl + 2 * e + 1] = 0;
+            }
+            let byte = &mut blocks[base + 2 + idx / 2];
+            *byte &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
+        }
+    }
+}
+
 fn split_planes(data: &[u8], n_groups: usize, block_stride: usize, group: usize) -> Vec<u8> {
     let nib = group / 2;
     let side = block_stride - nib;
@@ -197,7 +230,16 @@ fn main() {
 
                     let d_blocks = gpu
                         .upload_raw(
-                            &split_planes(&blocks, m * (k / group), block_stride, group),
+                            {
+                                normalize_overlays(
+                                    &mut blocks,
+                                    m * (k / group),
+                                    block_stride,
+                                    group,
+                                    n_out,
+                                );
+                                &split_planes(&blocks, m * (k / group), block_stride, group)
+                            },
                             &[blocks.len()],
                         )
                         .expect("upload blocks");
