@@ -17,36 +17,38 @@
 //! in flight per thread, block size, and how many waves are resident — plus a
 //! non-temporal variant that bypasses the cache hierarchy.
 //!
-//! # What is peak, actually
+//! # What peak is on this box
 //!
-//! gfx1151 (Strix Halo, Ryzen AI MAX+ 395) is LPDDR5X on a 256-bit bus. The
-//! commonly quoted figure is 8533 MT/s x 32 B = **273 GB/s**, and that is what
-//! `peak_gbps()` reports against. But this unit's `pp_dpm_mclk` tops out at
-//! **937 MHz**, and 937 MHz x 8 x 32 B = **240 GB/s** — which is exactly the
-//! ceiling observed on this box by other means. So 273 is plausibly the spec for
-//! a higher memory bin than this part runs.
+//! gfx1151 (Strix Halo, Ryzen AI MAX+ 395) is LPDDR5X on a 256-bit bus, so peak
+//! is `MT/s x 32 B`. Three numbers are easy to confuse:
 //!
-//! That is a HYPOTHESIS, not a measurement: the driver never marks an active
-//! state in `pp_dpm_mclk` on this APU (the UMC is SMU-managed and not exposed),
-//! so it could not be confirmed by reading the clock under load. Settling it
-//! needs a bandwidth counter or a vendor tool. It matters a lot for how to read
-//! the result below — 235 GB/s is 86 % of 273 but **98 % of 240**.
+//! | | MT/s | mclk max | peak |
+//! |---|---|---|---|
+//! | what the modules are RATED for | 8532 | — | 273 GB/s |
+//! | **configured now** (post BIOS change, 2026-08-20) | **8000** | 1000 MHz | **256 GB/s** |
+//! | configured before | ~7500 | 937 MHz | 240 GB/s |
 //!
-//! The buffer is deliberately GB-scale: it is GTT (system RAM) on this UMA part,
-//! which is exactly the path being measured.
+//! Read the truth from `dmidecode -t memory`: "Speed" is the module RATING,
+//! **"Configured Memory Speed" is what it actually runs at**. `pp_dpm_mclk`
+//! corroborates (max x 8 x 32 B = peak) — and note the driver never marks an
+//! ACTIVE mclk state on this APU (SMU-managed UMC), so the table's max is the
+//! only signal; you cannot confirm it by reading the clock under load.
 //!
 //! # Findings on gfx1151 (2 GiB buffer)
 //!
-//! * **best 235.4 GB/s**, `bw_chunk_u1`, block=1024, very wide grid.
+//! * **250.3 GB/s = 97.8 % of the 256 GB/s** now configured, via `bw_chunk_u1`,
+//!   block=1024, very wide grid. Before the BIOS change: 235.4 = 98.1 % of 240.
+//!   The kernel tracked the clock almost exactly and stayed pinned at the wall,
+//!   which is the useful result — nothing is left in the kernel, and more needs
+//!   the modules configured at their rated 8532 MT/s.
 //! * **Unrolling HURTS.** One 128-bit load per iteration wins; u2/u4/u8 give
-//!   219/216/203 GB/s on the grid-stride form. More loads in flight per thread is
-//!   the usual advice and it is wrong here.
-//! * The optimum is a WIDE, SHALLOW launch — ~1-2 `dwordx4` per thread. Past that
-//!   (0.2 per thread) it falls off as the grid outruns the data.
-//! * **Non-temporal loads are neutral** (234.1 best, same plateau). Worth knowing,
-//!   given they measurably regressed a different hipfire kernel (34eb024, -13 %).
-//! * **Buffer size is not a factor**: flat 223 -> 230 GB/s from 64 MiB to 4 GiB,
-//!   so address translation is not the limiter.
+//!   219/216/203 GB/s on the grid-stride form. "More loads in flight" is the
+//!   usual advice and it is wrong here.
+//! * The optimum is a WIDE, SHALLOW launch — ~1-2 `dwordx4` per thread.
+//! * **Non-temporal loads are neutral**, worth knowing given they measurably
+//!   regressed a different hipfire kernel (34eb024, -13 %).
+//! * **Buffer size is not a factor**: flat from 64 MiB to 4 GiB, so address
+//!   translation is not the limiter.
 //! * Read-only beats the read+write roofline in `bench_dram_bw` (201-211 GB/s)
 //!   by ~11 %, which is the point of having this one.
 //!
@@ -56,16 +58,16 @@ use hipfire_rdna::{DType, Gpu};
 use std::ffi::c_void;
 use std::time::Instant;
 
-/// Peak to report against. Defaults to the **240 GB/s** this box is actually
-/// capped at, not the 273 GB/s the silicon supports — see the header. Override
-/// with `HIPFIRE_DRAM_peak_gbps()=273` once the BIOS memory setting is raised, so
-/// the percentages stay honest without editing code.
+/// Peak to report against. Defaults to 256 GB/s (LPDDR5X-8000 x 256-bit), which is
+/// what this box runs at after the 2026-08-20 BIOS change. Override with
+/// `HIPFIRE_DRAM_PEAK_GBPS=273` if the modules are ever configured at their rated
+/// 8532 MT/s, or `=240` to compare against the pre-change cap.
 fn peak_gbps() -> f64 {
-    std::env::var("HIPFIRE_DRAM_peak_gbps()")
+    std::env::var("HIPFIRE_DRAM_PEAK_GBPS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(240.0)
+        .unwrap_or(256.0)
 }
 
 /// Pure-read streaming kernels. Every variant walks the buffer with a grid-stride
