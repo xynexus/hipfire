@@ -221,6 +221,24 @@ extern "C" __global__ void bw_gemm_rows_coop(const i32x4* __restrict__ src,
     if (threadIdx.x == 0) out[blockIdx.x] = s;
 }
 
+// Misalignment probe. The OqPlusCompact block is [2-byte scale][128 nibbles][...],
+// so every weight load in the compact GEMV sits at 2 mod 8. Same bytes, same
+// pattern, only the base offset differs — if the +2 version is materially slower,
+// re-laying the block out at load (scale moved to the end) is worth doing.
+extern "C" __global__ void bw_8b_off(const uint8_t* __restrict__ src,
+                                     unsigned long long n8, int off,
+                                     int* __restrict__ out) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    uint32_t a = 0, b = 0;
+    for (; i < n8; i += stride) {
+        uint32_t v[2];
+        __builtin_memcpy(v, src + (long long)off + i * 8, 8);
+        a += v[0]; b += v[1];
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = (int)(a + b);
+}
+
 extern "C" __global__ void bw_x4_u8_nt(const i32x4* __restrict__ src,
                                        unsigned long long n4, int* __restrict__ out) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -311,6 +329,47 @@ fn size_sweep(gpu: &mut Gpu) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
+    if std::env::args().any(|a| a == "--align") {
+        // 8-byte loads, aligned vs the compact block's 2 mod 8, same bytes.
+        let bytes: usize = 1024 * 1024 * 1024;
+        let src = gpu.alloc_tensor(&[bytes / 4 + 8], DType::F32).expect("src");
+        gpu.fill_f32(&src, 1.0).expect("fill");
+        let out = gpu.alloc_tensor(&[1 << 20], DType::F32).expect("out");
+        gpu.device_synchronize().expect("sync");
+        gpu.ensure_kernel_public("bench_read_bw", SRC, "bw_8b_off")
+            .expect("compile");
+        let n8 = ((bytes - 16) / 8) as u64;
+        println!(
+            "8-byte loads, aligned vs the compact block's +2 offset ({} MiB)\n",
+            bytes >> 20
+        );
+        for &off in &[0i32, 2, 4, 8] {
+            for &(block, blocks) in &[(256u32, 8192u32), (512, 16384)] {
+                let run = |g: &Gpu| {
+                    let mut kb = Blob::new();
+                    kb.ptr(src.buf.as_ptr() as *const c_void).u64v(n8);
+                    while kb.0.len() % 4 != 0 {
+                        kb.0.push(0);
+                    }
+                    kb.0.extend_from_slice(&off.to_ne_bytes());
+                    kb.ptr(out.buf.as_ptr() as *const c_void);
+                    g.launch_kernel_blob("bw_8b_off", [blocks, 1, 1], [block, 1, 1], 0, &mut kb.0)
+                        .expect("launch");
+                };
+                run(&gpu);
+                gpu.device_synchronize().expect("sync");
+                let mut best = 0.0f64;
+                for _ in 0..8 {
+                    let t = Instant::now();
+                    run(&gpu);
+                    gpu.device_synchronize().expect("sync");
+                    best = best.max(bytes as f64 / t.elapsed().as_secs_f64() / 1e9);
+                }
+                println!("   off=+{off:<2} block={block:<4} blocks={blocks:<6} {best:7.1} GB/s");
+            }
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--gemm-pattern") {
         // Real gate/up shape. Same 86 MiB either way; only the read shape differs.
         let (m, k) = (17408usize, 5120usize);

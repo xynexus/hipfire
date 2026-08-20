@@ -194,8 +194,8 @@ fn main() {
             .expect("gemv");
         let got = gpu.download_f32(&d_y).expect("dl");
 
-        // Multi-wave widths: every one must produce the same answer, and the
-        // bandwidth column is what says whether occupancy was the limiter.
+        // Every (waves, rows) shape must produce the same answer; the GB/s column
+        // is what says whether occupancy or activation load-issue was the limiter.
         let bytes = m * ng * block_stride;
         let mut mw = String::new();
         for &waves in &[1usize, 2, 4, 8] {
@@ -245,7 +245,7 @@ fn main() {
             }
             mw.push_str(&format!(" w{waves}={gbs:.0}{}", if bad { "!" } else { "" }));
         }
-        println!("    multi-wave GB/s:{mw}");
+        println!("    waves GB/s:{mw}");
 
         let (mut worst, mut at) = (0f32, 0usize);
         for r in 0..m {

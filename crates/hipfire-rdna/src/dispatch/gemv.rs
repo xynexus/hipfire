@@ -5500,11 +5500,13 @@ impl Gpu {
             return self.gemv_oq_compact_grouped(w_blocks, x_f32, y_f32, m, k, group, block_stride);
         }
         // Waves per workgroup. DEFAULT 2: same math, packed so RDNA's
-        // workgroup-per-CU cap does not leave waves unused. Measured end-to-end on
-        // Qwen3.8-27B oq4.25++ decode (q8 KV, 64 tokens, reproducible to the
-        // digit): 1 -> 10.40 tok/s, 2 -> 11.00, 4 -> 10.60, 8 -> 10.70. MoE
-        // Qwen3.5-35B-A3B: 51.80 -> 52.70. Wider than 2 gives the loads less to
-        // interleave per workgroup and falls back.
+        // workgroup-per-CU cap does not leave waves unused.
+        //
+        // Worth +1.9%, not more. Interleaved A/B on Qwen3.8-27B oq4.25++ decode
+        // (q8 KV, 64 tokens): waves=1 -> 10.40, 10.40 tok/s; waves=2 -> 10.60,
+        // 10.60. An earlier single run read 11.00 and overstated it — this kernel
+        // drifts a few percent between runs, so only interleaved A/B is
+        // trustworthy here. Wider than 2 measured 10.60 (w=4) and 10.70 (w=8).
         //
         // ponytail: tuned on gfx1151. HIPFIRE_OQ_COMPACT_GEMV_WAVES re-tunes it;
         // 1 selects the original one-wave-per-workgroup kernel.
