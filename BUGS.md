@@ -2117,3 +2117,82 @@ reproduction and the reasoning that led to the real cause are still useful.
   model returned `missing=0, 186/186`; a real MoE has not been run.
 - Visible per calibrated cell in `results.jsonl` as `ldlq_{success,attempts,
   missing,k_mismatch,pack_failed,pooled}` and `ldlq_skipped`.
+
+## [Medium] Calibration coverage: three open questions, all reducing to one missing measurement
+Examined 2026-08-20. Recorded together because they turn out to share a root.
+
+### 1. The collectors disagree about `lm_head`, and minimax is the outlier
+Surveyed all eight `build_capture_names` walkers: **minimax captures `lm_head`;
+the other seven do not.** llama's walker states the convention — "The lm-head
+(`output`) is not captured for a Hessian — like every other arch collector it is
+KLDREF-only" — and it is right about the other seven.
+
+The defect is not which side is correct, it is that the quantizer's LDLQ
+ELIGIBILITY set and the collectors' CAPTURE set disagree: the quantizer attempts
+`lm_head`, so a family following the convention reports a permanent `missing=1`
+and its `++` artifact is, strictly, not fully covered. **This is what blocks
+`HIPFIRE_LDLQ_STRICT` from becoming the default** — a strict pass fails seven
+families out of eight.
+
+Natural experiment, from switching the harness to minimax's real walker
+(PR #254) with baselines that had been recorded while `lm_head` was uncovered:
+
+    oq4+     0.00129443 -> 0.00129443   unchanged
+    oq4++    0.00129443 -> 0.00129443   unchanged
+    oq4.25++ 0.00089918 -> 0.00089271   -0.7%
+    oq8+     0.00000675 -> 0.00000675   unchanged
+    oq8++    0.00000675 -> 0.00000675   unchanged
+
+So covering `lm_head` with LDLQ has **no effect this fixture can resolve** — four
+of five cells identical, one moving 0.7%, all inside the ±25% budget. Read that
+as "below the fixture's resolution", not as "no effect": the values are printed
+at six significant figures.
+
+### 2. gemma4 still has no capture walker
+Confirmed post-merge: no `build_capture_names` in `hipfire-arch-gemma4`, and
+`tiny_harness.rs:1060` still hand-rolls the map. This is the family whose
+hand-rolled map named expert projections SPLIT while the artifact FUSES them,
+which PR #252 patched at the quantizer (fused -> split Hessian fallback). The
+durable fix is a walker in the arch crate; the harness arm then follows the
+other four.
+
+### 3. Real-MoE oq4.25++ is still unmeasured, and is NOT tractable on this box
+**Attempted 2026-08-20; the "tractable" claim in the first version of this entry
+was wrong.** I sized LFM2.5-8B-A1B (10.5 GB) and never checked whether its arch
+can be calibrated at all. It cannot:
+
+    InvalidSourcePlan("no native calibration adapter is registered for architecture 11")
+
+**Only five arches register a calibration adapter** — qwen35, gemma3, zaya,
+gemma4, cohere2 (`register_calibration_adapter!`). lfm2moe is not one, so no
+Hessian can be produced for it through the production path, and `oq4.25++`
+without a Hessian is not the format under test.
+
+The smallest real MoE on a supported arch is `Qwen3.5-35B-A3B` at ~44 GB. The
+measurement needs an HF restore (~44 GB, because `calibrate` accepts ONLY an HF
+snapshot — not `.hfa`, not `.hfq`; use `hipfire-coexistence repack` to restore)
+plus a bf16 anchor (~44 GB), a Hessian, and two `oq4.25++` artifacts (~19 GB
+each): **~170 GB of working space against 65 GB free.** Not feasible here.
+It needs a bigger box, or a small real MoE on one of those five arches.
+
+### 3b. The tiny harness calibrates families production cannot
+Falling out of the above, and pointing the same way as the capture-map drift:
+the tiny gate runs five calibrated cells for `lfm2_moe` (`oq4+`, `oq4++`,
+`oq4.25++`, `oq8+`, `oq8++`) while the production `calibrate` CLI refuses arch 11
+outright. It can do that because the harness uses its own `CalibCollector` +
+`capture_names()` rather than the `layer_stream` adapter registry.
+
+So a family can look **calibration-covered in the gate while being
+uncalibratable in production** — the harness/production divergence again, but
+inverted: here the harness does MORE than the real path, which is the direction
+that manufactures false confidence rather than false alarms.
+
+### The shared root
+(1) and (3) are the same question — *does a calibration/encoder change help real
+weights?* — and neither can be answered on the tiny fixtures, because seeded
+random-init weights have no outlier or correlation structure for AWQ scaling or
+Hessian feedback to exploit. That is the same limitation that made the gemma4
+fixture move OPPOSITE to the real model on oq4.25++
+(`docs/tiny-quant-gate-8-failures.md`). One real-MoE run on LFM2.5-8B-A1B would
+inform both: quantize either side of `8357081d3`, and separately with `lm_head`
+capture on and off.
