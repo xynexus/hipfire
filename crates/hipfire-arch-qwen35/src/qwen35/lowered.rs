@@ -660,6 +660,22 @@ pub(crate) fn steer_lowered_enabled() -> bool {
     *F.get_or_init(|| std::env::var("HIPFIRE_STEER_LOWERED").ok().as_deref() == Some("1"))
 }
 
+/// `HIPFIRE_DECODE_BACKEND_TRACE=1` — name the decode path actually taken.
+///
+/// `OnceLock` rather than a bare `std::env::var` because the caller sits on the
+/// per-token decode path: a raw read there costs a lock plus a `String`
+/// allocation on EVERY token, including the overwhelmingly common case of no
+/// steer session at all. Same reason `forward_lowered_enabled` above caches.
+pub(crate) fn decode_backend_trace_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("HIPFIRE_DECODE_BACKEND_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent
 /// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
 /// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`

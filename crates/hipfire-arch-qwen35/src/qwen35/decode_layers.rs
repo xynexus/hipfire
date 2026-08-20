@@ -53,12 +53,10 @@ pub(crate) fn forward_scratch_layers(
     // bypasses it so the two paths can be run against each other at all; with the
     // flag unset behaviour here is unchanged.
     let steer_forces_hand = hipfire_steer::is_active() && !steer_lowered_enabled();
-    if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE")
-        .ok()
-        .as_deref()
-        == Some("1")
-        && hipfire_steer::is_active()
-    {
+    // `is_active()` first: it is a relaxed atomic load, and it is false on every
+    // decode token of every non-steering request — which is the path that must
+    // not pay for this trace.
+    if hipfire_steer::is_active() && decode_backend_trace_enabled() {
         eprintln!(
             "  [decode] steer session active → {} path{}",
             if steer_forces_hand { "hand" } else { "lowered" },
