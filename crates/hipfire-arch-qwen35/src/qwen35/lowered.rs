@@ -645,6 +645,21 @@ pub(crate) fn forward_lowered_enabled() -> bool {
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
 }
 
+/// P2/M1 bypass: let a LIVE steer session run the lowered path instead of being
+/// forced onto the hand arms by the escape in `decode_layers.rs`.
+///
+/// Default OFF, which is what keeps M1 non-breaking — with the flag unset the
+/// escape still fires and production decode is byte-identical. It exists because
+/// parity between the two steering paths cannot be MEASURED while the escape
+/// stands unconditionally: an active session forces the hand path, so the
+/// lowered hook below never fires and there is nothing to compare against.
+/// `HIPFIRE_STEER_LOWERED=1` is that comparison lever, and nothing else — it
+/// carries no parity claim. Retired in M4 together with the escape itself.
+pub(crate) fn steer_lowered_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_STEER_LOWERED").ok().as_deref() == Some("1"))
+}
+
 /// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent
 /// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
 /// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`
@@ -707,6 +722,14 @@ pub(crate) fn forward_scratch_layers_lowered(
             }
         }
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
+        // Block-boundary steering/abliteration hook (no-op unless a session is
+        // active), mirroring `decode_layers.rs`. Placed at the same point in the
+        // layer as the hand path's call: after the settled post-residual `s.x`
+        // that `hidden_rb` and `dump_hidden_localize` read, not before. A
+        // boundary one op early or late still produces plausible output, so the
+        // position here is load-bearing, not cosmetic — see M2, which compares
+        // `CaptureMeans` precisely because that is where such a slip shows.
+        hipfire_steer::maybe_steer_block(gpu, &s.x, layer_idx)?;
     }
 
     // Final norm always (cheap; populates s.tmp, the hidden some callers read).
