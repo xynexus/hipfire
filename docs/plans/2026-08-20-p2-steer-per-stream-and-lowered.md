@@ -196,6 +196,47 @@ its own steering, asserted on output. A third stream with no spec is unaffected.
 
 *Falsified by:* stream B's output changing when only stream A's spec changes.
 
+#### BLOCKED — there is no "stream" to be per, yet (found 2026-08-20)
+
+M3 says "move the state into per-stream state". **The per-stream home does not
+exist.** The parent plan creates it in *its* M3 ("Replace the request `match` ...
+with `RunningStream` cursors", `2026-08-09-v2-daemon-module-major-multistream.md`
+§M3) — and `RunningStream` has no definition in the tree today. The two landed
+M1d conversions did not need one: `RAW_OVERRIDE` became a request parameter and
+the sampler RNG became a value the caller already owned. Steer has no such
+existing owner.
+
+The second half of the problem is the wire protocol. `SteerBeginCapture` and
+`SteerBeginApply` carry **no stream, session, or worker identifier** —
+`handlers/steer.rs` says as much ("the session is process-global ... two steer ops
+must never interleave"). So even with a per-stream container, a client currently
+has no way to say *which* stream a spec applies to. Nor is "stream" the same as
+"worker": the exit above wants two streams inside one batched step, i.e. two
+sessions against one resident model.
+
+Three shapes, and this plan does not pick — it is a protocol/ownership decision:
+
+1. **Wait for the parent plan's M3.** Build steer per-stream directly into
+   `RunningStream` when it lands. No double work, but blocks on a larger milestone.
+2. **Attach at admission.** Add the spec to the generate request and snapshot it
+   into per-request state; steer control ops stay global but become a *default*
+   a request overrides. Smallest protocol change; no new identifier.
+3. **Identify streams on the steer ops.** Add an explicit id to
+   `SteerBeginApply`/`SteerBeginCapture`. Most direct, but invents a naming scheme
+   ahead of the executor that will own it — likely to be re-done at parent-M3.
+
+Recommendation: **(1)**, with (2) as the cheap interim if per-stream steering is
+needed before the executor lands. What must NOT happen is picking (3) and
+threading a handle through ~10 `hipfire-steer` functions and ~14 daemon call sites
+against an identifier the executor then replaces.
+
+Measured surface for whenever it proceeds: **10** public functions in
+`hipfire-steer` touch `SESSION`/`ACTIVE`/`EPOCH` (the queue's "eighteen" counts
+doc mentions, as it notes); ~14 daemon call sites across `handlers/steer.rs`,
+`handlers/lora.rs`, `handlers/lifecycle.rs`; and 3 forward call sites —
+`decode_layers.rs`, `prefill_chunk.rs`, and `lowered.rs` as of M1. M3 must
+therefore stack on M1, since M1 adds the third.
+
 ### M4 — retire the escape
 
 Remove the steer condition from `decode_layers.rs`, and the M1 flag with it.
