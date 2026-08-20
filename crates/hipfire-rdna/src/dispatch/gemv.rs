@@ -5526,6 +5526,52 @@ impl Gpu {
         )
     }
 
+    /// DFlash2 grouped dynamic causal convolution.
+    ///
+    /// `h`/`y` are `[len, hidden]` f32, `d` is `[len, kernel_size, groups]` f32
+    /// (one coefficient per GROUP, not per channel), `b` is
+    /// `[kernel_size, hidden]` f32. Semantics pinned by
+    /// `hipfire_runtime::dflash2::grouped_dynamic_convolve`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash2_grouped_dynamic_conv(
+        &mut self,
+        h: &GpuTensor,
+        d: &GpuTensor,
+        b: &GpuTensor,
+        y: &GpuTensor,
+        len: usize,
+        hidden: usize,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            group_size > 0 && hidden % group_size == 0,
+            "dflash2 conv: hidden {hidden} must be a multiple of group {group_size}"
+        );
+        assert!(kernel_size > 0, "dflash2 conv: kernel_size must be > 0");
+        self.ensure_kernel(
+            "dflash2_grouped_dynamic_conv",
+            kernels::DFLASH2_GROUPED_DYNAMIC_CONV_SRC,
+            "dflash2_grouped_dynamic_conv",
+        )?;
+        let hp = h.buf.as_ptr();
+        let dp = d.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let li = len as i32;
+        let hi = hidden as i32;
+        let ki = kernel_size as i32;
+        let gi = group_size as i32;
+        self.launch_kernargs(
+            "dflash2_grouped_dynamic_conv",
+            [len.max(1) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr hp, ptr dp, ptr bp, ptr yp, i32 li, i32 hi, i32 ki, i32 gi],
+        )
+    }
+
     /// OQ4+ W4A16 decode GEMV with fused residual add (`y += W*x`).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4_grouped_residual(

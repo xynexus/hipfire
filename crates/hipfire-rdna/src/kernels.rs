@@ -4304,6 +4304,12 @@ pub const GEMV_OQ_COMPACT_GROUPED_SRC: &str =
 /// groups per wave for ILP, float4 activations. Requires group 256 and even ng;
 /// callers fall back to [`GEMV_OQ_COMPACT_GROUPED_SRC`] otherwise, mirroring the
 /// oq8 v1/v2 pair. `kernels/src/gemv_oq_compact_grouped_v2.hip`.
+/// DFlash2 grouped dynamic causal convolution. Semantics pinned by
+/// `hipfire_runtime::dflash2::grouped_dynamic_convolve` (parity-checked against
+/// z-lab/dflash). `kernels/src/dflash2_grouped_dynamic_conv.hip`.
+pub const DFLASH2_GROUPED_DYNAMIC_CONV_SRC: &str =
+    include_str!("../../../kernels/src/dflash2_grouped_dynamic_conv.hip");
+
 pub const GEMV_OQ_COMPACT_GROUPED_V2_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq_compact_grouped_v2.hip");
 
