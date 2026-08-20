@@ -4326,6 +4326,12 @@ pub const DFLASH2_GROUPED_DYNAMIC_CONV_SRC: &str =
 pub const GEMV_OQ_COMPACT_GROUPED_V2_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq_compact_grouped_v2.hip");
 
+/// Wide-load twin of the compact decode GEMV: 8 lanes per group and a `dwordx4`
+/// weight load (32 weights/lane), so one wave covers four groups per round.
+/// Requires ng % 4 == 0. See `kernels/src/gemv_oq_compact_grouped_v3.hip`.
+pub const GEMV_OQ_COMPACT_GROUPED_V3_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_grouped_v3.hip");
+
 /// Opus Quant W8A8 DECODE GEMV (batch=1): int8 generalization of
 /// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
 /// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.

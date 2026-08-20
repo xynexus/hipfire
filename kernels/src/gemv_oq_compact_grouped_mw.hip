@@ -72,15 +72,26 @@ __device__ __forceinline__ float oqc_group(
     s += (float)OQCV2_LO(w1, 2) * x3.x + (float)OQCV2_HI(w1, 2) * x3.y
        + (float)OQCV2_LO(w1, 3) * x3.z + (float)OQCV2_HI(w1, 3) * x3.w;
 
-    // Overlays REPLACE the bulk nibble, and `normalize_compact_overlays` ZEROES
-    // that nibble at load, so a correction is just val*x[idx] — it reads no
-    // lane's registers. Lane `lig` therefore takes entry `lig`: the serial,
-    // divergent scan collapses to ONE parallel step, and the caller's wave
-    // reduction sums the corrections wherever they landed. Duplicates were
-    // resolved at load too (loser's value := 0), so every entry applies
-    // unconditionally.
+    // Overlays REPLACE the bulk nibble, and the loader ZEROES that nibble, so
+    // a correction is just val*x[idx] and depends on no lane's registers.
+    // BRANCHLESS ON PURPOSE: the `lig < n_ov` guard used to be a divergent
+    // branch, and that branch — not the table loads, not the scattered
+    // gather, not alignment — was what the overlay actually cost. Every lane
+    // now issues the same loads and the inactive ones multiply by zero,
+    // worth 3.2% of decode (73.17 -> 70.83 ms/token on Qwen3.8-27B).
+    // Load-merging into one ushort (+1%), 8-byte block alignment (-0.5%),
+    // K-depth 2 (+14.6%) and pipelining the table one group ahead (+2.7%)
+    // were all tried against this same cost and all LOST; the branch was the
+    // thing. Entries beyond one per lane fall to the residual loop, whose
+    // bound is wave-uniform.
     const uint8_t* table = blk + 130;
-    for (int e = lig; e < n_ov; e += 16) {
+    {
+        const int e   = (lig < n_ov) ? lig : 0;
+        const int idx = (int)table[2 * e];
+        const int val = (lig < n_ov) ? (int)(int8_t)table[2 * e + 1] : 0;
+        s += (float)val * X[gi * 256 + idx];
+    }
+    for (int e = lig + 16; e < n_ov; e += 16) {
         const int idx = (int)table[2 * e];
         const int val = (int)(int8_t)table[2 * e + 1];
         s += (float)val * X[gi * 256 + idx];

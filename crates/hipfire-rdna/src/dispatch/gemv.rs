@@ -5499,24 +5499,36 @@ impl Gpu {
         if group != 256 || (k / 256) % 2 != 0 {
             return self.gemv_oq_compact_grouped(w_blocks, x_f32, y_f32, m, k, group, block_stride);
         }
-        // Waves per workgroup. DEFAULT 2: same math, packed so RDNA's
-        // workgroup-per-CU cap does not leave waves unused.
+        // Waves per workgroup. DEFAULT 1 (the `_v2` kernel); >1 routes to the
+        // multi-wave `_mw` kernel.
         //
-        // Worth +1.9%, not more. Interleaved A/B on Qwen3.8-27B oq4.25++ decode
-        // (q8 KV, 64 tokens): waves=1 -> 10.40, 10.40 tok/s; waves=2 -> 10.60,
-        // 10.60. An earlier single run read 11.00 and overstated it — this kernel
-        // drifts a few percent between runs, so only interleaved A/B is
-        // trustworthy here. Wider than 2 measured 10.60 (w=4) and 10.70 (w=8).
+        // THIS DEFAULT WAS 2 AND FLIPPED ON 2026-08-21, after the overlay loop
+        // stopped being a serial divergent scan:
         //
-        // ponytail: tuned on gfx1151. HIPFIRE_OQ_COMPACT_GEMV_WAVES re-tunes it;
-        // 1 selects the original one-wave-per-workgroup kernel.
+        //     Qwen3.8-27B oq4.25++ dense   w1 13.4  w2 11.7  w4 11.7  w8 11.7
+        //     Qwen3.5-35B-A3B oq4.25++ MoE w1 57.8  w2 55.9
+        //
+        // +14.6% dense, +3.4% MoE, same binary in both arms so only the routing
+        // differs.
+        //
+        // What actually moved is K-DEPTH, not wave count. `_mw` bundles two
+        // levers — waves>1 AND two groups' loads in flight — and the second is
+        // the one that inverted. Forcing `_mw` at waves=1 (a 32-thread workgroup,
+        // so the only difference from `_v2` is depth) reads 85.36 ms/token
+        // against `_mw` at waves=2's 85.62 and `_v2`'s 74.52: the whole 14.6% is
+        // depth. Depth 2 was worth +8.5% when it was hiding the overlay's
+        // dependent chain; with that chain gone it is pure register and cache
+        // pressure. Both of this kernel's tuned constants were tuned against a
+        // bottleneck that no longer exists, and both had to be re-measured.
+        //
+        // ponytail: tuned on gfx1151. HIPFIRE_OQ_COMPACT_GEMV_WAVES re-tunes it.
         static MW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let waves = *MW.get_or_init(|| {
             std::env::var("HIPFIRE_OQ_COMPACT_GEMV_WAVES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|w| (1..=8).contains(w))
-                .unwrap_or(2)
+                .unwrap_or(1)
         });
         if waves > 1 {
             return self.gemv_oq_compact_grouped_mw(
@@ -5536,11 +5548,29 @@ impl Gpu {
             block_stride >= header + 2 && (block_stride - header) % 2 == 0,
             "gemv_oq_compact_grouped_v2: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
         );
-        self.ensure_kernel(
-            "gemv_oq_compact_grouped_v2",
-            kernels::GEMV_OQ_COMPACT_GROUPED_V2_SRC,
-            "gemv_oq_compact_grouped_v2",
-        )?;
+        // v3 reads the same blocks with a dwordx4 per lane (8 lanes per group,
+        // four groups per wave round) instead of v2's dwordx2 — half the weight
+        // VMEM instructions per byte moved, which is the access shape the
+        // 250 GB/s pure-read stream uses. Worth -1.8% on Qwen3.8-27B decode
+        // (74.5 -> 73.2 ms/token, interleaved A/B, zero variance). Needs
+        // ng % 4 == 0 (K % 1024 == 0); v2 stays the fallback.
+        let v3 = (k / 256) % 4 == 0
+            && std::env::var("HIPFIRE_OQ_COMPACT_GEMV_V3")
+                .ok()
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let (kname, ksrc) = if v3 {
+            (
+                "gemv_oq_compact_grouped_v3",
+                kernels::GEMV_OQ_COMPACT_GROUPED_V3_SRC,
+            )
+        } else {
+            (
+                "gemv_oq_compact_grouped_v2",
+                kernels::GEMV_OQ_COMPACT_GROUPED_V2_SRC,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let wp = w_blocks.buf.as_ptr();
         let xp = x_f32.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -5549,7 +5579,7 @@ impl Gpu {
         let gi = group as i32;
         let bs = block_stride as i32;
         self.launch_kernargs(
-            "gemv_oq_compact_grouped_v2",
+            kname,
             [m as u32, 1, 1],
             [32, 1, 1],
             0,
