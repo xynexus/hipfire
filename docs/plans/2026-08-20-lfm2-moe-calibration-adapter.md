@@ -77,25 +77,58 @@ mechanism by which **full per-expert Hessians for LFM2-MoE become affordable**,
 upgrading the family from imatrix-only to real `++`. That should be stated as a
 hypothesis to test, not a promise — see the exit criteria.
 
-### Effort proxy, and why LFM2 lands high
+### Effort: most of this is ALREADY written — corrected
 
-Existing adapters, by size:
+The first draft of this section framed the work as writing ~1800–2400 lines of
+new machinery, extrapolated from `wc -l` on the existing adapters. **That framing
+is wrong and would have led someone to build the wrong thing.**
 
-| arch | lines | shape |
-|---|---|---|
-| gemma3 | 1057 | dense |
-| gemma4 | 1247 | MoE |
-| cohere2 | 1892 | dense |
-| qwen35 | 2139 | MoE |
-| **zaya** | **2410** | **hybrid** |
+**A shared calibration library already exists, and it is larger than every
+adapter combined:**
 
-LFM2.5-8B-A1B is 24 layers of **18 double-gated LIV short-conv + 6 GQA
-attention**, with per-layer dense-or-MoE FFN. It is hybrid *and* MoE, and zaya —
-the only other hybrid — has the largest adapter in the tree. **Expect the upper
-half of that range, ~1800–2400 lines**, not gemma4's 1247.
+| shared module (`hipfire-runtime/src/calibration/`) | lines |
+|---|---|
+| `layer_stream.rs` | 3991 |
+| `contracts.rs` | 2161 |
+| `source.rs` | 1582 |
+| `expert_capture.rs` | 1068 |
+| `boundary.rs` | 722 |
+| `stream.rs` | 634 |
+| `residual_probe.rs` | 298 |
+| **total** | **10,720** |
 
-This is a line-count proxy from `wc -l`, not an estimate from reading the
-implementations. Treat it as an order of magnitude.
+against **8,745** lines across all five adapters. And the adapters genuinely
+consume it — qwen35 imports shared tensor loaders and validators
+(`load_source_matrix`, `validate_source_shape`, `PlannedTensorReader`), shared
+capture contracts, the shared **`GroupedMoeCalibrationCapture`** for routed
+experts, and the shared **`RmsNormLmHeadFinalizer`**, which both gemma4 and
+qwen35 use rather than writing their own `load_finalizer` body.
+
+So an adapter is not 2000 lines of framework. It is arch-specific knowledge
+wired into an existing framework — which is why M1/M2 below are scoped as
+"reuse the naming that already exists" rather than "implement capture".
+
+### Is there a second shared library to extract? Measured: mostly no
+
+Eleven helpers recur by name across all three adapters sampled
+(`prepare_capture`, `register_capture`, `write_capture_part`, `release_states`,
+`push_required`, `prepare_sequence_group`, …), none of them trait methods. That
+looks like duplication, so it was measured rather than assumed.
+
+In gemma4's adapter those six total **218 of 1247 lines — 17%**. And the bodies
+are not copies: `write_capture_part` shares a seven-line prefix with qwen35's and
+then diverges into expert telemetry that only a MoE arch has. The largest of them,
+`register_capture` at 115 lines, is arch-specific *by nature* — it names this
+family's tensors.
+
+**Conclusion: the extraction the residual duplication would buy is ~17% of one
+adapter, much of which is not actually shareable.** Not worth blocking LFM2 on,
+and worth doing only as an independent cleanup with its own justification. The
+big extraction already happened; this doc's job is to reuse it, not to redo it.
+
+Corollary for the estimate: zaya's 2410 lines are most likely **hybrid-architecture
+complexity, not boilerplate** — which still predicts LFM2 (hybrid + MoE) lands
+high, but for a reason that no shared library can remove.
 
 ---
 
