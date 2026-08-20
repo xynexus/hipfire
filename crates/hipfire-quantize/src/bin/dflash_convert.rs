@@ -859,6 +859,28 @@ fn is_norm_tensor(name: &str) -> bool {
         || name.contains("k_norm")
         || name == "hidden_norm.weight"
         || name == "norm.weight"
+        // DFlash2's static per-channel conv kernel. `[2, kernel_size, hidden]`
+        // is 20 K values for the whole layer — quantizing it buys nothing and
+        // it multiplies the residual stream directly, like a norm weight does.
+        || name.ends_with("_conv.base_kernel")
+}
+
+/// DFlash2 tables the runtime needs DENSE, kept BF16 regardless of the chosen
+/// draft format.
+///
+/// * the candidate-selector codebooks are `[vocab, rank]` lookups read
+///   `top_k + 1` rows per position — a few KB per draft, so their size never
+///   touches bandwidth, while 4-bit rounding lands straight on the rank-256
+///   transition score;
+/// * `kernel_projection` is split into its `prepare`/`finish` halves at LOAD by
+///   slicing rows, which only works on a dense tensor — and its output is a
+///   convolution coefficient multiplying the residual stream, not a bulk MLP
+///   activation. 65 M values across the drafter, ~131 MiB at BF16.
+fn is_dflash2_dense_table(name: &str) -> bool {
+    name.ends_with("candidate_selector.predecessor_codebook")
+        || name.ends_with("candidate_selector.successor_codebook")
+        || name.ends_with("_conv.kernel_projection.weight")
+        || name == "candidate_selector.hidden_projection.weight"
 }
 
 fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
@@ -957,9 +979,18 @@ fn main() {
     let is_dflash = architectures
         .iter()
         .any(|v| v.as_str() == Some("DFlashDraftModel"));
-    if !is_dflash {
+    // DFlash2 (z-lab's newer drafters) is the same 5-layer body plus per-layer
+    // attention_conv/mlp_conv and a low-rank candidate_selector. Its tensors and
+    // config convert through this path unchanged — the bytes are all carried —
+    // so recognize it rather than warning, and RECORD the distinguishing fields
+    // below so the runtime can tell the two apart instead of loading a DFlash2
+    // artifact as a DFlash1 one and silently ignoring 23 tensors.
+    let is_dflash2 = architectures
+        .iter()
+        .any(|v| v.as_str() == Some("DFlash2DraftModel"));
+    if !is_dflash && !is_dflash2 {
         eprintln!(
-            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel"
+            "warning: config.json architectures = {architectures:?}; expected DFlashDraftModel or DFlash2DraftModel"
         );
     }
 
@@ -1038,6 +1069,16 @@ fn main() {
             "block_size": block_size,
             "mask_token_id": mask_token_id,
             "target_layer_ids": target_layer_ids,
+            // DFlash generation + the DFlash2-only geometry. `DflashConfig::
+            // from_source` keys off `dflash_version` to refuse a DFlash2 artifact
+            // until the conv + candidate-selector runtime exists; without these
+            // the metadata describes a perfectly valid DFlash1 drafter and the
+            // extra tensors are dropped on the floor at load.
+            "dflash_version": if is_dflash2 { 2 } else { 1 },
+            "selector_rank": dflash_cfg.get("selector_rank").and_then(|v| v.as_u64()),
+            "selector_top_k": dflash_cfg.get("selector_top_k").and_then(|v| v.as_u64()),
+            "conv_kernel_size": dflash_cfg.get("conv_kernel_size").and_then(|v| v.as_u64()),
+            "conv_group_size": dflash_cfg.get("conv_group_size").and_then(|v| v.as_u64()),
             "num_target_layers": num_target_layers,
             "num_hidden_layers": num_hidden_layers,
             "hidden_size": hidden_size,
@@ -1137,6 +1178,8 @@ fn main() {
         // (per-group scale/min carries meaning).
         let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
+        } else if is_dflash2_dense_table(name) {
+            (QuantType::BF16, 0u32, f32_slice_to_bf16_bytes(&f32_data))
         } else if draft_format == DraftFormat::F32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if draft_format == DraftFormat::Mq4 && n_elements >= 256 {

@@ -2315,6 +2315,7 @@ dependencies = [
  "hipfire-primitives",
  "hipfire-prompt",
  "hipfire-quant-format",
+ "hipfire-quantize",
  "hipfire-rdna",
  "hipfire-state",
  "hipfire-sysinfo",

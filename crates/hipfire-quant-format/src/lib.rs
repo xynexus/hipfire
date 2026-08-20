@@ -197,7 +197,16 @@ pub enum QuantType {
     /// direction is quantized, which is what makes 4 bits sufficient to keep
     /// the true argmax inside a small top-K (measured recall@8 = 100%).
     /// It always accompanies a full-precision fine tier that rescores the
-    /// shortlist; it is never the sole storage for a tensor.
+    /// shortlist; it is never the sole storage for a tensor. That restriction
+    /// is a property of the ROLE, not an untested caution: the shortlist masks
+    /// every non-selected logit to -inf, so the tail is gone regardless of how
+    /// good the codes are, and only an argmax/greedy consumer can use the
+    /// result. Scoring and eval paths need the full distribution.
+    ///
+    /// Selection fidelity, measured on Qwen3.5-35B-A3B (head [248320, 2048],
+    /// 5 prompts, 504 greedy tokens, K=32): 504/504 tokens identical to the
+    /// exact bf16 head — recall@1 = 100% over real decode states. Raising K is
+    /// free (K=256 measured within noise of K=32), so prefer margin on K.
     CoarseQ4Row = 48,
     /// BF16 with the exponent coded as a 3-bit per-block LUT index + escape —
     /// **losslessly** the same weights as [`QuantType::BF16`], ~1.38× smaller.
@@ -421,9 +430,9 @@ impl QuantType {
             Oq4G256 => Some(130), // 2 (f16 scale) + 128 nibbles
             // f32 scale (not f16) so the indexed kernels read it directly.
             Oq4G256MoeBlocks => Some(132), // 4 (f32 scale) + 128 nibbles
-            Oq3G256 => Some(98),  // 2 (f16 scale) + 8×3 u32 bit-planes
-            Oq2G256 => Some(66),  // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
-            Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)
+            Oq3G256 => Some(98),           // 2 (f16 scale) + 8×3 u32 bit-planes
+            Oq2G256 => Some(66),           // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
+            Oq6G256 => Some(194),          // 2 (f16 scale) + 192 (6-bit×256)
             Oq8G256 | Oq8G256RowPadded => Some(258), // 2 (f16 scale) + 256 int8
             Oq8Plain => Some(258),
             Oq4Plain => Some(130),

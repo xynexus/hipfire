@@ -766,6 +766,29 @@ pub mod page_timing {
     }
 }
 
+/// Which expert-module slot a tensor fills, if any.
+///
+/// Must be an EXACT suffix match on the weight, never `contains`. An expert
+/// module also carries `<proj>.awq_scale.weight`, and
+/// `"gate_up_proj.awq_scale.weight".contains("gate_up_proj")` is true — so a
+/// `contains` test let the sidecar, which is stored second, overwrite the
+/// weight's offset. The expert pointer table then aimed the routed GEMV at a
+/// 512 B scale vector instead of a 399 KB weight matrix.
+///
+/// Symptom, in case it comes back: paged decode output that does not depend on
+/// the expert weights at all — three artifacts differing only in expert content
+/// produced one identical logit hash. Only artifacts WITH AWQ sidecars were
+/// affected, so plain `oq4` paged bit-exactly throughout and hid it.
+fn expert_module_tensor_role(name: &str) -> Option<ExpertRole> {
+    if name.ends_with("gate_up_proj.weight") {
+        Some(ExpertRole::GateUp)
+    } else if name.ends_with("down_proj.weight") {
+        Some(ExpertRole::Down)
+    } else {
+        None
+    }
+}
+
 fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
     module.tensors.iter().any(|tensor| {
         matches!(
@@ -871,11 +894,10 @@ fn prepare_expert_module(
             _ => source.to_vec(),
         };
         bytes.extend_from_slice(&transformed);
-        if tensor.name.contains("gate_up_proj") {
-            gate_up_rel = Some(resident_rel);
-        }
-        if tensor.name.contains("down_proj") {
-            down_rel = Some(resident_rel);
+        match expert_module_tensor_role(&tensor.name) {
+            Some(ExpertRole::GateUp) => gate_up_rel = Some(resident_rel),
+            Some(ExpertRole::Down) => down_rel = Some(resident_rel),
+            None => {}
         }
     }
 
@@ -1183,8 +1205,8 @@ impl WeightPager {
         let expert = module.expert.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
         })?;
-        if find_module_tensor_rel_ptr(&module, "gate_up_proj").is_none()
-            || find_module_tensor_rel_ptr(&module, "down_proj").is_none()
+        if find_module_tensor_rel_ptr(&module, ExpertRole::GateUp).is_none()
+            || find_module_tensor_rel_ptr(&module, ExpertRole::Down).is_none()
         {
             return Err(WeightPagerError::InvalidModule(format!(
                 "module {} missing gate_up_proj or down_proj tensor",
@@ -1361,24 +1383,41 @@ impl WeightPager {
                 .transport
                 .read_host(module.data_offset, module.data_size, gpu)?;
             let prepared = prepare_expert_module(&module, &disk_bytes)?;
-            // Pooled, for the reason spelled out at the direct-staging site
-            // above: eviction returns this buffer to `GpuPool` via
-            // `free_tensor`, so a plain `upload_raw` here made every page-in a
-            // fresh `hipMalloc` while every page-out piled into a free-list that
-            // only pooled allocations can draw from. This is the host-repack
-            // branch — `module_requires_host_repack` is true for exactly
-            // Oq4G256 / Oq8G256 / OqPlusCompact, i.e. every Opus artifact — so
-            // it is the branch a paging Opus MoE actually takes, and its sibling
-            // `else` was already pooled.
+            // POOLED, not `upload_raw`. Eviction returns the buffer via
+            // `free_tensor` -> `pool.free`, so allocating outside the pool means
+            // every cold load takes fresh GTT while every eviction piles into a
+            // free-list nothing draws from. `upload_raw_pooled` exists for this
+            // call site and its doc says so; the pager just never used it.
+            //
+            // This is the host-repack branch, and `module_requires_host_repack`
+            // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
+            // artifact — so it is the branch a paging Opus MoE actually takes.
+            // Its sibling `else` was already pooled, which is why the bug needed
+            // a paging Opus model to show up at all.
+            //
+            // Found twice independently, so both measurements are kept:
+            //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
+            //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
+            //     pager's own accounting sat correctly at its 8 GiB budget and
+            //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
+            //     RSS).
+            //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
+            //     cache: died at ~1 min before, runs 1h49m to completion after,
+            //     returning a KLD bit-identical to the same score with paging
+            //     disabled. A SMALLER cache died FASTER — backwards for a budget,
+            //     and the signature of a leak proportional to eviction count.
+            // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
+            // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
+            // nothing.
             let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
             (tensor, prepared.gate_up_rel, prepared.down_rel)
         } else {
             let (tensor, _handle) =
                 self.transport
                     .fetch(module.data_offset, module.data_size, gpu)?;
-            let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
+            let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
+            let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
                 .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
             (tensor, gate_up_rel, down_rel)
         };
@@ -1818,11 +1857,22 @@ impl From<hip_bridge::HipError> for WeightPagerError {
     }
 }
 
-fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: &str) -> Option<usize> {
+/// Offset of an expert module's weight tensor, for the verbatim (no host
+/// repack) page-in path.
+///
+/// Goes through [`expert_module_tensor_role`] for the same reason
+/// `prepare_expert_module` does: this used to be `t.name.contains(role)`, and
+/// `"gate_up_proj.awq_scale.weight".contains("gate_up_proj")` is true, so on any
+/// artifact carrying AWQ sidecars the FIRST match could be the sidecar and the
+/// pointer table would aim the routed GEMV at a scale vector. The repack path
+/// had the same defect and it made paged decode ignore its expert weights
+/// entirely; this path is only latent because nothing ships pre-transformed
+/// expert modules yet.
+fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: ExpertRole) -> Option<usize> {
     module
         .tensors
         .iter()
-        .find(|t| t.name.contains(role))
+        .find(|t| expert_module_tensor_role(&t.name) == Some(role))
         .map(|t| t.rel_offset)
 }
 
@@ -1842,6 +1892,84 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sidecar must never claim the weight's slot. This is the exact bug that
+    /// made paged decode ignore its own expert weights on every calibrated
+    /// artifact; `contains` passes this list, `ends_with` does not.
+    #[test]
+    fn expert_module_sidecars_do_not_claim_the_weight_slot() {
+        use super::expert_module_tensor_role as role;
+        let p = "model.layers.0.mlp.experts.11.";
+        assert_eq!(
+            role(&format!("{p}gate_up_proj.weight")),
+            Some(ExpertRole::GateUp)
+        );
+        assert_eq!(
+            role(&format!("{p}down_proj.weight")),
+            Some(ExpertRole::Down)
+        );
+        for sidecar in [
+            "gate_up_proj.awq_scale.weight",
+            "down_proj.awq_scale.weight",
+            "gate_up_proj.scale.weight",
+        ] {
+            assert_eq!(
+                role(&format!("{p}{sidecar}")),
+                None,
+                "{sidecar} must not claim an expert weight slot"
+            );
+        }
+    }
+
+    /// Both page-in paths must agree on which tensor is the weight: the repack
+    /// path via `prepare_expert_module`, and the verbatim path via
+    /// `find_module_tensor_rel_ptr`. They had the same `contains` bug; a fix to
+    /// one that missed the other would be silent, because only the repack path
+    /// is exercised by any shipping artifact today.
+    #[test]
+    fn verbatim_page_in_picks_the_weight_not_the_sidecar() {
+        use super::{find_module_tensor_rel_ptr, ExpertRole};
+        let t = |name: &str, rel: usize| HfqModuleTensor {
+            name: name.to_string(),
+            quant_type: 36,
+            shape: vec![2048, 3072],
+            group_size: 256,
+            rel_offset: rel,
+            data_size: 8,
+        };
+        let module = HfqModuleRecord {
+            module_id: "layers.0.experts.7".into(),
+            kind: crate::hfq_modules::HfqModuleKind::RoutedExpert,
+            layer: Some(0),
+            expert: Some(7),
+            placement_policy: None,
+            data_offset: 0,
+            data_size: 64,
+            // Sidecars interleaved exactly as the writer emits them: each
+            // weight is immediately followed by its scale.
+            tensors: vec![
+                t("model.layers.0.mlp.experts.7.gate_up_proj.weight", 0),
+                t(
+                    "model.layers.0.mlp.experts.7.gate_up_proj.awq_scale.weight",
+                    16,
+                ),
+                t("model.layers.0.mlp.experts.7.down_proj.weight", 32),
+                t(
+                    "model.layers.0.mlp.experts.7.down_proj.awq_scale.weight",
+                    48,
+                ),
+            ],
+        };
+        assert_eq!(
+            find_module_tensor_rel_ptr(&module, ExpertRole::GateUp),
+            Some(0)
+        );
+        assert_eq!(
+            find_module_tensor_rel_ptr(&module, ExpertRole::Down),
+            Some(32)
+        );
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -1998,11 +2126,8 @@ mod tests {
         let groups_gu = 1024 * 2048 / 256;
         let groups_dn = 2048 * 512 / 256;
 
-        let canonical = routed_module_qt(
-            QuantType::Oq4G256.code(),
-            groups_gu * 130,
-            groups_dn * 130,
-        );
+        let canonical =
+            routed_module_qt(QuantType::Oq4G256.code(), groups_gu * 130, groups_dn * 130);
         assert!(
             module_requires_host_repack(&canonical),
             "canonical OQ4 is 130 B/group on disk and must be transformed on page-in"
@@ -2025,11 +2150,8 @@ mod tests {
     fn moe_blocks_and_canonical_agree_on_resident_length() {
         let groups_gu = 1024 * 2048 / 256;
         let groups_dn = 2048 * 512 / 256;
-        let canonical = routed_module_qt(
-            QuantType::Oq4G256.code(),
-            groups_gu * 130,
-            groups_dn * 130,
-        );
+        let canonical =
+            routed_module_qt(QuantType::Oq4G256.code(), groups_gu * 130, groups_dn * 130);
         let packed = routed_module_qt(
             QuantType::Oq4G256MoeBlocks.code(),
             groups_gu * 132,

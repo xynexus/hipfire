@@ -593,8 +593,22 @@ fn run_paged_mixed_routed_decode(
                 ),
             ));
         }
+        // Per-EXPERT AWQ rotation. `x_rot` is ONE rotation for the whole layer,
+        // built with whichever scale the caller had; routed experts do not share
+        // an AWQ scale (each sees a different token subset, so a different
+        // imatrix, so a different s), so feeding it to every expert is the
+        // `(W·s)·x` error `0714f618e` fixed for the resident indexed path.
+        //
+        // Bucketing makes this cheap: a bucket is exactly one expert, so one
+        // rotation per bucket is correct and there are at most k_top of them per
+        // layer. `bucket_x_rot` is reused across buckets — each bucket's GEMM
+        // consumes it before the next overwrites it.
+        let bucket_x_rot = slice_f32_view(s.x_rot_expanded, 0, shape.gate_up_k);
         let gate_up_source = if matches!(gate_up_dtype, DType::F16 | DType::BF16) {
             x_norm
+        } else if let Some(scale) = ffn.expert_gate_up_awq.get(expert).and_then(|s| s.as_ref()) {
+            gpu.rotate_x_mq_awq_batched(x_norm, scale, &bucket_x_rot, shape.gate_up_k, 1)?;
+            &bucket_x_rot
         } else {
             x_rot
         };
@@ -637,11 +651,40 @@ fn run_paged_mixed_routed_decode(
     }
 
     gpu.silu_mul_f32(s.gate_batch, s.up_batch, s.hidden_batch)?;
+    // Plain rotation for experts with no sidecar; AWQ-carrying buckets redo it
+    // below with their own scale.
     gpu.rotate_x_mq_batched(s.hidden_batch, s.rot_batch, mi, k_top)?;
+    // Does `rot_batch` currently hold the PLAIN rotation? An AWQ bucket clobbers
+    // it, and a later no-sidecar bucket would then read someone else's scale —
+    // so track it and restore only when that actually happens. The alternative,
+    // rotating unconditionally per bucket, costs k_top launches per layer per
+    // token on artifacts with no sidecars at all, which is most of them.
+    let mut rot_is_plain = true;
 
     for bucket in &buckets {
         let expert = bucket.expert as usize;
         let dtype = moe_expert_down_dtype(ffn, expert).expect("validated mixed expert dtype");
+        // down_proj's input is each expert's OWN hidden state, so its scale is
+        // per-expert too — the clause that was missed longest on the resident
+        // side, because a comment claimed the experts shared an input basis.
+        //
+        // Rotating the whole `[k_top × mi]` batch with this bucket's scale is
+        // correct even though it touches other experts' rows: the GEMM below
+        // reads only this bucket's rows (via `bucket_sorted`), and the next
+        // bucket rewrites the buffer before its own read.
+        if !matches!(dtype, DType::F16 | DType::BF16) {
+            match ffn.expert_down_awq.get(expert).and_then(|s| s.as_ref()) {
+                Some(scale) => {
+                    gpu.rotate_x_mq_awq_batched(s.hidden_batch, scale, s.rot_batch, mi, k_top)?;
+                    rot_is_plain = false;
+                }
+                None if !rot_is_plain => {
+                    gpu.rotate_x_mq_batched(s.hidden_batch, s.rot_batch, mi, k_top)?;
+                    rot_is_plain = true;
+                }
+                None => {}
+            }
+        }
         let down_source = if matches!(dtype, DType::F16 | DType::BF16) {
             s.hidden_batch
         } else {
@@ -1017,8 +1060,8 @@ pub(crate) fn moe_ffn_decode_impl(
             // selected experts resident before dispatch. The pointer table
             // follows automatically (push), so this only supplies residency.
             expert_residency: residency_provider
-            .as_ref()
-            .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
+                .as_ref()
+                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
             routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
                 config.dim,
                 mi,
@@ -1814,9 +1857,8 @@ pub(crate) fn moe_ffn_decode_impl(
     // Routed geometry from `moe_expert_shape` — see the note at the other
     // `MoeParams` construction in this file. `ffn.experts.first()` is None under
     // paged residency and would marshal zeros.
-    let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
-        HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
-    })?;
+    let routed_shape = moe_expert_shape(ffn)
+        .ok_or_else(|| HipError::new(0, "missing MoE expert shape metadata for routed dispatch"))?;
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
         layer: layer_idx,
         dtypes: moe_dtypes,
@@ -1848,8 +1890,8 @@ pub(crate) fn moe_ffn_decode_impl(
         // selected experts resident before dispatch. The pointer table
         // follows automatically (push), so this only supplies residency.
         expert_residency: residency_provider
-        .as_ref()
-        .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
+            .as_ref()
+            .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
         routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
             config.dim,
             mi,

@@ -2304,6 +2304,20 @@ pub fn generate(
     // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
     // models to the plain AR path below (per-token forward_scratch prefill+decode).
     let kvarn_active = m.kv_cache().map(|c| c.quant_kvarn).unwrap_or(false);
+    // A drafter loads fine under KVarN and then never runs, because of the rule
+    // just above. Nothing else says so, so an operator benchmarking "DFlash on
+    // kvarn8" measures plain AR and reads it as a DFlash number. Say it once.
+    if m.dflash.is_some() && kvarn_active {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "  WARNING: a DFlash drafter is loaded but KVarN is active, so decode is \
+                 running PLAIN AR — spec-decode batch-prefills the prompt and would leave \
+                 the KVarN window/records unpopulated. Any tok/s measured here is NOT a \
+                 DFlash number. Use fp32 or q8 KV to actually engage the drafter."
+            );
+        });
+    }
     if m.dflash.is_some()
         && !kvarn_active
         && temp <= 1e-6

@@ -118,6 +118,30 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_awq_ptrs: Option<GpuTensor>,
     pub expert_down_awq_ptrs: Option<GpuTensor>,
 
+    /// Routed-expert AWQ scales for **paged** layers, indexed by expert id.
+    ///
+    /// Resident layers keep theirs inside `experts[i].{gate_up,down}.awq_scale`,
+    /// which is what holds those allocations alive. A paged layer has no
+    /// `ExpertWeights` at all, so the scales need an owner here or they drop at
+    /// the end of the loader and `expert_*_awq_ptrs` is left holding dangling
+    /// device pointers — which the indexed kernels dereference with no
+    /// validation. Same reason `paro_shared` exists.
+    ///
+    /// Indexed by expert rather than compacted, because the paged decode loop is
+    /// bucketed BY EXPERT and looks its scale up directly
+    /// (`run_paged_mixed_routed_decode`); the `expert_*_awq_ptrs` tables are
+    /// built from these for the indexed kernels. `None` at a slot means that
+    /// expert has no sidecar and takes the plain rotation.
+    ///
+    /// Empty for resident layers, and for artifacts with no routed sidecars.
+    ///
+    /// The scales are NOT paged. They are tiny next to the weights — f32 on
+    /// device, `dim + mi` per expert, ~201 MB for the 122B's 12,288 experts
+    /// against a 9.3 GB paged footprint — and paging them would mean a residency
+    /// transition on the rotation input as well as the weights.
+    pub expert_gate_up_awq: Vec<Option<GpuTensor>>,
+    pub expert_down_awq: Vec<Option<GpuTensor>>,
+
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,

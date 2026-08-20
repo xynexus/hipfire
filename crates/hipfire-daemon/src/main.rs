@@ -753,10 +753,7 @@ fn le_f32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<
         .collect())
 }
 
-fn hfqm_blob<'a>(
-    package: &'a hipfire_runtime::hfq::HfqPackage,
-    name: &str,
-) -> std::io::Result<&'a [u8]> {
+fn hfqm_blob(package: &hipfire_runtime::hfq::HfqPackage, name: &str) -> std::io::Result<Vec<u8>> {
     package
         .blob_data(name)
         .ok_or_else(|| invalid_kld_ref(format!("HFQM kldref missing payload {name}")))
@@ -810,23 +807,23 @@ fn read_hfqm_kld_ref_archive(path: &std::path::Path) -> std::io::Result<hipfire_
     let total_scored = json_usize(&meta_json, "total_scored")?;
 
     let tokens = le_u32_vec(
-        hfqm_blob(&package, "kldref.tokens")?,
+        &hfqm_blob(&package, "kldref.tokens")?,
         "kldref.tokens",
         n_chunk * n_ctx,
     )?;
     let top_count = n_chunk * scored_per_chunk * top_k;
     let top_indices = le_u32_vec(
-        hfqm_blob(&package, "kldref.top_indices")?,
+        &hfqm_blob(&package, "kldref.top_indices")?,
         "kldref.top_indices",
         top_count,
     )?;
     let top_log_probs = le_f32_vec(
-        hfqm_blob(&package, "kldref.top_log_probs")?,
+        &hfqm_blob(&package, "kldref.top_log_probs")?,
         "kldref.top_log_probs",
         top_count,
     )?;
     let residual_mass = le_f32_vec(
-        hfqm_blob(&package, "kldref.residual_mass")?,
+        &hfqm_blob(&package, "kldref.residual_mass")?,
         "kldref.residual_mass",
         n_chunk * scored_per_chunk,
     )?;

@@ -1866,6 +1866,9 @@ fn paro_load_moe_ffn(
         expert_down_ptrs,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
+        // Resident: the scales are owned by `experts[i].*.awq_scale`.
+        expert_gate_up_awq: Vec::new(),
+        expert_down_awq: Vec::new(),
         layer_idx,
         expert_shape: None,
         expert_gate_up_dtype,
@@ -2495,6 +2498,79 @@ fn build_expert_awq_ptr_tables(
     let gu = build(&|e: &ExpertWeights| e.gate_up.awq_scale.as_ref())?;
     let dn = build(&|e: &ExpertWeights| e.down.awq_scale.as_ref())?;
     Ok((Some(gu), Some(dn)))
+}
+
+/// Paged mirror of [`build_expert_awq_ptr_tables`], reading the sidecars from the
+/// HFQ index instead of from resident `ExpertWeights`.
+///
+/// Paged mode used to pass `(None, None)` here and warn. That is the same
+/// `(W·s)·x` instead of `W·x` error `0dd015f24` fixed for the resident repack —
+/// `rotate_x_mq_for` decides purely on `awq_scale.is_some()` and falls back to
+/// the non-AWQ rotation, so nothing errors — and the warning was written under
+/// the belief that no paged artifact carried sidecars. The 122B carries **21,914
+/// routed-expert `awq_scale` tensors**, 11,644 of its 12,288 gate_up, so the
+/// degraded path was the only path it would ever have taken.
+///
+/// The returned `Vec` is the OWNER of the scale allocations; the tables hold raw
+/// device pointers into it. Drop it and the tables dangle. It goes into
+/// `MoeFfnWeights::expert_awq_storage`, which lives exactly as long as the
+/// tables do.
+///
+/// A `0` slot means that expert has no sidecar, which the indexed rotate kernels
+/// already read as "plain rotation for this slot" — the mixed case is not
+/// special-cased anywhere and does not need to be. The 122B is exactly that
+/// shape: its 644 BF16 experts and 45 others have no scale.
+#[allow(clippy::type_complexity)]
+fn build_paged_expert_awq_ptr_tables(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    n_exp: usize,
+    gate_up_k: usize,
+    down_k: usize,
+) -> HipResult<(
+    Option<GpuTensor>,
+    Option<GpuTensor>,
+    Vec<Option<GpuTensor>>,
+    Vec<Option<GpuTensor>>,
+)> {
+    let mut gate_up: Vec<Option<GpuTensor>> = Vec::with_capacity(n_exp);
+    let mut down: Vec<Option<GpuTensor>> = Vec::with_capacity(n_exp);
+    for x in 0..n_exp {
+        gate_up.push(load_awq_scale_for(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+            gate_up_k,
+        ));
+        down.push(load_awq_scale_for(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+            down_k,
+        ));
+    }
+    if !gate_up.iter().chain(down.iter()).any(|s| s.is_some()) {
+        return Ok((None, None, Vec::new(), Vec::new()));
+    }
+    let mut build = |scales: &[Option<GpuTensor>]| -> HipResult<GpuTensor> {
+        let bytes: Vec<u8> = scales
+            .iter()
+            .flat_map(|s| {
+                s.as_ref()
+                    .map_or(0u64, |t| t.buf.as_ptr() as u64)
+                    .to_ne_bytes()
+            })
+            .collect();
+        let t = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&t.buf, &bytes)?;
+        Ok(t)
+    };
+    let gu = build(&gate_up)?;
+    let dn = build(&down)?;
+    // Moving a GpuTensor moves the handle, not the allocation, so the pointers
+    // captured above stay valid.
+    Ok((Some(gu), Some(dn), gate_up, down))
 }
 
 /// Explain an unpageable routed-expert quant type at the point of rejection.
@@ -4439,13 +4515,22 @@ pub fn load_weights(
                 awq_scale: None,
             }
         } else {
-            load_weight_tensor_raw(
-                gpu,
-                lm_info.quant_type,
-                &lm_data,
-                config.vocab_size,
-                config.dim,
-            )?
+            // `HIPFIRE_QWEN35_BF16_HEAD=1` (or a non-256 dim) lands here. The
+            // bytes are still LUT3-PACKED — `expand_bf16_index` leaves head
+            // tensors packed on purpose — and `load_weight_tensor_raw` rejects
+            // qt 49, so the flag could never actually load a qt-49 head. Decode
+            // to plain bf16 first; that is exactly what the flag is asking for.
+            let n_elems = config.vocab_size * config.dim;
+            let (qt, bytes) = if lm_info.quant_type == 49 {
+                let decoded =
+                    hipfire_primitives::bf16_lut3::decode(&lm_data, n_elems).ok_or_else(|| {
+                        HipError::new(0, "lm_head: Bf16Lut3 payload is corrupt or truncated")
+                    })?;
+                (16u8, std::borrow::Cow::Owned(decoded))
+            } else {
+                (lm_info.quant_type, std::borrow::Cow::Borrowed(&lm_data[..]))
+            };
+            load_weight_tensor_raw(gpu, qt, &bytes, config.vocab_size, config.dim)?
         }
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
@@ -6546,6 +6631,9 @@ fn load_moe_ffn(
         expert_down_ptrs,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
+        // Resident: the scales are owned by `experts[i].*.awq_scale`.
+        expert_gate_up_awq: Vec::new(),
+        expert_down_awq: Vec::new(),
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -6649,23 +6737,26 @@ fn load_moe_ffn_paged(
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &zero_ptrs)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &zero_ptrs)?;
 
-    // Paged mode: `experts` is empty (the pager owns the buffers), so there are
-    // no WeightTensors to read `awq_scale` from and no per-expert AWQ tables.
-    // `None` selects the plain rotation, which is correct ONLY while paged
-    // artifacts carry no routed-expert AWQ sidecars — true of the 122B today
-    // (it has zero). If that changes, the AWQ divide would be silently dropped
-    // for paged experts, so this warns rather than degrading quietly.
-    if hfq
-        .find_tensor_info(&format!("{p}.mlp.experts.0.gate_up_proj.awq_scale.weight"))
-        .is_some()
-    {
-        eprintln!(
-            "warning: paged MoE layer {p} has routed-expert AWQ sidecars, which the \
-             paged path cannot apply (experts are not resident). Expect degraded \
-             quality; load fully resident for AWQ-scaled routed experts."
-        );
+    // Paged mode has no resident `ExpertWeights` to read `awq_scale` from, so the
+    // scales are loaded from the HFQ index and OWNED by this layer. They stay
+    // resident: they are ~4 KB + ~12 KB per expert against megabytes of weight,
+    // and the rotation needs them on every token regardless of which experts the
+    // pager happens to hold.
+    //
+    // This used to be `(None, None)` plus a warning, on the belief that no paged
+    // artifact carried sidecars. It does — the 122B has 21,914 — so that branch
+    // silently computed (W·s)·x instead of W·x on every AWQ-scaled routed expert,
+    // which is the failure this whole path was fixed for in `0dd015f24`.
+    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs, expert_gate_up_awq, expert_down_awq) =
+        build_paged_expert_awq_ptr_tables(hfq, gpu, p, n_exp, config.dim, mi)?;
+    let n_scales = expert_gate_up_awq
+        .iter()
+        .chain(expert_down_awq.iter())
+        .filter(|s| s.is_some())
+        .count();
+    if n_scales > 0 {
+        eprintln!("  paged MoE layer {p}: {n_scales} routed-expert AWQ scales resident");
     }
-    let (expert_gate_up_awq_ptrs, expert_down_awq_ptrs) = (None, None);
 
     Ok(MoeFfnWeights {
         router,
@@ -6676,6 +6767,8 @@ fn load_moe_ffn_paged(
         expert_down_ptrs,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
+        expert_gate_up_awq,
+        expert_down_awq,
         layer_idx,
         expert_shape: Some(hipfire_runtime::weight_pager::ExpertShape {
             gate_up_m: 2 * mi,

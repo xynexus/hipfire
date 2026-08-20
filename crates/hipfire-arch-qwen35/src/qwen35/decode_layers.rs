@@ -27,10 +27,15 @@ pub(crate) fn forward_scratch_layers(
     let _qkv_dim = k_dim * 2 + v_dim;
     // #397 Ship 6 — forward-as-pipeline. Single-GPU decode routes through the
     // lowered super-op executor BY DEFAULT (see forward_lowered_enabled);
-    // HIPFIRE_FORWARD_LOWERED=0 opts back to the hand arms below. Skipped when a
-    // hidden-state ring buffer or GDN tape capture is active (spec-decode
-    // capture engages only the hand path for now), and when a steer session is
-    // live — so the hand arms below are the exception path, not the default one.
+    // HIPFIRE_FORWARD_LOWERED=0 opts back to the hand arms below. Skipped when
+    // GDN tape capture is active, and when a steer session is live — so the hand
+    // arms below are the exception path, not the default one.
+    //
+    // `hidden_rb` USED to force the hand path too, which is what routed DFlash
+    // verify onto arms that miscompute on dense models — the whole of
+    // docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md. The lowered
+    // executor extracts per-layer hidden itself now, so spec-decode verify runs
+    // the same forward as production decode.
     // RoughQuant corrections are wired into THIS hand path, but the hand path is
     // currently broken (bf16 self-KLD 13.89 vs lowered 0.000 — see
     // docs/roughquant/phase3-real-format-scope.md). Until it is resurrected OR the
@@ -41,7 +46,6 @@ pub(crate) fn forward_scratch_layers(
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
     if forward_lowered_enabled()
-        && hidden_rb.is_none()
         && gdn_tape_capture.is_none()
         && !rq_hand_optin
         // An active steer/capture session needs the per-layer block-boundary
@@ -56,6 +60,7 @@ pub(crate) fn forward_scratch_layers(
             kv_cache,
             dn_state,
             s,
+            hidden_rb.as_deref(),
             needs_last_token_logits,
         );
     }
@@ -76,9 +81,9 @@ pub(crate) fn forward_scratch_layers(
                 // The hand path owns this stage. Prepare the shared normalized
                 // input once; the lowered bridge is a complete alternative,
                 // not a prelude to the manual projections below.
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wqkv,
+                    &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -947,9 +952,9 @@ pub(crate) fn forward_scratch_layers(
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
                 // Fused rmsnorm + FWHT rotation for wq/wk/wv (all share input).
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wq,
+                    &[&layer.wq, &layer.wk, &layer.wv],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -1609,9 +1614,9 @@ pub(crate) fn forward_scratch_layers(
                 // for full-attention layers (post-attn residual feeding ffn_norm).
                 dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.w_gate,
+                    &[&layer.w_gate, &layer.w_up],
                     &s.x,
                     &layer.ffn_norm,
                     &s.tmp,
@@ -1818,9 +1823,9 @@ pub(crate) fn forward_scratch_layers(
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wqkv,
+                    &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -2151,9 +2156,9 @@ pub(crate) fn forward_scratch_layers(
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
                 trace_stage_if_enabled(&format!("layer {layer_idx} FullAttnMoe enter"));
-                let x_rot = fused_rmsnorm_rotate_for_mq(
+                let x_rot = fused_rmsnorm_prepare_bases(
                     gpu,
-                    &layer.wq,
+                    &[&layer.wq, &layer.wk, &layer.wv],
                     &s.x,
                     &layer.attn_norm,
                     &s.tmp,
@@ -2771,7 +2776,15 @@ pub(crate) fn forward_scratch_layers(
             // (it needs runtime int4 activation quant), so route through the
             // dedicated weight_gemv Oq4 arm (rotate → quantize_act_oq4 → grouped
             // iu4 GEMM). Same treatment the layer projections get.
-            weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+            // Two-stage lm_head when HIPFIRE_LMHEAD_TWOSTAGE is set and the head
+            // is BF16: a coarse Q4 pass shortlists top-K, then an exact pass
+            // rescores just those. Falls back to the exact GEMV otherwise, so
+            // this is a no-op for every artifact that does not opt in.
+            //
+            // qwen35 called `weight_gemv` directly and so could never reach it —
+            // the path existed in llama.rs and arch-zaya only, which is why the
+            // 35B's CoarseQ4Row tensor was dead weight for qwen35 serving.
+            hipfire_runtime::llama::lmhead_project(gpu, &weights.output, &s.tmp, &s.logits)?;
         } else {
             let ctx = DispatchCtx::new(gpu);
             let wr = weights.output.dispatch_ref();

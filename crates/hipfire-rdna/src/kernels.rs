@@ -4294,6 +4294,30 @@ pub const FUSED_QKVZA_OQ4_WMMA_SRC: &str =
 /// N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq4_grouped.hip`.
 pub const GEMV_OQ4_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq4_grouped.hip");
 
+/// Compact-resident Opus decode GEMV — reads OqPlusCompact (qt=36) blocks
+/// directly at batch=1 instead of running the grouped WMMA GEMM with one useful
+/// column. `kernels/src/gemv_oq_compact_grouped.hip`.
+pub const GEMV_OQ_COMPACT_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_grouped.hip");
+
+/// Bandwidth-optimized compact-resident decode GEMV: 64-bit nibble loads, two
+/// groups per wave for ILP, float4 activations. Requires group 256 and even ng;
+/// callers fall back to [`GEMV_OQ_COMPACT_GROUPED_SRC`] otherwise, mirroring the
+/// oq8 v1/v2 pair. `kernels/src/gemv_oq_compact_grouped_v2.hip`.
+/// DFlash2 candidate-selector transition scores (one position per launch; the
+/// trace is greedy and sequential). `kernels/src/dflash2_candidate_selector.hip`.
+pub const DFLASH2_CANDIDATE_SELECTOR_SRC: &str =
+    include_str!("../../../kernels/src/dflash2_candidate_selector.hip");
+
+/// DFlash2 grouped dynamic causal convolution. Semantics pinned by
+/// `hipfire_runtime::dflash2::grouped_dynamic_convolve` (parity-checked against
+/// z-lab/dflash). `kernels/src/dflash2_grouped_dynamic_conv.hip`.
+pub const DFLASH2_GROUPED_DYNAMIC_CONV_SRC: &str =
+    include_str!("../../../kernels/src/dflash2_grouped_dynamic_conv.hip");
+
+pub const GEMV_OQ_COMPACT_GROUPED_V2_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_grouped_v2.hip");
+
 /// Opus Quant W8A8 DECODE GEMV (batch=1): int8 generalization of
 /// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
 /// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.

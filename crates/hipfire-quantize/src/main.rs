@@ -165,8 +165,29 @@ static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 /// once when `--hessian` is first resolved; absent for RTN/data-free formats.
 static CALIB_PROVENANCE: OnceLock<serde_json::Value> = OnceLock::new();
 static CALIB_PRESERVE_EXPERTS: OnceLock<HashSet<(usize, usize)>> = OnceLock::new();
+static FORCED_PRESERVE_EXPERTS: OnceLock<HashSet<(usize, usize)>> = OnceLock::new();
+
+/// `HIPFIRE_FORCE_PRESERVE_EXPERTS`, parsed once. Silently ignores malformed
+/// entries rather than failing a long quantize over a debug knob.
+fn forced_preserve_experts() -> HashSet<(usize, usize)> {
+    let Some(spec) = hipfire_env::FORCE_PRESERVE_EXPERTS.get() else {
+        return HashSet::new();
+    };
+    spec.split(',')
+        .filter_map(|pair| {
+            let (layer, expert) = pair.trim().split_once(':')?;
+            Some((layer.trim().parse().ok()?, expert.trim().parse().ok()?))
+        })
+        .collect()
+}
 
 fn calibration_preserves_expert(layer: usize, expert: usize) -> bool {
+    if FORCED_PRESERVE_EXPERTS
+        .get_or_init(forced_preserve_experts)
+        .contains(&(layer, expert))
+    {
+        return true;
+    }
     CALIB_PRESERVE_EXPERTS
         .get()
         .is_some_and(|experts| experts.contains(&(layer, expert)))
@@ -5784,8 +5805,30 @@ fn run_hfq_source_pipeline(
     awq_alpha_explicit: Option<f32>,
     tensor_overrides: &[TensorFormatOverride],
     mixed_bpw_target: Option<f64>,
+    tensor_source: Option<&Path>,
+    copy_untargeted: bool,
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
+    // `--tensor-source`: where TARGETED tensors are re-read from at source
+    // precision. Without it a surgical pass can only re-encode tensors the .hfq
+    // still holds unquantized, which excludes exactly the ones worth replacing —
+    // an already-quantized tensor has no path back to source.
+    let source_archive = match tensor_source {
+        Some(path) => {
+            let archive = hipfire_quantize::hfa::HfaArchive::open(path)
+                .map_err(|e| format!("open --tensor-source {}: {e}", path.display()))?;
+            let index = archive
+                .tensor_index()
+                .map_err(|e| format!("index --tensor-source {}: {e}", path.display()))?;
+            eprintln!(
+                "tensor-source: {} ({} tensors available)",
+                path.display(),
+                index.len()
+            );
+            Some((archive, index))
+        }
+        None => None,
+    };
     eprintln!(
         "HFQ input: arch_id={} tensors={} format={format:?}",
         hfq.arch_id,
@@ -6073,6 +6116,119 @@ fn run_hfq_source_pipeline(
         total_params += n_elements;
         let tensor_override = tensor_format_override(tensor_overrides, &t.name);
         let tensor_format = tensor_override.map_or(format, |entry| entry.format);
+        // Already-quantized tensors are COPIED, not re-quantized. There is no
+        // path back to source precision, so the alternative is to refuse the
+        // whole file — which is what this did, and it made a targeted
+        // `--tensor-format` pass impossible on any real artifact: the first
+        // quantized tensor aborted the run.
+        //
+        // That pass is the cheap way to fix a mixed artifact in place. The 122B
+        // carries 644 routed experts left at BF16 by
+        // `--expert-coverage-policy preserve-undercovered`, which is what stops
+        // it paging; they are source precision, so they can be re-encoded to W8
+        // while the 11,644 OqPlusCompact experts are copied byte-for-byte. A
+        // full requantize from the safetensors source would touch all of them
+        // and take hours to reproduce bytes it already has.
+        //
+        // An override that TARGETS a quantized tensor still errors: the user
+        // asked for a re-encode that cannot be done, and silently copying would
+        // hand back an artifact that does not match the request.
+        // `--copy-untargeted` makes the pass SURGICAL: touch exactly what was
+        // targeted, copy everything else whatever its precision. That is what
+        // repairing an existing artifact wants — re-encoding the untargeted
+        // source-precision tensors would rewrite norms and, worse, the F16 AWQ
+        // sidecars `load_awq_scale_for` requires at qt 1.
+        //
+        // It is a FLAG rather than "overrides are present", which is what this
+        // inferred before. The inference made the other use case impossible:
+        // building a MIXED artifact from a source-precision .hfq — base format
+        // for most tensors, an override for a few — silently copied everything
+        // instead. That shape is exactly what the tiny tier lacks and what the
+        // Q8-attention/OQ-expert bug lives in, so the tool could not construct
+        // its own reproducer.
+        let surgical = copy_untargeted;
+        let is_source_precision = hfq_source_dtype(t.quant_type).is_some();
+        // Targeted but already quantized: re-read the ORIGINAL from
+        // `--tensor-source` rather than refusing. This is the whole point of the
+        // flag — replacing a tensor that was quantized with the wrong format,
+        // without redoing the 58 GB of expert work in the same file.
+        if tensor_override.is_some() && !is_source_precision {
+            let Some((archive, index)) = source_archive.as_ref() else {
+                return Err(format!(
+                    "tensor {} is {} (already quantized) and cannot be re-encoded from this .hfq; \
+                     pass --tensor-source <model.hfa> to read it at source precision",
+                    t.name, t.quant_type
+                ));
+            };
+            let shard = index.get(&t.name).ok_or_else(|| {
+                format!(
+                    "--tensor-source has no tensor {} (checked {} names)",
+                    t.name,
+                    index.len()
+                )
+            })?;
+            let (src_bytes, src_dtype, src_shape) = archive
+                .tensor_bytes(shard, &t.name)
+                .map_err(|e| format!("read {} from --tensor-source: {e}", t.name))?;
+            let src_qt = match src_dtype.as_str() {
+                "BF16" => QuantType::BF16,
+                "F16" => QuantType::F16,
+                "F32" => QuantType::F32,
+                other => {
+                    return Err(format!(
+                        "--tensor-source {} has dtype {other}; only BF16/F16/F32 sources quantize",
+                        t.name
+                    ))
+                }
+            };
+            let shape_u32: Vec<u32> = src_shape.iter().map(|d| *d as u32).collect();
+            let (data, qt, group_size, label) = quantize_hfq_source_tensor(
+                &t.name,
+                hfq.arch_id,
+                &src_bytes,
+                src_qt as u8,
+                &shape_u32,
+                tensor_format,
+            )?;
+            eprintln!(
+                "  {label:>8}: {} {:?} (from source, was quant_type {}, {:.1} KB -> {:.1} KB)",
+                t.name,
+                src_shape,
+                t.quant_type,
+                src_bytes.len() as f64 / 1024.0,
+                data.len() as f64 / 1024.0
+            );
+            quantized_params += n_elements;
+            hfq_tensors.push(HfqTensor {
+                name: t.name.clone(),
+                quant_type: qt,
+                shape: shape_u32,
+                group_size,
+                data,
+                spilled_len: 0,
+            });
+            continue;
+        }
+        if tensor_override.is_none() && (surgical || !is_source_precision) {
+            eprintln!(
+                "    copied: {} {:?} (quant_type {}, {:.1} KB)",
+                t.name,
+                t.shape,
+                t.quant_type,
+                raw.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: t.name.clone(),
+                quant_type: QuantType::from_code(t.quant_type).ok_or_else(|| {
+                    format!("tensor {} has unknown quant_type {}", t.name, t.quant_type)
+                })?,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data: raw.to_vec(),
+                spilled_len: 0,
+            });
+            continue;
+        }
         let (data, qt, group_size, label) = quantize_hfq_source_tensor(
             &t.name,
             hfq.arch_id,
@@ -7162,6 +7318,12 @@ OPTIONS:
     --include-prefix <P>       ingest ONLY tensors whose name starts with <P> (build sidecars, e.g. mtp.)
     --tensor-format <GLOB=FMT> override selected tensor formats during HFQ requantization;
                                repeatable, with later matches taking precedence
+    --tensor-source <PATH>     .hfa archive to re-read TARGETED tensors from at source
+                               precision, so an already-quantized tensor can be replaced
+                               without requantizing the whole model
+    --copy-untargeted          copy every tensor no --tensor-format glob matched, verbatim,
+                               instead of applying --format to it. Use when REPAIRING an
+                               artifact; omit to build a mixed one from a bf16 .hfq
     --include-vision           include vision-tower tensors (default: skipped)
     --vision-quant <FMT>       format for vision tensors when --include-vision is set
 
@@ -7364,6 +7526,9 @@ fn main() {
         print_help();
         std::process::exit(0);
     }
+    let tensor_source: Option<std::path::PathBuf> =
+        arg_value(&args, "--tensor-source").map(std::path::PathBuf::from);
+    let copy_untargeted = args.iter().any(|a| a == "--copy-untargeted");
     let tensor_format_overrides = parse_tensor_format_overrides(&args).unwrap_or_else(|error| {
         eprintln!("error: {error}");
         std::process::exit(2);
@@ -8527,6 +8692,8 @@ fn main() {
                 awq_alpha_explicit,
                 &tensor_format_overrides,
                 mixed_bpw_target,
+                tensor_source.as_deref(),
+                copy_untargeted,
             ) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
@@ -10695,6 +10862,13 @@ fn main() {
                 use_oq8_plus,
                 opus_mixed_spec.map(|s| s.group).unwrap_or(256),
             );
+            // Undercovered experts go to W8 rather than source precision, but
+            // only where an OQ expert target is actually in play — under a
+            // BF16/F16/MQ target there is no pageability to protect and the old
+            // fallback is still the right answer. See the branch below.
+            let undercovered_experts_w8 = stacked_oq_format.is_some()
+                && supports_g256
+                && !hipfire_env::UNDERCOVERED_EXPERTS_SOURCE.flag();
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -10760,7 +10934,52 @@ fn main() {
                     };
                     let m_expert = inner_shape_clone[0] as usize;
                     let mut oq_sidecar_scales: Option<Vec<f32>> = None;
-                    let (quantized, qt, gs) = if preserve_source_precision && dtype == "BF16" {
+                    let (quantized, qt, gs) = if preserve_source_precision
+                        && undercovered_experts_w8
+                    {
+                        // Undercovered experts under an Opus expert target get
+                        // W8 (qt 35), not source precision.
+                        //
+                        // The policy's intent is "spend more bits where the
+                        // corpus gave us no evidence", and BF16 is only one way
+                        // to spend them. It is also the one way that makes the
+                        // artifact UNPAGEABLE: `paged_moe_dtype_for_quant` takes
+                        // only OQ routed dtypes and hard-errors at load on qt 16,
+                        // which is what stops the 122B (644 such experts) from
+                        // paging — and paging is mandatory for it, since
+                        // OqPlusCompact expands to int8 in VRAM and the artifact
+                        // needs ~130 GB resident.
+                        //
+                        // Oq8G256 and the OqPlusCompact majority resolve to the
+                        // SAME runtime dtype and the SAME resident byte length
+                        // (`oq_gpu_dtype_for_quant_type`,
+                        // `module_tensor_resident_len`), each with its own
+                        // page-in transform. So the on-disk forms may differ per
+                        // expert while the layer stays `Uniform(Oq8G256)` — which
+                        // is the uniformity the indexed kernels actually require.
+                        //
+                        // `oq8_for_matrix_cols` picks qt 35 only when
+                        // `cols % 256 == 0`, and that is the same constraint
+                        // `oq_indexed_admissible` imposes, so a pageable artifact
+                        // never lands on the row-padded qt 43 here.
+                        let f32_bytes: Vec<u8> = f32_slice
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        let (q, qt, gs, _label) = quantize_hfq_source_tensor(
+                            &expert_name,
+                            arch_id,
+                            &f32_bytes,
+                            QuantType::F32 as u8,
+                            &inner_shape_clone,
+                            HfqInputFormat::Oq8,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("undercovered W8 expert quantize {expert_name}: {error}")
+                        });
+                        oq_sidecar_scales = OQ4_AWQ_SIDECAR.with(|cell| cell.borrow_mut().take());
+                        (q, qt, gs)
+                    } else if preserve_source_precision && dtype == "BF16" {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if preserve_source_precision && dtype == "F16" {
                         (slice.to_vec(), QuantType::F16, 0u32)
@@ -10778,8 +10997,15 @@ fn main() {
                         // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
                         // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
                         // (int4 bulk + top-frac int8 → Oq8G256 at load, default 1%,
-                        // `--w8-top` overrides). Uniform across experts (indexed kernels
-                        // require it), so kmap MQ-promotion is intentionally NOT applied.
+                        // `--w8-top` overrides).
+                        //
+                        // The uniformity the indexed kernels require is at the
+                        // RUNTIME dtype, not the on-disk form: `Oq8G256` and
+                        // `OqPlusCompact` both resolve to `DType::Oq8G256` with the
+                        // same resident length, so they may be mixed per expert
+                        // (see the undercovered-W8 branch above). What must not
+                        // vary within a layer is the resolved dtype — which is why
+                        // kmap MQ-promotion is intentionally NOT applied here.
                         // Route through the shared HFQ-source quantizer so calibrated
                         // mixed OQ (`oq4.25++`) applies AWQ/LDLQ and contributes to
                         // strict Hessian validation like ordinary 2D weights.

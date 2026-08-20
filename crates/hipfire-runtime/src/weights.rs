@@ -817,57 +817,85 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
     }
 }
 
-pub fn fused_rmsnorm_rotate_for_mq<'a>(
+/// Dtypes whose weights live in the FWHT-rotated basis and therefore need a
+/// rotated activation. The OQ family is deliberately absent: those rotate inside
+/// their own GEMV rather than consuming a pre-rotated x here.
+fn needs_mq_rotated_basis(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256
+            | DType::MQ6G256
+            | DType::MQ3G256
+            | DType::MQ2G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
+            | DType::MQ4G256Lloyd
+            | DType::MFP4G32
+    )
+}
+
+/// Prepare the activation bases a projection GROUP consumes: the plain
+/// rmsnormed x, and the FWHT-rotated x when any member needs it. Returns the
+/// rotated buffer if produced, so `weight_gemv_prerotated` can pick per weight.
+///
+/// This was `fused_rmsnorm_rotate_for_mq`, and the name encoded the bug. It
+/// decided from ONE sample weight and applied that answer to a whole group, and
+/// on the MQ arm it never wrote `plain` — the underlying
+/// `fused_rmsnorm_rotate_mq` has no plain output. So a group whose sample was MQ
+/// left `plain` holding the PREVIOUS layer's activation, and any sibling that
+/// was not MQ silently read it.
+///
+/// Only mixed-dtype groups are affected, which is why uniform artifacts never
+/// showed it. Measured on a 2-layer fixture, mean KLD vs a bf16 reference:
+/// 0.206 with the DeltaNet input group uniformly OQ4, 0.061 with it uniformly
+/// Q8 — but 0.848 with a SINGLE member at Q8. The error tracks group
+/// uniformity, not bit width.
+///
+/// Deciding per group instead means `plain` is written whenever any member is
+/// unrotated, so no consumer can read a stale buffer, while a uniformly-rotated
+/// group still gets the single-output fused kernel and keeps its fusion.
+pub fn fused_rmsnorm_prepare_bases<'a>(
     gpu: &mut Gpu,
-    sample_weight: &WeightTensor,
+    group: &[&WeightTensor],
     x: &GpuTensor,
     norm_weight: &GpuTensor,
-    tmp: &GpuTensor,
+    plain: &GpuTensor,
     x_rot_scratch: &'a GpuTensor,
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
-    match sample_weight.gpu_dtype {
-        DType::MQ4G256
-        | DType::MQ6G256
-        | DType::MQ3G256
-        | DType::MQ2G256
-        | DType::MQ2G256Lloyd
-        | DType::MQ3G256Lloyd
-        | DType::MQ4G256Lloyd
-        | DType::MFP4G32 => {
-            // Phase A Stage A — AWQ-aware dispatch. When the upcoming linear
-            // carries an AWQ scale sidecar, use the AWQ variant of the fused
-            // kernel which divides activations by `awq_scale[i]` before the
-            // FWHT rotation, completing the math `(W·s) · (x/s) = W·x`.
-            // For Stage A specifically, only MQ4G256 actually emits AWQ
-            // sidecars from the quantizer (`--awq` flag), but routing all
-            // MQ-family dtypes through the AWQ check is correct + cheap.
-            if let Some(awq) = sample_weight.awq_scale.as_ref() {
-                gpu.fused_rmsnorm_rotate_mq_awq(
-                    x,
-                    norm_weight,
-                    awq,
-                    x_rot_scratch,
-                    sample_weight.k,
-                    eps,
-                )?;
-            } else {
-                gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
-            }
-            Ok(Some(x_rot_scratch))
-        }
-        DType::MQ8G256 => {
-            // MQ8 rotate+quantize produces INT8 scratch; can't fuse with rmsnorm the
-            // same way. Keep the split path for now.
-            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
-            gpu.rotate_quantize_x_mq8(tmp, sample_weight.k)?;
-            Ok(None)
-        }
-        _ => {
-            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
-            Ok(None)
-        }
+    // MQ8 keeps its own split path: rotate+quantize produces INT8 scratch that
+    // cannot fuse with rmsnorm the same way.
+    if let Some(w) = group.iter().find(|w| w.gpu_dtype == DType::MQ8G256) {
+        let k = w.k;
+        gpu.rmsnorm_f32(x, norm_weight, plain, eps)?;
+        gpu.rotate_quantize_x_mq8(plain, k)?;
+        return Ok(None);
     }
+    let Some(rotated) = group
+        .iter()
+        .copied()
+        .find(|w| needs_mq_rotated_basis(w.gpu_dtype))
+    else {
+        gpu.rmsnorm_f32(x, norm_weight, plain, eps)?;
+        return Ok(None);
+    };
+    let all_rotated = group.iter().all(|w| needs_mq_rotated_basis(w.gpu_dtype));
+    // AWQ-aware: when the rotated member carries a scale sidecar the kernel
+    // divides by it before the FWHT, completing `(W·s)·(x/s) = W·x`. That
+    // variant emits only the rotated basis, so a mixed group needs the plain one
+    // written separately.
+    if let Some(awq) = rotated.awq_scale.as_ref() {
+        if !all_rotated {
+            gpu.rmsnorm_f32(x, norm_weight, plain, eps)?;
+        }
+        gpu.fused_rmsnorm_rotate_mq_awq(x, norm_weight, awq, x_rot_scratch, rotated.k, eps)?;
+    } else if all_rotated {
+        gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, rotated.k, eps)?;
+    } else {
+        // One pass, both bases.
+        gpu.fused_rmsnorm_rotate_mq_plain(x, norm_weight, x_rot_scratch, plain, rotated.k, eps)?;
+    }
+    Ok(Some(x_rot_scratch))
 }
 
 /// Pre-rotate x once for a batch of MagnumQuant weight GEMVs that share the same input.

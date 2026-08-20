@@ -251,6 +251,25 @@ env_vars! {
          to OQ8 W8A16 under any Opus format. The router is precision-sensitive \
          and tiny, so the bit cost is negligible.";
 
+    FORCE_PRESERVE_EXPERTS = "HIPFIRE_FORCE_PRESERVE_EXPERTS", Developer,
+        "Comma-separated `layer:expert` pairs to treat as calibration- \
+         undercovered, e.g. `0:3,0:5,1:7`. Normally that set comes from the \
+         calibration sidecar's coverage admission, so there is no way to \
+         exercise the undercovered path without a real calibration; this forces \
+         it. Two uses: testing the undercovered-expert format end to end on a \
+         tiny fixture, and A/B-ing what a given expert costs at a different \
+         precision on a real model without recalibrating.";
+
+    UNDERCOVERED_EXPERTS_SOURCE = "HIPFIRE_UNDERCOVERED_EXPERTS_SOURCE", Developer,
+        "Set 1 to keep calibration-undercovered routed experts at SOURCE \
+         precision (BF16/F16) under an Opus expert target, which is what the \
+         quantizer did before 2026-08-13. The default now emits them as Oq8G256 \
+         (true W8) instead: source precision leaves the artifact unpageable, \
+         because the paged MoE decode takes only OQ routed dtypes and rejects \
+         BF16 at load — that is what blocks the 122B. W8 keeps the same runtime \
+         dtype as the OqPlusCompact majority, so the layer stays uniform. This \
+         is the A/B knob for the quality half of that trade.";
+
     NO_EXPERT_AWQ = "HIPFIRE_NO_EXPERT_AWQ", Developer,
         "Set 1 to suppress per-expert AWQ smoothing so routed experts fall back \
          to plain MQ4/MQ8. An A/B knob for measuring the expert-AWQ quality \

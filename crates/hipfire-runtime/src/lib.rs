@@ -26,10 +26,11 @@ pub mod cpu_router;
 pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+pub mod dflash2;
 pub mod dispatch;
 pub mod eos_filter;
-pub mod exec_trace;
 pub mod ep;
+pub mod exec_trace;
 pub mod hfq;
 pub mod hfq_compose;
 pub mod hfq_modules;

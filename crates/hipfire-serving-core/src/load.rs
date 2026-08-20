@@ -852,9 +852,60 @@ pub fn load_model(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            // Opus Quant (qt 33 OqPlusG256, 34 Oq4G256, 35 Oq8G256, 36
+            // OqPlusCompact, 38 Oq3G256, 52 OqPlusCompactG128) all resolve
+            // through `oq8_arch_load` to Oq8G256 / OqCompactG256 / G128, and
+            // `dflash_enqueue_verify_lm_head` now carries arms for those three
+            // (AWQ-aware rotate + quantize_act_oq8 + grouped-iu8 WMMA, on
+            // VerifyScratch buffers so it stays graph-capturable). Without
+            // these codes every oq* target — i.e. every model we now induct —
+            // refused to load with a draft attached.
+            // NOTE ON OPUS (qt 33/34/35/36/38/52): the batched lm_head half is
+            // DONE, and so is the correctness half. The dense miscompute that used
+            // to justify this gate was root-caused on 2026-08-20 and fixed in
+            // `b7b7a9ae5` — it was never about Opus. `forward_scratch_layers`
+            // skipped the lowered executor whenever a hidden-state ring buffer was
+            // requested, so spec-decode verify ran the hand arms in
+            // decode_layers.rs, which miscompute on DENSE qwen3.5-family models.
+            // The lowered path extracts per-layer hidden itself now, and dense
+            // DFlash commits byte-identical text to plain decode.
+            //
+            // The gate STAYS, for the one reason that survived: measured, DFlash
+            // does not pay on this family. On Qwen3.8-27B oq4.25++ + CASK,
+            // 128 tokens greedy (docs/experiments/2026-08-20-dflash2-qwen38-27b-performance.md):
+            //
+            //     baseline          7.50 tok/s
+            //     DFlash1 B=16      0.79 tok/s   tau 1.098
+            //     DFlash2 B=8       2.01 tok/s   tau 1.778   (q8 KV, batched verify)
+            //
+            // and the ceiling is arithmetic: verify costs ~6.8 serial decodes to
+            // check 9 positions, so even at 100 % acceptance the best case is
+            // 9.2 tok/s — 1.22x. 48 of 64 layers are DeltaNet and its recurrence is
+            // sequential per token, so a wider verify batch amortizes only the
+            // other quarter of the stack. Same shape as the MoE result
+            // (Qwen3.5-35B-A3B: 8.17 vs 35.7 tok/s, expert bytes rather than a
+            // recurrence). Speculation on this family needs the DeltaNet recurrence
+            // batched across the verify block before admitting it by default makes
+            // anyone faster.
+            //
+            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work. The drafters on
+            // disk are parked `.parked-slower-than-plain-decode` so sibling
+            // discovery cannot attach one silently; pass `params.draft` explicitly
+            // to measure.
+            let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
+                // Opt-in while the batched verify body is being bisected; see
+                // the note above. Default stays refused.
+                Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
+                // Unquantized heads. BF16 (16) resolves to DType::BF16; the
+                // losslessly recoded pair (Bf16Lut3=49, Bf16Huff=50) keeps the
+                // head PACKED as DType::Bf16L3. `dflash_enqueue_verify_lm_head`
+                // has arms for both. This is what makes a bf16 dense target
+                // runnable, which is the control that separates "dense" from
+                // "Opus" in the dense-Opus miscompute.
+                Some(16 | 49 | 50) => true,
                 _ => false,
             };
             if !supported {
@@ -865,8 +916,12 @@ pub fn load_model(
                 return Err(format!(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
-                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13), \
+                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50) always; MQ3G256 \
+                     (qt=17) on gfx11 only. Opus oq* (qt=33/34/35/36/38/52) is \
+                     CORRECT now but measured slower than plain decode on this \
+                     family, so it stays behind HIPFIRE_DFLASH_ALLOW_OPUS=1. \
+                     Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \

@@ -130,8 +130,7 @@ pub(crate) fn lower_variant(v: Q35Variant) -> LayerProgram {
 pub(crate) struct Qwen35Bindings<'a> {
     /// Weight pager, `Some` only for paged-expert models. `run_moe` forwards it
     /// so the lowered path can make selected experts resident before dispatch.
-    pub(crate) pager:
-        Option<&'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
+    pub(crate) pager: Option<&'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     pub(crate) layer: &'a LayerWeights,
     pub(crate) s: &'a Qwen35Scratch,
     pub(crate) config: &'a Qwen35Config,
@@ -508,8 +507,17 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s, self.layer_idx, self.pager)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
+        moe_ffn_dispatch(
+            gpu,
+            ffn,
+            &s.x,
+            ffn_norm,
+            config,
+            s,
+            self.layer_idx,
+            self.pager,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
     fn run_moe_ep(
@@ -640,6 +648,7 @@ pub(crate) fn forward_scratch_layers_lowered(
     kv_cache: &mut kv::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
     needs_logits: bool,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -678,6 +687,16 @@ pub(crate) fn forward_scratch_layers_lowered(
         ) {
             delta_layer_idx += 1;
         }
+        // Per-position hidden extraction for spec-decode drafters. This is the
+        // ONLY thing the hand path in `decode_layers.rs` had that the lowered
+        // executor did not, and wanting it is what used to route DFlash verify
+        // onto those (dense-broken) hand arms. The ring head advances once per
+        // token in the caller, exactly as before.
+        if let Some(rb) = hidden_rb {
+            if let Some(slot) = rb.extract_slot(layer_idx) {
+                rb.write_at_head(gpu, slot, &s.x)?;
+            }
+        }
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
@@ -687,7 +706,20 @@ pub(crate) fn forward_scratch_layers_lowered(
     // gfx1103 per rocprof). Without this, the lowered path ignored the caller's
     // no-logits request and computed lm_head every token.
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    // The vector the lm_head actually scores. Per-layer "pertoken" dumps stop
+    // before the final norm, so a coarse-tier / lm_head study had no way to get
+    // the real query distribution. `config.n_layers` as the layer index keeps it
+    // ordered after every layer dump.
+    dump_hidden_localize(gpu, &s.tmp, 1, pos, config.dim, config.n_layers, "fnorm");
     if needs_logits {
+        // Two-stage lm_head (coarse shortlist + exact rescore) when it is both
+        // enabled and applicable; otherwise fall through to the normal lowered
+        // GEMV so the default path is unchanged. This is the LIVE lm_head site —
+        // `decode_layers.rs` is the hand path and is off by default.
+        if hipfire_runtime::llama::lmhead_twostage_applies(&weights.output) {
+            hipfire_runtime::llama::lmhead_project(gpu, &weights.output, &s.tmp, &s.logits)?;
+            return Ok(());
+        }
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {

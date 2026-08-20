@@ -127,6 +127,10 @@ hipfire-xdna = { path = "../hipfire-xdna" }
 # features above and `required-features` on each `[[example]]` block
 # below.
 [dev-dependencies]
+# Examples only — the head-format studies need the Opus ENCODERS, which live in
+# the quantizer, alongside runtime's host DECODERS (`oq8_arch_load`). No cycle:
+# hipfire-quantize does not depend on hipfire-runtime.
+hipfire-quantize = { path = "../hipfire-quantize" }
 hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-xdna = { path = "../hipfire-xdna" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }

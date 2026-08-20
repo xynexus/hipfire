@@ -489,9 +489,9 @@ fn forward_scratch_layers_multi(
 
             match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
                 (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.wqkv,
+                        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                         &s.x,
                         &layer.attn_norm,
                         &s.tmp,
@@ -723,9 +723,9 @@ fn forward_scratch_layers_multi(
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.w_gate,
+                        &[&layer.w_gate, &layer.w_up],
                         &s.x,
                         &layer.ffn_norm,
                         &s.tmp,
@@ -822,9 +822,9 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.wq,
+                        &[&layer.wq, &layer.wk, &layer.wv],
                         &s.x,
                         &layer.attn_norm,
                         &s.tmp,
@@ -1243,9 +1243,9 @@ fn forward_scratch_layers_multi(
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.w_gate,
+                        &[&layer.w_gate, &layer.w_up],
                         &s.x,
                         &layer.ffn_norm,
                         &s.tmp,
@@ -1341,9 +1341,9 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.wqkv,
+                        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
                         &s.x,
                         &layer.attn_norm,
                         &s.tmp,
@@ -1629,9 +1629,9 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let x_rot = fused_rmsnorm_prepare_bases(
                         gpu,
-                        &layer.wq,
+                        &[&layer.wq, &layer.wk, &layer.wv],
                         &s.x,
                         &layer.attn_norm,
                         &s.tmp,

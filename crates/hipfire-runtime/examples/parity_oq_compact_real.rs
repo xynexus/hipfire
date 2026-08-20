@@ -100,7 +100,7 @@ fn main() {
         let block_stride = blocks.len() / n_blocks;
 
         // The REAL expander the loader uses, on the REAL bytes.
-        let combined = oqplus_compact_to_oq8_combined(blocks, m, k);
+        let combined = oqplus_compact_to_oq8_combined(&blocks, m, k);
 
         // Batch of 4 covers the ragged-lane tail without a large upload; the
         // activations are shared byte-for-byte by both paths.
@@ -113,7 +113,7 @@ fn main() {
             .map(|_| 0.25f32 + (rnd() % 100_000) as f32 * 1.0e-5)
             .collect();
 
-        let d_blocks = gpu.upload_raw(blocks, &[blocks.len()]).expect("up blocks");
+        let d_blocks = gpu.upload_raw(&blocks, &[blocks.len()]).expect("up blocks");
         let d_comb = gpu
             .upload_raw(&combined, &[combined.len()])
             .expect("up combined");

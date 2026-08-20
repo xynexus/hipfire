@@ -33,17 +33,30 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q4` / `1` =
-/// 4-bit coarse, K=32; `q2` = 2-bit, K=2048. Append `:<K>` to override K
+/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q2` / `1` =
+/// 2-bit coarse, K=128; `q4` = 4-bit, K=32. Append `:<K>` to override K
 /// (e.g. `q4:64`). Absent → the exact full lm_head. OFF by default.
+///
+/// `q2` used to default to K=2048 on the assumption that 2-bit codes rank
+/// poorly. Measured, they do not — the true argmax's worst rank at the shipped
+/// clip was 24 over 630 decode states on Qwen3.5-35B-A3B (head [248320, 2048])
+/// and 26 over 122 states on the 122B (head [248320, 3072]), so 2 bits ranks
+/// as well as 4 for shortlist purposes and the tier halves, 0.5 → 0.25 B/weight.
+/// See `examples/lmhead_coarse_bits_study.rs`.
+///
+/// K=128 rather than the 32 those maxima would allow: the fine pass is
+/// measurably free (K=32 and K=256 decode within noise of each other), so the
+/// margin costs nothing, and a worst observed rank of ~25 is uncomfortably close
+/// to 32 on query sets this size. 1-bit is genuinely too coarse — its worst
+/// rank was 1964 on the 122B, only 93.4% recall at K=32.
 fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
     let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
     let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
-        (2usize, 2048usize, r)
+        (2usize, 128usize, r)
     } else if let Some(r) = v.strip_prefix("q4") {
         (4, 32, r)
     } else if v == "1" {
-        (4, 32, "")
+        (2, 128, "")
     } else {
         return None;
     };
@@ -55,13 +68,26 @@ fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
     Some((bits, k))
 }
 
+/// True when `lmhead_project` would take the two-stage path for this weight,
+/// i.e. the env is set AND the head is bf16. Callers that otherwise emit their
+/// own lm_head GEMV (the lowered `Step::Gemv` pipeline) use this to divert only
+/// when the fast path is really available, leaving the default path untouched.
+pub fn lmhead_twostage_applies(w: &WeightTensor) -> bool {
+    lmhead_twostage_cfg().is_some() && w.gpu_dtype == DType::BF16
+}
+
 /// lm_head projection with an optional coarse-shortlist + fine-rescore fast path
 /// gated by `HIPFIRE_LMHEAD_TWOSTAGE`. Falls back to the exact `weight_gemv` when
 /// the env is unset or the head is not bf16. The two-stage path is **greedy-exact**
 /// (recall@1 = 1.0 at K=32 on real lm_heads) but truncates the tail to the
 /// shortlist, so it is a decode/argmax fast path — the eval/scoring paths simply
 /// leave the env unset to keep full-distribution logits.
-fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+pub fn lmhead_project(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
     if let Some((bits, topk)) = lmhead_twostage_cfg() {
         if w.gpu_dtype == DType::BF16 {
             let (vocab, hidden) = (w.m, w.k);
@@ -70,6 +96,9 @@ fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor)
             if stale {
                 let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                eprintln!(
+                    "[lmhead] two-stage active: coarse q{bits} tier built for [{vocab}, {hidden}], top-K={topk}"
+                );
                 LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
             }
             return LMHEAD_COARSE.with(|c| {

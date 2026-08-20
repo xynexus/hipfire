@@ -5426,6 +5426,196 @@ impl Gpu {
         )
     }
 
+    /// Compact-resident Opus decode GEMV (batch=1), reading OqPlusCompact
+    /// blocks as they sit on disk. The per-group weight scale leads each block,
+    /// so unlike the expanded path there is no separate scale plane to pass.
+    pub fn gemv_oq_compact_grouped(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            group == 256 || group == 128,
+            "gemv_oq_compact_grouped: compact group must be 256 or 128 (got {group})"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "gemv_oq_compact_grouped: K must be a multiple of group"
+        );
+        // Each lane owns a whole number of nibble bytes: (group/2) % 32 == 0.
+        assert_eq!(
+            (group / 2) % 32,
+            0,
+            "gemv_oq_compact_grouped: group/2 must be a multiple of 32 (got {group})"
+        );
+        let header = 2 + group / 2;
+        assert!(
+            block_stride >= header + 2 && (block_stride - header) % 2 == 0,
+            "gemv_oq_compact_grouped: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_grouped",
+            kernels::GEMV_OQ_COMPACT_GROUPED_SRC,
+            "gemv_oq_compact_grouped",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
+    /// Compact-resident Opus decode GEMV, v2 fast path where it applies.
+    ///
+    /// v2 needs group 256 and an even group count; anything else (short router
+    /// GEMVs, G=128 artifacts) routes to v1, exactly as the oq8 pair does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_grouped_auto(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        if group != 256 || (k / 256) % 2 != 0 {
+            return self.gemv_oq_compact_grouped(w_blocks, x_f32, y_f32, m, k, group, block_stride);
+        }
+        self.bind_thread()?;
+        let header = 2 + group / 2;
+        assert!(
+            block_stride >= header + 2 && (block_stride - header) % 2 == 0,
+            "gemv_oq_compact_grouped_v2: block_stride {block_stride} invalid (expected {header} + 2*N_out, N_out >= 1)"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_grouped_v2",
+            kernels::GEMV_OQ_COMPACT_GROUPED_V2_SRC,
+            "gemv_oq_compact_grouped_v2",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        let bs = block_stride as i32;
+        self.launch_kernargs(
+            "gemv_oq_compact_grouped_v2",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs],
+        )
+    }
+
+    /// DFlash2 candidate-selector transition scores for one position.
+    ///
+    /// `unary` `[top_k]`, `pred`/`hp` `[rank]`, `suc` `[top_k, rank]`, `out`
+    /// `[top_k]`, all f32. Semantics pinned by
+    /// `hipfire_runtime::dflash2::selector_scores`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash2_candidate_selector(
+        &mut self,
+        unary: &GpuTensor,
+        pred: &GpuTensor,
+        hp: &GpuTensor,
+        suc: &GpuTensor,
+        out: &GpuTensor,
+        top_k: usize,
+        rank: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            top_k > 0 && rank > 0,
+            "dflash2 selector: top_k and rank must be > 0"
+        );
+        self.ensure_kernel(
+            "dflash2_candidate_selector",
+            kernels::DFLASH2_CANDIDATE_SELECTOR_SRC,
+            "dflash2_candidate_selector",
+        )?;
+        let up = unary.buf.as_ptr();
+        let pp = pred.buf.as_ptr();
+        let hpp = hp.buf.as_ptr();
+        let sp = suc.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ti = top_k as i32;
+        let ri = rank as i32;
+        self.launch_kernargs(
+            "dflash2_candidate_selector",
+            [top_k as u32, 1, 1],
+            // ONE wave: the kernel reduces with __shfl_down, which does not
+            // cross waves on RDNA (wave32). Do not raise this to 64.
+            [32, 1, 1],
+            0,
+            &kernargs![ptr up, ptr pp, ptr hpp, ptr sp, ptr op, i32 ti, i32 ri],
+        )
+    }
+
+    /// DFlash2 grouped dynamic causal convolution.
+    ///
+    /// `h`/`y` are `[len, hidden]` f32, `d` is `[len, kernel_size, groups]` f32
+    /// (one coefficient per GROUP, not per channel), `b` is
+    /// `[kernel_size, hidden]` f32. Semantics pinned by
+    /// `hipfire_runtime::dflash2::grouped_dynamic_convolve`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash2_grouped_dynamic_conv(
+        &mut self,
+        h: &GpuTensor,
+        d: &GpuTensor,
+        b: &GpuTensor,
+        y: &GpuTensor,
+        len: usize,
+        hidden: usize,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            group_size > 0 && hidden % group_size == 0,
+            "dflash2 conv: hidden {hidden} must be a multiple of group {group_size}"
+        );
+        assert!(kernel_size > 0, "dflash2 conv: kernel_size must be > 0");
+        self.ensure_kernel(
+            "dflash2_grouped_dynamic_conv",
+            kernels::DFLASH2_GROUPED_DYNAMIC_CONV_SRC,
+            "dflash2_grouped_dynamic_conv",
+        )?;
+        let hp = h.buf.as_ptr();
+        let dp = d.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let li = len as i32;
+        let hi = hidden as i32;
+        let ki = kernel_size as i32;
+        let gi = group_size as i32;
+        self.launch_kernargs(
+            "dflash2_grouped_dynamic_conv",
+            [len.max(1) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr hp, ptr dp, ptr bp, ptr yp, i32 li, i32 hi, i32 ki, i32 gi],
+        )
+    }
+
     /// OQ4+ W4A16 decode GEMV with fused residual add (`y += W*x`).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq4_grouped_residual(

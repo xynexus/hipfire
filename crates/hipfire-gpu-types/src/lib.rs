@@ -250,6 +250,15 @@ impl DType {
                 // artifacts: W*s served against un-divided x, which scored KLD
                 // 8.27 while the non-AWQ path scored 1.61.
                 | DType::Qtip3G256I3
+                // Compact-RESIDENT Opus (HIPFIRE_OQ_COMPACT_RESIDENT): identical
+                // AWQ contract to Oq8G256 above — it is the same artifact, just
+                // left in 4.25 b/w blocks instead of expanded to int8 at load.
+                // Omitting these two is why whole-model compact residency served
+                // garbage: expanding hit the Oq8G256 arm and got x/s, staying
+                // compact silently dropped it and served W*s against undivided
+                // x. Same failure the Qtip3G256I3 arm above records.
+                | DType::OqCompactG256
+                | DType::OqCompactG128
         )
     }
 }

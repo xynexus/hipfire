@@ -254,6 +254,11 @@ fn dflash_moe_draft_ffn_graph_eligible(
 }
 
 fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
+    // Bisection hook: force the non-batched lm_head route to separate a bad
+    // batched-lm_head arm from a bad batched verify BODY.
+    if std::env::var("HIPFIRE_DFLASH_NO_BATCHED_LMHEAD").as_deref() == Ok("1") {
+        return false;
+    }
     matches!(
         dtype,
         hipfire_rdna::DType::Q8_0
@@ -262,6 +267,18 @@ fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
             | hipfire_rdna::DType::MQ3G256
             | hipfire_rdna::DType::HFQ6G256
             | hipfire_rdna::DType::MQ6G256
+            // Opus Quant: every oq* artifact resolves to one of these three
+            // after `oq8_arch_load`, and `dflash_enqueue_verify_lm_head` now
+            // has arms for all of them.
+            | hipfire_rdna::DType::Oq8G256
+            | hipfire_rdna::DType::OqCompactG256
+            | hipfire_rdna::DType::OqCompactG128
+            // Unquantized targets. These are the reference dtype for the
+            // verify body, which makes a bf16 dense target the control that
+            // separates "dense" from "Opus" in the dense-Opus miscompute
+            // (docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md).
+            | hipfire_rdna::DType::BF16
+            | hipfire_rdna::DType::Bf16L3
     )
 }
 
@@ -366,6 +383,123 @@ fn dflash_enqueue_verify_lm_head(
                 w_out.k,
                 b,
             )?;
+        }
+        // Opus Quant W8A8 lm_head. Same three steps `weight_gemm` runs for
+        // these dtypes — AWQ-aware FWHT rotate, int8 activation quantize,
+        // grouped-iu8 WMMA — but against VerifyScratch buffers, because this
+        // enqueues into a CAPTURED graph and `weight_gemm` allocates xq/xs per
+        // call. Every Opus artifact (oq4/oq4.25/oq8, ++ variants) lands on one
+        // of these two dtypes after `oq8_arch_load`, so this is what unblocks
+        // DFlash on the whole family; before it they fell to the per-row GEMV
+        // that hangs verify.
+        hipfire_rdna::DType::Oq8G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(
+                w_out.k % GROUP,
+                0,
+                "Oq8G256 verify lm_head: K must be % 256"
+            );
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch undersized for Opus lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let ng = w_out.k / GROUP;
+            gpu.ensure_mq_signs()?;
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            let xq = verify_scratch.act_q.sub_offset(0, b * w_out.k);
+            let xs = verify_scratch.act_s.sub_offset(0, b * ng);
+            weights::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.quantize_act_oq8(&rot, &xq, &xs, b, w_out.k, GROUP)?;
+            let ws = w_out.buf.sub_offset(w_out.m * w_out.k, w_out.m * ng * 4);
+            gpu.gemm_oq8_grouped_wmma(
+                &w_out.buf,
+                &ws,
+                &xq,
+                &xs,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+                GROUP,
+            )?;
+        }
+        // Compact-resident Opus: identical math, but the weight stays in
+        // OqPlusCompact blocks and the kernel decodes nibbles + sparse overlay
+        // per tile. `block_stride` is derived from the buffer, as in the GEMV
+        // dispatch arm.
+        hipfire_rdna::DType::OqCompactG256 | hipfire_rdna::DType::OqCompactG128 => {
+            let group = if w_out.gpu_dtype == hipfire_rdna::DType::OqCompactG256 {
+                256usize
+            } else {
+                128usize
+            };
+            assert_eq!(
+                w_out.k % group,
+                0,
+                "compact verify lm_head: K must be % group"
+            );
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch undersized for compact Opus lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let ng = w_out.k / group;
+            let blocks = w_out.m * ng;
+            if blocks == 0 || w_out.buf.byte_size() % blocks != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "compact verify lm_head: buffer length is not a whole number of blocks",
+                ));
+            }
+            let block_stride = w_out.buf.byte_size() / blocks;
+            gpu.ensure_mq_signs()?;
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            let xq = verify_scratch.act_q.sub_offset(0, b * w_out.k);
+            let xs = verify_scratch.act_s.sub_offset(0, b * ng);
+            weights::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.quantize_act_oq8(&rot, &xq, &xs, b, w_out.k, group)?;
+            gpu.gemm_oq_compact_grouped_wmma(
+                &w_out.buf,
+                &xq,
+                &xs,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+                group,
+                block_stride,
+            )?;
+        }
+        // BF16 / Bf16L3 lm_head. No rotation, no activation quantize — the
+        // same two calls `weight_gemm` makes, and the f32->bf16 staging buffer
+        // they share is scratch-resident (grown, never freed under a live
+        // graph), so this stays capture-safe.
+        hipfire_rdna::DType::BF16 => {
+            gpu.gemm_bf16_x_bf16_wmma(
+                &w_out.buf,
+                final_hidden,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        hipfire_rdna::DType::Bf16L3 => {
+            if b >= 16 {
+                gpu.gemm_bf16l3_wmma_coop(
+                    &w_out.buf,
+                    final_hidden,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            } else {
+                gpu.gemm_bf16l3_xf32(&w_out.buf, final_hidden, &logits_batch, w_out.m, w_out.k, b)?;
+            }
         }
         other => {
             return Err(hip_bridge::HipError::new(
@@ -5398,6 +5532,14 @@ pub struct VerifyScratch {
     /// FWHT-rotated hidden for MQ4 lm_head path, [max_n × hidden_k] F32.
     /// Allocated unconditionally; unused on non-MQ4 targets.
     pub rot: GpuTensor,
+    /// int8 activations for the Opus (W8A8) lm_head path, [max_n × hidden_k].
+    /// Preallocated for the same reason as `rot`: the verify lm_head runs
+    /// inside a captured graph, so `weight_gemm`'s per-call `alloc_tensor` for
+    /// xq/xs cannot be used here. Unused on non-Opus targets.
+    pub act_q: GpuTensor,
+    /// Per-group activation scales for the Opus lm_head path, [max_n × ng] F32
+    /// where ng = hidden_k / 256.
+    pub act_s: GpuTensor,
     /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
     pub argmax: GpuTensor,
     /// Persistent per-layer batch scratch for `qwen35::forward_prefill_batch`.
@@ -5426,6 +5568,9 @@ impl VerifyScratch {
             final_hidden: gpu.alloc_tensor(&[max_n * dim], hipfire_rdna::DType::F32)?,
             logits: gpu.alloc_tensor(&[max_n * vocab], hipfire_rdna::DType::F32)?,
             rot: gpu.alloc_tensor(&[max_n * hidden_k], hipfire_rdna::DType::F32)?,
+            act_q: gpu.alloc_tensor(&[max_n * hidden_k], hipfire_rdna::DType::Raw)?,
+            act_s: gpu
+                .alloc_tensor(&[max_n * (hidden_k / 256).max(1)], hipfire_rdna::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], hipfire_rdna::DType::F32)?,
             prefill_batch: None,
         })
@@ -5453,6 +5598,8 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.final_hidden);
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
+        let _ = gpu.free_tensor(self.act_q);
+        let _ = gpu.free_tensor(self.act_s);
         let _ = gpu.free_tensor(self.argmax);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
@@ -6615,6 +6762,20 @@ fn verify_dflash_block_inner(
         );
     }
 
+    // HIPFIRE_DFLASH_VERIFY_DEBUG=1: the block's inputs and its per-position
+    // argmax, side by side. Slot 0's argmax is the target's OWN next token for
+    // the already-committed prefix — it is what plain decode would emit at
+    // `start_pos`, so a mismatch there localizes the dense-DFlash miscompute to
+    // the verify forward itself rather than to acceptance or rollback.
+    if std::env::var("HIPFIRE_DFLASH_VERIFY_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[verify-dbg] start_pos={start_pos} b={b} mode={} in={:?} argmax={:?}",
+            vg_mode.as_str(),
+            &draft_tokens[..b.min(8)],
+            &argmax_per_pos[..argmax_per_pos.len().min(8)],
+        );
+    }
+
     Ok(DflashVerifyOutput {
         argmax_per_pos,
         logits_per_pos,
@@ -7362,6 +7523,20 @@ pub fn spec_step_dflash(
         .as_ref()
         .map(|pbs| pbs.moe_router_logits_batch.is_some())
         .unwrap_or(true);
+    // `prefill_batch_pbs_eligible` alone is NOT what the forward gates on.
+    // `forward_prefill_batch_with_pbs_opts` additionally requires a batched-
+    // capable KV tier (`!kv_f32`, plus no asym2+tree), and on a miss it drops to
+    // the tape-less per-token loop "leaving any passed tape stale" — its words.
+    // Consulting only the base predicate here made spec-decode believe a tape
+    // had been captured when none was, and replay a STALE one.
+    //
+    // That is the dense-Opus garbage: Qwen3.8-27B runs fp32 KV, so base=true but
+    // final=false, the two disagreed, and committed tokens came off a stale GDN
+    // tape ('嘟 plain' at 0.34 tok/s). Qwen3.5-35B-A3B is correct because it
+    // reports base=false — the predicates happen to AGREE there, not because MoE
+    // is special. Mirror the forward's condition so they cannot diverge again.
+    let kv_batched_capable =
+        target.kv_cache.quantized || target.kv_cache.quant_q8 || target.kv_cache.quant_hfq4;
     let verify_populates_tape = qwen35::prefill_batch_pbs_eligible(
         &target.weights,
         &target.config,
@@ -7369,7 +7544,7 @@ pub fn spec_step_dflash(
         b,
         gpu.arch.as_str(),
         moe_router_logits_present,
-    );
+    ) && kv_batched_capable;
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
     let trace_position = dflash_trace_position_from_env();

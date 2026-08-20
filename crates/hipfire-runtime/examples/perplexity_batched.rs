@@ -413,10 +413,10 @@ fn read_hfqm_ref(path: &str) -> HfqmRef {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect()
     };
-    let tokens = u32s(blob("kldref.tokens"));
-    let top_indices = u32s(blob("kldref.top_indices"));
-    let top_log_probs = f32s(blob("kldref.top_log_probs"));
-    let residual_mass = f32s(blob("kldref.residual_mass"));
+    let tokens = u32s(&blob("kldref.tokens"));
+    let top_indices = u32s(&blob("kldref.top_indices"));
+    let top_log_probs = f32s(&blob("kldref.top_log_probs"));
+    let residual_mass = f32s(&blob("kldref.residual_mass"));
     assert_eq!(tokens.len(), n_chunk * n_ctx, "kldref.tokens length");
     assert_eq!(
         top_indices.len(),
