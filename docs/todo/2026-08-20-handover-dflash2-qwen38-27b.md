@@ -36,11 +36,29 @@ calib artifact is reusable.
 
 ## NOT done
 
-* DFlash2 conv + candidate-selector RUNTIME kernels. These are validatable in
-  isolation with a parity example (see `parity_gemm_oq_compact.rs` for the
-  shape) even while the bug below blocks end-to-end use — that is the
-  recommended way in, since it does not depend on the verify path.
-* Any Qwen3.8-27B DFlash performance number.
+* **DFlash2 candidate selector.** The GPU kernel exists and is parity-checked
+  (`dflash2_candidate_selector`, max|Δ|=2.98e-8, argmax match), the codebooks are
+  carried BF16 in the artifact, but the draft path still takes a per-position
+  argmax where the reference traces a greedy path through the top-16 candidates.
+  Costs ACCEPTANCE RATE only — spec-decode is lossless — and the loader warns.
+  Plugs in where `spec_step_dflash` takes its argmax over the draft logits; needs
+  a top-16 (`topk_logsumexp_batched_f32` is capped at k≤8 today), a gather of the
+  predecessor/successor codebook rows, and the sequential per-position kernel.
+* Any Qwen3.8-27B DFlash2 acceptance or performance number — blocked on the
+  dense hand-decode-path bug below, not on DFlash2.
+
+## Done since
+
+* **Conv wiring** (`5169cbb59`): `attention_conv` / `mlp_conv` run per layer,
+  `prepare()` after the layernorm and `finish()` on the block output before the
+  residual add. `kernel_projection` is split into its prepare/finish halves at
+  LOAD by row range, so each side is a contiguous GEMM — the fused tensor's two
+  halves interleave per position and no conv kernel can read that directly.
+* `dflash_convert` keeps `base_kernel` F32 and `kernel_projection` +
+  selector codebooks/projection BF16 (932 -> 1209 MiB). Row-slicing needs dense,
+  and 4-bit rounding on a rank-256 codebook lands straight on the score.
+* Artifact built: `~/.hipfire/drafts/Qwen3.8-27B--dflash2.oq4+.hfq`. Loads,
+  `block=8`, draft=84 ms/cycle vs DFlash1's 197 ms at B=16.
 
 ## The open bug — ROOT-CAUSED 2026-08-20
 
