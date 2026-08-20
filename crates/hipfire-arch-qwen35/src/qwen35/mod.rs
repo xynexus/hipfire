@@ -2101,7 +2101,17 @@ pub fn prefill_batch_pbs_eligible(
     // no compact writer, and the small-B spec-decode VERIFY (n = K+1) has no
     // compact path either — n > 32 is the same boundary this file already uses
     // to separate that verify from a seed prefill.
-    let allow_compact = !tape_in_play && n > 32;
+    // HIPFIRE_PROBE_COMPACT_HIDDEN=1 additionally drops the seed-vs-verify size
+    // gate so the small-B spec-decode VERIFY can batch. MEASUREMENT ONLY — it is
+    // known to cost acceptance (0.482 -> 0.286 on Qwen3.8-27B/DFlash2) via the
+    // KV-quantization prefill-path fork, and to buy only +7.8% because compact's
+    // batched path amortizes ~1.6x where bf16's amortizes ~5x. See
+    // docs/plans/2026-08-21-compact-batched-prefill-blocker.md.
+    let allow_compact = if std::env::var("HIPFIRE_PROBE_COMPACT_HIDDEN").is_ok() {
+        !tape_in_play && n >= 2
+    } else {
+        !tape_in_play && n > 32
+    };
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of

@@ -351,3 +351,40 @@ NOT a usable workaround: running fp32 KV to dodge it. The F4 guard in
 `forward_prefill_batch_with_pbs_opts` forces per-token fallback for f32 KV
 ("F32 KV has only BatchEq(1) -> MissingImpl at resolve"), so the one tier where
 the paths agree is also the one tier that cannot batch.
+
+## Batched verify MEASURED — it is necessary but not sufficient
+
+Forced the small-B verify to batch (`HIPFIRE_PROBE_COMPACT_HIDDEN=1`) on
+Qwen3.8-27B oq4.25++ / DFlash2, 32 tokens:
+
+    verify per-token, q8 KV    4.49 tok/s   tau 3.375   accept 0.482
+    verify BATCHED,   q8 KV    4.84         tau 2.000   accept 0.286
+    verify BATCHED,   kvarn    4.81         tau 2.000   accept 0.286
+
+TWO results, both needed to plan the real fix.
+
+**Batching the verify buys only +7.8%, not the ~8x the arithmetic predicts.**
+Compact's batched path amortizes about 1.6x (prefill 15.2 -> 24.5) where bf16's
+amortizes about 5x (2B: 20.8 -> 104.7). The compact arms added here are UNFUSED —
+separate GEMMs plus residual adds, mirroring the Oq8 arms — while the admitted
+dtypes have fused QKVZA and gate+up kernels. So the verify still costs ~5 sweeps
+rather than ~1.
+
+**Acceptance drops 0.482 -> 0.286 (tau 3.375 -> 2.000)**, which is the KV-tier
+prefill-path fork above, now priced end-to-end. Note it costs the same under q8
+as under kvarn even though the hidden divergence differs 54x — so acceptance is
+not simply proportional to that norm.
+
+Net: spec-decode remains ~3x slower than plain decode either way, and the earlier
+tau/B proof is not the whole story. THREE things must land together:
+
+1. Fused compact QKVZA + gate+up prefill kernels, so the batched path amortizes
+   like bf16's rather than 1.6x.
+2. Match batched KV write/read granularity to the per-token fallback, so
+   acceptance survives batching.
+3. Then re-measure. With verify at bf16-like amortization (613 -> ~123 ms) and
+   tau preserved at 3.375, a cycle is ~175 ms => ~19 tok/s against 15.1 plain,
+   and the draft's own 52 ms becomes the next target.
+
+Doing (1) or (2) alone is measurably not enough, which is the point of recording
+both numbers.
