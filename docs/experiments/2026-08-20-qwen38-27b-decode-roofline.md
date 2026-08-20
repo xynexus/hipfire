@@ -141,3 +141,56 @@ rotation — `weight_gemv`'s own tail warns that routing a prerotated dtype thro
 effectively-unrotated activations to the prerotated kernel (garbage logits)",
 which matches the symptom exactly: finite, wrong, and only on the one projection
 whose activation the caller has already rotated.
+
+## Double rotation: REFUTED. And both compact kernels are innocent.
+
+`HIPFIRE_DOWN_TRACE=1` instruments `weight_gemv_swiglu_residual`'s `_` arm — the
+one `down_proj` takes — and prints what the GEMV is actually handed. Same prompt,
+same seed, first three decode calls:
+
+    expanded  dtype=Oq8G256       m=5120 k=17408 awq_scale=true mq_x_rot_elems=32768
+    compact   dtype=OqCompactG256 m=5120 k=17408 awq_scale=true mq_x_rot_elems=32768
+
+So, against the hypothesis:
+
+* **the AWQ sidecar IS attached** in both — `supports_awq_sidecar` already lists
+  `OqCompactG256`/`G128`, and its comment records that omitting them was a
+  previous incarnation of exactly this bug;
+* **the shared rotation scratch is big enough** — 32768 elems against K=17408, no
+  overrun;
+* **both dtypes take the SAME code path** — neither `weight_gemv_residual` nor
+  `weight_gemv_swiglu_residual` has an Opus arm, so both fall to the identical
+  `_` fallback. There is no second rotation to double-apply.
+
+**Double rotation is refuted.** And both compact kernels are now proven correct at
+`down_proj`'s geometry:
+
+* `parity_gemv_oq_compact` (new): the decode GEMV, ~4.4e-7 rel at
+  `[5120, 17408]` and at double the K;
+* `parity_gemm_oq_compact` (extended): the batched GEMM, **bit-identical** at
+  `[512, 17408]` for B=1 and B=9 across N_out 1/3/7/16 and both group sizes. Its
+  previous shapes topped out at **K=3584**, so the entire large-K regime was
+  untested — down_proj is K=17408.
+
+Also eliminated by reading: `oqplus_compact_to_oq8_combined` performs exactly the
+expansion the parity reference does (sign-extended nibbles + sparse overlay, no
+AWQ folding, same `block_bytes = len / n_groups` derivation, which is an exact
+136 for both `down_proj` and `gate_proj`); and `weight_gemm` has no compact arm
+but its fallback is a per-token `weight_gemv` loop, i.e. correct-but-slow.
+
+## Still open
+
+The trace shows `down_proj`'s INPUT already differs at the first decode call —
+absmax 4.62e-1 expanded against 3.58e0 compact — and `gate`/`up` are expanded in
+BOTH runs under `ONLY_K=17408`. So the divergence is inherited from prefill,
+which ran 64 layers with a compact `down_proj` before decode began. That is
+consistent, but it does NOT localize the fault, because the batched kernel
+prefill uses is bit-identical at this shape.
+
+What that leaves: something in the prefill/batched CALL SITE that differs by
+dtype without either kernel being wrong — the activation-rotation or
+activation-quantize stage feeding the compact path, or a `block_stride` /
+routing decision made somewhere other than the two dispatchers already checked.
+Next probe should dump per-layer hidden state during PREFILL (not decode) for the
+two dtypes and find the first layer that diverges; the `--gemm-pattern`-style
+isolation is exhausted, since both kernels pass.

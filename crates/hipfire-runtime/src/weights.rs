@@ -1376,6 +1376,50 @@ pub fn weight_gemv_swiglu_residual(
         _ => {
             // Non-MQ fallback: plain two-step.
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+            // HIPFIRE_DOWN_TRACE=1: the down_proj call site, which is the only
+            // projection reached through this function and the only class that
+            // breaks under compact residency. Prints what the GEMV is actually
+            // handed — dtype, whether the AWQ sidecar survived load, and the
+            // size of the SHARED rotation scratch against this weight's K,
+            // which is the one thing about down_proj that is unlike every other
+            // projection (K = FFN intermediate, not hidden).
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trace =
+                *TRACE.get_or_init(|| std::env::var("HIPFIRE_DOWN_TRACE").as_deref() == Ok("1"));
+            let stamp = |gpu: &mut Gpu, tag: &str, t: &GpuTensor, n: usize| {
+                let v = gpu.download_f32(t).unwrap_or_default();
+                let n = n.min(v.len());
+                let sum: f64 = v[..n].iter().map(|&a| a as f64).sum();
+                let amax = v[..n].iter().fold(0f32, |m, &a| m.max(a.abs()));
+                eprintln!("      {tag}: len={n} sum={sum:.6e} absmax={amax:.6e}");
+            };
+            if trace {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let i = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i < 3 {
+                    let rot = gpu.mq_x_rot.as_ref().map(|t| t.buf.size() / 4).unwrap_or(0);
+                    eprintln!(
+                        "[down] call={i} dtype={:?} m={} k={} awq_scale={} mq_x_rot_elems={} (need k={})",
+                        w_down.gpu_dtype,
+                        w_down.m,
+                        w_down.k,
+                        w_down.awq_scale.is_some(),
+                        rot,
+                        w_down.k,
+                    );
+                    stamp(gpu, "down_in (silu(gate)*up)", ffn_hidden_scratch, w_down.k);
+                    let r = weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x);
+                    stamp(gpu, "down_out+residual", x, w_down.m);
+                    let rot2 = gpu.mq_x_rot.as_ref().map(|t| t.buf.size() / 4).unwrap_or(0);
+                    if rot2 < w_down.k {
+                        eprintln!(
+                            "      !! mq_x_rot holds {rot2} elems but K={} — OVERRUN",
+                            w_down.k
+                        );
+                    }
+                    return r;
+                }
+            }
             weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
         }
     }

@@ -110,6 +110,16 @@ fn main() {
             (1024, 3584, 1),
             (512, 1024, 1),
             (512, 1024, 2),
+            // Qwen3.8-27B down_proj: K = the FFN intermediate, 17408. Every
+            // shape above tops out at K=3584, so the whole large-K regime was
+            // untested — and down_proj is the ONE class that serves garbage
+            // under HIPFIRE_OQ_COMPACT_RESIDENT while gate/up, qkv and lm_head
+            // (all K=5120) are fine. M is trimmed; K is the axis under test.
+            (512, 17408, 1),
+            (512, 17408, 9),
+            // Same M, ordinary K — the control that separates "large K" from
+            // "this M".
+            (512, 5120, 1),
         ] {
             for &n_out in &[1usize, 3, 7, 16] {
                 // Power-of-two scales are exact in f16 AND exact under f32 multiply, so
