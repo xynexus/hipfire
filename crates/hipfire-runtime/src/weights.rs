@@ -400,6 +400,57 @@ fn capture_at_weight_gemm_wrapper(dtype: DType) -> bool {
     dtype != DType::BF16
 }
 
+/// `HIPFIRE_DOWN_TRACE=1` — direct check for a DOUBLE FWHT on the down_proj
+/// activation. The FWHT used here is involutory, so applying it twice returns a
+/// vector PROPORTIONAL to the input. Cosine similarity between `x` and the
+/// rotated `xr` therefore separates the two cases cleanly:
+///   |cos| ~ 1  -> xr is (a scaling of) x  => rotated twice, or not at all
+///   |cos| ~ 0  -> genuinely rotated once
+/// Only fires for down_proj's K, and only for the first couple of calls.
+fn trace_rotation(gpu: &mut Gpu, tag: &str, w: &WeightTensor, x: &GpuTensor, xr: &GpuTensor) {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*TRACE.get_or_init(|| std::env::var("HIPFIRE_DOWN_TRACE").as_deref() == Ok("1")) {
+        return;
+    }
+    if w.k != 17408 {
+        return;
+    }
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2 {
+        return;
+    }
+    let (a, b) = match (gpu.download_f32(x), gpu.download_f32(xr)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return,
+    };
+    let n = w.k.min(a.len()).min(b.len());
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for i in 0..n {
+        dot += a[i] as f64 * b[i] as f64;
+        na += (a[i] as f64).powi(2);
+        nb += (b[i] as f64).powi(2);
+    }
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[rot] {tag} dtype={:?} k={} awq={} |x|={:.4e} |xr|={:.4e} cos(x,xr)={:+.6} {}",
+        w.gpu_dtype,
+        w.k,
+        w.awq_scale.is_some(),
+        na.sqrt(),
+        nb.sqrt(),
+        cos,
+        if cos.abs() > 0.9 {
+            "<== DOUBLE-ROTATED or NOT rotated"
+        } else {
+            "(rotated once)"
+        }
+    );
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -681,6 +732,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             gpu.ensure_mq_signs()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            trace_rotation(gpu, "generic-_", w, x, &xr);
             // xr is ALREADY FWHT-rotated by rotate_x_mq_for above. Use the
             // Prerotated GEMV directly — calling run_auto here would re-rotate
             // (dtype_rotation_plan(MQ*) != None), double-applying the involutory
