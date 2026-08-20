@@ -55,7 +55,8 @@ should be preferred over memory-derived mapping guesses.
   on gfx1100 is ±10–15%. A "+8% win" measured by editing code +
   re-running in the same shell is inside the noise band. Use
   `scripts/probe_commits.sh <baseline> <candidate>` for cross-process
-  measurement.
+  measurement — it builds each commit in a scratch git worktree and
+  never touches your working tree, so it is safe to run dirty.
 - **Bisect against the committed baseline, not against your last
   bench run.** This is how the nontemporal-load fake +2% got caught
   as an actual −13%. See `case-studies.md` §2.
