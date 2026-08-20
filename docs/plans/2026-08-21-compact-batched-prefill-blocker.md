@@ -1,5 +1,11 @@
-# Compact-resident Opus is excluded from batched prefill — and that is why
+# Compact-resident Opus was excluded from batched prefill — and that is why
 # spec-decode has never won on this family
+#
+# STATUS: FIXED for the dense DeltaNet + FullAttention path (commit
+# `feat(qwen35): batched prefill for compact Opus`). Prefill 15.1 -> 24.5 tok/s
+# at 128 tokens, decode unchanged, generated text character-identical to the
+# per-token path. The scope estimate below turned out to be wrong in the useful
+# direction — read the RESOLUTION section at the end before the estimate.
 
 Found while opening Phase 2 of
 `docs/plans/2026-08-21-qwen38-27b-peak-performance-goal.md`. It is a Phase 2
@@ -99,8 +105,15 @@ Scope of the real fix:
   (`rotate_x_mq_batched_for` then `gemm_oq_compact_act_batched`), so the
   per-call-site pattern is known.
 
-Not attempted here: turning a working-but-slow path into 70 half-wired call
-sites is how silent corruption ships. The probe was reverted.
+**That scope estimate was wrong.** It counted every call site in the file,
+including the MoE chains a dense model never reaches, and it assumed the compact
+GEMM entry points did not exist. They did:
+`gemm_oq_compact_residual_act_batched` and `gemm_oq_compact_act_batched` were
+already implemented and unused. The dense path needed SEVEN arms, each a
+one-for-one mirror of the Oq8 arm beside it, plus one new helper
+(`gemm_oq_compact_grouped_prequant`) so gate+up and q/k/v share a single
+activation quantize. Walking the loud guard one site at a time made it safe to
+do incrementally.
 
 ## Expected payoff
 
@@ -112,11 +125,37 @@ sites is how silent corruption ships. The probe was reverted.
   evaluating JetSpec / DFlare / DART / SSD, all of which assume K-token verify
   costs about one weight read.
 
-## Order of work
+## RESOLUTION (same day)
 
-1. Wire the compact arm at the plain + residual GEMM call sites.
-2. Add fused compact QKVZA and gate+up kernels.
-3. Validate batched vs per-token prefill logits on this model before trusting
-   any spec-decode number measured on top of it.
-4. Only then re-run DFlash/DFlash2 and unpark the drafts.
+DONE for the dense DeltaNet + FullAttention path:
+
+    prefill 128    15.1 -> 24.5 tok/s   (+62%)
+    prefill 512    14.8 -> 23.6         (+59%)
+    decode         70.67 -> 70.74 ms/token — unchanged
+
+Greedy generation through the daemon is CHARACTER-IDENTICAL between the batched
+and per-token paths; parity_gemv_oq_compact and parity_gemm_oq_compact pass; MoE
+compact is untouched (its FFN admission list keeps it on its own path).
+
+Prefill plateaus near ~24 tok/s rather than scaling with N because the DeltaNet
+recurrence is still sequential per token. Batching amortizes every NON-DeltaNet
+kernel; a chunked/parallel-scan DeltaNet is what would lift the plateau.
+
+KNOWN INTERACTION, measured, unexplained: with the opt-in two-stage lm_head ALSO
+enabled, running the batched prefill costs decode 6.4% (65.86 -> 70.08
+ms/token). It is allocation ORDER, not the prefill work — with two-stage off the
+two paths measure 67.35 vs 67.42. Padding the 318 MB coarse tier to a 2 MiB
+boundary does NOT move it, so it is physical placement on this UMA APU rather
+than base alignment.
+
+## Still open
+
+1. MoE routed/shared-expert chains still have no compact arms — MoE compact
+   models keep the per-token prefill.
+2. Fused compact QKVZA and gate+up kernels still do not exist; the dense path
+   uses the unfused arms, which is why prefill gains 60% and not more.
+3. The two-stage-lm_head allocation interaction above.
+4. Spec-decode is now worth re-measuring for the first time: re-run
+   DFlash/DFlash2 and consider unparking the drafts. Note the bar moved — dense
+   decode is 15.1 tok/s now, not the 7.50 those numbers were taken against.
 
