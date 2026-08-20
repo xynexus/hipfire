@@ -131,3 +131,49 @@ many waves per block, each owning a 16-row tile, block-cooperative staging, and
 an LDS budget that keeps enough waves resident (16 waves x 16 rows x 256 B is
 64 KB, so it has to stage in K-chunks). That is a kernel rewrite, not a tweak,
 and it is worth ~1.5x on 69 % of DFlash verify's GPU time.
+
+## Multi-wave blocks: the cheap +12 %
+
+The scoping above put ~8 % within reach without changing the access shape, by
+running several waves per block so there are several independent WMMA chains to
+hide the scattered read's latency. Implemented (`gemm_oq8_grouped_wmma_mw`, no
+LDS, block width from `blockDim.x`) and measured cold on gate/up `[17408, 5120]`
+at B=9:
+
+| waves/block | 1 | 2 | 4 | **8** | 16 |
+|---|---|---|---|---|---|
+| GB/s | 141.0 | 148.8 | 150.3 | **158.4** | 154.5 |
+
+**+12 %** on the tall-thin shape, and `down` / `o_proj` are flat within noise, so
+8 waves is now the default (`HIPFIRE_OQ8_GEMM_MW`, 0 selects the original
+one-wave kernel). Byte-exact — same reads, same math, only the block's wave count
+changes.
+
+End-to-end on Qwen3.8-27B oq4.25++ + CASK with DFlash2, q8 KV, at the post-BIOS
+memory clock (256 GB/s peak):
+
+| | verify/cycle | decode |
+|---|---|---|
+| 1 wave | 213 ms | 4.91 tok/s |
+| **8 waves** | **197 ms** | **5.04 tok/s** |
+| plain decode, no draft | — | 8.00 tok/s |
+
+Identical output text, same tau. Verify is now **197 ms against the 978 ms this
+started at** — a 5.0x reduction across the M-slab and multi-wave changes together.
+
+DFlash is still a net loss (5.04 against 8.00) because acceptance is the binding
+constraint now, not verify: at tau=2.05 the cycle commits ~3 tokens for
+`draft 74 + verify 197 + replay 3x131` ms. The ceiling at perfect acceptance is
+`(74 + 197) / 8` = 34 ms/token = **29 tok/s against 8.00, a 3.6x** — so the
+remaining work is the drafter (the unapplied DFlash2 candidate selector) and
+`replay`, not the GEMM.
+
+## Latent: the compact GEMM has the same shape
+
+`gemm_oq_compact_grouped_wmma` launches `grid_m = m.div_ceil(16)` — a single
+launch over all of M, exactly the shape that collapsed here. It did not appear in
+the Qwen3.8-27B profile (that model's body is Oq8G256, and compact is only its
+lm_head), so it is latent rather than hot, but any compact-resident Opus model
+will hit it on a tall projection. The M-slab transformation is shape-only and
+provably bit-identical, so porting it there is cheap; it just needs the same
+`m_all` / `m_base` kernel parameters and a placement parity case.

@@ -90,3 +90,77 @@ extern "C" __global__ void gemm_oq8_grouped_wmma(
         }
     }
 }
+
+// Multi-wave twin of the kernel above. Identical math, identical reads, one
+// change: WAVES waves per block, each owning its own 16-row tile, so a block
+// covers WAVES*16 rows and there are WAVES independent WMMA chains in flight.
+//
+// This does NOT fix the scattered weight read — lane L still holds row L,
+// because that is what `v_wmma_i32_16x16x16_iu8_w32` requires. Fixing that needs
+// LDS staging, which was implemented and measured SLOWER (101 GB/s against 140;
+// the coalescing does not pay for the barrier and the round-trip at these
+// sizes). What this buys is latency hiding only: measured on the read pattern
+// alone, 148.6 -> 160.7 GB/s, about +8%.
+//
+// Block width comes from `blockDim.x`, so the caller sweeps it without a
+// recompile. No LDS, so occupancy is unchanged.
+__launch_bounds__(512, 1)
+extern "C" __global__ void gemm_oq8_grouped_wmma_mw(
+    const int8_t*  __restrict__ W,
+    const float*   __restrict__ Ws,
+    const int8_t*  __restrict__ X,
+    const float*   __restrict__ Xs,
+    float*         __restrict__ Y,
+    int M, int K, int B, int group,
+    int m_all, int m_base
+) {
+    const int waves = blockDim.x >> 5;
+    const int wave  = threadIdx.x >> 5;
+    const int tid   = threadIdx.x & 31;     // lane within the wave
+    const int lane  = tid & 15;
+
+    const int row_start   = (blockIdx.x * waves + wave) * 16;
+    const int batch_start = blockIdx.y * 16;
+    if (row_start >= M || batch_start >= B) return;
+
+    const int a_row  = row_start + lane;
+    const int x_row  = batch_start + lane;
+    const int safe_a = (a_row < M) ? a_row : (M - 1);
+    const int safe_x = (x_row < B) ? x_row : (B - 1);
+    const int n_groups = K / group;
+    const int tiles_per_group = group / 16;
+
+    const int8_t* w_row  = W + (long long)safe_a * K;
+    const int8_t* x_prow = X + (long long)safe_x * K;
+
+    float8_t facc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int g = 0; g < n_groups; ++g) {
+        int32x8_t iacc = {0, 0, 0, 0, 0, 0, 0, 0};
+        const int g_off = g * group;
+        for (int kt = 0; kt < tiles_per_group; ++kt) {
+            const int32x4_t a = *(const int32x4_t*)(w_row + g_off + kt * 16);
+            const int32x4_t b = *(const int32x4_t*)(x_prow + g_off + kt * 16);
+            iacc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, iacc, false);
+        }
+        const int b_col = batch_start + lane;
+        const float sx = (b_col < B) ? Xs[(long long)b_col * n_groups + g] : 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int m_row = row_start + 2 * j + (tid >> 4);
+            const float sw = (m_row < M) ? Ws[(long long)m_row * n_groups + g] : 0.f;
+            facc[j] += (float)iacc[j] * sw * sx;
+        }
+    }
+
+    const int out_col = batch_start + lane;
+    if (out_col < B) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < M) {
+                Y[(long long)out_col * m_all + m_base + out_row] = facc[j];
+            }
+        }
+    }
+}

@@ -371,10 +371,38 @@ impl Gpu {
             0,
             "gemm_oq8_grouped_wmma: group must be a multiple of 16"
         );
+        // Multi-wave: several 16-row WMMA tiles per block, so there are that many
+        // independent WMMA chains in flight to hide the scattered weight read's
+        // latency. Same reads, same math, composes with the row-slab below.
+        //
+        // ponytail: 8 waves, from a cold sweep on gfx1151 (gate/up [17408, 5120],
+        // B=9): 141.0 at 1 wave, 148.8 / 150.3 / **158.4** / 154.5 at 2/4/8/16.
+        // The other two production shapes are flat within noise, so this is a
+        // free +12% on the tall-thin one. `HIPFIRE_OQ8_GEMM_MW` overrides;
+        // 0 selects the original one-wave kernel.
+        static MW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let mw_waves = *MW.get_or_init(|| {
+            std::env::var("HIPFIRE_OQ8_GEMM_MW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|w| *w <= 16)
+                .unwrap_or(8)
+        });
+        let entry = if mw_waves > 0 {
+            "gemm_oq8_grouped_wmma_mw"
+        } else {
+            "gemm_oq8_grouped_wmma"
+        };
+        let (block_threads, rows_per_block) = if mw_waves > 0 {
+            ((mw_waves * 32) as u32, mw_waves * 16)
+        } else {
+            (32u32, 16usize)
+        };
+
         self.ensure_kernel(
             "gemm_oq8_grouped_wmma",
             kernels::GEMM_OQ8_GROUPED_WMMA_SRC,
-            "gemm_oq8_grouped_wmma",
+            entry,
         )?;
         let wp = w_i8.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
@@ -447,13 +475,13 @@ impl Gpu {
                 &mut ma as *mut _ as *mut c_void,
                 &mut mb as *mut _ as *mut c_void,
             ];
-            let grid_m = rows.div_ceil(16) as u32;
-            let func = &self.functions["gemm_oq8_grouped_wmma"];
+            let grid_m = rows.div_ceil(rows_per_block) as u32;
+            let func = &self.functions[entry];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [grid_m, grid_b, 1],
-                    [32, 1, 1],
+                    [block_threads, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
