@@ -24,8 +24,17 @@ use super::*;
 // The super-op handlers call the SAME helper fns the hand path uses
 // (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
 // `moe_ffn_dispatch`, `weight_gemv_swiglu_residual`) plus the inline attend/
-// recurrent/gated-norm fragments. DIAG dumps / trace_finite / hidden_rb are
-// output-neutral and omitted here (hidden_rb engages only the hand path).
+// recurrent/gated-norm fragments. Of the hand path's output-neutral extras,
+// only `trace_finite` is absent here: `hidden_rb` is extracted at the layer
+// boundary below (search `extract_slot`), and `HIPFIRE_DUMP_HIDDEN` dumps run
+// through `dump_hidden_localize` on the same boundary.
+//
+// This sentence used to say hidden_rb "engages only the hand path". That became
+// false when the lowered executor took over the extraction — which is what let
+// spec-decode verify stop routing onto the dense-broken hand arms — and it is
+// the third comment in this tree found claiming the lowered path does less than
+// it does. If you are about to route something to the hand path because a
+// comment says the lowered one cannot do it, check the code first.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// qwen35-local super-op opcodes, encoded into `OpBinding.weights[0].0`. The

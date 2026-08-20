@@ -32,7 +32,13 @@ extern "C" __global__ void gemm_oq8_grouped_wmma(
     const int8_t*  __restrict__ X,
     const float*   __restrict__ Xs,
     float*         __restrict__ Y,
-    int M, int K, int B, int group
+    int M, int K, int B, int group,
+    // Row-slab support. W/Ws are already advanced to the slab by the caller and
+    // `M` is the slab height; Y is NOT sliced, because it is [B, M_all] so a row
+    // slab is strided per output column. Launching the full M in one go collapses
+    // to ~17 GB/s on tall-thin shapes (see bench_oq8_gemm_small_n); slabs keep it
+    // near 130.
+    int m_all, int m_base
 ) {
     const int tid  = threadIdx.x;
     const int lane = tid & 15;
@@ -79,7 +85,7 @@ extern "C" __global__ void gemm_oq8_grouped_wmma(
         for (int j = 0; j < 8; ++j) {
             const int out_row = row_start + 2 * j + (tid >> 4);
             if (out_row < M) {
-                Y[(long long)out_col * M + out_row] = facc[j];
+                Y[(long long)out_col * m_all + m_base + out_row] = facc[j];
             }
         }
     }

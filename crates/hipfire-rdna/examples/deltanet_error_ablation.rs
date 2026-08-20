@@ -36,7 +36,11 @@ fn l2_norm_per_head(x: &[f32], n_tokens: usize) -> Vec<f32> {
     for t in 0..n_tokens {
         for h in 0..N_HEADS {
             let base = t * N_HEADS * HD + h * HD;
-            let n: f32 = out[base..base + HD].iter().map(|v| v * v).sum::<f32>().sqrt();
+            let n: f32 = out[base..base + HD]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
             if n > 0.0 {
                 for v in out[base..base + HD].iter_mut() {
                     *v /= n;
@@ -91,7 +95,11 @@ fn to_f16(x: f64) -> f64 {
     }
     let a = v.abs();
     if a > 65504.0 {
-        return if v < 0.0 { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if v < 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     if a < 6.103_515_6e-5 {
         // subnormal: quantise to the fixed 2^-24 grid
@@ -240,7 +248,16 @@ fn dot_tree(a: &[f64], b: &[f64], as_f32: bool) -> f64 {
     lanes[0]
 }
 
-fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32], beta: &[f32], s0: &[f32]) -> Vec<f64> {
+fn run(
+    cfg: Cfg,
+    n_tokens: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: &[f32],
+    beta: &[f32],
+    s0: &[f32],
+) -> Vec<f64> {
     let stride = N_HEADS * HD;
     let mut s: Vec<f64> = s0.iter().map(|&x| x as f64).collect();
     for t in 0..n_tokens {
@@ -270,8 +287,10 @@ fn run(cfg: Cfg, n_tokens: usize, q: &[f32], k: &[f32], v: &[f32], gate: &[f32],
                 }
                 for c in 0..HD {
                     let mut nv = if cfg.all_f16 {
-                        to_f16(to_f16(to_f16(alpha) * to_f16(s[row + c]))
-                            + to_f16(to_f16(kt[c]) * to_f16(delta)))
+                        to_f16(
+                            to_f16(to_f16(alpha) * to_f16(s[row + c]))
+                                + to_f16(to_f16(kt[c]) * to_f16(delta)),
+                        )
                     } else if cfg.upd_f32 {
                         ((alpha as f32) * (s[row + c] as f32) + (kt[c] as f32) * (delta as f32))
                             as f64
@@ -337,22 +356,157 @@ fn main() {
         let s0: Vec<f32> = lcg(6, N_HEADS * HD * HD).iter().map(|x| x * 0.1).collect();
 
         let exact = run(
-            Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false },
-            n_tokens, &q, &k, &v, &gate, &beta, &s0,
+            Cfg {
+                tile_f32: false,
+                kv_f32: false,
+                upd_f32: false,
+                out_f32: false,
+                kv_kahan: false,
+                kv_dekker: false,
+                all_f16: false,
+            },
+            n_tokens,
+            &q,
+            &k,
+            &v,
+            &gate,
+            &beta,
+            &s0,
         );
 
         let cases: [(&str, Cfg); 11] = [
-            ("all f32 (models the kernel)", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("only TILE f32", Cfg { tile_f32: true, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("only KV dot f32", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("only UPDATE f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: true, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("only OUT dot f32", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("all f32 EXCEPT tile", Cfg { tile_f32: false, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: false, all_f16: false }),
-            ("all f32 + KAHAN kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: true, kv_dekker: false, all_f16: false }),
-            ("only KV f32, KAHAN", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: true, kv_dekker: false, all_f16: false }),
-            ("all f32 + DEKKER kv", Cfg { tile_f32: true, kv_f32: true, upd_f32: true, out_f32: true, kv_kahan: false, kv_dekker: true, all_f16: false }),
-            ("only KV f32, DEKKER", Cfg { tile_f32: false, kv_f32: true, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: true, all_f16: false }),
-            ("ALL f16 (storage+arith)", Cfg { tile_f32: false, kv_f32: false, upd_f32: false, out_f32: false, kv_kahan: false, kv_dekker: false, all_f16: true }),
+            (
+                "all f32 (models the kernel)",
+                Cfg {
+                    tile_f32: true,
+                    kv_f32: true,
+                    upd_f32: true,
+                    out_f32: true,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only TILE f32",
+                Cfg {
+                    tile_f32: true,
+                    kv_f32: false,
+                    upd_f32: false,
+                    out_f32: false,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only KV dot f32",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: true,
+                    upd_f32: false,
+                    out_f32: false,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only UPDATE f32",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: false,
+                    upd_f32: true,
+                    out_f32: false,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only OUT dot f32",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: false,
+                    upd_f32: false,
+                    out_f32: true,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "all f32 EXCEPT tile",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: true,
+                    upd_f32: true,
+                    out_f32: true,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "all f32 + KAHAN kv",
+                Cfg {
+                    tile_f32: true,
+                    kv_f32: true,
+                    upd_f32: true,
+                    out_f32: true,
+                    kv_kahan: true,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only KV f32, KAHAN",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: true,
+                    upd_f32: false,
+                    out_f32: false,
+                    kv_kahan: true,
+                    kv_dekker: false,
+                    all_f16: false,
+                },
+            ),
+            (
+                "all f32 + DEKKER kv",
+                Cfg {
+                    tile_f32: true,
+                    kv_f32: true,
+                    upd_f32: true,
+                    out_f32: true,
+                    kv_kahan: false,
+                    kv_dekker: true,
+                    all_f16: false,
+                },
+            ),
+            (
+                "only KV f32, DEKKER",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: true,
+                    upd_f32: false,
+                    out_f32: false,
+                    kv_kahan: false,
+                    kv_dekker: true,
+                    all_f16: false,
+                },
+            ),
+            (
+                "ALL f16 (storage+arith)",
+                Cfg {
+                    tile_f32: false,
+                    kv_f32: false,
+                    upd_f32: false,
+                    out_f32: false,
+                    kv_kahan: false,
+                    kv_dekker: false,
+                    all_f16: true,
+                },
+            ),
         ];
         println!("\n=== {n_tokens} tokens, heads={N_HEADS}, head_dim={HD} ===");
         println!("{:<30} {:>14}", "configuration", "rel L2 err");

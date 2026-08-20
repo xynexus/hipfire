@@ -3220,6 +3220,14 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 /// accumulator; this is what makes that reference checkable. fp64 is a small
 /// fraction of fp32 rate on consumer RDNA3, so it is measured offline behind
 /// `HIPFIRE_DN_STATE_F64_ORACLE=1`.
+/// Chunkwise-parallel gated DeltaNet — `gdn_chunk_pairs` + the
+/// `gated_delta_net_f32_chunk` main pass. Resolves a chunk of tokens together
+/// instead of one at a time, so a batched prefill (and therefore spec-decode
+/// verify) stops costing N serial decodes on a DeltaNet-heavy stack. Semantics
+/// are pinned by `crate::gdn_chunk::gdn_chunked_f64`.
+pub const GATED_DELTA_NET_CHUNK_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_chunk.hip");
+
 pub const GATED_DELTA_NET_F64ACC_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f64acc.hip");
 

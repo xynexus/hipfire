@@ -117,7 +117,10 @@ fn main() {
     // Keep alpha near 1: exp(gate) multiplies the state every step, so a wide
     // gate either explodes or annihilates it and the comparison stops being
     // about precision.
-    let gate: Vec<f32> = lcg(4, N_TOKENS * N_HEADS).iter().map(|x| x * 0.02).collect();
+    let gate: Vec<f32> = lcg(4, N_TOKENS * N_HEADS)
+        .iter()
+        .map(|x| x * 0.02)
+        .collect();
     let beta: Vec<f32> = lcg(5, N_TOKENS * N_HEADS).iter().map(|x| x * 0.5).collect();
     let state0: Vec<f32> = lcg(6, N_HEADS * HD * HD).iter().map(|x| x * 0.1).collect();
 
@@ -134,10 +137,8 @@ fn main() {
         let sd = up(&mut gpu, &state0);
         let od = up(&mut gpu, &vec![0.0f32; N_TOKENS * stride]);
         let _ = oracle;
-        gpu.gated_delta_net_f32_batch_seq(
-            &qd, &kd, &vd, &gd, &bd, &sd, &od, N_TOKENS, N_HEADS, HD,
-        )
-        .unwrap();
+        gpu.gated_delta_net_f32_batch_seq(&qd, &kd, &vd, &gd, &bd, &sd, &od, N_TOKENS, N_HEADS, HD)
+            .unwrap();
         gpu.device_synchronize().unwrap();
         (
             gpu.download_f32(&sd).unwrap(),
@@ -145,15 +146,16 @@ fn main() {
         )
     };
 
-    let oracle_on = std::env::var("HIPFIRE_DN_STATE_F64_ORACLE")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let oracle_on = std::env::var("HIPFIRE_DN_STATE_F64_ORACLE").ok().as_deref() == Some("1");
     let (gpu_state, gpu_out) = run(oracle_on);
 
     let s_err = rel_err(&gpu_state, &ref_state);
     let o_err = rel_err(&gpu_out, &ref_out);
-    let label = if oracle_on { "f64acc ORACLE" } else { "f32 kernel" };
+    let label = if oracle_on {
+        "f64acc ORACLE"
+    } else {
+        "f32 kernel"
+    };
     println!("{label}: tokens={N_TOKENS} heads={N_HEADS} head_dim={HD}");
     println!("  state rel L2 err vs f64 CPU reference : {s_err:.6e}");
     println!("  output rel L2 err vs f64 CPU reference: {o_err:.6e}");
