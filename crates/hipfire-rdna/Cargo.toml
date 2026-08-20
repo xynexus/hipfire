@@ -17,3 +17,19 @@ libc.workspace = true
 [dev-dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-xdna = { path = "../hipfire-xdna" }
+
+# The gated-DeltaNet dispatch methods are behind the `deltanet` feature, so these
+# examples cannot build without it. Declaring that here keeps a bare
+# `cargo clippy --all-targets` (what the commit gate runs) green instead of
+# failing on three examples it was never able to compile.
+[[example]]
+name = "parity_gated_delta_net_f64acc"
+required-features = ["deltanet"]
+
+[[example]]
+name = "parity_gated_delta_net_f64acc_routed"
+required-features = ["deltanet"]
+
+[[example]]
+name = "parity_gdn_chunk"
+required-features = ["deltanet"]
