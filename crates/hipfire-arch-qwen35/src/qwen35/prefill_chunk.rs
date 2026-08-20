@@ -3214,7 +3214,6 @@ pub(crate) fn forward_prefill_chunk(
                         // weights are rotated offline too. Omitting it here fed the
                         // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                         | DType::Oq8G256
-                        | DType::OqCompactG256
                         // Compact-resident Opus is the same W8A8 math reading the
                         // on-disk blocks in-kernel, so it needs the rotation too.
                         | DType::OqCompactG256
