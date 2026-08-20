@@ -1498,3 +1498,81 @@ remains the byte-identity oracle.
 - `tests/AGENTS.md` — record the three measurement traps as standing verification warnings.
 - `BUGS.md` — file the `upload_raw`/`GpuPool` asymmetry independently. It is wrong today,
   not only under v2.
+
+## M0 exit measurement, 2026-08-20 — 2 of 3 criteria pass, and the third is a mis-stated criterion
+
+**M0 was already implemented.** `hipfire_runtime::exec_trace` (499 lines) has the
+preallocated ring, `TraceEvent` (`DispatchBegin`/`DispatchEnd`/`TokenEmitted`/
+`Completed`/`VramSample`), per-frame VRAM sampling, `inter_token_gaps_ns`,
+percentiles, and a `DaemonRequest::ExecutorTrace` dump. It is armed with
+`HIPFIRE_DAEMON_TRACE=1`. What had not been done is the exit measurement, which
+is what certifies the stage — so this records it.
+
+Setup: `qwen3.5-0.8b--oq4++`, 256 tokens, `temperature 0` (greedy, so both arms
+do identical work), alternating traced/untraced runs, first run of each arm
+discarded.
+
+**Deviation, stated rather than hidden.** The plan says to alternate the A/B
+"within one daemon lifetime". That is impossible as implemented: `exec_trace`
+resolves `HIPFIRE_DAEMON_TRACE` through a `OnceLock`, so the flag is fixed for
+the life of the process. Alternating traced and untraced *processes* still
+controls the position effect the instruction exists to control.
+
+### Criterion 3 — tracing overhead < 1%: **PASS**
+
+    traced  median 56.25 tok/s
+    plain   median 56.00 tok/s
+    delta   +0.45%
+
+Traced is nominally *faster*, which is noise at this separation — the honest
+reading is "no measurable cost", not "tracing helps".
+
+### Criterion 2 — reconstructed wall time within 2%: **PASS**
+
+Generate-frame dispatch span from the ring, against `tokens / tok_s` from the
+`done` frame (an independent computation inside the generate loop):
+
+| run | trace span | done frame | error |
+|---|---|---|---|
+| 1 | 4643.7 ms | 4563.3 ms | 1.76% |
+| 2 | 4551.4 ms | 4547.1 ms | **0.10%** |
+| 3 | 4560.9 ms | 4555.2 ms | **0.13%** |
+
+Run 1 carries the first-run position effect; runs 2–3 agree to ~0.1%.
+
+Note the two wrong comparisons made before this one, because both look
+reasonable and neither is: first→last `TokenEmitted` against `(tokens-1)/tok_s`
+compares a decode-only span to one that amortises prefill; and `span_ns` against
+the process wall clock compares a first-record→last-record window to something
+that includes process start, model load and teardown. **Only the enclosing
+dispatch span is the same interval the `done` frame describes.**
+
+### Criterion 1 — "exactly 255 inter-token gaps": **FAILS AS WRITTEN**
+
+256 sampled tokens produce **254 token records and 253 gaps**, identically on all
+three runs, with `dropped = 0` against a 32768 capacity. Nothing was lost; the
+count is real and deterministic.
+
+Cause: `emit_text_bytes` (`serving-core/src/events.rs`) returns early on empty
+bytes and records only on valid UTF-8 — a partial multibyte fragment is held
+back until its codepoint completes. So `TokenEmitted` counts **emitted text
+frames, not sampled tokens**, and two steps of this generation emitted no frame.
+
+The criterion assumes one token = one frame, which is false for a streaming
+UTF-8 detokenizer. But this is not purely a wording bug, and the consequence
+should be recorded rather than waved through: **a step that emits no frame folds
+its duration into the NEXT gap.** Total time is preserved — which is exactly why
+criterion 2 passes — but one interval is merged into its neighbour, so a stall
+occurring during a held-back fragment is attributed to the following token
+rather than reported on its own. p99 is therefore slightly pessimistic on the
+merged gap and blind to the hidden one.
+
+Restated so it is checkable: *one `TokenEmitted` per emitted token frame; gaps =
+frames − 1; frames ≤ sampled tokens, with the difference equal to the number of
+steps that produced no printable text.*
+
+**Fixing it properly** means recording at the sampler rather than the emitter,
+which changes what the timestamp means (token ready vs token on the wire) and
+would want both events rather than a move. That is a deliberate design choice,
+not a cleanup, so it is left for whoever needs per-step attribution — M3's
+suspension measurement is the first thing that plausibly does.
