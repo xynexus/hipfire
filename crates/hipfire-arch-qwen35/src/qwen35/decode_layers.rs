@@ -36,13 +36,22 @@ pub(crate) fn forward_scratch_layers(
     // docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md. The lowered
     // executor extracts per-layer hidden itself now, so spec-decode verify runs
     // the same forward as production decode.
-    // RoughQuant corrections are wired into THIS hand path, but the hand path is
-    // currently broken (bf16 self-KLD 13.89 vs lowered 0.000 — see
-    // docs/roughquant/phase3-real-format-scope.md). Until it is resurrected OR the
-    // correction is wired into the lowered super-op executor, route rq models to
-    // the hand path ONLY under the opt-in HIPFIRE_RQ_HAND=1 (experiments); by
-    // default rq models use the working (uncorrected) lowered path so they stay
-    // coherent. The correction stack stays as a proven, dormant foundation.
+    // RoughQuant corrections are wired into THIS hand path.
+    //
+    // This comment used to say the hand path was "currently broken (bf16 self-KLD
+    // 13.89 vs lowered 0.000)". That was true and is now FIXED: the dense DeltaNet
+    // arm was feeding its FFN the attention-normalized, pre-attention residual
+    // because it never applied `ffn_norm` (see the FFN block in that arm). Hand and
+    // lowered now agree — measured self-KLD 5.3e-10 across 2044 scored tokens, and
+    // byte-identical greedy output over 204 tokens on dense and MoE artifacts.
+    //
+    // The rq opt-in below is therefore NO LONGER about the hand path being broken.
+    // It stays because the correction is still only wired HERE and not into the
+    // lowered super-op executor, so routing rq models to the hand path by default
+    // would silently change which forward every rq model runs. Default stays
+    // lowered (uncorrected); HIPFIRE_RQ_HAND=1 opts into the corrected hand path,
+    // which is now a legitimate baseline rather than a broken one — the roughquant
+    // verdict numbers taken against it should be re-measured.
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
     if forward_lowered_enabled()
@@ -682,6 +691,31 @@ pub(crate) fn forward_scratch_layers(
                     )?;
                 }
 
+                // FFN: fused rmsnorm + rotate for w_gate/w_up.
+                //
+                // This SHADOWS the attention `x_rot` bound at the top of the arm, and
+                // it must: without it the FFN below consumed `s.tmp` / `x_rot` still
+                // holding `rmsnorm(x_pre_attention, attn_norm)` from the qkv prepare —
+                // the wrong norm WEIGHTS applied to the wrong RESIDUAL (pre-attention,
+                // missing the `wo` output added just above). `ffn_norm` was never
+                // applied at all on this arm except in the PARO branch below, which is
+                // why that branch alone looked correct.
+                //
+                // The sibling arms already did this: `FullAttn` has the identical block,
+                // and `DeltaNetMoe` normalizes with `ffn_norm` before its MoE dispatch.
+                // Only `DeltaNet`-dense was missing it — that is the whole of the
+                // "dense arms broken, MoE arms fine" asymmetry in
+                // docs/experiments/2026-08-20-dense-opus-dflash-miscompute.md, and of
+                // the bf16 self-KLD 13.89 in docs/roughquant/phase3-real-format-scope.md.
+                let x_rot = fused_rmsnorm_prepare_bases(
+                    gpu,
+                    &[&layer.w_gate, &layer.w_up],
+                    &s.x,
+                    &layer.ffn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
+                )?;
                 // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
                 let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
                     && layer.w_gate.gpu_dtype == DType::ParoQ4G128
