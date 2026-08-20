@@ -5526,6 +5526,50 @@ impl Gpu {
         )
     }
 
+    /// DFlash2 candidate-selector transition scores for one position.
+    ///
+    /// `unary` `[top_k]`, `pred`/`hp` `[rank]`, `suc` `[top_k, rank]`, `out`
+    /// `[top_k]`, all f32. Semantics pinned by
+    /// `hipfire_runtime::dflash2::selector_scores`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash2_candidate_selector(
+        &mut self,
+        unary: &GpuTensor,
+        pred: &GpuTensor,
+        hp: &GpuTensor,
+        suc: &GpuTensor,
+        out: &GpuTensor,
+        top_k: usize,
+        rank: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            top_k > 0 && rank > 0,
+            "dflash2 selector: top_k and rank must be > 0"
+        );
+        self.ensure_kernel(
+            "dflash2_candidate_selector",
+            kernels::DFLASH2_CANDIDATE_SELECTOR_SRC,
+            "dflash2_candidate_selector",
+        )?;
+        let up = unary.buf.as_ptr();
+        let pp = pred.buf.as_ptr();
+        let hpp = hp.buf.as_ptr();
+        let sp = suc.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ti = top_k as i32;
+        let ri = rank as i32;
+        self.launch_kernargs(
+            "dflash2_candidate_selector",
+            [top_k as u32, 1, 1],
+            // ONE wave: the kernel reduces with __shfl_down, which does not
+            // cross waves on RDNA (wave32). Do not raise this to 64.
+            [32, 1, 1],
+            0,
+            &kernargs![ptr up, ptr pp, ptr hpp, ptr sp, ptr op, i32 ti, i32 ri],
+        )
+    }
+
     /// DFlash2 grouped dynamic causal convolution.
     ///
     /// `h`/`y` are `[len, hidden]` f32, `d` is `[len, kernel_size, groups]` f32
