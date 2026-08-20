@@ -629,7 +629,10 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
         ];
         let grid_m = m.div_ceil(16) as u32;
-        let grid_b = batch_size.div_ceil(16) as u32;
+        // Must match OQC_NB in the kernel: one workgroup covers OQC_NB b-tiles
+        // so the decoded weight tile is reused instead of re-read per b-tile.
+        const OQC_NB: usize = 8;
+        let grid_b = batch_size.div_ceil(16 * OQC_NB) as u32;
         let func = &self.functions["gemm_oq_compact_grouped_wmma"];
         unsafe {
             self.hip.launch_kernel(

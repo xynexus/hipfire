@@ -56,6 +56,16 @@ typedef float   __attribute__((ext_vector_type(8))) float8_t;
 // this are rejected host-side by the dispatch contract, never silently clipped.
 #define OQC_MAX_OVERLAYS 32
 
+// B-tiles handled by ONE workgroup. The weight tile — nibble loads, int4 decode
+// and the overlay scan — is done ONCE and reused across all of them.
+//
+// Without this the grid is [M/16, B/16] and every b-tile re-reads the whole
+// weight tile: FETCH_SIZE measured 566 GB for a 128-token prefill that needs
+// 13.3 GB, i.e. 42x redundant, against the decode GEMV's 1.05x on the same
+// weights. That redundancy — not the decode cost, and not the WMMA rate — is why
+// this kernel ran at ~3% of int8 peak.
+#define OQC_NB 8
+
 static __device__ __forceinline__ float oqc_f16_scale(const uint8_t* block) {
     const _Float16 value = *(const _Float16*)block;
     return (float)value;
@@ -66,7 +76,10 @@ static __device__ __forceinline__ int oqc_sext4(int q) {
     return (q << 28) >> 28;
 }
 
-__launch_bounds__(32, 8)
+// Fewer resident blocks than the old (32, 8): OQC_NB accumulators cost VGPRs,
+// and the kernel is redundancy-bound rather than occupancy-bound, so trading
+// occupancy for 1/OQC_NB of the weight traffic is the right side of the deal.
+__launch_bounds__(32, 2)
 extern "C" __global__ void gemm_oq_compact_grouped_wmma(
     const uint8_t* __restrict__ W,
     const int8_t*  __restrict__ X,
@@ -77,22 +90,28 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
     const int tid  = threadIdx.x;
     const int lane = tid & 15;
     const int row_start   = blockIdx.x * 16;
-    const int batch_start = blockIdx.y * 16;
+    const int batch_start = blockIdx.y * (16 * OQC_NB);
     if (row_start >= M || batch_start >= B) return;
 
     const int a_row = row_start + lane;
-    const int x_row = batch_start + lane;
     const int safe_a = (a_row < M) ? a_row : (M - 1);
-    const int safe_x = (x_row < B) ? x_row : (B - 1);
     const int n_groups = K / group;
     const int tiles_per_group = group / 16;
     // Header = f16 scale + G/2 nibble bytes; the rest is the overlay table.
     const int header = 2 + (group >> 1);
     const int overlays = (block_stride - header) >> 1;
 
-    const int8_t* x_prow = X + (long long)safe_x * K;
-
-    float8_t facc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const int8_t* x_prow[OQC_NB];
+    int b_col_nb[OQC_NB];
+    float8_t facc[OQC_NB];
+    #pragma unroll
+    for (int nb = 0; nb < OQC_NB; ++nb) {
+        const int x_row = batch_start + nb * 16 + lane;
+        b_col_nb[nb] = x_row;
+        const int safe_x = (x_row < B) ? x_row : (B - 1);
+        x_prow[nb] = X + (long long)safe_x * K;
+        facc[nb] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
 
     // SPLIT PLANES: all nibble groups first, then all [f16 scale][overlay table]
     // side records — see `hipfire_runtime::oq8_arch::split_compact_planes`.
@@ -115,14 +134,26 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
             ov_val[e] = (int8_t)table[2 * e + 1];
         }
 
-        int32x8_t iacc = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32x8_t iacc[OQC_NB];
+        #pragma unroll
+        for (int nb = 0; nb < OQC_NB; ++nb) {
+            iacc[nb] = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+        }
         for (int kt = 0; kt < tiles_per_group; ++kt) {
             // 16 group positions [base, base+16) live in 8 packed bytes.
             const int base = kt * 16;
+            // ONE 8-byte load, not eight 1-byte loads. Lanes are strided by
+            // `nib_bytes` (a whole weight row apart), so byte-granular reads put
+            // every single load on its own cache line — measured at ~3% of int8
+            // WMMA peak. The split-plane layout makes the nibble plane 8-byte
+            // aligned (`nib_bytes` = group/2 = 128, `base >> 1` = kt*8), so this
+            // window is aligned and the ISA takes it as a dwordx2.
+            uint32_t pk[2];
+            __builtin_memcpy(pk, nibbles + (base >> 1), 8);
             int8_t q[16];
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const uint8_t packed = nibbles[(base >> 1) + i];
+                const uint8_t packed = (uint8_t)(pk[i >> 2] >> (8 * (i & 3)));
                 q[2 * i]     = (int8_t)oqc_sext4(packed & 0xf);
                 q[2 * i + 1] = (int8_t)oqc_sext4(packed >> 4);
             }
@@ -134,36 +165,50 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
                 }
             }
 
+            // ONE decoded weight tile, OQC_NB WMMAs against it.
             const int32x4_t a = *(const int32x4_t*)q;
-            const int32x4_t b = *(const int32x4_t*)(x_prow + g * group + base);
-            iacc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, iacc, false);
+            #pragma unroll
+            for (int nb = 0; nb < OQC_NB; ++nb) {
+                const int32x4_t bv =
+                    *(const int32x4_t*)(x_prow[nb] + g * group + base);
+                iacc[nb] =
+                    __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bv, iacc[nb], false);
+            }
         }
 
-        // Per-group rescale. Activation scale is per (b-col) from the Xs plane;
-        // the weight scale is the block's own f16, and each lane owns 8 distinct
-        // m-rows (acc[j]) so each needs its own row's block scale.
-        const int b_col = batch_start + lane;
-        const float sx = (b_col < B) ? Xs[(long long)b_col * n_groups + g] : 0.f;
+        // Per-group rescale. The WEIGHT scale depends only on (m_row, g), so it
+        // is fetched once and reused across every b-tile; the ACTIVATION scale is
+        // per b-col.
+        float sw[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int m_row = row_start + 2 * j + (tid >> 4);
-            float sw = 0.f;
-            if (m_row < M) {
-                // Split layout: this row's scale lives in the side plane.
-                sw = oqc_f16_scale(
-                    W + side_base
-                      + ((long long)m_row * n_groups + g) * (long long)side_stride);
+            sw[j] = (m_row < M)
+                ? oqc_f16_scale(W + side_base
+                      + ((long long)m_row * n_groups + g) * (long long)side_stride)
+                : 0.f;
+        }
+        #pragma unroll
+        for (int nb = 0; nb < OQC_NB; ++nb) {
+            const int b_col = b_col_nb[nb];
+            const float sx = (b_col < B) ? Xs[(long long)b_col * n_groups + g] : 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                facc[nb][j] += (float)iacc[nb][j] * sw[j] * sx;
             }
-            facc[j] += (float)iacc[j] * sw * sx;
         }
     }
 
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int m_row = row_start + 2 * j + (tid >> 4);
-        const int b_col = batch_start + lane;
-        if (m_row < M && b_col < B) {
-            Y[(long long)b_col * M + m_row] = facc[j];
+    for (int nb = 0; nb < OQC_NB; ++nb) {
+        const int b_col = b_col_nb[nb];
+        if (b_col >= B) continue;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int m_row = row_start + 2 * j + (tid >> 4);
+            if (m_row < M) {
+                Y[(long long)b_col * M + m_row] = facc[nb][j];
+            }
         }
     }
 }
