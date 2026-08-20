@@ -7544,6 +7544,7 @@ pub fn spec_step_dflash(
         b,
         gpu.arch.as_str(),
         moe_router_logits_present,
+        /* tape_in_play */ true,
     ) && kv_batched_capable;
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };

@@ -1145,7 +1145,7 @@ pub fn forward_scratch_capture_gdn_tape(
 // through the gemm_*_mq4g256_lloyd_wmma family on gfx11 (always-on)
 // and gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd remains
 // unwired — MQ2-Lloyd lands separately.
-fn is_batchable_la(dt: DType, arch: &str) -> bool {
+fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
     let always_ok = matches!(
         dt,
         DType::MQ4G256 | DType::HFQ4G256
@@ -1183,10 +1183,19 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // versus per-token in the fallback — not accumulating drift. Anything
         // that needs the two to agree bit-for-bit must pin the path explicitly.
         | DType::BF16
-        | DType::OqCompactG256
     );
     if always_ok {
         return true;
+    }
+    // Compact-resident Opus: the dense prefill chain has compact arms, the GDN
+    // tape and the small-B spec-decode VERIFY do not. Admit it only for a real
+    // seed prefill — no tape, and n past the same n<=32 boundary this file
+    // already uses to separate "small-B MTP verify (n = K+1)" from "large seed
+    // prefill". Measured on Qwen3.8-27B oq4.25++ with the DFlash2 drafter,
+    // letting compact batch the verify took accept_rate 0.468 -> 0.000 and
+    // decode 5.10 -> 1.39 tok/s with the draft emitting random vocab ids.
+    if dt == DType::OqCompactG256 {
+        return allow_compact;
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
@@ -2044,6 +2053,16 @@ const MIN_BATCH: usize = 2;
 /// the single source of truth for the eligibility decision — called by the
 /// forward itself and by those callers, so the two can never drift. (The
 /// tree-verify forward keeps its own, deliberately simpler, eligibility check.)
+///
+/// `tape_in_play` is true when a `GdnTape` is being captured or replayed. It
+/// exists because compact-resident Opus can batch the FORWARD but does NOT yet
+/// populate the tape, and the two uses of this predicate must not disagree: a
+/// spec-decode caller that sees `true` replays the tape, so returning `true`
+/// for a compact model whose tape was never written replays a zero tape and
+/// corrupts DeltaNet state. Measured, on Qwen3.8-27B oq4.25++ with the DFlash2
+/// drafter: accept_rate 0.468 -> 0.000 and decode 5.10 -> 1.39 tok/s, with the
+/// draft emitting random vocab ids. Compact therefore batches ordinary prefill
+/// and declines the moment a tape is involved.
 pub fn prefill_batch_pbs_eligible(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -2051,6 +2070,7 @@ pub fn prefill_batch_pbs_eligible(
     n: usize,
     arch: &str,
     moe_router_logits_present: bool,
+    tape_in_play: bool,
 ) -> bool {
     // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback — an escape hatch
     // for the LARGE seed prefill (gfx11 24GB OOM + a batched-seed correctness bug
@@ -2077,6 +2097,11 @@ pub fn prefill_batch_pbs_eligible(
     // channel-tested. The scatter workspace supports at most 1024 experts.
     let moe_topk_ok =
         moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
+    // Compact-resident Opus batches a real SEED prefill only. The GDN tape has
+    // no compact writer, and the small-B spec-decode VERIFY (n = K+1) has no
+    // compact path either — n > 32 is the same boundary this file already uses
+    // to separate that verify from a seed prefill.
+    let allow_compact = !tape_in_play && n > 32;
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
@@ -2110,31 +2135,31 @@ pub fn prefill_batch_pbs_eligible(
         // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch),
+                is_batchable_la(l.wqkv.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wz.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wo.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch, allow_compact),
             LayerWeights::FullAttn(_) => true,
             LayerWeights::DeltaNetMoe(l) =>
                 moe_topk_ok
                     && moe_router_logits_present
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wz.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wo.gpu_dtype, arch, allow_compact)
                     && moe_ffn_batched_admissible(&l.ffn, arch),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && moe_router_logits_present
-                    && is_batchable_la(l.wq.gpu_dtype, arch)
-                    && is_batchable_la(l.wk.gpu_dtype, arch)
-                    && is_batchable_la(l.wv.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.wq.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wk.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wv.gpu_dtype, arch, allow_compact)
+                    && is_batchable_la(l.wo.gpu_dtype, arch, allow_compact)
                     && moe_ffn_batched_admissible(&l.ffn, arch),
         })
 }
@@ -4191,35 +4216,60 @@ mod tests {
 
     const NO_WMMA_ARCHS: &[&str] = &["gfx900", "gfx906", "gfx908", "gfx940", "gfx941", "gfx942"];
 
+    /// Compact-resident Opus is the one dtype whose admission is the CALLER's
+    /// decision. It has GEMM arms in the dense prefill chain but no writer for
+    /// the per-position state a spec-decode forward also exports (GDN tape,
+    /// hidden ring buffer), and answering "yes" to both questions at once took
+    /// DFlash2's accept_rate to 0.000.
+    #[test]
+    fn qwen35_compact_batches_only_when_the_caller_allows_it() {
+        for &arch in BATCHABLE_ARCHS {
+            assert!(
+                is_batchable_la(DType::OqCompactG256, arch, true),
+                "compact should batch an ordinary prefill on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::OqCompactG256, arch, false),
+                "compact must decline when the forward exports state on {arch}"
+            );
+            // Every other admitted dtype is unconditional — the flag must not
+            // accidentally gate them.
+            assert!(
+                is_batchable_la(DType::MQ4G256, arch, false),
+                "MQ4G256 must stay unconditional on {arch}"
+            );
+        }
+    }
+
     #[test]
     fn qwen35_is_batchable_la_always_ok() {
         for &arch in BATCHABLE_ARCHS {
             assert!(
-                is_batchable_la(DType::MQ4G256, arch),
+                is_batchable_la(DType::MQ4G256, arch, false),
                 "MQ4G256 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::HFQ4G256, arch),
+                is_batchable_la(DType::HFQ4G256, arch, false),
                 "HFQ4G256 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::MQ6G256, arch),
+                is_batchable_la(DType::MQ6G256, arch, false),
                 "MQ6G256 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::HFQ6G256, arch),
+                is_batchable_la(DType::HFQ6G256, arch, false),
                 "HFQ6G256 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::Q8_0, arch),
+                is_batchable_la(DType::Q8_0, arch, false),
                 "Q8_0 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::ParoQ4G128, arch),
+                is_batchable_la(DType::ParoQ4G128, arch, false),
                 "ParoQ4G128 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::F32, arch),
+                is_batchable_la(DType::F32, arch, false),
                 "F32 should batch on {arch}"
             );
         }
@@ -4229,19 +4279,19 @@ mod tests {
     fn qwen35_is_batchable_la_mq3_wmma_and_gfx10_scalar() {
         for &arch in WMMA_ARCHS {
             assert!(
-                is_batchable_la(DType::MQ3G256, arch),
+                is_batchable_la(DType::MQ3G256, arch, false),
                 "MQ3G256 should batch on {arch} (WMMA)"
             );
         }
         for &arch in GFX10_SCALAR_ARCHS {
             assert!(
-                is_batchable_la(DType::MQ3G256, arch),
+                is_batchable_la(DType::MQ3G256, arch, false),
                 "MQ3G256 should batch on {arch} (scalar)"
             );
         }
         for &arch in NO_WMMA_ARCHS {
             assert!(
-                !is_batchable_la(DType::MQ3G256, arch),
+                !is_batchable_la(DType::MQ3G256, arch, false),
                 "MQ3G256 must fall back on {arch}"
             );
         }
@@ -4251,21 +4301,21 @@ mod tests {
     fn qwen35_is_batchable_la_fp4_only_on_wmma() {
         for &arch in WMMA_ARCHS {
             assert!(
-                is_batchable_la(DType::HFP4G32, arch),
+                is_batchable_la(DType::HFP4G32, arch, false),
                 "HFP4G32 should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::MFP4G32, arch),
+                is_batchable_la(DType::MFP4G32, arch, false),
                 "MFP4G32 should batch on {arch}"
             );
         }
         for &arch in NO_WMMA_ARCHS {
             assert!(
-                !is_batchable_la(DType::HFP4G32, arch),
+                !is_batchable_la(DType::HFP4G32, arch, false),
                 "HFP4G32 must fall back on {arch}"
             );
             assert!(
-                !is_batchable_la(DType::MFP4G32, arch),
+                !is_batchable_la(DType::MFP4G32, arch, false),
                 "MFP4G32 must fall back on {arch}"
             );
         }
@@ -4276,30 +4326,30 @@ mod tests {
         // gfx11 always admits Lloyd MQ3
         for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
             assert!(
-                is_batchable_la(DType::MQ3G256Lloyd, arch),
+                is_batchable_la(DType::MQ3G256Lloyd, arch, false),
                 "MQ3G256Lloyd should batch on {arch}"
             );
             assert!(
-                is_batchable_la(DType::MQ4G256Lloyd, arch),
+                is_batchable_la(DType::MQ4G256Lloyd, arch, false),
                 "MQ4G256Lloyd should batch on {arch}"
             );
         }
         // gfx1152 not in admit list
         assert!(
-            !is_batchable_la(DType::MQ3G256Lloyd, "gfx1152"),
+            !is_batchable_la(DType::MQ3G256Lloyd, "gfx1152", false),
             "gfx1152 should NOT admit Lloyd MQ3"
         );
         assert!(
-            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1152"),
+            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1152", false),
             "gfx1152 should NOT admit Lloyd MQ4"
         );
         // gfx12 requires env gate
         assert!(
-            !is_batchable_la(DType::MQ3G256Lloyd, "gfx1200"),
+            !is_batchable_la(DType::MQ3G256Lloyd, "gfx1200", false),
             "gfx1200 without HIPFIRE_LLOYD_GFX12=1"
         );
         assert!(
-            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1200"),
+            !is_batchable_la(DType::MQ4G256Lloyd, "gfx1200", false),
             "gfx1200 without HIPFIRE_LLOYD_GFX12=1"
         );
     }
@@ -4307,26 +4357,32 @@ mod tests {
     #[test]
     fn qwen35_is_batchable_la_unsupported_dtypes() {
         for &arch in WMMA_ARCHS {
-            assert!(!is_batchable_la(DType::Q4K, arch), "Q4K must fall back");
-            assert!(!is_batchable_la(DType::Q6K, arch), "Q6K must fall back");
             assert!(
-                !is_batchable_la(DType::Q4F16G64, arch),
+                !is_batchable_la(DType::Q4K, arch, false),
+                "Q4K must fall back"
+            );
+            assert!(
+                !is_batchable_la(DType::Q6K, arch, false),
+                "Q6K must fall back"
+            );
+            assert!(
+                !is_batchable_la(DType::Q4F16G64, arch, false),
                 "Q4F16G64 must fall back"
             );
             assert!(
-                !is_batchable_la(DType::Q4F16G32, arch),
+                !is_batchable_la(DType::Q4F16G32, arch, false),
                 "Q4F16G32 must fall back"
             );
             assert!(
-                !is_batchable_la(DType::MQ2G256, arch),
+                !is_batchable_la(DType::MQ2G256, arch, false),
                 "MQ2G256 must fall back"
             );
             assert!(
-                !is_batchable_la(DType::MQ8G256, arch),
+                !is_batchable_la(DType::MQ8G256, arch, false),
                 "MQ8G256 must fall back"
             );
             assert!(
-                !is_batchable_la(DType::HFQ2G256, arch),
+                !is_batchable_la(DType::HFQ2G256, arch, false),
                 "HFQ2G256 must fall back"
             );
         }
@@ -4350,11 +4406,11 @@ mod tests {
             "gfx942",
         ] {
             assert!(
-                is_batchable_la(DType::MQ6G256, arch),
+                is_batchable_la(DType::MQ6G256, arch, false),
                 "MQ6 dense prefill should route through the HFQ6 batched family on {arch}"
             );
             assert!(
-                is_batchable_la(DType::HFQ6G256, arch),
+                is_batchable_la(DType::HFQ6G256, arch, false),
                 "HFQ6 dense prefill should stay batchable on {arch}"
             );
         }
@@ -4380,7 +4436,7 @@ mod tests {
             "gfx942",
         ] {
             assert!(
-                is_batchable_la(DType::BF16, arch),
+                is_batchable_la(DType::BF16, arch, false),
                 "BF16 dense prefill must stay on the batched BF16 WMMA-capable path on {arch}"
             );
         }

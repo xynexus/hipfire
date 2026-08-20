@@ -2331,39 +2331,39 @@ pub fn forward_prefill_batch_multi_with_caps(
             .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),))
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) => {
-                is_batchable_la(l.wqkv.gpu_dtype, arch0)
-                    && is_batchable_la(l.wz.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch0)
-                    && is_batchable_la(l.wo.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch0)
+                is_batchable_la(l.wqkv.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wz.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
             }
             LayerWeights::FullAttn(l) => {
-                is_batchable_la(l.wq.gpu_dtype, arch0)
-                    && is_batchable_la(l.wk.gpu_dtype, arch0)
-                    && is_batchable_la(l.wv.gpu_dtype, arch0)
-                    && is_batchable_la(l.wo.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch0)
+                is_batchable_la(l.wq.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wk.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wv.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
             }
             LayerWeights::DeltaNetMoe(l) => {
                 moe_topk_ok
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch0)
-                    && is_batchable_la(l.wz.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch0)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch0)
-                    && is_batchable_la(l.wo.gpu_dtype, arch0)
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wz.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
                     && moe_ffn_batched_admissible(&l.ffn, arch0)
             }
             LayerWeights::FullAttnMoe(l) => {
                 moe_topk_ok
-                    && is_batchable_la(l.wq.gpu_dtype, arch0)
-                    && is_batchable_la(l.wk.gpu_dtype, arch0)
-                    && is_batchable_la(l.wv.gpu_dtype, arch0)
-                    && is_batchable_la(l.wo.gpu_dtype, arch0)
+                    && is_batchable_la(l.wq.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wk.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wv.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0, /* allow_compact: EP has no compact arms */ false)
                     && moe_ffn_batched_admissible(&l.ffn, arch0)
             }
         });

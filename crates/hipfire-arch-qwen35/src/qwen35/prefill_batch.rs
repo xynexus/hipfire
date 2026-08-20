@@ -6148,6 +6148,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
         n,
         arch,
         moe_router_logits_present,
+        // Compact-resident Opus batches an ORDINARY prefill only. Anything that
+        // asks the forward to EXPORT per-position state — the GDN tape, the
+        // hidden ring buffer the DFlash drafter reads, tree-verify — has no
+        // compact writer, and handing a spec-decode caller a batched forward
+        // that silently skips those exports is what took DFlash2's accept_rate
+        // to 0.000 with the draft emitting random vocab ids.
+        tree_verify.is_some()
+            || gdn_tape.is_some()
+            || hidden_rb.is_some()
+            || per_token_hidden_out.is_some(),
     );
     // F4 guard: reject batched prefill when KV tier has no batched keys.
     // F32 KV has only BatchEq(1) → MissingImpl at resolve. asym2 + tree-verify

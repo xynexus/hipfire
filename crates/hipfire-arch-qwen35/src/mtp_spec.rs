@@ -2723,6 +2723,7 @@ pub fn spec_step_mtp_compressed_serial(
         n_verify,
         gpu.arch.as_str(),
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
+        /* tape_in_play */ true,
     );
     let verify_tape: Option<&mut GdnTape> = if tape_captured {
         // Tape row 0 records verify_tokens[0] at absolute position `cur_pos`;

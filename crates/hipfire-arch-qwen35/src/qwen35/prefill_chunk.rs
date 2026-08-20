@@ -2318,21 +2318,21 @@ pub(crate) fn forward_prefill_chunk(
     let fa_batched_ok = fa_kv_ok
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, fa_arch)
+                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.w_gate.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.w_up.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.w_down.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
             }
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_batched_admissible in the eligibility gate).
             LayerWeights::FullAttnMoe(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch)
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch)
+                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
             }
             _ => true, // LA layers don't gate this check
         });
@@ -2342,7 +2342,8 @@ pub(crate) fn forward_prefill_chunk(
     if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
         let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                (!is_batchable_la(l.wq.gpu_dtype, fa_arch)).then(|| format!("{:?}", l.wq.gpu_dtype))
+                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32))
+                    .then(|| format!("{:?}", l.wq.gpu_dtype))
             }
             _ => None,
         });
