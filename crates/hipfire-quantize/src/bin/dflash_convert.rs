@@ -859,6 +859,28 @@ fn is_norm_tensor(name: &str) -> bool {
         || name.contains("k_norm")
         || name == "hidden_norm.weight"
         || name == "norm.weight"
+        // DFlash2's static per-channel conv kernel. `[2, kernel_size, hidden]`
+        // is 20 K values for the whole layer — quantizing it buys nothing and
+        // it multiplies the residual stream directly, like a norm weight does.
+        || name.ends_with("_conv.base_kernel")
+}
+
+/// DFlash2 tables the runtime needs DENSE, kept BF16 regardless of the chosen
+/// draft format.
+///
+/// * the candidate-selector codebooks are `[vocab, rank]` lookups read
+///   `top_k + 1` rows per position — a few KB per draft, so their size never
+///   touches bandwidth, while 4-bit rounding lands straight on the rank-256
+///   transition score;
+/// * `kernel_projection` is split into its `prepare`/`finish` halves at LOAD by
+///   slicing rows, which only works on a dense tensor — and its output is a
+///   convolution coefficient multiplying the residual stream, not a bulk MLP
+///   activation. 65 M values across the drafter, ~131 MiB at BF16.
+fn is_dflash2_dense_table(name: &str) -> bool {
+    name.ends_with("candidate_selector.predecessor_codebook")
+        || name.ends_with("candidate_selector.successor_codebook")
+        || name.ends_with("_conv.kernel_projection.weight")
+        || name == "candidate_selector.hidden_projection.weight"
 }
 
 fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
@@ -1156,6 +1178,8 @@ fn main() {
         // (per-group scale/min carries meaning).
         let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
+        } else if is_dflash2_dense_table(name) {
+            (QuantType::BF16, 0u32, f32_slice_to_bf16_bytes(&f32_data))
         } else if draft_format == DraftFormat::F32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if draft_format == DraftFormat::Mq4 && n_elements >= 256 {

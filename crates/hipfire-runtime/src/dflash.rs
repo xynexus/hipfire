@@ -186,6 +186,17 @@ impl DflashConfig {
         self.target_layer_ids.len()
     }
 
+    /// DFlash2 conv channel groups. One dynamic coefficient per group.
+    pub fn conv_groups(&self) -> usize {
+        assert!(
+            self.conv_group_size > 0 && self.hidden % self.conv_group_size == 0,
+            "DFlash2 conv_group_size {} must divide hidden {}",
+            self.conv_group_size,
+            self.hidden
+        );
+        self.hidden / self.conv_group_size
+    }
+
     pub fn kv_dim(&self) -> usize {
         self.n_kv_heads * self.head_dim
     }
@@ -273,14 +284,15 @@ impl DflashConfig {
             .get("rope_theta")
             .and_then(|v| v.as_f64())
             .unwrap_or(10_000_000.0) as f32;
-        // DFlash2 refuses HERE rather than loading as DFlash1. Its checkpoint
-        // converts cleanly and every tensor is carried, but the drafter body
-        // additionally needs per-layer attention_conv/mlp_conv and the low-rank
-        // candidate_selector (rank 256, top-k 16) that this runtime does not yet
-        // implement. Loading it as DFlash1 silently drops 23 tensors: spec-decode
-        // stays CORRECT because the target verifies every token, so the only
-        // symptom would be a mysteriously poor acceptance rate. Fail loudly
-        // instead. Remove this once the conv + selector path lands.
+        // DFlash2 admission. The per-layer attention_conv/mlp_conv are wired
+        // into `draft_forward_opts`; the low-rank candidate_selector is NOT yet
+        // applied, so the drafter still takes a plain per-position argmax where
+        // the reference traces a path through the top-16 candidates. That costs
+        // ACCEPTANCE RATE only — spec-decode is lossless by construction, the
+        // target verifies every token — but it is not the drafter the checkpoint
+        // describes, so say so at load rather than let it look like a bad
+        // drafter. Refuse outright if the convs are missing, since without them
+        // the body is simply the wrong architecture.
         let version = df
             .get("dflash_version")
             .and_then(|v| v.as_u64())
@@ -291,15 +303,26 @@ impl DflashConfig {
         let conv_kernel_size = u("conv_kernel_size");
         let conv_group_size = u("conv_group_size");
         if version >= 2 || selector_rank > 0 {
-            eprintln!(
-                "  DFlash draft REFUSED: this is a DFlash2 drafter (selector_rank={:?}, \
-                 conv_kernel_size={:?}). Its conv + candidate-selector are not implemented \
-                 in the runtime yet; loading it as DFlash1 would drop those tensors and \
-                 quietly tank the acceptance rate. Use a DFlash1 drafter for now.",
-                df.get("selector_rank"),
-                df.get("conv_kernel_size"),
-            );
-            return None;
+            if conv_kernel_size == 0 || conv_group_size == 0 {
+                eprintln!(
+                    "  DFlash draft REFUSED: DFlash2 drafter without conv geometry \
+                     (conv_kernel_size={conv_kernel_size}, conv_group_size={conv_group_size}). \
+                     Loading it as DFlash1 would run the wrong architecture."
+                );
+                return None;
+            }
+            if source
+                .tensor("candidate_selector.hidden_projection.weight")
+                .is_some()
+            {
+                eprintln!(
+                    "  WARNING: DFlash2 candidate_selector (rank={selector_rank}, \
+                     top_k={selector_top_k}) is carried by this drafter but NOT applied — \
+                     the draft path still takes a per-position argmax. Output stays correct \
+                     (the target verifies every token); acceptance rate is below what this \
+                     checkpoint can do."
+                );
+            }
         }
         let block_size = df.get("block_size").and_then(|v| v.as_u64())? as usize;
         let mask_token_id = df.get("mask_token_id").and_then(|v| v.as_u64())? as u32;
@@ -336,6 +359,26 @@ impl DflashConfig {
 
 // ─── Weights ───────────────────────────────────────────────────────────────
 
+/// DFlash2 grouped dynamic causal convolution, one per attention/MLP block.
+///
+/// The checkpoint stores `base_kernel [2, kernel_size, hidden]` and a single
+/// `kernel_projection [2 * kernel_size * groups, hidden]`. The leading 2 is not
+/// a tap — it selects `prepare()` (applied to the block's normed input) or
+/// `finish()` (applied to the block's output, before the residual add). Both
+/// halves are split HERE, at load, so each side is a contiguous `[b, ks*groups]`
+/// GEMM result that `dflash2_grouped_dynamic_conv` can read directly; the
+/// alternative is one fused GEMM whose two halves interleave per position.
+pub struct Dflash2Conv {
+    /// `[kernel_size, hidden]` F32 — static per-channel taps for `prepare`.
+    pub base_prepare: GpuTensor,
+    /// `[kernel_size, hidden]` F32 — static per-channel taps for `finish`.
+    pub base_finish: GpuTensor,
+    /// `[kernel_size * groups, hidden]` — dynamic coefficients for `prepare`.
+    pub proj_prepare: WeightTensor,
+    /// `[kernel_size * groups, hidden]` — dynamic coefficients for `finish`.
+    pub proj_finish: WeightTensor,
+}
+
 pub struct DflashLayerWeights {
     pub attn_norm: GpuTensor, // [hidden] — F32, RMSNorm weight
     pub wq: WeightTensor,     // [q_dim, hidden]
@@ -348,6 +391,9 @@ pub struct DflashLayerWeights {
     pub w_gate: WeightTensor, // [intermediate, hidden]
     pub w_up: WeightTensor,   // [intermediate, hidden]
     pub w_down: WeightTensor, // [hidden, intermediate]
+    /// DFlash2 only. `None` on a DFlash1 drafter.
+    pub attn_conv: Option<Dflash2Conv>,
+    pub mlp_conv: Option<Dflash2Conv>,
 }
 
 pub struct DflashWeights {
@@ -576,6 +622,137 @@ fn validate_plain_opus_tensor(
         assert!(scale.is_finite(), "dflash {name}: non-finite Opus scale");
     }
     block_stride
+}
+
+/// Decode a dense (F16/F32/BF16) tensor to f32 on the host. Only used for the
+/// small DFlash2 conv tables, which `dflash_convert` keeps unquantized.
+fn dflash_dense_to_f32(name: &str, quant_type: u8, data: &[u8]) -> Vec<f32> {
+    match quant_type {
+        1 => data
+            .chunks_exact(2)
+            .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        q => panic!("dflash: {name} must be a dense F16/F32/BF16 tensor, got quant_type {q}"),
+    }
+}
+
+/// Load a contiguous ROW RANGE of a dense `[m_total, k]` tensor as its own
+/// `WeightTensor`. `dflash_convert` keeps the DFlash2 conv tables dense, so a
+/// row range is a plain byte slice — which is what lets `kernel_projection` be
+/// split into its `prepare` and `finish` halves at load instead of at use.
+fn hfq_weight_rows(
+    source: &(impl DflashSource + ?Sized),
+    gpu: &mut Gpu,
+    name: &str,
+    m_total: usize,
+    k: usize,
+    row_start: usize,
+    row_len: usize,
+    use_f16_weights: bool,
+) -> HipResult<WeightTensor> {
+    let tensor = source
+        .tensor(name)
+        .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
+    assert!(
+        row_start + row_len <= m_total,
+        "dflash {name}: rows {row_start}..{} exceed m={m_total}",
+        row_start + row_len
+    );
+    let all = dflash_dense_to_f32(name, tensor.quant_type, tensor.data.as_ref());
+    assert_eq!(all.len(), m_total * k, "dflash {name}: size mismatch");
+    let slice = &all[row_start * k..(row_start + row_len) * k];
+    // These are small (kernel_size × groups × hidden ≈ 3.3 M values); f16 keeps
+    // them on the WMMA dispatch rung the rest of the drafter uses.
+    if use_f16_weights {
+        let bytes: Vec<u8> = slice
+            .iter()
+            .flat_map(|&v| crate::quant::f32_to_f16(v).to_le_bytes())
+            .collect();
+        let mut buf = gpu.upload_raw(&bytes, &[slice.len()])?;
+        buf.dtype = DType::F16;
+        Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F16,
+            m: row_len,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })
+    } else {
+        let buf = gpu.upload_f32(slice, &[slice.len()])?;
+        Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m: row_len,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })
+    }
+}
+
+/// Load one `GroupedDynamicCausalConv`, splitting both of its tables into the
+/// `prepare` and `finish` halves. Returns `None` when the layer carries no conv
+/// (a DFlash1 drafter).
+fn load_dflash2_conv(
+    source: &(impl DflashSource + ?Sized),
+    gpu: &mut Gpu,
+    prefix: &str,
+    cfg: &DflashConfig,
+    use_f16_weights: bool,
+) -> HipResult<Option<Dflash2Conv>> {
+    let base_name = format!("{prefix}.base_kernel");
+    let Some(base_tensor) = source.tensor(&base_name) else {
+        return Ok(None);
+    };
+    let ks = cfg.conv_kernel_size;
+    let groups = cfg.conv_groups();
+    let h = cfg.hidden;
+    let base = dflash_dense_to_f32(
+        &base_name,
+        base_tensor.quant_type,
+        base_tensor.data.as_ref(),
+    );
+    assert_eq!(
+        base.len(),
+        2 * ks * h,
+        "dflash {base_name}: expected [2, {ks}, {h}]"
+    );
+    let proj_name = format!("{prefix}.kernel_projection.weight");
+    Ok(Some(Dflash2Conv {
+        base_prepare: gpu.upload_f32(&base[..ks * h], &[ks * h])?,
+        base_finish: gpu.upload_f32(&base[ks * h..], &[ks * h])?,
+        proj_prepare: hfq_weight_rows(
+            source,
+            gpu,
+            &proj_name,
+            2 * ks * groups,
+            h,
+            0,
+            ks * groups,
+            use_f16_weights,
+        )?,
+        proj_finish: hfq_weight_rows(
+            source,
+            gpu,
+            &proj_name,
+            2 * ks * groups,
+            h,
+            ks * groups,
+            ks * groups,
+            use_f16_weights,
+        )?,
+    }))
 }
 
 fn hfq_weight(
@@ -1002,6 +1179,20 @@ impl DflashWeights {
                     cfg.intermediate,
                     use_f16_weights,
                 )?,
+                attn_conv: load_dflash2_conv(
+                    hfq,
+                    gpu,
+                    &format!("{p}.attention_conv"),
+                    cfg,
+                    use_f16_weights,
+                )?,
+                mlp_conv: load_dflash2_conv(
+                    hfq,
+                    gpu,
+                    &format!("{p}.mlp_conv"),
+                    cfg,
+                    use_f16_weights,
+                )?,
             };
             layers.push(layer);
         }
@@ -1046,6 +1237,12 @@ impl DflashWeights {
             let _ = gpu.free_tensor(l.w_gate.buf);
             let _ = gpu.free_tensor(l.w_up.buf);
             let _ = gpu.free_tensor(l.w_down.buf);
+            for conv in [l.attn_conv, l.mlp_conv].into_iter().flatten() {
+                let _ = gpu.free_tensor(conv.base_prepare);
+                let _ = gpu.free_tensor(conv.base_finish);
+                let _ = gpu.free_tensor(conv.proj_prepare.buf);
+                let _ = gpu.free_tensor(conv.proj_finish.buf);
+            }
         }
     }
 }
@@ -1169,6 +1366,17 @@ pub struct DflashScratch {
     /// `target_hidden`: `[rows, num_extract * hidden]` f32. Empty when the NPU
     /// draft is disabled.
     pub npu_target_hidden_host: Vec<f32>,
+
+    /// DFlash2 conv working set. `conv_dyn_*` hold one `[b, kernel_size *
+    /// groups]` coefficient block each; both are produced from the SAME input
+    /// (the block's normed hidden) before the block runs, because `finish`'s
+    /// coefficients are a function of the block's INPUT, not its output.
+    /// `conv_tmp` receives the convolution — it cannot be done in place, since
+    /// the causal shift reads rows the output would already have overwritten.
+    /// `None` on a DFlash1 drafter.
+    pub conv_dyn_prepare: Option<GpuTensor>,
+    pub conv_dyn_finish: Option<GpuTensor>,
+    pub conv_tmp: Option<GpuTensor>,
 }
 
 impl DflashScratch {
@@ -1241,6 +1449,20 @@ impl DflashScratch {
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
         // = 128 MB. Trivial vs 24 GB VRAM.
+        // DFlash2 conv scratch. Tiny (b × ks × groups is ~10 K floats at B=16)
+        // but allocated up front so the captured FFN graph never mallocs.
+        let conv_dyn: (Option<GpuTensor>, Option<GpuTensor>, Option<GpuTensor>) =
+            if cfg.version >= 2 && cfg.conv_kernel_size > 0 {
+                let coeffs = b * cfg.conv_kernel_size * cfg.conv_groups();
+                (
+                    Some(gpu.alloc_tensor(&[coeffs], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[coeffs], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[b * h], DType::F32)?),
+                )
+            } else {
+                (None, None, None)
+            };
+
         let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
@@ -1292,6 +1514,9 @@ impl DflashScratch {
             #[cfg(target_os = "linux")]
             npu_body: None,
             npu_target_hidden_host: Vec::new(),
+            conv_dyn_prepare: conv_dyn.0,
+            conv_dyn_finish: conv_dyn.1,
+            conv_tmp: conv_dyn.2,
         })
     }
 
@@ -1668,6 +1893,103 @@ fn gemm_dispatch(
     result
 }
 
+// ─── DFlash2 grouped dynamic causal conv ───────────────────────────────────
+
+/// `prepare()`: project BOTH coefficient sets from the block's normed input,
+/// then convolve that input. `dyn_finish` is left populated for the matching
+/// [`dflash2_conv_finish`] call after the block — in the reference, `prepare`
+/// returns the finish coefficients and the caller carries them across the
+/// attention/MLP body, so they are a function of the block's INPUT.
+///
+/// `dst` receives the convolution; it must not alias `src`, because tap `k`
+/// reads row `t - k`, which an in-place write would already have clobbered.
+#[allow(clippy::too_many_arguments)]
+fn dflash2_conv_prepare(
+    gpu: &mut Gpu,
+    conv: &Dflash2Conv,
+    kernel_size: usize,
+    group_size: usize,
+    hidden: usize,
+    b: usize,
+    src: &GpuTensor,
+    dyn_prepare: &GpuTensor,
+    dyn_finish: &GpuTensor,
+    dst: &GpuTensor,
+    mq_x_rot: Option<&GpuTensor>,
+    sync_gemm: bool,
+) -> HipResult<()> {
+    gemm_dispatch(
+        gpu,
+        src,
+        &conv.proj_prepare,
+        dyn_prepare,
+        b,
+        mq_x_rot,
+        sync_gemm,
+    )?;
+    gemm_dispatch(
+        gpu,
+        src,
+        &conv.proj_finish,
+        dyn_finish,
+        b,
+        mq_x_rot,
+        sync_gemm,
+    )?;
+    gpu.dflash2_grouped_dynamic_conv(
+        src,
+        dyn_prepare,
+        &conv.base_prepare,
+        dst,
+        b,
+        hidden,
+        kernel_size,
+        group_size,
+    )
+}
+
+/// `finish()`: convolve the block's OUTPUT with the coefficients [`dflash2_conv_prepare`]
+/// stashed in `dyn_finish`, plus the second static kernel.
+#[allow(clippy::too_many_arguments)]
+fn dflash2_conv_finish(
+    gpu: &mut Gpu,
+    conv: &Dflash2Conv,
+    kernel_size: usize,
+    group_size: usize,
+    hidden: usize,
+    b: usize,
+    src: &GpuTensor,
+    dyn_finish: &GpuTensor,
+    dst: &GpuTensor,
+) -> HipResult<()> {
+    gpu.dflash2_grouped_dynamic_conv(
+        src,
+        dyn_finish,
+        &conv.base_finish,
+        dst,
+        b,
+        hidden,
+        kernel_size,
+        group_size,
+    )
+}
+
+/// Copy `src` back over `dst` so the conv stays transparent to every call site
+/// downstream (q/k/v projections, residual adds, golden dumps).
+fn dflash2_conv_writeback(
+    gpu: &mut Gpu,
+    dst: &GpuTensor,
+    src: &GpuTensor,
+    bytes: usize,
+    graph_safe: bool,
+) -> HipResult<()> {
+    if graph_safe {
+        gpu.memcpy_dtod_auto(&dst.buf, &src.buf, bytes)
+    } else {
+        gpu.hip.memcpy_dtod(&dst.buf, &src.buf, bytes)
+    }
+}
+
 fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
     gpu.capture_blobs.clear();
     gpu.capture_mode = true;
@@ -1697,6 +2019,7 @@ fn abort_draft_ffn_graph_capture(gpu: &mut Gpu) {
     gpu.capture_blobs.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draft_ffn_layer(
     gpu: &mut Gpu,
     layer: &DflashLayerWeights,
@@ -1704,6 +2027,7 @@ fn draft_ffn_layer(
     b: usize,
     h: usize,
     eps: f32,
+    conv_geom: Option<(usize, usize)>,
     graph_safe: bool,
 ) -> HipResult<()> {
     if graph_safe {
@@ -1714,6 +2038,31 @@ fn draft_ffn_layer(
     }
 
     gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+    // DFlash2 `mlp_conv.prepare` — between post_attention_layernorm and the MLP.
+    if let (Some(conv), Some((ks, gs))) = (layer.mlp_conv.as_ref(), conv_geom) {
+        let tmp = scratch.conv_tmp.as_ref().expect("dflash2 conv scratch");
+        dflash2_conv_prepare(
+            gpu,
+            conv,
+            ks,
+            gs,
+            h,
+            b,
+            &scratch.x_norm,
+            scratch
+                .conv_dyn_prepare
+                .as_ref()
+                .expect("dflash2 conv scratch"),
+            scratch
+                .conv_dyn_finish
+                .as_ref()
+                .expect("dflash2 conv scratch"),
+            tmp,
+            scratch.mq_x_rot.as_ref(),
+            scratch.sync_gemm,
+        )?;
+        dflash2_conv_writeback(gpu, &scratch.x_norm, tmp, b * h * 4, graph_safe)?;
+    }
     gemm_dispatch(
         gpu,
         &scratch.x_norm,
@@ -1742,6 +2091,25 @@ fn draft_ffn_layer(
         scratch.mq_x_rot.as_ref(),
         scratch.sync_gemm,
     )?;
+    // DFlash2 `mlp_conv.finish` — on the MLP output, before the residual add.
+    if let (Some(conv), Some((ks, gs))) = (layer.mlp_conv.as_ref(), conv_geom) {
+        let tmp = scratch.conv_tmp.as_ref().expect("dflash2 conv scratch");
+        dflash2_conv_finish(
+            gpu,
+            conv,
+            ks,
+            gs,
+            h,
+            b,
+            &scratch.x,
+            scratch
+                .conv_dyn_finish
+                .as_ref()
+                .expect("dflash2 conv scratch"),
+            tmp,
+        )?;
+        dflash2_conv_writeback(gpu, &scratch.x, tmp, b * h * 4, graph_safe)?;
+    }
     if graph_safe {
         gpu.add_f32_graph_safe(&scratch.residual_ffn, &scratch.x, &scratch.x)
     } else {
@@ -1749,6 +2117,7 @@ fn draft_ffn_layer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draft_ffn_layer_maybe_graph(
     gpu: &mut Gpu,
     layer: &DflashLayerWeights,
@@ -1757,10 +2126,11 @@ fn draft_ffn_layer_maybe_graph(
     b: usize,
     h: usize,
     eps: f32,
+    conv_geom: Option<(usize, usize)>,
     use_graph: bool,
 ) -> HipResult<()> {
     if !use_graph {
-        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, conv_geom, false);
     }
 
     if gpu.active_stream.is_none() {
@@ -1777,11 +2147,11 @@ fn draft_ffn_layer_maybe_graph(
 
     if !scratch.draft_ffn_warmed_up[layer_idx].contains(&b) {
         scratch.draft_ffn_warmed_up[layer_idx].insert(b);
-        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, conv_geom, false);
     }
 
     begin_draft_ffn_graph_capture(gpu)?;
-    let r = draft_ffn_layer(gpu, layer, scratch, b, h, eps, true);
+    let r = draft_ffn_layer(gpu, layer, scratch, b, h, eps, conv_geom, true);
     if r.is_ok() {
         let entry = end_draft_ffn_graph_capture(gpu)?;
         scratch.draft_ffn_graphs[layer_idx].insert(b, entry);
@@ -1901,6 +2271,10 @@ pub fn draft_forward_opts(
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
     let theta = cfg.rope_theta;
+    // DFlash2 only: `Some((kernel_size, group_size))` when the drafter carries
+    // grouped dynamic convs. `None` leaves every call site below at DFlash1.
+    let conv_geom = (cfg.version >= 2 && cfg.conv_kernel_size > 0)
+        .then(|| (cfg.conv_kernel_size, cfg.conv_group_size));
     let golden_dir = std::env::var("HIPFIRE_DFLASH_GOLDEN_DIR").ok();
 
     assert!(b <= scratch.max_block_size, "block_size > scratch max");
@@ -2042,6 +2416,33 @@ pub fn draft_forward_opts(
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        // DFlash2 `attention_conv.prepare` — between input_layernorm and the
+        // Q/K/V projections. Also stashes the coefficients `finish` needs after
+        // the attention body.
+        if let (Some(conv), Some((ks, gs))) = (layer.attn_conv.as_ref(), conv_geom) {
+            let tmp = scratch.conv_tmp.as_ref().expect("dflash2 conv scratch");
+            dflash2_conv_prepare(
+                gpu,
+                conv,
+                ks,
+                gs,
+                h,
+                b,
+                &scratch.x_norm,
+                scratch
+                    .conv_dyn_prepare
+                    .as_ref()
+                    .expect("dflash2 conv scratch"),
+                scratch
+                    .conv_dyn_finish
+                    .as_ref()
+                    .expect("dflash2 conv scratch"),
+                tmp,
+                scratch.mq_x_rot.as_ref(),
+                scratch.sync_gemm,
+            )?;
+            dflash2_conv_writeback(gpu, &scratch.x_norm, tmp, b * h * 4, false)?;
+        }
         if li == 0 {
             if let Some(dir) = &golden_dir {
                 dflash_golden_npy(gpu, dir, "rust_l0_input_norm", &scratch.x_norm, &[b, h]);
@@ -2316,6 +2717,27 @@ pub fn draft_forward_opts(
         )?;
         dflash_subphase_sync(gpu, dbg, li, "wo")?;
 
+        // DFlash2 `attention_conv.finish` — on the attention output, before the
+        // residual add.
+        if let (Some(conv), Some((ks, gs))) = (layer.attn_conv.as_ref(), conv_geom) {
+            let tmp = scratch.conv_tmp.as_ref().expect("dflash2 conv scratch");
+            dflash2_conv_finish(
+                gpu,
+                conv,
+                ks,
+                gs,
+                h,
+                b,
+                &scratch.attn_proj,
+                scratch
+                    .conv_dyn_finish
+                    .as_ref()
+                    .expect("dflash2 conv scratch"),
+                tmp,
+            )?;
+            dflash2_conv_writeback(gpu, &scratch.attn_proj, tmp, b * h * 4, false)?;
+        }
+
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
         dflash_subphase_sync(gpu, dbg, li, "attn_residual_add")?;
@@ -2337,7 +2759,17 @@ pub fn draft_forward_opts(
             && !dbg
             && !crate::config::get().draft_gemm_dump
             && gpu.active_capture.is_none();
-        draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
+        draft_ffn_layer_maybe_graph(
+            gpu,
+            layer,
+            scratch,
+            li,
+            b,
+            h,
+            eps,
+            conv_geom,
+            graph_ffn_active,
+        )?;
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
         // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
