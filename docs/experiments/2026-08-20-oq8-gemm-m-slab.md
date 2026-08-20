@@ -87,3 +87,47 @@ is now worth pursuing, and two things follow:
       --example bench_oq8_gemm_small_n -- --cold
     HIPFIRE_OQ8_GEMM_SLAB=0 <same>          # single-launch comparison
     HIPFIRE_OQ8_GEMM_SLAB_ROWS=2176 <same>  # re-tune the target
+
+## Follow-up: how much is actually left, and why LDS did not get it
+
+After the memory BIOS change (peak 240 -> 256 GB/s) the slabbed kernel reads
+**139.9 GB/s** cold, against a pure-read stream's **250**. That 56 % looks like
+~1.8x sitting on the table. It is not — most of the gap is the access SHAPE, and
+the shipped kernel is already near the ceiling that shape allows.
+
+Measured with the compute stripped out (`bench_read_bw --gemm-pattern`, same
+85 MiB, gate/up `[17408, 5120]`):
+
+| weight read | slabs | GB/s |
+|---|---|---|
+| scattered — 16 lanes on 16 rows, K bytes apart (what the kernel does) | 1 | 19.6 |
+| **scattered, 4 slabs** — what the SHIPPED kernel does | 4 | **151.3** |
+| scattered + multiple waves per block | 4 | 160.7 |
+| cooperative (all lanes sweep one row), block=32 | 4 | 193.2 |
+| **cooperative, block=512, unslabbed** | 1 | **231.3** |
+
+So:
+
+* The shipped GEMM's **139.9 is 92 % of the 151.3** its own access pattern can
+  reach. Nothing that leaves the pattern alone can find more than ~8 %.
+* Slabbing is confirmed in isolation as the whole of the earlier 7.3x: the same
+  scattered pattern goes 19.6 -> 151.3 purely by splitting the launch.
+* Widening the block (several waves, each on its own 16-row tile) is worth
+  **+8 %** and is a small change — the cheapest remaining win.
+* The real **1.5x** (151 -> 231) needs COALESCED reads, which the WMMA operand
+  layout forbids directly: `v_wmma_i32_16x16x16_iu8_w32` requires lane L to hold
+  row L, so the rows must arrive via LDS.
+
+**The obvious LDS fix was measured and LOST.** Staging the group's 16x256 B tile
+through LDS with cooperative loads gave **101 GB/s** against the unstaged 139.9.
+The first cut had a 16-way bank conflict — a 256 B row stride is 64 dwords, so
+every row starts on bank 0 — and padding the stride to 272 B only reached 108,
+still well short. At block=32 the barrier and LDS round-trip cost more than the
+coalescing saves. Both variants were byte-exact, so this is purely a perf result.
+
+What a real attempt needs, from the table above: the 231 GB/s row is
+**cooperative loads AND a wide block AND no slabbing**, i.e. a different tiling —
+many waves per block, each owning a 16-row tile, block-cooperative staging, and
+an LDS budget that keeps enough waves resident (16 waves x 16 rows x 256 B is
+64 KB, so it has to stage in K-chunks). That is a kernel rewrite, not a tweak,
+and it is worth ~1.5x on 69 % of DFlash verify's GPU time.

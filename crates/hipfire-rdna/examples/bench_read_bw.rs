@@ -173,6 +173,54 @@ READ_CHUNK(bw_chunk_u2, 2)
 READ_CHUNK(bw_chunk_u4, 4)
 READ_CHUNK(bw_chunk_u8, 8)
 
+// The weight-read pattern of gemm_oq8_grouped_wmma, with the compute stripped
+// out. Block owns 16 rows; lane L walks ROW row_start+L, 16 B per step. So one
+// load instruction touches 16 rows that are K bytes apart — 16 distinct cache
+// lines, 16 of 64 bytes used on first touch, and the next 3 steps hope to hit
+// what that pulled in. Same bytes as the streaming kernels, different shape.
+extern "C" __global__ void bw_gemm_rows(const i32x4* __restrict__ src,
+                                        int k16, int* __restrict__ out) {
+    const int lane = threadIdx.x & 15;
+    const long long row = (long long)blockIdx.x * 16 + lane;
+    i32x4 acc = {0, 0, 0, 0};
+    const i32x4* p = src + row * k16;
+    for (int kt = 0; kt < k16; ++kt) acc += p[kt];
+    int s = acc.x + acc.y + acc.z + acc.w;
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
+
+// Scattered read, but with SEVERAL waves per block — each wave takes its own
+// 16-row tile. Tests whether the collapse is about waves-in-flight (cheap to fix
+// in the real GEMM: just widen the block) or about the access shape itself
+// (expensive: needs LDS staging and a new tiling).
+extern "C" __global__ void bw_gemm_rows_mw(const i32x4* __restrict__ src,
+                                           int k16, int* __restrict__ out) {
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 15;
+    const int waves = blockDim.x >> 5;
+    const long long row = ((long long)blockIdx.x * waves + wave) * 16 + lane;
+    i32x4 acc = {0, 0, 0, 0};
+    const i32x4* p = src + row * k16;
+    for (int kt = 0; kt < k16; ++kt) acc += p[kt];
+    int s = acc.x + acc.y + acc.z + acc.w;
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
+
+// Same 16 rows, same bytes, but read COOPERATIVELY: all 32 lanes sweep one row
+// at a time, so each instruction covers 512 contiguous bytes. This is what LDS
+// staging would buy the real GEMM — if this recovers stream bandwidth, the
+// scattered per-lane row read is the whole problem.
+extern "C" __global__ void bw_gemm_rows_coop(const i32x4* __restrict__ src,
+                                             int k16, int* __restrict__ out) {
+    i32x4 acc = {0, 0, 0, 0};
+    for (int r = 0; r < 16; ++r) {
+        const i32x4* p = src + ((long long)blockIdx.x * 16 + r) * k16;
+        for (int i = threadIdx.x; i < k16; i += blockDim.x) acc += p[i];
+    }
+    int s = acc.x + acc.y + acc.z + acc.w;
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
+
 extern "C" __global__ void bw_x4_u8_nt(const i32x4* __restrict__ src,
                                        unsigned long long n4, int* __restrict__ out) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -263,6 +311,73 @@ fn size_sweep(gpu: &mut Gpu) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
+    if std::env::args().any(|a| a == "--gemm-pattern") {
+        // Real gate/up shape. Same 86 MiB either way; only the read shape differs.
+        let (m, k) = (17408usize, 5120usize);
+        let bytes = m * k;
+        let src = gpu.alloc_tensor(&[bytes / 4], DType::F32).expect("src");
+        gpu.fill_f32(&src, 1.0).expect("fill");
+        let out = gpu.alloc_tensor(&[1 << 20], DType::F32).expect("out");
+        gpu.device_synchronize().expect("sync");
+        let k16 = (k / 16) as i32;
+        println!(
+            "weight-read pattern, gate/up [{m}, {k}] = {} MiB\n",
+            bytes >> 20
+        );
+        // `slabs` mirrors the real dispatch, which splits M into ~5120-row
+        // launches. Without that the scattered pattern looks catastrophic; the
+        // question is what is left AFTER slabbing, which the shipped kernel does.
+        for (name, block, slabs) in [
+            ("bw_gemm_rows", 32u32, 1usize),
+            ("bw_gemm_rows", 32, 4),
+            ("bw_gemm_rows_mw", 128, 4),
+            ("bw_gemm_rows_mw", 256, 4),
+            ("bw_gemm_rows_mw", 512, 4),
+            ("bw_gemm_rows_mw", 512, 1),
+            ("bw_gemm_rows_coop", 32, 4),
+            ("bw_gemm_rows_coop", 256, 4),
+            ("bw_gemm_rows_coop", 512, 1),
+            ("bw_gemm_rows_coop", 512, 4),
+        ] {
+            gpu.ensure_kernel_public("bench_read_bw", SRC, name)
+                .expect("compile");
+            let rows_per_slab = m / slabs;
+            let rows_per_block = if name.ends_with("_mw") {
+                16 * (block as usize / 32)
+            } else {
+                16
+            };
+            let blocks = (rows_per_slab / rows_per_block) as u32;
+            let run = |g: &Gpu| {
+                for sl in 0..slabs {
+                    let p = unsafe { (src.buf.as_ptr() as *const u8).add(sl * rows_per_slab * k) };
+                    let mut kb = Blob::new();
+                    kb.ptr(p as *const c_void);
+                    while kb.0.len() % 4 != 0 {
+                        kb.0.push(0);
+                    }
+                    kb.0.extend_from_slice(&k16.to_ne_bytes());
+                    kb.ptr(out.buf.as_ptr() as *const c_void);
+                    g.launch_kernel_blob(name, [blocks, 1, 1], [block, 1, 1], 0, &mut kb.0)
+                        .expect("launch");
+                }
+            };
+            run(&gpu);
+            gpu.device_synchronize().expect("sync");
+            let mut best = 0.0f64;
+            for _ in 0..10 {
+                let t = Instant::now();
+                run(&gpu);
+                gpu.device_synchronize().expect("sync");
+                best = best.max(bytes as f64 / t.elapsed().as_secs_f64() / 1e9);
+            }
+            println!(
+                "  {name:<20} block={block:<4} slabs={slabs} blocks={blocks:<5} {best:7.1} GB/s  {:5.1}%",
+                100.0 * best / peak_gbps()
+            );
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--wide") {
         // The plateau showed up at very wide, very shallow launches — many waves
         // each issuing a couple of loads. Push that axis to where each thread
