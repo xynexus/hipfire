@@ -126,9 +126,69 @@ adapter, much of which is not actually shareable.** Not worth blocking LFM2 on,
 and worth doing only as an independent cleanup with its own justification. The
 big extraction already happened; this doc's job is to reuse it, not to redo it.
 
-Corollary for the estimate: zaya's 2410 lines are most likely **hybrid-architecture
-complexity, not boilerplate** — which still predicts LFM2 (hybrid + MoE) lands
-high, but for a reason that no shared library can remove.
+### Read zaya's body: the corollary was right, and there is a bigger finding
+
+The corollary above (hybrid complexity, not boilerplate) holds. But reading the
+file changes the recommendation, so it is recorded here rather than left as a
+line-count inference.
+
+Where zaya's 2410 lines actually go:
+
+| item | lines |
+|---|---|
+| `impl ZayaStreamedCalibrationLayer` | 566 — of which **`forward_position_slice` is 411** |
+| `zaya_resource_estimate` | 321 |
+| `impl CalibrationLayer` | 212 |
+| `impl CalibrationFamilyAdapter` | 174 |
+| `load_block_weights` | 151 |
+| `zaya_tensor_requests` | 123 |
+| everything else | the remainder |
+
+`zaya_resource_estimate` is 321 lines of genuinely arch-specific memory
+arithmetic — per-sequence KV, the CCA conv ring and its delayed value, router
+and expert widths, position-slice scratch. Nothing generic to extract; it is the
+direct analogue of what LFM2 would need for `conv_L_cache`.
+
+**The finding that matters: `forward_position_slice` re-implements the
+architecture's forward pass.** It calls kernels directly (`gpu.rmsnorm_batched`,
+the CCA attention chain, the MoE chain) with capture taps interleaved. And the
+adapter imports exactly two things from its own crate — `ZayaConfig` and
+`ARCH_ID_ZAYA`. It does not use zaya's serving forward at all; `gpu.rs` (3623
+lines) does not even share the same kernel set.
+
+So **every calibrated arch carries TWO forward implementations**: the serving
+one, and a position-sliced one inside its calibration adapter, agreeing only via
+a config struct. That is a far larger duplication than the 17% measured between
+adapters — and it is *the* reason an adapter costs what it costs.
+
+### What that means for LFM2 — and for whether to write it at all
+
+Writing an LFM2 adapter means writing a second LFM2 forward: 18 double-gated
+short-conv layers and 6 GQA layers, sliced by position, with taps. The existing
+`forward.rs` cannot be reused as-is, exactly as zaya's could not.
+
+**This is the duplication the v2 daemon plan already proposes deleting.**
+`docs/plans/2026-08-09-v2-daemon-module-major-multistream.md` §C makes
+calibration a *tap* on the single lowered march — "calibration / imatrix →
+`ActStatTap` pre-`Proj`", eliminating `CalibrateDaemonSession` and
+`handlers/calibrate.rs` — precisely because the lowered forward is data
+(`Vec<SuperOp>`) rather than control flow, and data can be streamed and tapped
+without being rewritten per consumer.
+
+So there is a real sequencing decision here, and it should be made deliberately:
+
+* **Write the adapter now.** Unblocks LFM2-MoE calibrated formats today, at the
+  cost of adding a *sixth* instance of the duplication v2 intends to remove.
+* **Wait for the v2 tap.** No new duplication, but LFM2-MoE stays uncalibratable
+  until a large plan lands, and v2's own first target is qwen35, not LFM2.
+* **Write it deliberately as throwaway.** Take the adapter, and record in it that
+  `forward_position_slice` is expected to be deleted when calibration becomes a
+  tap — so the next reader knows it is scaffolding rather than architecture.
+
+The third is probably right if LFM2-MoE calibration is wanted soon, but that is a
+judgement about priorities, not something this doc should settle unilaterally.
+**What this doc does settle is that the cost is a second forward, not a wiring
+job** — which is the opposite of what its first draft implied.
 
 ---
 
