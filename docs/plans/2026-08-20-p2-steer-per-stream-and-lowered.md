@@ -155,8 +155,36 @@ different act and is not authorised by it.
 
 ### M3 — per-stream state
 
-Only after M2. Move `SESSION`/`ACTIVE`/`EPOCH` into per-stream state and thread a
-handle to the hook.
+**Unblocked: M2 is satisfied as of 2026-08-20.** Move `SESSION`/`ACTIVE`/`EPOCH`
+into per-stream state and thread a handle to the hook.
+
+**Follow the two landed precedents; do NOT invent a container.** M3 is one third
+of the parent plan's M1d ("the remaining process globals become per-stream:
+`RAW_OVERRIDE`, `hipfire_steer::{SESSION, ACTIVE, EPOCH}`, `load_progress::SINK`").
+The other two thirds are already done, and both used the *same* shape — replace
+the global with a value the caller owns and passes explicitly:
+
+| global | became | where |
+|---|---|---|
+| `RAW_OVERRIDE` (`thread_local`) | an `override_: Option<bool>` parameter | `serving-core/src/model.rs::effective_raw` |
+| `SAMPLER_STATE: AtomicU32` | a `SamplerRng` value, `from_seed`, owned per stream | `runtime/src/sampler.rs` |
+| `load_progress::SINK` | a thread-scoped sink + `ThreadSinkGuard` | P1, `handlers/lifecycle.rs` |
+
+The parent plan's M1b text says to "move the state into `StreamState`". **There is
+no `StreamState` type in this tree** — grep before building one. What landed was
+explicit threading, which is what M3's "thread a handle to the hook" already
+describes.
+
+Note `load_progress` took the *thread-scoped* variant rather than a parameter,
+because its call sites are six arch loaders whose signatures were not worth
+touching. Steer has only two real forward-path call sites, so the parameter shape
+is available to it and is the stronger one — a thread-local would re-create the
+same "who owns this" ambiguity one layer down.
+
+One transferable detail from the sampler work: its tests "used to share a
+`static SAMPLER_STATE` and cargo runs them on parallel threads", which is the same
+test-isolation hazard P1 hit. Whatever M3 lands, its tests must not share process
+state or they will flake under `cargo test`.
 
 `APPLY_CACHE` stays a `thread_local` holding `GpuTensor` — it is `!Sync` and
 cannot move into shared state. What changes is what the epoch invalidates
