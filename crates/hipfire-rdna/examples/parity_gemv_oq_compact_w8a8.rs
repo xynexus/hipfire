@@ -4,11 +4,12 @@
 
 //! Parity + bandwidth for the compact-resident Opus W4A8 decode GEMV.
 //!
-//! **The A8 kernel measures SLOWER than its A16 sibling (0.64-0.75x)** and is not
-//! wired into any dispatch route. This example is what establishes that, and what
-//! would catch it changing. See the kernel header for why: at batch 1 the
-//! activation is a rounding error in the byte count, so A8 recovers no bandwidth,
-//! and int4 weights must be widened to int8 lanes before V_DOT4 can touch them.
+//! A8 REACHES the memory wall — 236 GB/s on o_proj against a 250 GB/s pure-read
+//! stream — but only at N_out=1. At the production N_out=3 the sparse overlay
+//! loop dominates both this kernel and its A16 sibling. `OQC8_NOUT` sweeps the
+//! overlay count, which is what exposes that: 1 -> 8 corrections costs BOTH
+//! kernels ~4x, because the loop is O(N_out^2) and divergent. Fix the overlay
+//! before judging the dot.
 //!
 //! Two things are checked, because they fail independently:
 //!
@@ -55,7 +56,14 @@ fn f16_bits_to_f32(b: u16) -> f32 {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
-    const N_OUT: usize = 3; // the real oq4.25++ block: 130 + 2*3 = 136 B
+    // Real oq4.25++ is N_out=3. OQC8_NOUT sweeps it: if the A8 deficit tracks the
+    // overlay count, the per-correction byte load of Xq[idx] is the cost.
+    let n_out: usize = std::env::var("OQC8_NOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    #[allow(non_snake_case)]
+    let N_OUT: usize = n_out;
     let block_stride = 130 + 2 * N_OUT;
 
     let shapes: &[(&str, usize, usize)] = &[

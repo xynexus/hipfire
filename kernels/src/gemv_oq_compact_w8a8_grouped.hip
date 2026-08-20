@@ -5,37 +5,31 @@
 // Compact-resident Opus DECODE GEMV, W4A8 (batch=1): the A8 twin of
 // `gemv_oq_compact_grouped_v2`.
 //
-// ⚠️ MEASURED SLOWER THAN THE A16 SIBLING. Kept because it is exact and because
-// the reason is worth not re-deriving. Not wired into any dispatch route.
+// Status: A8 REACHES the memory wall — 236 GB/s on o_proj against a 250 GB/s
+// pure-read stream, 94% — but only when the sparse overlay is out of the way.
+// At the production N_out=3 the overlay dominates BOTH this kernel and its A16
+// sibling, and this one comes out behind. Not wired into a dispatch route yet
+// for that reason.
 //
-//   shape                    A16        A8
-//   gate/up [17408, 5120]  145 GB/s   93 GB/s   0.64x
-//   down    [5120, 17408]  128        93        0.72x
-//   o_proj  [5120,  5120]  204       153        0.75x
+//   N_out   A16 gate/up   A8 gate/up   A16 o_proj   A8 o_proj
+//     1       197.7         171.2        250.2        236.4     <- bandwidth-bound
+//     3       146.9          91.6        202.3        133.7     <- production
+//     8        45.7          40.8         62.6         58.1
 //
-// The premise was that A8 doubles dot throughput, so the kernel would stop being
-// issue-bound and fall back onto the memory wall. It does not, for a batch-1
-// reason: the ACTIVATION is a rounding error in the byte count. Per group a lane
-// reads block_stride (136) bytes of weights against 16 bytes of int8 activation;
-// quantizing the activation saves 3*K bytes against M*K*0.53 of weights. There is
-// no bandwidth to recover, so A8 can only pay in compute — and for int4 weights
-// it COSTS compute, because V_DOT4 needs int8 lanes and the nibbles must be
-// widened first. `gemv_oq8_w8a8_grouped` wins on ZAYA precisely because its
-// weights are already dense int8 and it widens nothing.
+// The overlay loop is O(N_out^2) and divergent: every correction rescans the
+// remaining table entries looking for a superseding duplicate, and the ownership
+// test is a `continue`, so all 16 lanes of a group pay for every iteration even
+// though one lane applies it. That is what 1 -> 8 costs 4x on both kernels, and
+// it is the thing to fix before the dot matters. Deduping the overlay table
+// offline (last-wins already applied) would delete the inner rescan outright.
 //
-// The widening was optimized before concluding this: extracting and re-packing 16
-// nibbles measured 0.59-0.84x, and SWAR widening plus a V_PERM_B32 activation
-// de-interleave measured 0.64-0.75x. Nearly unchanged, which is what rules the
-// widening out as the cost and points at the batch-1 argument above.
-//
-// Where A8 DOES pay is batched, where the activation is B*K and the int8 WMMA
-// path far outruns f32 — which is why the batched Opus GEMM already uses W8A8.
-//
-// oq4.25++ is a MIXED-precision format — 4-bit bulk plus a sparse int8 outlier
-// overlay, decoded together — so the weights arrive as int4 and the dot needs
-// int8 lanes. The nibbles are therefore widened into packed int8 before the dot;
-// there is no int4xint8 dot on this ISA (`v_dot8_i32_iu4` needs BOTH operands
-// int4). The widening is register work that replaces 16 f32 converts.
+// What was ruled out along the way, so it is not re-derived: the dot IS emitted
+// (4x v_dot4_i32_iu8 in the ISA); this kernel uses FEWER resources than the A16
+// sibling (100 VALU vs 127, 27 VGPRs vs 47, 8 loads vs 10, no spills); and
+// breaking the four dots out of a single accumulator into independent ones
+// changed nothing. The nibble widening was optimized twice — naive
+// extract-and-repack, then SWAR + V_PERM_B32 — for no measurable difference,
+// which is what rules the widening out too.
 //
 // Numerics track `gemv_oq_compact_grouped_v2` exactly, including the overlay
 // contract: an overlay REPLACES the bulk nibble, so it is applied as a
@@ -123,11 +117,16 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_w8a8_grouped(
         const uint32_t xo1 = __builtin_amdgcn_perm(xd, xc, 0x07050301u);
 
         // sudot4 = V_DOT4_I32_IU8 with per-operand sign flags; both signed here.
-        int idot = 0;
-        idot = __builtin_amdgcn_sudot4(true, (int)we0, true, (int)xe0, idot, false);
-        idot = __builtin_amdgcn_sudot4(true, (int)wo0, true, (int)xo0, idot, false);
-        idot = __builtin_amdgcn_sudot4(true, (int)we1, true, (int)xe1, idot, false);
-        idot = __builtin_amdgcn_sudot4(true, (int)wo1, true, (int)xo1, idot, false);
+        // FOUR INDEPENDENT accumulators, not one chained: each v_dot4 carries its
+        // own accumulate operand, so writing them into a single `idot` serializes
+        // the four on that register's latency with nothing to overlap. Integer
+        // adds are exact and associative, so the final sum is identical.
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        d0 = __builtin_amdgcn_sudot4(true, (int)we0, true, (int)xe0, d0, false);
+        d1 = __builtin_amdgcn_sudot4(true, (int)wo0, true, (int)xo0, d1, false);
+        d2 = __builtin_amdgcn_sudot4(true, (int)we1, true, (int)xe1, d2, false);
+        d3 = __builtin_amdgcn_sudot4(true, (int)wo1, true, (int)xo1, d3, false);
+        int idot = (d0 + d1) + (d2 + d3);
 
         // Overlay corrections stay INTEGER — (val - bulk) * xq is exact in i32,
         // so the whole group still needs only one f32 rescale.
