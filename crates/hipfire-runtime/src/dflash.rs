@@ -162,6 +162,22 @@ pub struct DflashConfig {
     pub mask_token_id: u32,
     pub target_layer_ids: Vec<usize>,
     pub num_target_layers: usize,
+    /// DFlash generation: 1 for the classic drafter, 2 for z-lab's DFlash2
+    /// (per-layer grouped dynamic causal convs + a candidate selector). Both
+    /// DFlash2 GPU kernels exist and are parity-checked against the upstream
+    /// reference (`dflash2_grouped_dynamic_conv`, `dflash2_candidate_selector`);
+    /// what is still missing is the call sites in `draft_forward_opts` and the
+    /// drafting loop, so `from_source` refuses version 2. This geometry is what
+    /// those call sites will read once wired.
+    pub version: u32,
+    /// DFlash2 only: candidate-selector codebook rank, and candidates kept per
+    /// position. Zero on DFlash1.
+    pub selector_rank: usize,
+    pub selector_top_k: usize,
+    /// DFlash2 only: taps and channel-group width of the dynamic causal conv.
+    /// Zero on DFlash1.
+    pub conv_kernel_size: usize,
+    pub conv_group_size: usize,
 }
 
 impl DflashConfig {
@@ -265,13 +281,16 @@ impl DflashConfig {
         // stays CORRECT because the target verifies every token, so the only
         // symptom would be a mysteriously poor acceptance rate. Fail loudly
         // instead. Remove this once the conv + selector path lands.
-        if df
+        let version = df
             .get("dflash_version")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            >= 2
-            || df.get("selector_rank").is_some_and(|v| !v.is_null())
-        {
+            .unwrap_or(1) as u32;
+        let u = |k: &str| df.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let selector_rank = u("selector_rank");
+        let selector_top_k = u("selector_top_k");
+        let conv_kernel_size = u("conv_kernel_size");
+        let conv_group_size = u("conv_group_size");
+        if version >= 2 || selector_rank > 0 {
             eprintln!(
                 "  DFlash draft REFUSED: this is a DFlash2 drafter (selector_rank={:?}, \
                  conv_kernel_size={:?}). Its conv + candidate-selector are not implemented \
@@ -306,6 +325,11 @@ impl DflashConfig {
             mask_token_id,
             target_layer_ids,
             num_target_layers,
+            version,
+            selector_rank,
+            selector_top_k,
+            conv_kernel_size,
+            conv_group_size,
         })
     }
 }
@@ -2460,6 +2484,12 @@ mod dtype_tests {
             mask_token_id: 248070,
             target_layer_ids: vec![1, 8, 15, 22, 29],
             num_target_layers: 32,
+            // DFlash1 fixture: DFlash2 geometry is absent.
+            version: 1,
+            selector_rank: 0,
+            selector_top_k: 0,
+            conv_kernel_size: 0,
+            conv_group_size: 0,
         };
         // Qwen3.5-9B target geometry is 16 Q heads x 256, but those fields are
         // not part of the hidden-state/vocabulary interface to this drafter.
