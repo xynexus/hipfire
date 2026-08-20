@@ -1389,11 +1389,26 @@ impl WeightPager {
             // free-list nothing draws from. `upload_raw_pooled` exists for this
             // call site and its doc says so; the pager just never used it.
             //
-            // Measured on the paged 122B: ~9.6 MB leaked per page-in, system
-            // memory climbing ~1.1 GB/s to 116 GB and then OOMing on a 9 MiB
-            // allocation — while the pager's own accounting sat correctly at its
-            // 8 GiB budget and the daemon's RSS stayed at 0 (it is GTT, so it
-            // never shows in RSS).
+            // This is the host-repack branch, and `module_requires_host_repack`
+            // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
+            // artifact — so it is the branch a paging Opus MoE actually takes.
+            // Its sibling `else` was already pooled, which is why the bug needed
+            // a paging Opus model to show up at all.
+            //
+            // Found twice independently, so both measurements are kept:
+            //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
+            //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
+            //     pager's own accounting sat correctly at its 8 GiB budget and
+            //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
+            //     RSS).
+            //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
+            //     cache: died at ~1 min before, runs 1h49m to completion after,
+            //     returning a KLD bit-identical to the same score with paging
+            //     disabled. A SMALLER cache died FASTER — backwards for a budget,
+            //     and the signature of a leak proportional to eviction count.
+            // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
+            // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
+            // nothing.
             let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
             (tensor, prepared.gate_up_rel, prepared.down_rel)
         } else {

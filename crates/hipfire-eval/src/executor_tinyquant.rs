@@ -432,6 +432,69 @@ fn explicit_blocked_oq_cells(family: &str) -> &'static [(&'static str, bool)] {
     }
 }
 
+/// The quantizer's per-run LDLQ tally, parsed off its stderr.
+///
+/// Worth surfacing because `ldlq_report_and_validate` only enforces
+/// `success > 0`: a build that applied LDLQ to the dense tensors and skipped
+/// every routed expert passes that check silently, and a `++` artifact whose
+/// experts never got error feedback is indistinguishable downstream from one
+/// where they did. `missing` is the counter that tells them apart.
+#[derive(Clone, Default)]
+struct LdlqReport {
+    success: u64,
+    attempts: u64,
+    missing: u64,
+    k_mismatch: u64,
+    pack_failed: u64,
+    /// Tensors the quantizer reported skipping, with its stated reason. A count
+    /// says coverage is incomplete; these say WHICH, which is the difference
+    /// between "LDLQ missed a few norms" and "no routed expert got feedback".
+    skipped: Vec<String>,
+    /// Routed-expert tensors that resolved to a LAYER-POOLED donor Hessian
+    /// rather than their own. Counted separately because a pooled build and a
+    /// per-expert one are different experiments, and a `success` that came from
+    /// pooling is not the same evidence as a direct hit.
+    pooled: u64,
+}
+
+/// Parse `  LDLQ tensors:  success=N attempts=N missing=N k_mismatch=N pack_failed=N`.
+/// `None` when the line is absent, which is the normal case for an uncalibrated
+/// format — absent and all-zero are different and must not be conflated.
+fn parse_ldlq_report(stderr: &str) -> Option<LdlqReport> {
+    let line = stderr.lines().find(|l| l.contains("LDLQ tensors:"))?;
+    let field = |key: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|t| t.strip_prefix(key).and_then(|v| v.parse::<u64>().ok()))
+            .unwrap_or(0)
+    };
+    // `  ldlq: skip <name> (<reason>)` — one per skipped tensor, emitted next to
+    // the counters this parses.
+    let skipped: Vec<String> = stderr
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ldlq: skip "))
+        .map(|s| s.trim().to_string())
+        .collect();
+    // `  LDLQ pooled:      N routed-expert tensor(s) used a LAYER-POOLED Hessian`
+    // — printed only when N > 0, so absence means zero.
+    let pooled = stderr
+        .lines()
+        .find(|l| l.contains("LDLQ pooled:"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|t| t.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    Some(LdlqReport {
+        success: field("success="),
+        attempts: field("attempts="),
+        missing: field("missing="),
+        k_mismatch: field("k_mismatch="),
+        pack_failed: field("pack_failed="),
+        skipped,
+        pooled,
+    })
+}
+
 fn run_quantize(
     quant: &Path,
     input: &Path,
@@ -439,7 +502,7 @@ fn run_quantize(
     format: &str,
     extra_flags: &[&str],
     calib: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<Option<LdlqReport>, String> {
     let mut cmd = Command::new(quant);
     cmd.arg("--input")
         .arg(input)
@@ -473,7 +536,7 @@ fn run_quantize(
             out.status.code()
         ));
     }
-    Ok(())
+    Ok(parse_ldlq_report(&String::from_utf8_lossy(&out.stderr)))
 }
 
 fn run_kld(
@@ -896,21 +959,25 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 continue;
             }
             let cand = work.join(format!("{fam}.{}.hfq", fmt.replace('-', "_")));
-            if let Err(e) = run_quantize(&quant, &dir, &cand, fmt, plan.quant_flags, Some(&calib)) {
-                let mut m = BTreeMap::new();
-                m.insert("family".into(), json!(fam));
-                m.insert("format".into(), json!(fmt));
-                m.insert("calibrated".into(), json!(true));
-                push(
-                    fam,
-                    &format!("quantize:{fmt}(calib)"),
-                    EvalStatus::Fail,
-                    Some(e),
-                    m,
-                    &mut rows,
-                );
-                continue;
-            }
+            let ldlq = match run_quantize(&quant, &dir, &cand, fmt, plan.quant_flags, Some(&calib))
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    let mut m = BTreeMap::new();
+                    m.insert("family".into(), json!(fam));
+                    m.insert("format".into(), json!(fmt));
+                    m.insert("calibrated".into(), json!(true));
+                    push(
+                        fam,
+                        &format!("quantize:{fmt}(calib)"),
+                        EvalStatus::Fail,
+                        Some(e),
+                        m,
+                        &mut rows,
+                    );
+                    continue;
+                }
+            };
             match run_kld(&probe, fam, &anchor, &cand, plan.probe_env) {
                 Ok(cell) => {
                     let key = format!("{fmt}-calib");
@@ -921,7 +988,21 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                         observed.push((gpu_arch.clone(), fam.to_string(), key, cell.mean_kld));
                     }
                     let (st, rs) = kld_status(&cell, base, record);
-                    let m = kld_metrics(fam, fmt, true, &gpu_arch, &cell, base);
+                    let mut m = kld_metrics(fam, fmt, true, &gpu_arch, &cell, base);
+                    // Coverage, not quality: `success` alone cannot distinguish
+                    // "LDLQ reached every tensor" from "it reached the dense
+                    // ones and skipped every routed expert". `missing` can.
+                    if let Some(r) = ldlq.as_ref() {
+                        m.insert("ldlq_success".into(), json!(r.success));
+                        m.insert("ldlq_attempts".into(), json!(r.attempts));
+                        m.insert("ldlq_missing".into(), json!(r.missing));
+                        m.insert("ldlq_k_mismatch".into(), json!(r.k_mismatch));
+                        m.insert("ldlq_pack_failed".into(), json!(r.pack_failed));
+                        m.insert("ldlq_pooled".into(), json!(r.pooled));
+                        if !r.skipped.is_empty() {
+                            m.insert("ldlq_skipped".into(), json!(r.skipped));
+                        }
+                    }
                     push(fam, &format!("kld:{fmt}(calib)"), st, rs, m, &mut rows);
                 }
                 Err(e) => {

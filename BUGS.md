@@ -4,6 +4,57 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## [Low — re-record the baseline] oq4.25++ encoder changed at 8357081d3: +93% KLD on the random-init fixture, but −26% KLD on a REAL model
+- **RESOLVED 2026-08-13, and it reverses the naive reading.** Measured on
+  Qwen3.5-0.8B (real weights, one Hessian reused across both sides, both scored
+  against one bf16-anchor reference):
+
+  | | ppl | mean KLD vs bf16 |
+  |---|---|---|
+  | bf16 anchor | 15.105 | — (4.0e-10 self-check) |
+  | **new selector (master)** | **15.740** | **0.030567** |
+  | old selector (`b05f74a79`) | 16.126 | 0.041126 |
+
+  KLD −25.7%, and the new selector recovers 38% of the quantization perplexity
+  gap. Two independent metrics agree: `8357081d3` is a genuine improvement.
+- **Action: re-record `gemma4_moe/kld:oq4.25++`. Do not revisit the selector.**
+  The fixture is seeded random-init, where there is no outlier structure for a
+  promotion-set search to find, so it moved the opposite way for a reason that
+  says nothing about real models.
+- Remaining gap: the model measured is dense (arch 5); the failing fixture is
+  MoE. A real MoE is unmeasured — an assumption, not a measurement.
+- Also established: `hipfire-quantize` IS deterministic (same binary + inputs →
+  byte-identical payload); only HFQ front-metadata/tail key ordering varies.
+- Method warning, because it produced a perfect-looking wrong answer first: an
+  A/B script that runs `./target/release/hipfire-quantize` without rebuilding
+  inherits whatever commit `git bisect` last left it at. Rebuild explicitly, and
+  treat an impossibly clean agreement (two weight sets, KLD identical to 18
+  digits) as a symptom rather than a result. Full write-up:
+  `docs/tiny-quant-gate-8-failures.md`.
+
+## [superseded, kept for the record] oq4.25++ encoder changed output at 8357081d3 — +93% KLD on the gemma4_moe fixture, real-model impact UNMEASURED
+- Category: Quantization / encode-side
+- Location: `crates/hipfire-quantize/src/codecs.rs` `mixed_clipsearch`,
+  `crates/hipfire-quantize/src/ldlq.rs`; first bad commit `8357081d3`
+  ("fix(opus): choose the mixed scale and promotion set jointly", 2026-08-06)
+- `tests/tiny-quant-gate.sh` cell `gemma4_moe/kld:oq4.25++(calib)` went
+  0.003077 -> 0.005952 (+93%, budget ±25%) and has been red since. Bisected
+  over 549 commits on the measured VALUE, not pass/fail — the baseline file
+  moves across that range. Bit-identical either side of the commit, so it is a
+  deterministic step, not drift.
+- **The commit predicted the opposite**: "At the shipped oq4.25++ default
+  (N_out=3) this is a 0.6% SSE change; do not expect a visible KLD move there."
+  It changed the encoder and did not re-record `tests/tiny-quant-baselines.txt`.
+- The joint-argmin argument is sound; it minimizes group reconstruction SSE
+  while the gate measures KLD. 0.6% SSE -> 93% KLD is the proxy/target gap.
+- **Do not act on the fixture alone.** Tiny fixtures are seeded random-init over
+  a synthetic token stream, so this shows the encoder's output changed
+  materially — what the gate is for — not that real models quantize worse.
+  The owed measurement is a real model quantized to oq4.25++ either side of
+  `8357081d3`, compared by KLD; that decides re-record vs revisit-the-selector.
+- Full write-up, provenance table and the two accompanying vacuous cells:
+  `docs/tiny-quant-gate-8-failures.md` postscript.
+
 ## [FIXED] down_proj gets no Hessian/imatrix on bf16 models — `gemv_bf16_xf32` never tapped
 - Category: Correctness / Calibration
 - Location: `crates/hipfire-rdna/src/dispatch/gemv.rs` `gemv_bf16_xf32`
@@ -257,7 +308,10 @@ So every lever this thread identified should NOT be pulled:
 What the thread was right about, and what it was wrong about:
 - Right: the f32 kernel really does drift ~7x more from fp64 than FP16 storage
   drifts from f32 (3.5% vs 0.5% state divergence at 120 decode steps). The
-  attribution is real — the KV dot dominates, storage is smallest.
+  DIVERGENCE is real and reproducible.
+- Wrong: the attribution of it. "The KV dot dominates, storage is smallest" was
+  an artifact of unnormalised synthetic k/q; with realistic inputs the KV dot is
+  ~8% and the UPDATE/STORE is the whole term. See the CORRECTED entry above.
 - Wrong: that any of it reaches the output. State divergence is not KLD, and
   nobody had connected them. A recurrence amplifies perturbations, so the
   assumption cut both ways and needed measuring rather than arguing.
@@ -278,11 +332,34 @@ and it was wrong.
 | 512 | 255 (obs) | 256..511 | 3.744e-10 |
 | 2048 | 1023 (derived) | 1024..2047 | 1.477e-10 |
 | 8192 | 4095 (obs) | 4096..8191 | 2.016e-10 |
+| 16384 | 8191 (obs) | 8192..16383 | 7.834e-11 |
+| 32768 | 16383 (obs) | 16384..32767 | 1.360e-10 |
 
 `(obs)` = read from the run's `total_scored`; `(derived)` = computed from
 `n_ctx/2 - 1`, because that run's output was not captured to a file and only its
 KLD survives. The 512 row was re-run to confirm both the count and the KLD
 (3.7444e-10, bit-reproducible), which is what established the formula.
+
+**64x of context depth, and the KLD does not move.** Every point sits within ~5x
+of every other, the ordering is non-monotonic, and the DEEPEST point (16383
+tokens) is 2.8x LOWER than the shallowest. There is no growth term to
+extrapolate and no trend to fit — this is scatter around ~1.5e-10, not a curve.
+The mechanism is the one the corrected ablation identified: a decaying gate
+drains old error out of the recurrent state faster than new error accumulates.
+
+The state is advanced token-by-token across all 16383 tokens within the chunk,
+so recurrent accumulation over a long context IS exercised. What is still not
+exercised is autoregressive feedback — teacher forcing means a perturbed logit
+never changes the next input token. That is the one remaining scope caveat, and
+against ~8 orders of margin it does not put the conclusion in doubt.
+
+Measurement note on the last row, because the conditions differ: the 32768 score
+ran with `HIPFIRE_QWEN35_PAGED_EXPERTS=0` (all experts resident) while its
+reference was built WITH paging, and every other row used paging on both sides.
+Paging is a residency mechanism, not a numeric one, so this should not matter —
+and empirically it did not: the row lands mid-range among the others rather than
+as an outlier, which is itself a small piece of evidence that expert paging is
+numerically neutral. The switch was forced, not chosen; see below.
 
 **Flat, and non-monotonic, over an 8x span of context** — the 8192 point is
 LOWER than the 512 one. There is no growth term to extrapolate. This is the
@@ -297,10 +374,66 @@ the eval is teacher-forced, so a perturbed logit never changes the next input
 token. The 3.5% figure came from 120 autoregressive DECODE steps. With ~8 orders
 of margin and a measured-flat length response, the conclusion is not in doubt.
 
-Also observed: chunk 1 of the scoring run died with `paged expert residency
-layer=20 expert=78 ... free=15.1 MiB of total=43008.0 MiB` — the expert-cache
-pressure documented elsewhere in this file, unrelated to precision.
+**CLOSED. Do not re-open on new precision modelling alone.** The question was
+"how much precision does the DeltaNet recurrence need, including near max
+context", and it is answered: f32 arithmetic is required and sufficient; f16
+ARITHMETIC is not viable (~1.5e-3, four orders worse, see the CORRECTED entry);
+the f32 error does not compound with context over a 64x sweep; and the whole term
+is ~8 orders below the model's own quantization. Re-opening needs a NEW REGIME —
+autoregressive long generation is the only one identified — not another
+estimate of a term already bounded at 1e-10.
 
+### Side finding: the expert pager leaks, and it is what blocked 16383 at first
+
+Both paged attempts at the 32768 chunk died with
+`paged expert residency ... hipMalloc(1.55 MiB), free=15.1 MiB of
+total=43008.0 MiB`. The diagnostic part is HOW they died:
+
+| expert cache budget | survived |
+|---|---|
+| 14336 MB | ~1 hour |
+| 6144 MB | ~1 minute |
+| pager off (all resident) | ran to completion |
+
+**A smaller cache died faster.** That is backwards for a budget — a smaller cache
+should bound residency harder, not exhaust memory sooner — and it is exactly the
+signature of the `upload_raw`/`GpuPool` asymmetry already filed as a Tier-1
+prerequisite: `Gpu::upload_raw` mallocs directly while `free_tensor` frees into
+`GpuPool`, so every eviction parks VRAM in a free-list the next cold load cannot
+reach. Smaller cache -> more evictions -> more paging traffic -> faster leak.
+Disabling the pager removes every eviction, and the same run then completed.
+
+So this is not "expert-cache pressure" or a capacity limit of the box, which is
+how the earlier note in this file described it. It is a leak proportional to
+paging traffic, and the three-point cache sweep above is the cheapest reproducer
+found so far. Worth attaching to that filing rather than leaving it here.
+
+
+**FIXED 2026-08-15.** `WeightPager::ensure_expert_module_resident` had two
+allocation branches; the `module_requires_host_repack` one used the unpooled
+`gpu.upload_raw` while its sibling used the pooled path, and BOTH free through
+`gpu.free_tensor` into `GpuPool`. `module_requires_host_repack` is true for
+exactly `Oq4G256` / `Oq8G256` / `OqPlusCompact` — every Opus artifact — so a
+paging Opus MoE took the leaking branch on every cold load. Switched to
+`upload_raw_pooled`.
+
+Verified end to end on the reproducer above: the 32768-chunk score at a 6144 MB
+cache, which died in ~1 minute, now runs 1h49m to completion and returns
+`mean_kld = 1.360282858575701e-10` — **bit-identical to the pager-off run**, so
+the fix removes the failure without moving numerics.
+
+Quantified by `cargo run --release -p hipfire-rdna --example
+pool_churn_upload_raw` (the M1a exit measurement):
+
+    pooled    4000 cycles:  total_new += 0,  total_reused += 4000,  VRAM +0 B
+    unpooled   200 cycles:  VRAM +419,430,400 B  = 400 MiB stranded
+
+200 unpooled cycles strand 400 MiB; 4000 pooled cycles strand nothing.
+
+Note the tiny gates cannot cover this — `tiny-affected-gate.sh
+--require-coverage` reports "no tiny coverage selected for changed paths",
+because the tiny fixtures do not page experts. The evidence above is the
+coverage.
 ## [High] The FP32 DeltaNet reference drifts ~7x MORE than FP16 drifts from it
 
 Measured 2026-08-12 with a new FP64-accumulate oracle
@@ -1936,3 +2069,130 @@ reproduction and the reasoning that led to the real cause are still useful.
   then treat these three artifacts as single-chunk.
 - Scope: Tooling / evidence integrity
 - Confidence: High (self-test is deterministic and reproduces on all 3 files)
+
+## [Medium] tiny-quant `++` cells: gemma4_moe expert gate_up gets no Hessian — a hand-rolled capture map names it SPLIT while the artifact FUSES it
+- Category: Test coverage / calibration name resolution
+- Location: `crates/hipfire-serving-core/src/tiny_harness.rs` `capture_names()`
+  Gemma4 arm (L1067); `crates/hipfire-quantize/src/main.rs`
+  `calibration_tensor_name_candidates` (L6425)
+- **This entry has been wrong twice. The mechanism below is established by
+  name-level comparison, not inference.** First filed [High] with the right
+  symptom and a guessed mechanism; then retracted on a stale code comment
+  ("routed experts ... we don't name them") that does not describe what the
+  Gemma4 arm actually does. It names them — under the wrong names.
+- The capture map registers, per expert:
+
+      model.language_model.layers.{L}.experts.{E}.gate_proj    <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.up_proj      <- SPLIT
+      model.language_model.layers.{L}.experts.{E}.down_proj
+
+  while the quantized fixture FUSES gate and up, so the quantizer resolves
+  `...experts.{E}.gate_up_proj.weight`. `down_proj` matches; `gate_up_proj`
+  matches nothing. Hence exactly 16 missing (2 layers x 8 experts) with
+  `pooled=0`, and 16 expert `down_proj` among the successes. The arithmetic
+  closes: 22 dense + 16 down + 16 gate_up = 54 attempts, 38 success.
+- `qwen3_5_moe` is the control and the fix in miniature: its arm calls the arch's
+  REAL walker (`qwen35::build_capture_names`), the names agree, `missing=0`.
+- **Root cause is the divergence, not the names.** The harness hand-rolls capture
+  maps for 7 families (Qwen2, DotsOcr, Deepseek4, Gemma3, Gemma3Vl, MiniMax,
+  Gemma4) while 4 use the arch's real walker. Gemma3 and MiniMax hand-roll even
+  though `hipfire-arch-gemma3/src/calibration.rs:38` and
+  `hipfire-arch-minimax/src/calibration.rs:37` exist. Gemma4 has no walker at
+  all. The harness is meant to reuse real hipfire; every hand-rolled map is a
+  second source of truth that can drift from the artifact layout, and this is
+  that drift.
+- Note the genuine subtlety before "just fix the names": at runtime the Gemma4
+  model holds gate and up as SEPARATE tensors (captured by pointer), while the
+  artifact fuses them. So the capture cannot simply emit the fused name — one
+  name, two pointers. Either `calibration_tensor_name_candidates` learns the
+  fused<->split correspondence, or the collector combines the two captures.
+- Fix order: (1) give gemma4 a real `build_capture_names` in its arch crate and
+  switch Gemma3/MiniMax to theirs, so there is one source of truth; (2) resolve
+  fused<->split in the candidate list; (3) make `ldlq_report_and_validate`
+  strict about `missing > 0` for a `++` format — a partial application currently
+  emits an artifact named `++` regardless, which is the mislabelled-artifact
+  failure the quantizer refuses `qtip3++` over.
+- Shipped-artifact impact still UNMEASURED: real models calibrate through the
+  real engine (`calibration/expert_capture.rs:777`), not this map. A real dense
+  model returned `missing=0, 186/186`; a real MoE has not been run.
+- Visible per calibrated cell in `results.jsonl` as `ldlq_{success,attempts,
+  missing,k_mismatch,pack_failed,pooled}` and `ldlq_skipped`.
+
+## [Medium] Calibration coverage: three open questions, all reducing to one missing measurement
+Examined 2026-08-20. Recorded together because they turn out to share a root.
+
+### 1. The collectors disagree about `lm_head`, and minimax is the outlier
+Surveyed all eight `build_capture_names` walkers: **minimax captures `lm_head`;
+the other seven do not.** llama's walker states the convention — "The lm-head
+(`output`) is not captured for a Hessian — like every other arch collector it is
+KLDREF-only" — and it is right about the other seven.
+
+The defect is not which side is correct, it is that the quantizer's LDLQ
+ELIGIBILITY set and the collectors' CAPTURE set disagree: the quantizer attempts
+`lm_head`, so a family following the convention reports a permanent `missing=1`
+and its `++` artifact is, strictly, not fully covered. **This is what blocks
+`HIPFIRE_LDLQ_STRICT` from becoming the default** — a strict pass fails seven
+families out of eight.
+
+Natural experiment, from switching the harness to minimax's real walker
+(PR #254) with baselines that had been recorded while `lm_head` was uncovered:
+
+    oq4+     0.00129443 -> 0.00129443   unchanged
+    oq4++    0.00129443 -> 0.00129443   unchanged
+    oq4.25++ 0.00089918 -> 0.00089271   -0.7%
+    oq8+     0.00000675 -> 0.00000675   unchanged
+    oq8++    0.00000675 -> 0.00000675   unchanged
+
+So covering `lm_head` with LDLQ has **no effect this fixture can resolve** — four
+of five cells identical, one moving 0.7%, all inside the ±25% budget. Read that
+as "below the fixture's resolution", not as "no effect": the values are printed
+at six significant figures.
+
+### 2. gemma4 still has no capture walker
+Confirmed post-merge: no `build_capture_names` in `hipfire-arch-gemma4`, and
+`tiny_harness.rs:1060` still hand-rolls the map. This is the family whose
+hand-rolled map named expert projections SPLIT while the artifact FUSES them,
+which PR #252 patched at the quantizer (fused -> split Hessian fallback). The
+durable fix is a walker in the arch crate; the harness arm then follows the
+other four.
+
+### 3. Real-MoE oq4.25++ is still unmeasured, and is NOT tractable on this box
+**Attempted 2026-08-20; the "tractable" claim in the first version of this entry
+was wrong.** I sized LFM2.5-8B-A1B (10.5 GB) and never checked whether its arch
+can be calibrated at all. It cannot:
+
+    InvalidSourcePlan("no native calibration adapter is registered for architecture 11")
+
+**Only five arches register a calibration adapter** — qwen35, gemma3, zaya,
+gemma4, cohere2 (`register_calibration_adapter!`). lfm2moe is not one, so no
+Hessian can be produced for it through the production path, and `oq4.25++`
+without a Hessian is not the format under test.
+
+The smallest real MoE on a supported arch is `Qwen3.5-35B-A3B` at ~44 GB. The
+measurement needs an HF restore (~44 GB, because `calibrate` accepts ONLY an HF
+snapshot — not `.hfa`, not `.hfq`; use `hipfire-coexistence repack` to restore)
+plus a bf16 anchor (~44 GB), a Hessian, and two `oq4.25++` artifacts (~19 GB
+each): **~170 GB of working space against 65 GB free.** Not feasible here.
+It needs a bigger box, or a small real MoE on one of those five arches.
+
+### 3b. The tiny harness calibrates families production cannot
+Falling out of the above, and pointing the same way as the capture-map drift:
+the tiny gate runs five calibrated cells for `lfm2_moe` (`oq4+`, `oq4++`,
+`oq4.25++`, `oq8+`, `oq8++`) while the production `calibrate` CLI refuses arch 11
+outright. It can do that because the harness uses its own `CalibCollector` +
+`capture_names()` rather than the `layer_stream` adapter registry.
+
+So a family can look **calibration-covered in the gate while being
+uncalibratable in production** — the harness/production divergence again, but
+inverted: here the harness does MORE than the real path, which is the direction
+that manufactures false confidence rather than false alarms.
+
+### The shared root
+(1) and (3) are the same question — *does a calibration/encoder change help real
+weights?* — and neither can be answered on the tiny fixtures, because seeded
+random-init weights have no outlier or correlation structure for AWQ scaling or
+Hessian feedback to exploit. That is the same limitation that made the gemma4
+fixture move OPPOSITE to the real model on oq4.25++
+(`docs/tiny-quant-gate-8-failures.md`). One real-MoE run on LFM2.5-8B-A1B would
+inform both: quantize either side of `8357081d3`, and separately with `lm_head`
+capture on and off.

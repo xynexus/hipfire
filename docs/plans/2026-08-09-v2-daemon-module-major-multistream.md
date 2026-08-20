@@ -1498,3 +1498,69 @@ remains the byte-identity oracle.
 - `tests/AGENTS.md` — record the three measurement traps as standing verification warnings.
 - `BUGS.md` — file the `upload_raw`/`GpuPool` asymmetry independently. It is wrong today,
   not only under v2.
+
+## Status, 2026-08-20 — prerequisites re-checked against master
+
+The 2026-08-09 prerequisite list is stale. Re-checked item by item at
+`20c02555b`. Method: grep plus the doc comments at each site, NOT a read of the
+surrounding logic — several "cleared" marks below rest on a comment saying "this
+used to be a static", which is strong evidence but not a proof of correctness
+under interleaving.
+
+### Tier 1 (blocks correctness) — 3 of 4 cleared
+
+| item | state |
+|---|---|
+| process-global sampler RNG (`sampler.rs`) | **CLEARED** — "used to be `static SAMPLER_STATE: AtomicU32`" |
+| missing lease reaper (`hipfire-scheduler`) | **CLEARED** — `reap_expired` / `LeaseGuard` present |
+| `RAW_OVERRIDE` (`serving-core/src/model.rs`) | **CLEARED** — "used to be a `thread_local RAW_OVERRIDE`" |
+| `upload_raw` / `GpuPool` asymmetry | **PARTIAL** — see below |
+
+`Gpu::upload_raw` still calls `self.hip.malloc()` directly
+(`dispatch/mod.rs:2169`) while `upload_raw_pooled` (`:2212`) uses the pool. The
+paged-expert call sites that made this bite are fixed (PR #253 and the
+independent `c6c06b27a`), and the M1a example passes — but **the asymmetric API
+survives, so any new caller reintroduces the leak.** The plan's structural fix
+(fixed-frame slabs) is what actually closes it; until then this is a live trap
+rather than a cleared prerequisite.
+
+### Tier 2 (blocks the latency goal) — mostly open, and one dominates
+
+| item | state |
+|---|---|
+| **prefill not lowered** | **OPEN — the critical-path blocker.** Zero `SuperOp`/`LayerProgram` references in `prefill_chunk.rs` or `prefill_batch.rs` |
+| `hipEventQuery` / `hipStreamQuery` | **OPEN** — zero occurrences in `hip-bridge/src/ffi.rs` |
+| `hipfire_steer` globals | **OPEN** — `static SESSION`, `static ACTIVE`, `static EPOCH` all still present |
+| `load_progress::SINK` | **OPEN** — still `static SINK: Mutex<Option<...>>` |
+| the four hand-path escapes | **REDUCED** — the `hidden_rb` escape is gone and RoughQuant is now opt-in behind `HIPFIRE_RQ_HAND=1`; GDN tape capture and a live steer session still force the hand path |
+
+**Prefill is the one that matters.** ~14.2k lines of hand-written control flow
+across the two files is, by definition, one indivisible quantum — which defeats
+the whole premise, since v2's claim is suspension *between modules* and an
+unlowered prefill cannot be suspended at all. Everything else in this tier is
+small by comparison; `hipEventQuery`/`hipStreamQuery` is ~15 lines.
+
+### M0 (the instrument) — not built
+
+No `executor_trace` in the daemon. This matters more than its size suggests:
+**every stage in this plan exits on a measurement read from that trace**, so
+until it exists no stage can be shown to have landed. It is also purely
+additive — it breaks nothing — which makes it the obvious first commit.
+
+### Tier 3 — one item improved
+
+Indexed routed-OQ MoE decode is now the DEFAULT (`0d425bfbf`), where the plan
+listed "indexed expert layout opt-in on arch 6" as an M5 blocker.
+
+### So: what actually blocks starting?
+
+**Nothing blocks starting.** M0 is additive and is already the declared first
+stage; Tier 1 is one API-shape trap away from clear. What blocks *finishing* —
+specifically the latency claim that justifies the whole design — is prefill
+lowering, and that is large enough to be its own project.
+
+A defensible order, given the above: M0 (additive, and unblocks every other
+exit criterion) → `hipEventQuery`/`hipStreamQuery` (~15 lines, hard prereq for
+async prefetch) → the three remaining process globals (they become *wrong*, not
+merely ugly, the moment two streams interleave) → `upload_raw` slabs → prefill
+lowering.

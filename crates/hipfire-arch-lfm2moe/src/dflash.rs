@@ -807,6 +807,13 @@ mod tests {
             mask_token_id: 127,
             target_layer_ids: vec![1, 3],
             num_target_layers: 4,
+            // DFlash1 fixture: DFlash2 geometry is absent, same as the
+            // hipfire-runtime fixture this mirrors.
+            version: 1,
+            selector_rank: 0,
+            selector_top_k: 0,
+            conv_kernel_size: 0,
+            conv_group_size: 0,
         }
     }
 

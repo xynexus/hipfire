@@ -155,6 +155,12 @@ struct HipExternalMemoryBufferDesc {
 }
 
 const HIP_SUCCESS: u32 = 0;
+/// `hipErrorNotReady` — an async operation is still outstanding.
+///
+/// Named here because it is the one HIP status that is a legitimate ANSWER
+/// rather than a failure: the query entry points return it to mean "not yet",
+/// and treating it as an error would make polling impossible.
+const HIP_ERROR_NOT_READY: u32 = 600;
 /// `hipDeviceAttributeIntegrated` in HIP's cuda-compatible attribute block.
 const HIP_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 16;
 /// `hipDeviceAttributeMultiprocessorCount` (number of CUs / multiprocessors).
@@ -223,6 +229,7 @@ pub struct HipRuntime {
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
     fn_stream_synchronize: unsafe extern "C" fn(HipStream) -> u32,
+    fn_stream_query: unsafe extern "C" fn(HipStream) -> u32,
     fn_stream_destroy: unsafe extern "C" fn(HipStream) -> u32,
 
     // Modules & kernels
@@ -264,6 +271,7 @@ pub struct HipRuntime {
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
     fn_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> u32,
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
+    fn_event_query: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
     fn_event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
     fn_stream_wait_event: unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32,
@@ -479,6 +487,11 @@ impl HipRuntime {
                     "hipStreamSynchronize",
                     unsafe extern "C" fn(HipStream) -> u32
                 ),
+                fn_stream_query: load_fn!(
+                    lib,
+                    "hipStreamQuery",
+                    unsafe extern "C" fn(HipStream) -> u32
+                ),
                 fn_stream_destroy: load_fn!(
                     lib,
                     "hipStreamDestroy",
@@ -550,6 +563,11 @@ impl HipRuntime {
                 fn_event_synchronize: load_fn!(
                     lib,
                     "hipEventSynchronize",
+                    unsafe extern "C" fn(HipEvent) -> u32
+                ),
+                fn_event_query: load_fn!(
+                    lib,
+                    "hipEventQuery",
                     unsafe extern "C" fn(HipEvent) -> u32
                 ),
                 fn_event_elapsed_time: load_fn!(
@@ -1251,6 +1269,24 @@ impl HipRuntime {
         self.check(code, "hipStreamSynchronize")
     }
 
+    /// Has every operation queued on `stream` completed? Non-blocking.
+    ///
+    /// Same contract as [`Self::event_query`]: `Ok(false)` is "still running",
+    /// not an error. See that method for why the `hipErrorNotReady` case cannot
+    /// go through `check`.
+    pub fn stream_query(&self, stream: &Stream) -> HipResult<bool> {
+        let code = unsafe { (self.fn_stream_query)(stream.0) };
+        match code {
+            HIP_SUCCESS => Ok(true),
+            HIP_ERROR_NOT_READY => Ok(false),
+            other => Err(HipError::from_code(
+                other,
+                "hipStreamQuery",
+                Some(&self.fn_get_error_string),
+            )),
+        }
+    }
+
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_destroy)(stream.0) };
         self.check(code, "hipStreamDestroy")
@@ -1481,6 +1517,31 @@ impl HipRuntime {
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
         crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
+    }
+
+    /// Has `event` completed? Non-blocking.
+    ///
+    /// `Ok(false)` means "not yet" and is the normal answer, NOT a failure:
+    /// `hipEventQuery` reports an outstanding event as `hipErrorNotReady`, so
+    /// routing that through [`Self::check`] like every other entry point would
+    /// turn the expected case into an `Err` and make the call useless. Only a
+    /// third code is a real error.
+    ///
+    /// This exists so a caller can POLL. `event_synchronize` blocks, which
+    /// serialises the pipeline a prefetch is trying to overlap — the v2 daemon
+    /// plan lists the absence of a non-blocking query as a hard prerequisite for
+    /// real async transfer for exactly that reason.
+    pub fn event_query(&self, event: &Event) -> HipResult<bool> {
+        let code = unsafe { (self.fn_event_query)(event.0) };
+        match code {
+            HIP_SUCCESS => Ok(true),
+            HIP_ERROR_NOT_READY => Ok(false),
+            other => Err(HipError::from_code(
+                other,
+                "hipEventQuery",
+                Some(&self.fn_get_error_string),
+            )),
+        }
     }
 
     pub fn event_elapsed_ms(&self, start: &Event, stop: &Event) -> HipResult<f32> {
