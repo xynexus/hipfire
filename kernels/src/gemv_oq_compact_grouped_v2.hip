@@ -87,25 +87,20 @@ __launch_bounds__(32) extern "C" __global__ void gemv_oq_compact_grouped_v2(
         s += (float)OQCV2_LO(w1, 2) * x3.x + (float)OQCV2_HI(w1, 2) * x3.y
            + (float)OQCV2_LO(w1, 3) * x3.z + (float)OQCV2_HI(w1, 3) * x3.w;
 
-        // Overlays REPLACE the bulk nibble, so add the difference, applied by
-        // whichever lane owns the position. Duplicate indices are resolved at
-        // LOAD (`normalize_compact_overlays`) rather than rescanned here — the
-        // rescan was O(N_out^2) and divergent, and measured as the thing holding
-        // this kernel off the memory wall (1 -> 8 corrections cost ~4x).
+        // Overlays REPLACE the bulk nibble, and `normalize_compact_overlays`
+        // ZEROES that nibble at load, so a correction is just val*x[idx]. It
+        // therefore depends on no lane's registers, and lane `lig` can take
+        // entry `lig`: the serial, divergent scan collapses to ONE parallel
+        // step, and the wave reduction below sums the corrections wherever they
+        // landed. That scan — not the extra bytes — is what held this kernel off
+        // the memory wall: ablating it was worth 25% at the shipped N_out=3,
+        // while the N_out sweep alone only prices entries 2 and 3 at 6%.
+        // Duplicate indices are resolved at load too (loser's value := 0).
         const uint8_t* table = blk + 130;
-        for (int e = 0; e < n_ov; ++e) {
+        for (int e = lig; e < n_ov; e += 16) {
             const int idx = (int)table[2 * e];
-            if ((idx >> 4) != lig) continue;
-            // No supersede rescan: duplicate indices are resolved at load by
-            // `normalize_compact_overlays`, which neutralises a superseded entry
-            // (value := the bulk nibble under it, so the difference is zero).
-            const int slot = idx & 15;
-            const int j    = slot >> 1;
-            const uint32_t word = (j < 4) ? w0 : w1;
-            const int sh   = 8 * (j & 3) + ((slot & 1) ? 4 : 0);
-            const int bulk = (int)((word >> sh) & 0xf) << 28 >> 28;
-            const int val  = (int)(int8_t)table[2 * e + 1];
-            s += (float)(val - bulk) * X[gi * 256 + idx];
+            const int val = (int)(int8_t)table[2 * e + 1];
+            s += (float)val * X[gi * 256 + idx];
         }
 
         facc += s * sw;

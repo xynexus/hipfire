@@ -164,24 +164,36 @@ pub fn oq3_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// is derived from the byte length (uniform per tensor). Sign-extend the int4
 /// bulk into int8, then overlay the sparse int8 outliers at their in-group
 /// indices → the same combined `[int8 m*k][f32 scales m*ng]` layout.
-/// Resolve duplicate overlay indices in OqPlusCompact blocks, in place.
+/// Prepare `OqPlusCompact` blocks for the kernels, in place: resolve duplicate
+/// overlay indices, and zero the bulk nibble under every overlay index.
 ///
-/// The sparse overlay REPLACES the bulk nibble, and a repeated index means the
-/// LAST entry wins. Honouring that in the kernel costs an inner rescan of the
-/// remaining table per correction — `O(N_out^2)`, and divergent, because the
-/// ownership test is a `continue` so every lane of a group pays for every
-/// iteration. Measured, that rescan is what holds the compact decode GEMV off
-/// the memory wall: 1 -> 8 corrections costs ~4x on both the A16 and A8 kernels,
-/// while at N_out=1 the A8 kernel reaches 94% of pure-read stream bandwidth.
+/// An overlay REPLACES the bulk nibble, so a kernel that applies it as a
+/// correction has to add `(val - bulk)·x[idx]`. That `bulk` term carries two
+/// costs, and both sit on the critical path of the compact decode GEMV:
 ///
-/// Resolving it here instead lets the kernels apply every entry unconditionally.
-/// The table stays its declared size — a superseded entry is neutralised rather
-/// than removed, by setting its value to the bulk nibble it sits on, so its
-/// `val - bulk` difference is exactly zero. That keeps `block_stride` (and hence
-/// every offset derived from it) untouched, and leaves the expansion path's
-/// last-wins semantics unchanged: the no-op writes the value already there.
+/// - `bulk` lives in the registers of whichever lane owns that position, so only
+///   that lane can apply the correction. Hence a divergent ownership test that
+///   every lane pays for every entry, and a serial scan of the table whose
+///   dependent `X[idx]` load cannot be hoisted.
+/// - a repeated index means the LAST entry wins, which the kernel used to honour
+///   with an inner `O(N_out^2)` rescan.
 ///
-/// Idempotent, so running it on an already-clean artifact is a no-op.
+/// Zeroing the bulk under each overlay index makes the correction exactly
+/// `val·x[idx]`, which depends on no lane's registers. Lane `e` can then apply
+/// entry `e` in parallel and let the existing wave reduction sum the results.
+/// Measured on `down [5120, 17408]` at the shipped N_out=3, ablating the overlay
+/// loop was worth 25% of achieved bandwidth (178.3 -> 222.1 GB/s), so this is
+/// the binding cost, not the 6% an N_out sweep alone suggests — every N_out,
+/// including 1, pays the same fixed loop.
+///
+/// Transparent to every consumer: a kernel computing `val - bulk` now computes
+/// `val - 0`, and one that replaces the nibble outright (the compact GEMM, and
+/// the `oqplus_compact_to_oq8_combined*` expansion) overwrites the zero with the
+/// value it always wrote. Duplicates are neutralised by zeroing the LOSER's
+/// value, which is a no-op correction and still decodes last-wins.
+///
+/// The table keeps its declared size, so `block_stride` and every offset derived
+/// from it are untouched. Idempotent — zeroing an already-zero nibble is a no-op.
 pub fn normalize_compact_overlays(data: &mut [u8], m: usize, k: usize, group: usize) {
     let ng = k / group;
     let n_groups = m * ng;
@@ -194,27 +206,22 @@ pub fn normalize_compact_overlays(data: &mut [u8], m: usize, k: usize, group: us
         return;
     }
     let n_out = (block_bytes - header) / 2;
-    if n_out < 2 {
-        return; // a single entry cannot be superseded
-    }
     for b in 0..n_groups {
         let base = b * block_bytes;
         let tbl = base + header;
-        for e in 0..n_out - 1 {
+        for e in 0..n_out {
             let idx = data[tbl + 2 * e] as usize;
-            // Superseded by any LATER entry on the same index?
-            let superseded = (e + 1..n_out).any(|e2| data[tbl + 2 * e2] as usize == idx);
-            if !superseded {
-                continue;
+            if idx >= group {
+                continue; // out-of-range index: leave the block alone, decode ignores it
             }
-            // Neutralise: value := the bulk nibble under this index.
-            let byte = data[base + 2 + idx / 2];
-            let bulk = if idx % 2 == 0 {
-                ((byte & 0xf) as i8) << 4 >> 4
-            } else {
-                ((byte >> 4) as i8) << 4 >> 4
-            };
-            data[tbl + 2 * e + 1] = bulk as u8;
+            // Superseded by any LATER entry on the same index? Then its
+            // correction must vanish; the winner still lands on a zeroed bulk.
+            if (e + 1..n_out).any(|e2| data[tbl + 2 * e2] as usize == idx) {
+                data[tbl + 2 * e + 1] = 0;
+            }
+            // Zero the bulk nibble this entry sits on, so `val - bulk == val`.
+            let byte = &mut data[base + 2 + idx / 2];
+            *byte &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
         }
     }
 }
@@ -604,8 +611,9 @@ mod overlay_normalize_tests {
         assert_eq!(before, after, "normalization changed the decoded weights");
         assert_ne!(blocks, norm, "fixture had no duplicates to resolve");
 
-        // And after normalization every surviving index is unique — which is the
-        // property the kernels are allowed to rely on.
+        // The two properties the kernels are allowed to rely on: the bulk nibble
+        // under every overlay index is ZERO (so `val - bulk == val`), and every
+        // entry that still carries a nonzero value sits on a unique index.
         for b in 0..m {
             let tbl = b * stride + 2 + G / 2;
             let mut seen: Vec<u8> = Vec::new();
@@ -613,13 +621,9 @@ mod overlay_normalize_tests {
                 let idx = norm[tbl + 2 * e];
                 let val = norm[tbl + 2 * e + 1];
                 let byte = norm[b * stride + 2 + idx as usize / 2];
-                let bulk = if idx % 2 == 0 {
-                    ((byte & 0xf) as i8) << 4 >> 4
-                } else {
-                    ((byte >> 4) as i8) << 4 >> 4
-                };
-                // Either a live correction on a fresh index, or a neutralised no-op.
-                if val as i8 != bulk {
+                let bulk = if idx % 2 == 0 { byte & 0xf } else { byte >> 4 };
+                assert_eq!(bulk, 0, "bulk nibble under overlay index {idx} not zeroed");
+                if val != 0 {
                     assert!(!seen.contains(&idx), "duplicate live index {idx} survived");
                     seen.push(idx);
                 }
@@ -627,8 +631,11 @@ mod overlay_normalize_tests {
         }
     }
 
+    /// Blocks with no duplicate indices still get their bulk nibbles zeroed —
+    /// that part is unconditional, and it is what lets the kernel drop the
+    /// `bulk` term. Decoding is unchanged and a second pass is a no-op.
     #[test]
-    fn normalize_is_idempotent_and_safe_on_clean_blocks() {
+    fn normalize_zeroes_bulk_and_is_idempotent() {
         const G: usize = 256;
         let (m, k, n_out) = (2usize, G, 3usize);
         let stride = 2 + G / 2 + 2 * n_out;
@@ -636,13 +643,46 @@ mod overlay_normalize_tests {
         for b in 0..m {
             for e in 0..n_out {
                 blocks[b * stride + 2 + G / 2 + 2 * e] = (e * 9) as u8; // all distinct
+                blocks[b * stride + 2 + G / 2 + 2 * e + 1] = (7 + e) as u8;
             }
         }
+        let before = oqplus_compact_to_oq8_combined(&blocks, m, k);
         let mut once = blocks.clone();
         normalize_compact_overlays(&mut once, m, k, G);
-        assert_eq!(blocks, once, "clean blocks must be untouched");
+        assert_ne!(
+            blocks, once,
+            "bulk nibbles under the overlays were not zeroed"
+        );
+        assert_eq!(
+            before,
+            oqplus_compact_to_oq8_combined(&once, m, k),
+            "zeroing the bulk changed the decoded weights"
+        );
         let mut twice = once.clone();
         normalize_compact_overlays(&mut twice, m, k, G);
         assert_eq!(once, twice, "not idempotent");
+    }
+
+    /// A single-entry table has nothing to dedupe but still needs its bulk
+    /// zeroed — the old normalizer bailed at `n_out < 2` and would have left the
+    /// kernel adding `val` on top of a live nibble.
+    #[test]
+    fn normalize_handles_n_out_one() {
+        const G: usize = 256;
+        let (m, k) = (1usize, G);
+        let stride = 2 + G / 2 + 2;
+        let mut blocks = vec![0x11u8; stride];
+        blocks[0] = 0x00;
+        blocks[1] = 0x3c; // f16 1.0
+        blocks[2 + G / 2] = 5; // idx
+        blocks[2 + G / 2 + 1] = (-100i8) as u8;
+        let before = oqplus_compact_to_oq8_combined(&blocks, m, k);
+        normalize_compact_overlays(&mut blocks, m, k, G);
+        assert_eq!(
+            blocks[2 + 5 / 2] & 0xf0,
+            0,
+            "high nibble of byte 2 not zeroed"
+        );
+        assert_eq!(before, oqplus_compact_to_oq8_combined(&blocks, m, k));
     }
 }

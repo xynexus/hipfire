@@ -72,19 +72,18 @@ __device__ __forceinline__ float oqc_group(
     s += (float)OQCV2_LO(w1, 2) * x3.x + (float)OQCV2_HI(w1, 2) * x3.y
        + (float)OQCV2_LO(w1, 3) * x3.z + (float)OQCV2_HI(w1, 3) * x3.w;
 
-    // Overlays REPLACE the bulk nibble, so add the difference. No supersede
-    // rescan — duplicates were resolved at load.
+    // Overlays REPLACE the bulk nibble, and `normalize_compact_overlays` ZEROES
+    // that nibble at load, so a correction is just val*x[idx] — it reads no
+    // lane's registers. Lane `lig` therefore takes entry `lig`: the serial,
+    // divergent scan collapses to ONE parallel step, and the caller's wave
+    // reduction sums the corrections wherever they landed. Duplicates were
+    // resolved at load too (loser's value := 0), so every entry applies
+    // unconditionally.
     const uint8_t* table = blk + 130;
-    for (int e = 0; e < n_ov; ++e) {
+    for (int e = lig; e < n_ov; e += 16) {
         const int idx = (int)table[2 * e];
-        if ((idx >> 4) != lig) continue;
-        const int slot = idx & 15;
-        const int j    = slot >> 1;
-        const uint32_t word = (j < 4) ? w0 : w1;
-        const int sh   = 8 * (j & 3) + ((slot & 1) ? 4 : 0);
-        const int bulk = (int)((word >> sh) & 0xf) << 28 >> 28;
-        const int val  = (int)(int8_t)table[2 * e + 1];
-        s += (float)(val - bulk) * X[gi * 256 + idx];
+        const int val = (int)(int8_t)table[2 * e + 1];
+        s += (float)val * X[gi * 256 + idx];
     }
     return s;
 }

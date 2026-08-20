@@ -87,6 +87,14 @@ fn main() {
                         used[idx] = true;
                         blocks[off + hdr + 2 * s] = idx as u8;
                         blocks[off + hdr + 2 * s + 1] = (rnd() & 0xff) as u8;
+                        // Blocks reach the kernel through
+                        // `normalize_compact_overlays`, which zeroes the bulk
+                        // nibble an overlay sits on so the correction is
+                        // `val*x[idx]` with no dependency on the owning lane.
+                        // Mirror that here or the bench measures the kernel on
+                        // data the real path never hands it.
+                        let nb = &mut blocks[off + 2 + idx / 2];
+                        *nb &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
                     }
                 }
             }

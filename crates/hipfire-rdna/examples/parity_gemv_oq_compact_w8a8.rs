@@ -54,28 +54,33 @@ fn f16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// Mirror of `hipfire_runtime::oq8_arch::normalize_compact_overlays`. Duplicated
-/// rather than imported because hipfire-rdna cannot depend on hipfire-runtime;
-/// the runtime crate owns the authoritative version and its own unit tests.
-fn normalize_overlays(blocks: &mut [u8], m: usize, ng: usize, stride: usize, n_out: usize) {
-    if n_out < 2 {
-        return;
-    }
-    for b in 0..m * ng {
+/// Mirror of `hipfire_runtime::oq8_arch::normalize_compact_overlays`: neutralise
+/// a superseded duplicate (loser's value := 0) and ZERO the bulk nibble under
+/// every overlay index, so a kernel correction is exactly `val*x[idx]` and needs
+/// no register from the lane that owns the position. The GEMV kernels rely on
+/// the loader having done this, so the fixture must do it too. Duplicated rather
+/// than imported because hipfire-rdna cannot depend on hipfire-runtime.
+fn normalize_overlays(
+    blocks: &mut [u8],
+    n_blocks: usize,
+    stride: usize,
+    group: usize,
+    n_out: usize,
+) {
+    let header = 2 + group / 2;
+    for b in 0..n_blocks {
         let base = b * stride;
-        let tbl = base + 130;
-        for e in 0..n_out - 1 {
+        let tbl = base + header;
+        for e in 0..n_out {
             let idx = blocks[tbl + 2 * e] as usize;
-            if !(e + 1..n_out).any(|e2| blocks[tbl + 2 * e2] as usize == idx) {
+            if idx >= group {
                 continue;
             }
-            let byte = blocks[base + 2 + idx / 2];
-            let bulk = if idx % 2 == 0 {
-                ((byte & 0xf) as i8) << 4 >> 4
-            } else {
-                ((byte >> 4) as i8) << 4 >> 4
-            };
-            blocks[tbl + 2 * e + 1] = bulk as u8;
+            if (e + 1..n_out).any(|e2| blocks[tbl + 2 * e2] as usize == idx) {
+                blocks[tbl + 2 * e + 1] = 0;
+            }
+            let byte = &mut blocks[base + 2 + idx / 2];
+            *byte &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
         }
     }
 }
