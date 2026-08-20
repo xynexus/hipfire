@@ -24,7 +24,12 @@
 // Layout / phases: identical to fused_rmsnorm_mq_rotate.hip aside from the
 // extra Phase 1d divide. See that kernel's preamble for the FWHT details.
 
-__launch_bounds__(256, 1)
+// 1024 rather than 256: this kernel runs as a SINGLE workgroup (the RMS
+// reduction and the FWHT both need the whole row), so the workgroup width is
+// the only parallelism it has. At K=5120 phase 2 has 20 FWHT groups; 8 warps
+// meant three serial rounds, 32 warps means one. The caller sizes the dynamic
+// LDS as (K + blockDim.x) floats, so `reduce` grows with the block.
+__launch_bounds__(1024, 1)
 extern "C" __global__ void fused_rmsnorm_mq_rotate_awq(
     const float* __restrict__ x,
     const float* __restrict__ weight,
@@ -37,12 +42,12 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_awq(
 ) {
     extern __shared__ float smem[];
     float* x_shared = smem;            // [K]
-    float* reduce   = smem + K;        // [256]
+    float* reduce   = smem + K;        // [blockDim.x]
 
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x; // 256
+    const int block_size = blockDim.x;
     const int lane_id = tid & 31;
-    const int warp_id = tid >> 5;      // 0..7
+    const int warp_id = tid >> 5;
     const int num_warps = block_size >> 5;
 
     // Batch row: this block processes x[blockIdx.x * K .. (blockIdx.x+1) * K].

@@ -841,8 +841,15 @@ impl Gpu {
         let kv = k as i32;
         let eps_v = eps;
 
-        let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
+        // ONE workgroup by construction — the RMS reduction and the FWHT both
+        // span the whole row — so blockDim is this kernel's only parallelism,
+        // and 256 threads left it running on a fraction of a single CU. 1024
+        // where the row is wide enough to use them: at K=5120 that turns phase
+        // 2's 20 FWHT groups from three serial rounds over 8 warps into one
+        // round over 32. Measured on Qwen3.8-27B decode: 12.2 -> 6.2 us/call,
+        // 1.567 -> 0.790 ms/token, and 70.94 -> 69.76 ms/token end-to-end.
+        let block_size = if k >= 2048 { 1024u32 } else { 256u32 };
+        let shared_mem = ((k + block_size as usize) * 4) as u32;
         // Bandwidth: read x + weight + awq_scale + signs + write x_rot.
         let bytes = k * 4 * 4 + 2 * 256 * 4;
         let timer =
