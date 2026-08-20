@@ -4332,6 +4332,12 @@ pub const GEMV_OQ_COMPACT_GROUPED_V2_SRC: &str =
 pub const GEMV_OQ_COMPACT_GROUPED_V3_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq_compact_grouped_v3.hip");
 
+/// Fine pass of the two-stage lm_head for a COMPACT-RESIDENT Opus head: exact
+/// W4A16 dot over a shortlist of vocab rows, scattering into a -inf-masked
+/// logit buffer. Compact twin of `GEMV_BF16_GATHER_F32_SRC`.
+pub const GEMV_OQ_COMPACT_GATHER_F32_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_gather_f32.hip");
+
 /// Opus Quant W8A8 DECODE GEMV (batch=1): int8 generalization of
 /// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
 /// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.

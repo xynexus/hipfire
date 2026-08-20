@@ -21,7 +21,8 @@ pub use crate::dispatch::gemv_family;
 pub use hipfire_primitives::conv::f16_to_f32;
 
 use hipfire_rdna::lmhead_twostage::{
-    build_lmhead_coarse_bf16, lmhead_twostage_serve_bf16, LmheadCoarse,
+    build_lmhead_coarse_bf16, build_lmhead_coarse_rows, lmhead_twostage_serve_bf16,
+    lmhead_twostage_serve_compact, LmheadCoarse,
 };
 use std::cell::RefCell;
 
@@ -49,14 +50,46 @@ thread_local! {
 /// margin costs nothing, and a worst observed rank of ~25 is uncomfortably close
 /// to 32 on query sets this size. 1-bit is genuinely too coarse — its worst
 /// rank was 1964 on the 122B, only 93.4% recall at K=32.
-fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
+///
+/// `compact` selects the COMPACT-RESIDENT head's default shortlist, which was
+/// swept independently — the bf16 numbers above do not carry over, because a
+/// compact head is ALREADY 4.25 bits and the coarse tier has to beat that
+/// rather than bf16's 16.
+///
+/// Swept on 323 REAL decode states (FWHT-rotated, as serving scores them) from
+/// Qwen3.8-27B's [248320, 5120] head, against the exact full-vocab compact GEMV
+/// — `examples/verify_lmhead_twostage_compact.rs`:
+///
+///     bits   K      tier+fine MB   vs full   recall@1
+///        2   32          318.9      2.12x    323/323
+///        2   512         320.2      2.11x    323/323
+///        2   8192        341.1      1.98x    323/323
+///        4   512         638.1      1.06x    323/323
+///
+/// TWO CONCLUSIONS. **q2 is the only bitwidth worth having**: a q4 tier is
+/// 637 MB against the head's own 675 MB, a 1.06x saving that cannot pay for
+/// itself. And **K is not the binding constraint on real states** — every K from
+/// 32 up reproduced the full-vocab argmax exactly.
+///
+/// K=512 rather than the 32 that sweep would allow: the bf16 study measured a
+/// worst true-argmax rank of ~24-26 over 630 states, which is uncomfortably
+/// close to 32, and 323 probes is not enough to see that tail. The margin is
+/// almost free — 512 costs 1.3 MB more than 32 out of 319, or 0.4%.
+///
+/// An earlier revision defaulted to 8192 on the strength of a RANDOM-probe
+/// sweep that read 97.27% at K=128. That was the wrong distribution: random
+/// vectors do not look like decode states, and on real ones the same K is
+/// lossless. Corrected here rather than kept as a free-looking margin, because
+/// 8192 costs 22 MB/token for nothing.
+fn lmhead_twostage_cfg(compact: bool) -> Option<(usize, usize)> {
     let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
+    let q2_k = if compact { 512usize } else { 128usize };
     let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
-        (2usize, 128usize, r)
+        (2usize, q2_k, r)
     } else if let Some(r) = v.strip_prefix("q4") {
         (4, 32, r)
     } else if v == "1" {
-        (2, 128, "")
+        (2, q2_k, "")
     } else {
         return None;
     };
@@ -73,7 +106,62 @@ fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
 /// own lm_head GEMV (the lowered `Step::Gemv` pipeline) use this to divert only
 /// when the fast path is really available, leaving the default path untouched.
 pub fn lmhead_twostage_applies(w: &WeightTensor) -> bool {
-    lmhead_twostage_cfg().is_some() && w.gpu_dtype == DType::BF16
+    matches!(w.gpu_dtype, DType::BF16 | DType::OqCompactG256)
+        && lmhead_twostage_cfg(w.gpu_dtype == DType::OqCompactG256).is_some()
+}
+
+/// Byte stride of one OqPlusCompact block, derived from the buffer rather than
+/// carried as metadata: `[V, K/256]` blocks of `130 + 2*N_out` bytes.
+fn compact_block_stride(w: &WeightTensor) -> Option<usize> {
+    const GROUP: usize = 256;
+    if w.k % GROUP != 0 {
+        return None;
+    }
+    let blocks = w.m * (w.k / GROUP);
+    let bytes = w.buf.byte_size();
+    if blocks == 0 || bytes % blocks != 0 {
+        return None;
+    }
+    Some(bytes / blocks)
+}
+
+/// Coarse tier for a COMPACT-RESIDENT head. The tier only needs each row's L2
+/// norm and quantized direction, so the blocks are expanded once at build time
+/// through the same `oqplus_compact_to_oq8_combined_g` the non-compact-resident
+/// load path uses — i.e. the tier is built from exactly the weights the fine
+/// pass will rescore with, overlays and all.
+pub fn build_coarse_from_compact(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    vocab: usize,
+    hidden: usize,
+    bits: usize,
+) -> Result<LmheadCoarse, String> {
+    const GROUP: usize = 256;
+    let bytes = gpu
+        .download_raw(w, w.byte_size())
+        .map_err(|e| format!("lmhead compact download: {e:?}"))?;
+    // [int8 vocab*hidden][f32 scales vocab*ng]
+    let combined = crate::oq8_arch::oqplus_compact_to_oq8_combined_g(&bytes, vocab, hidden, GROUP);
+    drop(bytes);
+    let ng = hidden / GROUP;
+    let scale_off = vocab * hidden;
+    build_lmhead_coarse_rows(gpu, vocab, hidden, bits, |v, dst| {
+        let qrow = &combined[v * hidden..(v + 1) * hidden];
+        for g in 0..ng {
+            // One scale read per group, not per element.
+            let so = scale_off + (v * ng + g) * 4;
+            let sc = f32::from_le_bytes([
+                combined[so],
+                combined[so + 1],
+                combined[so + 2],
+                combined[so + 3],
+            ]);
+            for i in 0..GROUP {
+                dst[g * GROUP + i] = (qrow[g * GROUP + i] as i8) as f32 * sc;
+            }
+        }
+    })
 }
 
 /// lm_head projection with an optional coarse-shortlist + fine-rescore fast path
@@ -88,7 +176,49 @@ pub fn lmhead_project(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    if let Some((bits, topk)) = lmhead_twostage_cfg() {
+    if let Some((bits, topk)) = lmhead_twostage_cfg(w.gpu_dtype == DType::OqCompactG256) {
+        // COMPACT-RESIDENT head. Unlike bf16, the stored weights live in the
+        // FWHT-rotated (and AWQ-prescaled) basis, so BOTH tiers have to score
+        // the rotated activation — rotate once here and hand the same buffer to
+        // the coarse scorer and the fine gather.
+        if w.gpu_dtype == DType::OqCompactG256 {
+            if let Some(block_stride) = compact_block_stride(w) {
+                let (vocab, hidden) = (w.m, w.k);
+                let ptr = w.buf.buf.as_ptr() as usize;
+                let stale =
+                    LMHEAD_COARSE.with(|c| c.borrow().as_ref().map(|(p, ..)| *p) != Some(ptr));
+                if stale {
+                    let coarse = build_coarse_from_compact(gpu, &w.buf, vocab, hidden, bits)
+                        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                    eprintln!(
+                        "[lmhead] two-stage active: coarse q{bits} tier built for COMPACT [{vocab}, {hidden}], top-K={topk}"
+                    );
+                    LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
+                }
+                let x_rot = gpu.alloc_tensor(&[hidden], DType::F32)?;
+                let rotated = crate::weights::rotate_x_mq_for(gpu, w, x, &x_rot, hidden);
+                let res = rotated.and_then(|()| {
+                    LMHEAD_COARSE.with(|c| {
+                        let b = c.borrow();
+                        let (_, coarse, v, h) = b.as_ref().unwrap();
+                        lmhead_twostage_serve_compact(
+                            gpu,
+                            &w.buf,
+                            coarse,
+                            &x_rot,
+                            y,
+                            *v,
+                            *h,
+                            block_stride,
+                            topk,
+                        )
+                        .map_err(|e| hip_bridge::HipError::new(0, &e))
+                    })
+                });
+                let _ = gpu.free_tensor(x_rot);
+                return res;
+            }
+        }
         if w.gpu_dtype == DType::BF16 {
             let (vocab, hidden) = (w.m, w.k);
             let ptr = w.buf.buf.as_ptr() as usize;

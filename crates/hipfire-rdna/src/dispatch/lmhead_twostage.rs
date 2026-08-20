@@ -34,27 +34,24 @@ pub struct LmheadCoarse {
     pub bits: usize, // 2 or 4
 }
 
-/// Build the coarse tier from the model's bf16 lm_head weight `[vocab, hidden]`.
+/// Build the coarse tier from any source of f32 weight rows.
 ///
-/// Downloads the bf16 rows once, computes each row's L2 norm → f32 scale, and
-/// quantizes the unit direction to symmetric Q`bits` (`bits ∈ {2, 4}`). No
-/// projection, no residual correction (v1 minimal path). Mirrors
-/// `build_lmhead_coarse` in the zaya source with `proj_r = 0`, `correct_r = 0`.
-pub fn build_lmhead_coarse_bf16(
+/// `fill_row(v, dst)` writes row `v`'s `hidden` weights into `dst`. Splitting it
+/// out this way is what lets a COMPACT-RESIDENT (qt 36) head share this code
+/// with the bf16 one — the tier only ever needs each row's L2 norm and the
+/// quantized direction, never the source encoding.
+pub fn build_lmhead_coarse_rows(
     gpu: &mut Gpu,
-    lmhead_bf16: &GpuTensor,
     vocab: usize,
     hidden: usize,
     bits: usize,
+    mut fill_row: impl FnMut(usize, &mut [f32]),
 ) -> Result<LmheadCoarse, String> {
     if bits != 2 && bits != 4 {
         return Err(format!("lmhead coarse: bits must be 2 or 4, got {bits}"));
     }
     let kdim = hidden; // no low-rank projection in the minimal path.
-    let bytes = gpu
-        .download_raw(lmhead_bf16, vocab * hidden * 2)
-        .map_err(|e| format!("lmhead coarse download: {e:?}"))?;
-    // Global symmetric quant range + packing density for the chosen bit-width.
+                       // Global symmetric quant range + packing density for the chosen bit-width.
     let (lo, hi, max_mag, per_byte) = if bits == 2 {
         (-2.0f32, 1.0f32, 2.0f32, 4usize)
     } else {
@@ -69,12 +66,7 @@ pub fn build_lmhead_coarse_bf16(
     let mut scales = vec![0f32; vocab];
     let mut wv = vec![0f32; hidden];
     for v in 0..vocab {
-        let row = &bytes[v * hidden * 2..(v + 1) * hidden * 2];
-        for i in 0..hidden {
-            let u = u16::from_le_bytes([row[2 * i], row[2 * i + 1]]);
-            // bf16 → f32: the bf16 bits are the high 16 bits of the f32.
-            wv[i] = f32::from_bits((u as u32) << 16);
-        }
+        fill_row(v, &mut wv);
         let norm = wv.iter().map(|&x| x * x).sum::<f32>().sqrt();
         let q = &mut q4[v * kb..(v + 1) * kb];
         if norm > 0.0 {
@@ -106,6 +98,29 @@ pub fn build_lmhead_coarse_bf16(
         scales: scbuf,
         kdim,
         bits,
+    })
+}
+
+/// Build the coarse tier from the model's bf16 lm_head weight `[vocab, hidden]`.
+///
+/// Downloads the bf16 rows once and hands them to [`build_lmhead_coarse_rows`].
+pub fn build_lmhead_coarse_bf16(
+    gpu: &mut Gpu,
+    lmhead_bf16: &GpuTensor,
+    vocab: usize,
+    hidden: usize,
+    bits: usize,
+) -> Result<LmheadCoarse, String> {
+    let bytes = gpu
+        .download_raw(lmhead_bf16, vocab * hidden * 2)
+        .map_err(|e| format!("lmhead coarse download: {e:?}"))?;
+    build_lmhead_coarse_rows(gpu, vocab, hidden, bits, |v, dst| {
+        let row = &bytes[v * hidden * 2..(v + 1) * hidden * 2];
+        for (i, d) in dst.iter_mut().enumerate() {
+            let u = u16::from_le_bytes([row[2 * i], row[2 * i + 1]]);
+            // bf16 -> f32: the bf16 bits are the high 16 bits of the f32.
+            *d = f32::from_bits((u as u32) << 16);
+        }
     })
 }
 
@@ -232,4 +247,52 @@ pub fn lmhead_twostage_serve_bf16(
     let _ = gpu.free_tensor(idxbuf);
     let _ = gpu.free_tensor(xb);
     Ok(())
+}
+
+/// Two-stage serving path for a COMPACT-RESIDENT Opus (qt 36) lm_head.
+///
+/// Same three steps as [`lmhead_twostage_serve_bf16`] — coarse-score every row,
+/// device-select a shortlist, rescore exactly those rows and scatter into a
+/// `-inf`-masked logit buffer — but the fine pass reads the OqPlusCompact blocks
+/// directly, so there is no expanded fine tier and no bf16 cast.
+///
+/// `x_rot` must be the FWHT-rotated activation (AWQ-divided first when the head
+/// carries an `awq_scale`), because that is the basis the stored compact weights
+/// are in. The coarse tier is built from those same weights decoded, so both
+/// tiers score the same vector.
+///
+/// Greedy-exact when the coarse recall@1 is 100% at `topk`; it truncates the
+/// tail to the shortlist, so this is a decode/argmax fast path and scoring paths
+/// must leave it off.
+#[allow(clippy::too_many_arguments)]
+pub fn lmhead_twostage_serve_compact(
+    gpu: &mut Gpu,
+    lmhead_compact: &GpuTensor,
+    coarse: &LmheadCoarse,
+    x_rot: &GpuTensor,
+    logits_out: &GpuTensor,
+    vocab: usize,
+    hidden: usize,
+    block_stride: usize,
+    topk: usize,
+) -> Result<(), String> {
+    let kk = topk.min(vocab).max(1);
+    let scores = coarse_score(gpu, coarse, x_rot, vocab, hidden)?;
+    let (idxbuf, count) = gpu_topk(gpu, &scores, vocab, kk)?;
+    let _ = gpu.free_tensor(scores);
+    gpu.fill_f32(logits_out, f32::NEG_INFINITY)
+        .map_err(|e| format!("lmhead mask: {e:?}"))?;
+    let res = gpu
+        .gemv_oq_compact_gather_f32(
+            lmhead_compact,
+            &idxbuf,
+            x_rot,
+            logits_out,
+            count,
+            hidden,
+            block_stride,
+        )
+        .map_err(|e| format!("lmhead fine compact gather: {e:?}"));
+    let _ = gpu.free_tensor(idxbuf);
+    res
 }
