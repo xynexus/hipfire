@@ -84,10 +84,27 @@ the relevant docs under `docs/`.
   onto the latest `origin/master` when the worktree state allows it. Check
   `origin/master` — never `upstream` — for competing in-flight work before a
   refactor. Do not rewrite published shared history without explicit approval.
-- `git stash` is unusable in this repo: the untracked `.agents/` symlink tree
-  makes it fail, and a failed `stash` followed by `stash pop` will restore an
-  unrelated older stash over your work. Use `git show HEAD:<path>` or
-  `git diff <path>` to compare against HEAD instead.
+- `git stash` works here, but `git stash pop` is a loaded gun: the stash stack
+  holds **pre-existing entries from other branches** (as of 2026-08-20, five —
+  `stash@{0}` is a WIP on `feat/npu-flm-reverse-engineering`, and three are from
+  the pre-rename `chaingun` era). A bare `pop` takes `stash@{0}`, so if your own
+  `push` did not land you restore somebody else's months-old WIP over your tree.
+  Pop by explicit ref and check `git stash list` first.
+  - This rule used to read "`git stash` is unusable — the untracked `.agents/`
+    symlink tree makes it fail". That cause is gone: `.agents/` was once a farm
+    of symlinks-to-symlinks, and today `.claude -> .agents` is the single symlink
+    in the repo with nothing symlinked underneath. Re-tested 2026-08-20 on a
+    faithful clone with a real dirty tree: `stash push -u` and `pop` both
+    round-tripped byte-for-byte on git 2.53.0.
+  - Prefer a scratch `git worktree` over stashing for anything that needs a clean
+    tree — it cannot touch your working copy at all. `scripts/probe_commits.sh`
+    is the worked example. Never build tooling on `stash` + `git checkout -f` in
+    the main tree: the `-f` discards uncommitted work whenever the stash did not
+    cover it, which is how that script used to eat dirty trees.
+  - To compare against HEAD without any of this, `git show HEAD:<path>` and
+    `git diff <path>` still do the job.
+- `git add` cannot stage through the `.claude` symlink — it fails with "beyond a
+  symbolic link". Stage agent skills and docs via their real `.agents/...` path.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 
