@@ -266,3 +266,54 @@ step.
 Until then compact declines the exporting forward (`allow_compact`), which keeps
 spec-decode correct at its historical numbers and costs only the verify batching
 that was never working anyway.
+
+## ROOT CAUSE OF THE DRAFTER BREAKAGE — it is not a compact bug
+
+Built the valid comparator the previous note called for
+(`hipfire-runtime` example `compare_prefill_hidden_paths`): both paths, ONE
+process, the SAME `HiddenStateRingBuffer` the drafter actually consumes, diffed
+layer by layer and position by position.
+
+    Qwen3.8-27B oq4.25++ (compact, probe-forced to batch)
+        diverges from LAYER 0, worst |rel| 6.40
+
+    CONTROL — qwen3.5-2b bf16, a dtype that has ALWAYS batched,
+    with no compact code involved anywhere
+        diverges from LAYER 0, worst |rel| 0.93
+
+**The control diverges too.** The batched and per-token prefill paths export
+different hidden states for EVERY dtype. This is not something compact broke; it
+is a pre-existing property of the two paths, and it is already documented in this
+tree — `is_batchable_la`'s own comment records it for BF16:
+
+> the batched path is not numerically identical to per-token. Typical
+> |delta logit| is ~6e-2 (max 2.4e-1) against ~4e-6 for pure reordering, and only
+> 15% of positions keep the same top-256 set … most likely q8 KV scales taken
+> per-tile in the batched attention versus per-token in the fallback.
+
+So the DFlash breakage is fully explained: compact models NEVER batched prefill,
+so their drafters have only ever seen the PER-TOKEN capture. Switching compact to
+batched handed them the other one, and acceptance collapsed to zero — not because
+either forward is wrong (generation is character-identical) but because the
+drafter is sensitive to which capture it receives.
+
+That makes the shipped gate exactly right rather than merely conservative:
+compact declines the hidden-EXPORTING forward, so drafters keep the capture they
+were built against, while ordinary prefill still batches.
+
+CAVEAT on the two numbers: 6.40 vs 0.93 are different models (27B vs 2B) at
+different widths, so they do NOT establish that compact diverges more than bf16.
+The load-bearing claim is only that the control diverges AT ALL.
+
+### What this changes about the roadmap
+
+Batching the verify is still the precondition for spec-decode (the tau/B proof
+above is unaffected). But the work is no longer "make compact export hidden
+correctly" — it is:
+
+1. Decide which capture is canonical, and make the two paths agree, OR
+2. Retrain/validate the drafters against the batched capture.
+
+(1) is the better target because it also removes a documented,
+silently-accepted numerical fork between the two prefill paths that affects
+every dtype — not just this family.

@@ -6156,8 +6156,14 @@ pub fn forward_prefill_batch_with_pbs_opts(
         // to 0.000 with the draft emitting random vocab ids.
         tree_verify.is_some()
             || gdn_tape.is_some()
-            || hidden_rb.is_some()
-            || per_token_hidden_out.is_some(),
+            // HIPFIRE_PROBE_COMPACT_HIDDEN=1 drops these two terms so the
+            // hidden-exporting forward can be batched for comparison — see
+            // `examples/compare_prefill_hidden_paths.rs`. Not a serving knob:
+            // the two paths export MEASURABLY different hidden states (for every
+            // dtype, not just compact), and a drafter is sensitive to which one
+            // it is handed.
+            || (std::env::var("HIPFIRE_PROBE_COMPACT_HIDDEN").is_err()
+                && (hidden_rb.is_some() || per_token_hidden_out.is_some())),
     );
     // F4 guard: reject batched prefill when KV tier has no batched keys.
     // F32 KV has only BatchEq(1) → MissingImpl at resolve. asym2 + tree-verify
