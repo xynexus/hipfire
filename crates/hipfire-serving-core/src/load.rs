@@ -861,54 +861,37 @@ pub fn load_model(
             // these codes every oq* target — i.e. every model we now induct —
             // refused to load with a draft attached.
             // NOTE ON OPUS (qt 33/34/35/36/38/52): the batched lm_head half is
-            // DONE — `dflash_enqueue_verify_lm_head` now has Oq8G256 /
-            // OqCompactG256 / OqCompactG128 arms (AWQ-aware rotate +
-            // quantize_act_oq8 + grouped-iu8 WMMA on VerifyScratch buffers, so
-            // it stays graph-capturable) and `dflash_batched_lm_head_supported`
-            // admits them.
+            // DONE, and so is the correctness half. The dense miscompute that used
+            // to justify this gate was root-caused on 2026-08-20 and fixed in
+            // `b7b7a9ae5` — it was never about Opus. `forward_scratch_layers`
+            // skipped the lowered executor whenever a hidden-state ring buffer was
+            // requested, so spec-decode verify ran the hand arms in
+            // decode_layers.rs, which miscompute on DENSE qwen3.5-family models.
+            // The lowered path extracts per-layer hidden itself now, and dense
+            // DFlash commits byte-identical text to plain decode.
             //
-            // They stay REFUSED here anyway, for two SEPARATE measured reasons.
+            // The gate STAYS, for the one reason that survived: measured, DFlash
+            // does not pay on this family. On Qwen3.8-27B oq4.25++ + CASK,
+            // 128 tokens greedy (docs/experiments/2026-08-20-dflash2-qwen38-27b-performance.md):
             //
-            // 1. DENSE targets miscompute. Admitting qt=36 on Qwen3.8-27B
-            //    (dense, oq4.25++ + CASK) loads and engages DFlash — "DFlash
-            //    draft loaded: layers=5 block=16" — then emits garbage
-            //    ('嘟 plain') at 0.34 tok/s against 7.5 plain. The lm_head arms
-            //    are NOT the cause: forcing the non-batched route with
-            //    HIPFIRE_DFLASH_NO_BATCHED_LMHEAD=1 gives byte-identical
-            //    garbage. Also ruled out: CASK (same with the sidecar parked),
-            //    graph capture (same with HIPFIRE_VERIFY_GRAPH=0), and the Opus
-            //    batched GEMMs (parity_oq8_gemm 45 dB SQNR, parity_gemm_oq_compact
-            //    bit-identical). MoE Opus is fine, so the fault is DENSE-specific.
-            //    Reproduced on a SECOND dense model (Qwen3.6-27B oq4.25++) with
-            //    z-lab's own MATCHED DFlash1 drafter -> 'extr' at 0.41 tok/s, so
-            //    it is neither the 3.8 artifact nor the heretic-lineage drafter.
-            //    Two things narrow it further. `forward_prefill_batch`'s
-            //    DeltaNet/DeltaNetMoe arms are DEAD for these models -- both were
-            //    instrumented and neither fires, with or without a draft -- so
-            //    that file is the wrong place to look. And an rocprofv3 kernel
-            //    diff shows the draft run adds only DRAFTER kernels
-            //    (gemm_dflash_oq4_plain_dp4a_staged_8w, quantize_dflash_act_g256,
-            //    attention_dflash_f32) plus the lm_head arm; the target body
-            //    reuses the plain-decode kernels. So the divergence is in how
-            //    verify DRIVES that shared body -- state or position handling
-            //    across the block -- not in a separate dtype-specific arm.
+            //     baseline          7.50 tok/s
+            //     DFlash1 B=16      0.79 tok/s   tau 1.098
+            //     DFlash2 B=8       2.01 tok/s   tau 1.778   (q8 KV, batched verify)
             //
-            // 2. MoE targets are CORRECT but unprofitable. Qwen3.5-35B-A3B
-            //    oq4.25++ + CASK + a DFlash1 drafter serves coherently, and
-            //    slower: 8.17 tok/s against a 35.7 baseline. HIPFIRE_SPEC_PHASES=1
-            //    says why — per B=16 cycle, verify=540ms, draft=47ms, and the
-            //    35.7 tok/s baseline is 28ms/token, so verifying 17 positions
-            //    costs ~17 serial decodes. On an A3B each position picks its own
-            //    top-8 of 128 experts, so batched verify reads ~17x the expert
-            //    bytes one decode does and amortizes NOTHING. Speculation cannot
-            //    win there. (`replay` also scales with acceptance at ~28ms per
-            //    accepted token — one decode step each — so accepted tokens are
-            //    paid for twice; worth fixing regardless.)
+            // and the ceiling is arithmetic: verify costs ~6.8 serial decodes to
+            // check 9 positions, so even at 100 % acceptance the best case is
+            // 9.2 tok/s — 1.22x. 48 of 64 layers are DeltaNet and its recurrence is
+            // sequential per token, so a wider verify batch amortizes only the
+            // other quarter of the stack. Same shape as the MoE result
+            // (Qwen3.5-35B-A3B: 8.17 vs 35.7 tok/s, expert bytes rather than a
+            // recurrence). Speculation on this family needs the DeltaNet recurrence
+            // batched across the verify block before admitting it by default makes
+            // anyone faster.
             //
-            // So the payoff is on DENSE targets, where the weights are shared
-            // across the block and batched verify genuinely amortizes — which is
-            // exactly the case that is broken. Fix (1), then re-measure.
-            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work.
+            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work. The drafters on
+            // disk are parked `.parked-slower-than-plain-decode` so sibling
+            // discovery cannot attach one silently; pass `params.draft` explicitly
+            // to measure.
             let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
@@ -933,11 +916,12 @@ pub fn load_model(
                 return Err(format!(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
-                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Opus oq* \
-                     (qt=33/34/35/36/38/52) has its batched lm_head arms wired \
-                     but the batched verify BODY still mis-computes, so it stays \
-                     refused. Other dtypes \
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13), \
+                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50) always; MQ3G256 \
+                     (qt=17) on gfx11 only. Opus oq* (qt=33/34/35/36/38/52) is \
+                     CORRECT now but measured slower than plain decode on this \
+                     family, so it stays behind HIPFIRE_DFLASH_ALLOW_OPUS=1. \
+                     Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
