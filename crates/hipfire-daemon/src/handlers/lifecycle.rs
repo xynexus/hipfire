@@ -446,10 +446,23 @@ pub(crate) fn load(
 
     // Stream per-layer load progress back to the client (see
     // `emit_load_progress`). Loaders call `load_progress::report`, which this sink
-    // turns into a `load_progress` frame. Installed only for the duration of this
-    // load and cleared right after the match, so no stray frames leak into later
-    // ops. `load_model` runs synchronously on this thread, so the sink's writes
-    // interleave safely with the handler's own (each is a whole line).
+    // turns into a `load_progress` frame.
+    //
+    // THREAD-scoped, not process-wide (v2 prerequisite P1). The process-wide sink
+    // is correct only while one load runs at a time; v2 moves loading off the
+    // executor thread precisely so a multi-second `LoadModel` stops being a
+    // non-preemptible frame, at which point two loads overlap and the second
+    // installer silently redirects the FIRST load's progress to the second caller.
+    // Nothing errors — the frames just reach the wrong client. `load_model` runs
+    // synchronously on this thread (so "the thread doing the load" and "the load"
+    // are the same thing), which is what makes a thread-local the right shape and
+    // keeps `report`'s signature — and therefore the six arch loaders — untouched.
+    //
+    // The guard also replaces two hand-written `set_sink(None)` clears, one per
+    // exit path. That pairing is the leak this type exists to prevent: any new
+    // early return between here and the load would have left a stale sink
+    // installed for whatever this thread did next. Drop-based cleanup also covers
+    // the panic path, which the manual clears did not.
     //
     // The sink captures *this connection's* writer and request id. It used to call
     // a free fn that took a fresh process-stdout lock, which worked only because
@@ -458,15 +471,17 @@ pub(crate) fn load(
     // Sync, which is what lets it live in the `Fn` sink closure.
     let progress_sink = daemon_state.out.sink.clone();
     let progress_id = daemon_state.out.request_id.clone();
-    hipfire_runtime::load_progress::set_sink(Some(Box::new(move |current, total, phase| {
-        emit_load_progress(
-            &mut progress_sink.clone(),
-            &progress_id,
-            current,
-            total,
-            phase,
-        )
-    })));
+    let progress_guard = hipfire_runtime::load_progress::ThreadSinkGuard::install(Box::new(
+        move |current, total, phase| {
+            emit_load_progress(
+                &mut progress_sink.clone(),
+                &progress_id,
+                current,
+                total,
+                phase,
+            )
+        },
+    ));
     let _qwen_residency_env =
         qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
     let planned_resource_usage = daemon_state
@@ -476,7 +491,8 @@ pub(crate) fn load(
         .resource_reservations
         .release_placeholders(&mut daemon_state.gpu)
     {
-        hipfire_runtime::load_progress::set_sink(None);
+        // No manual clear: `progress_guard` restores the previous thread sink as
+        // it drops on this return.
         write_error(
             &mut daemon_state.out.sink,
             "",
@@ -497,7 +513,9 @@ pub(crate) fn load(
         pp,
         &mut daemon_state.gpu,
     );
-    hipfire_runtime::load_progress::set_sink(None);
+    // Explicit, so progress stops at exactly the point the old `set_sink(None)`
+    // stopped it rather than at end of scope.
+    drop(progress_guard);
     match load_result {
         Ok(mut m) => {
             daemon_state

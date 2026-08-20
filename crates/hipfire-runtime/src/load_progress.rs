@@ -135,11 +135,28 @@ mod tests {
         Arc,
     };
 
+    /// Serializes every test in this module, because one of them installs the
+    /// PROCESS-WIDE sink and Rust runs a crate's tests in parallel threads inside
+    /// a single process. With correct precedence the others are insulated (they
+    /// each install a thread sink before reporting), but that is a property of how
+    /// they happen to be written, not a guarantee — a future test that reports
+    /// without a thread sink would flake depending on scheduling. Cheap insurance
+    /// against a heisentest.
+    ///
+    /// Poison is ignored deliberately: a panicking test must not cascade into
+    /// failures in the others.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The property P1 exists for: two concurrent loads must not report into
     /// each other's caller. Asserted rather than inspected — with the global
     /// sink alone, whichever thread installed second captures both.
     #[test]
     fn concurrent_thread_sinks_do_not_cross_talk() {
+        let _serial = serial();
         let a = Arc::new(AtomicU32::new(0));
         let b = Arc::new(AtomicU32::new(0));
         let (a2, b2) = (Arc::clone(&a), Arc::clone(&b));
@@ -172,6 +189,7 @@ mod tests {
     /// leave its sink installed for whatever the thread does next.
     #[test]
     fn guard_restores_previous_thread_sink() {
+        let _serial = serial();
         let outer = Arc::new(AtomicU32::new(0));
         let o2 = Arc::clone(&outer);
         let _g = ThreadSinkGuard::install(Box::new(move |c, _, _| {
@@ -189,5 +207,57 @@ mod tests {
         report(3, 10, "weights");
         assert_eq!(outer.load(Ordering::Relaxed), 3, "outer sink was not restored");
         let _ = set_thread_sink(None);
+    }
+
+    /// Precedence over an INSTALLED global, not merely over an absent one — and
+    /// the global still reached by a thread that has not migrated.
+    ///
+    /// The two tests above only ever install thread sinks, so they pass even if
+    /// `report` consulted the global first. That is the daemon's actual
+    /// configuration during the v2 transition (thread sink on the load path, the
+    /// global left as the fallback a cross-thread reporter still reaches), so the
+    /// precedence is the property the migration rests on.
+    #[test]
+    fn thread_sink_takes_precedence_over_installed_global() {
+        let _serial = serial();
+        let global = Arc::new(AtomicU32::new(0));
+        let g2 = Arc::clone(&global);
+        set_sink(Some(Box::new(move |c, _, _| {
+            g2.fetch_add(c, Ordering::Relaxed);
+        })));
+
+        let mine = Arc::new(AtomicU32::new(0));
+        let m2 = Arc::clone(&mine);
+        std::thread::spawn(move || {
+            let _g = ThreadSinkGuard::install(Box::new(move |c, _, _| {
+                m2.fetch_add(c, Ordering::Relaxed);
+            }));
+            report(5, 10, "weights");
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            mine.load(Ordering::Relaxed),
+            5,
+            "thread sink did not receive its own report"
+        );
+        assert_eq!(
+            global.load(Ordering::Relaxed),
+            0,
+            "report reached the global sink too — a migrated load would double-report"
+        );
+
+        // A thread that has NOT installed one still falls through to the global.
+        std::thread::spawn(|| report(4, 10, "weights"))
+            .join()
+            .unwrap();
+        assert_eq!(
+            global.load(Ordering::Relaxed),
+            4,
+            "global fallback missed an unmigrated report"
+        );
+
+        set_sink(None);
     }
 }
