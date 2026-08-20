@@ -648,6 +648,7 @@ pub(crate) fn forward_scratch_layers_lowered(
     kv_cache: &mut kv::KvCache,
     dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
     needs_logits: bool,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -685,6 +686,16 @@ pub(crate) fn forward_scratch_layers_lowered(
             LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
         ) {
             delta_layer_idx += 1;
+        }
+        // Per-position hidden extraction for spec-decode drafters. This is the
+        // ONLY thing the hand path in `decode_layers.rs` had that the lowered
+        // executor did not, and wanting it is what used to route DFlash verify
+        // onto those (dense-broken) hand arms. The ring head advances once per
+        // token in the caller, exactly as before.
+        if let Some(rb) = hidden_rb {
+            if let Some(slot) = rb.extract_slot(layer_idx) {
+                rb.write_at_head(gpu, slot, &s.x)?;
+            }
         }
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
