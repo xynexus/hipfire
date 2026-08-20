@@ -518,3 +518,37 @@ So spec-decode on this family needs BOTH the KV-granularity fix and a cheaper
 drafter to beat autoregressive decode. That is a materially different conclusion
 from where this started ("the drafters are bad" / "verify cannot amortize"), and
 every number above is measured rather than modelled.
+
+## Two measurement artifacts RULED OUT, and the honest verify accounting
+
+Before concluding that spec-decode loses, two things that would have made the
+number unfairly pessimistic were checked and neither applies:
+
+- **Seed prefill amortization.** The seed is 419 ms and 41% of a short run's
+  kernel time. But `decode_tok_s` is decode-only: --max 32 and --max 128 both
+  report 8.54/8.53, so the seed is already excluded. The number is fair.
+- **Demo-only overhead.** `dflash_spec_demo` runs a rollback PARITY CHECK
+  (`rollback_parity: checked=...`), which shows up as ~1032 extra
+  `gemv_oq_compact_grouped_v3` calls, roughly two whole target forwards. That is
+  diagnostic cost this harness adds and production would not pay, so the true
+  production figure is somewhat BETTER than 8.55 — but not by the 1.8x needed.
+
+With tape replay on, the cycle is:
+
+    draft 64,500us   verify 370,683us   replay 24,470us   total 463,203us
+
+Replay is solved (203 -> 24 ms). Verify is 370 ms while `gemv_oq_compact_multicol`
+accounts for ~48 ms/cycle, so the remainder is the rest of the verify forward plus
+the demo's parity check, not the compact GEMM.
+
+## FINAL STATE
+
+    dense decode    11.50 -> 15.1 tok/s   (Phase 1, at the bandwidth limit)
+    dense prefill   15.2  -> 42.5         (2.8x)
+    MoE decode      52.10 -> 54.8
+    spec-decode     ~4.5  -> 8.55         (+90%, still 1.8x BELOW plain decode)
+
+Spec-decode does not beat autoregressive decode on this family. The remaining
+terms are measured, not modelled: acceptance halved by the KV-tier prefill fork
+(restoring tau 3.375 scales 8.55 to ~14.4), and the drafter at ~64 ms/cycle.
+Both must land; neither alone clears 15.1.
