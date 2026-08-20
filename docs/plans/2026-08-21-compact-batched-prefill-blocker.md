@@ -159,3 +159,54 @@ than base alignment.
    DFlash/DFlash2 and consider unparking the drafts. Note the bar moved — dense
    decode is 15.1 tok/s now, not the 7.50 those numbers were taken against.
 
+
+## PHASE 2 MEASURED (2026-08-21, after the prefill wiring)
+
+Spec-decode now RUNS on this target and family for the first time
+(`HIPFIRE_DFLASH_ALLOW_OPUS=1`, DFlash2 drafter, KVarN):
+
+    accept_rate 0.482   tau 3.38   decode 4.45 tok/s
+
+against plain decode at **15.1 tok/s** — so spec-decode is still 3.4x SLOWER,
+and the parked label on the drafter remains accurate. But the drafter is NOT the
+problem: tau 3.38 means it is genuinely predicting three-plus tokens per cycle.
+`HIPFIRE_SPEC_PHASES=1` says where the time goes, per cycle at B=8:
+
+    draft    52,000 us
+    ngram     1,700
+    verify   613,000        <-- 76.6 us per token x 8: EIGHT SEQUENTIAL DECODES
+    replay   68,000-473,000 (7 of 8 rollbacks took `replay_full_prefill`)
+    total   670,000-1,146,000
+
+**Verify costs one full weight sweep PER DRAFT TOKEN.** That is the whole
+result: 613 ms / 8 = 76.6 ms is exactly a decode step, so the verify is not
+batching at all. The same is true of rollback — `replay_gdn_tape=0` and
+`replay_full_prefill=7`, so every rejection re-runs a full prefill instead of
+replaying the cheap tape.
+
+Both are the SAME missing piece as the prefill blocker, one level down: the
+compact chain has GEMM arms for an ordinary forward, and no writer for the
+per-position state that verify and tape-replay consume. The prefill fix
+deliberately makes compact DECLINE whenever the forward must export that state
+(see `allow_compact`), which is what keeps spec-decode correct today — at the
+cost of leaving it per-token.
+
+### What fixing it is worth
+
+With verify batched, 8 draft tokens cost about ONE sweep (~70 ms) instead of 613:
+
+    cycle = 52 (draft) + 70 (verify) + small  ~= 125 ms for tau 3.4 tokens
+          ~= 27 tok/s, against 15.1 plain -> ~1.8x
+
+Add cheap tape replay (removing the 270-473 ms full-prefill rollback) and the
+draft's own 52 ms becomes the next target. This is the first time the ceiling
+has been an arithmetic estimate off measured phases rather than a guess.
+
+### Order of work, revised
+
+1. Compact writer for the GDN tape + hidden ring buffer, so verify and rollback
+   can batch. This is the single highest-value item in the tree right now.
+2. Then re-measure DFlash2 and unpark the drafters.
+3. Only then evaluate JetSpec / DFlare / DART / SSD — every one of them assumes
+   K-token verify costs about one weight read, which is precisely what item 1
+   buys.
