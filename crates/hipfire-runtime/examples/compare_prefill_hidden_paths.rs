@@ -95,6 +95,14 @@ fn main() {
                 kv_max,
             )
             .expect("kv q8"),
+            "fp32" => KvCache::new_gpu(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .expect("kv fp32"),
             other => panic!("unsupported --kv-mode {other}"),
         };
         let scratch = Qwen35Scratch::new(gpu, &config, 64).expect("scratch");

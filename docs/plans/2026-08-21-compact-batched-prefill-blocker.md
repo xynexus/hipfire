@@ -317,3 +317,37 @@ correctly" — it is:
 (1) is the better target because it also removes a documented,
 silently-accepted numerical fork between the two prefill paths that affects
 every dtype — not just this family.
+
+## The divergence is ENTIRELY KV quantization — and KVarN is the worst case
+
+Same comparator, same model (qwen3.5-2b bf16), 48 positions, only the KV tier
+changed:
+
+    KV = fp32     IDENTICAL across all layers      worst 0.00e0
+    KV = q8       diverges from layer 0            worst 1.72e-2
+    KV = kvarn    diverges from layer 0            worst 9.34e-1
+
+With UNQUANTIZED KV the batched and per-token prefill paths agree EXACTLY. So
+the fork is not in the GEMM arms, the chunking, the ring, or anything dtype-
+specific — it is the KV tier, precisely as `is_batchable_la`'s comment guessed
+("per-tile vs per-token q8 KV scales"). That guess is now a measurement.
+
+TWO CONSEQUENCES WORTH ACTING ON.
+
+**KVarN is ~54x worse than q8 here** (9.3e-1 vs 1.7e-2). KVarN is the sanctioned
+default family and q8 is deprecated, so the default KV choice moved the
+prefill-path fork from "small" to "large". Any DFlash drafter validated under q8
+KV is being handed a substantially different capture under KVarN. That is a
+testable hypothesis — re-measure drafter acceptance across KV tiers — and it may
+already be costing acceptance on models that DO batch prefill, independently of
+anything compact.
+
+**The fix for spec-decode is now specific**: make the batched KV write/read use
+the same quantization granularity as the per-token fallback. Then the paths
+agree, the batched verify exports the capture the drafter expects, and the tau/B
+proof above stops binding.
+
+NOT a usable workaround: running fp32 KV to dodge it. The F4 guard in
+`forward_prefill_batch_with_pbs_opts` forces per-token fallback for f32 KV
+("F32 KV has only BatchEq(1) -> MissingImpl at resolve"), so the one tier where
+the paths agree is also the one tier that cannot batch.
