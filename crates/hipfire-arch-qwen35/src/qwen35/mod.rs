@@ -3422,6 +3422,12 @@ pub fn shard_moe_experts(
     shard: &ShardConfig,
     rank: usize,
     n_exp: usize,
+    // The model's slab storage, or `None` when it was not slab-loaded.
+    // Required, not optional-for-convenience: without it this function cannot
+    // tell an owned expert buffer from a non-owning alias into a slab, and
+    // freeing the latter corrupts live weights. Callers holding a
+    // `Qwen35Weights` pass `weights.slab_storage.as_ref()`.
+    slabs: Option<&layout::ModelGpuStorage>,
 ) -> HipResult<()> {
     debug_assert_eq!(
         ffn.experts.len(),
@@ -3429,6 +3435,10 @@ pub fn shard_moe_experts(
         "shard_moe_experts expects a full-loaded expert Vec (paged EP is unsupported in v1)",
     );
     // Free non-owned experts; compact owned to the front, recording global→local.
+    // Both aliasing cases must be checked, exactly as `free_moe_ffn_maybe_slab`
+    // does: `raw_expert_storage` (interior slices of a stacked allocation) and
+    // slab-backed tensors (interior slices of a weight slab).
+    let raw_expert_storage = ffn.raw_expert_storage.is_some();
     let old = std::mem::take(&mut ffn.experts);
     let mut compacted: Vec<ExpertWeights> = Vec::with_capacity(shard.experts_per_rank(n_exp));
     let mut local_of_global = vec![usize::MAX; n_exp];
@@ -3436,15 +3446,27 @@ pub fn shard_moe_experts(
         if shard.owns_expert(rank, e) {
             local_of_global[e] = compacted.len();
             compacted.push(ew);
+        } else if raw_expert_storage {
+            // These buffers are interior slices of one owning stacked
+            // allocation, so freeing them individually would hand `GpuPool` a
+            // pointer into the middle of a live block. The owner frees the
+            // whole thing later. Mirrors `free_moe_ffn_maybe_slab`.
+            std::mem::forget(ew.gate_up.buf);
+            std::mem::forget(ew.down.buf);
         } else {
-            let _ = gpu.free_tensor(ew.gate_up.buf);
-            if let Some(s) = ew.gate_up.awq_scale {
-                let _ = gpu.free_tensor(s);
-            }
-            let _ = gpu.free_tensor(ew.down.buf);
-            if let Some(s) = ew.down.awq_scale {
-                let _ = gpu.free_tensor(s);
-            }
+            // `_maybe_slab`, NOT `free_tensor`: with slab loading on (the
+            // default when `gpu.integrated`, i.e. this box and halo) an expert
+            // tensor can be a NON-OWNING alias into a weight slab —
+            // `alias_raw_tensor` -> `DeviceBuffer::from_raw(slab_ptr + rel)`.
+            // Freeing one puts a mid-slab pointer on the pool's free list, and
+            // the next `pool.alloc` in that bucket hands it out as scratch: the
+            // write lands on another layer's live weights. Silent corruption,
+            // not a leak.
+            //
+            // The guard already existed — `free_gpu` has routed through these
+            // helpers all along. This site predates it and never picked it up.
+            layout::free_weight_tensor_maybe_slab(gpu, slabs, ew.gate_up);
+            layout::free_weight_tensor_maybe_slab(gpu, slabs, ew.down);
         }
     }
     assert!(
@@ -3496,10 +3518,23 @@ pub fn shard_all_moe_layers(
     rank: usize,
     n_exp: usize,
 ) -> HipResult<()> {
-    for layer in weights.layers.iter_mut() {
+    // Split-borrow so the slab reference and the layer iterator coexist: the
+    // fields are disjoint, but `&mut weights` plus `weights.slab_storage` is not
+    // provable to the borrow checker without destructuring.
+    let Qwen35Weights {
+        layers,
+        slab_storage,
+        ..
+    } = weights;
+    let slabs = slab_storage.as_ref();
+    for layer in layers.iter_mut() {
         match layer {
-            LayerWeights::DeltaNetMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
-            LayerWeights::FullAttnMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
+            LayerWeights::DeltaNetMoe(l) => {
+                shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp, slabs)?
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp, slabs)?
+            }
             _ => {}
         }
     }
