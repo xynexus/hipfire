@@ -253,6 +253,32 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
         }
+        // A request that names NO `session_id` is a one-shot and must not
+        // inherit the previous request's conversation.
+        //
+        // Without this, session-capable arches silently differed from every
+        // other one. `supports_generate_session` is
+        // `(qwen35 && pp == 1) || lfm2-moe`; every other arch REJECTS
+        // `session_id` outright a few lines below and re-prefills from scratch,
+        // so it is stateless by construction. But here a session-less request
+        // fell back to the shared `QWEN35_LEGACY_SESSION_ID` and continued it —
+        // KV and DeltaNet state are cumulative across turns — so the same
+        // request repeated gave a different answer each time on qwen35 and the
+        // same answer every time on llama. Same protocol usage, opposite
+        // semantics, decided by arch.
+        //
+        // Multi-turn is not lost, it becomes explicit: send a `session_id` and
+        // the conversation accumulates exactly as before.
+        //
+        // `prefill_already_done` is excluded deliberately — that contract says
+        // the caller has ALREADY prefilled this session, so clearing it here
+        // would throw away the prefill the request depends on.
+        if session_id.is_none() && !prefill_already_done {
+            if let Err(e) = m.reset_active_session(&mut daemon_state.gpu) {
+                emit_error_with_id(&mut daemon_state.out.sink, id, e);
+                return;
+            }
+        }
     } else if session_id.is_some() || prefill_already_done {
         emit_error_with_id(
             &mut daemon_state.out.sink,

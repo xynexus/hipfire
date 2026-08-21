@@ -37,11 +37,22 @@ the measurement is real and the trap is easy to fall into twice.
    multi-generation A/B is still valid if both sides run the identical sequence
    — the accumulation then cancels — which is why the executor-v2 M3a/M3b0
    parity runs were unaffected.
-2. **Arch-inconsistent semantics, unverified as intentional.** Under identical
-   client behaviour (no `session_id`), qwen35 accumulates a conversation while
-   llama does not: Qwen3-0.6B gives `a5de2e9d083a` three times for the same
-   repeated request. So the same protocol usage is stateful on one arch and
-   stateless on another. Worth deciding deliberately rather than by arch.
+2. ~~**Arch-inconsistent semantics, unverified as intentional.**~~ **FIXED
+   2026-08-21.** Under identical client behaviour (no `session_id`), qwen35
+   accumulated a conversation while llama did not — the same protocol usage was
+   stateful on one arch and stateless on another, decided by arch rather than
+   deliberately.
+
+   A `generate` naming no `session_id` is now a **one-shot on every arch**: the
+   daemon resets the active session after activating it, so qwen35 no longer
+   inherits the previous request's conversation. Multi-turn is unchanged and
+   becomes explicit — send a `session_id` and state accumulates exactly as
+   before (verified byte-identical: turn 2 of an explicit session hashes
+   `e5a2bfac6e60` before and after).
+
+   `prefill_already_done` is excluded from the reset: that contract says the
+   caller already prefilled this session, so clearing it would discard the
+   prefill the request depends on.
 
 ## [Low — re-record the baseline] oq4.25++ encoder changed at 8357081d3: +93% KLD on the random-init fixture, but −26% KLD on a REAL model
 - **RESOLVED 2026-08-13, and it reverses the naive reading.** Measured on
