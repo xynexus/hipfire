@@ -199,13 +199,16 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// (`APPLY_CACHE`, which can't live in the `Sync` static because `GpuTensor` is
 /// `!Sync`) knows when to refresh its uploaded directions.
 ///
-/// Deliberately still ONE counter across all keys. A per-key epoch is the
-/// eventual optimisation, but a shared counter is the safe direction of error
-/// here: bumping it for another stream's change makes this stream's cache
-/// refresh when it did not strictly need to (a wasted upload), whereas a
-/// per-key counter that missed a bump would reuse another stream's uploaded
-/// directions — silently steering with the wrong vector. Over-invalidate rather
-/// than under-invalidate until the cache is keyed too.
+/// One counter across all keys, which is sound ONLY because `ApplyCache` now
+/// also compares its `key`.
+///
+/// An earlier version of this comment argued the shared counter was the safe
+/// direction of error because it could only over-invalidate. That was wrong in
+/// the case that matters: EPOCH moves on session MUTATION, and switching which
+/// stream is applying mutates nothing, so across keys the shared counter
+/// UNDER-invalidated — the cache stayed "valid" and the next stream reused the
+/// previous one's uploaded directions. The key comparison in
+/// `ensure_apply_cache` is what closes that; the epoch alone does not.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn sessions() -> &'static RwLock<SessionMap> {
@@ -552,7 +555,7 @@ pub fn maybe_steer_block_for(
             }
             Session::Applying(stack) => {
                 if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
-                    apply_on_gpu(gpu, x, layer_idx, stack, epoch)?;
+                    apply_on_gpu(gpu, x, layer_idx, stack, epoch, key)?;
                 }
             }
         }
@@ -632,6 +635,15 @@ thread_local! {
 }
 
 struct ApplyCache {
+    /// The session whose directions are currently uploaded.
+    ///
+    /// Load-bearing. Validity was once (epoch, hidden, adapter count, dirs
+    /// count) with no key, and EPOCH moves on session MUTATION, not on a key
+    /// switch — so two keyed sessions of identical shape alternating on one
+    /// thread both saw `shape_matches && cache.epoch == epoch` and the second
+    /// was steered with the FIRST one's directions, scale and mode. Silent, and
+    /// exactly the wrong-vector failure the epoch comment claimed to prevent.
+    key: SteerKey,
     epoch: u64,
     hidden: usize,
     /// GPU-resident mirror of the stack (per-adapter uploaded directions + scale).
@@ -662,10 +674,11 @@ fn apply_on_gpu(
     layer_idx: usize,
     stack: &LoraStack,
     epoch: u64,
+    key: &SteerKey,
 ) -> HipResult<()> {
     APPLY_CACHE.with(|cell| -> HipResult<()> {
         let mut slot = cell.borrow_mut();
-        ensure_apply_cache(&mut slot, gpu, stack, epoch)?;
+        ensure_apply_cache(&mut slot, gpu, stack, epoch, key)?;
         let cache = slot.as_ref().unwrap();
 
         // Phase 1 (reads): per-adapter coefficient from the pre-apply residual.
@@ -708,6 +721,7 @@ fn ensure_apply_cache(
     gpu: &mut Gpu,
     stack: &LoraStack,
     epoch: u64,
+    key: &SteerKey,
 ) -> HipResult<()> {
     let hidden = stack
         .adapters
@@ -739,6 +753,7 @@ fn ensure_apply_cache(
             });
         }
         *slot = Some(ApplyCache {
+            key: key.clone(),
             epoch,
             hidden,
             adapters,
@@ -749,7 +764,10 @@ fn ensure_apply_cache(
     }
 
     let cache = slot.as_mut().unwrap();
-    if cache.epoch != epoch {
+    // Key change re-uploads even at an unchanged epoch: switching streams does
+    // not mutate any session, so EPOCH does not move, and without this the
+    // shape-compatible cache of the PREVIOUS stream would be reused verbatim.
+    if cache.epoch != epoch || cache.key != *key {
         for (ca, a) in cache.adapters.iter_mut().zip(stack.adapters.iter()) {
             for (buf, d) in ca.dirs.iter().zip(a.directions.iter()) {
                 gpu.memcpy_htod_auto(&buf.buf, &f32_bytes(d))?;
@@ -759,6 +777,7 @@ fn ensure_apply_cache(
             ca.layer_range = a.layer_range.clone();
         }
         cache.epoch = epoch;
+        cache.key = key.clone();
     }
     Ok(())
 }
