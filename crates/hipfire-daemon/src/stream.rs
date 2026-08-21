@@ -80,10 +80,7 @@ pub(crate) fn session_of(msg: &serde_json::Value) -> SessionKey {
 /// The caller **must still run the frame**: M3a moves the shape, not the
 /// behaviour, and a refusal here would be user-visible. `None` doubles as
 /// "nothing to retire".
-pub(crate) fn admit_generate(
-    state: &mut DaemonState,
-    msg: &serde_json::Value,
-) -> Option<StreamId> {
+pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -> Option<StreamId> {
     if executor_v2_enabled() {
         static ANNOUNCED: std::sync::Once = std::sync::Once::new();
         ANNOUNCED.call_once(|| {
