@@ -178,3 +178,41 @@ If you want to override, say so explicitly in the launching prompt:
   asking for one in your own words). Not recommended here for the same
   lock-contention reason.
 - **Never** run two GPU-touching agents concurrently.
+
+## Final verification (post-merge with origin/master)
+
+Re-taken after merging origin's `fix(qwen35): dense DeltaNet arm never applied
+ffn_norm`, which lands in the hand decode path this branch also touches.
+
+| measurement | result |
+|---|---|
+| dense decode, `--prefill 16` | **15.1 tok/s** (217.5 GiB/s), 2 reps, zero variance |
+| dense decode, `--prefill 512` | **14.0 tok/s** (202.2 GiB/s), 2 reps, zero variance |
+| `parity_gemv_oq_compact_multicol` | PASS (max 1.12e-7) |
+| `parity_rmsnorm_rotate_awq_width` | PASS (0.00e0, exact) |
+
+**State the context with the number.** The headline 15.1 is at prefill=16; at
+prefill=512 the same binary does 14.0, because KV attention grows with context
+while the weight stream does not. Comparisons to other runtimes are only
+meaningful at equal context.
+
+### tiny-affected-gate: 8 failing cells, NONE of them from this branch
+
+The gate reports FAIL on this branch (qwen2/hfq4, gemma3/q8f16, gemma3/hfq4,
+minimax/mq4, qwen3_5/q8f16, qwen3_5_moe/{q8f16,mq6,mq4}). All eight reproduce
+**identically — to the last printed digit —** on clean `origin/master` in a
+scratch worktree. `tests/tiny-quant-baselines.txt` is stale on master; this
+branch adds no drift.
+
+Two methodology notes, both mistakes made while checking this:
+
+- `tiny-affected-gate.sh` SELECTS cells from the diff against `--base`. Running
+  the branch with `--base origin/master` and master with `--base origin/master~1`
+  compares **different cell sets**, and the resulting "8 vs 4" looked like four
+  new failures that did not exist. To compare like with like, drive the
+  underlying gate directly with `HIPFIRE_TINYQUANT_FAMILIES=<families>`.
+- The first explanation reached for — that the `fused_rmsnorm_mq_rotate_awq`
+  width change (256 -> 1024) shifted float reduction order — was refuted by the
+  comment written in that same diff: the fixtures are hidden=256 and never reach
+  the `k >= 2048` branch, so they give it zero coverage. Read your own notes
+  before theorising.
