@@ -4296,6 +4296,12 @@ pub const GEMM_OQ_COMPACT_IU4_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4X2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4x2_wmma.hip");
 
+/// Compact-resident Opus W4A4 on the TUNED wave64 structure — BK=64 K-strip,
+/// N-heavy BM=64/BN=256, register-staged double buffer — carrying the compact
+/// per-group scales. See `kernels/src/gemm_oq_compact_iu4_w64.hip`.
+pub const GEMM_OQ_COMPACT_IU4_W64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_iu4_w64.hip");
+
 /// Sparse overlay correction for the compact W4A4 path: adds the
 /// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
 /// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.

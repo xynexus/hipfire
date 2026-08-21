@@ -735,6 +735,66 @@ impl Gpu {
         }
     }
 
+    /// Compact-resident Opus W4A4 on the tuned **wave64** structure. Same block
+    /// bytes as `gemm_oq_compact_iu4_wmma`; the A operand is the compact nibble
+    /// plane read directly, which is already a dense `[M, K/2]` int4 array.
+    ///
+    /// Does NOT apply the sparse overlay. Requires `K % 256 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4_w64(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_oq_compact_iu4_w64: K must be a multiple of 256"
+        );
+        self.ensure_kernel(
+            "gemm_oq_compact_iu4_w64",
+            kernels::GEMM_OQ_COMPACT_IU4_W64_SRC,
+            "gemm_oq_compact_iu4_w64",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let mut si = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        // Must match BM / BN in the kernel.
+        const BM: usize = 64;
+        const BN: usize = 256;
+        let func = &self.functions["gemm_oq_compact_iu4_w64"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m.div_ceil(BM) as u32, batch_size.div_ceil(BN) as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Compact-resident Opus **W4A4** GEMM. Same block bytes as
     /// `gemm_oq_compact_grouped_wmma`, but the bulk nibbles go to
     /// `v_wmma_i32_16x16x16_iu4` raw and `x_i4` is packed signed int4
