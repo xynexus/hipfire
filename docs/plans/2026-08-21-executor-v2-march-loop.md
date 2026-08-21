@@ -137,6 +137,34 @@ moving the setup and teardown to the same footing, and making the four items
 with output byte-identical to today — verified the same way M3b0 was, on a real
 qwen35 artifact with at least one sampled run.
 
+**Concrete boundaries, measured** (`serving-core/src/generate.rs`, post-M3b0):
+
+| phase | lines | what it owns |
+|---|---|---|
+| `start()` | 3304 → 3590 | prefill (`forward_prefill_batch` + the multi / PFlash-compressed variants), the multi-turn auto-reset, ngram scope, `tok0` sample, `t_prefill` |
+| `step()` | — | **done**: `qwen35_decode_one` |
+| `finish()` | 3623 → 3716 | the `\n` trailer after `<|im_end|>`, the timing arithmetic, evidence + MoE-router histogram writes, the `done` frame, `qwen35_restore_or_error` |
+
+**Do `finish()` first, and take `session` BY VALUE.** That is not a style
+preference — it dissolves the constraint that shaped M3b0. M3b0's
+`Qwen35Step::Failed(String)` exists only because `qwen35_restore_or_error`
+consumes the session while `kv`/`dn` are `&mut` borrows *out of* it, so the
+unwind could not live inside the extracted function. A `finish` that **owns**
+`session` can derive `kv`/`dn` from it internally and call the restore directly —
+no `Failed` hand-back, no borrow gymnastics.
+
+What `finish()` must close over, all verified present: `prefill_tokens`
+(`= new_tokens.len()`, :3301), `t0`/`t_prefill`, `nl`, `im_end_token`,
+`evidence_dir: Option<&str>`, `DaemonMoeRouterHistogramGuard` (:3343), and the
+PFlash triple — `pflash_summary: Option<CompressedPrompt>` (:2978),
+`pflash_bypass_reason: Option<String>` (:2982), `pflash_alpha: Option<f32>`
+(:2985), which the `done` frame needs via `pflash_done_fragment`.
+
+**M3b0.5 does not decompose the way M3b0 did.** The handle's field set is
+determined by what `finish()` closes over, so "extract the phases" and "define
+the handle" are one change, not two. Budget it as one ~300-line pass with the
+M3b0 verification method attached, rather than expecting to land it in slices.
+
 #### M3b1 — the loop itself
 
 Small **once M3b0.5 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
