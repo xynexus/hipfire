@@ -244,7 +244,10 @@ type-check `#[cfg(test)]` code. `stream.rs`'s tests — offered as the justifica
 for its file-scope `#![allow(dead_code)]` — are run by nothing in CI. Add
 `hipfire-daemon` (and `hipfire-steer`) to the gate's explicit test list.
 
-**Half the steer API is keyed.** `load_adapter`, `load_lora_adapter`,
+**~~Half the steer API is keyed.~~ FIXED** — `load_adapter_for`,
+`load_lora_adapter_for`, `set_adapter_scale_for`, `unload_adapter_for` and
+`loaded_adapters_for` added; the un-keyed forms delegate to the default key, so no
+caller changed. Original description: `load_adapter`, `load_lora_adapter`,
 `set_adapter_scale`, `unload_adapter` and `loaded_adapters` are hard-wired to the
 default key, so a keyed session's adapters cannot be listed, rescaled or unloaded.
 
