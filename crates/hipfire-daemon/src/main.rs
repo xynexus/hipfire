@@ -1043,6 +1043,7 @@ mod generate_batch_prefill_tests;
 mod handlers;
 mod queue;
 mod state;
+mod stream;
 mod transport;
 use state::DaemonState;
 
