@@ -1448,6 +1448,7 @@ impl Gpu {
     /// legacy stream depend on a capturing blocking stream" under capture
     /// mode Global. Use this helper whenever the copy might live inside
     /// a captured region.
+    #[track_caller]
     pub fn memcpy_dtod_at_auto(
         &self,
         dst: &hip_bridge::DeviceBuffer,

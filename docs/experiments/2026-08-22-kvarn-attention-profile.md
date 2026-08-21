@@ -124,3 +124,61 @@ correlation IDs`) — **corrected from the previous note, which blamed KVarN: th
 trigger is hipGraph.** `HIPFIRE_GRAPH=0` makes it profile cleanly. That also
 means any rocprofv3 profile of this daemon is taken with graph amortisation
 disabled, and its absolute dispatch overhead is therefore pessimistic.
+
+---
+
+## Follow-up: chasing the extra dispatches — the copy is real and NOT worth fixing
+
+The dispatch sequence, per full-attention layer, localises the difference exactly:
+
+```
+f32    : rope_partial_halfsplit -> kv_cache_write x2 -> attention_f32          = 3
+kvarn  : rope_partial_halfsplit -> mq_rotate_x x2 -> kv_cache_write_q8_0_batched
+         -> __amd_rocclr_copyBuffer -> attention_flash_kvarn_tile_batched
+         -> attention_flash_asym_reduce_batched                                = 6
+```
+
+**KVarN doubles the attention block's dispatch count.** The copy is
+`grid_x=512` (kvarn 36,265 vs f32 2,313 — exactly +33,952, one per attention
+call) and 4096 bytes, i.e. `kv_dim = n_kv_heads*head_dim = 1024` floats: **one
+token's K**.
+
+Located it with `HIPFIRE_MEMCPY_DUMP=1` after adding `#[track_caller]` to
+`memcpy_dtod_at_auto` (kept — without it the dump names the wrapper, which is
+useless): `crates/hipfire-rdna/src/dispatch/kv.rs:1725`, the KVarN K write:
+
+```rust
+// 2. K write: append to window, flush each completed 128-token block.
+self.memcpy_dtod_at_auto(&window.buf, slot*kv_dim*4, &fa_k.buf, written*kv_dim*4, take*kv_dim*4)?;
+```
+
+In decode (`n == 1`) that is a 4 KB device-to-device memcpy per full-attention
+layer per token, purely to append one token's K to the f32 recent window. It is
+also **synchronous** — the dump only fires from the sync variant
+(`memcpy_dtod_async_at` has no dump), so `active_stream` is `None` here and each
+one is a blocking CPU-GPU round trip.
+
+**Priced it: removing the copy entirely (wrong results, timing-valid) gives
+decode 14.0 vs 13.9 tok/s — ~0.7%, inside noise.** Not worth fixing.
+
+That is worth stating plainly because the correlation looked compelling:
+kvarn issues +3.7% dispatches against a ~4% end-to-end slowdown, and it was
+tempting to read the one obviously-wrong dispatch (a synchronous memcpy in the
+per-token path!) as the cause. It is not. **The ~4% is spread thinly across all
+the extra dispatches; there is no single smoking gun**, and the remaining
+candidates (2x `mq_rotate_x` per call, the `asym_reduce` second pass) are each
+required for correctness, not obviously removable.
+
+## Where this leaves the KVarN question
+
+- The attention kernel is genuinely 1.56x slower than the f32 oracle in GPU time.
+- That cannot be fixed by optimising the kernel: six body experiments moved it by
+  <0.06%, because it sits at the per-dispatch floor.
+- The end-to-end 4% is dispatch count, spread out, with no dominant term.
+- The 4-10x KVarN should win is unreachable until attention does real work per
+  dispatch — long context AND batched prefill.
+
+**Stop optimising here.** Decode is 91% weight-GEMV and already at 90% of its DRAM
+bound; attention is ~1.7% of decode. The remaining prize on this model is prefill,
+which runs per-token at 1.4% of its realistic ceiling — two orders of magnitude
+more headroom than anything in this file.
