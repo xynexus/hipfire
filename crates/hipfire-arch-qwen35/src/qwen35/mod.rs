@@ -2097,21 +2097,29 @@ pub fn prefill_batch_pbs_eligible(
     // channel-tested. The scatter workspace supports at most 1024 experts.
     let moe_topk_ok =
         moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
-    // Compact-resident Opus batches a real SEED prefill only. The GDN tape has
-    // no compact writer, and the small-B spec-decode VERIFY (n = K+1) has no
-    // compact path either — n > 32 is the same boundary this file already uses
-    // to separate that verify from a seed prefill.
-    // HIPFIRE_PROBE_COMPACT_HIDDEN=1 additionally drops the seed-vs-verify size
-    // gate so the small-B spec-decode VERIFY can batch. MEASUREMENT ONLY — it is
-    // known to cost acceptance (0.482 -> 0.286 on Qwen3.8-27B/DFlash2) via the
-    // KV-quantization prefill-path fork, and to buy only +7.8% because compact's
-    // batched path amortizes ~1.6x where bf16's amortizes ~5x. See
-    // docs/plans/2026-08-21-compact-batched-prefill-blocker.md.
-    let allow_compact = if std::env::var("HIPFIRE_PROBE_COMPACT_HIDDEN").is_ok() {
-        !tape_in_play && n >= 2
-    } else {
-        !tape_in_play && n > 32
-    };
+    // Compact-resident Opus batches any forward that EXPORTS NOTHING.
+    //
+    // `tape_in_play` is the real guard: it is true whenever the caller asked for
+    // a GDN tape, a hidden ring-buffer, a per-token hidden dump, or a tree
+    // verify — i.e. exactly the forwards whose captures a drafter consumes, and
+    // which are known to cost acceptance when they batch (0.482 -> 0.286 on
+    // Qwen3.8-27B/DFlash2, via the KV-quantization prefill-path fork).
+    //
+    // This used to ALSO require `n > 32`, as a proxy for "is this a seed prefill
+    // rather than a small-B verify". That proxy was redundant — every
+    // drafter-facing verify already sets `tape_in_play` — and it silently
+    // blocked the one caller it was never aimed at: the spec-decode ROLLBACK
+    // replay, which re-runs the target over `accept_len + 1` accepted tokens and
+    // passes None for all four capture slots. With n ~ 3 it failed `n > 32`, so
+    // compact fell back to PER-TOKEN and paid accept_len+1 whole weight sweeps
+    // per rejection — measured at ~122 ms/cycle, the single largest term in the
+    // spec-decode budget (draft 64 + verify 48 + rollback 122).
+    //
+    // Compact has no GDN-tape writer, so `gdn_tape_opt` is always None for it
+    // and the cheap `SpecRollbackReplayKind::GdnTape` replay can never engage
+    // (`replay_gdn_tape=0` in every run). Batching the FullPrefill replay is the
+    // available lever; a compact tape writer would be the other one.
+    let allow_compact = !tape_in_play;
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of

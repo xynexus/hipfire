@@ -2814,6 +2814,29 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wqkv.k,
                         n,
                     )?;
+                } else if matches!(layer.wqkv.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: the SAME W8A8 math as the oq8 arm
+                    // above, decoding OqPlusCompact blocks in-kernel.
+                    //
+                    // Without this arm compact fell through to the final `else`,
+                    // which hard-codes `FusedQkvzaHfq4G256` — so a 136-byte
+                    // [f16 scale][128 nibbles][3x(u8 idx, i8 val)] block was read
+                    // as an HFQ4G256 block. Two layouts sharing no field, and no
+                    // error: just wrong numbers. That is what made compact's
+                    // BATCHED prefill unusable, which is why the batched
+                    // spec-decode verify had to exclude compact entirely and why
+                    // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
+                    // Measured: 48 fall-throughs in a 16-token spec run.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+                    for (w, y) in [
+                        (&layer.wqkv, &pbs.dn_qkv_batch),
+                        (&layer.wz, &pbs.dn_z_batch),
+                        (&layer.w_beta, &pbs.dn_beta_batch),
+                        (&layer.w_alpha, &pbs.dn_alpha_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else {
                     run_fused_qkvza_key(
                         gpu,
