@@ -2315,24 +2315,33 @@ pub(crate) fn forward_prefill_chunk(
         || kv_cache.quant_asym4
         || kv_cache.quant_asym3
         || kv_cache.quant_asym2;
+    // NB the compact admission below is `gdn_tape.is_none()`, NOT
+    // `gdn_tape.is_none() && n > 32`. The `n > 32` proxy (for "seed prefill, not
+    // a small-B verify") was a SECOND copy of the one dropped from
+    // `prefill_batch_pbs_eligible`, and it silently split every batched forward:
+    // DeltaNet layers batched while EVERY FullAttn layer fell to the per-token
+    // gather/scatter fallback, because a spec-decode verify runs at n = B = 8.
+    // Measured on Qwen3.8-27B: 16655 per-token `gemv_oq_compact_grouped_v3`
+    // calls in a 32-token spec run — 29.7 whole target forwards' worth, 33.7% of
+    // the profile — against 561 such calls per genuine AR forward.
     let fa_batched_ok = fa_kv_ok
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.w_gate.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.w_up.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.w_down.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.w_gate.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.w_up.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.w_down.gpu_dtype, fa_arch, gdn_tape.is_none())
             }
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_batched_admissible in the eligibility gate).
             LayerWeights::FullAttnMoe(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32)
+                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none())
+                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none())
             }
             _ => true, // LA layers don't gate this check
         });
@@ -2342,7 +2351,7 @@ pub(crate) fn forward_prefill_chunk(
     if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
         let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none() && n > 32))
+                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none()))
                     .then(|| format!("{:?}", l.wq.gpu_dtype))
             }
             _ => None,
