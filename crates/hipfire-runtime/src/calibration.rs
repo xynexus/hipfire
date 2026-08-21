@@ -178,6 +178,13 @@ struct Acc {
     /// oppositely. These four are what an A4 decision can actually be made
     /// against. `None` only on the no-buffer weighted path below.
     stats: Option<GpuTensor>,
+    /// `[2, K/256]` per-(token, group) crest: row 0 sums it over tokens, row 1
+    /// maxes. This is what an Opus scale ACTUALLY sees — `stats` reduces over
+    /// tokens and so reports a corpus-wide per-channel crest, which on
+    /// Qwen3.8-27B read 226 on down_proj while that model serves fine at W4A8.
+    /// `None` when K is not a multiple of the 256 group, or on the no-buffer
+    /// weighted path.
+    gcrest: Option<GpuTensor>,
     h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
     /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
     /// The GPU outer-product accumulates `Σxxᵀ` in f32; RDNA has no f64 matrix
@@ -206,6 +213,10 @@ impl Acc {
         }
         if let Some(stats) = self.stats.as_ref() {
             gpu.calib_actstats_reduce_f32(&self.buf, stats, self.buf_rows, self.k)
+                .map_err(|e| contracts::CalibError::Runtime(e.to_string()))?;
+        }
+        if let Some(gc) = self.gcrest.as_ref() {
+            gpu.calib_group_crest_reduce_f32(&self.buf, gc, self.buf_rows, self.k, 256)
                 .map_err(|e| contracts::CalibError::Runtime(e.to_string()))?;
         }
         gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
@@ -344,10 +355,31 @@ impl CalibCollector {
                 return Err(contracts::CalibError::Runtime(error.to_string()));
             }
         };
+        // 256 is the Opus group; a tensor whose K is not a multiple of it has
+        // no group-crest to report rather than a differently-shaped one.
+        let gcrest = if want_stats && k % 256 == 0 {
+            match gpu.zeros(&[2, k / 256], DType::F32) {
+                Ok(t) => Some(t),
+                Err(error) => {
+                    let _ = gpu.free_tensor(diag);
+                    if let Some(h) = h {
+                        let _ = gpu.free_tensor(h);
+                    }
+                    let _ = gpu.free_tensor(buf);
+                    if let Some(t) = stats {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(contracts::CalibError::Runtime(error.to_string()));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Acc {
             output_names,
             diag,
             stats,
+            gcrest,
             h,
             h_f64,
             buf,
@@ -409,6 +441,9 @@ impl CalibCollector {
             if let Some(stats) = acc.stats {
                 let _ = gpu.free_tensor(stats);
             }
+            if let Some(gc) = acc.gcrest {
+                let _ = gpu.free_tensor(gc);
+            }
             if let Some(h) = acc.h {
                 let _ = gpu.free_tensor(h);
             }
@@ -452,6 +487,7 @@ impl CalibCollector {
                     // Weighted path stages no rows, so the shape statistics have
                     // nothing to reduce over; the imatrix is accumulated directly.
                     stats: None,
+                    gcrest: None,
                     h,
                     h_f64: None,
                     buf,
@@ -734,6 +770,7 @@ impl CalibCollector {
         // how to produce each payload, in the SAME order.
         enum Plan {
             ActStats { key: String },
+            GroupCrest { key: String },
             Hessian { key: String, output_name: String },
             Imatrix { key: String },
             Extra(usize),
@@ -779,6 +816,17 @@ impl CalibCollector {
                     data_len: (4 * acc.k * 4) as u64,
                 });
                 plan.push(Plan::ActStats { key: key.clone() });
+            }
+            if acc.gcrest.is_some() {
+                let ngc = acc.k / 256;
+                entries.push(HfqStreamEntry {
+                    name: format!("{output_name}.groupcrest"),
+                    quant_type: 2,
+                    shape: vec![2, ngc as u32],
+                    group_size: 256,
+                    data_len: (2 * ngc * 4) as u64,
+                });
+                plan.push(Plan::GroupCrest { key: key.clone() });
             }
         }
         for (j, t) in extra.iter().enumerate() {
@@ -829,6 +877,21 @@ impl CalibCollector {
                             write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
                         }
                     }
+                }
+                Plan::GroupCrest { key } => {
+                    let acc = &accs[key];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let gc = gpu
+                        .download_f32(acc.gcrest.as_ref().expect("groupcrest planned"))
+                        .map_err(io_err)?;
+                    // Row 0 is a SUM over tokens -> mean; row 1 is a MAX and is
+                    // written raw.
+                    let ngc = acc.k / 256;
+                    let mut out = gc.clone();
+                    for v in out[..ngc].iter_mut() {
+                        *v *= inv;
+                    }
+                    write_f32_scaled(w, &out, 1.0)
                 }
                 Plan::ActStats { key } => {
                     let acc = &accs[key];
@@ -1735,6 +1798,7 @@ impl ActivationCapture for CalibCollector {
                     // Weighted path stages no rows, so the shape statistics have
                     // nothing to reduce over; the imatrix is accumulated directly.
                     stats: None,
+                    gcrest: None,
                     h,
                     h_f64,
                     buf,

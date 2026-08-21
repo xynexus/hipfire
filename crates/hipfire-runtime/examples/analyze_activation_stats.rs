@@ -52,8 +52,12 @@ fn main() {
     }
     println!("activation shape statistics from {} tensors\n", names.len());
     println!(
-        "  {:<58} {:>7} {:>9} {:>8} {:>9}",
-        "tensor", "crest", "kurtosis", "asym", "int4?"
+        "  {:<50} {:>8} {:>8} {:>8} {:>9} {:>8}",
+        "tensor", "corpus", "grp-mean", "grp-max", "kurtosis", "int4?"
+    );
+    println!(
+        "  {:<50} {:>8} {:>8} {:>8}",
+        "", "(crest)", "(crest)", "(crest)"
     );
 
     let mut worst: Vec<(f32, String)> = Vec::new();
@@ -70,6 +74,20 @@ fn main() {
         // Pair with the imatrix (Σx²/N) for the true rms and true kurtosis.
         let im_name = name.replace(".actstats", ".imatrix");
         let imatrix = hfq.tensor_data(&im_name).map(|(_, b)| as_f32(&b));
+        // And with the per-(token, group) crest, which is what the quantizer
+        // actually experiences. The corpus-wide column above reduces over
+        // tokens and so cannot see that window.
+        let gc_name = name.replace(".actstats", ".groupcrest");
+        let gc = hfq.tensor_data(&gc_name).map(|(_, b)| as_f32(&b));
+        let (gmean, gmax) = match &gc {
+            Some(v) if v.len() >= 2 => {
+                let h = v.len() / 2;
+                let m = v[..h].iter().sum::<f32>() / h as f32;
+                let x = v[h..].iter().cloned().fold(0f32, f32::max);
+                (m, x)
+            }
+            _ => (0.0, 0.0),
+        };
         let mut max_crest = 0f32;
         let mut sum_kurt = 0f64;
         let mut max_asym = 0f32;
@@ -98,21 +116,28 @@ fn main() {
             continue;
         }
         let kurt = sum_kurt / n as f64;
-        let verdict = if max_crest < 6.0 {
+        // Judge on the PER-GROUP max where available — that is the window the
+        // scale is chosen in. Signed int4 has 7 positive levels, so rms sits at
+        // 7/crest levels: <4 is comfortable, <8 workable, beyond that int4
+        // flattens the bulk of the group.
+        let judged = if gmax > 0.0 { gmax } else { max_crest };
+        let verdict = if judged < 4.0 {
             "ok"
-        } else if max_crest < 20.0 {
+        } else if judged < 8.0 {
             "tight"
         } else {
             "CLIPS"
         };
         let short = name.trim_end_matches(".actstats");
         let short = short.rsplit_once("layers.").map(|x| x.1).unwrap_or(short);
-        println!("  {short:<58} {max_crest:>7.2} {kurt:>9.2} {max_asym:>8.2} {verdict:>9}");
-        worst.push((max_crest, short.to_string()));
+        println!(
+            "  {short:<50} {max_crest:>8.1} {gmean:>8.2} {gmax:>8.2} {kurt:>9.1} {verdict:>8}"
+        );
+        worst.push((judged, short.to_string()));
     }
 
     worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    println!("\n  worst channels by crest factor (these decide whether A4 is viable):");
+    println!("\n  worst by the PER-GROUP crest the quantizer actually sees:");
     for (c, n) in worst.iter().take(8) {
         println!("    {c:>8.2}  {n}");
     }

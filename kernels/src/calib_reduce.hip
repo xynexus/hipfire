@@ -9,6 +9,8 @@
 //   calib_sumsq_reduce_f32      acc[c]   += Σ_n x[n,c]²          (imatrix / diag(H))
 //   calib_hessian_outer_f32     H[i,j]   += Σ_n x[n,i]·x[n,j]    (GPTQ Hessian, K×K)
 //   calib_actstats_reduce_f32   acc[4,K] += Σx, Σ|x|, Σx⁴, max|x| (activation SHAPE)
+//   calib_group_crest_reduce_f32 acc[2,ng]: mean/max over tokens of the
+//                               PER-(token, group) crest the quantizer sees
 //
 // Both ADD into their destination so the caller accumulates across the whole
 // calibration corpus (one call per captured linear per forward). Destinations
@@ -231,4 +233,63 @@ extern "C" __global__ void calib_actstats_reduce_f32(
     acc[K + c]         += sa;
     acc[2 * K + c]     += s4;
     acc[3 * K + c]      = fmaxf(acc[3 * K + c], mx);
+}
+
+// Per-(token, group) crest factor — what the ACTUAL quantizer experiences.
+//
+// `calib_actstats_reduce_f32` reduces over tokens, so its crest is
+// `max|x| over the WHOLE CORPUS / rms over the whole corpus`, per channel. That
+// is not the quantizer's world. An Opus scale is chosen per (token, group of
+// `group` channels), a far narrower window, and a channel whose magnitude drifts
+// slowly across the corpus has a huge corpus-wide crest and a perfectly tame
+// per-token one.
+//
+// The gap is not academic: the corpus-wide statistic reported crest 226 on
+// Qwen3.8-27B down_proj, which against int8's 127 levels should be
+// catastrophic — while that model serves coherently at W4A8 today. The
+// statistic was wrong, not the model.
+//
+// So this reduces the other way round: for each (token, group) take
+// `max|x|` and `rms` ACROSS THE GROUP's channels, form their ratio, and
+// aggregate that over tokens.
+//
+//   acc[0, g] += Σ_tokens crest(t, g)      (÷ n_tokens at write time → mean)
+//   acc[1, g]  = max_tokens crest(t, g)
+//
+// One wave per (token, group); the wave reduces `group` values. Cross-token
+// aggregation needs atomics because many tokens land on the same group — the max
+// uses an integer atomicMax on the float bit pattern, which is exact here
+// because crest is non-negative and IEEE-754 orders non-negative floats
+// identically to their unsigned bit patterns.
+extern "C" __global__ void calib_group_crest_reduce_f32(
+    const float* __restrict__ x,
+    float* __restrict__ acc,   // [2, ng]
+    int N, int K, int group
+) {
+    const int waves = blockDim.x >> 5;
+    const int idx   = blockIdx.x * waves + (threadIdx.x >> 5);
+    const int ng    = K / group;
+    if (idx >= N * ng) return;
+    const int n = idx / ng;
+    const int g = idx - n * ng;
+    const int lane = threadIdx.x & 31;
+
+    const float* row = x + (long long)n * K + (long long)g * group;
+    float mx = 0.0f, ss = 0.0f;
+    for (int i = lane; i < group; i += 32) {
+        const float v = row[i];
+        mx = fmaxf(mx, fabsf(v));
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor(mx, off));
+        ss += __shfl_xor(ss, off);
+    }
+    if (lane == 0) {
+        const float rms = sqrtf(ss / (float)group);
+        const float crest = (rms > 1e-20f) ? (mx / rms) : 0.0f;
+        atomicAdd(&acc[g], crest);
+        atomicMax((unsigned int*)&acc[ng + g], __float_as_uint(crest));
+    }
 }

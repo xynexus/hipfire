@@ -3706,6 +3706,45 @@ impl Gpu {
         )
     }
 
+    /// Calibration: per-(token, group) crest into a `[2, K/group]` F32
+    /// accumulator — row 0 sums the per-token crest (divide by token count for
+    /// the mean), row 1 takes the max. `x` is `[N, K]` F32.
+    ///
+    /// This is the statistic an Opus scale actually experiences, unlike
+    /// `calib_actstats_reduce_f32`'s corpus-wide per-channel crest, which
+    /// reduces over tokens and so cannot see the per-(token, group) window.
+    pub fn calib_group_crest_reduce_f32(
+        &mut self,
+        x: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_group_crest_reduce_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let acc_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let g_i = group as i32;
+        let block = 256u32;
+        let waves = block / 32;
+        let units = (n * (k / group)) as u32;
+        let grid = units.div_ceil(waves).max(1);
+        self.launch_kernargs(
+            "calib_group_crest_reduce_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr x_ptr, ptr acc_ptr, i32 n_i, i32 k_i, i32 g_i],
+        )
+    }
+
     /// Calibration: `H[i,j] += Σ_n x[n,i]·x[n,j]` (the K×K GPTQ Hessian, tiled
     /// GEMM accumulate). `x` is [N, K] F32; `H` is [K, K] F32 row-major, ADDED
     /// into (caller zeroes once, then accumulates across the calibration corpus).
