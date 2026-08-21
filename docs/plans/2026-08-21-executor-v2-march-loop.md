@@ -63,19 +63,139 @@ behaviour is unchanged and only the *shape* moves.
 
 ### M3b — the march loop
 
+**Rewritten 2026-08-21 after M3a landed.** The original text is preserved at the
+end of this section, because what it got wrong is instructive: it costed the
+*loop* and never costed the *quantum*, and the quantum is the whole job.
+
 A serial loop that picks a runnable stream, advances it one quantum, records the
 cursor, and repeats. Serial is deliberate: the parallelism is intra-kernel, and
 per-stream state exists because a serial executor interleaves streams *within* a
 march.
 
-Cancellation moves here — from three per-token hook sites into the pick step, one
-site instead of three-and-counting.
+#### M3b0 — a quantum has to exist first
+
+**There is no quantum on the `Generate` path today.** `handlers::generate::text`
+ends in a single `generate(...)` call, and the qwen35 per-token loop lives
+*inside that function body* — `crates/hipfire-serving-core/src/generate.rs:3124`,
+`while generated < max_tokens {`, ~365 lines — with every cross-token variable a
+stack local (`rng_state`, `filter`, `think_count`, `loop_guard`, and ~10 more).
+`crates/hipfire-runtime/src/arch.rs:1192` is a second such loop with ~16 more,
+two of them RAII GPU scratch that returns to the pool when the frame drops.
+
+Neither is re-enterable. A march loop built today would march **whole requests**,
+which is indistinguishable from not having one — the trap `stream.rs` already
+warns about ("a green run under the flag is not evidence the executor ran").
+
+So M3b0 is: extract the loop body into a state struct plus a one-token function,
+and leave the existing loop calling it. One struct, one function, exactly one
+caller. No flag, no march loop, no `StreamTable` change.
+
+*Exit:* a pure extraction, byte-identical by construction, with
+`./tests/tiny-affected-gate.sh --require-coverage` green and a real generation
+compared byte-for-byte. **Inert on both paths**, not merely flag-off — which is a
+stronger safety argument than the flag, and is needed here because this is
+flag-off code.
+
+*Scope:* qwen35 (pp==1) only. That is where the exit can be demonstrated at all
+(see the arch scope below), and it is graph-free by a hard literal —
+`crates/hipfire-arch-qwen35/src/qwen35/mod.rs:1000` is `let use_graph = false;`.
+Doing `arch.rs:1192` as well doubles the diff and buys nothing M3b can test.
+
+#### M3b1 — the loop itself
+
+Small once M3b0 exists: ~150–250 lines across `main.rs`, `stream.rs`, `state.rs`.
+Four things must move with it, none of them optional and none in the `Generate`
+arm:
+
+1. **Reply routing.** `Responder` is one per process, and `out.sink` is swapped
+   per *frame*. `RunningStream` gains a `ReplySink` clone plus its `request_id`,
+   installed before each quantum. `ReplySink` is already `Clone` over an
+   `Arc<Mutex<..>>` and `pub(crate)`, so **this needs no `transport.rs` edit** —
+   but note `RunningStream` and `StreamTable` both `#[derive(Debug)]` and
+   `ReplySink` does not, which tempts a derive *in* `transport.rs`. Hand-write or
+   drop the stream-side `Debug` instead. That is the stop-line, reached by
+   accident.
+2. **The blocking `recv`.** With a live marching stream and an empty queue, the
+   executor parks forever instead of marching. It must block only when the queue
+   is empty **and** nothing is runnable.
+3. **The per-frame cancel resets.** Under a march loop one frame is not one
+   stream, so dispatching any frame wipes a live stream's unpolled abort.
+4. **`activate_session` per quantum**, not per frame — otherwise a stream switch
+   drives stream B's tokens into stream A's KV.
 
 *Exit:* two concurrent `Generate` requests interleave at quantum granularity
 under the flag, each producing output byte-identical to running it alone.
 
 *Falsified by:* either stream's output differing from its solo run. That is the
 accept-and-miscompute class; only exact comparison catches it.
+
+#### The exit needs an arch scope and a harness decision
+
+**Arch scope: qwen35 (pp==1) and lfm2-moe only.** Interleaving requires
+`activate_session` per switch, and `handlers/generate.rs:249-262` gates it to
+`(is_qwen35_family_arch_id(m.arch_id) && m.pp == 1) || is_lfm2_generate_session`;
+every other arch errors on `session_id` and holds one unkeyed KV. Naming the
+scope is the difference between a scoped milestone and a fixture that silently
+corrupts KV.
+
+**Harness: undecided, and it must be decided before code.** Two concurrent
+`Generate`s on ONE connection break the invariant `queue.rs` exists to protect —
+its own words are "a connection's frames are a dependency chain… the order *is*
+the declaration", which holds today only because dispatch order equals execution
+order. Two connections need a listening daemon, and **nothing in the tree starts
+one**: `--listen` appears only in `main.rs` (help text, parser, dispatch); grep
+over `scripts/` and `tests/` returns zero, and `daemon-adapter`'s
+`attach_or_spawn` always falls through to a stdio spawn.
+
+The harness must also use **distinct `session_id`s**, or
+`AdmitError::SessionAlreadyLive` refuses the second stream and the test silently
+measures one stream twice. And once the march loop owns execution, that refusal
+stops being swallowable: M3a's `admit_generate` returns `None` and the caller
+runs the frame anyway, which is right for a shape-only stage but leaves a refused
+stream with no runner. Decide the policy — error frame, or queue behind the live
+stream — in M3b1.
+
+#### Cancellation does NOT consolidate here
+
+The original text said "cancellation moves here — from three per-token hook sites
+into the pick step, one site instead of three-and-counting." **There are six
+sites across two different primitives**, and the consolidation is not reachable
+in M3b:
+
+* id-keyed `cancel::is_cancelled`: `arch.rs:1206`,
+  `serving-core/generate_arch.rs:1073`, `serving-core/events.rs:174`.
+* unkeyed `take_generation_cancel()`: `arch.rs:1215`,
+  `serving-core/generate.rs:1557`, `serving-core/generate.rs:3132`.
+
+`GENERATION_CANCEL` is a process-global `AtomicBool` and its take is a consuming
+`swap(false)`, so with two streams marching, whichever polls first eats the
+other's cancel. Its own doc justifies that with "a cancel never leaks into the
+next request" — premised on one request at a time, the exact premise M3b removes.
+
+And **the pick step does not hold the key.** `cancel::PENDING` is keyed on the
+*request* id; `RunningStream` carries a `SessionKey`, which resolves to the
+client's `session_id` whenever one is sent. A pick-step check on the session key
+would silently never match for exactly the clients that set it.
+
+Two served decode loops also have **zero** cancellation coverage today —
+`serving-core/generate_vl.rs` (qwen35-VL and dots_ocr) contains no occurrence of
+"cancel" at all. Consolidating would either newly cancel paths that never could
+be — a behaviour change under the flag, which this plan forbids — or leave them
+uncovered.
+
+**M3b adds a pick-step check and leaves the per-token ones.** Removing them needs
+every decode path routed through the march loop, which is M3c at the earliest.
+
+<details><summary>Original M3b text, superseded</summary>
+
+> A serial loop that picks a runnable stream, advances it one quantum, records
+> the cursor, and repeats. […] Cancellation moves here — from three per-token
+> hook sites into the pick step, one site instead of three-and-counting.
+>
+> *Exit:* two concurrent `Generate` requests interleave at quantum granularity
+> under the flag, each producing output byte-identical to running it alone.
+
+</details>
 
 ### M3c — the suspension boundary
 
@@ -85,9 +205,25 @@ exists and is tested at the type level; this makes it true of an actual forward.
 *Exit:* a stream parked mid-generation and resumed produces output
 byte-identical to an uninterrupted run. This is the contract §M6 later depends on.
 
-**`hipGraph` capture is off on the v2 path** until its WCET is declared — a graph
-is one indivisible quantum by construction, and a declared WCET that ignores an
-enabled graph is exactly the failure the contract exists to prevent.
+**`hipGraph` capture must be TURNED off on the v2 path** until its WCET is
+declared — a graph is one indivisible quantum by construction, and a declared
+WCET that ignores an enabled graph is exactly the failure the contract exists to
+prevent.
+
+This sentence previously read "is off", as a statement of fact. **It is not off.**
+It is default-ON on a served path: `hipfire-arch-deepseek4/src/forward.rs:1612`
+is `env_override.unwrap_or_else(|| arch.starts_with("gfx11") || arch.starts_with("gfx12"))`,
+it captures the entire decode body in one graph, and it is reached
+unconditionally from `serving-core/generate_arch.rs`. qwen35's DFlash verify
+graph is default-on too, via a different API. Turning it off is an action item
+and not one switch — `hipfire-rdna/src/dispatch/mod.rs` holds three independent
+capture families, enumerated together by `graph_state_live()`.
+
+qwen35 **AR** decode is the exception and that is why M3b0 scopes to it:
+`hipfire-arch-qwen35/src/qwen35/mod.rs:1000` is a literal `let use_graph = false;`
+with the parsed `HIPFIRE_GRAPH` deliberately discarded on the next line. Do not
+widen the v2 scope to deepseek4 without dealing with the graph first — the
+smallest possible quantum there is one whole captured forward.
 
 ### M3d — the exit measurements
 
@@ -98,6 +234,15 @@ milestone:
 1. **p99 and max module duration**, and which `SuperOpKind` owns the max — the
    achievable suspension floor, and therefore the tightest drain budget the design
    can hold.
+
+   **Not obtainable from the M0 trace today.** `TraceRecord.module`'s own doc says
+   "Which module (M4 onward). 0 until the module graph exists", every `record()`
+   call site passes 0, `TraceRecord` has no field that could hold a `SuperOpKind`,
+   and `exec_trace.rs` contains zero references to that type. `TraceEvent` has
+   five coarse variants and the file records that a `Yielded` variant was left out
+   deliberately because "today nothing can construct it". So either scope M3d to
+   measurements 2 and 3, or budget the instrumentation as part of it — but do not
+   plan to read (1) off the trace as it stands.
 2. **Time from realtime admission to first dispatch** under saturating bulk load.
 3. **Bulk throughput, loaded vs solo — ≥ 0.6×.** Without (3), (2) is trivially
    satisfiable by refusing to run the bulk job. Report all three or none.
@@ -129,6 +274,14 @@ is wrong regardless of what the on-path measurements say.
 
 Remove `#![allow(dead_code)]` from `stream.rs` when M3b lands. From that point a
 dead item there is a real signal, and the attribute hides it.
+
+**Except that it will fire immediately, on `StreamCursor::advance_module`.**
+Nothing in the tree produces a module index: `run_layer_program` is `for op in
+program` with no resumption index, and qwen35 rebuilds a fresh per-layer op `Vec`
+every token. Its only callers are this file's own tests. So either module
+marching lands with M3b — it cannot, see M3b0 — or the attribute stays and this
+plan says why. It stays, and the reason is that the cursor's `module` half is
+scaffolding for §M4, which is honest as long as it is written down.
 
 ## Stop and ask
 
