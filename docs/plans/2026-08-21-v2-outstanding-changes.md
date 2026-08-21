@@ -265,5 +265,8 @@ section. Original description: `refresh_active_gate` drops its read
 guard before storing, so `clear_for(A)` racing `begin_apply_for(B)` can land a
 stale `false` and silently disable B's steering.
 
-**`SteerKeyGuard` is `Send`.** Its `Drop` restores into whatever thread drops it,
+**~~`SteerKeyGuard` is `Send`.~~ FIXED** — a `PhantomData<*const ()>` field pins
+it to its installing thread, so a cross-thread move is now a compile error. A
+compile-time assertion (two blanket impls, one gated on `Send`) proves it: the
+call resolving IS the assertion. Original description: Its `Drop` restores into whatever thread drops it,
 so a guard that crosses threads pins the installing thread to another stream's key.
