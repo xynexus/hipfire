@@ -204,6 +204,12 @@ Three cases, all found by grepping before building. Worth the habit.
 
 ---
 
+## Next: executor v2 (parent §M3)
+
+Planned in `2026-08-21-executor-v2-march-loop.md`. Staged M3a admit → M3b march →
+M3c suspend → M3d measure, all behind `HIPFIRE_DAEMON_EXECUTOR=v2`, default off.
+M3a alone unblocks half of P2/M3 below.
+
 ## M3 is BLOCKED on two prerequisites (found 2026-08-21, before writing code)
 
 Wiring the daemon steer handler to route per session was attempted and stopped.
