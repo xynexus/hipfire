@@ -38,8 +38,9 @@
 
 use hipfire_rdna::Gpu;
 use hipfire_steer::{
-    apply_direction, begin_apply, begin_capture, clear, commit_capture, derive_directions,
-    finish_capture, maybe_steer_block, CaptureMeans, SteerMode, SteerSpec,
+    apply_direction, begin_apply, begin_apply_for, begin_capture, clear, clear_all, commit_capture,
+    derive_directions, finish_capture, maybe_steer_block, maybe_steer_block_for, CaptureMeans,
+    SteerKey, SteerMode, SteerSpec,
 };
 
 const NUM_LAYERS: usize = 4;
@@ -187,6 +188,8 @@ fn main() {
         );
     }
 
+    failures += keyed_sessions_do_not_alias(&mut gpu, &mut rng);
+
     if failures == 0 {
         println!("ALL PASS");
     } else {
@@ -211,4 +214,67 @@ fn run_capture(gpu: &mut Gpu, rng: &mut Lcg, offsets: &[f32]) -> CaptureMeans {
         commit_capture();
     }
     finish_capture().expect("capture session was active")
+}
+
+/// Two keyed sessions of IDENTICAL shape, alternating on one thread, must each
+/// be steered with their OWN direction.
+///
+/// This is the regression test for a silent miscompute: `ApplyCache` is a
+/// per-thread upload validated on (epoch, hidden, adapter count, dirs count).
+/// EPOCH moves when a session is MUTATED, and switching which stream applies
+/// mutates nothing — so before `ApplyCache` also compared its `key`, the second
+/// stream hit the cache-valid path and was steered with the FIRST stream's
+/// directions, scale and mode. Same shape, no error, wrong vector.
+///
+/// Remove the `cache.key != *key` clause in `ensure_apply_cache` and this case
+/// fails while every other case above still passes.
+fn keyed_sessions_do_not_alias(gpu: &mut Gpu, rng: &mut Lcg) -> usize {
+    let mut failures = 0usize;
+    clear_all();
+
+    let dir_a = rng.unit_vec(HIDDEN);
+    let dir_b = rng.unit_vec(HIDDEN);
+    let (key_a, key_b) = (SteerKey::session("stream-a"), SteerKey::session("stream-b"));
+
+    // Identical shape on purpose: one adapter, NUM_LAYERS directions, same
+    // hidden. That is what makes the stale cache look valid.
+    let spec = |dir: &Vec<f32>, strength: f32| SteerSpec {
+        directions: vec![dir.clone(); NUM_LAYERS],
+        mode: SteerMode::Steer,
+        strength,
+        layer_range: 0..NUM_LAYERS,
+    };
+    begin_apply_for(&key_a, spec(&dir_a, 0.5));
+    begin_apply_for(&key_b, spec(&dir_b, 1.25));
+
+    // Alternate, as a serial march interleaving two streams would.
+    for layer_idx in 0..NUM_LAYERS {
+        for (key, dir, strength, who) in [
+            (&key_a, &dir_a, 0.5f32, "stream-a"),
+            (&key_b, &dir_b, 1.25f32, "stream-b"),
+        ] {
+            let x = rng.vec(HIDDEN);
+            let mut expected = x.clone();
+            apply_direction(&mut expected, dir, SteerMode::Steer, strength);
+
+            let x_gpu = gpu.upload_f32(&x, &[HIDDEN]).unwrap();
+            maybe_steer_block_for(key, gpu, &x_gpu, layer_idx).unwrap();
+            let got = gpu.download_f32(&x_gpu).unwrap();
+
+            let err = max_abs_err(&got, &expected);
+            let tol = 1e-4;
+            let ok = err <= tol;
+            if !ok {
+                failures += 1;
+            }
+            println!(
+                "  [{}] keyed no-alias {who} layer={layer_idx}: max_abs_err={err:.2e} (tol {tol:.0e}) {}",
+                if ok { "PASS" } else { "FAIL" },
+                if ok { "" } else { "<- steered with the other stream's direction" }
+            );
+        }
+    }
+
+    clear_all();
+    failures
 }
