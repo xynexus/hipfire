@@ -474,8 +474,14 @@ pub fn clear_for(key: &SteerKey) {
     set_session_for(key, Session::Inactive);
 }
 
-/// Drop every session, keyed and unscoped. Model load/unload uses this: a spec
-/// captured against one model must not survive into the next.
+/// Drop every session, keyed and unscoped.
+///
+/// NOT yet wired: `handlers/lifecycle.rs` still calls the un-keyed [`clear`] on
+/// model load and unload, which after this change drops only the unscoped
+/// session. So a keyed spec WOULD survive a model swap. Harmless today because
+/// nothing creates a keyed session, but whoever wires the daemon routing must
+/// switch those two call sites to this function in the same change — otherwise a
+/// spec captured against one model silently applies to the next.
 pub fn clear_all() {
     sessions().write().unwrap().clear();
     refresh_active_gate();
