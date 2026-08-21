@@ -226,10 +226,12 @@ miscompute — both paths are correct since `1f7c2eeba` — but it is a routing
 regression the moment keyed sessions exist. It must become per-key, or M4 must
 delete the escape first.
 
-**Five hook call sites, not three.** `hipfire-arch-gemma3/src/forward.rs:781` and
-`:1050` also call the steer hooks. Earlier text in this file and in the P2 plan
-says qwen35-only; the thread-scoped key therefore changes gemma3's routing too,
-which no PR mentioned or tested.
+**~~Five hook call sites, not three.~~ FIXED** — inventoried in the P2 plan's M3
+section and named at both gemma3 call sites. Investigating it corrected the
+concern as stated: gemma3 has **no routing predicate** — no lowered/hand split,
+so no escape and no M1-M4 staging — and was therefore never exposed to the
+`is_active()` regression. It does participate in per-stream steering (its
+un-keyed hooks resolve the calling thread's key), which nothing had said.
 
 **No gate runs the daemon's tests.** `hipfire-daemon` is bin-only (no `src/lib.rs`,
 no `[lib]`), so `ci.yml`'s `cargo test --lib --workspace` selects zero targets
