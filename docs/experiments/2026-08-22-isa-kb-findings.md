@@ -86,3 +86,114 @@ Our kernels answer it for IU4 empirically: the A/B operand is passed as
 `byte = k_even | (k_odd << 4)`. Parity against a CPU oracle passes on every
 shape, so the packing is confirmed. IU8 by the same construction is `int32x4`
 (4 VGPRs) for 16 int8 values = **4 per VGPR**, likewise parity-confirmed.
+
+---
+
+# Part 2: what the disassembly says, once the KB tells you what to look for
+
+Disassembling `gemm_oq_compact_iu4_w64.hsaco` and counting the **steady-state
+loop body only** (one 256-element compact group) gives the exact issue budget:
+
+| class | count per group |
+|---|---|
+| WMMA | **64** |
+| non-WMMA VALU | **291** |
+| SALU | 92 |
+| VMEM | 16 |
+| LDS | 14 |
+
+and the 291 breaks down as:
+
+| op | count | what it is |
+|---|---|---|
+| `v_cvt_f32_i32` | 64 | rescale: i32 acc -> f32 |
+| `v_fma_mix_f32` | 64 | rescale: apply the f16 weight scale |
+| `v_fmac_f32` | 64 | rescale: apply the activation scale, accumulate |
+| **`v_mov_b32`** | **64** | **accumulator reset — pure shuffling, no arithmetic** |
+| address adds | 32 | |
+
+This **calibrates the issue-bound model** that the no-op probe established.
+Solving `64X / (64X + 291) = 0.51` (the measured fraction of peak) gives
+**X = 4.7 cycles per WMMA**, with VALU at 1. The model is self-consistent: WMMA
+and VALU serialize on one issue port, a WMMA costs ~4.7 slots, and every VALU op
+in the loop is one slot of lost matrix throughput.
+
+## The rescale is arithmetically irreducible at G=256
+
+`facc += (float)acc * sw * sx` compiles to exactly 3 ops (cvt, fma_mix, fmac),
+and that is minimal:
+
+* `sw` depends on the row `m`, `sx` on the column `n`. In the wave64 C layout
+  (`C[m][n]` in `V(m>>2)`, lane `16*(m&3)+n`) `m` varies across lane groups and
+  `n` within them, so **neither scale is uniform over a VGPR** and neither
+  factors out of the elementwise loop.
+* Pre-combining `sw*sx` does not help — the product depends on `i`, `j` and `g`,
+  so there are exactly as many products as elements.
+* The cvt cannot be folded: `v_fma_mix_f32` reads f16/f32, never i32, and the
+  bit-hack int->float alternative (`or` + `sub`) is 2 ops, worse than 1 cvt.
+
+The only way to cut rescale cost per WMMA is **more WMMAs per rescale**, i.e. a
+larger quant group. G=256 gives 64 WMMA per 192 rescale ops; G=512 would halve
+it. That is a format and quality change, not a kernel change, and it is not on
+the table here.
+
+## FAILED: inline-constant C to delete the 64 `v_mov_b32`
+
+The KB notes "inline constants may only be used for the C matrix", which looked
+like a free 22% cut of the non-WMMA VALU: the 64 movs are the per-group
+accumulator reset, and if the first WMMA of each group took a literal zero as C
+instead, they would vanish. Predicted +12% (53.4 -> ~60 TOPS) under the model
+above.
+
+Implemented by restructuring the strip loop into an explicit group/strip nest so
+that "this strip starts a group" is compile-time known, then passing
+`((i32x4){0,0,0,0})` as C on that first WMMA. **Parity passes, performance does
+not improve, and the disassembly shows why it cannot:**
+
+* **No WMMA received an inline constant.** Every one still names a VGPR tuple as
+  its C operand. The ISA permits the encoding; the **LLVM builtin cannot express
+  it** — `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w64`'s C operand is constrained
+  to a v4i32 register class, so the backend materialises the zero into registers
+  and the movs survive.
+* The forced full unroll of the group made it strictly worse: VGPRs 240 -> 256,
+  and **`vgpr_spill_count` 0 -> 2** — the kernel began spilling. `v_mov_b32` per
+  group went **up**, 64 -> 132.
+
+Reverted. Baseline restored and re-verified: 240 VGPRs, 0 spills, parity PASS.
+
+**The lesson generalises:** an ISA capability is only reachable if the compiler
+intrinsic exposes it. Reading the ISA tells you what the silicon can do, not what
+you can ask for through HIP. Checking the disassembly for the encoding you
+expected is the only way to tell the difference, and it is cheap.
+
+## Also closed: the wave32 VOPD question, negatively
+
+Part 1 flagged wave32's VOPD dual-issue as the one lever arguing for wave32 over
+wave64. The opcode list settles it — **it is not worth pursuing**:
+
+* The `V_DUAL_*` set is **f32-only** (FMAC/MUL/ADD/SUB/MOV/CNDMASK/MIN/MAX/
+  DOT2ACC) plus three integer Y-column ops (`ADD_NC_U32`, `LSHLREV_B32`,
+  `AND_B32`).
+* **No `V_CVT_*` is dual-issuable anywhere**, so the rescale's cvt — a third of
+  its cost — can never pair.
+* Only a **left** shift is in the set. Nibble unpacking needs a **right** shift,
+  which cannot co-issue on gfx1151.
+
+So of the loop's non-WMMA VALU, only the `v_fmac_f32` could ever pair. Even
+assuming *perfect* dual-issue of everything eligible, wave32's ratio improves
+from 4.56 to ~2.78, predicting ~38 TOPS — still well below wave64's measured
+53.4. **wave64 wins decisively and the wave32 path is closed.**
+
+## Unused: the RDNA3.5 scalar FP unit
+
+gfx1151 has a scalar float unit gfx1100 lacks (`S_CVT_F32_F16`, scalar F32/F16
+arithmetic, 4-cycle SALU latency), and the KB suggests offloading uniform
+scale/zero-point math to it — attractive when VALU issue is the binding
+constraint, since SALU is a different port. **The compiled kernel contains zero
+scalar float ops.**
+
+It does not obviously help *this* kernel: neither scale is wave-uniform, which is
+the same property that makes the rescale irreducible. It is worth revisiting for
+the **decode GEMV**, where B=1 makes the activation scale a single wave-uniform
+scalar per group — though that kernel is already at ~90% of the DRAM ceiling, so
+freeing VALU slots there would buy nothing today.
