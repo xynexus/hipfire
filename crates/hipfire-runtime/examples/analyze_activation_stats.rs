@@ -16,6 +16,12 @@
 //! 7.5 / crest levels. Rule of thumb: crest ~3 keeps ~2.5 levels of rms
 //! resolution and is comfortable; crest ~30 leaves 0.25 and clips or flattens.
 //!
+//! rms comes from the SIBLING `.imatrix` record (Σx²/N), not from the actstats
+//! fourth moment. Using `E[x⁴]^(1/4)` as an rms stand-in is tempting and wrong:
+//! on heavy-tailed data it sits well ABOVE the true rms, which deflates the
+//! crest factor exactly where the tail is worst — i.e. it under-reports risk
+//! precisely on the channels the metric exists to find.
+//!
 //!   cargo run --release -p hipfire-runtime --example analyze_activation_stats -- <artifact.calib.hfq>
 
 use hipfire_runtime::hfq::HfqFile;
@@ -61,10 +67,9 @@ fn main() {
         let (sum, sumabs, sum4, absmax) =
             (&v[..k], &v[k..2 * k], &v[2 * k..3 * k], &v[3 * k..4 * k]);
 
-        // Σ|x| and Σx⁴ are per-token means; Σx² is not in this record, so rms is
-        // recovered from the fourth and first absolute moments only where valid.
-        // Use E[x⁴]^(1/4) as a tail-weighted scale and E|x| as the bulk scale;
-        // their ratio is a peakedness proxy that needs no second moment.
+        // Pair with the imatrix (Σx²/N) for the true rms and true kurtosis.
+        let im_name = name.replace(".actstats", ".imatrix");
+        let imatrix = hfq.tensor_data(&im_name).map(|(_, b)| as_f32(&b));
         let mut max_crest = 0f32;
         let mut sum_kurt = 0f64;
         let mut max_asym = 0f32;
@@ -75,14 +80,14 @@ fn main() {
                 continue;
             }
             let m4 = sum4[c].max(0.0) as f64;
-            let rms_like = m4.powf(0.25) as f32; // tail-weighted scale
-            let crest = if rms_like > 1e-12 {
-                absmax[c] / rms_like
-            } else {
-                0.0
-            };
-            // E[x⁴] / E[|x|]⁴ — 3.0 for a Gaussian-ish bulk, higher = heavy tail.
-            let kurt = m4 / (l1 as f64).powi(4).max(1e-30);
+            let m2 = imatrix
+                .as_ref()
+                .map(|v| v[c].max(0.0) as f64)
+                .unwrap_or(0.0);
+            let rms = m2.sqrt() as f32;
+            let crest = if rms > 1e-12 { absmax[c] / rms } else { 0.0 };
+            // True kurtosis E[x⁴]/E[x²]²: 3.0 is Gaussian, higher = heavy tail.
+            let kurt = if m2 > 1e-30 { m4 / (m2 * m2) } else { 0.0 };
             let asym = (sum[c] / l1).abs(); // 0 = symmetric, 1 = one-sided
             max_crest = max_crest.max(crest);
             sum_kurt += kurt.min(1e6);
