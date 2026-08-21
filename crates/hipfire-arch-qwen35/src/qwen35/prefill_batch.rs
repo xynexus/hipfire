@@ -6148,22 +6148,41 @@ pub fn forward_prefill_batch_with_pbs_opts(
         n,
         arch,
         moe_router_logits_present,
-        // Compact-resident Opus batches an ORDINARY prefill only. Anything that
-        // asks the forward to EXPORT per-position state — the GDN tape, the
-        // hidden ring buffer the DFlash drafter reads, tree-verify — has no
-        // compact writer, and handing a spec-decode caller a batched forward
-        // that silently skips those exports is what took DFlash2's accept_rate
-        // to 0.000 with the draft emitting random vocab ids.
+        // The GDN tape and tree-verify genuinely have no compact writer, so a
+        // batched forward would silently skip those exports — which is what once
+        // took DFlash2's accept_rate to 0.000 with the draft emitting random
+        // vocab ids. They stay excluded.
+        //
+        // The HIDDEN ring buffer is different: `write_rows_to_staging` is
+        // dtype-independent, so the batched path exports it correctly. It used to
+        // be excluded alongside them because batching compact corrupted the
+        // DeltaNet qkvza projection (no compact arm — it fell through to
+        // FusedQkvzaHfq4G256). With that fixed, batching the hidden-exporting
+        // forward is a large net win, measured on Qwen3.8-27B / DFlash2 over
+        // three prompts at 64 tokens:
+        //
+        //     decode  4.26 -> 5.05, 4.81 -> 5.98, 3.98 -> 4.75  (+18.5/24.3/19.3%)
+        //     prefill 14.8 -> 24.8 / 27.6 / 28.2                (+68..90%)
+        //     tau     2.63 -> 2.05, 3.25 -> 2.50, 2.37 -> 2.05  (-22% mean)
+        //
+        // The seed prefill exports hidden states too, which is why prefill moves
+        // so much — it was per-token for the same reason.
+        //
+        // Acceptance still drops ~22%: the batched and per-token paths export
+        // MEASURABLY different hidden states (for every dtype, not just compact)
+        // and a drafter is sensitive to which it is handed. The throughput gain
+        // outweighs it roughly 4:1, so this is on by default; recovering the tau
+        // would be worth a further ~35%. HIPFIRE_COMPACT_BATCHED_CAPTURE=0 opts
+        // out (and is how `examples/compare_prefill_hidden_paths.rs` gets its
+        // per-token arm).
         tree_verify.is_some()
             || gdn_tape.is_some()
-            // HIPFIRE_PROBE_COMPACT_HIDDEN=1 drops these two terms so the
-            // hidden-exporting forward can be batched for comparison — see
-            // `examples/compare_prefill_hidden_paths.rs`. Not a serving knob:
-            // the two paths export MEASURABLY different hidden states (for every
-            // dtype, not just compact), and a drafter is sensitive to which one
-            // it is handed.
-            || (std::env::var("HIPFIRE_PROBE_COMPACT_HIDDEN").is_err()
-                && (hidden_rb.is_some() || per_token_hidden_out.is_some())),
+            || (matches!(
+                std::env::var("HIPFIRE_COMPACT_BATCHED_CAPTURE")
+                    .ok()
+                    .as_deref(),
+                Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+            ) && (hidden_rb.is_some() || per_token_hidden_out.is_some())),
     );
     // F4 guard: reject batched prefill when KV tier has no batched keys.
     // F32 KV has only BatchEq(1) → MissingImpl at resolve. asym2 + tree-verify

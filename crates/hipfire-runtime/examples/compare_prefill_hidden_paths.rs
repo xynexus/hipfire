@@ -23,7 +23,7 @@
 //!
 //!   compare_prefill_hidden_paths --model <m.hfq> [--n 48] [--kv-mode kvarn]
 //!
-//! Needs `HIPFIRE_PROBE_COMPACT_HIDDEN=1` to be meaningful on a compact model:
+//! `HIPFIRE_COMPACT_BATCHED_CAPTURE=0` forces the per-token arm on a compact model:
 //! without it compact declines the hidden-exporting forward by design and both
 //! arms run per-token.
 
