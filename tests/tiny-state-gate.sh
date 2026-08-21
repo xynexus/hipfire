@@ -8,7 +8,35 @@
 # not a semantic quality test.
 #
 #   ./tests/tiny-state-gate.sh            # check vs committed baselines
-#   ./tests/tiny-state-gate.sh --record   # rewrite baselines for THIS gpu
+#   ./tests/tiny-state-gate.sh --record   # rewrite baselines for THIS environment
+#
+# Baseline key: gpu_arch + family + format, PLUS the two trailing env fields
+# `hip=` and `kcache=` when present. The arch alone is not a host: nix1 and nix2
+# are both gfx1103, so a baseline recorded on one silently overwrote the other's
+# row and the two hosts ping-ponged the value (mamba2/fp16 took three different
+# values in 15 days with no code change between them).
+#
+# The key is deliberately what CAUSES numeric differences, not machine identity:
+# the ROCm/HIP toolchain version, which determines kernel codegen. Two hosts on
+# the same toolchain share one row, which is correct; a host on another gets "no
+# baseline" (INCONCLUSIVE) rather than a false FAIL against a foreign row.
+#
+# A hash of the PRECOMPILED KERNEL CACHE was tried here and reverted before it
+# shipped: the gate compiles kernels into that cache as it runs, so the hash
+# mutates mid-run and even differs between cells (mamba2 saw kcache=8fdaba9f6e93
+# where qwen3_5_moe_indexed saw c4aad18bdc7d in the same invocation). A key that
+# the act of measuring invalidates can never match again, which would silently
+# turn every re-recorded cell into a permanent INCONCLUSIVE — a disabled
+# tripwire that still looks like a configured one. Do not reintroduce it.
+#
+# Machine identity was considered and rejected as the key. It is also mostly
+# unavailable: x86 has no CPU serial (CPUID leaf 3 was Pentium-III-only), and
+# `rocm-smi --showserial` reports "Not supported" on Phoenix/Strix APUs with
+# `--showuniqueid` returning 0x0. `/etc/machine-id` exists but would fragment
+# baselines across hosts that ought to agree.
+#
+# Rows written before this change have no env fields and match ANY environment,
+# so nothing is invalidated; an exact env match is preferred when one exists.
 #
 # Env:
 #   HIPFIRE_TINYQUANT_FAMILIES=llama,qwen2,...
@@ -46,9 +74,26 @@ anchor_for() {
     esac
 }
 
+# ROCm/HIP toolchain version — changes kernel codegen, so it changes logit bits.
+hip_version() {
+    hipconfig --version 2>/dev/null | head -1 | tr -d ' \n' || true
+}
+
+# Prefer a row matching this environment exactly; fall back to a legacy row that
+# carries no env fields. Echoes "logit token scope".
 lookup_baseline() {
     [ -f "$BASELINES" ] || return 0
-    awk -v g="$1" -v f="$2" -v q="$3" '$1==g && $2==f && $3==q {print $4" "$5}' "$BASELINES" | head -1
+    awk -v g="$1" -v f="$2" -v q="$3" -v h="$4" '
+        $1==g && $2==f && $3==q {
+            env_hip = ""
+            for (i = 7; i <= NF; i++) {
+                if ($i ~ /^hip=/) { env_hip = substr($i, 5) }
+            }
+            if (env_hip == "")     { legacy = $4" "$5" legacy" }
+            else if (env_hip == h) { exact  = $4" "$5" exact" }
+        }
+        END { print (exact != "" ? exact : legacy) }
+    ' "$BASELINES" | head -1
 }
 
 echo "tiny-state-gate: building..."
@@ -120,18 +165,21 @@ for raw_family in "${families[@]}"; do
         fail=$((fail + 1))
         continue
     fi
-    RECORDED+=("$gpu_arch $family $fmt $logit_hash $token_hash 0")
+    env_hip="$(hip_version)"
+    RECORDED+=("$gpu_arch $family $fmt $logit_hash $token_hash 0 hip=$env_hip")
     if [ "$RECORD" = 1 ]; then
-        echo "  $fmt: $logit_hash $token_hash ($gpu_arch) [record]"
+        echo "  $fmt: $logit_hash $token_hash ($gpu_arch hip=$env_hip) [record]"
         matched=$((matched + 1))
         continue
     fi
-    read -r base_logit base_token <<<"$(lookup_baseline "$gpu_arch" "$family" "$fmt")"
+    read -r base_logit base_token base_scope \
+        <<<"$(lookup_baseline "$gpu_arch" "$family" "$fmt" "$env_hip")"
     if [ -z "$base_logit" ] || [ -z "$base_token" ]; then
-        echo "  NOTE no baseline for $gpu_arch $family/$fmt — observed $logit_hash $token_hash"
+        echo "  NOTE no baseline for $gpu_arch/$family/$fmt at hip=$env_hip — observed $logit_hash $token_hash"
         skip=$((skip + 1))
     elif [ "$base_logit" != "$logit_hash" ] || [ "$base_token" != "$token_hash" ]; then
-        echo "  FAIL drift: observed $logit_hash/$token_hash baseline $base_logit/$base_token"
+        echo "  FAIL drift: observed $logit_hash/$token_hash baseline $base_logit/$base_token [$base_scope]"
+        [ "$base_scope" = legacy ] && echo "         (matched a pre-env-key row; it may have been recorded under a different toolchain — hip=$env_hip here)"
         fail=$((fail + 1))
     else
         echo "  OK $fmt: matches baseline ($logit_hash/$token_hash)"

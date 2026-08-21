@@ -28,8 +28,9 @@ pub(crate) fn forward_scratch_layers(
     // #397 Ship 6 — forward-as-pipeline. Single-GPU decode routes through the
     // lowered super-op executor BY DEFAULT (see forward_lowered_enabled);
     // HIPFIRE_FORWARD_LOWERED=0 opts back to the hand arms below. Skipped when
-    // GDN tape capture is active, and when a steer session is live — so the hand
-    // arms below are the exception path, not the default one.
+    // GDN tape capture is active, and (by default, see `steer_forces_hand`
+    // below) when a steer session is live — so the hand arms below are the
+    // exception path, not the default one.
     //
     // `hidden_rb` USED to force the hand path too, which is what routed DFlash
     // verify onto arms that miscompute on dense models — the whole of
@@ -54,13 +55,43 @@ pub(crate) fn forward_scratch_layers(
     // verdict numbers taken against it should be re-measured.
     let rq_hand_optin = !weights.rq_corrections.is_empty()
         && std::env::var("HIPFIRE_RQ_HAND").as_deref() == Ok("1");
-    if forward_lowered_enabled()
+    // An active steer/capture session needs the per-layer block-boundary hook.
+    // The lowered executor now carries that hook too (P2/M1), but the escape
+    // stays ON BY DEFAULT until parity has actually been demonstrated (M2) and
+    // per-stream state has landed (M3) — M4 deletes it. `HIPFIRE_STEER_LOWERED=1`
+    // bypasses it so the two paths can be run against each other at all; with the
+    // flag unset behaviour here is unchanged.
+    // PER-REQUEST, deliberately not `is_active()`. Once sessions are keyed,
+    // `is_active()` means "ANY session is active", so using it here would force
+    // every unsteered request onto the hand path the moment one stream held a
+    // spec — a routing regression that no single-stream test would show.
+    // `current_is_active()` asks whether THIS forward's session is steering, and
+    // still short-circuits on the same global gate when nobody is.
+    let steer_forces_hand = hipfire_steer::current_is_active() && !steer_lowered_enabled();
+    let take_lowered = forward_lowered_enabled()
         && gdn_tape_capture.is_none()
         && !rq_hand_optin
-        // An active steer/capture session needs the per-layer block-boundary
-        // hook, which only the hand arms below carry — force the hand path.
-        && !hipfire_steer::is_active()
-    {
+        && !steer_forces_hand;
+    // Emitted AFTER the decision and reporting the decision itself, not one of
+    // its four predicates. An earlier version printed above this `if` and chose
+    // its message from `steer_forces_hand` alone, so with HIPFIRE_FORWARD_LOWERED=0
+    // — the very configuration the comparison flag exists for — it announced
+    // "lowered path" while the hand arms ran. An instrument that cannot see three
+    // of the four inputs to the decision it reports is worse than none.
+    // `is_active()` is checked first so the unsteered path pays one atomic load.
+    if hipfire_steer::current_is_active() && decode_backend_trace_enabled() {
+        eprintln!(
+            "  [decode] steer session active → {} path{}",
+            if take_lowered { "lowered" } else { "hand" },
+            match (take_lowered, steer_forces_hand, forward_lowered_enabled()) {
+                (true, _, _) => " (HIPFIRE_STEER_LOWERED=1)",
+                (false, true, _) => " (steer escape)",
+                (false, _, false) => " (HIPFIRE_FORWARD_LOWERED=0)",
+                _ => " (gdn tape or rq opt-in)",
+            }
+        );
+    }
+    if take_lowered {
         return forward_scratch_layers_lowered(
             gpu,
             weights,
