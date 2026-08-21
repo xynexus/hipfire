@@ -604,6 +604,73 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Compact-resident Opus **W4A4** GEMM. Same block bytes as
+    /// `gemm_oq_compact_grouped_wmma`, but the bulk nibbles go to
+    /// `v_wmma_i32_16x16x16_iu4` raw and `x_i4` is packed signed int4
+    /// (`[B, K/2]`, byte = k_even | k_odd<<4).
+    ///
+    /// Does NOT apply the sparse overlay — the loader zeroes the bulk nibble
+    /// under each entry, so those positions contribute 0 here and the caller
+    /// must add the `val * x[idx]` correction separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4_wmma(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_oq_compact_iu4_wmma: K % group != 0");
+        assert!(
+            group == 256 || group == 128,
+            "gemm_oq_compact_iu4_wmma: compact group must be 256 or 128 (got {group})"
+        );
+        self.ensure_kernel(
+            "gemm_oq_compact_iu4_wmma",
+            kernels::GEMM_OQ_COMPACT_IU4_WMMA_SRC,
+            "gemm_oq_compact_iu4_wmma",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let (mut gi, mut si) = (group as i32, block_stride as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        // Must match OQC4_NB / OQC4_MW in the kernel.
+        const OQC4_NB: usize = 8;
+        const OQC4_MW: usize = 16;
+        let grid_m = m.div_ceil(16 * OQC4_MW) as u32;
+        let grid_b = batch_size.div_ceil(16 * OQC4_NB) as u32;
+        let func = &self.functions["gemm_oq_compact_iu4_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [(32 * OQC4_MW) as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn gemm_oq_compact_grouped_wmma(
         &mut self,
         w_blocks: &GpuTensor,

@@ -4280,6 +4280,15 @@ pub const GEMM_OQ8_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_grouped_wmma.hip");
 
+/// Compact-resident Opus W4A4: the iu4 twin of the above. Feeds the compact
+/// block's bulk nibbles to v_wmma_i32_16x16x16_iu4 RAW — the format's packing is
+/// already what the instruction wants — and takes int4 activations, halving the
+/// activation traffic the iu8 twin is bound by. Does NOT apply the sparse int8
+/// overlay; that is a separate correction pass.
+/// See `kernels/src/gemm_oq_compact_iu4_wmma.hip`.
+pub const GEMM_OQ_COMPACT_IU4_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_iu4_wmma.hip");
+
 /// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
 /// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq8.hip`.
