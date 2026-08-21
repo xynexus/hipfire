@@ -1067,8 +1067,33 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
     )
 }
 
-fn dflash_force_serial_rollback_replay(env_force_serial: bool, gdn_tape_available: bool) -> bool {
-    env_force_serial || !gdn_tape_available
+/// `HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL=1` — replay a rejected block by
+/// re-running the target over the committed prefix as ONE batched prefill,
+/// instead of `accept_len + 1` sequential AR decodes.
+///
+/// This exists because the tape-free batched replay was UNREACHABLE. The serial
+/// default is forced by `env_force_serial || !gdn_tape_available`, and
+/// compact-resident Opus has no GDN-tape writer, so `!gdn_tape_available` is
+/// permanently true for it — pinning every compact rollback to the serial path
+/// even with the env override off. But "no tape" does not imply "must be
+/// serial": the branch below it replays through `forward_prefill_batch`, which
+/// needs no tape. Each serial step is a whole weight sweep, so at tau 2.6 the
+/// rollback costs ~2.6 sweeps where the batched replay costs one.
+fn dflash_rollback_batched_prefill_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
+fn dflash_force_serial_rollback_replay(
+    env_force_serial: bool,
+    gdn_tape_available: bool,
+    batched_prefill_replay: bool,
+) -> bool {
+    !batched_prefill_replay && (env_force_serial || !gdn_tape_available)
 }
 
 /// `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1` — opt in to replacing serial
@@ -7890,6 +7915,7 @@ pub fn spec_step_dflash(
     let force_serial_rollback = dflash_force_serial_rollback_replay(
         dflash_force_serial_rollback_replay_from_env(),
         gdn_tape_opt.is_some(),
+        dflash_rollback_batched_prefill_from_env(),
     );
     let rollback_replay = if verify_complete_rollback {
         SpecRollbackReplayKind::VerifyComplete
@@ -12423,10 +12449,13 @@ mod tests {
 
     #[test]
     fn dflash_live_rollback_allows_fast_tape_when_explicitly_opted_in() {
-        assert!(!dflash_force_serial_rollback_replay(false, true));
-        assert!(dflash_force_serial_rollback_replay(true, true));
-        assert!(dflash_force_serial_rollback_replay(true, false));
-        assert!(dflash_force_serial_rollback_replay(false, false));
+        assert!(!dflash_force_serial_rollback_replay(false, true, false));
+        // no tape + batched replay opted in => NOT serial (the compact case)
+        assert!(!dflash_force_serial_rollback_replay(true, false, true));
+        assert!(dflash_force_serial_rollback_replay(true, false, false));
+        assert!(dflash_force_serial_rollback_replay(true, true, false));
+        assert!(dflash_force_serial_rollback_replay(true, false, false));
+        assert!(dflash_force_serial_rollback_replay(false, false, false));
     }
 
     #[test]
