@@ -9,31 +9,32 @@ order that matters, and because several items below were discovered by tripping
 over them rather than by reading a plan — those are exactly the ones that get
 rediscovered expensively.
 
-Last updated 2026-08-21, against `master` at `5bc7fa788`. Three PRs open.
+Last updated 2026-08-21, against `master` at `660cd2bf9`. **No v2 PRs open.**
 
 ---
 
-## In flight — three open PRs
+## In flight — nothing
 
-| PR | What | Base | State |
-|---|---|---|---|
-| [#281](https://github.com/xynexus/hipfire/pull/281) | executor v2 **M3a** — a `Generate` frame admits a `RunningStream` | `master` | green |
-| [#282](https://github.com/xynexus/hipfire/pull/282) | eleven plan corrections for M3b/M3c/M3d — **stacks on #281** | `#281` | docs only |
-| [#283](https://github.com/xynexus/hipfire/pull/283) | **M3b0** — `qwen35_decode_one`, the quantum M3b marches | `master` | green |
+`#281` (M3a), `#283` (M3b0) and `#282` (the plan corrections) all merged on
+2026-08-21. `#194` is open but unrelated to v2.
 
-"Green" means every **required** check passes. `rustfmt (advisory)` fails on all
-of them; it fails on `master` too (see *Pre-existing noise*).
+Landed, and what it means for the next person:
 
-### Merge order
+| | What landed |
+|---|---|
+| **M3a** | A `Generate` frame admits a `RunningStream` into `DaemonState.streams` and is retired at the dispatch site. Admission is unconditional, not flag-gated. |
+| **M3b0** | `qwen35_decode_one` — the quantum. Advancing a token is now a call, not a loop iteration. |
+| **corrections** | §M3b/M3c/M3d rewritten against the code; see the march-loop plan. |
 
-`#281` and `#283` are independent — any order, any time. `#283` touches only
-`hipfire-serving-core`; `#281` only `hipfire-daemon`.
+**Next is M3b1**, the march loop itself — and read the M3b section of
+`2026-08-21-executor-v2-march-loop.md` before starting it, because it carries
+five constraints found the expensive way, including one (the per-step snapshot
+of `m.eviction` / `m.physical_cap`) that only *becomes* wrong when the march loop
+exists.
 
-`#282` stacks on `#281` (it is based on that branch), so merge `#281` first.
-
-**The previous contents of this table were stale, and that is the failure this
-section exists to prevent.** It listed `#266`–`#271` as open with a merge order
-that mattered; all seven of `#266`–`#272` had long since merged. A stale
+**Keeping this section current is the point.** It has now gone stale twice: it
+listed `#266`–`#271` as open long after all seven of `#266`–`#272` merged, and
+then listed `#281`–`#283` as open within minutes of their merging. A stale
 in-flight table is worse than no table — it is read as current by exactly the
 person who has not been following along. **Re-check `gh pr list` before trusting
 this section**, and update it when you open or merge anything.
