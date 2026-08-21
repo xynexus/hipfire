@@ -90,3 +90,42 @@ anything.
 3. **Sparse outlier passes** on both sides, mirroring the existing weight overlay.
 4. Only then does raising the MAC ceiling from 52.9 to 99.2 become the binding
    constraint.
+
+---
+
+# Follow-up: where the iu4 kernel's remaining headroom is
+
+Built and measured (`gemm_oq_compact_iu4_wmma`, B=256). Ablations, TOPS:
+
+| variant | gate/up | down | qkv | wo |
+|---|---|---|---|---|
+| as shipped | 20.58 | 18.04 | 21.83 | 25.68 |
+| activation loads removed | 39.73 | 56.81 | 50.46 | 50.47 |
+| activation + weight loads removed | 69.95 | 82.07 | 57.32 | 61.90 |
+
+Read against the **iu4** peak of 99.2 TOPS (not the 52.9 int8 peak — that one no
+longer applies once the MACs are int4):
+
+- The WMMA issue path reaches **70-83% of peak**, so the instruction side is
+  healthy and is NOT what to work on.
+- The kernel is **still activation-bound**: removing the activation loads is
+  worth 2-3x. Same lever as the iu8 twin, just at a higher absolute level.
+- Weight loads cost a further ~1.5x.
+
+**The tiling parameter is already at its optimum.** OQC4_MW swept 8/16/32:
+
+    MW=8    19.85  12.69  19.82   5.00
+    MW=16   20.88  18.43  21.86  25.57
+    MW=32   15.13  15.57  19.28   5.95
+
+So there is no cheap parameter win left. The remaining 2-3x needs a STRUCTURAL
+change to how activations are fed — LDS staging of the activation tile is the
+obvious candidate, since with OQC4_MW row-tiles per workgroup the activation
+columns are genuinely reused across waves.
+
+## Sequencing note
+
+That structural work is best done AFTER the activation-outlier design is settled,
+not before: the outlier scheme decides whether the dense int4 plane stays the
+only activation input, and it is the one part of W4A4 with real quality risk. A
+kernel tuned against the wrong activation layout gets tuned twice.
