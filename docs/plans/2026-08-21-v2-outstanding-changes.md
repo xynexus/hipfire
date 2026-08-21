@@ -160,9 +160,12 @@ Each was confirmed to reproduce on clean `origin/master` with identical numbers.
   drift `0.005677` vs baseline `0.008147`.
 - **`tiny-state-gate`**: `qwen3_5/fp16`, `qwen3_5_moe/fp16`, `qwen3_5_vl/fp16`
   drift, with byte-identical observed hashes across branches.
-- **`rustfmt (advisory)`** fails workspace-wide: `hip-bridge/src/ffi.rs`,
+- **`rustfmt (advisory)`** fails workspace-wide on NINE files: `hip-bridge/src/ffi.rs`,
   `hipfire-arch-qwen35/src/qwen35/layout.rs`, `hipfire-eval`, `hipfire-quantize`,
-  `hipfire-runtime/src/{exec_trace,load_progress,sampler}.rs`.
+  `hipfire-runtime/src/{exec_trace,load_progress,sampler}.rs`, plus
+  `hipfire-scheduler/src/lib.rs` and `hipfire-serving-core/src/qwen35_decode.rs`.
+  (This list previously omitted the last two — a section whose whole job is
+  preventing misattribution was itself sending people hunting.)
 
 ### Two ways the tiny gate reports a false green
 
@@ -197,3 +200,54 @@ Three cases, all found by grepping before building. Worth the habit.
 - **"fix the hand path = resurrect dead code"** — it was one missing block, not
   dead code. `docs/roughquant/phase3-real-format-scope.md` carries the
   correction.
+
+
+---
+
+## Found by the pre-merge audit (2026-08-21)
+
+A parallel audit before merging found one blocker and a set of accuracy defects,
+most of them in claims these very PRs made. Fixed before merge: the
+`ApplyCache`/`SteerKey` aliasing (proven on GPU — without the key check
+`gpu_validate` fails 4 cases at 1.08e-1, every failure on the second stream), the
+backend trace reporting a predicate rather than the decision, `run()` silently
+un-parking, `admit` checking presence rather than liveness, and three classes of
+doc that contradicted their own code.
+
+Still open, and each verified:
+
+**`is_active()` is a per-request predicate over global state.** `decode_layers.rs`
+routes with `steer_forces_hand = is_active() && !steer_lowered_enabled()`, while
+the keyed registry defines `ACTIVE` as "ANY session is active". Composed, one
+stream holding a keyed spec forces EVERY request onto the hand path. Not a
+miscompute — both paths are correct since `1f7c2eeba` — but it is a routing
+regression the moment keyed sessions exist. It must become per-key, or M4 must
+delete the escape first.
+
+**Five hook call sites, not three.** `hipfire-arch-gemma3/src/forward.rs:781` and
+`:1050` also call the steer hooks. Earlier text in this file and in the P2 plan
+says qwen35-only; the thread-scoped key therefore changes gemma3's routing too,
+which no PR mentioned or tested.
+
+**No gate runs the daemon's tests.** `hipfire-daemon` is bin-only (no `src/lib.rs`,
+no `[lib]`), so `ci.yml`'s `cargo test --lib --workspace` selects zero targets
+from it, and `no-gpu-ci.sh`'s `cargo check --workspace --examples` does not even
+type-check `#[cfg(test)]` code. `stream.rs`'s tests — offered as the justification
+for its file-scope `#![allow(dead_code)]` — are run by nothing in CI. Add
+`hipfire-daemon` (and `hipfire-steer`) to the gate's explicit test list.
+
+**Half the steer API is keyed.** `load_adapter`, `load_lora_adapter`,
+`set_adapter_scale`, `unload_adapter` and `loaded_adapters` are hard-wired to the
+default key, so a keyed session's adapters cannot be listed, rescaled or unloaded.
+
+**`with_session` takes a write lock and inserts.** It is `entry(key.clone())
+.or_insert(...)` under the exclusive lock, per layer per token — a String clone
+and a permanent map entry, not the "map lookup" the prose claims. Every distinct
+key ever passed leaves a tombstone.
+
+**`ACTIVE` is stored outside the lock.** `refresh_active_gate` drops its read
+guard before storing, so `clear_for(A)` racing `begin_apply_for(B)` can land a
+stale `false` and silently disable B's steering.
+
+**`SteerKeyGuard` is `Send`.** Its `Drop` restores into whatever thread drops it,
+so a guard that crosses threads pins the installing thread to another stream's key.
