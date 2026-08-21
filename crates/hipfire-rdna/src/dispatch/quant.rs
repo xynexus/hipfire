@@ -646,6 +646,13 @@ impl Gpu {
         // over — measured at 64 us per draft token against plain decode's 66.
         // `gemv_oq_compact_multicol` reads each weight row ONCE and accumulates
         // B columns, so verify costs one weight sweep for all B tokens.
+        // RE-TESTED 2026-08-21 and this routing HOLDS. multicol is now 80.7% of a
+        // spec-decode profile and sustains only ~35 GB/s against a 233 GB/s
+        // ceiling, which makes it look like the thing to route around. It is not:
+        // sending B <= 16 to the WMMA GEMM instead measured 6.72 tok/s against
+        // multicol's 11.84 on Qwen3.8-27B/DFlash2 (tau 4.875, identical both
+        // ways). The half-empty 16-wide tile at B=8 costs more than multicol's
+        // low bandwidth. The lever is making THIS kernel faster, not replacing it.
         if batch_size <= 16 && group == 256 {
             return self.gemv_oq_compact_multicol(
                 w_blocks,
