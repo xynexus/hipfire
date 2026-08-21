@@ -169,24 +169,45 @@ __device__ __forceinline__ void kvarn_tile_body(
         // `group` is a multiple of cpb, so (idx & cpb_mask) does not depend on i:
         // idx = (d0+i)*group + t_local, hence the sub-byte shift is loop-invariant
         // and hoists out of the inner loop too.
-        for (int t_local = wv; t_local < tile_len; t_local += NW) {
-            const int t = tile_start + t_local;
-            const float sc = __half2float(s_col[t_local]);
-            const int sh = (t_local & cpb_mask) * bits;
-            float partial = c_local;
+        // ONE DWORD LOAD PER 8 TOKENS, not one byte load per token.
+        //
+        // Measured: this kernel issued 1,545,404 L2 requests per call for 4.61 MB
+        // of data — 21.5 requests per 64B line it actually needs — against plain
+        // f32 attention's 0.5. It is bound by L2 REQUEST THROUGHPUT, not DRAM
+        // (98.8% L2 hit rate, only ~1 MB per call reaches memory), which is why
+        // it sat 20-40x off its DRAM floor.
+        //
+        // The layout is channel-major, so a lane's consecutive DIMS are `group/2`
+        // = 64 bytes apart (a separate line each — unavoidable), but consecutive
+        // TOKENS are adjacent codes. Striding the token loop by TPW = 32/bits
+        // codes-per-dword lets one aligned dword load serve TPW tokens for a dim.
+        // idx = (d0+i)*group + t_base with group a multiple of TPW and t_base a
+        // multiple of TPW makes idx a multiple of TPW, so idx>>cpb_shift is
+        // 4-byte aligned — the load is always legal.
+        const int TPW = 32 / bits;                    // codes per dword: 8 at bits=4
+        for (int t_base = wv * TPW; t_base < tile_len; t_base += NW * TPW) {
+            const int nt = min(TPW, tile_len - t_base);
+            float part[8];                            // TPW <= 8 for bits >= 4
+            #pragma unroll
+            for (int tt = 0; tt < 8; tt++) part[tt] = c_local;
             for (int i = 0; i < dpt; i++) {
-                const int idx = (d0 + i) * group + t_local;    // channel-major flat index
-                const uint8_t byte = rec[idx >> cpb_shift];
-                partial += (float)((byte >> sh) & codemask) * qa[i];
+                const int idx = (d0 + i) * group + t_base;
+                const uint32_t w4 = *(const uint32_t*)(rec + (idx >> cpb_shift));
+                const float qai = qa[i];
+                for (int tt = 0; tt < nt; tt++)
+                    part[tt] += (float)((w4 >> (tt * bits)) & codemask) * qai;
             }
-            partial *= sc;
-            for (int off = 16; off > 0; off >>= 1)
-                partial += __shfl_xor(partial, off);
-            if (lane == 0) {
-                float s = partial * scale_attn;
-                if (tree_mode && t >= block_start)
-                    s += tree_bias[global_bid * block_cols + (t - block_start)];
-                scores[t_local] = s;
+            for (int tt = 0; tt < nt; tt++) {
+                float partial = part[tt] * __half2float(s_col[t_base + tt]);
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor(partial, off);
+                if (lane == 0) {
+                    const int t = tile_start + t_base + tt;
+                    float s = partial * scale_attn;
+                    if (tree_mode && t >= block_start)
+                        s += tree_bias[global_bid * block_cols + (t - block_start)];
+                    scores[t_base + tt] = s;
+                }
             }
         }
     } else {
