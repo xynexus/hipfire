@@ -18,10 +18,15 @@ pub(crate) fn load(
     msg: &serde_json::Value,
     protocol_load: &Option<hipfire_model::ModelLoadRequest>,
 ) {
-    // A steer session is process-global and outlives the model it was
-    // captured/applied against; drop it before swapping models so a
-    // stale apply can't perturb the freshly-loaded one.
-    hipfire_steer::clear();
+    // A steer session outlives the model it was captured/applied against; drop it
+    // before swapping models so a stale apply can't perturb the freshly-loaded
+    // one.
+    //
+    // `clear_all`, not `clear`: sessions are keyed now, and `clear` drops only the
+    // UNSCOPED one — so a keyed spec would survive the swap and silently apply to
+    // the next model. A spec captured against one model's residual geometry is
+    // meaningless against another's.
+    hipfire_steer::clear_all();
     let requested_worker_id = message_worker_id(&msg);
     // Unload previous if any. PFlash drafter goes first so
     // its tensors join the pool before unload_model drains
@@ -1098,7 +1103,8 @@ pub(crate) fn unload(daemon_state: &mut DaemonState) {
     daemon_state.active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
     // Drop any steer session so a stale capture/apply can't leak its
     // process-global state across model loads.
-    hipfire_steer::clear();
+    // clear_all: see the load handler — a keyed spec must not outlive its model.
+    hipfire_steer::clear_all();
     daemon_state
         .out
         .emit(serde_json::json!({ "type": "unloaded" }));

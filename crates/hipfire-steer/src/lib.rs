@@ -623,12 +623,10 @@ pub fn clear_for(key: &SteerKey) {
 
 /// Drop every session, keyed and unscoped.
 ///
-/// NOT yet wired: `handlers/lifecycle.rs` still calls the un-keyed [`clear`] on
-/// model load and unload, which after this change drops only the unscoped
-/// session. So a keyed spec WOULD survive a model swap. Harmless today because
-/// nothing creates a keyed session, but whoever wires the daemon routing must
-/// switch those two call sites to this function in the same change — otherwise a
-/// spec captured against one model silently applies to the next.
+/// Wired into `handlers/lifecycle.rs` at both model-swap sites (load and unload).
+/// [`clear`] would drop only the unscoped session, so a keyed spec would survive
+/// the swap and silently apply to the next model — meaningless against a
+/// different model's residual geometry.
 pub fn clear_all() {
     let mut guard = sessions().write().unwrap();
     guard.clear();
