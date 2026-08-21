@@ -71,6 +71,13 @@ __device__ __forceinline__ void kvarn_tile_body(
     // (not a hardcoded 8) is what makes the kernel correct for head_dim != 256.
     const int dpt = head_dim / 32;
     const int cpb = 8 / bits;                  // K codes per byte
+    // `bits` is a RUNTIME parameter, so `idx / cpb` and `idx % cpb` compiled to a
+    // real integer divide — 8 x `v_rcp_iflag_f32` plus fixups — PER ELEMENT in the
+    // score loop below, on hardware with no integer-divide unit. bits is always
+    // in {2,4,8}, so cpb is always a power of two and the exact same result is a
+    // shift and a mask (one instruction each, runtime amount is fine).
+    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);   // log2(8/bits)
+    const int cpb_mask = cpb - 1;
     const int codemask = (1 << bits) - 1;
 
     const int global_bid = batch_offset + local_bid;
@@ -113,23 +120,43 @@ __device__ __forceinline__ void kvarn_tile_body(
         const __half* scale_abs = (const __half*)(rec + off_scale);
         const __half* zp_abs = (const __half*)(rec + off_zp);
         const __half* s_col = (const __half*)(rec + off_scol);
-        // Per-channel scale/zp for this thread's dpt dims — load once per tile.
-        float sa[MAXDPT], za[MAXDPT];
+        // FOLD THE DEQUANT INTO THE Q VECTOR, once per tile.
+        //
+        //   partial = sum_i mq[i] * (qd_i*sa[i] + za[i]) * sc
+        //           = sc * ( sum_i qd_i*(mq[i]*sa[i]) + sum_i mq[i]*za[i] )
+        //           = sc * ( sum_i qd_i*A[i] + C )
+        //
+        // A[i] and C are per-channel/per-tile, so they hoist out of the token
+        // loop entirely and `sc` collapses to ONE multiply per token instead of
+        // one per element. That takes the inner loop from 4 float ops per element
+        // (cvt, fma, mul by sc, fma by mq) down to 2 (cvt, fma) — the dequant
+        // arithmetic is what made this kernel LOSE to plain f32 attention despite
+        // reading ~5x fewer KV bytes.
+        //
+        // C is folded into each lane's own partial before the cross-lane
+        // reduction, so the shuffle sums the per-lane C_local terms for free.
+        float qa[MAXDPT];
+        float c_local = 0.0f;
         for (int i = 0; i < dpt; i++) {
-            sa[i] = __half2float(scale_abs[d0 + i]);
-            za[i] = __half2float(zp_abs[d0 + i]);
+            const float sa_i = __half2float(scale_abs[d0 + i]);
+            const float za_i = __half2float(zp_abs[d0 + i]);
+            qa[i] = mq[i] * sa_i;
+            c_local += mq[i] * za_i;
         }
+        // `group` is a multiple of cpb, so (idx & cpb_mask) does not depend on i:
+        // idx = (d0+i)*group + t_local, hence the sub-byte shift is loop-invariant
+        // and hoists out of the inner loop too.
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const int t = tile_start + t_local;
             const float sc = __half2float(s_col[t_local]);
-            float partial = 0.0f;
+            const int sh = (t_local & cpb_mask) * bits;
+            float partial = c_local;
             for (int i = 0; i < dpt; i++) {
                 const int idx = (d0 + i) * group + t_local;    // channel-major flat index
-                const uint8_t byte = rec[idx / cpb];
-                const float qd = (float)((byte >> ((idx % cpb) * bits)) & codemask);
-                const float k = (qd * sa[i] + za[i]) * sc;
-                partial += mq[i] * k;
+                const uint8_t byte = rec[idx >> cpb_shift];
+                partial += (float)((byte >> sh) & codemask) * qa[i];
             }
+            partial *= sc;
             for (int off = 16; off > 0; off >>= 1)
                 partial += __shfl_xor(partial, off);
             if (tid == 0) {
@@ -184,17 +211,28 @@ __device__ __forceinline__ void kvarn_tile_body(
     // ── Phase D: V-weighted accumulation (Q8_0) — identical to the Q8 tile. ──
     float out_vec[MAXDPT];
     for (int i = 0; i < MAXDPT; i++) out_vec[i] = 0.0f;
+    // Phase D is 99.9% of this kernel's runtime (measured: gutting it takes the
+    // kernel from 9.79 s to 0.010 s over a 3k-token run). It was reloading the
+    // Q8 block's f16 scale and recomputing the block pointer FOR EVERY DIM.
+    //
+    // Both are loop-invariant. A thread owns dims d0..d0+dpt-1 with d0 = tid*dpt
+    // and dpt = head_dim/32, so the dims are a contiguous run that starts at a
+    // multiple of dpt and is dpt long — it can never straddle a 32-dim Q8 block
+    // boundary. So `bi = d/32` is CONSTANT across the inner loop, and with it the
+    // block pointer and its scale. Hoisting them turns 2 loads + ~6 ops per
+    // element into 1 load + 3, and drops the f16 scale loads 8x (1024 -> 128 per
+    // wave at head_dim=256).
+    const int bi0 = d0 / 32;
+    const int bj0 = d0 % 32;
+    const size_t vh_off = (size_t)(kv_head_blk + bi0) * 34;
     for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const float w = scores[t_local];
+        const int t = tile_start + t_local;
+        const unsigned char* vbh = v_cache + (size_t)t * v_row_stride + vh_off;
+        const float wvs = w * (float)*((const _Float16*)vbh);
+        const signed char* vq = (const signed char*)(vbh + 2 + bj0);
         for (int i = 0; i < dpt; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* vbh = vb + (kv_head_blk + bi) * 34;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+            out_vec[i] += wvs * (float)vq[i];
         }
     }
 

@@ -144,6 +144,10 @@ extern "C" __global__ void kvarn_quantize_tile(
 
     // ── Quantize using best scales: per-row `bits`-bit min/max of balanced tile.
     const int n = r_dim * c_dim;
+    // cpb is a power of two (bits in {2,4,8}); shift+mask instead of a runtime
+    // integer divide in the per-element loop below.
+    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);
+    const int cpb_mask = cpb - 1;
     const int qbytes = (n + cpb - 1) / cpb;
     const int off_scale = qbytes;
     const int off_zp = off_scale + r_dim * 2;
@@ -163,10 +167,10 @@ extern "C" __global__ void kvarn_quantize_tile(
             float v = tile[r * c_dim + c] * er * __expf(-blc[c]);
             int code = (int)(fminf(fmaxf(roundf((v - lo) / scale), 0.f), qmax));
             int gi = r * c_dim + c;
-            int sub = gi % cpb;
+            int sub = gi & cpb_mask;
             uint8_t shifted = (uint8_t)((code & codemask) << (sub * bits));
-            if (sub == 0) rec[gi / cpb] = shifted;   // first code in byte clears it
-            else rec[gi / cpb] |= shifted;
+            if (sub == 0) rec[gi >> cpb_shift] = shifted;   // first code in byte clears it
+            else rec[gi >> cpb_shift] |= shifted;
         }
         __half sa = __float2half(scale * s_row);
         __half za = __float2half(lo * s_row);

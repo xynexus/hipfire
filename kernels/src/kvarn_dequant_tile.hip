@@ -36,6 +36,11 @@ extern "C" __global__ void kvarn_dequant_tile(
     const int n = r_dim * c_dim;
     const int cpb = 8 / bits;              // codes per byte
     const int mask = (1 << bits) - 1;
+    // cpb is a power of two (bits in {2,4,8}); shift+mask instead of a runtime
+    // integer divide in the per-element loop below. See the note in
+    // attention_flash_kvarn_tile_batched.hip.
+    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);
+    const int cpb_mask = cpb - 1;
     const int qbytes = (n + cpb - 1) / cpb;
     const int off_scale = qbytes;
     const int off_zp = off_scale + r_dim * 2;
@@ -47,8 +52,8 @@ extern "C" __global__ void kvarn_dequant_tile(
     for (int i = tid; i < n; i += nth) {
         const int r = i / c_dim;
         const int c = i - r * c_dim;
-        const uint8_t byte = rec[i / cpb];
-        const float q = (float)((byte >> ((i % cpb) * bits)) & mask);
+        const uint8_t byte = rec[i >> cpb_shift];
+        const float q = (float)((byte >> ((i & cpb_mask) * bits)) & mask);
         const float sa = __half2float(scale_abs[r]);
         const float za = __half2float(zp_abs[r]);
         const float sc = __half2float(s_col[c]);
