@@ -129,3 +129,77 @@ That structural work is best done AFTER the activation-outlier design is settled
 not before: the outlier scheme decides whether the dense int4 plane stays the
 only activation input, and it is the one part of W4A4 with real quality risk. A
 kernel tuned against the wrong activation layout gets tuned twice.
+
+---
+
+# Why performance is "still bad" — measured with hardware counters
+
+First, scope it. Decode is NOT the problem: 15.0 tok/s at 232 GB/s is **93% of the
+248.5 GB/s DRAM ceiling** — hardware-limited, nothing left. Prefill at 186 tok/s
+against a ~980 compute ceiling is **19% of peak**, and prefill is 85% one kernel.
+So "performance is bad" means "the compact GEMM is at ~20-30% of peak".
+
+Ablations answered *where* the time goes but not *why*. `rocprofv3 --pmc` does.
+gfx1151 exposes a thin counter set; the useful ones here were SQ_INSTS_VALU,
+SQ_INSTS_LDS, SQC_LDS_BANK_CONFLICT and SQC_LDS_IDX_ACTIVE.
+
+| kernel | VALU | LDS | bank conflicts |
+|---|---|---|---|
+| iu8 | 15.89 G | 0 | — |
+| iu4 (start) | 2.12 G | 0.33 G | **0** |
+| iu4x2 | 3.13 G | 0.64 G | **0** |
+
+Three findings:
+
+1. **Zero LDS bank conflicts.** The 132-byte column padding works — confirmed,
+   not assumed. Do not spend time there.
+2. **iu8 issues 7.5x the VALU of iu4** — the nibble decode and overlay scan it
+   pays and iu4 does not. That, not memory, is why the iu8 path sits at ~25%.
+3. **The iu4 kernel was issuing 5.8 non-WMMA VALU per WMMA.** Against 312M WMMA
+   instructions in the bench, the *index arithmetic was the workload* and the
+   matrix core was idle waiting for it.
+
+## Two fixes, both from the counter, both measured
+
+**Integer division in the staging loop.** `i / dwords_per_col` with a runtime
+divisor expands to ~20 VALU on AMD, executed once per staged dword.
+`dwords_per_col` is `group/8`, always 16 or 32 — a power of two — so it is a
+shift and a mask. VALU 2.12G -> 1.82G, ratio 5.8 -> 4.8.
+
+Worth noting the shape-dependence, because it is the tell: `down` (K=17408, 68
+groups) gained **+16%** while gate/up (20 groups) barely moved. The staging loop
+runs once per group, so the shape with 3.4x the groups shows 3.4x the benefit.
+
+**Runtime `tiles_per_group` and `lds_stride`.** Specialising the G=256 case makes
+both compile-time, so the k-loop fully unrolls and every LDS offset becomes an
+immediate rather than an add per (k-tile, b-tile). VALU 1.82G -> 1.47G, ratio
+4.8 -> **3.7**.
+
+Measured, medians of 3 (single runs mislead here — one `down` sample read -8%
+when the median was +8%):
+
+    gate/up  29.60 -> 31.66 TOPS      down  27.11 -> 29.31
+    qkv      30.89 -> 33.59           wo    30.04 -> 33.43
+
+## Where the compact iu4 GEMM now stands
+
+    20.58 TOPS  1-pass, no LDS staging
+    28.76       + LDS-staged activations
+    29.60       + staging division removed
+    31.7-33.6   + G=256 specialisation        <- ~33% of the 99.2 TOPS iu4 peak
+
+against ~13 TOPS for the iu8 path it replaces, i.e. **~2.4x**.
+
+## What is left, and it is still VALU
+
+3.7 non-WMMA VALU per WMMA remain, and the pure-WMMA ablation ceiling was ~70
+TOPS, so roughly 2x is still on the table. The residue is the per-group rescale
+epilogue: 8 b-tiles x 8 accumulator rows x (mul, mul, add) per group, which is
+~220 VALU against 128 WMMA and does not shrink with any tiling choice, because
+both terms scale together.
+
+The one structural escape is doing MORE WMMA per epilogue. That is exactly what
+the 2-pass kernel does — its ratio is **3.6 against the 1-pass kernel's 4.8 at
+the same point**, because the epilogue amortises over twice the matrix work. So
+the 8-bit path is not merely affordable, it is *more efficient per instruction*
+than the 4-bit one.

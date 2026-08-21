@@ -102,14 +102,17 @@ extern "C" __global__ void gemm_oq_compact_iu4x2_wmma(
     __shared__ uint8_t xl[OQC4X2_COLS * (128 + OQC4X2_PAD)];
     const int lds_stride = nib_bytes + OQC4X2_PAD;
     const int dwords_per_col = nib_bytes >> 2;
+    // Power of two (16 or 32) — shift/mask, not a DIVISION. See the 1-pass twin.
+    const int dpc_shift = __builtin_ctz(dwords_per_col);
+    const int dpc_mask  = dwords_per_col - 1;
     const int stage_total = OQC4X2_COLS * dwords_per_col;
     const int cols = (B - batch_start < OQC4X2_COLS) ? (B - batch_start) : OQC4X2_COLS;
 
     for (int g = 0; g < n_groups; ++g) {
         __syncthreads();
         for (int i = tid; i < stage_total; i += blockDim.x) {
-            const int c = i / dwords_per_col;
-            const int d = i - c * dwords_per_col;
+            const int c = i >> dpc_shift;
+            const int d = i & dpc_mask;
             const int br = batch_start + c;
             const int sb = (br < B) ? br : (B - 1);
             const long long off = (long long)sb * x_stride + g * nib_bytes + d * 4;

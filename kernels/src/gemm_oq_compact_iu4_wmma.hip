@@ -121,6 +121,13 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
     __shared__ uint8_t xt[OQC4_COLS * (128 + OQC4_LDS_PAD)];
     const int lds_stride = nib_bytes + OQC4_LDS_PAD;
     const int dwords_per_col = nib_bytes >> 2;
+    // `group` is 128 or 256, so this is 16 or 32 — always a power of two, and
+    // a shift/mask rather than a DIVISION. It was a division, and that mattered:
+    // AMD integer divide expands to ~20 VALU, executed once per staged dword,
+    // and PMC showed this kernel issuing ~5.8 non-WMMA VALU per WMMA against
+    // 312M WMMA instructions. The index math, not the matrix core, was the work.
+    const int dpc_shift = __builtin_ctz(dwords_per_col);
+    const int dpc_mask  = dwords_per_col - 1;
     const int stage_total = OQC4_COLS * dwords_per_col;
 #endif
 
@@ -132,8 +139,8 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
         // reading group g-1 races the stage of group g.
         __syncthreads();
         for (int i = tid; i < stage_total; i += blockDim.x) {
-            const int col = i / dwords_per_col;
-            const int d   = i - col * dwords_per_col;
+            const int col = i >> dpc_shift;
+            const int d   = i & dpc_mask;
             const int brow = batch_start + col;
             const int safe_b = (brow < B) ? brow : (B - 1);
             const uint32_t v = *(const uint32_t*)(
@@ -148,22 +155,33 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
         for (int nb = 0; nb < OQC4_NB; ++nb) {
             iacc[nb] = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
         }
-        for (int kt = 0; kt < tiles_per_group; ++kt) {
-            // RAW nibbles straight into the matrix core — this is the whole
-            // point of the format meeting the instruction.
-            const int32x2_t a = oqc4_load_u4x16(nibbles + kt * 8);
-            #pragma unroll
-            for (int nb = 0; nb < OQC4_NB; ++nb) {
-#if OQC4_LDS
-                const int32x2_t b =
-                    oqc4_load_u4x16(xt + (nb * 16 + lane) * lds_stride + kt * 8);
-#else
-                const int32x2_t b = oqc4_load_u4x16(x_prow[nb] + g_byte + kt * 8);
-#endif
-                iacc[nb] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
-                    true, a, true, b, iacc[nb], false);
-            }
+        // RAW nibbles straight into the matrix core — this is the whole point of
+        // the format meeting the instruction.
+        //
+        // Specialised on the G=256 case so `tiles_per_group` (16) and
+        // `lds_stride` (132) are COMPILE-TIME: the k-loop then fully unrolls and
+        // every LDS offset becomes an immediate, instead of an add per
+        // (k-tile, b-tile). PMC put this kernel at ~4.8 non-WMMA VALU per WMMA
+        // with the address math the largest remaining share, so the immediates
+        // are the point, not the unrolling itself.
+#define OQC4_KLOOP(TPG, STRIDE)                                                \
+        for (int kt = 0; kt < (TPG); ++kt) {                                   \
+            const int32x2_t a = oqc4_load_u4x16(nibbles + kt * 8);             \
+            _Pragma("unroll")                                                  \
+            for (int nb = 0; nb < OQC4_NB; ++nb) {                             \
+                const int32x2_t b =                                            \
+                    oqc4_load_u4x16(xt + (nb * 16 + lane) * (STRIDE) + kt * 8);\
+                iacc[nb] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(         \
+                    true, a, true, b, iacc[nb], false);                        \
+            }                                                                  \
         }
+        if (group == 256) {
+            #pragma unroll
+            OQC4_KLOOP(16, 128 + OQC4_LDS_PAD)
+        } else {
+            OQC4_KLOOP(tiles_per_group, lds_stride)
+        }
+#undef OQC4_KLOOP
 
         float sw[8];
         #pragma unroll
