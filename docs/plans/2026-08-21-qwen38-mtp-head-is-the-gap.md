@@ -101,3 +101,70 @@ Per AGENTS.md this is format conversion, so it belongs in
 - What precision for the head? It is 1.6% of the model, so bf16 costs little and
   protects acceptance; quantizing it to oq4 saves ~600 MB of draft-step traffic.
   Measure both.
+
+---
+
+# CORRECTION: MTP is the WRONG target. DFlash2 already beats it on this model.
+
+Everything above ranks drafters by raw acceptance rate. That is the wrong metric,
+and the conclusion it produced ("wire up MTP") is wrong.
+
+The DFlash2 paper (inco.ai/blog/dflash2) reports, **for Qwen3.8-27B specifically**
+(its Table 4), mean acceptance LENGTH:
+
+    DFlash 2   4.80
+    MTP        4.28
+    DSpark     3.62
+
+DFlash2 beats MTP on the exact model in question. And the pass structure differs:
+DFlash2 is single-pass — "the entire block, every position, predicted in
+parallel", one drafter forward per cycle — whereas MTP runs n sequential passes.
+Normalising per byte, which is the metric that matters on a bandwidth-bound box:
+
+    DFlash2   4.80 tokens / 1.2 GB (1 pass)        = 4.0 tokens/GB
+    MTP       4.28 tokens / ~1.58 GB (7 x 226 MB)  = 2.7 tokens/GB
+
+DFlash2 wins by ~1.5x per byte. The MTP head's small size is cancelled by needing
+to be re-read once per drafted token.
+
+Reported speedup for Qwen3.8-27B at batch 1: **2.7-3.4x autoregressive**. On our
+15.1 tok/s AR that is **41-51 tok/s** — above the 36.04 the ROCmFP4 MTP build
+reaches. So the ceiling here is higher than the external benchmark, not lower.
+
+## The real gap is overhead, not drafter choice
+
+                        designed        ours
+    tau                 4.80            2.0 - 3.0
+    speedup vs AR       2.7 - 3.4x      0.33x  (5.06 vs 15.1)
+
+Acceptance is short, but it is the SMALLER problem. At our own measured tau=3.0
+the byte roofline — 1.2 GB draft + 14.3 GB verify at the 233 GB/s this kernel
+sustains — is 3.0 / 0.0665 s = **~45 tok/s**. We measure 5.06. That is ~9x of
+pure overhead, and no amount of acceptance work touches it.
+
+Where it is, from the profile already taken:
+
+- **The draft moves 1.2 GB in 64 ms = 19 GB/s**, against 233 GB/s achievable.
+  DFlash2 is single-pass by design, so this is ONE forward running 13x slower
+  than its bytes justify — the same dispatch-bound, small-M regime measured in
+  `2026-08-21-npu-drafter-dispatch-cost.md` (~214 GMAC/s, 0.4% of peak). That
+  document's conclusion stands and is now the main event rather than a footnote.
+- Rollback and verify are already addressed on this branch.
+
+## Hypothesis worth checking first (cheap)
+
+The paper puts the selector at 2.0M params and the convolutions at 16.5M = "3% of
+drafter", implying a drafter of roughly 550M params ~ 310 MB at oq4+. Our
+artifact is **1.2 GB** — a gap about the size of the 248320 x 5120 vocab
+embedding (1.27G params). If the drafter artifact carries, uploads and re-reads
+an embedding/head the target already holds, that is simultaneously a byte problem
+and a dispatch problem, and it would be the first thing to fix.
+
+## Revised order
+
+1. Check the drafter artifact's tensor inventory for a redundant vocab
+   embedding / lm_head.
+2. Fix the drafter's dispatch efficiency (19 GB/s -> near 233). This is worth
+   roughly 9x and is independent of acceptance.
+3. Only then chase tau 3.0 -> 4.80.
+4. Do NOT convert the MTP head. It loses to DFlash2 per byte on this model.
