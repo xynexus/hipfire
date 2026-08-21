@@ -2518,6 +2518,134 @@ fn qwen35_finish_generation(
     qwen35_restore_or_error(stdout, id, m, gpu, session);
 }
 
+/// A qwen35 generation in flight — everything a suspended stream must carry
+/// between quanta, and nothing it must not.
+///
+/// Executor v2 §M3b0.5. [`Qwen35Generation::step`] advances one token,
+/// [`Qwen35Generation::finish`] runs the teardown.
+///
+/// **Owns no borrow of the GPU or the model.** Those arrive per call, because a
+/// serial executor hands the device to another stream between quanta; a handle
+/// holding `&mut Gpu` would pin the device to one stream for its whole life and
+/// defeat the interleaving it exists to enable. That property is why
+/// `Qwen35DecodeState` was built borrow-free in M3b0 and why `Qwen35DecodeCfg`
+/// had its lifetime removed — this type is what both were for.
+struct Qwen35Generation {
+    session: Qwen35RequestSessionState,
+    st: Qwen35DecodeState,
+    cfg: Qwen35DecodeCfg,
+    /// The ChatML `\n` tokens; `finish` forwards them when the turn ended on
+    /// `<|im_end|>`. `cfg.nl_len` is the same sequence's length, read by the
+    /// budget-alert headroom check.
+    nl: Vec<u32>,
+    t0: Instant,
+    t_prefill: Instant,
+    prefill_tokens: usize,
+    evidence_dir: Option<String>,
+    moe_router_histogram: DaemonMoeRouterHistogramGuard,
+    pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    pflash_bypass_reason: Option<String>,
+    pflash_alpha: Option<f32>,
+}
+
+impl Qwen35Generation {
+    /// Advance one token. The model and GPU are borrowed for the call only.
+    ///
+    /// `weights`/`config`/`scratch` and `eviction`/`physical_cap` are derived
+    /// per step rather than captured once, which is what §M3b1 asks for: the
+    /// moment the march loop can hand `&mut LoadedModel` to another stream
+    /// between quanta, a captured snapshot and a per-use read stop agreeing.
+    fn step(
+        &mut self,
+        m: &LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        tokenizer: &hipfire_model::tokenizer::Tokenizer,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+    ) -> Qwen35Step {
+        let config = m.q35_config.as_ref().unwrap();
+        let weights = m.q35_weights.as_ref().unwrap();
+        let scratch = m.q35_scratch.as_ref().unwrap();
+        // Disjoint field paths: kv and recurrent are distinct fields of
+        // session.sequence_state, and cursor is a third field of session.
+        let kv = self
+            .session
+            .sequence_state
+            .kv
+            .as_mut()
+            .expect("qwen35 session always has KV");
+        let dn = self
+            .session
+            .sequence_state
+            .recurrent
+            .as_mut()
+            .expect("qwen35 session has DeltaNet state")
+            .as_any_mut()
+            .downcast_mut::<qwen35::DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState");
+        qwen35_decode_one(
+            gpu,
+            weights,
+            config,
+            scratch,
+            kv,
+            dn,
+            &mut self.session.cursor,
+            m.eviction.as_ref(),
+            m.physical_cap,
+            tokenizer,
+            stdout,
+            id,
+            self.t0,
+            &self.cfg,
+            &mut self.st,
+        )
+    }
+
+    /// Run the teardown and emit the `done` frame. Consumes the handle, because
+    /// the session restore consumes the session.
+    fn finish(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+    ) {
+        let Qwen35Generation {
+            session,
+            st,
+            cfg,
+            nl,
+            t0,
+            t_prefill,
+            prefill_tokens,
+            evidence_dir,
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
+        } = self;
+        qwen35_finish_generation(
+            m,
+            gpu,
+            stdout,
+            id,
+            session,
+            st.generated,
+            &nl,
+            cfg.im_end_token,
+            t0,
+            t_prefill,
+            prefill_tokens,
+            evidence_dir.as_deref(),
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// The default autoregressive text generate path for the qwen35 / qwen3 (llama)
 /// families, and the central text dispatcher: frames the prompt (chat template
@@ -3697,96 +3825,64 @@ pub fn generate(
         // v2's march loop needs (§M3b0). The `while` stays exactly as it was:
         // budget-alert injection can push `generated` past the iteration count,
         // so the cap is rechecked at each loop start.
-        let mut st = Qwen35DecodeState {
-            rng_state,
-            next_token: tok0,
-            generated: 0,
-            streamed_tokens: Vec::new(),
-            bytes_fed_to_filter: 0,
-            filter: chat_output_filter(m, request_stop_sequences),
-            alert_fired: false,
-            think_count: 0,
-            prev_in_think: false,
-        };
-        let decode_cfg = Qwen35DecodeCfg {
-            max_tokens,
-            max_think_tokens,
-            budget_alert_at_tok,
-            budget_alert_text: budget_alert_text.to_string(),
-            im_end_token,
-            nl_len: nl.len(),
-            vocab_size,
-            top_k,
-            repeat_buf_cap,
-            ngram_scope_start,
-            attractor_pairs,
-            // N-gram loop detector: track 4-gram token sequences. When any
-            // 4-gram repeats more than `ngram_loop_threshold` times in the
-            // last `ngram_window` tokens, force EOS. This catches answer-phase
-            // repetition loops that the think cap and repeat penalty miss.
-            // Operates on token IDs (no decode overhead). Implementation lives
-            // in `hipfire-generate` loop_guard; defaults read from
-            // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
-            // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
-            loop_guard: loop_guard_from_runtime_config(),
-            temperature: temp,
-            top_p,
-            repeat_penalty,
-            presence_penalty,
-            frequency_penalty,
-        };
-        while st.generated < max_tokens {
-            match qwen35_decode_one(
-                gpu,
-                weights,
-                config,
-                scratch,
-                kv,
-                dn,
-                // Disjoint from `kv`/`dn`: those borrow session.sequence_state,
-                // this borrows session.cursor.
-                &mut session.cursor,
-                m.eviction.as_ref(),
-                m.physical_cap,
-                tokenizer,
-                stdout,
-                id,
-                t0,
-                &decode_cfg,
-                &mut st,
-            ) {
-                Qwen35Step::Continue => {}
-                Qwen35Step::Stop => break,
-                // The unwind lives HERE rather than inside the step, because
-                // `qwen35_restore_or_error` consumes the session that `kv` and
-                // `dn` are borrowed out of. It can only run at a point where
-                // those borrows are dead — which, on this path, they are.
-                Qwen35Step::Failed(message) => {
-                    write_error(stdout, id, &message);
-                    qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return;
-                }
-            }
-        }
-        let generated = st.generated;
-        qwen35_finish_generation(
-            m,
-            gpu,
-            stdout,
-            id,
+        let mut generation = Qwen35Generation {
             session,
-            generated,
-            &nl,
-            im_end_token,
+            st: Qwen35DecodeState {
+                rng_state,
+                next_token: tok0,
+                generated: 0,
+                streamed_tokens: Vec::new(),
+                bytes_fed_to_filter: 0,
+                filter: chat_output_filter(m, request_stop_sequences),
+                alert_fired: false,
+                think_count: 0,
+                prev_in_think: false,
+            },
+            cfg: Qwen35DecodeCfg {
+                max_tokens,
+                max_think_tokens,
+                budget_alert_at_tok,
+                budget_alert_text: budget_alert_text.to_string(),
+                im_end_token,
+                nl_len: nl.len(),
+                vocab_size,
+                top_k,
+                repeat_buf_cap,
+                ngram_scope_start,
+                attractor_pairs,
+                loop_guard: loop_guard_from_runtime_config(),
+                temperature: temp,
+                top_p,
+                repeat_penalty,
+                presence_penalty,
+                frequency_penalty,
+            },
+            nl,
             t0,
             t_prefill,
             prefill_tokens,
-            evidence_dir,
+            evidence_dir: evidence_dir.map(str::to_string),
             moe_router_histogram,
             pflash_summary,
             pflash_bypass_reason,
             pflash_alpha,
-        );
+        };
+        // `while` rather than `for`: budget-alert injection can push `generated`
+        // past the iteration count, so the cap is rechecked at each loop start.
+        while generation.st.generated < generation.cfg.max_tokens {
+            match generation.step(m, gpu, tokenizer, stdout, id) {
+                Qwen35Step::Continue => {}
+                Qwen35Step::Stop => break,
+                // The unwind stays out here: `qwen35_restore_or_error` consumes
+                // the session, so it cannot run while `step` holds borrows of it.
+                Qwen35Step::Failed(message) => {
+                    write_error(stdout, id, &message);
+                    qwen35_restore_or_error(stdout, id, m, gpu, generation.session);
+                    return;
+                }
+            }
+        }
+        generation.finish(m, gpu, stdout, id);
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware. This is the `not qwen35`
         // fallback, but it's specifically the llama (arch 0/1) state — every
