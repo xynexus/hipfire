@@ -153,17 +153,89 @@ enum Session {
     Applying(LoraStack),
 }
 
-static SESSION: OnceLock<RwLock<Session>> = OnceLock::new();
+/// Which steering session an operation addresses.
+///
+/// [`SteerKey::default()`] is the **unscoped** session: every function in this
+/// crate that does not take a key operates on it, so all existing callers keep
+/// exactly today's behaviour. A keyed session is addressed by a stream's wire
+/// `session_id` (see the daemon's `SessionKey`), which is what lets two streams
+/// decoding in one batched step each carry their own spec.
+///
+/// Deliberately a plain string rather than the daemon's `StreamId`: this crate
+/// sits below the daemon and must not depend on the executor's internal
+/// bookkeeping.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SteerKey(String);
+
+impl SteerKey {
+    /// A session scoped to a stream, named by its wire `session_id`.
+    pub fn session(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// True for the unscoped session that the un-keyed API operates on.
+    pub fn is_unscoped(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+type SessionMap = std::collections::HashMap<SteerKey, Session>;
+
+static SESSIONS: OnceLock<RwLock<SessionMap>> = OnceLock::new();
 /// Fast-path gate so the hot forward path pays only one relaxed atomic load when
 /// steering is inactive (the common case during normal serving).
+///
+/// Now means "ANY session is active", which keeps the hot path at exactly one
+/// relaxed load regardless of how many streams carry specs. A stream with no spec
+/// still costs one load plus, only when some other stream is steering, a map
+/// lookup — the gate cannot be per-key without the hot path knowing the key
+/// before it checks the gate.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Bumped on every session change so the per-thread GPU apply cache
 /// (`APPLY_CACHE`, which can't live in the `Sync` static because `GpuTensor` is
 /// `!Sync`) knows when to refresh its uploaded directions.
+///
+/// Deliberately still ONE counter across all keys. A per-key epoch is the
+/// eventual optimisation, but a shared counter is the safe direction of error
+/// here: bumping it for another stream's change makes this stream's cache
+/// refresh when it did not strictly need to (a wasted upload), whereas a
+/// per-key counter that missed a bump would reuse another stream's uploaded
+/// directions — silently steering with the wrong vector. Over-invalidate rather
+/// than under-invalidate until the cache is keyed too.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
-fn session() -> &'static RwLock<Session> {
-    SESSION.get_or_init(|| RwLock::new(Session::Inactive))
+fn sessions() -> &'static RwLock<SessionMap> {
+    SESSIONS.get_or_init(|| RwLock::new(SessionMap::new()))
+}
+
+/// Run `f` against `key`'s session, creating it as `Inactive` if absent.
+fn with_session<R>(key: &SteerKey, f: impl FnOnce(&mut Session) -> R) -> R {
+    let mut guard = sessions().write().unwrap();
+    let entry = guard.entry(key.clone()).or_insert(Session::Inactive);
+    f(entry)
+}
+
+/// Read-only view of `key`'s session. `None` when that key has none.
+fn read_session<R>(key: &SteerKey, f: impl FnOnce(&Session) -> R) -> Option<R> {
+    let guard = sessions().read().unwrap();
+    guard.get(key).map(f)
+}
+
+/// Recompute the `ACTIVE` gate from the whole map. Called under the caller's own
+/// lock discipline, after any mutation — a stream going inactive must not clear
+/// the gate while another stream is still steering.
+fn refresh_active_gate() {
+    let any = sessions()
+        .read()
+        .unwrap()
+        .values()
+        .any(|s| !matches!(s, Session::Inactive));
+    EPOCH.fetch_add(1, Ordering::Release);
+    ACTIVE.store(any, Ordering::Release);
 }
 
 /// Serializes tests that mutate the process-global session (the apply control API
@@ -172,18 +244,18 @@ fn session() -> &'static RwLock<Session> {
 #[cfg(test)]
 pub(crate) static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn set_session(s: Session) {
-    let active = !matches!(s, Session::Inactive);
-    *session().write().unwrap() = s;
-    mark_session_changed(active);
+fn set_session_for(key: &SteerKey, s: Session) {
+    // The write guard is dropped before refreshing the gate: the refresh takes a
+    // READ lock on the same map, and re-entering would deadlock this thread.
+    sessions().write().unwrap().insert(key.clone(), s);
+    refresh_active_gate();
 }
 
-/// Bump the epoch (so the per-thread GPU apply cache refreshes) and update the
+/// Bump the epoch (so the per-thread GPU apply cache refreshes) and recompute the
 /// fast-path `ACTIVE` gate. For in-place mutations of the resident stack that
 /// don't replace the whole `Session` (load/scale/unload).
-fn mark_session_changed(active: bool) {
-    EPOCH.fetch_add(1, Ordering::Release);
-    ACTIVE.store(active, Ordering::Release);
+fn mark_session_changed() {
+    refresh_active_gate();
 }
 
 // ── Control API ─────────────────────────────────────────────────────────────
@@ -191,26 +263,44 @@ fn mark_session_changed(active: bool) {
 /// Begin a CAPTURE session: subsequent forwards accumulate per-block residual
 /// means. Run the +set, call [`finish_capture`], then the -set similarly.
 pub fn begin_capture(num_layers: usize, hidden: usize) {
-    set_session(Session::Capturing(CaptureAcc::new(num_layers, hidden)));
+    begin_capture_for(&SteerKey::default(), num_layers, hidden)
+}
+
+/// [`begin_capture`] against a specific session.
+pub fn begin_capture_for(key: &SteerKey, num_layers: usize, hidden: usize) {
+    set_session_for(key, Session::Capturing(CaptureAcc::new(num_layers, hidden)));
 }
 
 /// Fold the current prompt's last-token residuals into the capture means and
 /// count it. Call once after each prompt's forward during a CAPTURE session.
 pub fn commit_capture() {
-    if let Session::Capturing(acc) = &mut *session().write().unwrap() {
-        acc.commit();
-    }
+    commit_capture_for(&SteerKey::default())
+}
+
+/// [`commit_capture`] against a specific session.
+pub fn commit_capture_for(key: &SteerKey) {
+    with_session(key, |s| {
+        if let Session::Capturing(acc) = s {
+            acc.commit();
+        }
+    });
 }
 
 /// End a CAPTURE session and return the accumulated per-block means (`None` if
 /// no capture was active).
 pub fn finish_capture() -> Option<CaptureMeans> {
-    let means = match &*session().read().unwrap() {
+    finish_capture_for(&SteerKey::default())
+}
+
+/// [`finish_capture`] against a specific session.
+pub fn finish_capture_for(key: &SteerKey) -> Option<CaptureMeans> {
+    let means = read_session(key, |s| match s {
         Session::Capturing(acc) => Some(acc.means()),
         _ => None,
-    };
+    })
+    .flatten();
     if means.is_some() {
-        set_session(Session::Inactive);
+        set_session_for(key, Session::Inactive);
     }
     means
 }
@@ -219,6 +309,12 @@ pub fn finish_capture() -> Option<CaptureMeans> {
 /// adapter (`id = "default"`, `scale = spec.strength`). The back-compat entry the
 /// search loop uses; [`load_adapter`] composes a multi-adapter stack instead.
 pub fn begin_apply(spec: SteerSpec) {
+    begin_apply_for(&SteerKey::default(), spec)
+}
+
+/// [`begin_apply`] against a specific session. This is the entry a per-stream
+/// spec uses: two streams may hold different specs simultaneously.
+pub fn begin_apply_for(key: &SteerKey, spec: SteerSpec) {
     let adapter = ResidentAdapter {
         id: "default".to_string(),
         directions: spec.directions,
@@ -226,9 +322,12 @@ pub fn begin_apply(spec: SteerSpec) {
         scale: spec.strength,
         layer_range: spec.layer_range,
     };
-    set_session(Session::Applying(LoraStack {
-        adapters: vec![adapter],
-    }));
+    set_session_for(
+        key,
+        Session::Applying(LoraStack {
+            adapters: vec![adapter],
+        }),
+    );
 }
 
 /// Push (or replace, by `id`) an adapter onto the APPLY stack, starting a session
@@ -248,21 +347,18 @@ pub fn load_adapter(
         scale,
         layer_range,
     };
-    {
-        let mut guard = session().write().unwrap();
-        match &mut *guard {
-            Session::Applying(stack) => {
-                stack.adapters.retain(|a| a.id != adapter.id);
-                stack.adapters.push(adapter);
-            }
-            _ => {
-                *guard = Session::Applying(LoraStack {
-                    adapters: vec![adapter],
-                });
-            }
+    with_session(&SteerKey::default(), |slot| match slot {
+        Session::Applying(stack) => {
+            stack.adapters.retain(|a| a.id != adapter.id);
+            stack.adapters.push(adapter);
         }
-    }
-    mark_session_changed(true);
+        other => {
+            *other = Session::Applying(LoraStack {
+                adapters: vec![adapter],
+            });
+        }
+    });
+    mark_session_changed();
 }
 
 /// Materialize and load a rank-1 residual [`lora::LoraAdapter`] (ablate-only) onto
@@ -313,20 +409,17 @@ pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
 /// Set a loaded adapter's live `scale` (intensity). Returns `false` if no adapter
 /// with `id` is loaded. Cheap — bumps the epoch so the GPU cache refreshes.
 pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
-    let found = {
-        let mut guard = session().write().unwrap();
-        match &mut *guard {
-            Session::Applying(stack) => stack
-                .adapters
-                .iter_mut()
-                .find(|a| a.id == id)
-                .map(|a| a.scale = scale)
-                .is_some(),
-            _ => false,
-        }
-    };
+    let found = with_session(&SteerKey::default(), |slot| match slot {
+        Session::Applying(stack) => stack
+            .adapters
+            .iter_mut()
+            .find(|a| a.id == id)
+            .map(|a| a.scale = scale)
+            .is_some(),
+        _ => false,
+    });
     if found {
-        mark_session_changed(true);
+        mark_session_changed();
     }
     found
 }
@@ -334,24 +427,21 @@ pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
 /// Remove an adapter by `id`. Returns `false` if absent. The session goes
 /// `Inactive` when the last adapter is unloaded.
 pub fn unload_adapter(id: &str) -> bool {
-    let (found, empty) = {
-        let mut guard = session().write().unwrap();
-        match &mut *guard {
-            Session::Applying(stack) => {
-                let before = stack.adapters.len();
-                stack.adapters.retain(|a| a.id != id);
-                let found = stack.adapters.len() < before;
-                let empty = stack.adapters.is_empty();
-                if empty {
-                    *guard = Session::Inactive;
-                }
-                (found, empty)
+    let (found, _empty) = with_session(&SteerKey::default(), |slot| match slot {
+        Session::Applying(stack) => {
+            let before = stack.adapters.len();
+            stack.adapters.retain(|a| a.id != id);
+            let found = stack.adapters.len() < before;
+            let empty = stack.adapters.is_empty();
+            if empty {
+                *slot = Session::Inactive;
             }
-            _ => (false, false),
+            (found, empty)
         }
-    };
+        _ => (false, false),
+    });
     if found {
-        mark_session_changed(!empty);
+        mark_session_changed();
     }
     found
 }
@@ -359,24 +449,44 @@ pub fn unload_adapter(id: &str) -> bool {
 /// `(id, scale)` for each loaded adapter (apply session only). Drives a
 /// `lora_list`-style introspection.
 pub fn loaded_adapters() -> Vec<(String, f32)> {
-    match &*session().read().unwrap() {
+    read_session(&SteerKey::default(), |slot| match slot {
         Session::Applying(stack) => stack
             .adapters
             .iter()
             .map(|a| (a.id.clone(), a.scale))
             .collect(),
         _ => Vec::new(),
-    }
+    })
+    .unwrap_or_default()
 }
 
 /// Tear down any active session.
 pub fn clear() {
-    set_session(Session::Inactive);
+    clear_for(&SteerKey::default())
+}
+
+/// [`clear`] for one session. Other sessions are untouched — tearing down one
+/// stream's steering must not disarm another's.
+pub fn clear_for(key: &SteerKey) {
+    set_session_for(key, Session::Inactive);
+}
+
+/// Drop every session, keyed and unscoped. Model load/unload uses this: a spec
+/// captured against one model must not survive into the next.
+pub fn clear_all() {
+    sessions().write().unwrap().clear();
+    refresh_active_gate();
 }
 
 /// Whether a capture or apply session is currently active.
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
+}
+
+/// Whether THIS session is active. The un-keyed [`is_active`] stays the hot-path
+/// gate ("is anyone steering"); this answers the per-stream question.
+pub fn is_active_for(key: &SteerKey) -> bool {
+    read_session(key, |s| !matches!(s, Session::Inactive)).unwrap_or(false)
 }
 
 // ── Direction derivation ────────────────────────────────────────────────────
@@ -415,23 +525,39 @@ pub fn derive_directions(
 /// Single-vector block-boundary hook for the decode/AR path. `x` is the
 /// `[hidden]` residual after block `layer_idx`.
 pub fn maybe_steer_block(gpu: &mut Gpu, x: &GpuTensor, layer_idx: usize) -> HipResult<()> {
+    maybe_steer_block_for(&SteerKey::default(), gpu, x, layer_idx)
+}
+
+/// [`maybe_steer_block`] against a specific session — the per-stream hook.
+///
+/// The `is_active()` gate stays FIRST and stays global: it answers "is anyone
+/// steering" with one relaxed load, so a stream with no spec pays nothing extra
+/// while nobody is steering, and pays only a map lookup when someone is.
+pub fn maybe_steer_block_for(
+    key: &SteerKey,
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    layer_idx: usize,
+) -> HipResult<()> {
     if !is_active() {
         return Ok(());
     }
     let epoch = EPOCH.load(Ordering::Acquire);
-    match &mut *session().write().unwrap() {
-        Session::Inactive => {}
-        Session::Capturing(acc) => {
-            let host = gpu.download_f32(x)?;
-            acc.observe(layer_idx, &host);
-        }
-        Session::Applying(stack) => {
-            if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
-                apply_on_gpu(gpu, x, layer_idx, stack, epoch)?;
+    with_session(key, |slot| -> HipResult<()> {
+        match slot {
+            Session::Inactive => {}
+            Session::Capturing(acc) => {
+                let host = gpu.download_f32(x)?;
+                acc.observe(layer_idx, &host);
+            }
+            Session::Applying(stack) => {
+                if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
+                    apply_on_gpu(gpu, x, layer_idx, stack, epoch)?;
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Batched block-boundary hook for the prefill path. `x_batch` is the
@@ -446,32 +572,54 @@ pub fn maybe_steer_block_batched(
     num_positions: usize,
     hidden: usize,
 ) -> HipResult<()> {
+    maybe_steer_block_batched_for(
+        &SteerKey::default(),
+        gpu,
+        x_batch,
+        layer_idx,
+        num_positions,
+        hidden,
+    )
+}
+
+/// [`maybe_steer_block_batched`] against a specific session.
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_steer_block_batched_for(
+    key: &SteerKey,
+    gpu: &mut Gpu,
+    x_batch: &GpuTensor,
+    layer_idx: usize,
+    num_positions: usize,
+    hidden: usize,
+) -> HipResult<()> {
     if !is_active() {
         return Ok(());
     }
-    match &mut *session().write().unwrap() {
-        Session::Inactive => {}
-        Session::Capturing(acc) => {
-            let host = gpu.download_f32(x_batch)?;
-            let last = (num_positions - 1) * hidden;
-            acc.observe(layer_idx, &host[last..last + hidden]);
-        }
-        Session::Applying(stack) => {
-            if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
-                // Prefill is one-shot per request, and the search loop scores via
-                // single-token decode forwards, so this host round-trip is amortized
-                // — the per-token decode path is the one moved on-GPU. The whole
-                // stack is summed per position (read from the pre-apply residual).
-                let mut host = gpu.download_f32(x_batch)?;
-                for p in 0..num_positions {
-                    let off = p * hidden;
-                    apply_stack_host(&stack.adapters, layer_idx, &mut host[off..off + hidden]);
+    with_session(key, |slot| -> HipResult<()> {
+        match slot {
+            Session::Inactive => {}
+            Session::Capturing(acc) => {
+                let host = gpu.download_f32(x_batch)?;
+                let last = (num_positions - 1) * hidden;
+                acc.observe(layer_idx, &host[last..last + hidden]);
+            }
+            Session::Applying(stack) => {
+                if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
+                    // Prefill is one-shot per request, and the search loop scores via
+                    // single-token decode forwards, so this host round-trip is amortized
+                    // — the per-token decode path is the one moved on-GPU. The whole
+                    // stack is summed per position (read from the pre-apply residual).
+                    let mut host = gpu.download_f32(x_batch)?;
+                    for p in 0..num_positions {
+                        let off = p * hidden;
+                        apply_stack_host(&stack.adapters, layer_idx, &mut host[off..off + hidden]);
+                    }
+                    write_back(gpu, x_batch, &host)?;
                 }
-                write_back(gpu, x_batch, &host)?;
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 // ── On-GPU apply (decode/AR path) ───────────────────────────────────────────
@@ -691,6 +839,118 @@ fn write_back(gpu: &mut Gpu, x: &GpuTensor, host: &[f32]) -> HipResult<()> {
 mod stack_tests {
     use super::*;
     use crate::lora;
+
+    fn spec_of(strength: f32) -> SteerSpec {
+        SteerSpec {
+            directions: vec![vec![1.0, 0.0, 0.0]],
+            mode: SteerMode::Steer,
+            strength,
+            layer_range: 0..1,
+        }
+    }
+
+    /// The M3 property: two streams hold their own specs simultaneously, and
+    /// neither can see or disturb the other's.
+    #[test]
+    fn keyed_sessions_do_not_alias() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let a = SteerKey::session("stream-a");
+        let b = SteerKey::session("stream-b");
+        begin_apply_for(&a, spec_of(0.5));
+        begin_apply_for(&b, spec_of(2.0));
+
+        assert!(is_active_for(&a) && is_active_for(&b));
+        assert!(
+            is_active(),
+            "the hot-path gate reports that someone is steering"
+        );
+        assert!(
+            !is_active_for(&SteerKey::default()),
+            "keyed sessions must not activate the unscoped one"
+        );
+
+        // Tearing down one must not disarm the other — the failure mode that
+        // makes a single global session unusable under interleaving.
+        clear_for(&a);
+        assert!(!is_active_for(&a));
+        assert!(is_active_for(&b), "clearing stream A disarmed stream B");
+        assert!(
+            is_active(),
+            "the gate must stay set while B is still steering"
+        );
+
+        clear_for(&b);
+        assert!(!is_active(), "the gate must clear once nobody is steering");
+        clear_all();
+    }
+
+    /// The un-keyed API is exactly the keyed API on the default key, which is
+    /// what makes this migration invisible to every existing caller.
+    #[test]
+    fn the_unscoped_session_is_the_default_key() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        begin_apply(spec_of(1.0));
+        assert!(
+            is_active_for(&SteerKey::default()),
+            "begin_apply targets the default key"
+        );
+        assert!(is_active());
+
+        let other = SteerKey::session("s1");
+        assert!(!is_active_for(&other), "an unrelated stream sees nothing");
+
+        clear();
+        assert!(!is_active_for(&SteerKey::default()));
+        assert!(!is_active());
+        clear_all();
+    }
+
+    /// Capture is per-session too: folding one stream's residuals must not land
+    /// in another's means.
+    #[test]
+    fn keyed_capture_accumulates_independently() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let a = SteerKey::session("cap-a");
+        let b = SteerKey::session("cap-b");
+        begin_capture_for(&a, 1, 3);
+        begin_capture_for(&b, 1, 3);
+
+        with_session(&a, |s| {
+            if let Session::Capturing(acc) = s {
+                acc.observe(0, &[1.0, 2.0, 3.0]);
+            }
+        });
+        commit_capture_for(&a);
+
+        let means_a = finish_capture_for(&a).expect("A captured");
+        assert_eq!(means_a.0[0], vec![1.0, 2.0, 3.0]);
+
+        let means_b = finish_capture_for(&b).expect("B had a session");
+        assert_eq!(
+            means_b.0[0],
+            vec![0.0, 0.0, 0.0],
+            "stream A's observation must not fold into stream B's means"
+        );
+        clear_all();
+    }
+
+    #[test]
+    fn clear_all_drops_every_session() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        begin_apply(spec_of(1.0));
+        begin_apply_for(&SteerKey::session("x"), spec_of(1.0));
+        assert!(is_active());
+        clear_all();
+        assert!(!is_active(), "model load/unload must leave nothing armed");
+        assert!(!is_active_for(&SteerKey::session("x")));
+    }
 
     fn unit(v: &[f32]) -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
