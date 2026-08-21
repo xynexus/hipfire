@@ -147,8 +147,17 @@ impl StreamTable {
         spec: WorkloadSpec,
         rng: SamplerRng,
     ) -> Result<StreamId, AdmitError> {
-        if let Some(&live) = self.by_session.get(&session) {
-            return Err(AdmitError::SessionAlreadyLive(live));
+        // Liveness, not mere presence. `finish()` does not touch `by_session` —
+        // only `retire()` does — so a terminal-but-unretired stream would
+        // otherwise refuse its own conversation's next turn, naming a dead
+        // stream. A finished holder is reclaimed here instead.
+        if let Some(&held) = self.by_session.get(&session) {
+            let finished = self.streams.get(&held).is_none_or(|s| s.is_finished());
+            if !finished {
+                return Err(AdmitError::SessionAlreadyLive(held));
+            }
+            self.streams.remove(&held);
+            self.by_session.remove(&session);
         }
         let id = self.ids.next();
         self.by_session.insert(session.clone(), id);
@@ -341,9 +350,16 @@ impl RunningStream {
         matches!(self.status, StreamStatus::Admitted | StreamStatus::Running)
     }
 
-    /// Give this stream the GPU. No-op if already running.
+    /// Give this stream the GPU. No-op unless it is runnable.
+    ///
+    /// Guards `Parked` as well as `Finished`. It previously guarded only
+    /// `Finished`, so `run()` silently un-parked a suspended stream — the exact
+    /// transition this module documents as impossible without an explicit act,
+    /// and the one `resume()` returns a bool to make visible. A march loop that
+    /// called `run()` on everything would have quietly resurrected every parked
+    /// bulk stream.
     pub(crate) fn run(&mut self) {
-        if self.status != StreamStatus::Finished {
+        if self.is_runnable() {
             self.status = StreamStatus::Running;
         }
     }
@@ -463,6 +479,37 @@ mod tests {
                 module: 2
             },
             "advancing after resume continues from the parked position"
+        );
+    }
+
+    /// `run()` must not be a back door around `resume()`.
+    #[test]
+    fn run_does_not_unpark() {
+        let mut ids = StreamIds::default();
+        let mut s = stream(&mut ids, "bulk");
+        s.run();
+        s.cursor.advance_module();
+        s.park();
+        s.run();
+        assert_eq!(s.status(), StreamStatus::Parked, "run() silently un-parked");
+        assert!(!s.is_runnable());
+        assert!(s.resume(), "only an explicit resume may un-park");
+    }
+
+    /// A finished-but-unretired stream must not lock its conversation out.
+    #[test]
+    fn a_finished_stream_does_not_block_its_session() {
+        let mut t = StreamTable::default();
+        let first = table_admit(&mut t, "conv-9");
+        t.get_mut(first).unwrap().finish();
+        // NOTE: no retire() — this is the leak path.
+        let second = table_admit(&mut t, "conv-9");
+        assert_ne!(second, first);
+        assert_eq!(t.id_for_session(&SessionKey::new("conv-9")), Some(second));
+        assert_eq!(
+            t.len(),
+            1,
+            "the dead stream must be reclaimed, not accumulate"
         );
     }
 
