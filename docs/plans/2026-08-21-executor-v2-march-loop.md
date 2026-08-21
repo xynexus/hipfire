@@ -122,6 +122,21 @@ arm:
    stream, so dispatching any frame wipes a live stream's unpolled abort.
 4. **`activate_session` per quantum**, not per frame — otherwise a stream switch
    drives stream B's tokens into stream A's KV.
+5. **Re-check M3b0's per-step snapshots.** `qwen35_decode_one` takes
+   `m.eviction`, `m.physical_cap` and `nl.len()` as values captured once per
+   step, where the original re-read them at four separate points deep in the
+   body. That is provably equivalent *today* — and specifically because the
+   borrow checker forbids it from being otherwise: `weights`/`config`/`scratch`
+   are shared reborrows out of `*m` held across the whole loop, so nothing can
+   take `&mut LoadedModel` mid-step.
+
+   **M3b1 removes exactly that guarantee.** The moment the march loop can hand
+   `&mut LoadedModel` to another stream between quanta, a per-step snapshot and
+   a per-use re-read stop agreeing — and they diverge *silently*: a stale
+   `need_kv <= physical_cap` suppresses or emits a budget-alert nudge, changing
+   the token stream with no error frame. Either re-read them per use, or assert
+   the model cannot be swapped mid-quantum. Do not let this be rediscovered as a
+   token-stream mystery.
 
 *Exit:* two concurrent `Generate` requests interleave at quantum granularity
 under the flag, each producing output byte-identical to running it alone.
