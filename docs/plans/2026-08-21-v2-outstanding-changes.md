@@ -216,7 +216,9 @@ doc that contradicted their own code.
 
 Still open, and each verified:
 
-**`is_active()` is a per-request predicate over global state.** `decode_layers.rs`
+**~~`is_active()` is a per-request predicate over global state.~~ FIXED (#272)** —
+`current_is_active()` answers the per-request question; `is_active()` stays the
+hot-path gate. Original description: `decode_layers.rs`
 routes with `steer_forces_hand = is_active() && !steer_lowered_enabled()`, while
 the keyed registry defines `ACTIVE` as "ANY session is active". Composed, one
 stream holding a keyed spec forces EVERY request onto the hand path. Not a
