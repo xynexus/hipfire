@@ -108,69 +108,92 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
     const uint8_t* x_prow[OQC4_NB];
     int b_col_nb[OQC4_NB];
     float8_t facc[OQC4_NB];
+    // Per-b-tile ACTIVATION-SCALE pointers, hoisted out of the group loop. The
+    // index `b_col * n_groups + g` only varies in `g` across groups, so what was
+    // a 64-bit multiply per (group, b-tile) becomes one multiply per b-tile for
+    // the whole kernel and a `[g]` index inside. Same for the weight scales
+    // below. Those multiplies are a large share of the residual non-WMMA VALU:
+    // the measured 3.7-per-WMMA is well above what the staging, addressing and
+    // rescale arithmetic alone account for.
+    const float* xs_p[OQC4_NB];
     #pragma unroll
     for (int nb = 0; nb < OQC4_NB; ++nb) {
         const int x_row = batch_start + nb * 16 + lane;
         b_col_nb[nb] = x_row;
         const int safe_x = (x_row < B) ? x_row : (B - 1);
         x_prow[nb] = X + (long long)safe_x * x_stride;
+        xs_p[nb] = Xs + (long long)safe_x * n_groups;
         facc[nb] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     }
+    // Per-accumulator-row WEIGHT-SCALE pointers, likewise hoisted; only the
+    // `g * side_stride` step varies per group.
+    const uint8_t* sw_p[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int m_row = row_start + 2 * j + half;
+        const int safe_m = (m_row < M) ? m_row : (M - 1);
+        sw_p[j] = W + side_base
+                + (long long)safe_m * n_groups * (long long)side_stride;
+    }
 
-#if OQC4_LDS
-    __shared__ uint8_t xt[OQC4_COLS * (128 + OQC4_LDS_PAD)];
+    // DOUBLE-BUFFERED activation stage. The single-buffered form needed TWO
+    // barriers per group — one before the overwrite so no wave is still reading
+    // group g-1, one after so no wave runs ahead of the fill — and those
+    // barriers were the binding constraint, not instruction count: ablating them
+    // measured +19% on gate/up and +45% on `down` (which has 68 groups, so 136
+    // barriers).
+    //
+    // Staging g+1 into the alternate buffer while computing from g removes the
+    // first barrier entirely: the writes and the reads target different memory,
+    // so only ONE barrier per group is needed, at the end.
+    __shared__ uint8_t xt[2][OQC4_COLS * (128 + OQC4_LDS_PAD)];
     const int lds_stride = nib_bytes + OQC4_LDS_PAD;
     const int dwords_per_col = nib_bytes >> 2;
-    // `group` is 128 or 256, so this is 16 or 32 — always a power of two, and
-    // a shift/mask rather than a DIVISION. It was a division, and that mattered:
-    // AMD integer divide expands to ~20 VALU, executed once per staged dword,
-    // and PMC showed this kernel issuing ~5.8 non-WMMA VALU per WMMA against
-    // 312M WMMA instructions. The index math, not the matrix core, was the work.
+    // `group` is 128 or 256, so this is 16 or 32 — a power of two, hence a
+    // shift/mask and not a DIVISION. AMD integer divide expands to ~20 VALU and
+    // this runs once per staged dword.
     const int dpc_shift = __builtin_ctz(dwords_per_col);
     const int dpc_mask  = dwords_per_col - 1;
     const int stage_total = OQC4_COLS * dwords_per_col;
-#endif
+
+#define OQC4_STAGE(G, BUF)                                                     \
+    do {                                                                       \
+        for (int i = tid; i < stage_total; i += blockDim.x) {                  \
+            const int col = i >> dpc_shift;                                    \
+            const int d   = i & dpc_mask;                                      \
+            const int brow = batch_start + col;                                \
+            const int sb = (brow < B) ? brow : (B - 1);                        \
+            const uint32_t v = *(const uint32_t*)(                             \
+                X + (long long)sb * x_stride + (G) * nib_bytes + d * 4);       \
+            *(uint32_t*)(xt[BUF] + col * lds_stride + d * 4) = v;              \
+        }                                                                      \
+    } while (0)
+
+    OQC4_STAGE(0, 0);
+    __syncthreads();
 
     for (int g = 0; g < n_groups; ++g) {
+        const int cur = g & 1;
+        // Fill the NEXT group's buffer while this one is consumed below.
+        if (g + 1 < n_groups) OQC4_STAGE(g + 1, cur ^ 1);
+
         const uint8_t* nibbles = W + ((long long)safe_a * n_groups + g) * nib_bytes;
-        const int g_byte = g * nib_bytes;
-#if OQC4_LDS
-        // Barrier BEFORE the overwrite as well as after it, or a wave still
-        // reading group g-1 races the stage of group g.
-        __syncthreads();
-        for (int i = tid; i < stage_total; i += blockDim.x) {
-            const int col = i >> dpc_shift;
-            const int d   = i & dpc_mask;
-            const int brow = batch_start + col;
-            const int safe_b = (brow < B) ? brow : (B - 1);
-            const uint32_t v = *(const uint32_t*)(
-                X + (long long)safe_b * x_stride + g_byte + d * 4);
-            *(uint32_t*)(xt + col * lds_stride + d * 4) = v;
-        }
-        __syncthreads();
-#endif
 
         int32x8_t iacc[OQC4_NB];
         #pragma unroll
         for (int nb = 0; nb < OQC4_NB; ++nb) {
             iacc[nb] = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
         }
-        // RAW nibbles straight into the matrix core — this is the whole point of
-        // the format meeting the instruction.
-        //
-        // Specialised on the G=256 case so `tiles_per_group` (16) and
-        // `lds_stride` (132) are COMPILE-TIME: the k-loop then fully unrolls and
-        // every LDS offset becomes an immediate, instead of an add per
-        // (k-tile, b-tile). PMC put this kernel at ~4.8 non-WMMA VALU per WMMA
-        // with the address math the largest remaining share, so the immediates
-        // are the point, not the unrolling itself.
+        // Specialised on G=256 so `tiles_per_group` (16) and `lds_stride` (132)
+        // are COMPILE-TIME: the k-loop fully unrolls and every LDS offset becomes
+        // an immediate rather than an add per (k-tile, b-tile).
 #define OQC4_KLOOP(TPG, STRIDE)                                                \
         for (int kt = 0; kt < (TPG); ++kt) {                                   \
             const int32x2_t a = oqc4_load_u4x16(nibbles + kt * 8);             \
             _Pragma("unroll")                                                  \
             for (int nb = 0; nb < OQC4_NB; ++nb) {                             \
-                const int32x2_t b =                                            \
-                    oqc4_load_u4x16(xt + (nb * 16 + lane) * (STRIDE) + kt * 8);\
+                const int32x2_t b = oqc4_load_u4x16(                           \
+                    xt[cur] + (nb * 16 + lane) * (STRIDE) + kt * 8);           \
                 iacc[nb] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(         \
                     true, a, true, b, iacc[nb], false);                        \
             }                                                                  \
@@ -183,25 +206,26 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
         }
 #undef OQC4_KLOOP
 
+        const int g_off = g * side_stride;
         float sw[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int m_row = row_start + 2 * j + half;
-            sw[j] = (m_row < M)
-                ? oqc4_f16_scale(W + side_base
-                      + ((long long)m_row * n_groups + g) * (long long)side_stride)
-                : 0.f;
+            sw[j] = (m_row < M) ? oqc4_f16_scale(sw_p[j] + g_off) : 0.f;
         }
         #pragma unroll
         for (int nb = 0; nb < OQC4_NB; ++nb) {
-            const int b_col = b_col_nb[nb];
-            const float sx = (b_col < B) ? Xs[(long long)b_col * n_groups + g] : 0.f;
+            const float sx = (b_col_nb[nb] < B) ? xs_p[nb][g] : 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 facc[nb][j] += (float)iacc[nb][j] * sw[j] * sx;
             }
         }
+        // The ONE barrier: the next iteration flips `cur`, so this must cover
+        // both "everyone finished reading xt[cur]" and "the g+1 fill completed".
+        __syncthreads();
     }
+#undef OQC4_STAGE
 
     #pragma unroll
     for (int nb = 0; nb < OQC4_NB; ++nb) {
