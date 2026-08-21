@@ -183,6 +183,67 @@ impl SteerKey {
     }
 }
 
+thread_local! {
+    /// The session the CURRENT thread's forward belongs to.
+    ///
+    /// The forward calls `maybe_steer_block(gpu, x, layer_idx)` from deep inside
+    /// a layer loop and has no idea which stream it is serving. Threading a key
+    /// explicitly would mean a parameter on `forward_scratch` and its three
+    /// siblings — **155 external call sites**, nearly all of which never steer.
+    ///
+    /// So the key is thread-scoped instead, exactly as `load_progress`'s sink is
+    /// (§M1d treats that as a legitimate answer to this same shape of problem).
+    /// The justification is the same: the forward runs synchronously on the
+    /// calling thread, so "the thread doing the forward" and "the stream being
+    /// forwarded" are the same thing, and the executor is serial by design — one
+    /// stream holds the GPU per quantum.
+    ///
+    /// This is scoped ambient state, not a process global: it is installed for a
+    /// stream's quantum and restored after, including on panic. The failure the
+    /// M1d globals had — a second installer silently redirecting the first
+    /// stream's work — cannot happen, because there is no second installer on
+    /// this thread while a guard is live.
+    static CURRENT_KEY: RefCell<SteerKey> = RefCell::new(SteerKey::default());
+}
+
+/// Install the current thread's steering session, restoring the previous one on
+/// drop — including on an early return or a panic, so a forward that fails
+/// partway cannot leave another stream's key installed for whatever runs next.
+pub struct SteerKeyGuard(Option<SteerKey>);
+
+impl SteerKeyGuard {
+    pub fn install(key: SteerKey) -> Self {
+        Self(Some(
+            CURRENT_KEY.with(|c| std::mem::replace(&mut *c.borrow_mut(), key)),
+        ))
+    }
+}
+
+impl Drop for SteerKeyGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            CURRENT_KEY.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+}
+
+/// Run `f` against this thread's current key.
+///
+/// Borrow failure falls back to the unscoped session rather than panicking:
+/// steering is an intervention on inference, and it must not be able to take
+/// down a forward. Same reasoning as `load_progress::report`'s `try_borrow`.
+fn with_current_key<R>(f: impl FnOnce(&SteerKey) -> R) -> R {
+    CURRENT_KEY.with(|c| match c.try_borrow() {
+        Ok(k) => f(&k),
+        Err(_) => f(&SteerKey::default()),
+    })
+}
+
+/// This thread's current steering session.
+pub fn current_key() -> SteerKey {
+    with_current_key(|k| k.clone())
+}
+
 type SessionMap = std::collections::HashMap<SteerKey, Session>;
 
 static SESSIONS: OnceLock<RwLock<SessionMap>> = OnceLock::new();
@@ -525,7 +586,13 @@ pub fn derive_directions(
 /// Single-vector block-boundary hook for the decode/AR path. `x` is the
 /// `[hidden]` residual after block `layer_idx`.
 pub fn maybe_steer_block(gpu: &mut Gpu, x: &GpuTensor, layer_idx: usize) -> HipResult<()> {
-    maybe_steer_block_for(&SteerKey::default(), gpu, x, layer_idx)
+    // Gate BEFORE touching the thread-local: on the unsteered path this must stay
+    // one relaxed atomic load and nothing else. Reading the key first would put a
+    // TLS access on every layer of every token for no reason.
+    if !is_active() {
+        return Ok(());
+    }
+    with_current_key(|key| maybe_steer_block_for(key, gpu, x, layer_idx))
 }
 
 /// [`maybe_steer_block`] against a specific session — the per-stream hook.
@@ -572,14 +639,12 @@ pub fn maybe_steer_block_batched(
     num_positions: usize,
     hidden: usize,
 ) -> HipResult<()> {
-    maybe_steer_block_batched_for(
-        &SteerKey::default(),
-        gpu,
-        x_batch,
-        layer_idx,
-        num_positions,
-        hidden,
-    )
+    if !is_active() {
+        return Ok(());
+    }
+    with_current_key(|key| {
+        maybe_steer_block_batched_for(key, gpu, x_batch, layer_idx, num_positions, hidden)
+    })
 }
 
 /// [`maybe_steer_block_batched`] against a specific session.
@@ -847,6 +912,78 @@ mod stack_tests {
             strength,
             layer_range: 0..1,
         }
+    }
+
+    #[test]
+    fn no_guard_means_the_unscoped_session() {
+        assert!(
+            current_key().is_unscoped(),
+            "a thread that never installed a key must behave exactly as before"
+        );
+    }
+
+    #[test]
+    fn the_guard_installs_and_restores() {
+        assert!(current_key().is_unscoped());
+        {
+            let _g = SteerKeyGuard::install(SteerKey::session("outer"));
+            assert_eq!(current_key().as_str(), "outer");
+            {
+                let _inner = SteerKeyGuard::install(SteerKey::session("inner"));
+                assert_eq!(current_key().as_str(), "inner");
+            }
+            assert_eq!(
+                current_key().as_str(),
+                "outer",
+                "the inner guard must restore the outer key, not clear it"
+            );
+        }
+        assert!(
+            current_key().is_unscoped(),
+            "leaving every guard returns the thread to the unscoped session"
+        );
+    }
+
+    /// A guard that is dropped by unwinding must still restore, or a forward that
+    /// failed partway would leave another stream's key installed for whatever the
+    /// thread ran next.
+    #[test]
+    fn the_guard_restores_on_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            let _g = SteerKeyGuard::install(SteerKey::session("doomed"));
+            assert_eq!(current_key().as_str(), "doomed");
+            panic!("forward failed partway");
+        });
+        assert!(
+            current_key().is_unscoped(),
+            "unwinding past a guard must not leave its key installed"
+        );
+    }
+
+    /// The key is per THREAD, so two threads forwarding different streams cannot
+    /// see each other's — the property that makes this scoped ambient state
+    /// rather than another process global.
+    #[test]
+    fn current_key_does_not_leak_between_threads() {
+        let _g = SteerKeyGuard::install(SteerKey::session("main-thread"));
+        let seen = std::thread::spawn(|| {
+            let before = current_key();
+            let _g = SteerKeyGuard::install(SteerKey::session("other-thread"));
+            (before, current_key())
+        })
+        .join()
+        .unwrap();
+
+        assert!(
+            seen.0.is_unscoped(),
+            "a fresh thread starts unscoped, not on this thread's key"
+        );
+        assert_eq!(seen.1.as_str(), "other-thread");
+        assert_eq!(
+            current_key().as_str(),
+            "main-thread",
+            "the other thread's guard must not disturb this one"
+        );
     }
 
     /// The M3 property: two streams hold their own specs simultaneously, and
