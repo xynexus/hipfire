@@ -248,12 +248,17 @@ for its file-scope `#![allow(dead_code)]` — are run by nothing in CI. Add
 `set_adapter_scale`, `unload_adapter` and `loaded_adapters` are hard-wired to the
 default key, so a keyed session's adapters cannot be listed, rescaled or unloaded.
 
-**`with_session` takes a write lock and inserts.** It is `entry(key.clone())
+**~~`with_session` takes a write lock and inserts.~~ FIXED** — it no longer
+creates: absent key returns `None`, so no key clone and no tombstone on the hot
+path. `load_adapter` keeps an explicit creating path (its contract is to start a
+session) but that is control-plane, once per load. Original description: It is `entry(key.clone())
 .or_insert(...)` under the exclusive lock, per layer per token — a String clone
 and a permanent map entry, not the "map lookup" the prose claims. Every distinct
 key ever passed leaves a tombstone.
 
-**`ACTIVE` is stored outside the lock.** `refresh_active_gate` drops its read
+**~~`ACTIVE` is stored outside the lock.~~ FIXED** — `refresh_active_gate_locked`
+takes the map by reference, so mutation + recompute + store are one critical
+section. Original description: `refresh_active_gate` drops its read
 guard before storing, so `clear_for(A)` racing `begin_apply_for(B)` can land a
 stale `false` and silently disable B's steering.
 

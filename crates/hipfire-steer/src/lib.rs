@@ -276,11 +276,36 @@ fn sessions() -> &'static RwLock<SessionMap> {
     SESSIONS.get_or_init(|| RwLock::new(SessionMap::new()))
 }
 
-/// Run `f` against `key`'s session, creating it as `Inactive` if absent.
-fn with_session<R>(key: &SteerKey, f: impl FnOnce(&mut Session) -> R) -> R {
+/// Run `f` against `key`'s session. `None` when that key has no session.
+///
+/// Deliberately does NOT create the entry. It used to be
+/// `entry(key.clone()).or_insert(Session::Inactive)`, which ran on the per-layer,
+/// per-token hot path and therefore (a) heap-cloned the key string on every call
+/// and (b) left a permanent map entry for every key ever *queried* — so the
+/// registry grew without bound from lookups alone, never mind sessions. A key
+/// with no session has nothing to do, which is exactly what `None` says.
+///
+/// Does not touch the activity gate: callers that only READ or fold state cannot
+/// change whether anyone is steering. Callers that can must use
+/// [`with_session_changing`], which recomputes it without releasing the lock.
+fn with_session<R>(key: &SteerKey, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
     let mut guard = sessions().write().unwrap();
-    let entry = guard.entry(key.clone()).or_insert(Session::Inactive);
-    f(entry)
+    guard.get_mut(key).map(f)
+}
+
+/// Like [`with_session`], but for mutations that can change whether ANY session
+/// is active — and it recomputes the gate while still holding the write lock.
+///
+/// The atomicity is the point. The gate was previously refreshed after the guard
+/// dropped, re-acquiring a read lock, so `clear_for(A)` racing `begin_apply_for(B)`
+/// could interleave as: A clears, B applies, B computes `any = true`, A computes
+/// `any = false`, A stores last. `ACTIVE` then reads false while B is Applying and
+/// B's steering silently does nothing — a lost intervention with no error.
+fn with_session_changing<R>(key: &SteerKey, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+    let mut guard = sessions().write().unwrap();
+    let out = guard.get_mut(key).map(f);
+    refresh_active_gate_locked(&guard);
+    out
 }
 
 /// Read-only view of `key`'s session. `None` when that key has none.
@@ -289,17 +314,24 @@ fn read_session<R>(key: &SteerKey, f: impl FnOnce(&Session) -> R) -> Option<R> {
     guard.get(key).map(f)
 }
 
-/// Recompute the `ACTIVE` gate from the whole map. Called under the caller's own
-/// lock discipline, after any mutation — a stream going inactive must not clear
-/// the gate while another stream is still steering.
-fn refresh_active_gate() {
-    let any = sessions()
-        .read()
-        .unwrap()
-        .values()
-        .any(|s| !matches!(s, Session::Inactive));
+/// Recompute the `ACTIVE` gate from the whole map, WHILE THE CALLER HOLDS THE
+/// WRITE LOCK.
+///
+/// Takes the map by reference rather than re-locking, so the mutation, the
+/// recomputation and the store are one critical section. Recomputed from the
+/// whole map rather than from the mutated entry, so one session going inactive
+/// cannot clear the gate while another is still steering.
+fn refresh_active_gate_locked(map: &SessionMap) {
+    let any = map.values().any(|s| !matches!(s, Session::Inactive));
     EPOCH.fetch_add(1, Ordering::Release);
     ACTIVE.store(any, Ordering::Release);
+}
+
+/// Number of live session entries. Test-only: the registry is an implementation
+/// detail, but "querying must not create entries" is a property worth asserting.
+#[cfg(test)]
+pub(crate) fn session_count() -> usize {
+    sessions().read().unwrap().len()
 }
 
 /// Serializes tests that mutate the process-global session (the apply control API
@@ -309,17 +341,10 @@ fn refresh_active_gate() {
 pub(crate) static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn set_session_for(key: &SteerKey, s: Session) {
-    // The write guard is dropped before refreshing the gate: the refresh takes a
-    // READ lock on the same map, and re-entering would deadlock this thread.
-    sessions().write().unwrap().insert(key.clone(), s);
-    refresh_active_gate();
-}
-
-/// Bump the epoch (so the per-thread GPU apply cache refreshes) and recompute the
-/// fast-path `ACTIVE` gate. For in-place mutations of the resident stack that
-/// don't replace the whole `Session` (load/scale/unload).
-fn mark_session_changed() {
-    refresh_active_gate();
+    let mut guard = sessions().write().unwrap();
+    guard.insert(key.clone(), s);
+    // Under the same guard: see `refresh_active_gate_locked`.
+    refresh_active_gate_locked(&guard);
 }
 
 // ── Control API ─────────────────────────────────────────────────────────────
@@ -411,7 +436,13 @@ pub fn load_adapter(
         scale,
         layer_range,
     };
-    with_session(&SteerKey::default(), |slot| match slot {
+    // This one CREATES: its contract is "starting a session if none is active",
+    // so it cannot use `with_session`, which deliberately no longer inserts.
+    // Creating here is fine — it is a control-plane op, not the hot path, so the
+    // key clone and the insert happen once per load rather than per token.
+    let key = SteerKey::default();
+    let mut guard = sessions().write().unwrap();
+    match guard.entry(key).or_insert(Session::Inactive) {
         Session::Applying(stack) => {
             stack.adapters.retain(|a| a.id != adapter.id);
             stack.adapters.push(adapter);
@@ -421,8 +452,8 @@ pub fn load_adapter(
                 adapters: vec![adapter],
             });
         }
-    });
-    mark_session_changed();
+    }
+    refresh_active_gate_locked(&guard);
 }
 
 /// Materialize and load a rank-1 residual [`lora::LoraAdapter`] (ablate-only) onto
@@ -473,7 +504,9 @@ pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
 /// Set a loaded adapter's live `scale` (intensity). Returns `false` if no adapter
 /// with `id` is loaded. Cheap — bumps the epoch so the GPU cache refreshes.
 pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
-    let found = with_session(&SteerKey::default(), |slot| match slot {
+    // `_changing` because a scale of 0 disables an adapter; the gate is
+    // recomputed under the same lock. `None` = no session for this key.
+    with_session_changing(&SteerKey::default(), |slot| match slot {
         Session::Applying(stack) => stack
             .adapters
             .iter_mut()
@@ -481,17 +514,14 @@ pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
             .map(|a| a.scale = scale)
             .is_some(),
         _ => false,
-    });
-    if found {
-        mark_session_changed();
-    }
-    found
+    })
+    .unwrap_or(false)
 }
 
 /// Remove an adapter by `id`. Returns `false` if absent. The session goes
 /// `Inactive` when the last adapter is unloaded.
 pub fn unload_adapter(id: &str) -> bool {
-    let (found, _empty) = with_session(&SteerKey::default(), |slot| match slot {
+    let (found, _empty) = with_session_changing(&SteerKey::default(), |slot| match slot {
         Session::Applying(stack) => {
             let before = stack.adapters.len();
             stack.adapters.retain(|a| a.id != id);
@@ -503,10 +533,8 @@ pub fn unload_adapter(id: &str) -> bool {
             (found, empty)
         }
         _ => (false, false),
-    });
-    if found {
-        mark_session_changed();
-    }
+    })
+    .unwrap_or((false, false));
     found
 }
 
@@ -544,8 +572,9 @@ pub fn clear_for(key: &SteerKey) {
 /// switch those two call sites to this function in the same change — otherwise a
 /// spec captured against one model silently applies to the next.
 pub fn clear_all() {
-    sessions().write().unwrap().clear();
-    refresh_active_gate();
+    let mut guard = sessions().write().unwrap();
+    guard.clear();
+    refresh_active_gate_locked(&guard);
 }
 
 /// Whether a capture or apply session is currently active.
@@ -637,6 +666,8 @@ pub fn maybe_steer_block_for(
         return Ok(());
     }
     let epoch = EPOCH.load(Ordering::Acquire);
+    // `None` (no session for this key) is the common case once keys exist and
+    // means there is nothing to apply — NOT an error, and no entry is created.
     with_session(key, |slot| -> HipResult<()> {
         match slot {
             Session::Inactive => {}
@@ -652,6 +683,7 @@ pub fn maybe_steer_block_for(
         }
         Ok(())
     })
+    .unwrap_or(Ok(()))
 }
 
 /// Batched block-boundary hook for the prefill path. `x_batch` is the
@@ -712,6 +744,7 @@ pub fn maybe_steer_block_batched_for(
         }
         Ok(())
     })
+    .unwrap_or(Ok(()))
 }
 
 // ── On-GPU apply (decode/AR path) ───────────────────────────────────────────
@@ -1027,6 +1060,71 @@ mod stack_tests {
             "main-thread",
             "the other thread's guard must not disturb this one"
         );
+    }
+
+    /// Querying a key must not CREATE it.
+    ///
+    /// `with_session` used to be `entry(key.clone()).or_insert(Inactive)` on the
+    /// per-layer/per-token hot path, so every key ever *looked at* left a
+    /// permanent entry — the registry grew from lookups, not from sessions.
+    #[test]
+    fn querying_an_absent_session_leaves_no_tombstone() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        assert_eq!(session_count(), 0);
+
+        for i in 0..50 {
+            let k = SteerKey::session(format!("ephemeral-{i}"));
+            assert!(!is_active_for(&k));
+            assert!(commit_capture_for(&k) == () || true); // exercises with_session
+            assert!(finish_capture_for(&k).is_none());
+        }
+        assert_eq!(
+            session_count(),
+            0,
+            "querying absent keys grew the registry — every lookup left a tombstone"
+        );
+
+        // A real session still lands, and clearing it is not a tombstone either.
+        let live = SteerKey::session("live");
+        begin_apply_for(&live, spec_of(1.0));
+        assert_eq!(session_count(), 1);
+        clear_all();
+        assert_eq!(session_count(), 0);
+    }
+
+    /// The gate must stay consistent with the map under concurrent control ops.
+    ///
+    /// ACTIVE was stored after the write guard dropped, so clear_for(A) racing
+    /// begin_apply_for(B) could land a stale `false` while B was still Applying —
+    /// B's steering silently a no-op.
+    #[test]
+    fn the_gate_stays_consistent_under_concurrent_control_ops() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        let b = SteerKey::session("B");
+        begin_apply_for(&b, spec_of(1.0));
+
+        // Hammer an unrelated session while B stays Applying throughout.
+        let t = std::thread::spawn(|| {
+            let a = SteerKey::session("A");
+            for _ in 0..500 {
+                begin_apply_for(&a, spec_of(0.5));
+                clear_for(&a);
+            }
+        });
+        for _ in 0..500 {
+            assert!(
+                is_active(),
+                "the gate went false while B was still Applying — a lost intervention"
+            );
+        }
+        t.join().unwrap();
+
+        assert!(is_active_for(&b), "B must still be applying");
+        assert!(is_active(), "and the gate must agree with the map");
+        clear_all();
+        assert!(!is_active());
     }
 
     /// The routing predicate must be about THIS request, not about the process.
