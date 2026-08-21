@@ -3670,6 +3670,42 @@ impl Gpu {
         )
     }
 
+    /// Calibration: per-channel activation SHAPE statistics into a `[4, K]` F32
+    /// accumulator — `Σx`, `Σ|x|`, `Σx⁴`, `max|x|` (rows 0..3). `x` is `[N, K]`
+    /// F32. Rows 0-2 ADD, row 3 takes a max, so the caller accumulates across
+    /// the corpus from a once-zeroed destination.
+    ///
+    /// Complements `calib_sumsq_reduce_f32`: that captures channel ENERGY (Σx²),
+    /// which is what AWQ-style weight scaling needs and is blind to the tail
+    /// shape that decides whether an ACTIVATION survives 4-bit quantization.
+    pub fn calib_actstats_reduce_f32(
+        &mut self,
+        x: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_actstats_reduce_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let acc_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 256u32;
+        let grid = ((k as u32) + block - 1) / block;
+        self.launch_kernargs(
+            "calib_actstats_reduce_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr x_ptr, ptr acc_ptr, i32 n_i, i32 k_i],
+        )
+    }
+
     /// Calibration: `H[i,j] += Σ_n x[n,i]·x[n,j]` (the K×K GPTQ Hessian, tiled
     /// GEMM accumulate). `x` is [N, K] F32; `H` is [K, K] F32 row-major, ADDED
     /// into (caller zeroes once, then accumulates across the calibration corpus).

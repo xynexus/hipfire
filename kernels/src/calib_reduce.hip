@@ -8,6 +8,7 @@
 //   calib_gather_rows_f32       dst[d+r,:] = src[sorted[s+r]/div,:]
 //   calib_sumsq_reduce_f32      acc[c]   += Σ_n x[n,c]²          (imatrix / diag(H))
 //   calib_hessian_outer_f32     H[i,j]   += Σ_n x[n,i]·x[n,j]    (GPTQ Hessian, K×K)
+//   calib_actstats_reduce_f32   acc[4,K] += Σx, Σ|x|, Σx⁴, max|x| (activation SHAPE)
 //
 // Both ADD into their destination so the caller accumulates across the whole
 // calibration corpus (one call per captured linear per forward). Destinations
@@ -176,4 +177,58 @@ extern "C" __global__ void calib_hessian_outer_weighted_f32(
     if (i < K && j < K) {
         H[(long long)i * K + j] += acc;
     }
+}
+
+// Per-channel activation SHAPE statistics, in one pass over the same staged rows.
+//
+// Everything the calibration captured until now was a second moment: Σx² per
+// channel (imatrix) and Σxxᵀ (Hessian). Those measure channel ENERGY, which is
+// what AWQ-style weight scaling wants, and they are the WRONG statistic for
+// deciding anything about ACTIVATION quantization. Two channels with identical
+// Σx² are indistinguishable in the imatrix and opposite in what 4-bit
+// activations do to them: one whose mass is spread evenly quantizes cleanly,
+// one whose mass sits in a single spike is destroyed. Second moments cannot tell
+// them apart, so W4A4 had no measurement to design against.
+//
+// These four do, and they are all one fused pass over rows already staged:
+//
+//   acc[0,c] += Σ_n x[n,c]      first moment — asymmetry, i.e. whether a
+//                               symmetric quantizer is even the right choice
+//   acc[1,c] += Σ_n |x[n,c]|    L1; with Σx² gives a peakedness ratio that needs
+//                               no fourth moment to be useful
+//   acc[2,c] += Σ_n x[n,c]⁴     with Σx² gives kurtosis, THE heavy-tail signal
+//   acc[3,c]  = max(acc, max|x|) range; with rms gives the crest factor, which
+//                               is directly "how many bits does this channel
+//                               need" — signed int4 has 15 levels, so a crest
+//                               factor of 3 is comfortable and 30 clips badly
+//
+// f32 accumulation is deliberate even for Σx⁴, whose dynamic range is the worst
+// of the four. These are corpus ESTIMATES whose sampling noise dwarfs f32
+// rounding, and RDNA runs f64 at ~1:16 — per the repo's precision rule, spend
+// width where the data needs it, and a calibration statistic does not.
+//
+// ADDs into its destination like the other two (max for the range row), so the
+// caller accumulates across the corpus; the destination is caller-zeroed once.
+// One thread owns a column, so the max needs no atomic.
+extern "C" __global__ void calib_actstats_reduce_f32(
+    const float* __restrict__ x,
+    float* __restrict__ acc,   // [4, K]
+    int N, int K
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= K) return;
+    float s = 0.0f, sa = 0.0f, s4 = 0.0f, mx = 0.0f;
+    for (int n = 0; n < N; n++) {
+        const float v = x[(long long)n * K + c];
+        const float a = fabsf(v);
+        const float v2 = v * v;
+        s  += v;
+        sa += a;
+        s4 += v2 * v2;
+        mx = fmaxf(mx, a);
+    }
+    acc[c]             += s;
+    acc[K + c]         += sa;
+    acc[2 * K + c]     += s4;
+    acc[3 * K + c]      = fmaxf(acc[3 * K + c], mx);
 }

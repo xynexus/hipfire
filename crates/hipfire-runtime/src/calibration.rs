@@ -170,7 +170,14 @@ struct Acc {
     /// Gate/up and Q/K/V aliases therefore reuse one GPU accumulator while the
     /// writer still emits one record per source tensor.
     output_names: Vec<String>,
-    diag: GpuTensor,      // [K]   Σx²  (imatrix)
+    diag: GpuTensor, // [K]   Σx²  (imatrix)
+    /// `[4, K]` activation SHAPE statistics: Σx, Σ|x|, Σx⁴, max|x|.
+    /// `diag` measures channel ENERGY, which is what AWQ-style weight scaling
+    /// wants and which says nothing about tail shape — two channels with equal
+    /// Σx² can be flat or a single spike, and 4-bit ACTIVATIONS treat those
+    /// oppositely. These four are what an A4 decision can actually be made
+    /// against. `None` only on the no-buffer weighted path below.
+    stats: Option<GpuTensor>,
     h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
     /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
     /// The GPU outer-product accumulates `Σxxᵀ` in f32; RDNA has no f64 matrix
@@ -196,6 +203,10 @@ impl Acc {
     fn flush_result(&mut self, gpu: &mut Gpu) -> Result<(), contracts::CalibError> {
         if self.buf_rows == 0 {
             return Ok(());
+        }
+        if let Some(stats) = self.stats.as_ref() {
+            gpu.calib_actstats_reduce_f32(&self.buf, stats, self.buf_rows, self.k)
+                .map_err(|e| contracts::CalibError::Runtime(e.to_string()))?;
         }
         gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
             .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
@@ -311,9 +322,32 @@ impl CalibCollector {
         } else {
             None
         };
+        // HIPFIRE_CALIB_NO_ACTSTATS=1 skips the shape statistics. They are
+        // [4, K] against the Hessian's [K, K], i.e. 0.08% at K=5120 — but on
+        // IMATRIX-ONLY tensors (MoE routed experts, where a per-expert Hessian
+        // does not fit at all) there is no [K,K] term to hide behind and this is
+        // 4x the imatrix. Calibration memory is the standing risk on this path,
+        // so the escape hatch exists.
+        let want_stats = std::env::var("HIPFIRE_CALIB_NO_ACTSTATS").is_err();
+        let stats = match if want_stats {
+            gpu.zeros(&[4, k], DType::F32).map(Some)
+        } else {
+            Ok(None)
+        } {
+            Ok(t) => t,
+            Err(error) => {
+                let _ = gpu.free_tensor(diag);
+                if let Some(h) = h {
+                    let _ = gpu.free_tensor(h);
+                }
+                let _ = gpu.free_tensor(buf);
+                return Err(contracts::CalibError::Runtime(error.to_string()));
+            }
+        };
         Ok(Acc {
             output_names,
             diag,
+            stats,
             h,
             h_f64,
             buf,
@@ -372,6 +406,9 @@ impl CalibCollector {
         let mut accs = self.accs.lock().unwrap();
         for (_, acc) in accs.drain() {
             let _ = gpu.free_tensor(acc.diag);
+            if let Some(stats) = acc.stats {
+                let _ = gpu.free_tensor(stats);
+            }
             if let Some(h) = acc.h {
                 let _ = gpu.free_tensor(h);
             }
@@ -412,6 +449,9 @@ impl CalibCollector {
                 Acc {
                     output_names: vec![tensor_name.to_string()],
                     diag,
+                    // Weighted path stages no rows, so the shape statistics have
+                    // nothing to reduce over; the imatrix is accumulated directly.
+                    stats: None,
                     h,
                     h_f64: None,
                     buf,
@@ -693,6 +733,7 @@ impl CalibCollector {
         // Build the index entries (payload sizes from `k`) + a parallel plan of
         // how to produce each payload, in the SAME order.
         enum Plan {
+            ActStats { key: String },
             Hessian { key: String, output_name: String },
             Imatrix { key: String },
             Extra(usize),
@@ -729,6 +770,16 @@ impl CalibCollector {
                 data_len: (acc.k * 4) as u64,
             });
             plan.push(Plan::Imatrix { key: key.clone() });
+            if acc.stats.is_some() {
+                entries.push(HfqStreamEntry {
+                    name: format!("{output_name}.actstats"),
+                    quant_type: 2,
+                    shape: vec![4, acc.k as u32],
+                    group_size: 0,
+                    data_len: (4 * acc.k * 4) as u64,
+                });
+                plan.push(Plan::ActStats { key: key.clone() });
+            }
         }
         for (j, t) in extra.iter().enumerate() {
             entries.push(HfqStreamEntry {
@@ -778,6 +829,22 @@ impl CalibCollector {
                             write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
                         }
                     }
+                }
+                Plan::ActStats { key } => {
+                    let acc = &accs[key];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let stats = gpu
+                        .download_f32(acc.stats.as_ref().expect("actstats planned"))
+                        .map_err(io_err)?;
+                    // Rows 0-2 are SUMS and are normalised per token so the
+                    // record does not depend on corpus size. Row 3 is a MAX and
+                    // must be written raw — scaling it would turn a range into a
+                    // meaningless per-token average.
+                    let mut out = stats.clone();
+                    for v in out[..3 * acc.k].iter_mut() {
+                        *v *= inv;
+                    }
+                    write_f32_scaled(w, &out, 1.0)
                 }
                 Plan::Imatrix { key } => {
                     let acc = &accs[key];
@@ -1665,6 +1732,9 @@ impl ActivationCapture for CalibCollector {
                 Acc {
                     output_names: vec![tensor_name.to_string()],
                     diag,
+                    // Weighted path stages no rows, so the shape statistics have
+                    // nothing to reduce over; the imatrix is accumulated directly.
+                    stats: None,
                     h,
                     h_f64,
                     buf,
