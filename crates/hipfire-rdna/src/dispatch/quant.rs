@@ -735,6 +735,44 @@ impl Gpu {
         }
     }
 
+    /// Launch one of the pure iu4 WMMA issue-rate probes. `chains` selects the
+    /// number of independent accumulator chains (1/2/4/8/16/32); `wave64`
+    /// selects which family. No memory is touched by the kernel.
+    pub fn wmma_iu4_noop(
+        &mut self,
+        out: &GpuTensor,
+        blocks: u32,
+        iters: i32,
+        chains: u32,
+        wave64: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (file, src) = if wave64 {
+            ("wmma_iu4_noop_w64", kernels::WMMA_IU4_NOOP_W64_SRC)
+        } else {
+            ("wmma_iu4_noop_w32", kernels::WMMA_IU4_NOOP_W32_SRC)
+        };
+        let name = format!("{file}_c{chains}");
+        self.ensure_kernel(file, src, &name)?;
+        let op = out.buf.as_ptr();
+        let mut it = iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &mut it as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[&name];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Compact-resident Opus W4A4 on the tuned **wave64** structure. Same block
     /// bytes as `gemm_oq_compact_iu4_wmma`; the A operand is the compact nibble
     /// plane read directly, which is already a dense `[M, K/2]` int4 array.

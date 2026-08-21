@@ -4302,6 +4302,12 @@ pub const GEMM_OQ_COMPACT_IU4X2_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4_W64_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4_w64.hip");
 
+/// Pure iu4 WMMA issue-rate probes (no memory at all), sweeping the number of
+/// INDEPENDENT accumulator chains. See `kernels/src/wmma_iu4_noop_w64.hip`.
+pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w64.hip");
+/// wave32 twin of the above.
+pub const WMMA_IU4_NOOP_W32_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w32.hip");
+
 /// Sparse overlay correction for the compact W4A4 path: adds the
 /// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
 /// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.
