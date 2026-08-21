@@ -2339,6 +2339,185 @@ fn qwen35_decode_one(
     Qwen35Step::Continue
 }
 
+/// Helper: render the JSON field fragment for `done` per PRD §3.1.
+/// Three states:
+///   - compressed: full metadata + alpha
+///   - bypass (non-Off, drafter loaded): alpha + bypass_reason
+///   - nothing: empty string so backwards-compatible clients see the
+///     original done shape
+/// Formats the `"pflash"` fragment of the `done` frame. Lifted out of
+/// `generate()` so `qwen35_finish_generation` can reach it; it is a plain
+/// capture-free `fn`, so moving it changes nothing.
+fn pflash_done_fragment(
+    s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    bypass_reason: &Option<String>,
+    alpha: Option<f32>,
+) -> String {
+    match (s, bypass_reason) {
+        (Some(cp), _) => format!(
+            r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
+            cp.source_tokens,
+            cp.kept_tokens,
+            cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+            alpha.unwrap_or(0.0),
+            cp.timings.score_ms,
+            cp.timings.total_ms,
+            cp.source_md5,
+            cp.compressed_md5,
+        ),
+        (None, Some(reason)) => format!(
+            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
+            reason.replace('"', "'"),
+            alpha.unwrap_or(0.0),
+        ),
+        (None, None) => String::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Finish a qwen35 generation: the ChatML `\n` trailer, the timing arithmetic,
+/// the evidence writes, the `done` frame, and the session restore.
+///
+/// Executor v2 §M3b0.5 — the `finish()` half. Moved verbatim out of
+/// [`generate`]'s qwen35 arm, so behaviour is byte-identical by construction.
+///
+/// **Takes `session` BY VALUE, and that is the point.** `qwen35_restore_or_error`
+/// consumes the session while `kv`/`dn` are disjoint `&mut` borrows *out of* it.
+/// That is exactly why M3b0's [`Qwen35Step::Failed`] has to hand a message back
+/// to its caller instead of unwinding in place. Owning the session here dissolves
+/// the constraint: `kv`/`dn` are derived internally and the restore is a direct
+/// call, so the whole teardown — including its own error path — lives in one
+/// place.
+fn qwen35_finish_generation(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    mut session: Qwen35RequestSessionState,
+    generated: usize,
+    nl: &[u32],
+    im_end_token: Option<u32>,
+    t0: Instant,
+    t_prefill: Instant,
+    prefill_tokens: usize,
+    evidence_dir: Option<&str>,
+    moe_router_histogram: DaemonMoeRouterHistogramGuard,
+    pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    pflash_bypass_reason: Option<String>,
+    pflash_alpha: Option<f32>,
+) {
+    let config = m.q35_config.as_ref().unwrap();
+    let weights = m.q35_weights.as_ref().unwrap();
+    let scratch = m.q35_scratch.as_ref().unwrap();
+    // Same disjoint field-path borrow the decode phase uses: kv and dn are
+    // distinct fields of session.sequence_state, so both &mut live at once.
+    let kv = session
+        .sequence_state
+        .kv
+        .as_mut()
+        .expect("qwen35 session always has KV");
+    let dn = session
+        .sequence_state
+        .recurrent
+        .as_mut()
+        .expect("qwen35 session has DeltaNet state")
+        .as_any_mut()
+        .downcast_mut::<qwen35::DeltaNetState>()
+        .expect("qwen35 session recurrent state is DeltaNetState");
+    // session.cursor.seq_pos is already the "next physical write slot" — advanced
+    // per-token in the decode loop above, and evicted back down to
+    // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
+
+    // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
+    // and DeltaNet state stay in sync with seq_pos.
+    if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
+        && !nl.is_empty()
+    {
+        for &t in nl {
+            if let Err(e) = qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                t,
+                session.cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+            ) {
+                write_error(
+                    stdout,
+                    id,
+                    &format!("qwen35 ChatML newline forward_scratch failed: {e:?}"),
+                );
+                qwen35_restore_or_error(stdout, id, m, gpu, session);
+                return;
+            }
+            session.cursor.seq_pos += 1;
+            if let Some(ref ev) = m.eviction {
+                if let Some(hipfire_runtime::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
+                {
+                    session.cursor.seq_pos = new_phys;
+                }
+            }
+            session.cursor.conversation_tokens.push(t);
+        }
+    }
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    if let Some(dir) = evidence_dir {
+        write_daemon_runtime_oneshot_evidence(
+            dir,
+            m,
+            gpu,
+            id,
+            prefill_tokens,
+            generated,
+            prefill_s,
+            decode_s,
+            prefill_s * 1000.0,
+        );
+        if let Some(hist) = moe_router_histogram.take() {
+            write_daemon_moe_router_evidence(dir, m, id, hist);
+        }
+    }
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0,
+        pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
+    );
+    let _ = stdout.flush();
+    qwen35_restore_or_error(stdout, id, m, gpu, session);
+}
+
 #[allow(clippy::too_many_arguments)]
 /// The default autoregressive text generate path for the qwen35 / qwen3 (llama)
 /// families, and the central text dispatcher: frames the prompt (chat template
@@ -2983,37 +3162,6 @@ pub fn generate(
     // Effective alpha for this request (from cfg if pflash_state is loaded).
     // PRD §3.1 lists alpha as a required done-object field.
     let pflash_alpha: Option<f32> = pflash_cfg.map(|c| c.alpha);
-    // Helper: render the JSON field fragment for `done` per PRD §3.1.
-    // Three states:
-    //   - compressed: full metadata + alpha
-    //   - bypass (non-Off, drafter loaded): alpha + bypass_reason
-    //   - nothing: empty string so backwards-compatible clients see the
-    //     original done shape
-    pub fn pflash_done_fragment(
-        s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
-        bypass_reason: &Option<String>,
-        alpha: Option<f32>,
-    ) -> String {
-        match (s, bypass_reason) {
-            (Some(cp), _) => format!(
-                r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
-                cp.source_tokens,
-                cp.kept_tokens,
-                cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                alpha.unwrap_or(0.0),
-                cp.timings.score_ms,
-                cp.timings.total_ms,
-                cp.source_md5,
-                cp.compressed_md5,
-            ),
-            (None, Some(reason)) => format!(
-                r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-                reason.replace('"', "'"),
-                alpha.unwrap_or(0.0),
-            ),
-            (None, None) => String::new(),
-        }
-    }
     if std::env::var("HIPFIRE_PFLASH_DEBUG").is_ok() {
         eprintln!(
             "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
@@ -3621,98 +3769,24 @@ pub fn generate(
             }
         }
         let generated = st.generated;
-        // session.cursor.seq_pos is already the "next physical write slot" — advanced
-        // per-token in the decode loop above, and evicted back down to
-        // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
-
-        // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
-        // and DeltaNet state stay in sync with seq_pos.
-        if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
-            && !nl.is_empty()
-        {
-            for &t in &nl {
-                if let Err(e) = qwen35::forward_scratch(
-                    gpu,
-                    weights,
-                    config,
-                    t,
-                    session.cursor.seq_pos,
-                    kv,
-                    dn,
-                    scratch,
-                ) {
-                    write_error(
-                        stdout,
-                        id,
-                        &format!("qwen35 ChatML newline forward_scratch failed: {e:?}"),
-                    );
-                    qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return;
-                }
-                session.cursor.seq_pos += 1;
-                if let Some(ref ev) = m.eviction {
-                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                    {
-                        session.cursor.seq_pos = new_phys;
-                    }
-                }
-                session.cursor.conversation_tokens.push(t);
-            }
-        }
-
-        let t_end = Instant::now();
-        let total_s = t_end.duration_since(t0).as_secs_f64();
-        let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-        let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-        let tok_s = if total_s > 0.0 {
-            generated as f64 / total_s
-        } else {
-            0.0
-        };
-        let prefill_tok_s = if prefill_s > 0.0 {
-            prefill_tokens as f64 / prefill_s
-        } else {
-            0.0
-        };
-        let decode_tok_s = if decode_s > 0.0 {
-            generated as f64 / decode_s
-        } else {
-            0.0
-        };
-        if let Some(dir) = evidence_dir {
-            write_daemon_runtime_oneshot_evidence(
-                dir,
-                m,
-                gpu,
-                id,
-                prefill_tokens,
-                generated,
-                prefill_s,
-                decode_s,
-                prefill_s * 1000.0,
-            );
-            if let Some(hist) = moe_router_histogram.take() {
-                write_daemon_moe_router_evidence(dir, m, id, hist);
-            }
-        }
-        let _ = writeln!(
+        qwen35_finish_generation(
+            m,
+            gpu,
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
             id,
+            session,
             generated,
-            tok_s,
+            &nl,
+            im_end_token,
+            t0,
+            t_prefill,
             prefill_tokens,
-            prefill_s * 1000.0,
-            prefill_tok_s,
-            decode_tok_s,
-            prefill_s * 1000.0,
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
+            evidence_dir,
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
         );
-        let _ = stdout.flush();
-        qwen35_restore_or_error(stdout, id, m, gpu, session);
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware. This is the `not qwen35`
         // fallback, but it's specifically the llama (arch 0/1) state — every
