@@ -202,6 +202,27 @@ The verdict requires wiring the correction into the lowered super-op executor
 (`run_layer_program`) — the scoped follow-up, to be gated by the product call (vs
 mq6).
 
+**Correction (2026-08-20): the premise of the deferral above is no longer true.**
+The hand path was NOT dead code needing resurrection — it was one missing block.
+The dense `DeltaNet` arm never applied `ffn_norm`, so its FFN consumed the
+attention-normalized, pre-attention residual; `FullAttn` and both MoE arms always
+had the norm, which is the entire "dense broken / MoE fine" asymmetry. Fixed in
+`docs/experiments/2026-08-20-qwen35-hand-dense-ffn-norm-fix.md`: hand-vs-lowered
+self-KLD is now **5.3e-10** (was 13.89), with byte-identical greedy output on
+dense and MoE artifacts.
+
+What this does and does not change:
+
+- The hand path is now a **legitimate baseline**. The "hand path can't produce the
+  clean ~0.084 verdict number" blocker above is lifted.
+- The mechanism numbers below (KLD 0.598 → 0.571, and the 0.598 vs lowered 0.158
+  divergence) were all measured **through the broken forward** and are therefore
+  not trustworthy as stated. They should be re-taken before informing the product
+  call.
+- It does **not** by itself deliver the verdict: the correction is still wired only
+  into the hand path, so either re-measure on the (now-correct) hand path, or
+  proceed with the lowered-executor wiring as originally scoped.
+
 **Mechanism IS proven**: in the hand path, corrections reduce KLD 0.598 → 0.571
 (real reduction; the math + kernels + loader are correct, consistent with the
 standalone `rq_real_gemv_check` proof). The remaining work for the shippable
