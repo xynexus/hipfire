@@ -39,29 +39,45 @@ value rather than lowering it.
 
 ## CORRECTED — occupancy, and why 240 VGPRs is acceptable
 
-gfx1151 is a **1024-VGPR/SIMD** part (gfx1100 is the 1536 one), wave32 granule
-16, wave64 granule 8, and **a wave64 costs 2x the register file for the same
-logical VGPR count**. So for wave64, `waves/SIMD = 512 / VGPRs`.
+> **This section was wrong when first written and is corrected here.** It read
+> gfx1151 as a 1024-VGPR/SIMD part, from `occupancy-and-limits.md`. That is a
+> **KB error**: `rocm-toolchain.md` states gfx1151 carries LLVM's
+> `Feature1536VGPRs` (gfx1150/1152/1153 do not), and the installed LLVM confirms
+> it — `libLLVM.so` contains `1536-physical-vgprs` / `has1536VGPRs`. Every wave
+> count below is now taken from the compiler
+> (`-Rpass-analysis=kernel-resource-usage`) rather than derived from a constant.
 
-Measured from the compiled `.hsaco`:
+gfx1151 has **1536 VGPRs/SIMD**, the same file as gfx1100 — not 1024. A wave64
+still costs 2x the register file for the same logical VGPR count, so for wave64
+`waves/SIMD = 768 / VGPRs`. The compiler agrees, and reports the same occupancy
+for this kernel on gfx1151 and gfx1100.
 
-| kernel | VGPRs | LDS | wave | waves/SIMD |
-|---|---|---|---|---|
-| compact iu4 **w64** | **240** | 20 kB | 64 | **2** |
-| reference `gemm_iu4_i32_wmma_lds` | **136** | 20 kB | 64 | **3** |
-| compact iu4 wave32 | 214 | 33 kB | 32 | 4 |
-| no-op probe | 9 | 0 | 64 | 16 (capped) |
+Compiler-reported, not derived:
 
-No spills anywhere. The compact kernel carries **104 more VGPRs than the
+| kernel | VGPRs | LDS | wave | waves/SIMD | (I had claimed) |
+|---|---|---|---|---|---|
+| compact iu4 **w64** | **240** | 20 kB | 64 | **3** | ~~2~~ |
+| reference `gemm_iu4_i32_wmma_lds` | **136** | 20 kB | 64 | **5** | ~~3~~ |
+| compact iu4 wave32 | 214 | 33 kB | 32 | **7** | ~~4~~ |
+| no-op probe | 9 | 0 | 64 | 16 (capped) | 16 |
+
+No spills anywhere. The compact kernel still carries **104 more VGPRs than the
 reference**, entirely the f32 accumulator set the per-group rescale forces, and
-that costs a third of the occupancy.
+it still costs occupancy — but the gap is 3 vs 5 waves, not 2 vs 3.
 
-**Tested rather than assumed:** WNt 8 -> 4 drops VGPRs 240 -> 166 and raises
-occupancy 2 -> 3 waves/SIMD, and it is SLOWER (1.4x vs 1.6x over wave32). Data
-reuse beats occupancy here, which is consistent with the no-op result — WMMA
-needs no latency hiding, and the register-staged double buffer already covers
-memory latency. **240 VGPRs at 2 waves/SIMD is the right operating point**, and
-"reduce registers to raise occupancy" would have been a wrong turn.
+**The tested conclusion is unaffected.** WNt 8 -> 4 drops VGPRs 240 -> 166,
+which raises occupancy from 3 to 4 waves/SIMD, and it is SLOWER (1.4x vs 1.6x
+over wave32). Data reuse beats occupancy here, consistent with the no-op result —
+WMMA needs no latency hiding, and the register-staged double buffer already
+covers memory latency. **240 VGPRs is the right operating point**, and "reduce
+registers to raise occupancy" would have been a wrong turn. Only the absolute
+wave counts were wrong; the ordering, the experiment, and the conclusion stand.
+
+**Lesson for using this KB:** where a doc derived from the ISA PDF disagrees with
+one derived from LLVM about a *target-specific* constant, the LLVM-derived one
+wins — the ISA PDF describes RDNA3.5 generically and does not enumerate per-part
+register files. Better still, ask the compiler: `-Rpass-analysis=kernel-resource-usage`
+prints VGPRs, spills, LDS and occupancy directly, and costs one compile.
 
 ## NEW — a wave32 advantage not previously considered
 
