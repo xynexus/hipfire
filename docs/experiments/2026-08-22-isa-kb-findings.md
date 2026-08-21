@@ -213,3 +213,118 @@ the same property that makes the rescale irreducible. It is worth revisiting for
 the **decode GEMV**, where B=1 makes the activation scale a single wave-uniform
 scalar per group — though that kernel is already at ~90% of the DRAM ceiling, so
 freeing VALU slots there would buy nothing today.
+
+---
+
+# Part 3: the rest of the KB
+
+Read the remaining documents: `matrix-and-dot-ops`, `dtypes-and-conversion`,
+`lds-and-crosslane`, `memory-and-sync`, `hazards-and-waitstates`,
+`rocm-toolchain`, and all of `gfx1151/`. Findings, in descending order of what
+they change.
+
+## 1. TOP CANDIDATE: `V_DOT8_I32_IU4` eats packed nibbles with no unpacking
+
+`dtypes §10.4` — "`V_DOT8_*_*4` consumes a packed dword of eight nibbles
+**directly, with no unpacking at all** — one instruction replaces 16 ops of
+§10.1 plus 8 FMAs... For W4A4/W4A8 MoE GEMV this is by far the best path on
+gfx1151."
+
+**`gemv_oq_compact_multicol` does exactly the unpacking this avoids.** It spends
+a `v_perm_b32` interleave plus OR-based 4->8-bit sign extension to widen nibbles,
+then feeds two `sudot4` (dp4a). Per 8 weights that is roughly perm + or + 2x dot4
+= 4 ops. Using `sudot8` on the raw nibbles instead: split the int8 activation into
+two int4 planes **once per activation** (amortised across every row), then 2x dot8
+= 2 ops in the inner loop. **~2x less inner-loop ALU.**
+
+Verified reachable — this compiles and selects correctly on gfx1151:
+
+```
+__builtin_amdgcn_sudot8(true, a, true, b, acc, false)  ->  v_dot8_i32_iu4 ... neg_lo:[1,1,0]
+__builtin_amdgcn_udot8(a, b, acc, false)               ->  v_dot8_u32_u4
+```
+
+Note the guard names: on gfx11/11.5 the builtins are `udot4`/`udot8`
+(`dot7-insts`) and `sudot4`/`sudot8` (`dot8-insts`). **`sdot4`/`sdot8` are
+`dot1-insts` and do not exist here** — reaching for them by CDNA muscle memory
+fails to compile, and using `udot*` on signed data is silently wrong.
+
+Worth doing because multicol sits at ~59 GB/s against a ~248 GB/s ceiling, i.e.
+~24% — it is not bandwidth-bound, so inner-loop ALU is the right thing to attack.
+
+## 2. Portability of the 240-VGPR w64 kernel — measured, not assumed
+
+The KB warns a kernel tuned to the 1536-VGPR budget "will spill on
+gfx1150/1152/1153 despite them all being RDNA 3.5". Compiled the actual kernel
+for each target:
+
+| target | VGPRs | waves/SIMD | spill |
+|---|---|---|---|
+| gfx1151 | 240 | 3 | 0 |
+| gfx1100 | 240 | 3 | 0 |
+| **gfx1150** | **252** | **2** | **0** |
+| **gfx1201** (RDNA4) | — | — | **hard compile error** |
+
+Milder than warned on gfx1150 — the allocator absorbs it by spending 12 more
+VGPRs and dropping a wave, with no spill. RDNA4 fails loudly rather than
+silently: `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w64` does not exist on gfx12,
+which needs the `_gfx12` builtins and a different fragment layout (RDNA4 packs
+distinct K-elements into the upper lane half instead of replicating). A loud
+failure is the good outcome; the dangerous port is the reverse direction.
+
+## 3. Confirmations that close open threads
+
+* **Cache bits are clean.** Zero `glc`/`slc`/`dlc` on any load in the kernel, so
+  everything is default LRU/CU-scope. This matters because `GLC=1` "forces a miss
+  *and invalidates the matching L0 line*" — it would have silently destroyed the
+  L1 reuse the MW row-tiling exists to get.
+* **The accumulate loop is NOP-free by the rule, not by luck.** "Matrix A/B can
+  overlap C as long as C is distinct from D. The typical case is that C and D are
+  the same." Same C=D set across many WMMAs with distinct A/B is explicitly the
+  safe case. Note `s_nop` would NOT satisfy the hazard where it does apply — the
+  filler must occupy the VALU pipe.
+* **The scalar FP unit still cannot help.** `S_CVT_F32_I32` and scalar F32 math do
+  exist on RDNA3.5 (not on gfx1100). But the rescale's weight scale indexes row
+  `m = 4g + (wtid>>4)` and the activation scale indexes a lane-varying column, so
+  neither is wave-uniform. Same property that makes the rescale irreducible.
+* **`S_CLAUSE` is not a lever.** A VALU clause locks the arbiter onto one wave,
+  which does not reduce instruction count in an issue-bound loop.
+
+## 4. LDS bank conflicts: real, and correctly ignored
+
+Bank index is `(byte_addr >> 2) & 31` over a 32-bank set. The fragment reads use
+a `BK/2 = 32`-byte row pitch = 8 DWORDs, so lanes 0-15 touch only banks
+{0,1},{8,9},{16,17},{24,25} — **a 4-way conflict**, on both the A and X reads.
+
+It is genuinely there, and it is genuinely not worth fixing: the loop has 14 LDS
+ops against ~590 issue slots. This is the ISA-level explanation for why
+"LDS bank-pad" is already recorded in our tuning notes as a tried dead end — the
+kernel is issue-bound, not LDS-bound, so removing the conflict buys nothing.
+(A wave64 DS op also costs a 2-cycle minimum vs wave32's 1.)
+
+## 5. Filed for later
+
+* **`V_CVT_OFF_F32_I4`** is a signed-INT4 -> F32 LUT converter present on all four
+  archs. It reads only `S0[3:0]`, so **no AND mask**, and the two's-complement sign
+  is handled by the LUT: 2 VALU ops per weight versus the conventional
+  shift+and+cvt+sign-fixup chain of 4-5. Output is `s4/16`, so fold the x16 into
+  the block scale once. We have no f32 INT4 dequant path today, but any future one
+  should start here — the KB notes it "is almost never used".
+* **Cross-lane reductions**: `row_xmask` (XOR butterfly in a row of 16) and
+  `row_share` are the RDNA reduction backbone; GCN's `row_bcast:15/31` and
+  `wave_shl/shr/rol/ror` were **removed**. `ds_bpermute` in wave64 only crosses 32
+  lanes on RDNA3/3.5, executing as two independent wave32s — any wave64 reduction
+  must handle the split by hand. And **DPP cannot be used on `V_DOT4`/`V_DOT8`/WMMA
+  or in VOPD**, so a cross-lane reduction cannot be fused into a dot.
+
+## 6. A caveat on our own bandwidth number
+
+`gfx1151/memory-system.md`: "Memory bandwidth: neither source gives a number...
+**measure it, and measure it *with a CPU load running*, because the CPU shares the
+same controller.**"
+
+Our 248.5 GB/s pure-read ceiling was measured with an idle CPU. During real
+serving the CPU is busy (tokenizer, sampler, daemon), so the bandwidth actually
+available to a decode GEMV is likely lower. That does not change any ranking, but
+it means "GEMV is at ~90% of the ceiling" is if anything an **under**-statement of
+how close to done that kernel is, and a re-measure under load would tighten it.
