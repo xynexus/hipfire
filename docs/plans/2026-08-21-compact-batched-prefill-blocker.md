@@ -625,3 +625,43 @@ B, and feed the EXISTING verify path (which this branch made cheap). Worth doing
 — but note it pays off on code and structured or repetitive output, not on the
 fresh explanatory prose this benchmark uses, so it would not demonstrate a win
 on THIS prompt even if it worked well.
+
+## After merging origin/master (the ffn_norm fix), and two more closed doors
+
+Merged `origin/master` mid-investigation, which brought
+`fix(qwen35): dense DeltaNet arm never applied ffn_norm` — a real correctness fix
+to `forward_scratch_layers`, the HAND decode path. That path matters here
+specifically because it is the ONE the DFlash verify uses (the lowered executor
+handles plain decode), so it was corrupting exactly the path spec-decode depends
+on.
+
+Re-measured after the merge:
+
+    per-token verify (hand path)   5.20 tok/s   tau 3.273   accept 0.468
+    batched verify                 8.52         tau 2.000   accept 0.286
+
+The fix moved per-token verify's tau slightly (3.375 -> 3.273) but did NOT
+restore acceptance under the BATCHED verify — expected, since the batched path is
+`forward_prefill_batch`, not the hand arm the fix touched. Plain decode, prefill
+and MoE are unchanged (15.1 / 42.5 / 54.9) and all three compact parity gates
+still PASS.
+
+Two more levers tried and closed:
+
+- **Draft width B.** With the multicol verify, B tokens cost ONE weight sweep
+  regardless of B, so raising B should be nearly free on the target side. It is
+  not tunable: `--adaptive-b-range 8:8 / 12:12 / 16:16 / 8:16` all report
+  `mean_B=8.00`. B is fixed by the DFlash2 drafter's block size, not by the
+  harness.
+- **DDTree.** Rejected compact outright ("unsupported target.output dtype"), the
+  same Opus-missing-from-an-admission-list pattern as everything else. Adding the
+  compact lm_head arm (rotate + `gemm_oq_compact_act_batched`, mirroring the MQ6
+  arm) made it RUN, but tau collapsed to 0.5 and got worse with budget
+  (0.76 -> 0.32 -> 0.18 tok/s at budget 16/32/60). The lm_head is not sufficient:
+  tree verify also needs the batched tree-verify forward, which compact declines.
+  REVERTED rather than shipped broken.
+
+`tau = 2.0000` and `accept_rate = 0.2857` (= 2/7) are EXACT in every batched-verify
+run across every prompt and length tried. That constancy is the signature of a
+systematically wrong capture, not statistical degradation, and is the sharpest
+remaining clue about the batched hidden export.
