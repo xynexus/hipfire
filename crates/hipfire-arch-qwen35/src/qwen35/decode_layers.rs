@@ -62,25 +62,30 @@ pub(crate) fn forward_scratch_layers(
     // bypasses it so the two paths can be run against each other at all; with the
     // flag unset behaviour here is unchanged.
     let steer_forces_hand = hipfire_steer::is_active() && !steer_lowered_enabled();
-    // `is_active()` first: it is a relaxed atomic load, and it is false on every
-    // decode token of every non-steering request — which is the path that must
-    // not pay for this trace.
+    let take_lowered = forward_lowered_enabled()
+        && gdn_tape_capture.is_none()
+        && !rq_hand_optin
+        && !steer_forces_hand;
+    // Emitted AFTER the decision and reporting the decision itself, not one of
+    // its four predicates. An earlier version printed above this `if` and chose
+    // its message from `steer_forces_hand` alone, so with HIPFIRE_FORWARD_LOWERED=0
+    // — the very configuration the comparison flag exists for — it announced
+    // "lowered path" while the hand arms ran. An instrument that cannot see three
+    // of the four inputs to the decision it reports is worse than none.
+    // `is_active()` is checked first so the unsteered path pays one atomic load.
     if hipfire_steer::is_active() && decode_backend_trace_enabled() {
         eprintln!(
             "  [decode] steer session active → {} path{}",
-            if steer_forces_hand { "hand" } else { "lowered" },
-            if steer_forces_hand {
-                ""
-            } else {
-                " (HIPFIRE_STEER_LOWERED=1)"
+            if take_lowered { "lowered" } else { "hand" },
+            match (take_lowered, steer_forces_hand, forward_lowered_enabled()) {
+                (true, _, _) => " (HIPFIRE_STEER_LOWERED=1)",
+                (false, true, _) => " (steer escape)",
+                (false, _, false) => " (HIPFIRE_FORWARD_LOWERED=0)",
+                _ => " (gdn tape or rq opt-in)",
             }
         );
     }
-    if forward_lowered_enabled()
-        && gdn_tape_capture.is_none()
-        && !rq_hand_optin
-        && !steer_forces_hand
-    {
+    if take_lowered {
         return forward_scratch_layers_lowered(
             gpu,
             weights,
