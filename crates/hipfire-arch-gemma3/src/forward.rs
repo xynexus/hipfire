@@ -778,6 +778,13 @@ fn forward_after_x_capture(
         gpu.add_f32(&state.x, &state.tmp, &state.x)?;
         // Block-boundary steering/abliteration hook (no-op unless a session is
         // active). `state.x` is the settled post-residual stream — fusion-proof.
+        // gemma3 has no lowered/hand split, so there is no routing escape here and
+        // none of the qwen35 M1-M4 staging applies. It does participate in
+        // per-stream steering: this un-keyed entry resolves the calling thread's
+        // SteerKey, so a forward run under a SteerKeyGuard is steered by that
+        // stream's spec and an un-guarded one by the unscoped session (today's
+        // behaviour). Any change to the hook's contract must count this arch —
+        // the plan docs said "qwen35 only" and were wrong.
         hipfire_steer::maybe_steer_block(gpu, &state.x, logical_layer_idx)?;
         // DSpark/DFlash extract-layer capture: append the settled residual at the
         // requested layers (ascending) to the host sink. See fn doc.
@@ -1047,6 +1054,8 @@ pub fn forward_prefill_batch(
         gpu.add_f32(x_batch, &tmp, x_batch)?;
         // Block-boundary steering/abliteration hook (no-op unless active).
         // Prefill convention: capture folds the last position, apply hits all.
+        // See the decode hook above: gemma3 is a full participant in per-stream
+        // steering despite carrying no routing escape of its own.
         hipfire_steer::maybe_steer_block_batched(gpu, x_batch, layer_idx, m, dim)?;
     }
 
