@@ -1622,11 +1622,17 @@ impl Gpu {
                 let nfb = n_full_blocks as i32;
                 let rb = rec_bytes as i32;
                 let bt = bits as i32;
+                // KVARN_NW waves per workgroup (mirrors the kernel's default).
+                // One wave per tile left the kernel at 6% of DRAM peak — it was
+                // parallelism-starved, not compute- or bandwidth-bound.
+                // LDS: [TILE_SIZE scores][NW wave slots][NW * head_dim V accums]
+                const KVARN_NW: usize = 4;
+                let lds = (TILE_SIZE + KVARN_NW + KVARN_NW * head_dim) * 4;
                 self.launch_kernargs(
                     tile_kernel,
                     [n_heads as u32, max_tiles as u32, chunk as u32],
-                    [32, 1, 1],
-                    (TILE_SIZE * 4) as u32,
+                    [(32 * KVARN_NW) as u32, 1, 1],
+                    lds as u32,
                     &kernargs![
                         ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr,
                         ptr pos_ptr, ptr bias_ptr,

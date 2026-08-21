@@ -39,7 +39,25 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-template <int MAXDPT>
+#ifndef KVARN_NW
+#define KVARN_NW 4              // waves per workgroup
+#endif
+
+// NW = WAVES PER WORKGROUP. This kernel used to launch ONE wave32 per (head,
+// tile, batch) and walk all `tile_len` (=128) tokens serially in it. Measured on
+// a 3000-token context that left it at 16.0 GB/s = 6% of the 248.5 GB/s DRAM
+// peak, 15.6x off its OWN bandwidth floor (4.61 MB moved, 18.5 us of traffic,
+// 288 us spent) — which is why KVarN lost to plain f32 attention (132.8 GB/s,
+// 53% of peak) despite reading 5.3x fewer bytes. Six ablations of the inner work
+// (dequant arithmetic, the cross-lane reduction, load coalescing, the whole V
+// accumulation) each changed the runtime by <0.1%: the kernel was never compute-
+// or bandwidth-bound, it was starved of parallelism.
+//
+// NW waves now split the token loop NW ways. The Q.K reduction stays INSIDE a
+// wave (shfl_xor over 32 lanes, unchanged), so only the phases that span the
+// whole tile need cross-wave work: the softmax max/sum, and the final V
+// accumulator sum.
+template <int MAXDPT, int NW>
 __device__ __forceinline__ void kvarn_tile_body(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
     const uint8_t* __restrict__ records,       // block-tiled KVarN K records
@@ -66,7 +84,9 @@ __device__ __forceinline__ void kvarn_tile_body(
     const int tile_id = blockIdx.y;
     const int local_bid = blockIdx.z;
     if (h >= n_heads) return;
-    const int tid = threadIdx.x;
+    const int lane = threadIdx.x & 31;         // lane within the wave: owns dims
+    const int wv = threadIdx.x >> 5;           // wave index: owns a token stripe
+    const int nthr = 32 * NW;
     // dims-per-thread: 32-thread block covers head_dim (128 -> 4, 256 -> 8). This
     // (not a hardcoded 8) is what makes the kernel correct for head_dim != 256.
     const int dpt = head_dim / 32;
@@ -100,12 +120,15 @@ __device__ __forceinline__ void kvarn_tile_body(
     const int v_row_stride    = total_blocks * 34;
     const int kv_dim          = n_kv_heads * head_dim;
 
+    // LDS: [tile_size scores][NW wave-reduction slots][NW * head_dim V accumulators]
     extern __shared__ float sdata[];
     float* scores = sdata;
+    float* wred = sdata + group;               // NW slots for cross-wave reduce
+    float* dacc = wred + NW;                   // NW * head_dim
 
     // Load Q for this batch position: `dpt` consecutive dims per thread.
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    const int d0 = tid * dpt;
+    const int d0 = lane * dpt;
     float mq[MAXDPT];                          // dpt <= MAXDPT (head_dim <= 32*MAXDPT)
     for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
@@ -146,7 +169,7 @@ __device__ __forceinline__ void kvarn_tile_body(
         // `group` is a multiple of cpb, so (idx & cpb_mask) does not depend on i:
         // idx = (d0+i)*group + t_local, hence the sub-byte shift is loop-invariant
         // and hoists out of the inner loop too.
-        for (int t_local = 0; t_local < tile_len; t_local++) {
+        for (int t_local = wv; t_local < tile_len; t_local += NW) {
             const int t = tile_start + t_local;
             const float sc = __half2float(s_col[t_local]);
             const int sh = (t_local & cpb_mask) * bits;
@@ -159,7 +182,7 @@ __device__ __forceinline__ void kvarn_tile_body(
             partial *= sc;
             for (int off = 16; off > 0; off >>= 1)
                 partial += __shfl_xor(partial, off);
-            if (tid == 0) {
+            if (lane == 0) {
                 float s = partial * scale_attn;
                 if (tree_mode && t >= block_start)
                     s += tree_bias[global_bid * block_cols + (t - block_start)];
@@ -169,7 +192,7 @@ __device__ __forceinline__ void kvarn_tile_body(
     } else {
         // Trailing partial block: f32 recent window, slot = token - n_full*GROUP.
         const int win_base = n_full_blocks * group;            // == tile_start
-        for (int t_local = 0; t_local < tile_len; t_local++) {
+        for (int t_local = wv; t_local < tile_len; t_local += NW) {
             const int t = tile_start + t_local;
             const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
             float partial = 0.0f;
@@ -178,7 +201,7 @@ __device__ __forceinline__ void kvarn_tile_body(
             }
             for (int off = 16; off > 0; off >>= 1)
                 partial += __shfl_xor(partial, off);
-            if (tid == 0) {
+            if (lane == 0) {
                 float s = partial * scale_attn;
                 if (tree_mode && t >= block_start)
                     s += tree_bias[global_bid * block_cols + (t - block_start)];
@@ -190,23 +213,31 @@ __device__ __forceinline__ void kvarn_tile_body(
 
     // ── Phase B: tile max ──
     float local_max = -1e30f;
-    for (int i = tid; i < tile_len; i += 32)
+    for (int i = threadIdx.x; i < tile_len; i += nthr)
         local_max = fmaxf(local_max, scores[i]);
     for (int off = 16; off > 0; off >>= 1)
         local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-    float tile_max = local_max;
+    if (lane == 0) wred[wv] = local_max;
+    __syncthreads();
+    float tile_max = wred[0];
+    #pragma unroll
+    for (int w = 1; w < NW; w++) tile_max = fmaxf(tile_max, wred[w]);
 
     // ── Phase C: exp + sum ──
     float local_sum = 0.0f;
-    for (int i = tid; i < tile_len; i += 32) {
+    for (int i = threadIdx.x; i < tile_len; i += nthr) {
         float e = expf(scores[i] - tile_max);
         scores[i] = e;
         local_sum += e;
     }
     for (int off = 16; off > 0; off >>= 1)
         local_sum += __shfl_xor(local_sum, off);
-    float tile_sum = local_sum;
+    __syncthreads();                            // scores[] rewritten above
+    if (lane == 0) wred[wv] = local_sum;
     __syncthreads();
+    float tile_sum = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) tile_sum += wred[w];
 
     // ── Phase D: V-weighted accumulation (Q8_0) — identical to the Q8 tile. ──
     float out_vec[MAXDPT];
@@ -225,7 +256,7 @@ __device__ __forceinline__ void kvarn_tile_body(
     const int bi0 = d0 / 32;
     const int bj0 = d0 % 32;
     const size_t vh_off = (size_t)(kv_head_blk + bi0) * 34;
-    for (int t_local = 0; t_local < tile_len; t_local++) {
+    for (int t_local = wv; t_local < tile_len; t_local += NW) {
         const float w = scores[t_local];
         const int t = tile_start + t_local;
         const unsigned char* vbh = v_cache + (size_t)t * v_row_stride + vh_off;
@@ -236,26 +267,38 @@ __device__ __forceinline__ void kvarn_tile_body(
         }
     }
 
+    // Each wave holds a partial V accumulator over its own token stripe; sum the
+    // NW of them. Lane L of every wave owns the same dims, so the reduction is a
+    // plain per-dim sum across the NW rows of `dacc`.
+    for (int i = 0; i < dpt; i++) dacc[wv * head_dim + d0 + i] = out_vec[i];
+    __syncthreads();
+
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
                         + tile_id * (2 + head_dim);
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         p[0] = tile_max;
         p[1] = tile_sum;
     }
-    for (int i = 0; i < dpt; i++)
-        p[2 + d0 + i] = out_vec[i];
+    if (wv == 0) {
+        for (int i = 0; i < dpt; i++) {
+            float acc = dacc[d0 + i];
+            #pragma unroll
+            for (int w = 1; w < NW; w++) acc += dacc[w * head_dim + d0 + i];
+            p[2 + d0 + i] = acc;
+        }
+    }
 }
 
 // head_dim <= 256 (dpt <= 8): the original entry point, byte-identical register
 // footprint (gemma3/qwen35 kvarn).
-extern "C" __launch_bounds__(32, 16) __global__ void attention_flash_kvarn_tile_batched(
+extern "C" __launch_bounds__(32 * KVARN_NW, 1) __global__ void attention_flash_kvarn_tile_batched(
     const float* __restrict__ q, const uint8_t* __restrict__ records,
     const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
     float* __restrict__ partials, const int* __restrict__ positions,
     const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
     int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
-    kvarn_tile_body<8>(q, records, window, v_cache, partials, positions, tree_bias,
+    kvarn_tile_body<8, KVARN_NW>(q, records, window, v_cache, partials, positions, tree_bias,
                        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
                        max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
                        rec_bytes, bits);
@@ -263,14 +306,14 @@ extern "C" __launch_bounds__(32, 16) __global__ void attention_flash_kvarn_tile_
 
 // head_dim == 512 (dpt == 16): gemma4 global layers. Lower min-blocks hint since
 // the register arrays double.
-extern "C" __launch_bounds__(32, 8) __global__ void attention_flash_kvarn_tile_batched_hd512(
+extern "C" __launch_bounds__(32 * KVARN_NW, 1) __global__ void attention_flash_kvarn_tile_batched_hd512(
     const float* __restrict__ q, const uint8_t* __restrict__ records,
     const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
     float* __restrict__ partials, const int* __restrict__ positions,
     const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
     int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
-    kvarn_tile_body<16>(q, records, window, v_cache, partials, positions, tree_bias,
+    kvarn_tile_body<16, KVARN_NW>(q, records, window, v_cache, partials, positions, tree_bias,
                         n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
                         max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
                         rec_bytes, bits);
