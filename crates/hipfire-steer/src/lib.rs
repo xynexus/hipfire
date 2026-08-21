@@ -429,6 +429,26 @@ pub fn load_adapter(
     scale: f32,
     layer_range: Range<usize>,
 ) {
+    load_adapter_for(
+        &SteerKey::default(),
+        id,
+        directions,
+        mode,
+        scale,
+        layer_range,
+    )
+}
+
+/// [`load_adapter`] against a specific session.
+#[allow(clippy::too_many_arguments)]
+pub fn load_adapter_for(
+    key: &SteerKey,
+    id: impl Into<String>,
+    directions: Vec<Vec<f32>>,
+    mode: SteerMode,
+    scale: f32,
+    layer_range: Range<usize>,
+) {
     let adapter = ResidentAdapter {
         id: id.into(),
         directions,
@@ -440,9 +460,8 @@ pub fn load_adapter(
     // so it cannot use `with_session`, which deliberately no longer inserts.
     // Creating here is fine — it is a control-plane op, not the hot path, so the
     // key clone and the insert happen once per load rather than per token.
-    let key = SteerKey::default();
     let mut guard = sessions().write().unwrap();
-    match guard.entry(key).or_insert(Session::Inactive) {
+    match guard.entry(key.clone()).or_insert(Session::Inactive) {
         Session::Applying(stack) => {
             stack.adapters.retain(|a| a.id != adapter.id);
             stack.adapters.push(adapter);
@@ -459,6 +478,11 @@ pub fn load_adapter(
 /// Materialize and load a rank-1 residual [`lora::LoraAdapter`] (ablate-only) onto
 /// the APPLY stack — the bridge from the serialized artifact to the runtime.
 pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
+    load_lora_adapter_for(&SteerKey::default(), adapter)
+}
+
+/// [`load_lora_adapter`] against a specific session.
+pub fn load_lora_adapter_for(key: &SteerKey, adapter: &lora::LoraAdapter) -> Result<(), String> {
     use lora::LoraTarget;
     if adapter.deltas.is_empty() {
         return Err("load_lora_adapter: adapter has no deltas".to_string());
@@ -491,7 +515,8 @@ pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
         // Residual form: A row = vᵀ = the unit direction.
         directions[layer(&d.target)] = d.a[0].clone();
     }
-    load_adapter(
+    load_adapter_for(
+        key,
         adapter.id.clone(),
         directions,
         SteerMode::Ablate,
@@ -504,9 +529,14 @@ pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
 /// Set a loaded adapter's live `scale` (intensity). Returns `false` if no adapter
 /// with `id` is loaded. Cheap — bumps the epoch so the GPU cache refreshes.
 pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
+    set_adapter_scale_for(&SteerKey::default(), id, scale)
+}
+
+/// [`set_adapter_scale`] against a specific session.
+pub fn set_adapter_scale_for(key: &SteerKey, id: &str, scale: f32) -> bool {
     // `_changing` because a scale of 0 disables an adapter; the gate is
     // recomputed under the same lock. `None` = no session for this key.
-    with_session_changing(&SteerKey::default(), |slot| match slot {
+    with_session_changing(key, |slot| match slot {
         Session::Applying(stack) => stack
             .adapters
             .iter_mut()
@@ -521,7 +551,12 @@ pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
 /// Remove an adapter by `id`. Returns `false` if absent. The session goes
 /// `Inactive` when the last adapter is unloaded.
 pub fn unload_adapter(id: &str) -> bool {
-    let (found, _empty) = with_session_changing(&SteerKey::default(), |slot| match slot {
+    unload_adapter_for(&SteerKey::default(), id)
+}
+
+/// [`unload_adapter`] against a specific session.
+pub fn unload_adapter_for(key: &SteerKey, id: &str) -> bool {
+    let (found, _empty) = with_session_changing(key, |slot| match slot {
         Session::Applying(stack) => {
             let before = stack.adapters.len();
             stack.adapters.retain(|a| a.id != id);
@@ -541,7 +576,14 @@ pub fn unload_adapter(id: &str) -> bool {
 /// `(id, scale)` for each loaded adapter (apply session only). Drives a
 /// `lora_list`-style introspection.
 pub fn loaded_adapters() -> Vec<(String, f32)> {
-    read_session(&SteerKey::default(), |slot| match slot {
+    loaded_adapters_for(&SteerKey::default())
+}
+
+/// [`loaded_adapters`] for a specific session. Without this, a keyed session's
+/// adapters could not be listed, rescaled or unloaded — `lora_list` reported
+/// nothing and the daemon's lora handlers silently addressed the wrong session.
+pub fn loaded_adapters_for(key: &SteerKey) -> Vec<(String, f32)> {
+    read_session(key, |slot| match slot {
         Session::Applying(stack) => stack
             .adapters
             .iter()
@@ -1060,6 +1102,55 @@ mod stack_tests {
             "main-thread",
             "the other thread's guard must not disturb this one"
         );
+    }
+
+    /// A keyed session's adapters must be listable, rescalable and unloadable.
+    ///
+    /// Before this, the whole adapter half of the API was hard-wired to the
+    /// default key with no `_for` variant, so a keyed session's stack was
+    /// invisible: `lora_list` reported nothing for it, and a scale or unload
+    /// aimed at it silently addressed the UNSCOPED session instead — mutating a
+    /// stack the caller never named.
+    #[test]
+    fn a_keyed_sessions_adapters_are_addressable() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        let k = SteerKey::session("stream-k");
+        let v = vec![1.0f32, 0.0, 0.0];
+
+        load_adapter_for(&k, "a1", vec![v.clone()], SteerMode::Steer, 0.5, 0..1);
+        load_adapter_for(&k, "a2", vec![v.clone()], SteerMode::Ablate, 1.0, 0..1);
+
+        let listed = loaded_adapters_for(&k);
+        assert_eq!(listed.len(), 2, "a keyed session's stack must be listable");
+        assert!(
+            loaded_adapters().is_empty(),
+            "and must NOT appear in the unscoped session"
+        );
+
+        assert!(set_adapter_scale_for(&k, "a1", 0.25));
+        assert_eq!(
+            loaded_adapters_for(&k)
+                .iter()
+                .find(|(id, _)| id == "a1")
+                .map(|(_, s)| *s),
+            Some(0.25),
+            "rescaling a keyed adapter must take effect on THAT session"
+        );
+        assert!(
+            !set_adapter_scale_for(&SteerKey::default(), "a1", 9.0),
+            "the unscoped session does not hold this adapter"
+        );
+
+        assert!(unload_adapter_for(&k, "a1"));
+        assert_eq!(loaded_adapters_for(&k).len(), 1);
+        assert!(unload_adapter_for(&k, "a2"));
+        assert!(
+            !is_active_for(&k),
+            "the session goes Inactive with its last adapter"
+        );
+
+        clear_all();
     }
 
     /// Querying a key must not CREATE it.
