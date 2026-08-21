@@ -4289,6 +4289,13 @@ pub const GEMM_OQ_COMPACT_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4_wmma.hip");
 
+/// Compact-resident Opus W4 with **8-bit activations carried as two iu4
+/// passes** (`x = 16*x_hi + x_lo`). The weight tile is loaded once and consumed
+/// by both passes, which is what keeps this well under 2x the 1-pass cost.
+/// See `kernels/src/gemm_oq_compact_iu4x2_wmma.hip`.
+pub const GEMM_OQ_COMPACT_IU4X2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_iu4x2_wmma.hip");
+
 /// Sparse overlay correction for the compact W4A4 path: adds the
 /// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
 /// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.

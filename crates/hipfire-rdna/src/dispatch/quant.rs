@@ -665,6 +665,76 @@ impl Gpu {
         }
     }
 
+    /// Compact-resident Opus W4 with 8-bit activations carried as TWO iu4
+    /// passes. `x_hi` is packed SIGNED int4, `x_lo` packed UNSIGNED int4, both
+    /// `[B, K/2]`; together they span int8 exactly and are recombined as
+    /// `16*hi + lo` in i32 before scaling.
+    ///
+    /// Does NOT apply the sparse weight overlay — same contract as the 1-pass
+    /// `gemm_oq_compact_iu4_wmma`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_wmma(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_hi: &GpuTensor,
+        x_lo: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_oq_compact_iu4x2_wmma: K % group != 0");
+        assert!(
+            group == 256 || group == 128,
+            "gemm_oq_compact_iu4x2_wmma: compact group must be 256 or 128 (got {group})"
+        );
+        self.ensure_kernel(
+            "gemm_oq_compact_iu4x2_wmma",
+            kernels::GEMM_OQ_COMPACT_IU4X2_WMMA_SRC,
+            "gemm_oq_compact_iu4x2_wmma",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xhp = x_hi.buf.as_ptr();
+        let xlp = x_lo.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let (mut gi, mut si) = (group as i32, block_stride as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xhp as *const _ as *mut c_void,
+            &xlp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        // Must match OQC4X2_NB / OQC4X2_MW. NB is HALVED against the 1-pass
+        // kernel because two live i32 accumulator sets double the register cost.
+        const NB: usize = 4;
+        const MW: usize = 16;
+        let grid_m = m.div_ceil(16 * MW) as u32;
+        let grid_b = batch_size.div_ceil(16 * NB) as u32;
+        let func = &self.functions["gemm_oq_compact_iu4x2_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [(32 * MW) as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Compact-resident Opus **W4A4** GEMM. Same block bytes as
     /// `gemm_oq_compact_grouped_wmma`, but the bulk nibbles go to
     /// `v_wmma_i32_16x16x16_iu4` raw and `x_i4` is packed signed int4

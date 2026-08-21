@@ -33,7 +33,7 @@ fn main() {
 
     println!("gemv_oq_compact_multicol at Qwen3.8-27B shapes (n_out={n_out}, stride={stride})");
     println!("weight bytes only; 233 GB/s is the measured achievable ceiling\n");
-    println!("  proj             M      K    B     iu8ms  iu8TOPS    iu4ms  iu4TOPS   speedup");
+    println!("  proj             M      K    B     iu8ms  iu8TOPS    iu4ms  iu4TOPS  speedup   [8-bit via 2 iu4 passes]");
 
     for &(name, m, k, b) in &[
         ("gate/up", 17408usize, 5120usize, 256usize),
@@ -83,6 +83,10 @@ fn main() {
         let xq: Vec<i8> = (0..b * k).map(|_| (rnd() % 255) as i8).collect();
         // Packed signed int4 activations, [B, K/2], byte = k_even | k_odd<<4.
         let x4: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
+        // Two digit planes for the 8-bit-via-2-passes arm (same total bytes as
+        // one int8 activation, which is the point).
+        let xhi: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
+        let xlo: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
@@ -116,6 +120,18 @@ fn main() {
         }
         gpu.device_synchronize().expect("sync");
         let ms4 = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let xhb = gpu.upload_raw(&xhi, &[xhi.len()]).expect("xhi");
+        let xlb = gpu.upload_raw(&xlo, &[xlo.len()]).expect("xlo");
+        gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xhb, &xlb, &xsb, &yb, m, k, b, GROUP, stride)
+            .expect("warm2p");
+        gpu.device_synchronize().expect("sync");
+        let t2p = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xhb, &xlb, &xsb, &yb, m, k, b, GROUP, stride)
+                .expect("run2p");
+        }
+        gpu.device_synchronize().expect("sync");
+        let ms2p = t2p.elapsed().as_secs_f64() * 1e3 / iters as f64;
         // Cost of the sparse overlay correction that makes the iu4 arm complete.
         gpu.gemv_oq_compact_overlay_correct(&wb, &x4b, &xsb, &yb, m, k, b, GROUP, stride)
             .expect("warmc");
@@ -130,14 +146,18 @@ fn main() {
         let tops4 = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms4 * 1e-3) / 1e12;
         // 2 ops per MAC, as TOPS is conventionally quoted for int8.
         let tops = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms * 1e-3) / 1e12;
+        let r2i8 = ms / ms2p;
+        let r2i4 = ms2p / ms4;
         println!(
-            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x  corr={msc:>6.3}ms ({:>4.1}%) net={:>5.2}x",
+            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x  corr={msc:>6.3}ms ({:>4.1}%) net={:>5.2}x  2p={ms2p:>7.3}ms {r2i8:>5.2}x-iu8 {r2i4:>5.2}x-1p",
             ms / ms4,
             100.0 * msc / ms4,
             ms / (ms4 + msc)
         );
         let _ = bytes;
         let _ = gpu.free_tensor(x4b);
+        let _ = gpu.free_tensor(xhb);
+        let _ = gpu.free_tensor(xlb);
         let _ = gpu.free_tensor(wb);
         let _ = gpu.free_tensor(xqb);
         let _ = gpu.free_tensor(xsb);
