@@ -666,7 +666,11 @@ impl Gpu {
             );
         }
 
-        const MAX_OVERLAYS: usize = 32;
+        // Must track OQC_MAX_OVERLAYS in the kernel. Raising it costs REGISTERS
+        // there, not just an unused bound: 32 measured 9.41 TOPS against 16's
+        // 10.24. 16 admits oq4.25++ (3), oq4.5++ (7) and the parity suite's
+        // N_out=16 cell at no cost over 8.
+        const MAX_OVERLAYS: usize = 16;
         let overlays = (block_stride - header) / 2;
         assert!(
             overlays <= MAX_OVERLAYS,

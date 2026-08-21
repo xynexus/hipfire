@@ -52,9 +52,21 @@ typedef int32_t __attribute__((ext_vector_type(8))) int32x8_t;
 typedef float   __attribute__((ext_vector_type(8))) float8_t;
 
 // Overlay entries held in registers per group. oq4.25++ carries 3 and oq4.5++
-// carries 7; the cap keeps the scan in registers. Blocks with more overlays than
+// carries 7, so 8 covers every shipped format. Blocks with more overlays than
 // this are rejected host-side by the dispatch contract, never silently clipped.
-#define OQC_MAX_OVERLAYS 32
+//
+// This was 32, and the extra headroom was NOT free: `ov_idx`/`ov_val` are
+// indexed by a runtime bound, so oversizing them costs registers (and spill)
+// rather than sitting unused. Measured on gate/up M=17408 K=5120 B=256:
+//
+//   cap 32   9.41 TOPS      cap 16  10.24      cap 8   10.22      cap 4  10.97
+//   overlay scan removed entirely: 10.88 — i.e. by cap 4 the SCAN itself is
+//   free and everything the cap cost was register pressure, not comparisons.
+//
+// The cliff is between 16 and 32, so 16 is chosen over 8: it costs nothing
+// against 8 and keeps `parity_gemm_oq_compact`'s N_out=16 cell, which covers a
+// representable format even though no shipped artifact uses more than 7.
+#define OQC_MAX_OVERLAYS 16
 
 // B-tiles handled by ONE workgroup. The weight tile — nibble loads, int4 decode
 // and the overlay scan — is done ONCE and reused across all of them.
