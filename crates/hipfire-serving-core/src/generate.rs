@@ -1190,6 +1190,7 @@ pub fn generate_multi(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
@@ -1515,7 +1516,7 @@ pub fn generate_multi(
     let cfg0 = SamplerConfig {
         temperature: temp,
         top_p,
-        top_k: 20,
+        top_k,
         repeat_penalty,
         repeat_window: repeat_buf_cap,
         presence_penalty,
@@ -1714,7 +1715,7 @@ pub fn generate_multi(
                 let cfg = SamplerConfig {
                     temperature: temp,
                     top_p,
-                    top_k: 20,
+                    top_k,
                     repeat_penalty,
                     repeat_window: repeat_buf_cap,
                     presence_penalty,
@@ -1802,7 +1803,7 @@ pub fn generate_multi(
         let cfg = SamplerConfig {
             temperature: temp,
             top_p,
-            top_k: 20,
+            top_k,
             repeat_penalty,
             repeat_window: repeat_buf_cap,
             presence_penalty,
@@ -1932,6 +1933,10 @@ struct Qwen35DecodeCfg<'a> {
     /// budget-alert KV headroom check.
     nl_len: usize,
     vocab_size: usize,
+    /// Candidates retained before nucleus sampling. Threaded from the request
+    /// (`0` = the backend's full candidate set); the daemon defaults it to 20,
+    /// which is the literal this replaced.
+    top_k: usize,
     /// Repeat window bounded by the GPU `repeat_buf` capacity.
     repeat_buf_cap: usize,
     /// Start of the repeat-penalty ngram scope: generated tokens only, never the
@@ -2203,7 +2208,7 @@ fn qwen35_decode_one(
             let sampler_cfg = SamplerConfig {
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
-                top_k: 20,
+                top_k: cfg.top_k,
                 repeat_penalty: cfg.repeat_penalty,
                 repeat_window: cfg.repeat_buf_cap,
                 presence_penalty: cfg.presence_penalty,
@@ -2311,7 +2316,7 @@ fn qwen35_decode_one(
     let sampler_cfg = SamplerConfig {
         temperature: cfg.temperature,
         top_p: cfg.top_p,
-        top_k: 20,
+        top_k: cfg.top_k,
         repeat_penalty: cfg.repeat_penalty,
         repeat_window: cfg.repeat_buf_cap,
         presence_penalty: cfg.presence_penalty,
@@ -2706,6 +2711,7 @@ pub fn generate(
             system_prompt,
             temp,
             top_p,
+            top_k,
             max_tokens,
             repeat_penalty,
             repeat_window,
@@ -3511,7 +3517,7 @@ pub fn generate(
         let cfg0 = SamplerConfig {
             temperature: temp,
             top_p,
-            top_k: 20,
+            top_k,
             repeat_penalty,
             // Window is bounded by the GPU repeat_buf capacity. Pre-PR3 code did this
             // bound by setting `scope_start = len - repeat_buf_cap`
@@ -3562,6 +3568,7 @@ pub fn generate(
             im_end_token,
             nl_len: nl.len(),
             vocab_size,
+            top_k,
             repeat_buf_cap,
             ngram_scope_start,
             attractor_pairs,
