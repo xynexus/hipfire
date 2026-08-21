@@ -177,9 +177,13 @@ describes.
 
 Note `load_progress` took the *thread-scoped* variant rather than a parameter,
 because its call sites are six arch loaders whose signatures were not worth
-touching. Steer has only two real forward-path call sites, so the parameter shape
-is available to it and is the stronger one — a thread-local would re-create the
-same "who owns this" ambiguity one layer down.
+touching. **Both sentences that once followed here were wrong and are retracted.**
+They said steer had "only two real forward-path call sites" so an explicit
+parameter was the stronger shape, and that a thread-local "would re-create the
+same 'who owns this' ambiguity". There are FIVE call sites (inventory in M3), and
+the parameter shape was measured at 155 external call sites and rejected; the
+thread-scoped guard is what landed, in #271. A scoped guard installed for one
+quantum and restored on drop is not the ambient state that argument feared.
 
 One transferable detail from the sampler work: its tests "used to share a
 `static SAMPLER_STATE` and cargo runs them on parallel threads", which is the same
@@ -233,9 +237,21 @@ against an identifier the executor then replaces.
 Measured surface for whenever it proceeds: **10** public functions in
 `hipfire-steer` touch `SESSION`/`ACTIVE`/`EPOCH` (the queue's "eighteen" counts
 doc mentions, as it notes); ~14 daemon call sites across `handlers/steer.rs`,
-`handlers/lora.rs`, `handlers/lifecycle.rs`; and 3 forward call sites —
-`decode_layers.rs`, `prefill_chunk.rs`, and `lowered.rs` as of M1. M3 must
-therefore stack on M1, since M1 adds the third.
+`handlers/lora.rs`, `handlers/lifecycle.rs`; and **five** forward call sites,
+across TWO arch crates:
+
+| crate | file | hook |
+|---|---|---|
+| `hipfire-arch-qwen35` | `qwen35/decode_layers.rs` | `maybe_steer_block` |
+| `hipfire-arch-qwen35` | `qwen35/lowered.rs` (as of M1) | `maybe_steer_block` |
+| `hipfire-arch-qwen35` | `qwen35/prefill_chunk.rs` | `maybe_steer_block_batched` |
+| `hipfire-arch-gemma3` | `src/forward.rs:781` | `maybe_steer_block` |
+| `hipfire-arch-gemma3` | `src/forward.rs:1057` | `maybe_steer_block_batched` |
+
+gemma3 was omitted from every earlier count in this file, despite the daemon's own
+comment naming it as an arch the hook is compiled into. It carries no lowered/hand
+split, so it has no routing escape and the M1-M4 staging does not apply to it —
+but it IS steered, and any change to the hook's contract must count it.
 
 ### M4 — retire the escape
 
