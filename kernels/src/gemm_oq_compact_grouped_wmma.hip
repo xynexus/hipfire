@@ -78,6 +78,24 @@ typedef float   __attribute__((ext_vector_type(8))) float8_t;
 // this kernel ran at ~3% of int8 peak.
 #define OQC_NB 8
 
+// ROW-TILES per workgroup, one per wave. Each wave owns a different 16-row tile
+// but they all consume the SAME OQC_NB b-tiles of X, so the activation reads are
+// issued by 8 waves on one CU against identical addresses and are served from L1
+// instead of going to memory 8 separate times.
+//
+// This is the other half of the redundancy story. OQC_NB fixed the WEIGHT
+// re-read; the ACTIVATION re-read was still 16:1 — a 16-row x 128-col workgroup
+// reads 128*K bytes of X against 8*K of weights, and with M/16 = 1088 row-tiles
+// X was fetched ~1088 times: ~1.4 GB of X traffic against 45 MB of weights.
+// Measured: removing the activation loads entirely was worth +70%, far more than
+// the nibble decode (+6%) or the overlay scan (+12%).
+//
+// No LDS and no barrier: the waves share through cache, so a wave whose row-tile
+// is past M can still early-return without deadlocking the others.
+#ifndef OQC_MW
+#define OQC_MW 16
+#endif
+
 static __device__ __forceinline__ float oqc_f16_scale(const uint8_t* block) {
     const _Float16 value = *(const _Float16*)block;
     return (float)value;
@@ -91,7 +109,7 @@ static __device__ __forceinline__ int oqc_sext4(int q) {
 // Fewer resident blocks than the old (32, 8): OQC_NB accumulators cost VGPRs,
 // and the kernel is redundancy-bound rather than occupancy-bound, so trading
 // occupancy for 1/OQC_NB of the weight traffic is the right side of the deal.
-__launch_bounds__(32, 2)
+__launch_bounds__(32 * OQC_MW, 1)
 extern "C" __global__ void gemm_oq_compact_grouped_wmma(
     const uint8_t* __restrict__ W,
     const int8_t*  __restrict__ X,
@@ -99,9 +117,14 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
     float*         __restrict__ Y,
     int M, int K, int B, int group, int block_stride
 ) {
-    const int tid  = threadIdx.x;
-    const int lane = tid & 15;
-    const int row_start   = blockIdx.x * 16;
+    const int tid   = threadIdx.x;
+    const int wave  = tid >> 5;
+    const int wlane = tid & 31;
+    const int lane  = wlane & 15;
+    // Half-of-wave selector for the C-fragment row mapping. Was `tid >> 4`,
+    // which is only correct while the workgroup is a single wave.
+    const int half  = wlane >> 4;
+    const int row_start   = (blockIdx.x * OQC_MW + wave) * 16;
     const int batch_start = blockIdx.y * (16 * OQC_NB);
     if (row_start >= M || batch_start >= B) return;
 
@@ -194,7 +217,7 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
         float sw[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const int m_row = row_start + 2 * j + (tid >> 4);
+            const int m_row = row_start + 2 * j + half;
             sw[j] = (m_row < M)
                 ? oqc_f16_scale(W + side_base
                       + ((long long)m_row * n_groups + g) * (long long)side_stride)
@@ -217,7 +240,7 @@ extern "C" __global__ void gemm_oq_compact_grouped_wmma(
         if (b_col >= B) continue;
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const int m_row = row_start + 2 * j + (tid >> 4);
+            const int m_row = row_start + 2 * j + half;
             if (m_row < M) {
                 Y[(long long)b_col * M + m_row] = facc[nb][j];
             }

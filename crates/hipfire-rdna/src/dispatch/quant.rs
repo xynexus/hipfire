@@ -701,7 +701,10 @@ impl Gpu {
             &mut gi as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let grid_m = m.div_ceil(16) as u32;
+        // Must match OQC_MW in the kernel: one workgroup covers OQC_MW row-tiles,
+        // one per wave, so they share the same X columns through L1.
+        const OQC_MW: usize = 16;
+        let grid_m = m.div_ceil(16 * OQC_MW) as u32;
         // Must match OQC_NB in the kernel: one workgroup covers OQC_NB b-tiles
         // so the decoded weight tile is reused instead of re-read per b-tile.
         const OQC_NB: usize = 8;
@@ -711,7 +714,7 @@ impl Gpu {
             self.hip.launch_kernel(
                 func,
                 [grid_m, grid_b, 1],
-                [32, 1, 1],
+                [(32 * OQC_MW) as u32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
