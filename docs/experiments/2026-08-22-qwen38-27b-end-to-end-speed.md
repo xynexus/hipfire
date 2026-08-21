@@ -60,25 +60,50 @@ it.
 default, not of serving configuration.** Any prefill number taken from
 `--battery speed` without an explicit `--kv-mode` is measuring the per-token path.
 
-## But KVarN does NOT fix it — and that part is NOT yet explained
+## RESOLVED: KVarN prefills per-token BY DESIGN
 
-Switching to `--kv-mode kvarn` passes the `kv_f32` guard, and prefill got
-*slightly worse* (14.3). More telling: with kvarn **neither**
-`HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1` nor the `HIPFIRE_KERNEL_TRACE=1`
-`pbs_eligible` line prints at all, while both print under fp32. The batched entry
-`forward_prefill_batch_with_pbs_opts` is therefore never reached under kvarn —
-something routes around it further upstream. Not identified; the two diagnostics
-above are the thread to pull.
+*(This section originally read "NOT yet explained". It is now located.)*
 
-This is consistent with the recorded KVarN batched-prefill defect (batched + KVarN
-is far less faithful than per-token), so a deliberate exclusion somewhere is
-plausible — but it has not been located and should not be assumed.
+`hipfire-serving-core/src/generate.rs:2923` declines batched prefill for KVarN
+outright, with the reason in place:
 
-## What this reorders
+```rust
+if kv.quant_kvarn {
+    // KVarN (and the deferred-hierarchical two-tier cache built on it)
+    // require the per-token attention dispatch (kv_cache_attention_dispatch):
+    // the batched forward_prefill_batch runs its own batched attention and
+    // never populates the KVarN window/records (nor the hier hot ring), so
+    // the prompt KV is wrong and decode degenerates. Prefill per-token via
+    // forward_scratch ... Slower prefill, but kvarn is a KV-memory mode, not
+    // a throughput one.
+    for &tok in &new_tokens { qwen35::forward_scratch(...) }
+```
 
-Every kernel result this session moves decode, which is already at 90% of its
-bound, or moves prefill GEMM throughput, which prefill is not currently using at
-all. **Prefill at 1.4% of its realistic ceiling is worth more than the entire
-remaining W4A4 GEMM headroom** (53.4 -> 105 TOPS would be ~2x on a path that is
-not running). Making batched prefill actually engage is the highest-value work
-outstanding on this model, ahead of any further kernel tuning.
+So `forward_prefill_batch_with_pbs_opts` is never reached under KVarN — which is
+exactly what the missing `pbs_eligible` / `prefill-eligible` traces showed. Not a
+bug; a deliberate correctness fallback.
+
+**Both KV modes therefore prefill per-token, for different reasons:**
+
+| KV mode | why prefill is per-token |
+|---|---|
+| f32 (eval default, oracle only) | `kv_f32` guard — f32 KV has only `BatchEq(1)`, so batched prefill would hit `MissingImpl` at resolve |
+| **kvarn (production)** | **explicitly declined — batched prefill never populates the KVarN window/records, so the prompt KV would be wrong** |
+
+That is why prefill measured ~15 tok/s in *every* configuration tried, with and
+without the CASK eviction cap.
+
+## The fix is well-defined, and the pieces already exist
+
+Batched prefill does not have to be incompatible with KVarN — the batched KVarN
+write path is already written and in use elsewhere in the same file:
+
+- `prefill_batch.rs:702` — `kv_cache_write_kvarn_window_routed_batched`
+- `prefill_batch.rs:864` — `kvarn_gather_k_tiles` + `kvarn_quantize_tile`
+
+What is missing is wiring those into the batched forward so it populates the
+window/records the way the per-token path does, at which point the
+`generate.rs:2923` fallback can be lifted. **That is the single highest-value
+piece of work outstanding on this model**: prefill is at 1.4% of its realistic
+ceiling, ~70x, against a decode that is already at 90% of its DRAM bound.
+
