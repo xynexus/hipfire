@@ -49,6 +49,21 @@ typedef float   __attribute__((ext_vector_type(8))) float8_t;
 #define OQC4_MW 16
 #endif
 
+// Stage the activation tile in LDS: the OQC4_MW waves in this workgroup all
+// consume the SAME OQC4_NB b-tiles, so without staging each wave re-issues the
+// identical global loads and the kernel stays activation-bound (ablating those
+// loads measured 2-3x: gate/up 20.58 -> 39.73 TOPS).
+//
+// One group's tile is OQC4_NB*16 columns x (group/2) bytes = 16 KB at NB=8,
+// G=256. PADDED by 4 bytes per column: at an unpadded 128-byte stride every lane
+// lands on the same LDS bank (128 B = 32 dwords, and there are 32 banks), which
+// is a 32-way conflict. 132 bytes = 33 dwords walks the banks instead.
+#ifndef OQC4_LDS
+#define OQC4_LDS 1
+#endif
+#define OQC4_COLS   (OQC4_NB * 16)
+#define OQC4_LDS_PAD 4
+
 static __device__ __forceinline__ int32x2_t oqc4_load_u4x16(const uint8_t* p) {
     return (int32x2_t){(int32_t)*(const uint32_t*)(p + 0),
                        (int32_t)*(const uint32_t*)(p + 4)};
@@ -74,7 +89,12 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
     const int half  = wlane >> 4;
     const int row_start   = (blockIdx.x * OQC4_MW + wave) * 16;
     const int batch_start = blockIdx.y * (16 * OQC4_NB);
-    if (row_start >= M || batch_start >= B) return;
+    // Only the workgroup-UNIFORM condition may early-return: `batch_start`
+    // depends solely on blockIdx.y, so every wave leaves together. `row_start`
+    // varies per wave, and returning on it would desert the __syncthreads()
+    // below and hang the rest of the workgroup. Out-of-range rows instead ride
+    // the existing `safe_a` clamp and are dropped by the `m_row < M` store guard.
+    if (batch_start >= B) return;
 
     const int a_row  = row_start + lane;
     const int safe_a = (a_row < M) ? a_row : (M - 1);
@@ -97,9 +117,31 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
         facc[nb] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     }
 
+#if OQC4_LDS
+    __shared__ uint8_t xt[OQC4_COLS * (128 + OQC4_LDS_PAD)];
+    const int lds_stride = nib_bytes + OQC4_LDS_PAD;
+    const int dwords_per_col = nib_bytes >> 2;
+    const int stage_total = OQC4_COLS * dwords_per_col;
+#endif
+
     for (int g = 0; g < n_groups; ++g) {
         const uint8_t* nibbles = W + ((long long)safe_a * n_groups + g) * nib_bytes;
         const int g_byte = g * nib_bytes;
+#if OQC4_LDS
+        // Barrier BEFORE the overwrite as well as after it, or a wave still
+        // reading group g-1 races the stage of group g.
+        __syncthreads();
+        for (int i = tid; i < stage_total; i += blockDim.x) {
+            const int col = i / dwords_per_col;
+            const int d   = i - col * dwords_per_col;
+            const int brow = batch_start + col;
+            const int safe_b = (brow < B) ? brow : (B - 1);
+            const uint32_t v = *(const uint32_t*)(
+                X + (long long)safe_b * x_stride + g_byte + d * 4);
+            *(uint32_t*)(xt + col * lds_stride + d * 4) = v;
+        }
+        __syncthreads();
+#endif
 
         int32x8_t iacc[OQC4_NB];
         #pragma unroll
@@ -112,7 +154,12 @@ extern "C" __global__ void gemm_oq_compact_iu4_wmma(
             const int32x2_t a = oqc4_load_u4x16(nibbles + kt * 8);
             #pragma unroll
             for (int nb = 0; nb < OQC4_NB; ++nb) {
+#if OQC4_LDS
+                const int32x2_t b =
+                    oqc4_load_u4x16(xt + (nb * 16 + lane) * lds_stride + kt * 8);
+#else
                 const int32x2_t b = oqc4_load_u4x16(x_prow[nb] + g_byte + kt * 8);
+#endif
                 iacc[nb] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
                     true, a, true, b, iacc[nb], false);
             }

@@ -15,8 +15,6 @@
 
 use hipfire_rdna::{DType, Gpu};
 
-const GROUP: usize = 256;
-
 fn f16_to_f32(bits: u16) -> f32 {
     let s = ((bits >> 15) & 1) as u32;
     let e = ((bits >> 10) & 0x1f) as u32;
@@ -48,8 +46,8 @@ fn sext4(v: u8) -> i32 {
 }
 
 /// Split planes: all nibble groups first, then all [f16 scale][overlay table].
-fn split_planes(blocks: &[u8], nblk: usize, stride: usize) -> Vec<u8> {
-    let nib = GROUP / 2;
+fn split_planes(blocks: &[u8], nblk: usize, stride: usize, group: usize) -> Vec<u8> {
+    let nib = group / 2;
     let side = stride - nib;
     let mut out = vec![0u8; nblk * stride];
     for b in 0..nblk {
@@ -71,32 +69,37 @@ fn main() {
     };
     let mut fail = 0usize;
     println!("gemm_oq_compact_iu4_wmma vs CPU oracle (BULK term, overlay excluded)\n");
-    println!("      M      K    B  N_out    max|rel|   verdict");
+    println!("      M      K    B  N_out    G    max|rel|   verdict");
 
-    for &(m, k, b, n_out) in &[
-        (16usize, 256usize, 16usize, 1usize),
-        (32, 512, 16, 3),
-        (256, 1024, 32, 3),
-        (512, 5120, 128, 3),
-        (272, 2560, 256, 7),
+    // GROUP is covered at both defined compact sizes: the LDS stride is derived
+    // from `group`, so G=128 is a distinct code path, not a smaller G=256.
+    for &(m, k, b, n_out, group) in &[
+        (16usize, 256usize, 16usize, 1usize, 256usize),
+        (32, 512, 16, 3, 256),
+        (256, 1024, 32, 3, 256),
+        (512, 5120, 128, 3, 256),
+        (272, 2560, 256, 7, 256),
+        (16, 128, 16, 1, 128),
+        (64, 512, 32, 3, 128),
+        (256, 2560, 128, 7, 128),
     ] {
-        let ng = k / GROUP;
-        let stride = 2 + GROUP / 2 + 2 * n_out;
+        let ng = k / group;
+        let stride = 2 + group / 2 + 2 * n_out;
         let nblk = m * ng;
         let mut blocks = vec![0u8; nblk * stride];
         for blk in 0..nblk {
             let off = blk * stride;
             let bits = (((14 + rnd() % 3) as u16) << 10) | (rnd() % 1024) as u16;
             blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
-            for i in 0..GROUP / 2 {
+            for i in 0..group / 2 {
                 blocks[off + 2 + i] = (rnd() & 0xff) as u8;
             }
-            let hdr = 2 + GROUP / 2;
-            let mut used = [false; GROUP];
+            let hdr = 2 + group / 2;
+            let mut used = vec![false; group];
             for s in 0..n_out {
-                let mut idx = (rnd() % GROUP as u32) as usize;
+                let mut idx = (rnd() % group as u32) as usize;
                 while used[idx] {
-                    idx = (idx + 1) % GROUP;
+                    idx = (idx + 1) % group;
                 }
                 used[idx] = true;
                 blocks[off + hdr + 2 * s] = idx as u8;
@@ -120,14 +123,14 @@ fn main() {
                 let sw = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
                 for bb in 0..b {
                     let mut acc = 0i32;
-                    for i in 0..GROUP {
+                    for i in 0..group {
                         let p = blocks[off + 2 + i / 2];
                         let qw = if i % 2 == 0 {
                             sext4(p & 0xf)
                         } else {
                             sext4(p >> 4)
                         };
-                        let xp = x4[(bb * k + g * GROUP + i) / 2];
+                        let xp = x4[(bb * k + g * group + i) / 2];
                         let qx = if i % 2 == 0 {
                             sext4(xp & 0xf)
                         } else {
@@ -140,12 +143,12 @@ fn main() {
             }
         }
 
-        let dev = split_planes(&blocks, nblk, stride);
+        let dev = split_planes(&blocks, nblk, stride, group);
         let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
         let xb = gpu.upload_raw(&x4, &[x4.len()]).expect("x4");
         let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
         let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
-        gpu.gemm_oq_compact_iu4_wmma(&wb, &xb, &xsb, &yb, m, k, b, GROUP, stride)
+        gpu.gemm_oq_compact_iu4_wmma(&wb, &xb, &xsb, &yb, m, k, b, group, stride)
             .expect("launch");
         let got = gpu.download_f32(&yb).expect("dl");
 
@@ -165,7 +168,7 @@ fn main() {
             fail += 1;
         }
         println!(
-            "  {m:>5} {k:>6} {b:>4} {n_out:>6}    {worst:>8.2e}   {}   (max|d|={max_abs:.3e} |ref|max={max_ref:.3e})",
+            "  {m:>5} {k:>6} {b:>4} {n_out:>6} {group:>4}    {worst:>8.2e}   {}   (max|d|={max_abs:.3e} |ref|max={max_ref:.3e})",
             if ok { "PASS" } else { "FAIL" }
         );
         let _ = gpu.free_tensor(wb);
