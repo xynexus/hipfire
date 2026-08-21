@@ -203,3 +203,65 @@ the 2-pass kernel does — its ratio is **3.6 against the 1-pass kernel's 4.8 at
 the same point**, because the epilogue amortises over twice the matrix work. So
 the 8-bit path is not merely affordable, it is *more efficient per instruction*
 than the 4-bit one.
+
+---
+
+# Why the compact W4A4 kernel is still ~2x short: it is the wrong SHAPE
+
+After the counter-driven fixes the compact iu4 GEMM sits at 32.9 / 27.2 / 34.2 /
+35.0 TOPS (gate-up / down / qkv / wo), i.e. ~33% of the 99.2 TOPS peak. Three
+successive instruction-level attempts then returned NOTHING:
+
+  * rewriting the rescale epilogue as vector expressions to coax packed FP32:
+    VALU 1.47G -> 1.49G, throughput unchanged. The compiler already emits it.
+  * hoisting the 64-bit scale-pointer multiplies out of the group loop: VALU
+    1.47G -> 1.39G (ratio 3.7 -> 3.4) and throughput unchanged — a 5% instruction
+    cut buying 0%, which is what says VALU issue is no longer binding.
+  * batching all NB LDS b-operand loads ahead of the WMMAs: unchanged. The
+    unrolled loop was already scheduled that way.
+
+Three nulls in a row is the signal to stop tuning and check the SHAPE.
+
+**This repo already contains a tuned iu4 GEMM that is ~2x faster at these exact
+shapes.** `gemm_iu4_i32_wmma_lds`, measured here today:
+
+| shape | compact iu4 (mine) | gemm_iu4_i32_wmma_lds | ratio |
+|---|---|---|---|
+| gate/up 17408x5120 | 32.9 | **62.8** (63% of peak) | 1.9x |
+| down 5120x17408 | 27.2 | **49.9** (50%) | 1.8x |
+| qkv 6144x5120 | 34.2 | **69.0** (70%) | 2.0x |
+| wo 5120x4096 | 35.0 | 30.8 | **0.88x** |
+
+Its recorded tuning arc explains the gap exactly, and my kernel lands precisely
+where that arc says a wave32 double-buffered design lands:
+
+    single-chain                        ~3.5k GOP/s
+    wave32 LDS + double-buffer 2x8      22.6k     <- the design I have
+    + wave64                            30.6k     (+35%)
+    + ds_load_b128 fragment reads       31.5k
+    + BK=64 K-strip, N-heavy BM64/BN256 49.7k
+
+So the missing levers are **wave64** (via the `// HIPFIRE_COMPILER_FLAGS:
+-mwavefrontsize64` source magic comment and `v_wmma_i32_16x16x16_iu4_w64`),
+**BK=64**, **N-heavy tiling** (BM=64, BN=256 — the opposite of my BM=256/BN=128),
+and **b128 fragment reads**. None is a tweak; each changes the lane mapping or the
+tile.
+
+Note `wo` INVERTS: mine is 14% faster there. BN=256 gives only one N-tile at
+B=256, and BM=64 over M=5120 is just 80 workgroups — the N-heavy shape starves on
+small M. So this is not "replace one with the other", it is a shape-dependent
+routing decision.
+
+## What the port actually involves
+
+`gemm_iu4_i32_wmma_lds` is the pure integer core: dense int4 A, dense int4 X,
+i32 out, no scales. Compact's BULK NIBBLES ARE dense int4 — the same bytes. So
+the port is narrow rather than a rewrite:
+
+1. address A from the compact split-plane nibble region instead of a dense plane;
+2. add the per-group f16 weight scale and per-(token, group) activation scale to
+   its epilogue;
+3. leave the sparse overlay where it is — a separate pass either way.
+
+That is the work worth doing, and it is worth ~2x on the three shapes that carry
+the FFN. Hill-climbing the wave32 design further is not.
