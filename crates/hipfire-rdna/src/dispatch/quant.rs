@@ -577,14 +577,43 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // B == 0 reached here before (the router admits `batch_size <= 16`) and
+        // launched a kernel whose column loop ran zero times. Keep that a no-op
+        // rather than letting the tightened assert below turn it into a panic.
+        if batch_size == 0 {
+            return Ok(());
+        }
         assert!(
-            batch_size <= 16,
-            "gemv_oq_compact_multicol: B must be <= 16"
+            (1..=16).contains(&batch_size),
+            "gemv_oq_compact_multicol: B must be in 1..=16"
         );
+        // B is a COMPILE-TIME parameter of the kernel: with a runtime B the
+        // column loop cannot unroll and `facc[b]` degrades to indexed-register
+        // access (`m0` + `v_movrels`/`v_movreld` per column) plus one
+        // `s_waitcnt lgkmcnt(0)` per column for its `Xs` load. One entry point
+        // per reachable B, so that path no longer exists.
+        let entry: &str = match batch_size {
+            1 => "gemv_oq_compact_multicol_b1",
+            2 => "gemv_oq_compact_multicol_b2",
+            3 => "gemv_oq_compact_multicol_b3",
+            4 => "gemv_oq_compact_multicol_b4",
+            5 => "gemv_oq_compact_multicol_b5",
+            6 => "gemv_oq_compact_multicol_b6",
+            7 => "gemv_oq_compact_multicol_b7",
+            8 => "gemv_oq_compact_multicol_b8",
+            9 => "gemv_oq_compact_multicol_b9",
+            10 => "gemv_oq_compact_multicol_b10",
+            11 => "gemv_oq_compact_multicol_b11",
+            12 => "gemv_oq_compact_multicol_b12",
+            13 => "gemv_oq_compact_multicol_b13",
+            14 => "gemv_oq_compact_multicol_b14",
+            15 => "gemv_oq_compact_multicol_b15",
+            _ => "gemv_oq_compact_multicol_b16",
+        };
         self.ensure_kernel(
             "gemv_oq_compact_multicol",
             kernels::GEMV_OQ_COMPACT_MULTICOL_SRC,
-            "gemv_oq_compact_multicol",
+            entry,
         )?;
         let (wp, xp, xsp, yp) = (
             w_blocks.buf.as_ptr(),
@@ -593,9 +622,12 @@ impl Gpu {
             y_f32.buf.as_ptr(),
         );
         let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
-        let grid = ((m as u32).div_ceil(8)).clamp(1, 2048);
+        // Each wave carries RW rows (mirrors the RW choice in the .hip entry
+        // macro), so the grid shrinks by RW or most waves launch with no rows.
+        let rw: u32 = if batch_size <= 8 { 4 } else { 2 };
+        let grid = ((m as u32).div_ceil(8 * rw)).clamp(1, 2048);
         self.launch_kernargs(
-            "gemv_oq_compact_multicol",
+            entry,
             [grid, 1, 1],
             [256, 1, 1],
             0,
