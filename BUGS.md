@@ -4,27 +4,44 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## [High] GREEDY decode is not reproducible across requests in one daemon process
+## [NOT A BUG — entry was wrong, corrected 2026-08-21] "GREEDY decode is not reproducible across requests"
 
-- The **same greedy request repeated 3× in one daemon process gives 3 different
-  outputs**. Greedy is deterministic argmax; it cannot legitimately vary.
-- Repro (qwen35, `~/.hipfire/models/qwen3.5-0.8b--oq4++.hfq`), one `load`, then
-  the same `{"temperature":0.0,"max_tokens":40}` generate three times with ids
-  `g1`/`g2`/`g3`, then `unload`. Token-stream md5 (first 12): `1764618420aa`,
-  `11845de02f29`, `9755690dde69`.
-- **Pre-existing and long-standing.** Reproduced byte-identically on a binary
-  built from `5bc7fa788` — before executor-v2 M3a and M3b0 — so it is not the
-  admission or decode-loop work. Found 2026-08-21 while A/B testing the `top_k`
-  fix, where it silently confounded the first harness.
-- Not conversation bleed: run 2 does not continue run 1's text. Runs 1 and 2
-  emit the identical prefix `"\nHmm, the user wants a"` and diverge one token
-  later, which reads as a small logit perturbation compounding — stale KV or
-  reused scratch across the session swap, not accumulated context.
-- Run #1 in a fresh process always matches an isolated single-generation run, so
-  the drift starts at the *second* request. That is the place to look.
-- **Consequence for methodology:** any A/B that puts several generations in one
-  daemon process is only valid if both sides run the identical sequence (the
-  confound then cancels). One generation per process otherwise.
+**Retracted. Greedy decode is reproducible; the original entry mistook designed
+multi-turn accumulation for nondeterminism.** Kept rather than deleted because
+the measurement is real and the trap is easy to fall into twice.
+
+- **What is actually happening.** A `generate` with no explicit `session_id`
+  falls back to `loaded_model_default_session_id`, i.e. the single shared
+  `QWEN35_LEGACY_SESSION_ID`. Consecutive session-less requests are therefore
+  turns of ONE conversation, and the qwen35 arm says so in its own words:
+  "multi-turn: prefill only the NEW turn tokens, continuing from
+  `session.cursor.seq_pos` (KV cache + DeltaNet state are cumulative)"
+  (`hipfire-serving-core/src/generate.rs`). Repeating a request is not repeating
+  an input — the input grows each time. Different output is CORRECT.
+- **The disproof.** The same prompt three times with DISTINCT `session_id`s
+  (`s1`/`s2`/`s3`) gives `1764618420aa` three times, byte-identical to an
+  isolated single-request run. Session isolation works. `{"type":"reset"}`
+  between requests likewise restores it, because it clears the conversation.
+- The `session.reset(gpu)` inside `generate` is only a **context-full overflow
+  guard** (`seq_pos + prompt_est + max_tokens > max_seq`), not a
+  new-conversation detector. That is deliberate.
+- Original (wrong) reading, for the record: same request 3× → `1764618420aa`,
+  `11845de02f29`, `9755690dde69`, read as "stale KV or reused scratch". The
+  numbers are right; the interpretation was not.
+
+**Two things that ARE real and came out of this:**
+
+1. **A/B methodology.** Any harness issuing several session-less generates to
+   one daemon is measuring a GROWING CONVERSATION, not a repeated request. Give
+   each request a distinct `session_id` (or one generation per process). A
+   multi-generation A/B is still valid if both sides run the identical sequence
+   — the accumulation then cancels — which is why the executor-v2 M3a/M3b0
+   parity runs were unaffected.
+2. **Arch-inconsistent semantics, unverified as intentional.** Under identical
+   client behaviour (no `session_id`), qwen35 accumulates a conversation while
+   llama does not: Qwen3-0.6B gives `a5de2e9d083a` three times for the same
+   repeated request. So the same protocol usage is stateful on one arch and
+   stateless on another. Worth deciding deliberately rather than by arch.
 
 ## [Low — re-record the baseline] oq4.25++ encoder changed at 8357081d3: +93% KLD on the random-init fixture, but −26% KLD on a REAL model
 - **RESOLVED 2026-08-13, and it reverses the naive reading.** Measured on
