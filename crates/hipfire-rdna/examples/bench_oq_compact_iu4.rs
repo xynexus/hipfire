@@ -116,12 +116,25 @@ fn main() {
         }
         gpu.device_synchronize().expect("sync");
         let ms4 = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // Cost of the sparse overlay correction that makes the iu4 arm complete.
+        gpu.gemv_oq_compact_overlay_correct(&wb, &x4b, &xsb, &yb, m, k, b, GROUP, stride)
+            .expect("warmc");
+        gpu.device_synchronize().expect("sync");
+        let t2 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemv_oq_compact_overlay_correct(&wb, &x4b, &xsb, &yb, m, k, b, GROUP, stride)
+                .expect("corr");
+        }
+        gpu.device_synchronize().expect("sync");
+        let msc = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
         let tops4 = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms4 * 1e-3) / 1e12;
         // 2 ops per MAC, as TOPS is conventionally quoted for int8.
         let tops = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms * 1e-3) / 1e12;
         println!(
-            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x",
-            ms / ms4
+            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x  corr={msc:>6.3}ms ({:>4.1}%) net={:>5.2}x",
+            ms / ms4,
+            100.0 * msc / ms4,
+            ms / (ms4 + msc)
         );
         let _ = bytes;
         let _ = gpu.free_tensor(x4b);

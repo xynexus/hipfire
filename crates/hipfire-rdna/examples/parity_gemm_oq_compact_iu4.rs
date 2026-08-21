@@ -116,7 +116,8 @@ fn main() {
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
 
-        let mut want = vec![0f32; b * m];
+        let mut want = vec![0f32; b * m]; // bulk only
+        let mut want_full = vec![0f32; b * m]; // bulk + sparse overlay
         for row in 0..m {
             for g in 0..ng {
                 let off = (row * ng + g) * stride;
@@ -139,6 +140,22 @@ fn main() {
                         acc += qw * qx;
                     }
                     want[bb * m + row] += acc as f32 * sw * xs[bb * ng + g];
+                    // The overlay REPLACES the bulk nibble and the loader zeroed
+                    // that nibble, so the full term is bulk + val*x[idx].
+                    let ohdr = 2 + group / 2;
+                    let mut ov = 0i32;
+                    for e in 0..n_out {
+                        let idx = blocks[off + ohdr + 2 * e] as usize;
+                        let val = blocks[off + ohdr + 2 * e + 1] as i8 as i32;
+                        let xp = x4[(bb * k + g * group + idx) / 2];
+                        let qx = if idx % 2 == 0 {
+                            sext4(xp & 0xf)
+                        } else {
+                            sext4(xp >> 4)
+                        };
+                        ov += val * qx;
+                    }
+                    want_full[bb * m + row] += (acc + ov) as f32 * sw * xs[bb * ng + g];
                 }
             }
         }
@@ -167,9 +184,37 @@ fn main() {
         if !ok {
             fail += 1;
         }
+        // GEMM + correction must reproduce the FULL reference, overlays included.
+        gpu.gemv_oq_compact_overlay_correct(&wb, &xb, &xsb, &yb, m, k, b, group, stride)
+            .expect("correct");
+        let got_full = gpu.download_f32(&yb).expect("dl2");
+        let mut fa = 0f32;
+        let mut fr = 0f32;
+        for i in 0..b * m {
+            fa = fa.max((got_full[i] - want_full[i]).abs());
+            fr = fr.max(want_full[i].abs());
+        }
+        let worst_full = fa / fr.max(1e-30);
+        if std::env::var("DBG").is_ok() && !(worst_full < 1e-5) {
+            let n = 6.min(b * m);
+            for i in 0..n {
+                println!(
+                    "      dbg[{i}] gemm={:.6e} +corr={:.6e} want_bulk={:.6e} want_full={:.6e}",
+                    got[i], got_full[i], want[i], want_full[i]
+                );
+            }
+        }
+        let ok_full = worst_full < 1e-5;
+        if !ok_full {
+            fail += 1;
+        }
         println!(
             "  {m:>5} {k:>6} {b:>4} {n_out:>6} {group:>4}    {worst:>8.2e}   {}   (max|d|={max_abs:.3e} |ref|max={max_ref:.3e})",
             if ok { "PASS" } else { "FAIL" }
+        );
+        println!(
+            "        + overlay correction                    {worst_full:>8.2e}   {}",
+            if ok_full { "PASS" } else { "FAIL" }
         );
         let _ = gpu.free_tensor(wb);
         let _ = gpu.free_tensor(xb);

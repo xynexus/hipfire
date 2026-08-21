@@ -604,6 +604,67 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Sparse overlay correction for the compact W4A4 path. ACCUMULATES into
+    /// `y_f32`, so it must run AFTER `gemm_oq_compact_iu4_wmma` on the same Y.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq_compact_overlay_correct(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "overlay_correct: K % group != 0");
+        let header = 2 + group / 2;
+        let overlays = (block_stride - header) / 2;
+        assert!(
+            overlays <= 16,
+            "overlay_correct: {overlays} overlays exceeds the 16 the kernel keeps"
+        );
+        self.ensure_kernel(
+            "gemv_oq_compact_overlay_correct",
+            kernels::GEMV_OQ_COMPACT_OVERLAY_CORRECT_SRC,
+            "gemv_oq_compact_overlay_correct",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let (mut gi, mut si) = (group as i32, block_stride as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        let waves = 8u32; // 256 threads, one wave per row
+        let grid_m = (m as u32).div_ceil(waves);
+        let grid_b = 1u32;
+        let func = &self.functions["gemv_oq_compact_overlay_correct"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [waves * 32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Compact-resident Opus **W4A4** GEMM. Same block bytes as
     /// `gemm_oq_compact_grouped_wmma`, but the bulk nibbles go to
     /// `v_wmma_i32_16x16x16_iu4` raw and `x_i4` is packed signed int4

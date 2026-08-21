@@ -4289,6 +4289,13 @@ pub const GEMM_OQ_COMPACT_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4_wmma.hip");
 
+/// Sparse overlay correction for the compact W4A4 path: adds the
+/// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
+/// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.
+/// See `kernels/src/gemv_oq_compact_overlay_correct.hip`.
+pub const GEMV_OQ_COMPACT_OVERLAY_CORRECT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_overlay_correct.hip");
+
 /// Opus Quant W8A8: dynamic per-token/group INT8 activation quantizer (f32 →
 /// signed int8 + per-group scales). Feeds `gemm_oq8_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq8.hip`.
