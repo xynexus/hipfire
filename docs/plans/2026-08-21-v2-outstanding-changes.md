@@ -83,9 +83,26 @@ Both remaining steps were blocked on state having nowhere to live. `#268` and
 `#268` lands the stream object only. Still to build:
 
 - **The march loop** — advance runnable streams a module at a time.
-- **Admission** — `PendingQueue` narrows from *running* a `Generate` frame to
-  *admitting* a stream and returning. `transport.rs` survives verbatim;
-  `batch_runner.rs` is deleted, not moved.
+- ~~**Admission**~~ **DONE — M3a.** A `Generate` frame admits a `RunningStream`
+  into a `StreamTable` on `DaemonState` and is retired out of it at the dispatch
+  site. `transport.rs` untouched, as the plan requires.
+
+  The seam is the **dispatch site** (`main.rs`'s `DaemonRequest::Generate` arm),
+  not inside `handlers::generate::text`. That handler has many early returns, and
+  a retire per exit path is the leak shape `ThreadSinkGuard` exists to prevent —
+  measured: the two frames that early-return on an unsupported `session_id`
+  retire correctly, and the table reads 0 after every request including those.
+
+  Two things this does NOT do. Admission is **unconditional**, not flag-gated:
+  gating it would leave the shape untested by every default run, and the flag's
+  job is selecting who *runs* an admitted stream. And `AdmitError` is currently
+  **unreachable** — the daemon is serial and retires before the next frame, so no
+  session can hold a live stream across requests until the march loop lands. Its
+  caller runs the frame anyway rather than refusing, because a refusal would be
+  user-visible.
+
+  `batch_runner.rs` is in `hipfire-server`, not the daemon; not touched. See the
+  correction in the M3 plan.
 - **The suspension boundary** — park/resume across a real forward, with output
   byte-identical to an uninterrupted run.
 - **Remove `#![allow(dead_code)]` from `stream.rs`.** It is there because the
@@ -185,6 +202,18 @@ fails `no-gpu-ci`. Four false alarms in one session. Either track it, or have th
 gate regenerate instead of erroring.
 
 ---
+
+## The trace and the table partition by different things (live, from M3a)
+
+The M3 plan flagged this as "reconcile explicitly, do not assume they agree."
+They do not. `exec_trace::stream_id_of` derives a trace stream from the **request
+id**; admission keys on the **session id, falling back to the request id**. For
+every frame that carries an explicit `session_id`, the two disagree — the trace
+splits one conversation across a stream per turn.
+
+Harmless today (nothing reads the table yet), and it is M3d that pays: its exit
+is three numbers read off that trace, per stream. Reconcile before measuring, or
+the numbers partition by turn rather than by stream.
 
 ## Wording in the plans that does not match the code
 

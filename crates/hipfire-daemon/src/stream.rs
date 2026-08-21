@@ -36,8 +36,88 @@
 #![allow(dead_code)]
 
 use hipfire_runtime::sampler::SamplerRng;
-use hipfire_scheduler::{WorkloadClass, WorkloadSpec};
+use hipfire_scheduler::{WorkloadClass, WorkloadResources, WorkloadSpec};
 use hipfire_steer::SteerSpec;
+
+use crate::state::DaemonState;
+
+/// Executor v2 master switch (`HIPFIRE_DAEMON_EXECUTOR=v2`), default off.
+///
+/// M3a admits **unconditionally**, and that is deliberate: gating admission on
+/// the flag would leave the shape untested by every default run, which is the
+/// one thing this stage exists to move. What the flag selects is who *runs* an
+/// admitted stream, and until the march loop lands (M3b) there is exactly one
+/// runner. So today it changes nothing — and [`admit_generate`] says so out
+/// loud, because a green run under the flag is not evidence the executor ran.
+pub(crate) fn executor_v2_enabled() -> bool {
+    std::env::var("HIPFIRE_DAEMON_EXECUTOR").is_ok_and(|v| v == "v2")
+}
+
+/// The session a `Generate` frame is admitted under.
+///
+/// Deliberately the SAME fallback `handlers::generate::text` applies — an
+/// explicit non-empty `session_id`, else the request id — so admission and the
+/// handler name the same conversation. Keying the table on anything else would
+/// invent a second identity for something the protocol already names.
+///
+/// The request id is read straight off `msg["id"]` here where the handler
+/// prefers the parsed `GenerateTextRequest::id`. Those agree: that field is a
+/// bare `String` with no serde default, so the parse can only succeed when
+/// `msg["id"]` is a string, and both derivations fall back to `"0"` otherwise.
+pub(crate) fn session_of(msg: &serde_json::Value) -> SessionKey {
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+    SessionKey::new(
+        msg.get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id),
+    )
+}
+
+/// Admit the stream a `Generate` frame belongs to, and give it the GPU.
+///
+/// `None` means admission was refused — that session already has a live stream.
+/// The caller **must still run the frame**: M3a moves the shape, not the
+/// behaviour, and a refusal here would be user-visible. `None` doubles as
+/// "nothing to retire".
+pub(crate) fn admit_generate(
+    state: &mut DaemonState,
+    msg: &serde_json::Value,
+) -> Option<StreamId> {
+    if executor_v2_enabled() {
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            tracing::warn!(
+                "HIPFIRE_DAEMON_EXECUTOR=v2: admission is live, but the march loop lands in \
+                 M3b — generate still runs inline"
+            );
+        });
+    }
+    let session = session_of(msg);
+    // priority and enqueued_at_ms are 0 because nothing schedules on them yet;
+    // the march loop is what gives them meaning.
+    let spec = WorkloadSpec::singleton(
+        session.as_str(),
+        WorkloadClass::TokenDecode,
+        0,
+        0,
+        WorkloadResources::default(),
+    );
+    // The rng is a slot: the daemon's decode path does not sample through
+    // `SamplerRng` yet, and greedy decode never consults it — which is why
+    // greedy baselines must not move when this lands.
+    let id = match state
+        .streams
+        .admit(session, spec, SamplerRng::from_entropy())
+    {
+        Ok(id) => id,
+        Err(AdmitError::SessionAlreadyLive(_)) => return None,
+    };
+    if let Some(stream) = state.streams.get_mut(id) {
+        stream.run();
+    }
+    Some(id)
+}
 
 /// Monotonic per-daemon stream identity — the executor's INTERNAL key.
 ///
@@ -634,6 +714,44 @@ mod tests {
 
         assert!(t.by_session_mut(&SessionKey::new("b")).unwrap().resume());
         assert_eq!(t.runnable(), vec![a, b], "an explicit resume puts it back");
+    }
+
+    /// Admission must name the conversation the HANDLER names. `session_of` is
+    /// a second copy of `handlers::generate::text`'s fallback (that one derives
+    /// the request id from the parsed request, which a unit test cannot reach
+    /// without a `DaemonState`), so the copy is what can drift — pin all four
+    /// branches of it.
+    ///
+    /// Drift is not cosmetic: a table keyed on a different string than the
+    /// handler uses would admit a second stream for a conversation that already
+    /// has one, which is the multi-turn KV corruption `SessionKey` exists to
+    /// prevent.
+    #[test]
+    fn session_of_matches_the_generate_handlers_fallback() {
+        use serde_json::json;
+
+        assert_eq!(
+            session_of(&json!({"id": "req-1", "session_id": "conv-9"})),
+            SessionKey::new("conv-9"),
+            "an explicit session_id wins over the request id"
+        );
+        assert_eq!(
+            session_of(&json!({"id": "req-1", "session_id": ""})),
+            SessionKey::new("req-1"),
+            "an EMPTY session_id falls back to the request id, as the handler's \
+             `.filter(|s| !s.is_empty())` does — not to an empty key that every \
+             unnamed request would collide on"
+        );
+        assert_eq!(
+            session_of(&json!({"id": "req-1"})),
+            SessionKey::new("req-1"),
+            "absent session_id falls back to the request id"
+        );
+        assert_eq!(
+            session_of(&json!({"prompt": "hi"})),
+            SessionKey::new("0"),
+            "no id at all lands on the handler's own \"0\" default"
+        );
     }
 
     /// Per-stream state is per stream — the property the M1d globals could not

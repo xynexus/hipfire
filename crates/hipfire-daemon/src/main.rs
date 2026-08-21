@@ -1460,7 +1460,22 @@ fn main() {
                 // arm this branch had already refactored into
                 // handlers::generate::text — only the reset is new behaviour.
                 hipfire_runtime::reset_generation_cancel();
-                handlers::generate::text(&mut daemon_state, &msg)
+                // §M3a: the frame ADMITS a stream, then runs it. Only the shape
+                // moves — the run is still inline and unchanged.
+                //
+                // The seam is HERE rather than inside `text` because that
+                // handler has many early returns, and a retire per exit path is
+                // exactly the leak shape `ThreadSinkGuard` exists to prevent.
+                //
+                // `None` means the session already had a live stream. It still
+                // runs: refusing would be user-visible, which M3a must not be.
+                let admitted = stream::admit_generate(&mut daemon_state, &msg);
+                handlers::generate::text(&mut daemon_state, &msg);
+                if let Some(id) = admitted {
+                    // Retire on the way out, so the table returns to empty. With
+                    // no march loop yet there is nobody to hand the stream to.
+                    daemon_state.streams.retire(id);
+                }
             }
 
             DaemonRequest::ReleaseSessions => {

@@ -86,6 +86,11 @@ pub(crate) struct DaemonState {
     /// cannot hold the queue while the executor is mid-dispatch. Taken after the
     /// current frame is popped, so `queue_depth` is what remains behind it.
     pub scheduler_stats: SchedulerStats,
+    /// Streams admitted by the executor. A `Generate` frame admits into this
+    /// table and is retired out of it on the way back; with the march loop
+    /// still to land (§M3b) it holds at most one stream, and only for the
+    /// duration of the inline run.
+    pub streams: crate::stream::StreamTable,
 }
 
 /// The response sink plus the id every frame written through it is stamped with.
@@ -213,6 +218,7 @@ impl DaemonState {
             resource_reservations: ResourceReservationManager::from_env(),
             out: Responder::to_stdout(),
             scheduler_stats: SchedulerStats::default(),
+            streams: crate::stream::StreamTable::default(),
         }
     }
 
