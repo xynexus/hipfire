@@ -161,6 +161,11 @@ gfx1103 qwen3_5_moe oq8 0.02028731 0.25
 gfx1103 qwen3_5_moe oq8++-calib 0.00814733 0.25
 gfx1103 qwen3_5_moe oq8+-calib 0.00814733 0.25
 gfx1103 qwen3_5_moe q8f16 0.17921833 0.25
+gfx1103 qwen3_5_moe_indexed oq4 0.06008187 0.25
+gfx1103 qwen3_5_moe_indexed oq4++-calib 0.04766144 0.25
+gfx1103 qwen3_5_moe_indexed oq4.25++-calib 0.03898237 0.25
+gfx1103 qwen3_5_moe_indexed oq8 0.00332721 0.25
+gfx1103 qwen3_5_moe_indexed oq8++-calib 0.00290585 0.25
 gfx1103 qwen3_5_vl hfq4 0.12904442 0.25
 gfx1103 qwen3_5_vl oq4 0.25591837 0.25
 gfx1103 qwen3_5_vl oq4++-calib 0.24739725 0.25
