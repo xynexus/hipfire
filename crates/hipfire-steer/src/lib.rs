@@ -559,6 +559,24 @@ pub fn is_active_for(key: &SteerKey) -> bool {
     read_session(key, |s| !matches!(s, Session::Inactive)).unwrap_or(false)
 }
 
+/// Whether the session THIS THREAD is currently forwarding is active.
+///
+/// Use this for any PER-REQUEST decision. [`is_active`] answers "is anyone
+/// steering" — correct as a hot-path gate, wrong as a predicate about one
+/// request, because once sessions are keyed it is true whenever ANY stream holds
+/// a spec. A routing decision built on it would send every unsteered request
+/// down whatever path a single steered stream requires.
+///
+/// Cheap in the common case: the global gate is checked first, so a process with
+/// nobody steering pays one atomic load and never touches the thread-local or
+/// the map.
+pub fn current_is_active() -> bool {
+    if !is_active() {
+        return false;
+    }
+    with_current_key(is_active_for)
+}
+
 // ── Direction derivation ────────────────────────────────────────────────────
 
 /// Derive per-block unit-norm contrastive directions:
@@ -1009,6 +1027,51 @@ mod stack_tests {
             "main-thread",
             "the other thread's guard must not disturb this one"
         );
+    }
+
+    /// The routing predicate must be about THIS request, not about the process.
+    ///
+    /// `is_active()` is true whenever any session holds a spec, so a routing
+    /// decision built on it sends unsteered requests down the steered path the
+    /// moment one stream is steering. `current_is_active()` is the per-request
+    /// question.
+    #[test]
+    fn current_is_active_is_per_request_not_global() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let a = SteerKey::session("steered");
+        begin_apply_for(&a, spec_of(1.0));
+
+        // Global gate: someone is steering.
+        assert!(
+            is_active(),
+            "the hot-path gate sees the process-wide answer"
+        );
+
+        // This thread is forwarding an UNSTEERED request.
+        assert!(
+            !current_is_active(),
+            "an unsteered request must not be told it is steering just because \
+             another stream is — that is the routing regression"
+        );
+
+        // Now this thread is forwarding the steered stream.
+        {
+            let _g = SteerKeyGuard::install(a.clone());
+            assert!(
+                current_is_active(),
+                "the steered stream must see its own session"
+            );
+        }
+        assert!(
+            !current_is_active(),
+            "and the answer reverts with the guard"
+        );
+
+        clear_all();
+        assert!(!current_is_active());
+        assert!(!is_active());
     }
 
     /// The M3 property: two streams hold their own specs simultaneously, and
