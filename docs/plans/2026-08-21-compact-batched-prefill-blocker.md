@@ -665,3 +665,37 @@ Two more levers tried and closed:
 run across every prompt and length tried. That constancy is the signature of a
 systematically wrong capture, not statistical degradation, and is the sharpest
 remaining clue about the batched hidden export.
+
+## CORRECTION: the batched capture is not "systematically wrong"
+
+The previous note read `tau = 2.0000` / `accept_rate = 0.2857` (= 2/7), exact in
+every batched-verify run, as the signature of a systematically wrong capture —
+specifically that early positions were right and later ones wrong. **That is
+disproven.** A per-row divergence profile of the last layer (batched vs
+per-token, qwen3.5-2b bf16, q8 KV) is FLAT:
+
+    row 0  7.55e-3    row 4  4.35e-3    row  8  1.01e-3
+    row 1  1.72e-2    row 5  6.21e-3    row  9  2.94e-3
+    row 2  8.14e-3    row 6  1.47e-3    row 10  2.44e-3
+    row 3  4.44e-3    row 7  4.06e-3    row 11  1.59e-2
+
+No positional structure. And against the fp32-KV reference the batched arm is the
+MORE faithful of the two (1.615e-2 vs per-token's 2.392e-2).
+
+So the batched export is not broken, not misaligned, and not less accurate. It is
+uniformly ~1e-2 DIFFERENT, and the exact-2/7 constancy is simply what a
+deterministic greedy pipeline does: every cycle takes the same path, so the
+accepted count repeats.
+
+### What this changes
+
+The remaining spec-decode gap is NOT "fix the batched hidden export". It is that
+**the drafter is brittle to which capture it receives** — a ~1e-2 shift in its
+input costs it a third of its acceptance (tau 3.27 -> 2.00). The target side is
+fine.
+
+That makes the remaining work a TRAINING task, not a kernel one: retrain or
+regularise the drafter against the capture it will actually be served, or make it
+robust to both. No amount of kernel work on this branch's side closes it, which
+is consistent with everything measured above and is the honest end state of
+Phase 2.

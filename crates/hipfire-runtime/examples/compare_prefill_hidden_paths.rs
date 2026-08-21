@@ -196,6 +196,25 @@ fn main() {
         None => println!("\nIDENTICAL across all layers (worst {worst_all:.2e})"),
     }
 
+    // PER-ROW profile of the last layer. If the batched export were merely
+    // noisier this would be flat; if it is positionally wrong — the signature of
+    // spec-decode accepting EXACTLY 2 tokens every cycle — early rows match and
+    // later ones do not.
+    if let (Some(x), Some(y)) = (a.last(), b.last()) {
+        println!("\nper-row divergence, last layer (batched vs per-token):");
+        let rows = (x.len() / dim).min(y.len() / dim).min(n);
+        for r0 in 0..rows.min(12) {
+            let (xs, ys) = (&x[r0 * dim..(r0 + 1) * dim], &y[r0 * dim..(r0 + 1) * dim]);
+            let sc = ys.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+            let d = xs
+                .iter()
+                .zip(ys)
+                .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
+                / sc;
+            println!("  row {r0:>3}  {d:.3e}");
+        }
+    }
+
     if let Some(r) = reference {
         let dist = |x: &Vec<Vec<f32>>| -> f32 {
             let mut w = 0f32;
