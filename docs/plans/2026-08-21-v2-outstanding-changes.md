@@ -204,6 +204,34 @@ Three cases, all found by grepping before building. Worth the habit.
 
 ---
 
+## M3 is BLOCKED on two prerequisites (found 2026-08-21, before writing code)
+
+Wiring the daemon steer handler to route per session was attempted and stopped.
+Both blockers were found by grepping first; building would have shipped a feature
+that looks complete and routes nowhere.
+
+**1. The batched decode path never consults steer.** `hipfire-serving-core`
+contains **zero** references to `hipfire_steer` — the fused multi-session decode
+backends do not call the hook at all. M3's exit is "two streams with different
+specs decode in ONE BATCHED STEP and each gets its own steering". That path
+cannot satisfy it, because it never asks. Reaching the exit needs per-row
+steering inside the fused batched decode, which is a materially larger change
+than the handler wiring and touches the fused kernels' row structure.
+
+**2. `StreamTable` is instantiated nowhere.** Not in `DaemonState`, not in any
+handler — grep returns zero. Nothing admits a stream, because the daemon still
+executes `Generate` inline; admission arrives with the executor (parent §M3).
+Resolving `session_id` through it today would resolve against a permanently empty
+table.
+
+So the ordering in the ledger was still too optimistic. The steer subsystem is
+ready — keyed sessions, keyed adapters, the thread guard, the keyed apply cache
+— but its two consumers are not. **M3 waits on the executor** (admission, so
+there are streams) **and on the batched decode path calling the hook** (so per-row
+specs are consulted). Neither is steer work.
+
+M4 (deleting the escape) waits on M3 and is unchanged.
+
 ## Found by the pre-merge audit (2026-08-21)
 
 A parallel audit before merging found one blocker and a set of accuracy defects,
