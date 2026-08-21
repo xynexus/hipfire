@@ -25,6 +25,20 @@
 
 #define OQCM_MAX_B 16
 
+// V_DOT4 with the same arch guard `gemm_dflash_oq_plain_ref.hip` uses: gfx11xx /
+// gfx12xx expose it as sudot4 with explicit per-operand signedness, older parts
+// as sdot4. gfx1151 has NO `dot1-insts`, so a bare `__builtin_amdgcn_sdot4`
+// fails to compile here — keep the guard rather than calling it directly.
+static __device__ __forceinline__ int oqcm_dot4_i8(int a, int b, int acc) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, acc, false);
+#else
+    return __builtin_amdgcn_sdot4(a, b, acc, false);
+#endif
+}
+
 __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_multicol(
     const uint8_t* __restrict__ W,
     const int8_t*  __restrict__ Xq,
@@ -59,12 +73,21 @@ __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_multicol(
             // 4 bytes = this lane's 8 weights. 32 lanes x 8 = 256 = one group.
             uint32_t w4;
             __builtin_memcpy(&w4, n_row + (long long)g * 128 + lane * 4, 4);
-            int8_t q[8];
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                q[2 * j]     = (int8_t)((int)((w4 >> (8 * j)) & 0xf) << 28 >> 28);
-                q[2 * j + 1] = (int8_t)((int)((w4 >> (8 * j + 4)) & 0xf) << 28 >> 28);
-            }
+
+            // Decode the 8 nibbles ONCE per group into two packed int8x4 for
+            // V_DOT4, instead of 8 scalar shift/mask/sign-extends re-done for
+            // every column. v_perm_b32 does the lo/hi interleave in one
+            // instruction: q order is [lo.b0, hi.b0, lo.b1, hi.b1, ...].
+            const uint32_t lo4 = w4 & 0x0F0F0F0Fu;
+            const uint32_t hi4 = (w4 >> 4) & 0x0F0F0F0Fu;
+            uint32_t p0 = __builtin_amdgcn_perm(hi4, lo4, 0x05010400u);
+            uint32_t p1 = __builtin_amdgcn_perm(hi4, lo4, 0x07030602u);
+            // Sign-extend 4->8 bits per byte by OR, not by subtract: each byte
+            // holds 0..15, so `x - 16` would BORROW into the next byte. Setting
+            // bits 4-7 where bit 3 is set is borrow-free (1 * 0xF0 = 240 < 256,
+            // so the multiply cannot carry across byte lanes either).
+            p0 |= ((p0 >> 3) & 0x01010101u) * 0xF0u;
+            p1 |= ((p1 >> 3) & 0x01010101u) * 0xF0u;
 
             // Overlays REPLACE the bulk nibble and the loader ZEROED it, so a
             // correction is val*x[idx] and needs no lane's registers. Lane `lane`
@@ -77,9 +100,11 @@ __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_multicol(
             const int elt = lane * 8;
             for (int b = 0; b < B; ++b) {
                 const int8_t* xq = Xq + (long long)b * K + (long long)g * 256;
-                int acc = 0;
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) acc += (int)q[i] * (int)xq[elt + i];
+                uint32_t x0, x1;
+                __builtin_memcpy(&x0, xq + elt, 4);
+                __builtin_memcpy(&x1, xq + elt + 4, 4);
+                int acc = oqcm_dot4_i8((int)p0, (int)x0, 0);
+                acc = oqcm_dot4_i8((int)p1, (int)x1, acc);
                 acc += oval * (int)xq[oidx];
                 // Tables deeper than one entry per lane (32 here) never occur in
                 // shipped artifacts, but must not be silently dropped.
@@ -93,14 +118,15 @@ __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_multicol(
                 // WMMA path accumulates the whole 256-wide group in int32 and
                 // then does one `+= (float)iacc * sw * sx` per group, and this
                 // now matches that order exactly.
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
                 facc[b] += (float)acc * sw * Xs[(long long)b * ng + g];
             }
         }
 
-        // Every lane holds the same facc after the per-group butterfly, so no
-        // final reduction is needed.
+        // ONE reduction per row instead of one per (group, column).
+        for (int b = 0; b < B; ++b) {
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) facc[b] += __shfl_xor(facc[b], off);
+        }
         if (lane == 0) {
             for (int b = 0; b < B; ++b) Y[(long long)b * M + row] = facc[b];
         }
