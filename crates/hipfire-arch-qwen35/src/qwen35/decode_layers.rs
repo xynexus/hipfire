@@ -61,7 +61,13 @@ pub(crate) fn forward_scratch_layers(
     // per-stream state has landed (M3) — M4 deletes it. `HIPFIRE_STEER_LOWERED=1`
     // bypasses it so the two paths can be run against each other at all; with the
     // flag unset behaviour here is unchanged.
-    let steer_forces_hand = hipfire_steer::is_active() && !steer_lowered_enabled();
+    // PER-REQUEST, deliberately not `is_active()`. Once sessions are keyed,
+    // `is_active()` means "ANY session is active", so using it here would force
+    // every unsteered request onto the hand path the moment one stream held a
+    // spec — a routing regression that no single-stream test would show.
+    // `current_is_active()` asks whether THIS forward's session is steering, and
+    // still short-circuits on the same global gate when nobody is.
+    let steer_forces_hand = hipfire_steer::current_is_active() && !steer_lowered_enabled();
     let take_lowered = forward_lowered_enabled()
         && gdn_tape_capture.is_none()
         && !rq_hand_optin
@@ -73,7 +79,7 @@ pub(crate) fn forward_scratch_layers(
     // "lowered path" while the hand arms ran. An instrument that cannot see three
     // of the four inputs to the decision it reports is worse than none.
     // `is_active()` is checked first so the unsteered path pays one atomic load.
-    if hipfire_steer::is_active() && decode_backend_trace_enabled() {
+    if hipfire_steer::current_is_active() && decode_backend_trace_enabled() {
         eprintln!(
             "  [decode] steer session active → {} path{}",
             if take_lowered { "lowered" } else { "hand" },
