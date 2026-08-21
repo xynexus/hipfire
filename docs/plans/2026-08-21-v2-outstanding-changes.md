@@ -9,7 +9,7 @@ order that matters, and because several items below were discovered by tripping
 over them rather than by reading a plan — those are exactly the ones that get
 rediscovered expensively.
 
-Last updated 2026-08-21, against `master` at `7b30c7209`.
+Last updated 2026-08-21, against `master` at `7b30c7209`. Six PRs open.
 
 ---
 
@@ -21,6 +21,8 @@ Last updated 2026-08-21, against `master` at `7b30c7209`.
 | [#267](https://github.com/xynexus/hipfire/pull/267) | P1 — load-progress sink scoped to the loading thread | green, mergeable |
 | [#268](https://github.com/xynexus/hipfire/pull/268) | `RunningStream`, `StreamId`, `SessionKey`, `StreamTable` | green, mergeable |
 | [#269](https://github.com/xynexus/hipfire/pull/269) | `hipfire-steer` per-session state (`SteerKey`, keyed registry) | green, mergeable |
+| [#270](https://github.com/xynexus/hipfire/pull/270) | this ledger | docs only |
+| [#271](https://github.com/xynexus/hipfire/pull/271) | P2/M3 forward-side thread-scoped key — **stacks on #269** | green |
 
 "Green" means every **required** check passes. The `rustfmt (advisory)` job fails
 on all four; it fails on `master` too (see *Pre-existing noise*).
@@ -29,10 +31,17 @@ on all four; it fails on `master` too (see *Pre-existing noise*).
 
 `#267` and `#269` are independent — any order, any time.
 
-`#268` is independent to merge, but **`#266` must land before the forward-side
-hook threading** (below), because `#266` adds the third `maybe_steer_block` call
-site, in `lowered.rs`. Threading a key through the hook without `#266` in first
-means doing that call site twice.
+`#268` is independent to merge.
+
+**Correction (2026-08-21).** This section previously said `#266` must land before
+the forward-side hook threading. That was true only of the explicit-parameter
+approach, which was measured and rejected: a `SteerKey` parameter on
+`forward_scratch` and its three siblings reaches **155 external call sites**,
+nearly all of which never steer. The thread-scoped guard that landed instead
+(`#271`) changes no forward signature, so it touches no call site in `#266` and
+is independent of it.
+
+`#271` stacks on `#269` (it needs `SteerKey`), so merge `#269` first.
 
 ---
 
@@ -45,12 +54,14 @@ unaffected.*
 Both remaining steps were blocked on state having nowhere to live. `#268` and
 `#269` remove that.
 
-1. **Thread the stream key to the hook.** The forward calls
-   `maybe_steer_block(gpu, &s.x, layer_idx)` and does not know which stream it is
-   serving. Three call sites: `qwen35/decode_layers.rs`,
-   `qwen35/prefill_chunk.rs`, and `qwen35/lowered.rs` (the last from `#266`).
-   `#269` already provides `maybe_steer_block_for(&SteerKey, …)`, so this is
-   plumbing, not design. **Stacks on `#266`.**
+1. ~~**Thread the stream key to the hook.**~~ **DONE — `#271`.** A thread-scoped
+   `SteerKeyGuard`, installed for a stream's quantum and restored on drop
+   (including on panic). No forward signature changes.
+
+   This entry originally called it "plumbing, not design". **It was design**, and
+   the measurement is why: the explicit-parameter alternative reaches 155
+   external call sites. The lesson generalises — size the call graph before
+   calling a threading change mechanical.
 2. **Daemon steer handler accepts `session_id`.** `SteerBeginApply` /
    `SteerBeginCapture` carry no stream identifier today. Add an optional
    `session_id`, resolve it through `StreamTable`, and route to
