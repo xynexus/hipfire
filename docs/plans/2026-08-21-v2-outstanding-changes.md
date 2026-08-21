@@ -233,7 +233,11 @@ so no escape and no M1-M4 staging — and was therefore never exposed to the
 `is_active()` regression. It does participate in per-stream steering (its
 un-keyed hooks resolve the calling thread's key), which nothing had said.
 
-**No gate runs the daemon's tests.** `hipfire-daemon` is bin-only (no `src/lib.rs`,
+**~~No gate runs the daemon's tests.~~ FIXED** — `no-gpu-ci.sh` now runs
+`cargo test -p hipfire-daemon --bin hipfire-daemon` (95 tests). `--bin` is required:
+`-p` alone inherits the same empty `--lib` selection. `hipfire-steer` needed no
+change — it is a lib crate, so `ci.yml`'s `--lib --workspace` already covered it.
+Original description: `hipfire-daemon` is bin-only (no `src/lib.rs`,
 no `[lib]`), so `ci.yml`'s `cargo test --lib --workspace` selects zero targets
 from it, and `no-gpu-ci.sh`'s `cargo check --workspace --examples` does not even
 type-check `#[cfg(test)]` code. `stream.rs`'s tests — offered as the justification

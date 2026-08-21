@@ -18,6 +18,14 @@ cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
 cargo test -p hipfire-runtime quant_catalog_matches_derived_gemv_routes
+# hipfire-daemon is BIN-ONLY (no src/lib.rs, only [[bin]]), so ci.yml's
+# `cargo test --lib --workspace` selects zero targets from it — it does not fail,
+# it silently tests nothing. `cargo check --workspace --examples` above does not
+# type-check #[cfg(test)] code either. Its unit tests therefore ran in NO gate:
+# the executor-v2 stream tests were added with a file-scope #![allow(dead_code)]
+# justified by "the unit tests exercise every item", while nothing in CI ran them.
+# --bin is required; -p alone inherits the same empty --lib selection.
+cargo test -p hipfire-daemon --bin hipfire-daemon
 cargo test -p hipfire-arch-api --lib
 cargo test -p hipfire-arch-specs --lib
 cargo test -p hipfire-arch-template-spec --lib
