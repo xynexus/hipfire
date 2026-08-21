@@ -209,19 +209,35 @@ thread_local! {
 /// Install the current thread's steering session, restoring the previous one on
 /// drop — including on an early return or a panic, so a forward that fails
 /// partway cannot leave another stream's key installed for whatever runs next.
-pub struct SteerKeyGuard(Option<SteerKey>);
+pub struct SteerKeyGuard {
+    prev: Option<SteerKey>,
+    /// Pins the guard to the thread that installed it.
+    ///
+    /// Without this the guard was `Send` — it wraps only a `String` — and its
+    /// `Drop` restores into WHICHEVER thread drops it, not the one that
+    /// installed it. A guard moved to a worker, or stored in a struct that
+    /// crosses threads, would therefore leave the installing thread pinned to
+    /// another stream's key: the same wrong-stream-spec failure the keyed
+    /// registry exists to prevent, reached by a different route.
+    ///
+    /// A raw pointer is `!Send`, so moving the guard across a thread boundary is
+    /// now a compile error rather than a silent runtime hazard. `PhantomData`
+    /// means it costs nothing at runtime.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
 
 impl SteerKeyGuard {
     pub fn install(key: SteerKey) -> Self {
-        Self(Some(
-            CURRENT_KEY.with(|c| std::mem::replace(&mut *c.borrow_mut(), key)),
-        ))
+        Self {
+            prev: Some(CURRENT_KEY.with(|c| std::mem::replace(&mut *c.borrow_mut(), key))),
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
 impl Drop for SteerKeyGuard {
     fn drop(&mut self) {
-        if let Some(prev) = self.0.take() {
+        if let Some(prev) = self.prev.take() {
             CURRENT_KEY.with(|c| *c.borrow_mut() = prev);
         }
     }
@@ -1060,6 +1076,25 @@ mod stack_tests {
             current_key().is_unscoped(),
             "leaving every guard returns the thread to the unscoped session"
         );
+    }
+
+    /// Compile-time proof that a `SteerKeyGuard` cannot cross a thread boundary.
+    ///
+    /// Two blanket impls, one gated on `Send`. If `SteerKeyGuard` were `Send`
+    /// BOTH would apply and the call below would be ambiguous — a compile error.
+    /// The fact that this resolves IS the assertion; there is no runtime part.
+    ///
+    /// It matters because the guard's `Drop` restores into whichever thread drops
+    /// it. A `Send` guard moved to a worker would leave the INSTALLING thread
+    /// pinned to another stream's key — steering the wrong stream, silently.
+    #[test]
+    fn the_guard_cannot_cross_a_thread_boundary() {
+        trait AmbiguousIfSend<A> {
+            fn assert_not_send() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        let _ = <SteerKeyGuard as AmbiguousIfSend<_>>::assert_not_send;
     }
 
     /// A guard that is dropped by unwinding must still restore, or a forward that
