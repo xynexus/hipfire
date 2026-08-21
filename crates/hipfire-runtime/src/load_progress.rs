@@ -12,14 +12,18 @@
 //! stderr, deadlock-prone on non-UTF-8 bytes.
 //!
 //! Instead, loaders call [`report`] at the same points. The daemon installs a
-//! sink (via [`set_sink`]) before a load that serializes each report into a
-//! `load_progress` frame on its framed stdout channel — the same structured,
+//! THREAD-scoped sink (via [`ThreadSinkGuard`]) for the duration of a load, which
+//! serializes each report into a `load_progress` frame on its framed stdout channel — the same structured,
 //! UTF-8-safe path used for tokens and other events. When no sink is installed
 //! (CLI loads, tests, eval batteries), [`report`] is a cheap no-op.
 //!
 //! This lives in `hipfire-runtime` because it is the lowest crate reachable by
 //! every loader: `hfq.rs` is in this crate, and the arch crates all depend on
-//! it. The daemon (which also depends on this crate) is the only installer.
+//! it. The daemon (which also depends on this crate) is the only installer, and
+//! it installs the thread-scoped sink — [`set_sink`] has no production caller.
+//! The process-wide sink remains only as the fallback a CROSS-THREAD reporter
+//! would reach; no loader currently reports off the loading thread, so in
+//! practice it is unused and a report reaching it would print the human line.
 
 use std::sync::Mutex;
 
@@ -49,9 +53,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Install (or clear, with `None`) the process-wide load-progress sink. The
-/// daemon installs one for the duration of a `Load` op and clears it after, so
-/// stray reports outside a load are dropped.
+/// Install (or clear, with `None`) the process-wide load-progress sink.
+///
+/// No production caller: the daemon moved to [`ThreadSinkGuard`]. Kept as the
+/// fallback a cross-thread reporter would reach, and for single-load callers.
 ///
 /// Prefer [`set_thread_sink`] for anything that can run concurrently with
 /// another load; this one stays for single-load callers and as the fallback a
