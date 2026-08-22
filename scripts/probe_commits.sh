@@ -5,7 +5,7 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 # Probe a list of commits for 9B decode perf. Output per commit:
-#   <hash>  <gen_tok_s>  <short message>
+#   <hash>  <tok_s>  <short message>   (metric selected by PROBE_METRIC)
 #
 # YOUR WORKING TREE IS NEVER TOUCHED. Every checkout happens in a scratch git
 # worktree; this script does not stash, does not check out in the main tree, and
@@ -31,6 +31,11 @@
 #                      leave it built at some other commit. Persisting it across
 #                      invocations keeps builds incremental.
 #   PROBE_WORKTREE     Scratch worktree path (default a mktemp dir).
+#   PROBE_BENCH_ARGS   bench_qwen35_speed args (default "--prefill 16 --warmup 3
+#                      --gen 30", i.e. decode). For PREFILL work, pass something
+#                      like "--prefill 2059 --warmup 1 --gen 4" together with
+#                      PROBE_METRIC=prefill_tok_s.
+#   PROBE_METRIC       Which SUMMARY field to report (default gen_tok_s).
 set -u
 
 BENCH_MODEL="${BENCH_MODEL:-qwen3.5-9b-mq4.hfq}"
@@ -95,8 +100,8 @@ for h in "${RESOLVED[@]}"; do
     out=$(HIPFIRE_KV_MODE="${HIPFIRE_KV_MODE:-asym3}" HIPFIRE_GRAPH="${HIPFIRE_GRAPH:-1}" \
         "$TARGET_DIR/release/examples/bench_qwen35_speed" \
         "$HOME/.hipfire/models/$BENCH_MODEL" \
-        --prefill 16 --warmup 3 --gen 30 2>&1)
-    tok_s=$(echo "$out" | grep -oE 'gen_tok_s=[0-9.]+' | sed 's/gen_tok_s=//')
+        ${PROBE_BENCH_ARGS:---prefill 16 --warmup 3 --gen 30} 2>&1)
+    tok_s=$(echo "$out" | grep -oE "${PROBE_METRIC:-gen_tok_s}=[0-9.]+" | head -1 | sed "s/${PROBE_METRIC:-gen_tok_s}=//")
     if [ -z "$tok_s" ]; then
         echo "BENCH_FAIL  $msg"
     else

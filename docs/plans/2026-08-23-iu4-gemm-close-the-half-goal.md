@@ -46,6 +46,55 @@ Levers and negatives: `.agents/skills/hipfire-kernel-tuning/levers.md` §9-§15.
   there are no extra bubbles to fill.
 - **Overlay fusion into the GEMM epilogue.** Tried twice, lost 6-14% both times.
 
+## Progress (updated 2026-08-23)
+
+**216.3 -> 256.3 tok/s prefill, +18.5%**, cross-process verified with
+`scripts/probe_commits.sh e741131d5 29c01daf8` (scratch worktree, separate build
+dir). Prefill window 8.457 s -> 7.381 s at 98.7% GPU busy.
+
+Step 0 changed the plan's priorities: the GEMM was 46% of prefill and the sparse
+overlay -- correcting 1.17% of the weight positions -- was 30.2%. Four of the
+five wins came from outside the GEMM.
+
+| # | change | e2e |
+|---|--------|-----|
+| 1 | overlay: compile-time loop bound (killed `v_movrels`) | +3.8% |
+| 2 | overlay: LDS transpose so Y stores coalesce | +9.3% |
+| 3 | GEMM: grid swizzle, N as the fast axis (step 1) | +2.7% |
+| 4 | overlay: hoist the k-major transpose out of the route | +1.8% |
+| 5 | GEMM: seed group accumulators from a shared zero | +1.7% |
+
+Detail: `docs/experiments/2026-08-23-prefill-overlay-and-swizzle.md`.
+Levers: `.agents/skills/hipfire-kernel-tuning/levers.md` §16-§19.
+
+Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
+14.1% (1030.0 ms), gated delta net 5.1%.
+
+### Closed since this plan was written -- do not re-attempt
+
+- **BK=128** (was step 2). Loses 13% on gate/up. LDS 45056 B drops the WGP to one
+  resident workgroup: fewer barriers does not pay if it costs the second
+  workgroup that was hiding them. levers §12 from the other direction.
+- **Manual fragment software-pipelining** (was step 2, B1). LLVM already hoists
+  14 `ds_load`s to the top of the body and consumes them under progressively
+  relaxed `lgkmcnt(12)...(5)`. Nothing left to hand-write. levers §19.
+- **LDS staging of the overlay's activation tile.** Break-even is R = 85 rows per
+  workgroup (32 kB staged against R*384 B gathered) and the accumulator registers
+  cap R well below that. Not worth building.
+
+### Still open, in order
+
+1. **GEMM, 50.3% of prefill, ~57% of the 110.9 TOPS ceiling.** The 21% staging
+   and 20% LDS-read costs remain latency-shaped and have now resisted width,
+   tile geometry, wave grid, BK, and pipelining. What is left is step 3 (4-bit
+   activations, halving the matrix work) and `s_prefetch_data`.
+2. **Overlay, 20.3%.** The store is fixed; the gather now dominates, reading
+   ~535 MB per gate/up call to consume a 2.6 MB activation. Needs cross-row
+   sharing, which needs either big row blocks (register-bound) or a CSC-style
+   reorder (write-bound). No cheap version identified.
+3. **Attention, 14.1%.** Never examined. Now the third-largest item and the only
+   one with no measurements at all.
+
 ## Work, in order
 
 ### 0. Frame it: what fraction of prefill is the GEMM?
