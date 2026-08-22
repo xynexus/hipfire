@@ -2929,18 +2929,40 @@ pub fn generate(
                 // forward_scratch — the same path decode already uses below, and the one
                 // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
                 // kvarn is a KV-memory mode, not a throughput one.
-                for &tok in &new_tokens {
-                    qwen35::forward_scratch(
-                        gpu,
-                        weights,
-                        config,
-                        tok,
-                        session.cursor.seq_pos,
-                        kv,
-                        dn,
-                        scratch,
-                    )
-                    .unwrap();
+                // Only the LAST prompt token's logits are ever read; the rest
+                // are discarded. On Qwen3.8-27B the lm_head is 675 MB at
+                // oq4.25 (vocab 248320 x 5120) = ~2.9 ms per call, so running
+                // the logits-producing forward per prompt token spent ~2.9 ms
+                // per token producing nothing. Measured on a 3000-token prompt:
+                // 2122 lm_head dispatches under kvarn against 7 under the f32
+                // path, which routes through a prefill that already skips it.
+                let last = new_tokens.len().saturating_sub(1);
+                for (i, &tok) in new_tokens.iter().enumerate() {
+                    if i == last {
+                        qwen35::forward_scratch(
+                            gpu,
+                            weights,
+                            config,
+                            tok,
+                            session.cursor.seq_pos,
+                            kv,
+                            dn,
+                            scratch,
+                        )
+                        .unwrap();
+                    } else {
+                        qwen35::forward_scratch_no_logits(
+                            gpu,
+                            weights,
+                            config,
+                            tok,
+                            session.cursor.seq_pos,
+                            kv,
+                            dn,
+                            scratch,
+                        )
+                        .unwrap();
+                    }
                     session.cursor.seq_pos += 1;
                 }
             } else if let Some(ref ev) = m.eviction {

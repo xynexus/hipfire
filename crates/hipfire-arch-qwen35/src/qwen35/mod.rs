@@ -2707,7 +2707,11 @@ pub fn forward_scratch_with_hidden(
     Ok(())
 }
 
-fn forward_scratch_no_logits(
+/// `forward_scratch` without the lm_head. The head is 675 MB at oq4.25 on
+/// Qwen3.8-27B (vocab 248320 x 5120) — ~2.9 ms per call, measured — and its
+/// logits are DISCARDED for every prompt token except the last, so a prefill
+/// loop that calls the logits-producing variant per token burns that per token.
+pub fn forward_scratch_no_logits(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
