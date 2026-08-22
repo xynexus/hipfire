@@ -4312,6 +4312,11 @@ pub const GEMM_OQ_COMPACT_IU4X2_W64_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4X2_TILED_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4x2_tiled.hip");
 
+/// First-principles ladder: every rung a correct, parity-checked compact GEMM.
+/// See `kernels/src/gemm_oq_compact_ladder.hip`.
+pub const GEMM_OQ_COMPACT_LADDER_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_ladder.hip");
+
 /// Pure iu4 WMMA issue-rate probes (no memory at all), sweeping the number of
 /// INDEPENDENT accumulator chains. See `kernels/src/wmma_iu4_noop_w64.hip`.
 pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w64.hip");
