@@ -748,6 +748,89 @@ pub(crate) fn ensure_qwen35_forward_capability(config: &Qwen35Config) -> HipResu
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
 /// buffers, never allocates.
+/// §M4's route stage, lifted verbatim out of `moe_ffn_decode_impl`.
+///
+/// This is the first of the three boundaries §M4 wants (`MoeRoute` /
+/// `MoeExpert` / `MoeCombine`), and `2026-08-22-m4-premise-falsified.md` shows
+/// they are already dispatch boundaries on the indexed path — routing ends by
+/// writing `s.topk_indices` / `s.topk_weights`, which the expert GEMVs then read
+/// out of persistent scratch. Making the seam a function is the prerequisite for
+/// binding it as its own super-op; it changes nothing on its own.
+///
+/// Returns the CPU-side top-K when the fallback ran, `(None, None)` when the
+/// device path did — the caller distinguishes on exactly that, as before.
+#[allow(clippy::too_many_arguments)]
+fn moe_route_topk(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+    router_logits: &GpuTensor,
+    use_gpu_topk: bool,
+    n_exp: usize,
+    k: usize,
+    layer_idx: usize,
+) -> HipResult<(Option<Vec<usize>>, Option<Vec<f32>>)> {
+    Ok(if use_gpu_topk {
+            // GPU path: split softmax + top-K + renorm into two kernels so
+            // the routing path uses identical softmax math to gpu.softmax_f32
+            // (and thus to a CPU reference). The fused
+            // moe_softmax_topk_renorm_k8 variant produced topk_weights that
+            // differed from gpu.softmax_f32 + manual `*w /= sum` by exactly
+            // 1 ULP per element, which compounds across 30+ MoE layers and
+            // 8 experts/layer into a structural attractor on Qwen3.5-A3B
+            // and 122B-A10B at MQ4. The new moe_topk_renorm_k8 takes
+            // pre-softmaxed probs and uses direct division for renorm.
+            gpu.softmax_f32(router_logits)?;
+            gpu.moe_topk_renorm_k8(
+                router_logits,
+                s.topk_indices,
+                s.topk_weights,
+                n_exp,
+                config.norm_topk_prob,
+            )?;
+            if ffn.experts.is_empty() {
+                paged_moe_debug_sync(gpu, "after paged topk")?;
+            }
+            if moe_router_histogram_active() {
+                let indices = download_i32_tensor(gpu, s.topk_indices, k)?
+                    .into_iter()
+                    .map(router_index_i32_to_usize)
+                    .collect::<Vec<_>>();
+                let weights = gpu.download_f32(s.topk_weights)?;
+                record_moe_router_selection(layer_idx, &indices, &weights);
+            }
+            (None, None)
+        } else {
+            // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
+            gpu.softmax_f32(router_logits)?;
+            let probs = gpu.download_f32(router_logits)?;
+            let mut indices: Vec<usize> = (0..n_exp).collect();
+            indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+            topk_indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+            if config.norm_topk_prob {
+                let sum: f32 = topk_weights.iter().sum();
+                if sum > 0.0 {
+                    for w in topk_weights.iter_mut() {
+                        *w /= sum;
+                    }
+                }
+            }
+            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
+            (Some(topk_indices), Some(topk_weights))
+        })
+}
+
 pub(crate) fn moe_ffn_decode_impl(
     gpu: &mut Gpu,
     pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
@@ -1220,65 +1303,17 @@ pub(crate) fn moe_ffn_decode_impl(
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
-    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) =
-        if use_gpu_topk {
-            // GPU path: split softmax + top-K + renorm into two kernels so
-            // the routing path uses identical softmax math to gpu.softmax_f32
-            // (and thus to a CPU reference). The fused
-            // moe_softmax_topk_renorm_k8 variant produced topk_weights that
-            // differed from gpu.softmax_f32 + manual `*w /= sum` by exactly
-            // 1 ULP per element, which compounds across 30+ MoE layers and
-            // 8 experts/layer into a structural attractor on Qwen3.5-A3B
-            // and 122B-A10B at MQ4. The new moe_topk_renorm_k8 takes
-            // pre-softmaxed probs and uses direct division for renorm.
-            gpu.softmax_f32(router_logits)?;
-            gpu.moe_topk_renorm_k8(
-                router_logits,
-                s.topk_indices,
-                s.topk_weights,
-                n_exp,
-                config.norm_topk_prob,
-            )?;
-            if ffn.experts.is_empty() {
-                paged_moe_debug_sync(gpu, "after paged topk")?;
-            }
-            if moe_router_histogram_active() {
-                let indices = download_i32_tensor(gpu, s.topk_indices, k)?
-                    .into_iter()
-                    .map(router_index_i32_to_usize)
-                    .collect::<Vec<_>>();
-                let weights = gpu.download_f32(s.topk_weights)?;
-                record_moe_router_selection(layer_idx, &indices, &weights);
-            }
-            (None, None)
-        } else {
-            // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
-            gpu.softmax_f32(router_logits)?;
-            let probs = gpu.download_f32(router_logits)?;
-            let mut indices: Vec<usize> = (0..n_exp).collect();
-            indices.select_nth_unstable_by(k - 1, |&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-            topk_indices.sort_by(|&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-            if config.norm_topk_prob {
-                let sum: f32 = topk_weights.iter().sum();
-                if sum > 0.0 {
-                    for w in topk_weights.iter_mut() {
-                        *w /= sum;
-                    }
-                }
-            }
-            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
-            (Some(topk_indices), Some(topk_weights))
-        };
+    let (topk_indices_cpu, topk_weights_cpu) = moe_route_topk(
+        gpu,
+        ffn,
+        config,
+        s,
+        router_logits,
+        use_gpu_topk,
+        n_exp,
+        k,
+        layer_idx,
+    )?;
     if ffn.experts.is_empty() {
         if let (Some(indices), Some(weights)) =
             (topk_indices_cpu.as_ref(), topk_weights_cpu.as_ref())
