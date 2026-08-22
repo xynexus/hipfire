@@ -29,7 +29,7 @@ fn main() {
     };
     let n_out = 3usize;
     let stride = 2 + GROUP / 2 + 2 * n_out; // 136 at n_out=3 => 4.25 bits
-    let iters = 10usize;
+    let _outer_iters = 10usize;
 
     println!("gemv_oq_compact_multicol at Qwen3.8-27B shapes (n_out={n_out}, stride={stride})");
     println!("weight bytes only; 233 GB/s is the measured achievable ceiling\n");
