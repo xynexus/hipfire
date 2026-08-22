@@ -108,22 +108,10 @@ fn main() {
             }
         }
 
-        // ORIGINAL int8 activations, then the radix-16 digit split.
+        // int8 activations, exactly as quantize_act_oq8 leaves them. The kernel
+        // does the radix-16 digit split itself while staging into LDS.
         let x8: Vec<i8> = (0..b * k).map(|_| (rnd() % 256) as u8 as i8).collect();
-        let mut xhi = vec![0u8; b * k / 2];
-        let mut xlo = vec![0u8; b * k / 2];
-        for i in 0..b * k {
-            let u = (x8[i] as i32 + 128) as u32;
-            let hi = ((u >> 4) as i32 - 8) as u32 & 0xf; // signed int4 nibble
-            let lo = u & 0xf; // unsigned int4 nibble
-            if i % 2 == 0 {
-                xhi[i / 2] |= hi as u8;
-                xlo[i / 2] |= lo as u8;
-            } else {
-                xhi[i / 2] |= (hi as u8) << 4;
-                xlo[i / 2] |= (lo as u8) << 4;
-            }
-        }
+        let x8u: Vec<u8> = x8.iter().map(|&v| v as u8).collect();
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
@@ -151,11 +139,10 @@ fn main() {
 
         let dev = split_planes(&blocks, nblk, stride, group);
         let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
-        let xhb = gpu.upload_raw(&xhi, &[xhi.len()]).expect("xhi");
-        let xlb = gpu.upload_raw(&xlo, &[xlo.len()]).expect("xlo");
+        let x8b = gpu.upload_raw(&x8u, &[x8u.len()]).expect("x8");
         let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
         let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
-        gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xhb, &xlb, &xsb, &yb, m, k, b, group, stride)
+        gpu.gemm_oq_compact_iu4x2_wmma(&wb, &x8b, &xsb, &yb, m, k, b, group, stride)
             .expect("launch");
         let got = gpu.download_f32(&yb).expect("dl");
 
@@ -174,7 +161,7 @@ fn main() {
             "  {m:>5} {k:>6} {b:>4} {n_out:>6} {group:>4}    {worst:>8.2e}   {}",
             if ok { "PASS" } else { "FAIL" }
         );
-        for t in [wb, xhb, xlb, xsb, yb] {
+        for t in [wb, x8b, xsb, yb] {
             let _ = gpu.free_tensor(t);
         }
     }

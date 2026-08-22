@@ -85,8 +85,6 @@ fn main() {
         let x4: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
         // Two digit planes for the 8-bit-via-2-passes arm (same total bytes as
         // one int8 activation, which is the point).
-        let xhi: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
-        let xlo: Vec<u8> = (0..b * k / 2).map(|_| (rnd() & 0xff) as u8).collect();
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
@@ -120,14 +118,12 @@ fn main() {
         }
         gpu.device_synchronize().expect("sync");
         let ms4 = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let xhb = gpu.upload_raw(&xhi, &[xhi.len()]).expect("xhi");
-        let xlb = gpu.upload_raw(&xlo, &[xlo.len()]).expect("xlo");
-        gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xhb, &xlb, &xsb, &yb, m, k, b, GROUP, stride)
+        gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xqb, &xsb, &yb, m, k, b, GROUP, stride)
             .expect("warm2p");
         gpu.device_synchronize().expect("sync");
         let t2p = Instant::now();
         for _ in 0..iters {
-            gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xhb, &xlb, &xsb, &yb, m, k, b, GROUP, stride)
+            gpu.gemm_oq_compact_iu4x2_wmma(&wb, &xqb, &xsb, &yb, m, k, b, GROUP, stride)
                 .expect("run2p");
         }
         gpu.device_synchronize().expect("sync");
@@ -156,8 +152,6 @@ fn main() {
         );
         let _ = bytes;
         let _ = gpu.free_tensor(x4b);
-        let _ = gpu.free_tensor(xhb);
-        let _ = gpu.free_tensor(xlb);
         let _ = gpu.free_tensor(wb);
         let _ = gpu.free_tensor(xqb);
         let _ = gpu.free_tensor(xsb);

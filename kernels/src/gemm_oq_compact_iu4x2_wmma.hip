@@ -29,8 +29,11 @@
 // weight tile per pass instead would restore the naive 2x and defeat the point.
 //
 //   W    : compact SPLIT-PLANE blocks (bulk nibbles fed to the core RAW)
-//   Xhi  : [B, K/2] packed SIGNED   int4 high digits
-//   Xlo  : [B, K/2] packed UNSIGNED int4 low digits
+//   Xq   : [B, K] int8 activations, exactly as `quantize_act_oq8_batched`
+//          leaves them. The two digit planes are split out during the LDS
+//          store: hi = v >> 4 (signed), lo = v & 0xf (unsigned), which is the
+//          same byte volume as pre-split planes (K/2 + K/2 == K), so this
+//          costs a few ALU ops and saves a kernel launch plus a 2*B*K/2 buffer.
 //   Xs   : [B, K/G] f32     Y : [B, M] f32
 //
 // Does NOT apply the sparse weight overlay — same contract as the 1-pass twin.
@@ -60,11 +63,17 @@ static __device__ __forceinline__ float oqc4x2_f16(const uint8_t* b) {
     return (float)(*(const _Float16*)b);
 }
 
+// Pack the low nibble of each of 4 bytes into the low 16 bits, in order.
+// Input must already be masked to 0x0f0f0f0f.
+__device__ __forceinline__ uint32_t oqc4x2_pack4(uint32_t t) {
+    t = (t | (t >> 4)) & 0x00ff00ffu;
+    return (t | (t >> 8)) & 0x0000ffffu;
+}
+
 __launch_bounds__(32 * OQC4X2_MW, 1)
 extern "C" __global__ void gemm_oq_compact_iu4x2_wmma(
     const uint8_t* __restrict__ W,
-    const uint8_t* __restrict__ Xhi,
-    const uint8_t* __restrict__ Xlo,
+    const int8_t*  __restrict__ Xq,
     const float*   __restrict__ Xs,
     float*         __restrict__ Y,
     int M, int K, int B, int group, int block_stride
@@ -87,7 +96,7 @@ extern "C" __global__ void gemm_oq_compact_iu4x2_wmma(
     const int nib_bytes   = group >> 1;
     const int side_stride = block_stride - nib_bytes;
     const long long side_base = (long long)M * n_groups * nib_bytes;
-    const int x_stride = K / 2;
+    const int x_stride = K;  // int8, one byte per element
 
     int b_col_nb[OQC4X2_NB];
     float8_t facc[OQC4X2_NB];
@@ -115,9 +124,17 @@ extern "C" __global__ void gemm_oq_compact_iu4x2_wmma(
             const int d = i & dpc_mask;
             const int br = batch_start + c;
             const int sb = (br < B) ? br : (B - 1);
-            const long long off = (long long)sb * x_stride + g * nib_bytes + d * 4;
-            *(uint32_t*)(xh + c * lds_stride + d * 4) = *(const uint32_t*)(Xhi + off);
-            *(uint32_t*)(xl + c * lds_stride + d * 4) = *(const uint32_t*)(Xlo + off);
+            // One output dword = 8 nibbles = 8 activations = 2 int8 dwords.
+            const long long off = (long long)sb * x_stride + (long long)g * group + d * 8;
+            const uint32_t a0 = *(const uint32_t*)(Xq + off);
+            const uint32_t a1 = *(const uint32_t*)(Xq + off + 4);
+            // Nibble-pack 4 bytes' low nibbles into 16 bits (see oqc4x2_pack4).
+            const uint32_t hp = oqc4x2_pack4((a0 >> 4) & 0x0f0f0f0fu)
+                              | (oqc4x2_pack4((a1 >> 4) & 0x0f0f0f0fu) << 16);
+            const uint32_t lp = oqc4x2_pack4(a0 & 0x0f0f0f0fu)
+                              | (oqc4x2_pack4(a1 & 0x0f0f0f0fu) << 16);
+            *(uint32_t*)(xh + c * lds_stride + d * 4) = hp;
+            *(uint32_t*)(xl + c * lds_stride + d * 4) = lp;
         }
         __syncthreads();
 

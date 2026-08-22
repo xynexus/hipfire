@@ -780,8 +780,7 @@ impl Gpu {
     pub fn gemm_oq_compact_iu4x2_wmma(
         &mut self,
         w_blocks: &GpuTensor,
-        x_hi: &GpuTensor,
-        x_lo: &GpuTensor,
+        x_i8: &GpuTensor,
         x_scales: &GpuTensor,
         y_f32: &GpuTensor,
         m: usize,
@@ -802,16 +801,14 @@ impl Gpu {
             "gemm_oq_compact_iu4x2_wmma",
         )?;
         let wp = w_blocks.buf.as_ptr();
-        let xhp = x_hi.buf.as_ptr();
-        let xlp = x_lo.buf.as_ptr();
+        let xqp = x_i8.buf.as_ptr();
         let xsp = x_scales.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
         let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
         let (mut gi, mut si) = (group as i32, block_stride as i32);
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
-            &xhp as *const _ as *mut c_void,
-            &xlp as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
             &xsp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
             &mut mi as *mut _ as *mut c_void,
