@@ -64,6 +64,38 @@ layer and three — 120 rather than 40 across a 40-layer forward — without tou
 the kernel contract that `2026-08-22-unfused-oom-mechanism.md` shows is the real
 blocker for the per-slot version.
 
+## Where the super-op boundary can actually go
+
+It is tempting to read the above as "so binding `MoeRoute` is a small change".
+**It is not, and the reason sits one line above the seam.**
+
+`router_logits` is produced at `moe_decode.rs:1213` by the **fused 4-way GEMV** —
+router + `shared_expert_gate` + `shared.gate` + `shared.up` — whose own comment
+records that the four "read the SAME rotated `x_rot_local` with the SAME K" and
+that fusing them "saves 3 launch submits per MoE layer and lets underused tails
+(shared_expert_gate_m=1, router_m=256) co-schedule".
+
+So routing cannot be hoisted *above* the expert-side work into a leading
+`MoeRoute` op: it depends on a kernel deliberately fused with three
+shared-expert GEMVs. Hoisting means unfusing that GEMV — the same class of cost
+§M4 objected to, at a boundary the sections above had not checked.
+
+What is reachable is a two-way split at a **different** point:
+
+```
+stage A: norm/rotate → fused 4-way GEMV → top-K      (ends at moe_route_topk)
+stage B: routed experts → combine
+```
+
+That needs no unfusing, and still gives two quanta per MoE layer rather than
+one. But it means splitting `moe_ffn_decode_impl` into two functions sharing the
+locals that live across the seam — the shared-expert block at `:1283-1347` sits
+between them and uses stage-A state. A restructure, not a binding.
+
+The three-way `MoeRoute` / `MoeExpert` / `MoeCombine` shape §M4 names is
+reachable only after the 4-way GEMV is unfused, or with `MoeRoute` redefined to
+include it.
+
 ## Not claimed
 
 That the three-way split is *implemented* — it is not. What is established is
