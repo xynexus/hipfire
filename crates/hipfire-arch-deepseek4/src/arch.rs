@@ -183,6 +183,50 @@ impl DeepseekV4 {
     /// The non-owned w2 (down) ptr reuses the compact base — its rotate input
     /// is 0 regardless, so the down weights read don't matter. `shard = None`
     /// uploads all experts (single-GPU, byte-identical to the original).
+    /// §M5 Phase 3b. Paged variant: allocate the pointer tables the pager will
+    /// maintain, record the strides the kernels need, and upload NOTHING.
+    ///
+    /// The tables are left zeroed on purpose — a slot is only valid once the
+    /// pager has made that expert resident, which it does per token via
+    /// `ExpertResidency`. Reading an unpopulated slot would mean dispatching an
+    /// expert nobody asked for.
+    ///
+    /// Strides come from expert 0's tensor *info*, never its bytes, so this
+    /// costs no I/O: the whole point is that the 1152 MiB-per-layer `combined`
+    /// upload does not happen.
+    fn register_layer_routed_experts_paged(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<(), String> {
+        let info_of = |name: &str| -> Result<usize, String> {
+            hfq.find_tensor_info(name)
+                .map(|i| i.data_size)
+                .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))
+        };
+        let w2_stride = info_of(&format!("{prefix}.ffn.experts.0.w2.weight"))?;
+        let w1_stride = info_of(&format!("{prefix}.ffn.experts.0.w1.weight"))?;
+        let w3_stride = info_of(&format!("{prefix}.ffn.experts.0.w3.weight"))?;
+        if w1_stride != w3_stride {
+            return Err(format!(
+                "deepseek4: {prefix} w1/w3 stride mismatch: w1={w1_stride} w3={w3_stride}"
+            ));
+        }
+        let mut alloc = |what: &str| {
+            gpu.alloc_tensor(&[2 * n_exp], hipfire_rdna::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc paged ptr table {prefix}.{what}: {e:?}"))
+        };
+        let w2_ptrs = alloc("w2")?;
+        let gate_up_ptrs = alloc("gate_up")?;
+        layer.expert_w2_ptrs = Some(w2_ptrs);
+        layer.expert_w2_stride = w2_stride;
+        layer.expert_gate_up_ptrs = Some(gate_up_ptrs);
+        layer.expert_gate_up_stride = w1_stride + w3_stride;
+        Ok(())
+    }
+
     fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -620,6 +664,22 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
+        // §M5 Phase 3b. Paged routed experts: the pager owns the expert bytes
+        // and keeps the pointer tables live, so nothing is uploaded up front.
+        // Off by default — a model that fits stays fully resident and pays
+        // nothing. Requires the HFQM v2 routed-expert module table, which the
+        // current quantizer emits for every MoE artifact.
+        let paged_experts = matches!(
+            std::env::var("HIPFIRE_DEEPSEEK4_PAGED_EXPERTS").ok().as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        );
+        if paged_experts && hfq.modules().is_empty() {
+            return Err(
+                "HIPFIRE_DEEPSEEK4_PAGED_EXPERTS=1 requires an HFQM v2 routed-expert module \
+                 table; regenerate the artifact with the current hipfire-quantize"
+                    .to_string(),
+            );
+        }
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -1265,14 +1325,24 @@ impl DeepseekV4 {
                     "experts",
                 );
                 let n_exp = cfg.n_routed_experts;
-                Self::upload_layer_routed_experts(
-                    hfq,
-                    gpu,
-                    &format!("layers.{l}"),
-                    n_exp,
-                    layer,
-                    shard,
-                )?;
+                if paged_experts {
+                    Self::register_layer_routed_experts_paged(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                    )?;
+                } else {
+                    Self::upload_layer_routed_experts(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                        shard,
+                    )?;
+                }
             }
         }
 
@@ -1301,6 +1371,50 @@ impl DeepseekV4 {
             }
         }
 
+
+        // §M5 Phase 3b. Build the pager and hand it the module table plus the
+        // per-layer pointer tables the paged branch allocated above. From here
+        // `ensure_expert_module_resident` both pages the bytes in and patches
+        // the slot the kernel dereferences, which is why the dispatch side
+        // never patches anything itself.
+        if paged_experts {
+            let budget = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|b| *b > 0);
+            let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
+                hfq.path(),
+                hipfire_runtime::weight_pager::PagerConfig {
+                    // `u64::MAX` is the pager's "never evict" sentinel on this
+                    // base. #310 renames it `ResidencyPolicy::PinAll`; this uses
+                    // the shape that exists on master so the two land
+                    // independently.
+                    vram_budget_bytes: budget.unwrap_or(u64::MAX),
+                    trace: matches!(
+                        std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_TRACE")
+                            .ok()
+                            .as_deref(),
+                        Some("1" | "true" | "on" | "yes")
+                    ),
+                },
+            )
+            .map_err(|e| format!("deepseek4: open expert module pager: {e}"))?;
+            let registered = pager
+                .register_expert_modules(hfq.modules().iter().cloned())
+                .map_err(|e| format!("deepseek4: register expert modules: {e}"))?;
+            for (l, layer) in weights.layers.iter_mut().enumerate() {
+                if let (Some(gu), Some(dn)) = (
+                    layer.expert_gate_up_ptrs.as_ref(),
+                    layer.expert_w2_ptrs.as_ref(),
+                ) {
+                    pager.register_expert_ptr_tables(l as u16, gu, dn);
+                }
+            }
+            eprintln!(
+                "deepseek4: paged experts enabled: registered {registered} routed expert modules"
+            );
+            weights.pager = Some(std::cell::RefCell::new(pager));
+        }
         Ok(weights)
     }
 }
