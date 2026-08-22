@@ -1923,11 +1923,11 @@ struct Qwen35DecodeState {
 /// is what a suspended stream must carry, this is what it can be handed again on
 /// resume. Keeping them apart is also what stops the step function from taking
 /// thirty arguments.
-struct Qwen35DecodeCfg<'a> {
+struct Qwen35DecodeCfg {
     max_tokens: usize,
     max_think_tokens: usize,
     budget_alert_at_tok: usize,
-    budget_alert_text: &'a str,
+    budget_alert_text: String,
     im_end_token: Option<u32>,
     /// `tokenizer.encode("\n").len()` — only the length is read, by the
     /// budget-alert KV headroom check.
@@ -1992,7 +1992,7 @@ fn qwen35_decode_one(
     stdout: &mut dyn std::io::Write,
     id: &str,
     t0: Instant,
-    cfg: &Qwen35DecodeCfg<'_>,
+    cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
 ) -> Qwen35Step {
     // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
@@ -2227,7 +2227,7 @@ fn qwen35_decode_one(
             );
             return Qwen35Step::Continue;
         }
-        let nudge_tokens = tokenizer.encode(cfg.budget_alert_text);
+        let nudge_tokens = tokenizer.encode(&cfg.budget_alert_text);
         let budget_left = cfg.max_tokens.saturating_sub(st.generated);
         let nudge_len = nudge_tokens.len().min(budget_left);
         // KV headroom check — don't run past physical_cap. If we don't
@@ -3712,7 +3712,7 @@ pub fn generate(
             max_tokens,
             max_think_tokens,
             budget_alert_at_tok,
-            budget_alert_text,
+            budget_alert_text: budget_alert_text.to_string(),
             im_end_token,
             nl_len: nl.len(),
             vocab_size,
