@@ -2312,14 +2312,19 @@ pub fn generate(
         WARNED.call_once(|| {
             eprintln!(
                 "  WARNING: a DFlash drafter is loaded but KVarN is active, so decode is \
-                 running PLAIN AR — spec-decode batch-prefills the prompt and would leave \
-                 the KVarN window/records unpopulated. Any tok/s measured here is NOT a \
-                 DFlash number. Use fp32 or q8 KV to actually engage the drafter."
+                 running PLAIN AR. Any tok/s measured here is NOT a DFlash number. Set \
+                 HIPFIRE_KVARN_BATCHED_PREFILL=1 to route KVarN through the batched \
+                 forward and actually engage the drafter (measured coherent; see \
+                 docs/experiments/2026-08-22-kvarn-batched-prefill.md)."
             );
         });
     }
+    let kvarn_specdecode_ok = std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("1");
     if m.dflash.is_some()
-        && !kvarn_active
+        && (!kvarn_active || kvarn_specdecode_ok)
         && temp <= 1e-6
         && is_qwen35_family_arch_id(m.arch_id)
         && !budgeted_thinking_needs_ar
@@ -2920,7 +2925,12 @@ pub fn generate(
                     }
                 }
             }
-            if kv.quant_kvarn {
+            if kv.quant_kvarn
+                && std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
+                    .ok()
+                    .as_deref()
+                    != Some("1")
+            {
                 // KVarN (and the deferred-hierarchical two-tier cache built on it)
                 // require the per-token attention dispatch (kv_cache_attention_dispatch):
                 // the batched forward_prefill_batch runs its own batched attention and
