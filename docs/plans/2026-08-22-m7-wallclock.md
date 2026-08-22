@@ -118,6 +118,37 @@ every one of those. Two ways out:
 under greedy and will diverge at `temperature > 0` — any parity check between
 them must be greedy, or compare distributions rather than tokens.
 
+### The seam that makes (a) concrete
+
+Reading `qwen35_decode_step_fused_grouped_moe_native_chunks`
+(`qwen35_decode.rs:1040`), the batched step is already **sample-then-forward**:
+
+1. sample an outcome per session from that session's *existing* `state.logits`
+   (`qwen35_decode_token_outcome`),
+2. push each chosen token into its conversation,
+3. build one `DensePrefillSessionBatchRow` per session carrying that single
+   token,
+4. call `forward_prefill_grouped_moe_session_batch` — the same fused batched
+   forward prefill uses — which writes fresh logits back into each
+   `state.logits`.
+
+Sampling and the forward are therefore **already separate**, and the residency
+eviction is already handled (`qwen35_save_active_session` at the top of the
+step).
+
+So `qwen35_step_batch` is not new machinery. It is a split of
+`Qwen35Generation::step` into its sample half and its forward half — the same
+shape as the stage split in `run_moe_decode` — with a driver that:
+
+- lets each handle sample its own next token from its own session's logits,
+  keeping per-stream RNG, stop sequences and counters exactly where they are;
+- collects the N chosen tokens into rows and issues **one** batched forward;
+- lets each handle update its own counters from its own token.
+
+That is what makes the handle authoritative while still getting the single fused
+forward, and it is why (a) costs a refactor of `step` rather than a
+reimplementation of the generation state machine.
+
 ## Available today, without that work
 
 The batch protocol is reachable now: `generate_batch_prefill` →
