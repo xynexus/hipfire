@@ -88,6 +88,41 @@ Two consequences worth stating plainly:
    quant/kernel-contract question, not a residency one, and it does not belong
    to M5.
 
+## The obvious fix is wrong, and the experiment says so
+
+The tempting conclusion from the arithmetic above is that the prefill regions
+are dead weight for a ROUTED expert — the indexed path serves prefill from the
+interleaved form, so why would the split form be read? Dropping it would halve
+the footprint and unblock §M4.
+
+**It is read.** `HIPFIRE_POISON_EXPERT_PREFILL_REGION=1`
+(`loading.rs:poison_expert_prefill_region`, off by default) fills the split
+nibbles and split f32 scales of every routed expert with `0xA5` after load and
+leaves the interleaved region intact. On the tiny `qwen3_5_moe` fixture:
+
+| cell | clean | split region poisoned |
+|---|---|---|
+| `kld:oq4` | 0.1941 | **0.6717** (3.4×) |
+| `kld:oq4+` / `oq4++` | 0.1947 | **0.6848** |
+| `kld:oq8` | pass | pass — different layout |
+| `kld:oq4.25++` | pass | pass — mixed precision, not the OQ4 arch layout |
+| `mq3` / `mq4` / `mq6` / `q8f16` | pass | pass — not OQ4 at all |
+
+The selectivity is the point: exactly the cells whose routed experts take the
+OQ4 arch combined layout degrade, and nothing else moves. The probe hit what it
+aimed at, and the region is live.
+
+So the second copy is **not** redundant. Routed-expert prefill really does read
+the split MMQ form, and the 2.000× is the cost of serving prefill and decode
+from one arch-combined buffer.
+
+**What that leaves for §M4.** The fix is not "drop the prefill region" — that is
+a silent-miscomputation change, and this experiment is what it looks like when
+you check first. It is "teach the non-indexed prefill to read the interleaved
+MoE-block form", which is what the indexed kernels already do for both phases.
+That is a kernel-contract change, and it is now established by experiment rather
+than assumed.
+
 ## What it does not say
 
 The upstream 4.35 GB figure the M5 plan cites is not refuted — it was measured
