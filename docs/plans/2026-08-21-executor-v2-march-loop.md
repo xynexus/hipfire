@@ -243,6 +243,118 @@ The full-parameter list, for costing: `budget_alert_at_tok`, `budget_alert_text`
 `repeat_window`, `request_stop_sequences`, `t0`, `temp`, `think_pair`,
 `tool_call_pair`, `top_k`, `top_p`.
 
+#### M3b1 — DONE 2026-08-22. Exit met.
+
+Two concurrent `Generate` frames interleave at token granularity under the flag,
+each byte-identical to its solo run:
+
+```
+pattern: ABABABABABABABABABABABABABABABABABABABABABABAB
+A: solo 24a4614f2685 == interleaved 24a4614f2685
+B: solo eaed6fb9a6b1 == interleaved eaed6fb9a6b1
+```
+
+Flag off is byte-identical to master on all three harnesses.
+
+**The blocker below was real and is solved by park/resume, NOT by option 3.** The
+correction that mattered: options 1 and 3 do *not* collapse, as an earlier note
+here claimed. That claim assumed option 1 restores the session into the slot
+*before* a step. It does not — a stream parks (restores) *after* its step and
+resumes (takes) *before* the next one, so `step` keeps reading its own session
+and needs no change at all. The whole fix is ~10 sites:
+
+* `Qwen35Generation::session` becomes `Option`, so the move between slot and
+  handle is trackable.
+* `park()` / `resume()` on the handle.
+* The march loop resumes before a step and **parks after** it.
+* The handler parks at stash time too — two frames are dispatched back to back
+  before the loop ever runs, so without that the second `generate_start` still
+  finds an empty slot.
+
+**The invariant, stated once:** a stream owns the session *only while it is
+stepping*. Between quanta the slot is populated, which is what gives the next
+`activate_session` something to save. Every failure on the way here was a
+violation of exactly that.
+
+Cost: one take + one restore per stream per token. `restore_into_loaded` leaked a
+`[vocab_size] f32` logits snapshot on every call (~970 KiB), harmless at one swap
+per session and *not* harmless at one per token — fixed with the `free_tensor`
+the #288 review already recommended.
+
+Option 3 (handle stops owning the session) remains a valid optimisation: it would
+remove the per-token swap entirely. It is ~60 sites and changes default-path
+semantics, so it is an optimisation with a working baseline to measure against,
+not a prerequisite.
+
+<details><summary>The blocker as originally recorded</summary>
+
+The march loop is built and works **for one stream**. Flag-off is byte-identical;
+flag-on marches a single generation to completion and its output matches the solo
+run exactly (`24a4614f2685`). The two-stream exit **cannot be met** as designed:
+
+```
+{"type":"error","id":"B","message":"failed to save active qwen35 session: qwen35 session missing decode state"}
+```
+
+`Qwen35Generation` TAKES the session out of the model at `start()`
+(`take_from_loaded`), and `LoadedModel.active` is a **single** resident slot. So
+with stream A admitted, the slot is empty; B's `generate_start` calls
+`activate_session`, whose save step finds nothing, and B dies before its first
+token.
+
+**Item 4 above ("`activate_session` per quantum") does not fix this.** It assumes
+the session lives in the slot and merely needs swapping between quanta. It does
+not live there — the handle owns it. There is nothing to activate between.
+
+Three ways out, none of them small:
+
+1. **Per-quantum save/restore.** `restore_into_loaded` before the step,
+   `take_from_loaded` after. Correct, but that is the exact round trip #288
+   showed allocates a `[vocab_size] f32` logits tensor per call — two per token
+   per stream, and it leaked until the in-place rewind landed.
+2. **Make the resident slot a table.** Real multi-session residency. That is §M5
+   territory, not M3.
+3. **Stop the handle owning the session.** Leave it in the slot and have the
+   handle hold only decode state, so `activate_session` per quantum becomes
+   sufficient after all. This is the smallest of the three, but it means
+   unpicking `finish()`'s by-value session — the property M3b0.5 deliberately
+   chose to dissolve the `Failed(String)` hand-back.
+
+**Measured 2026-08-22, by attempting it. Options 1 and 3 COLLAPSE into the same
+change.**
+
+Option 1 (per-quantum save/restore) sounded independent of option 3, and is not.
+Restoring the session into the slot before a step means `step` must read `kv`/`dn`
+from `m.active` rather than from an owned session — which *is* option 3's core
+change. Having made it, the handle no longer needs to own the session between
+quanta at all, so option 1 buys nothing and costs two GPU allocations per token
+per stream. **Discard option 1.**
+
+The option-3 surface, measured:
+
+* `step()` — **done and proven**: switching it to `m: &mut LoadedModel`, deriving
+  `kv`/`dn` from `m.active.sequence_state` and the tokenizer internally, compiles
+  cleanly. The disjoint-field borrow works, and the pattern already exists in this
+  file (the `pp > 1` path binds `&m.q35_config` alongside `&mut m.active` the same
+  way). Only the call sites needed updating.
+* `qwen35_finish_generation` — 16 `session` references, plus its by-value session
+  and the `qwen35_restore_or_error` unwind, all of which disappear when the
+  session never leaves the slot.
+* `generate_start`'s qwen35 arm — drop the `take_from_loaded`, rebind `kv`/`dn`
+  from the resident slot, and rewrite the `session.cursor` uses (22 across the
+  file).
+* `fail()` collapses to `write_error`; the handle's `session` field goes away.
+
+**It is one pass, not slices** — the same property M3b0.5 had, for the same
+reason: the session either lives in the slot or in the handle, and every site has
+to agree at once.
+
+**And note what it costs conceptually.** Leaving the session resident is a
+semantic change to the DEFAULT path, not just the flag-on one: today `m.active`
+is *empty* for the duration of a generation, and afterwards it would be
+populated. Anything that reads `m.active` mid-generate changes behaviour. That
+needs the full harness plus gates, not just a flag-off diff.
+
 #### M3b1 — the loop itself
 
 Small **once M3b0.75 exists**: ~150–250 lines across `main.rs`, `stream.rs`,

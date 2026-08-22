@@ -1952,7 +1952,7 @@ struct Qwen35DecodeCfg {
 }
 
 /// What one step of the qwen35 decode loop decided.
-enum Qwen35Step {
+pub enum Qwen35Step {
     /// The next token was sampled; the loop continues.
     Continue,
     /// A stop condition fired (EOS, terminator, filter, loop guard, cancel, or a
@@ -2531,7 +2531,9 @@ fn qwen35_finish_generation(
 /// `Qwen35DecodeState` was built borrow-free in M3b0 and why `Qwen35DecodeCfg`
 /// had its lifetime removed — this type is what both were for.
 pub struct Qwen35Generation {
-    session: Qwen35RequestSessionState,
+    /// `Some` while this stream owns the session; `None` while it is parked
+    /// back in the model's resident slot. Only one place holds it at a time.
+    session: Option<Qwen35RequestSessionState>,
     st: Qwen35DecodeState,
     cfg: Qwen35DecodeCfg,
     /// The ChatML `\n` tokens; `finish` forwards them when the turn ended on
@@ -2555,7 +2557,7 @@ impl Qwen35Generation {
     /// per step rather than captured once, which is what §M3b1 asks for: the
     /// moment the march loop can hand `&mut LoadedModel` to another stream
     /// between quanta, a captured snapshot and a per-use read stop agreeing.
-    fn step(
+    pub fn step(
         &mut self,
         m: &LoadedModel,
         gpu: &mut hipfire_rdna::Gpu,
@@ -2568,14 +2570,16 @@ impl Qwen35Generation {
         let scratch = m.q35_scratch.as_ref().unwrap();
         // Disjoint field paths: kv and recurrent are distinct fields of
         // session.sequence_state, and cursor is a third field of session.
-        let kv = self
+        let session = self
             .session
+            .as_mut()
+            .expect("stream must be resumed before it is stepped");
+        let kv = session
             .sequence_state
             .kv
             .as_mut()
             .expect("qwen35 session always has KV");
-        let dn = self
-            .session
+        let dn = session
             .sequence_state
             .recurrent
             .as_mut()
@@ -2590,7 +2594,7 @@ impl Qwen35Generation {
             scratch,
             kv,
             dn,
-            &mut self.session.cursor,
+            &mut session.cursor,
             m.eviction.as_ref(),
             m.physical_cap,
             tokenizer,
@@ -2604,7 +2608,63 @@ impl Qwen35Generation {
 
     /// Run the teardown and emit the `done` frame. Consumes the handle, because
     /// the session restore consumes the session.
-    fn finish(
+    /// Unwind after [`Qwen35Step::Failed`]: report and restore the session.
+    ///
+    /// Exists so a driver outside this crate can handle `Failed` without
+    /// touching `session`, which stays private because `qwen35_restore_or_error`
+    /// consumes it.
+    pub fn fail(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+        message: &str,
+    ) {
+        write_error(stdout, id, message);
+        if let Some(session) = self.session {
+            qwen35_restore_or_error(stdout, id, m, gpu, session);
+        }
+    }
+
+    /// True while the decode loop should keep stepping. Encapsulates the cap so
+    /// a driver does not need the private `st`/`cfg` fields.
+    /// Hand the session back to the model's resident slot.
+    ///
+    /// Called after every quantum. The slot must be POPULATED between steps or
+    /// the next stream's `activate_session` has nothing to save and dies with
+    /// "qwen35 session missing decode state" — which is exactly how two
+    /// concurrent streams failed before this existed.
+    pub fn park(&mut self, m: &mut LoadedModel, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
+        match self.session.take() {
+            Some(session) => session.restore_into_loaded(m, gpu),
+            None => Ok(()),
+        }
+    }
+
+    /// Make this stream's session resident again and take ownership for a step.
+    ///
+    /// `activate_session` saves whichever stream was parked and swaps ours in;
+    /// the take then gives this handle exclusive use for the quantum.
+    pub fn resume(
+        &mut self,
+        m: &mut LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        crate::session::qwen35_activate_session(m, gpu, session_id)?;
+        self.session = Some(Qwen35RequestSessionState::take_from_loaded(m, gpu)?);
+        Ok(())
+    }
+
+    pub fn should_continue(&self) -> bool {
+        self.st.generated < self.cfg.max_tokens
+    }
+
+    pub fn finish(
         self,
         m: &mut LoadedModel,
         gpu: &mut hipfire_rdna::Gpu,
@@ -2630,7 +2690,7 @@ impl Qwen35Generation {
             gpu,
             stdout,
             id,
-            session,
+            session.expect("finish requires a resumed stream"),
             st.generated,
             &nl,
             cfg.im_end_token,
@@ -3844,7 +3904,7 @@ pub fn generate_start(
         // budget-alert injection can push `generated` past the iteration count,
         // so the cap is rechecked at each loop start.
         return Qwen35Start::Ready(Qwen35Generation {
-            session,
+            session: Some(session),
             st: Qwen35DecodeState {
                 rng_state,
                 next_token: tok0,
@@ -4175,7 +4235,9 @@ pub fn generate(
                     // the session, so it cannot run while `step` holds borrows.
                     Qwen35Step::Failed(message) => {
                         write_error(stdout, id, &message);
-                        qwen35_restore_or_error(stdout, id, m, gpu, generation.session);
+                        if let Some(session) = generation.session.take() {
+                            qwen35_restore_or_error(stdout, id, m, gpu, session);
+                        }
                         return;
                     }
                 }

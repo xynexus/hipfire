@@ -827,7 +827,13 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             let _ = daemon_state.out.sink.flush();
             return;
         }
-        generate(
+        // §M3b1: the DAEMON owns the decode loop now, not serving-core.
+        // `generate_start` frames and prefills, then hands back a handle this
+        // loop marches one token at a time. Flag-off behaviour is unchanged —
+        // the same steps in the same order — but the loop being HERE is what
+        // lets the executor interleave two streams instead of running one
+        // request to completion inside a single call.
+        let started = generate_start(
             m,
             &mut daemon_state.gpu,
             daemon_state.pflash_drafter_gpu.as_mut(),
@@ -861,5 +867,59 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 .or_else(|| msg.get("evidence_dir").and_then(|v| v.as_str())),
             raw_override,
         );
+        let Qwen35Start::Ready(mut generation) = started else {
+            // Served by another route (spec-decode, VL, llama) or already
+            // failed and reported it. Nothing to march.
+            return;
+        };
+        // §M3b1: under the executor flag the frame ADMITS and returns — the
+        // march loop advances it. Inline drive below is the flag-off path, and
+        // also the fallback when admission was refused (a session already live),
+        // because refusing to generate would be user-visible.
+        if crate::stream::executor_v2_enabled() {
+            // Park immediately, not just after a march step. Two Generate
+            // frames are dispatched back to back before the loop ever runs, so
+            // if this stream keeps the session the NEXT frame's
+            // `generate_start` finds an empty slot and dies with "qwen35
+            // session missing decode state". The invariant is: a stream holds
+            // the session only while it is actually stepping.
+            if generation.park(m, &mut daemon_state.gpu).is_err() {
+                return;
+            }
+            if let Some(s) = daemon_state
+                .streams
+                .by_session_mut(&crate::stream::session_of(msg))
+            {
+                s.generation = Some(generation);
+                return;
+            }
+        }
+        while generation.should_continue() {
+            let tokenizer = match m.tokenizer.as_ref() {
+                Some(t) => t,
+                None => break,
+            };
+            match generation.step(
+                m,
+                &mut daemon_state.gpu,
+                tokenizer,
+                &mut daemon_state.out.sink,
+                id,
+            ) {
+                Qwen35Step::Continue => {}
+                Qwen35Step::Stop => break,
+                Qwen35Step::Failed(message) => {
+                    generation.fail(
+                        m,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.out.sink,
+                        id,
+                        &message,
+                    );
+                    return;
+                }
+            }
+        }
+        generation.finish(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, id);
     }
 }

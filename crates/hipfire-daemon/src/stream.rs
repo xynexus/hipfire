@@ -111,6 +111,11 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
         Err(AdmitError::SessionAlreadyLive(_)) => return None,
     };
     if let Some(stream) = state.streams.get_mut(id) {
+        stream.request_id = msg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0")
+            .to_string();
         stream.run();
     }
     Some(id)
@@ -345,9 +350,17 @@ pub(crate) enum StreamStatus {
 /// file does not change the behaviour of any existing path. The migration is
 /// §M1d's remaining third, and it needs a place to move the state *to* before it
 /// can move it.
-#[derive(Debug)]
 pub(crate) struct RunningStream {
     pub(crate) id: StreamId,
+    /// The in-flight generation this stream advances, once admitted under the
+    /// executor flag. `None` on the inline path, where `generate` is driven to
+    /// completion inside the request instead.
+    pub(crate) generation: Option<hipfire_serving_core::generate::Qwen35Generation>,
+    /// The request id this stream's frames are tagged with. Stored because the
+    /// march loop emits `token`/`done` long after the frame that created it, and
+    /// `session` is NOT a substitute — they differ whenever a client sends an
+    /// explicit `session_id`.
+    pub(crate) request_id: String,
     /// The wire identity this stream was admitted for. Immutable: rebinding a
     /// live stream to a different session would silently redirect its KV and
     /// conversation state, so a session change is a new stream, not a mutation.
@@ -379,6 +392,21 @@ pub(crate) struct RunningStream {
     pub(crate) steer: Option<SteerSpec>,
 }
 
+impl std::fmt::Debug for RunningStream {
+    /// Hand-written because `Qwen35Generation` is not `Debug` and should not be
+    /// made so just to satisfy a derive here — the same reasoning the plan gives
+    /// for not adding a derive in `transport.rs`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningStream")
+            .field("id", &self.id)
+            .field("session", &self.session)
+            .field("status", &self.status)
+            .field("cursor", &self.cursor)
+            .field("generation", &self.generation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunningStream {
     /// Admit a stream. Starts at cursor zero in `Admitted`.
     ///
@@ -394,6 +422,8 @@ impl RunningStream {
             id,
             session,
             spec,
+            generation: None,
+            request_id: String::new(),
             cursor: StreamCursor::default(),
             status: StreamStatus::Admitted,
             rng,
