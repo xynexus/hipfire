@@ -56,6 +56,11 @@ fn main() {
         std::process::exit(2);
     };
     let cap: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(32);
+    // How many output rows SHARE one pool. In production every row that reuses
+    // the compacted activation X_pool must share it, so this is not free to set:
+    // a narrow share means recompacting X_pool more often. Measuring the quality
+    // side of that knob is the point -- a pool tuned on 32 rows is optimistic.
+    let share: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(cap);
 
     let pkg = HessianSidecar::open(std::path::Path::new(&cal)).expect("calib");
     let file = std::fs::File::open(&st).expect("open");
@@ -132,13 +137,20 @@ fn main() {
         })
         .collect();
 
-    // Pool orders per group, by two criteria.
-    let mut order_sse: Vec<Vec<usize>> = Vec::with_capacity(ng);
-    let mut order_h: Vec<Vec<usize>> = Vec::with_capacity(ng);
-    for g in 0..ng {
+    // Pool orders per (group, share-block).
+    let nblocks = take.div_ceil(share);
+    let mut order_sse: Vec<Vec<usize>> = Vec::with_capacity(ng * nblocks);
+    let mut order_h: Vec<Vec<usize>> = Vec::with_capacity(ng * nblocks);
+    for gb in 0..ng * nblocks {
+        let g = gb / nblocks;
+        let blk = gb % nblocks;
+        let lo = blk * share;
+        let hi = (lo + share).min(take);
+        let _ = (lo, hi);
         let mut b_sse = vec![0.0f64; G];
         let mut b_h = vec![0.0f64; G];
-        for (ri, r) in rowsv.iter().enumerate() {
+        for ri in lo..hi {
+            let r = &rowsv[ri];
             let grp = &r[g * G..(g + 1) * G];
             let sc = scales[ri][g];
             let inv = 1.0 / sc;
@@ -158,15 +170,21 @@ fn main() {
         order_h.push(o2);
     }
 
-    let arms: Vec<(&str, usize, bool)> = vec![
-        ("int4", 0, false),
-        ("overlay-3", usize::MAX, false),
-        ("pool16 SSE-pick", 16, false),
-        ("pool16 H-pick", 16, true),
-        ("pool32 SSE-pick", 32, false),
-        ("pool32 H-pick", 32, true),
-        ("pool64 SSE-pick", 64, false),
-        ("pool64 H-pick", 64, true),
+    // `seg1` = ONE scale per row over the whole K (Kairic's kSegments=1). It
+    // removes the per-group fold from the WMMA inner loop, which is what forces
+    // the second accumulator set and caps WNt at 4 -- so it is what would buy the
+    // 1-pass twin's WNt=8 shape. Pooling is the natural partner: a coarse scale
+    // fails exactly where dynamic range is unusual, which is what pooled extra
+    // bits restore, and it restores them WITHOUT a gather.
+    let arms: Vec<(&str, usize, bool, bool)> = vec![
+        ("int4 G256", 0, false, false),
+        ("overlay-3 G256", usize::MAX, false, false),
+        ("pool32 G256", 32, false, false),
+        ("pool64 G256", 64, false, false),
+        ("int4 seg1", 0, false, true),
+        ("pool32 seg1", 32, false, true),
+        ("pool64 seg1", 64, false, true),
+        ("pool128 seg1", 128, false, true),
     ];
     let mut energy = 0.0f64;
     for r in &rowsv {
@@ -179,13 +197,15 @@ fn main() {
         "arm", "H-weighted", "vs ov", "recovered"
     );
     let mut results = Vec::new();
-    for (name, p, hpick) in &arms {
+    for (name, p, hpick, seg1) in &arms {
         let mut tot = 0.0f64;
         for (ri, r) in rowsv.iter().enumerate() {
             let mut d = vec![0.0f64; k];
+            // One scale for the entire row when seg1.
+            let row_scale = symmetric_clipsearch(r, 7.0);
             for g in 0..ng {
                 let grp = &r[g * G..(g + 1) * G];
-                let sc = scales[ri][g];
+                let sc = if *seg1 { row_scale } else { scales[ri][g] };
                 let mut wide = vec![false; G];
                 if *p == usize::MAX {
                     let mut own: Vec<usize> = (0..G).collect();
@@ -194,7 +214,9 @@ fn main() {
                         wide[q] = true;
                     }
                 } else {
-                    let ord = if *hpick { &order_h[g] } else { &order_sse[g] };
+                    let blk = ri / share;
+                    let gb = g * nblocks + blk;
+                    let ord = if *hpick { &order_h[gb] } else { &order_sse[gb] };
                     for &q in &ord[..*p] {
                         wide[q] = true;
                     }
