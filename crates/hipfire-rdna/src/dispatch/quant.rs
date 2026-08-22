@@ -973,9 +973,12 @@ impl Gpu {
         iters: i32,
         chains: u32,
         fold: bool,
+        stage: Option<(&GpuTensor, usize)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let name = if fold {
+        let name = if stage.is_some() {
+            format!("wmma_iu4_stage_w32_c{chains}")
+        } else if fold {
             format!("wmma_iu4_fold_w32_c{chains}")
         } else {
             format!("wmma_iu4_lds_w32_c{chains}")
@@ -987,6 +990,20 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &mut it as *mut _ as *mut c_void,
         ];
+        // The staging variant takes (src, mask) after `out`; keep the arg order
+        // matching the kernel signature (out, src, iters, srcmask).
+        let sp;
+        let mut smask;
+        if let Some((src, words)) = stage {
+            sp = src.buf.as_ptr();
+            smask = (words - 1) as i32;
+            params = vec![
+                &op as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &mut it as *mut _ as *mut c_void,
+                &mut smask as *mut _ as *mut c_void,
+            ];
+        }
         let func = &self.functions[&name];
         unsafe {
             self.hip.launch_kernel(
