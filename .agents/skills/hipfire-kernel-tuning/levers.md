@@ -427,6 +427,22 @@ Non-zero means an array you think is in registers is not. The cost is paying a
 predicated tail when the runtime bound is below the compile-time one, so check
 the shapes you actually run.
 
+**The compile-time bound has to be SMALL.** This works at the overlay's MAXQ=4.
+It does NOT work at 8 or 16: applied to `attention_flash_kvarn_tile_batched`
+(MAXDPT = 8, and 16 for the `_hd512` twin) the same `#pragma unroll` + `break`
+took movrel 22 -> 36 (one loop), -> 42 (two loops), -> 64 (six loops), and left
+the biggest loop byte-identical at 92 instructions with 1 FMA and 3 movrel. At
+that bound LLVM multiplies unrolled copies instead of collapsing the indices.
+
+Two further conditions, both learned the hard way there:
+
+- Fixing ONE loop is not enough. The array has to be compile-time indexed at
+  EVERY use. `out_vec` is written in the hot loop and read by a later
+  runtime-bounded loop, so patching only the writer left it indexed anyway.
+- When the bound is too large for unrolling, the real fix is to make the trip
+  count a TEMPLATE PARAMETER and instantiate per value, not to predicate. That
+  is a dispatch change, not a kernel-local one.
+
 ## 17. Check the STORE pattern before optimizing the loads
 
 The same overlay kernel had a carefully justified k-major GATHER (its header

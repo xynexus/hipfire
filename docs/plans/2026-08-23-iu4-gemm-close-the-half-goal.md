@@ -103,8 +103,23 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
      bound + break, as in the overlay) took movrel 22 -> 64: MAXDPT is 8/16, far
      larger than MAXQ=4, so the unroll multiplies copies instead of collapsing
      indices. Reverted, do not retry that shape.
-   - 21 distinct loops and no single obvious hot one. This needs per-loop
-     attribution from a real profile, not static ISA reading, before any edit.
+   - The kernel already carries prior attribution in a comment: **Phase D
+     (V-weighted accumulation) is ~99.9% of its runtime** (gutting it took a 3k
+     run from 9.79 s to 0.010 s). So the phase split is known; Phase D is the
+     target.
+   - Phase D's inner dim loop is `for (i = 0; i < dpt; i++) out_vec[i] += wvs *
+     vq[i]` with `dpt = head_dim/32` RUNTIME. The compiler neither unrolls it nor
+     gives `out_vec` static registers, so the ISA shows **1 FMA per 39-92 loop
+     instructions** -- the rest is address math and movrel.
+   - **The cheap fix does not work here.** `#pragma unroll` to MAXDPT + `break`
+     (which took movrel 24 -> 0 in the overlay at MAXQ=4) makes it WORSE at
+     MAXDPT=8/16: 22 -> 36 for one loop, -> 42 for two, -> 64 for six, with the
+     biggest loop byte-identical. Tried three ways, all reverted.
+   - **The fix is to make `dpt` a template parameter** and instantiate per value
+     (head_dim/32, so 2/4/8/16), the way MAXDPT already is, with the dispatch
+     picking the instantiation. Then Phase D's inner loop fully unrolls to `dpt`
+     FMAs against static registers. That is a dispatch change, and it is the
+     single highest-value item left in attention.
 
 ## Work, in order
 
