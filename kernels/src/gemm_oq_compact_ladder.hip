@@ -15,7 +15,17 @@
 // Contract, identical at every rung:
 //   W    : compact SPLIT-PLANE blocks. Nibble plane [M][n_groups][128 B], then
 //          side records [M][n_groups][side_stride] = [f16 scale][overlay table].
-//   Xq   : [B, K] int8      Xs : [B, K/256] f32      Y : [B, M] f32
+//   Xq   : [B, K] bytes holding the activation PRE-SPLIT AND INTERLEAVED at
+//          fragment granularity: for each column, each 16-K step contributes
+//          8 bytes of hi nibbles immediately followed by 8 bytes of lo. Same
+//          byte volume and the SAME column stride as the int8 form, so one
+//          16-byte load yields both WMMA operands with no VALU.
+//
+//          Two separate planes (hi at [0,B*K/2), lo after) was tried and is 30%
+//          SLOWER than in-kernel splitting: it doubles the transaction count and
+//          halves their size, from two streams B*K/2 apart. Locality beats the
+//          VALU saving.
+//   Xs   : [B, K/256] f32      Y : [B, M] f32
 //   exact W4A8: x = 16*x_hi + x_lo, hi signed, lo unsigned, two iu4 passes on
 //   one weight fragment. No sparse overlay (separate pass, as for every twin).
 //
@@ -40,6 +50,7 @@
 #include <stdint.h>
 
 typedef int32_t i32x2 __attribute__((ext_vector_type(2)));
+typedef int32_t i32x4 __attribute__((ext_vector_type(4)));
 typedef int32_t i32x8 __attribute__((ext_vector_type(8)));
 typedef float f32x8 __attribute__((ext_vector_type(8)));
 #define LWH(a, b, c) __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c, false)
@@ -82,7 +93,11 @@ __launch_bounds__(32 * LWAVES) extern "C" __global__ void gemm_oq_compact_ladder
     // Hoisted: every base is computed ONCE in 64-bit, then advanced by a
     // constant stride per group, so the loop body is 32-bit pointer bumps.
     const uint8_t* arow = W + (long long)a_row * n_groups * 128;
-    const int8_t* xrow = Xq + (long long)b_col * K;
+    // The B operand wants lane n to hold column n's 16 K values AS NIBBLES.
+    // From int8 storage that needs a 16-byte read plus ~20 VALU ops per WMMA
+    // pair to split. Pre-split planes make it two 8-byte loads and no VALU --
+    // and cost the same bytes, since K/2 + K/2 == K.
+    const uint8_t* xrow = (const uint8_t*)Xq + (long long)b_col * K;
     const float* xsp = Xs + (long long)b_col * n_groups;
     // Fold scale pointers: the row for element e is m0 + 2*e + half, which does
     // not depend on the group. Pre-clamp here so the fold has NO branches.
@@ -101,18 +116,11 @@ __launch_bounds__(32 * LWAVES) extern "C" __global__ void gemm_oq_compact_ladder
         for (int s = 0; s < LGROUP / 16; ++s) {
             // weights: 16 nibbles = 8 bytes, already the operand layout
             const i32x2 af = *(const i32x2*)(arow + s * 8);
-            // activations: 16 int8 -> 8 bytes of hi nibbles + 8 of lo
-            const uint32_t d0 = *(const uint32_t*)(xrow + s * 16);
-            const uint32_t d1 = *(const uint32_t*)(xrow + s * 16 + 4);
-            const uint32_t d2 = *(const uint32_t*)(xrow + s * 16 + 8);
-            const uint32_t d3 = *(const uint32_t*)(xrow + s * 16 + 12);
+            // interleaved: ONE 16-byte load gives both operands
+            const i32x4 bx = *(const i32x4*)(xrow + s * 16);
             i32x2 bh, bl;
-            bh[0] = (int)(lpack4((d0 >> 4) & 0x0f0f0f0fu)
-                        | (lpack4((d1 >> 4) & 0x0f0f0f0fu) << 16));
-            bh[1] = (int)(lpack4((d2 >> 4) & 0x0f0f0f0fu)
-                        | (lpack4((d3 >> 4) & 0x0f0f0f0fu) << 16));
-            bl[0] = (int)(lpack4(d0 & 0x0f0f0f0fu) | (lpack4(d1 & 0x0f0f0f0fu) << 16));
-            bl[1] = (int)(lpack4(d2 & 0x0f0f0f0fu) | (lpack4(d3 & 0x0f0f0f0fu) << 16));
+            bh[0] = bx[0]; bh[1] = bx[1];
+            bl[0] = bx[2]; bl[1] = bx[3];
             ah = LWH(af, bh, ah);
             al = LWL(af, bl, al);
         }

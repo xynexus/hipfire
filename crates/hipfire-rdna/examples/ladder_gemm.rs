@@ -114,7 +114,17 @@ fn main() {
         // int8 activations, exactly as quantize_act_oq8 leaves them. The kernel
         // does the radix-16 digit split itself while staging into LDS.
         let x8: Vec<i8> = (0..b * k).map(|_| (rnd() % 256) as u8 as i8).collect();
-        let x8u: Vec<u8> = x8.iter().map(|&v| v as u8).collect();
+        let mut x8u = vec![0u8; b * k];
+        for col in 0..b {
+            for st in 0..k / 16 {
+                for j in 0..8 {
+                    let a = x8[col * k + st * 16 + 2 * j] as u8;
+                    let bb = x8[col * k + st * 16 + 2 * j + 1] as u8;
+                    x8u[col * k + st * 16 + j] = (a >> 4) | (bb & 0xf0);
+                    x8u[col * k + st * 16 + 8 + j] = (a & 0xf) | ((bb & 0xf) << 4);
+                }
+            }
+        }
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
@@ -185,7 +195,18 @@ fn main() {
             *v = (i * 7 + 1) as u8;
         }
         let dev = split_planes(&blocks, m * ng, stride, group);
-        let x8u: Vec<u8> = (0..b * k).map(|i| (i * 13 + 5) as u8).collect();
+        let raw: Vec<u8> = (0..b * k).map(|i| (i * 13 + 5) as u8).collect();
+        let mut x8u = vec![0u8; b * k];
+        for col in 0..b {
+            for st in 0..k / 16 {
+                for j in 0..8 {
+                    let a = raw[col * k + st * 16 + 2 * j];
+                    let bb = raw[col * k + st * 16 + 2 * j + 1];
+                    x8u[col * k + st * 16 + j] = (a >> 4) | (bb & 0xf0);
+                    x8u[col * k + st * 16 + 8 + j] = (a & 0xf) | ((bb & 0xf) << 4);
+                }
+            }
+        }
         let xs: Vec<f32> = (0..b * ng).map(|i| (i % 997) as f32 * 1e-5 + 1e-4).collect();
         let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
         let x8b = gpu.upload_raw(&x8u, &[x8u.len()]).expect("x");
