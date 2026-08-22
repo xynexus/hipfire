@@ -408,6 +408,77 @@ If what you want is a "do not cache this" hint, that is the nontemporal /
 TH cache-policy bits instead -- and those are already a documented fake win
 (case-studies §2: measured +2%, actually -13%).
 
+## 16. Runtime loop bounds silently evict register arrays (gfx1151, any arch)
+
+A loop bounded by a RUNTIME value cannot keep an indexed array in static
+registers. LLVM falls back to M0-relative indexed moves -- `v_movrels_b32` /
+`v_movreld_b32` -- plus a pile of `v_mov` and SALU bookkeeping around them.
+
+Seen in the sparse overlay: the hot loop was 144 instructions carrying 7
+MAC-ish ops (**20.6 instructions per MAC**), of which 24 were movrel. Bounding
+the loop by a compile-time maximum and predicating the tail took movrel to 0 and
+bought +3.8% end to end.
+
+Cheap detector, worth running on any kernel with a small indexed accumulator:
+
+    hipcc --offload-arch=gfx1151 -O3 -S -o - k.hip | grep -c v_movrel
+
+Non-zero means an array you think is in registers is not. The cost is paying a
+predicated tail when the runtime bound is below the compile-time one, so check
+the shapes you actually run.
+
+## 17. Check the STORE pattern before optimizing the loads
+
+The same overlay kernel had a carefully justified k-major GATHER (its header
+argues the layout at length) sitting next to a store nobody had looked at.
+Ablation:
+
+    baseline                       1.657 ms
+    gather replaced by a constant  1.174      gather = 29%
+    Y store predicated off         0.555      STORE  = 67%
+    neither                        0.324
+
+Y was `[B, M]` f32 -- contiguous in ROWS -- while a wave owned one row and 128
+b, so 128 stores hit 128 lines at 4 bytes each: 32x write amplification, on a
+read-modify-write.
+
+When the gather and the store want opposite lane->axis mappings, you do not have
+to choose: keep the gather, accumulate into LDS, transpose there, store
+coalesced. That was +9.3% end to end.
+
+**Pad the LDS tile.** `[32][128]` f32 has a 128-dword row stride, which is
+0 mod 64, so every lane of a transposed readback hits ONE bank -- a 32-way
+conflict that returns the entire win. `[32][128+1]` fixes it. Same trap as §9's
+XPAD, different kernel.
+
+## 18. Grid axis order is a cache-blocking decision
+
+Workgroups dispatch with `blockIdx.x` fastest. If x is the axis whose operand is
+LARGE, you sweep that whole operand once per step of the slow axis.
+
+The compact GEMM launched `[M/BM, B/BN]`: the full 47 MB weight set was swept
+once per N-block, 4 sweeps against a 32 MB MALL that cannot hold one, so 190 MB
+of DRAM where 47 MB would do. Swapping to `[B/BN, M/BM]` was +2.7% end to end.
+
+Pick the fast axis so the SMALL operand is the one re-swept. And re-check when
+the batch grows: at B=2048 the X tensor is 10.5 MB and the swizzle turns into a
+0.91x regression.
+
+## 19. Negative: manual fragment software-pipelining (LLVM already does it)
+
+Prefetching the next K-step's LDS fragments during this step's WMMA is the
+textbook fix for `lgkmcnt` stalls. Check the ISA before writing it: with the K
+loop unrolled, LLVM already hoists the loads to the top of the body and consumes
+them under progressively relaxed waits.
+
+In `gemm_oq_compact_iu4x2_w64` the body reads:
+
+    |B||||GGG|LLLLLLLLLLLLLL|WW|WW|WW|WW|WWWWWWWWLLLL|WW|...
+
+14 `ds_load_b128` hoisted, then WMMA interleaved with `lgkmcnt(12)`, `(11)`,
+`(10)`... i.e. matrix work starts as soon as the first two loads land. That is
+software pipelining; there is nothing left to hand-write. Companion to §14.
+
 ## When you're done
 
 Commit your win (or your null-result revert) with the commit-message
