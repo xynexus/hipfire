@@ -1141,6 +1141,40 @@ struct CalibrateDaemonSession {
 /// back (or retired) only after the model borrow ends. Holding
 /// `&mut streams` and `&mut model` together does not compile, and working
 /// around that by cloning would copy a live KV handle.
+/// Run the executor until nothing is runnable.
+///
+/// Required before anything that destroys the model the live streams are
+/// mid-generation on. The march loop only runs when the pending queue is EMPTY
+/// (`pop_next() -> None`), so a batch that arrives together — the stdin
+/// protocol delivers exactly that — dispatches `unload` BEFORE the executor has
+/// stepped anything. `daemon_state.model` is then `None` when the march finally
+/// runs, every admitted stream takes the `None => Outcome::Retired` arm, and the
+/// whole batch is lost **without a single error frame**.
+///
+/// Measured on a 4-stream batch: with `unload` present, 0 tokens and 0 errors;
+/// with it removed, 4 x 16 tokens. Same binary, same flag.
+fn drain_streams(daemon_state: &mut state::DaemonState) {
+    if !stream::executor_v2_enabled() {
+        return;
+    }
+    // Bounded: `march_streams` retires a stream on every terminal outcome, so
+    // the runnable set strictly shrinks unless a stream is making progress. The
+    // cap is a backstop against a stream that neither progresses nor retires —
+    // it would otherwise hang the daemon on teardown.
+    let mut guard = 0usize;
+    while !daemon_state.streams.runnable().is_empty() {
+        march_streams(daemon_state);
+        guard += 1;
+        if guard > 1_000_000 {
+            eprintln!(
+                "[executor] drain gave up with {} stream(s) still runnable",
+                daemon_state.streams.runnable().len()
+            );
+            break;
+        }
+    }
+}
+
 fn march_streams(daemon_state: &mut state::DaemonState) {
     if !stream::executor_v2_enabled() {
         return;
@@ -1556,6 +1590,9 @@ fn main() {
                 handlers::status::registry(&mut daemon_state, &llm_registry)
             }
             DaemonRequest::Load(_) => {
+                // A load replaces the resident model, so it destroys live
+                // streams exactly as an unload does.
+                drain_streams(&mut daemon_state);
                 handlers::lifecycle::load(&mut daemon_state, &msg, &protocol_load)
             }
 
@@ -1640,7 +1677,11 @@ fn main() {
 
             DaemonRequest::Reset => handlers::lifecycle::reset(&mut daemon_state, &msg),
 
-            DaemonRequest::Unload => handlers::lifecycle::unload(&mut daemon_state),
+            DaemonRequest::Unload => {
+                // Finish live streams before their model disappears.
+                drain_streams(&mut daemon_state);
+                handlers::lifecycle::unload(&mut daemon_state)
+            }
 
             DaemonRequest::UnloadWorker => {
                 handlers::lifecycle::unload_worker(&mut daemon_state, &msg)
