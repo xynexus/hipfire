@@ -2185,6 +2185,7 @@ mod tests {
 
         let req = GenerateTextRequest {
             id: "req-1".to_string(),
+            session_id: None,
             prompt: "hello".to_string(),
             messages: None,
             sampling: GenerationSamplingPolicy {

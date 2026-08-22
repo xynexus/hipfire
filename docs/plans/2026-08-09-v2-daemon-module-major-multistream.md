@@ -1540,12 +1540,32 @@ the whole premise, since v2's claim is suspension *between modules* and an
 unlowered prefill cannot be suspended at all. Everything else in this tier is
 small by comparison; `hipEventQuery`/`hipStreamQuery` is ~15 lines.
 
-### M0 (the instrument) — not built
+### M0 (the instrument) — BUILT at event granularity, NOT at module granularity
 
-No `executor_trace` in the daemon. This matters more than its size suggests:
-**every stage in this plan exits on a measurement read from that trace**, so
-until it exists no stage can be shown to have landed. It is also purely
-additive — it breaks nothing — which makes it the obvious first commit.
+**Corrected 2026-08-21.** This section previously read "not built. No
+`executor_trace` in the daemon." That is no longer true, and the half that IS
+true matters more than the half that changed.
+
+Built: `hipfire-runtime/src/exec_trace.rs` exists and the daemon records into it
+— `state.rs`'s `Responder::trace_frame` records `Completed`, `main.rs` records
+dispatch, `serving-core::events` records token emissions — and it is readable
+over the protocol via the `ExecutorTrace` request (`handlers/status.rs` →
+`snapshot_json`). `TraceEvent` has five variants: `DispatchBegin`,
+`DispatchEnd`, `TokenEmitted`, `Completed`, `VramSample`.
+
+**Not built: the module dimension.** `TraceRecord.module` exists but its own doc
+says "Which module (M4 onward). 0 until the module graph exists", and every
+`record()` call site passes 0. `TraceRecord` has no field that could carry a
+`SuperOpKind`, and the type appears in `exec_trace.rs` **zero** times. The file
+also records that a `Yielded` variant was deliberately left out because "today
+nothing can construct it".
+
+So the original warning still holds, but narrowly: **§M3d's first exit
+measurement — p99/max module duration and which `SuperOpKind` owns the max —
+cannot be read off this trace as it stands.** Measurements 2 and 3
+(admission→first-dispatch, and loaded-vs-solo bulk throughput) are event-level
+and are obtainable today. Scope M3d accordingly, or budget the module
+instrumentation as part of it.
 
 ### Tier 3 — one item improved
 

@@ -1190,6 +1190,7 @@ pub fn generate_multi(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
@@ -1515,7 +1516,7 @@ pub fn generate_multi(
     let cfg0 = SamplerConfig {
         temperature: temp,
         top_p,
-        top_k: 20,
+        top_k,
         repeat_penalty,
         repeat_window: repeat_buf_cap,
         presence_penalty,
@@ -1714,7 +1715,7 @@ pub fn generate_multi(
                 let cfg = SamplerConfig {
                     temperature: temp,
                     top_p,
-                    top_k: 20,
+                    top_k,
                     repeat_penalty,
                     repeat_window: repeat_buf_cap,
                     presence_penalty,
@@ -1802,7 +1803,7 @@ pub fn generate_multi(
         let cfg = SamplerConfig {
             temperature: temp,
             top_p,
-            top_k: 20,
+            top_k,
             repeat_penalty,
             repeat_window: repeat_buf_cap,
             presence_penalty,
@@ -1882,6 +1883,787 @@ pub fn generate_multi(
     let _ = stdout.flush();
 }
 
+/// Cross-token state of one qwen35 decode loop.
+///
+/// Hoisted out of [`generate`]'s stack frame so that advancing one token is a
+/// **function call** rather than a loop iteration. That is the entire point:
+/// executor v2's march loop needs a quantum it can step, and a `while` body
+/// holding nine live locals is not one. See
+/// `docs/plans/2026-08-21-executor-v2-march-loop.md` §M3b0.
+///
+/// It deliberately owns **no borrow of the GPU or the model**. A serial executor
+/// hands the GPU to another stream between quanta, so anything a stream keeps
+/// across a suspension must not borrow it; the resources arrive per step
+/// instead. A struct that held `&mut Gpu` would pin the device to one stream for
+/// its whole life and defeat the interleaving it exists to enable.
+struct Qwen35DecodeState {
+    /// Sampler RNG. Advanced by `sampler::sample`; greedy decode never consults
+    /// it, which is why greedy baselines do not move when this is threaded.
+    rng_state: u32,
+    /// Sampled but NOT yet committed: written to the KV cache at the top of the
+    /// next step. The cancellation check is placed before that write on purpose
+    /// — see the KV-safe chokepoint comment in [`qwen35_decode_one`].
+    next_token: u32,
+    generated: usize,
+    streamed_tokens: Vec<u32>,
+    /// Index into the freshly-decoded byte stream past which bytes have not yet
+    /// been handed to `filter`; the filter owns UTF-8 boundary buffering.
+    bytes_fed_to_filter: usize,
+    filter: EosFilter,
+    alert_fired: bool,
+    /// `max_think_tokens` enforcement. Counts only while inside an open
+    /// `<think>` block, and re-arms if the model opens another one.
+    think_count: usize,
+    prev_in_think: bool,
+}
+
+/// Per-request decode settings that do not change between tokens.
+///
+/// Split from [`Qwen35DecodeState`] along the mutable/immutable line: the state
+/// is what a suspended stream must carry, this is what it can be handed again on
+/// resume. Keeping them apart is also what stops the step function from taking
+/// thirty arguments.
+struct Qwen35DecodeCfg {
+    max_tokens: usize,
+    max_think_tokens: usize,
+    budget_alert_at_tok: usize,
+    budget_alert_text: String,
+    im_end_token: Option<u32>,
+    /// `tokenizer.encode("\n").len()` — only the length is read, by the
+    /// budget-alert KV headroom check.
+    nl_len: usize,
+    vocab_size: usize,
+    /// Candidates retained before nucleus sampling. Threaded from the request
+    /// (`0` = the backend's full candidate set); the daemon defaults it to 20,
+    /// which is the literal this replaced.
+    top_k: usize,
+    /// Repeat window bounded by the GPU `repeat_buf` capacity.
+    repeat_buf_cap: usize,
+    /// Start of the repeat-penalty ngram scope: generated tokens only, never the
+    /// prompt.
+    ngram_scope_start: usize,
+    attractor_pairs: Vec<(u32, u32)>,
+    loop_guard: hipfire_generate::loop_guard::LoopGuard,
+    temperature: f32,
+    top_p: f32,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+}
+
+/// What one step of the qwen35 decode loop decided.
+enum Qwen35Step {
+    /// The next token was sampled; the loop continues.
+    Continue,
+    /// A stop condition fired (EOS, terminator, filter, loop guard, cancel, or a
+    /// spent budget). The caller breaks and emits the done frame as before.
+    Stop,
+    /// A forward failed. The message is formatted but NOT written here, and the
+    /// caller unwinds.
+    ///
+    /// This is not stylistic. `qwen35_restore_or_error` takes the session **by
+    /// value**, while `kv` and `dn` are disjoint `&mut` borrows *out of* that
+    /// same session. Inline in a loop body, NLL accepts the move because the
+    /// borrows are dead on a path that returns immediately. Across a function
+    /// signature they must all coexist, so the consuming call cannot live in
+    /// here — it has to happen where the borrows have been released.
+    Failed(String),
+}
+
+/// Advance one qwen35 decode step: commit the pending token, write its K/V,
+/// apply the stop/think/loop-guard/budget-alert rules, and sample the next one.
+///
+/// Extracted verbatim from [`generate`]'s `while generated < max_tokens` body.
+/// It is a **pure move**: every branch, every emit, and every arithmetic
+/// operation is the code that was there before, so output is byte-identical by
+/// construction rather than by argument.
+#[allow(clippy::too_many_arguments)]
+fn qwen35_decode_one(
+    gpu: &mut hipfire_rdna::Gpu,
+    weights: &qwen35::Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &qwen35::Qwen35Scratch,
+    kv: &mut hipfire_runtime::kv::KvCache,
+    dn: &mut qwen35::DeltaNetState,
+    cursor: &mut crate::session::SessionCursor,
+    eviction: Option<&crate::model::Eviction>,
+    physical_cap: usize,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    t0: Instant,
+    cfg: &Qwen35DecodeCfg,
+    st: &mut Qwen35DecodeState,
+) -> Qwen35Step {
+    // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
+    // chokepoint: on entry every prior token's K/V has been written
+    // via forward_scratch and seq_pos advanced; the pending `next_token`
+    // is sampled but not yet written. Stopping here drops only that
+    // unwritten sample, so the cache/session stay consistent — identical
+    // to a natural `max_tokens` stop — and the done frame below is
+    // emitted normally.
+    if hipfire_runtime::take_generation_cancel() {
+        return Qwen35Step::Stop;
+    }
+    st.generated += 1;
+    cursor.conversation_tokens.push(st.next_token);
+    st.streamed_tokens.push(st.next_token);
+    emit_committed_event(
+        stdout,
+        id,
+        st.next_token,
+        st.streamed_tokens.len() - 1,
+        t0.elapsed().as_millis() as u64,
+    );
+    // Incremental UTF-8 + filter routing: feed only the new
+    // bytes since last call, let the filter buffer any partial
+    // codepoint or marker prefix until disambiguated.
+    let all_bytes = tokenizer.decode_bytes(&st.streamed_tokens);
+    let new_bytes = &all_bytes[st.bytes_fed_to_filter..];
+    st.bytes_fed_to_filter = all_bytes.len();
+    let filter_stop = emit_filter_action(stdout, id, st.filter.observe(new_bytes));
+
+    // Write this token's K/V to the cache FIRST so the next turn
+    // always starts from a fully-written context. Stopping before
+    // forward_scratch used to leave a hole at the im_end/eos
+    // position — the next turn then attended over zero-init K/V
+    // at that slot.
+    //
+    // Under eviction, cursor.seq_pos is the *physical* write slot; we
+    // advance and call maybe_evict immediately so the next write
+    // never overruns physical_cap. compact_offset bookkeeping on
+    // the cache itself keeps RoPE phase correct across evictions.
+    if let Err(e) = qwen35::forward_scratch(
+        gpu,
+        weights,
+        config,
+        st.next_token,
+        cursor.seq_pos,
+        kv,
+        dn,
+        scratch,
+    ) {
+        return Qwen35Step::Failed(format!("qwen35 decode forward_scratch failed: {e:?}"));
+    }
+    cursor.seq_pos += 1;
+    if let Some(ev) = eviction {
+        if let Some(hipfire_runtime::triattn::EvictionResult {
+            new_physical: new_phys,
+            ..
+        }) = ev.maybe_evict(gpu, kv, cursor.seq_pos).unwrap()
+        {
+            cursor.seq_pos = new_phys;
+        }
+    }
+    if filter_stop {
+        return Qwen35Step::Stop;
+    }
+
+    if st.next_token == config.eos_token {
+        return Qwen35Step::Stop;
+    }
+    if cfg.im_end_token == Some(st.next_token) {
+        return Qwen35Step::Stop;
+    }
+    if tokenizer.is_terminator(st.next_token) {
+        return Qwen35Step::Stop;
+    }
+
+    // max_think_tokens enforcement. Track whether we're inside an
+    // open <think>...</think> block and how many tokens we've
+    // emitted there. When the cap is hit, splice "</think>\n" into
+    // the stream (KV write + stdout emit + advance generated) so
+    // the model commits to an answer with the remaining budget.
+    // Same decoded-text scan budget_alert uses; counter is
+    // incremented per-iteration only when we're still inside.
+    if cfg.max_think_tokens > 0 {
+        let raw_so_far = tokenizer.decode_bytes(&st.streamed_tokens);
+        let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+        let open_idx = raw_str.rfind("<think>");
+        let close_idx = raw_str.rfind("</think>");
+        let in_think = match (open_idx, close_idx) {
+            (Some(o), Some(c)) => o > c,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if in_think {
+            if !st.prev_in_think {
+                st.think_count = 1;
+            } else {
+                st.think_count += 1;
+            }
+        } else {
+            st.think_count = 0;
+        }
+        st.prev_in_think = in_think;
+
+        if in_think && st.think_count >= cfg.max_think_tokens {
+            // Force-close. Encode the close sequence and run each
+            // token through the KV write + emit path the same way
+            // a normally-sampled token does. This ensures the
+            // model's next sample is conditioned on having "said"
+            // </think>\n itself, instead of seeing a hidden-state
+            // discontinuity. Respect max_tokens — clip the close
+            // sequence if not enough room remains and bail.
+            let close_tokens = tokenizer.encode("</think>\n");
+            let budget_left = cfg.max_tokens.saturating_sub(st.generated);
+            let take = close_tokens.len().min(budget_left);
+            for &t in &close_tokens[..take] {
+                qwen35::forward_scratch(gpu, weights, config, t, cursor.seq_pos, kv, dn, scratch)
+                    .unwrap();
+                cursor.seq_pos += 1;
+                if let Some(ev) = eviction {
+                    if let Some(hipfire_runtime::triattn::EvictionResult {
+                        new_physical: new_phys,
+                        ..
+                    }) = ev.maybe_evict(gpu, kv, cursor.seq_pos).unwrap()
+                    {
+                        cursor.seq_pos = new_phys;
+                    }
+                }
+                cursor.conversation_tokens.push(t);
+                st.streamed_tokens.push(t);
+                emit_committed_event(
+                    stdout,
+                    id,
+                    t,
+                    st.streamed_tokens.len() - 1,
+                    t0.elapsed().as_millis() as u64,
+                );
+                let all_bytes = tokenizer.decode_bytes(&st.streamed_tokens);
+                let new_bytes = &all_bytes[st.bytes_fed_to_filter..];
+                st.bytes_fed_to_filter = all_bytes.len();
+                let _ = emit_filter_action(stdout, id, st.filter.observe(new_bytes));
+                st.generated += 1;
+            }
+            st.think_count = 0;
+            st.prev_in_think = false;
+            if st.generated >= cfg.max_tokens {
+                return Qwen35Step::Stop;
+            }
+        }
+    }
+
+    // N-gram loop detector: check if any 4-gram in the recent window
+    // repeats excessively. When detected, emit an info message and
+    // force EOS to prevent wasting the remaining token budget on
+    // repetitive output. Logic lives in `hipfire-generate` loop_guard.
+    if let Some(StopReason::NgramRepeat { count, .. }) = cfg.loop_guard.check(&st.streamed_tokens) {
+        let window_len = cfg.loop_guard.window_len(st.streamed_tokens.len());
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+            id, count, window_len
+        );
+        let _ = stdout.flush();
+        return Qwen35Step::Stop;
+    }
+
+    // Budget-alert injection: once we hit the configured token count,
+    // splice the nudge text into the stream. Tokens are emitted to
+    // stdout (so the client sees them) AND forward-fed through the KV
+    // cache (so the model's next sample is conditioned on having
+    // "said" them itself). Injected tokens count against `max_tokens`
+    // — we never exceed the caller's requested budget — so we clip
+    // the nudge if not enough room remains, and stop if the budget is
+    // fully spent after injection.
+    if !st.alert_fired
+        && cfg.budget_alert_at_tok > 0
+        && st.generated >= cfg.budget_alert_at_tok
+        && !cfg.budget_alert_text.is_empty()
+    {
+        st.alert_fired = true;
+        // Only inject while the model is inside an open <think> block.
+        // The whole point of the feature is to nudge the model's
+        // reasoning; firing past </think> just graffities the visible
+        // answer with a system-alert string. Check the raw decoded
+        // text rather than token IDs since <think> tokenizes as a
+        // multi-token sequence in Qwen3.5's vocab.
+        let raw_so_far = tokenizer.decode_bytes(&st.streamed_tokens);
+        let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+        let think_open_idx = raw_str.rfind("<think>");
+        let think_close_idx = raw_str.rfind("</think>");
+        let in_think = match (think_open_idx, think_close_idx) {
+            (Some(o), Some(c)) => o > c,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !in_think {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+            // Fall through — resample next token as normal
+            let ngram_scope = &cursor.conversation_tokens[cfg.ngram_scope_start..];
+            let mut blocked: Vec<u32> = Vec::new();
+            collect_unclosed_attractor_blocks(
+                ngram_scope,
+                &cfg.attractor_pairs,
+                20,
+                2,
+                &mut blocked,
+            );
+            let sampler_cfg = SamplerConfig {
+                temperature: cfg.temperature,
+                top_p: cfg.top_p,
+                top_k: cfg.top_k,
+                repeat_penalty: cfg.repeat_penalty,
+                repeat_window: cfg.repeat_buf_cap,
+                presence_penalty: cfg.presence_penalty,
+                frequency_penalty: cfg.frequency_penalty,
+                blocked_tokens: blocked,
+            };
+            st.next_token = sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                cfg.vocab_size,
+                ngram_scope,
+                &sampler_cfg,
+                &mut st.rng_state,
+            );
+            return Qwen35Step::Continue;
+        }
+        let nudge_tokens = tokenizer.encode(&cfg.budget_alert_text);
+        let budget_left = cfg.max_tokens.saturating_sub(st.generated);
+        let nudge_len = nudge_tokens.len().min(budget_left);
+        // KV headroom check — don't run past physical_cap. If we don't
+        // have room for the clipped nudge, skip entirely rather than
+        // emit a partial nudge that poisons the trajectory. Under
+        // eviction the physical check is trivially satisfied (budget
+        // always holds post-evict), but we still respect the check for
+        // the non-eviction path.
+        let need_kv =
+            cursor.seq_pos + nudge_len + (cfg.max_tokens - st.generated - nudge_len) + cfg.nl_len;
+        if nudge_len > 0 && (eviction.is_some() || need_kv <= physical_cap) {
+            for &tok in &nudge_tokens[..nudge_len] {
+                cursor.conversation_tokens.push(tok);
+                st.streamed_tokens.push(tok);
+                emit_committed_event(
+                    stdout,
+                    id,
+                    tok,
+                    st.streamed_tokens.len() - 1,
+                    t0.elapsed().as_millis() as u64,
+                );
+                // Emit the injected token's text to stdout so the client
+                // sees it as part of the stream (will be inside <think>
+                // if that's the current state, and get stripped client-
+                // side just like any other think token).
+                let all_bytes2 = tokenizer.decode_bytes(&st.streamed_tokens);
+                let new_bytes2 = &all_bytes2[st.bytes_fed_to_filter..];
+                st.bytes_fed_to_filter = all_bytes2.len();
+                let _ = emit_filter_action(stdout, id, st.filter.observe(new_bytes2));
+                if let Err(e) = qwen35::forward_scratch(
+                    gpu,
+                    weights,
+                    config,
+                    tok,
+                    cursor.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                ) {
+                    return Qwen35Step::Failed(format!(
+                        "qwen35 budget-alert forward_scratch failed: {e:?}"
+                    ));
+                }
+                cursor.seq_pos += 1;
+                if let Some(ev) = eviction {
+                    if let Some(hipfire_runtime::triattn::EvictionResult {
+                        new_physical: new_phys,
+                        ..
+                    }) = ev.maybe_evict(gpu, kv, cursor.seq_pos).unwrap()
+                    {
+                        cursor.seq_pos = new_phys;
+                    }
+                }
+                st.generated += 1;
+            }
+        } else if nudge_len < nudge_tokens.len() {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
+                id, nudge_len, budget_left
+            );
+            let _ = stdout.flush();
+        } else {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
+                id
+            );
+            let _ = stdout.flush();
+        }
+        // Respect max_tokens: if injection used the remainder, bail
+        // before sampling another model token.
+        if st.generated >= cfg.max_tokens {
+            return Qwen35Step::Stop;
+        }
+    }
+
+    // Decide which paired-opener tokens (if any) trip the depth
+    // threshold over a 20-token window. #111 attractor block —
+    // cheap when not tripped, ~5 µs per blocked token when
+    // tripped (single 4-byte H2D into the logits buffer
+    // performed inside sampler::sample).
+    let ngram_scope = &cursor.conversation_tokens[cfg.ngram_scope_start..];
+    let mut blocked: Vec<u32> = Vec::new();
+    collect_unclosed_attractor_blocks(ngram_scope, &cfg.attractor_pairs, 20, 2, &mut blocked);
+    let sampler_cfg = SamplerConfig {
+        temperature: cfg.temperature,
+        top_p: cfg.top_p,
+        top_k: cfg.top_k,
+        repeat_penalty: cfg.repeat_penalty,
+        repeat_window: cfg.repeat_buf_cap,
+        presence_penalty: cfg.presence_penalty,
+        frequency_penalty: cfg.frequency_penalty,
+        blocked_tokens: blocked,
+    };
+    // GPU sample: reads scratch.logits (already on GPU), writes
+    // token+rng to scratch.sample_buf. Blocks only on the 8-byte
+    // D2H readback inside sampler::sample.
+    st.next_token = sampler::sample(
+        gpu,
+        &scratch.logits,
+        &scratch.sample_buf,
+        &scratch.repeat_buf,
+        cfg.vocab_size,
+        ngram_scope,
+        &sampler_cfg,
+        &mut st.rng_state,
+    );
+    Qwen35Step::Continue
+}
+
+/// Helper: render the JSON field fragment for `done` per PRD §3.1.
+/// Three states:
+///   - compressed: full metadata + alpha
+///   - bypass (non-Off, drafter loaded): alpha + bypass_reason
+///   - nothing: empty string so backwards-compatible clients see the
+///     original done shape
+/// Formats the `"pflash"` fragment of the `done` frame. Lifted out of
+/// `generate()` so `qwen35_finish_generation` can reach it; it is a plain
+/// capture-free `fn`, so moving it changes nothing.
+fn pflash_done_fragment(
+    s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    bypass_reason: &Option<String>,
+    alpha: Option<f32>,
+) -> String {
+    match (s, bypass_reason) {
+        (Some(cp), _) => format!(
+            r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
+            cp.source_tokens,
+            cp.kept_tokens,
+            cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+            alpha.unwrap_or(0.0),
+            cp.timings.score_ms,
+            cp.timings.total_ms,
+            cp.source_md5,
+            cp.compressed_md5,
+        ),
+        (None, Some(reason)) => format!(
+            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
+            reason.replace('"', "'"),
+            alpha.unwrap_or(0.0),
+        ),
+        (None, None) => String::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Finish a qwen35 generation: the ChatML `\n` trailer, the timing arithmetic,
+/// the evidence writes, the `done` frame, and the session restore.
+///
+/// Executor v2 §M3b0.5 — the `finish()` half. Moved verbatim out of
+/// [`generate`]'s qwen35 arm, so behaviour is byte-identical by construction.
+///
+/// **Takes `session` BY VALUE, and that is the point.** `qwen35_restore_or_error`
+/// consumes the session while `kv`/`dn` are disjoint `&mut` borrows *out of* it.
+/// That is exactly why M3b0's [`Qwen35Step::Failed`] has to hand a message back
+/// to its caller instead of unwinding in place. Owning the session here dissolves
+/// the constraint: `kv`/`dn` are derived internally and the restore is a direct
+/// call, so the whole teardown — including its own error path — lives in one
+/// place.
+fn qwen35_finish_generation(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    mut session: Qwen35RequestSessionState,
+    generated: usize,
+    nl: &[u32],
+    im_end_token: Option<u32>,
+    t0: Instant,
+    t_prefill: Instant,
+    prefill_tokens: usize,
+    evidence_dir: Option<&str>,
+    moe_router_histogram: DaemonMoeRouterHistogramGuard,
+    pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    pflash_bypass_reason: Option<String>,
+    pflash_alpha: Option<f32>,
+) {
+    let config = m.q35_config.as_ref().unwrap();
+    let weights = m.q35_weights.as_ref().unwrap();
+    let scratch = m.q35_scratch.as_ref().unwrap();
+    // Same disjoint field-path borrow the decode phase uses: kv and dn are
+    // distinct fields of session.sequence_state, so both &mut live at once.
+    let kv = session
+        .sequence_state
+        .kv
+        .as_mut()
+        .expect("qwen35 session always has KV");
+    let dn = session
+        .sequence_state
+        .recurrent
+        .as_mut()
+        .expect("qwen35 session has DeltaNet state")
+        .as_any_mut()
+        .downcast_mut::<qwen35::DeltaNetState>()
+        .expect("qwen35 session recurrent state is DeltaNetState");
+    // session.cursor.seq_pos is already the "next physical write slot" — advanced
+    // per-token in the decode loop above, and evicted back down to
+    // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
+
+    // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
+    // and DeltaNet state stay in sync with seq_pos.
+    if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
+        && !nl.is_empty()
+    {
+        for &t in nl {
+            if let Err(e) = qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                t,
+                session.cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+            ) {
+                write_error(
+                    stdout,
+                    id,
+                    &format!("qwen35 ChatML newline forward_scratch failed: {e:?}"),
+                );
+                qwen35_restore_or_error(stdout, id, m, gpu, session);
+                return;
+            }
+            session.cursor.seq_pos += 1;
+            if let Some(ref ev) = m.eviction {
+                if let Some(hipfire_runtime::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
+                {
+                    session.cursor.seq_pos = new_phys;
+                }
+            }
+            session.cursor.conversation_tokens.push(t);
+        }
+    }
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    if let Some(dir) = evidence_dir {
+        write_daemon_runtime_oneshot_evidence(
+            dir,
+            m,
+            gpu,
+            id,
+            prefill_tokens,
+            generated,
+            prefill_s,
+            decode_s,
+            prefill_s * 1000.0,
+        );
+        if let Some(hist) = moe_router_histogram.take() {
+            write_daemon_moe_router_evidence(dir, m, id, hist);
+        }
+    }
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0,
+        pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
+    );
+    let _ = stdout.flush();
+    qwen35_restore_or_error(stdout, id, m, gpu, session);
+}
+
+/// A qwen35 generation in flight — everything a suspended stream must carry
+/// between quanta, and nothing it must not.
+///
+/// Executor v2 §M3b0.5. [`Qwen35Generation::step`] advances one token,
+/// [`Qwen35Generation::finish`] runs the teardown.
+///
+/// **Owns no borrow of the GPU or the model.** Those arrive per call, because a
+/// serial executor hands the device to another stream between quanta; a handle
+/// holding `&mut Gpu` would pin the device to one stream for its whole life and
+/// defeat the interleaving it exists to enable. That property is why
+/// `Qwen35DecodeState` was built borrow-free in M3b0 and why `Qwen35DecodeCfg`
+/// had its lifetime removed — this type is what both were for.
+pub struct Qwen35Generation {
+    session: Qwen35RequestSessionState,
+    st: Qwen35DecodeState,
+    cfg: Qwen35DecodeCfg,
+    /// The ChatML `\n` tokens; `finish` forwards them when the turn ended on
+    /// `<|im_end|>`. `cfg.nl_len` is the same sequence's length, read by the
+    /// budget-alert headroom check.
+    nl: Vec<u32>,
+    t0: Instant,
+    t_prefill: Instant,
+    prefill_tokens: usize,
+    evidence_dir: Option<String>,
+    moe_router_histogram: DaemonMoeRouterHistogramGuard,
+    pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    pflash_bypass_reason: Option<String>,
+    pflash_alpha: Option<f32>,
+}
+
+impl Qwen35Generation {
+    /// Advance one token. The model and GPU are borrowed for the call only.
+    ///
+    /// `weights`/`config`/`scratch` and `eviction`/`physical_cap` are derived
+    /// per step rather than captured once, which is what §M3b1 asks for: the
+    /// moment the march loop can hand `&mut LoadedModel` to another stream
+    /// between quanta, a captured snapshot and a per-use read stop agreeing.
+    fn step(
+        &mut self,
+        m: &LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        tokenizer: &hipfire_model::tokenizer::Tokenizer,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+    ) -> Qwen35Step {
+        let config = m.q35_config.as_ref().unwrap();
+        let weights = m.q35_weights.as_ref().unwrap();
+        let scratch = m.q35_scratch.as_ref().unwrap();
+        // Disjoint field paths: kv and recurrent are distinct fields of
+        // session.sequence_state, and cursor is a third field of session.
+        let kv = self
+            .session
+            .sequence_state
+            .kv
+            .as_mut()
+            .expect("qwen35 session always has KV");
+        let dn = self
+            .session
+            .sequence_state
+            .recurrent
+            .as_mut()
+            .expect("qwen35 session has DeltaNet state")
+            .as_any_mut()
+            .downcast_mut::<qwen35::DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState");
+        qwen35_decode_one(
+            gpu,
+            weights,
+            config,
+            scratch,
+            kv,
+            dn,
+            &mut self.session.cursor,
+            m.eviction.as_ref(),
+            m.physical_cap,
+            tokenizer,
+            stdout,
+            id,
+            self.t0,
+            &self.cfg,
+            &mut self.st,
+        )
+    }
+
+    /// Run the teardown and emit the `done` frame. Consumes the handle, because
+    /// the session restore consumes the session.
+    fn finish(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+    ) {
+        let Qwen35Generation {
+            session,
+            st,
+            cfg,
+            nl,
+            t0,
+            t_prefill,
+            prefill_tokens,
+            evidence_dir,
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
+        } = self;
+        qwen35_finish_generation(
+            m,
+            gpu,
+            stdout,
+            id,
+            session,
+            st.generated,
+            &nl,
+            cfg.im_end_token,
+            t0,
+            t_prefill,
+            prefill_tokens,
+            evidence_dir.as_deref(),
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
+        );
+    }
+}
+
+/// What [`generate_start`] decided.
+pub enum Qwen35Start {
+    /// A qwen35 AR generation is prefilled and ready to be marched.
+    Ready(Qwen35Generation),
+    /// Nothing to march: the request was served by another route (spec-decode,
+    /// VL, the llama path) or already failed and reported it.
+    Handled,
+}
+
+#[allow(clippy::too_many_arguments)]
+/// [`generate`] minus the decode loop: frames the prompt, prefills, and returns
+/// the handle the caller marches. Executor v2 §M3b0.75 — the entry the executor
+/// uses instead of running a whole request inline.
+///
+/// The split is HERE, above the framing prologue, not at the qwen35 arm. The
+/// prologue is what produces `new_tokens` / `nl` / `im_end_token` / the attractor
+/// pairs; a cut below it yields a function the daemon cannot call, because it
+/// holds none of those. Measured and recorded in the M3b0.75 plan note.
 #[allow(clippy::too_many_arguments)]
 /// The default autoregressive text generate path for the qwen35 / qwen3 (llama)
 /// families, and the central text dispatcher: frames the prompt (chat template
@@ -1890,7 +2672,7 @@ pub fn generate_multi(
 /// Delegates to the spec-decode fast paths ([`generate_mtp`], [`generate_dflash`],
 /// [`generate_multi`]) and to the non-qwen35 arch paths ([`generate_deepseek4`]
 /// etc.) when the loaded model calls for them.
-pub fn generate(
+pub fn generate_start(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
     drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
@@ -1923,7 +2705,7 @@ pub fn generate(
     // has no chat_template). Threaded rather than read from a global — see
     // `effective_raw` for the cross-request leak that motivated it.
     raw_override: Option<bool>,
-) {
+) -> Qwen35Start {
     // No RNG reset here any more. This used to seed a process-global CPU sampler
     // state so a request would not inherit RNG from its predecessor; the global
     // is gone (v2 plan, M1b), because with streams interleaved at module
@@ -1968,7 +2750,7 @@ pub fn generate(
             request_stop_sequences,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -2011,7 +2793,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_ZAYA {
         // ZAYA1 — CCA attention + EDA/MoD MoE, routed through the shared
@@ -2042,7 +2824,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_NEMOTRON_H || m.arch_id == ARCH_ID_MAMBA2 {
         // nemotron_h / mamba2 — routed through the Mamba-capable ServingBackend
@@ -2073,7 +2855,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_GEMMA3_TEXT {
         // arch_id=12 (gemma3 text, e.g. medgemma-*-text). Plain dense-AR via the
@@ -2103,7 +2885,7 @@ pub fn generate(
             repeat_penalty,
             repeat_window,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_GEMMA3_VL {
         // arch_id=13 (gemma3-vl / full MedGemma) with no media payload. Image and
@@ -2134,7 +2916,7 @@ pub fn generate(
             repeat_penalty,
             repeat_window,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_DEEPSEEK4_FLASH {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
@@ -2167,7 +2949,7 @@ pub fn generate(
             tools,
             messages_history,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_MINIMAX_M2 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
@@ -2201,7 +2983,7 @@ pub fn generate(
             messages_history,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     #[cfg(feature = "arch-lfm2moe")]
     if m.arch_id == ARCH_ID_LFM2_MOE {
@@ -2237,7 +3019,7 @@ pub fn generate(
             prefilled_prompt_tokens,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
@@ -2254,6 +3036,7 @@ pub fn generate(
             system_prompt,
             temp,
             top_p,
+            top_k,
             max_tokens,
             repeat_penalty,
             repeat_window,
@@ -2268,7 +3051,7 @@ pub fn generate(
             request_stop_sequences,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
@@ -2287,7 +3070,7 @@ pub fn generate(
             id,
             "prefill_already_done is not supported on DFlash-loaded models",
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if prefill_already_done && pflash_state.is_some() {
         write_error(
@@ -2295,7 +3078,7 @@ pub fn generate(
             id,
             "prefill_already_done is not supported when PFlash state is loaded",
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // KVarN (and the deferred-hierarchical two-tier cache built on it) require the
@@ -2381,7 +3164,7 @@ pub fn generate(
             budget_alert_text,
             pflash_state,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // MTP spec-decode: qwen35 model with a co-trained MTP head, no DFlash
@@ -2419,7 +3202,7 @@ pub fn generate(
             budget_alert_text,
             pflash_state,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     let is_qwen35_ar = is_qwen35_family_arch_id(m.arch_id);
@@ -2428,7 +3211,7 @@ pub fn generate(
             Ok(session) => Some(session),
             Err(e) => {
                 write_error(stdout, id, &format!("qwen35 request session state: {e}"));
-                return;
+                return Qwen35Start::Handled;
             }
         }
     } else {
@@ -2530,37 +3313,6 @@ pub fn generate(
     // Effective alpha for this request (from cfg if pflash_state is loaded).
     // PRD §3.1 lists alpha as a required done-object field.
     let pflash_alpha: Option<f32> = pflash_cfg.map(|c| c.alpha);
-    // Helper: render the JSON field fragment for `done` per PRD §3.1.
-    // Three states:
-    //   - compressed: full metadata + alpha
-    //   - bypass (non-Off, drafter loaded): alpha + bypass_reason
-    //   - nothing: empty string so backwards-compatible clients see the
-    //     original done shape
-    pub fn pflash_done_fragment(
-        s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
-        bypass_reason: &Option<String>,
-        alpha: Option<f32>,
-    ) -> String {
-        match (s, bypass_reason) {
-            (Some(cp), _) => format!(
-                r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
-                cp.source_tokens,
-                cp.kept_tokens,
-                cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                alpha.unwrap_or(0.0),
-                cp.timings.score_ms,
-                cp.timings.total_ms,
-                cp.source_md5,
-                cp.compressed_md5,
-            ),
-            (None, Some(reason)) => format!(
-                r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-                reason.replace('"', "'"),
-                alpha.unwrap_or(0.0),
-            ),
-            (None, None) => String::new(),
-        }
-    }
     if std::env::var("HIPFIRE_PFLASH_DEBUG").is_ok() {
         eprintln!(
             "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
@@ -2806,7 +3558,7 @@ pub fn generate(
             if let Some(session) = q35_session.take() {
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
             }
-            return;
+            return Qwen35Start::Handled;
         }
     } else if absolute_pos + budget_prefill_tokens + max_tokens + trailer > m.max_seq {
         let _ = writeln!(
@@ -2818,7 +3570,7 @@ pub fn generate(
         if let Some(session) = q35_session.take() {
             qwen35_restore_or_error(stdout, id, m, gpu, session);
         }
-        return;
+        return Qwen35Start::Handled;
     }
 
     let im_end_token = if im_end.len() == 1 {
@@ -2866,7 +3618,7 @@ pub fn generate(
                     ),
                 );
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
-                return;
+                return Qwen35Start::Handled;
             }
         }
         let config = m.q35_config.as_ref().unwrap();
@@ -3031,7 +3783,7 @@ pub fn generate(
                 ) {
                     write_error(stdout, id, &format!("prefill failed: {e}"));
                     qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return;
+                    return Qwen35Start::Handled;
                 }
                 session.cursor.seq_pos += new_tokens.len();
             }
@@ -3091,7 +3843,7 @@ pub fn generate(
         let cfg0 = SamplerConfig {
             temperature: temp,
             top_p,
-            top_k: 20,
+            top_k,
             repeat_penalty,
             // Window is bounded by the GPU repeat_buf capacity. Pre-PR3 code did this
             // bound by setting `scope_start = len - repeat_buf_cap`
@@ -3117,499 +3869,54 @@ pub fn generate(
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
         let t_prefill = Instant::now();
-        let mut next_token = tok0;
 
-        let mut generated = 0;
-        let mut streamed_tokens: Vec<u32> = Vec::new();
-        // `bytes_fed_to_filter` is the index into the freshly-decoded
-        // byte stream past which we have not yet handed bytes to the
-        // filter. The filter owns UTF-8 boundary buffering and any
-        // future arch quirks (Gemma 4 marker holdback, strip-think,
-        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
-        let mut bytes_fed_to_filter = 0usize;
-        let mut filter = chat_output_filter(m, request_stop_sequences);
-        let mut alert_fired = false;
-        // max_think_tokens enforcement state. think_count increments only
-        // while we observe ourselves to be inside a `<think>...</think>`
-        // block via the same decoded-text scan budget_alert uses. When the
-        // cap is hit we splice "</think>\n" into the stream (KV write +
-        // stdout emit + advance generated) so the model finishes thinking
-        // and commits to an answer with the remaining max_tokens budget.
-        // Re-armable: if the model later opens another <think> in the same
-        // turn (rare) the counter resets and the cap re-fires.
-        let mut think_count: usize = 0;
-        let mut prev_in_think: bool = false;
-
-        // N-gram loop detector: track 4-gram token sequences. When any
-        // 4-gram repeats more than `ngram_loop_threshold` times in the
-        // last `ngram_window` tokens, force EOS. This catches answer-phase
-        // repetition loops that the think cap and repeat penalty miss.
-        // Operates on token IDs (no decode overhead).
-        // Implementation lives in `hipfire-generate` loop_guard; defaults read from
-        // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
-        // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
-        let loop_guard = loop_guard_from_runtime_config();
-
-        // `while` instead of `for 0..max_tokens` so budget-alert injection
-        // (which increments `generated` beyond the iteration count) can't
-        // push generated past max_tokens: each loop start rechecks the cap.
-        while generated < max_tokens {
-            // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
-            // chokepoint: at loop top every prior token's K/V has been written
-            // via forward_scratch and seq_pos advanced; the pending `next_token`
-            // is sampled but not yet written. Breaking here drops only that
-            // unwritten sample, so the cache/session stay consistent — identical
-            // to a natural `max_tokens` stop — and the done frame below is
-            // emitted normally.
-            if hipfire_runtime::take_generation_cancel() {
-                break;
-            }
-            generated += 1;
-            session.cursor.conversation_tokens.push(next_token);
-            streamed_tokens.push(next_token);
-            emit_committed_event(
-                stdout,
-                id,
-                next_token,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            // Incremental UTF-8 + filter routing: feed only the new
-            // bytes since last call, let the filter buffer any partial
-            // codepoint or marker prefix until disambiguated.
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            let filter_stop = emit_filter_action(stdout, id, filter.observe(new_bytes));
-
-            // Write this token's K/V to the cache FIRST so the next turn
-            // always starts from a fully-written context. Breaking before
-            // forward_scratch used to leave a hole at the im_end/eos
-            // position — the next turn then attended over zero-init K/V
-            // at that slot.
-            //
-            // Under eviction, session.cursor.seq_pos is the *physical* write slot; we
-            // advance and call maybe_evict immediately so the next write
-            // never overruns physical_cap. compact_offset bookkeeping on
-            // the cache itself keeps RoPE phase correct across evictions.
-            if let Err(e) = qwen35::forward_scratch(
-                gpu,
-                weights,
-                config,
-                next_token,
-                session.cursor.seq_pos,
-                kv,
-                dn,
-                scratch,
-            ) {
-                write_error(
-                    stdout,
-                    id,
-                    &format!("qwen35 decode forward_scratch failed: {e:?}"),
-                );
-                qwen35_restore_or_error(stdout, id, m, gpu, session);
-                return;
-            }
-            session.cursor.seq_pos += 1;
-            if let Some(ref ev) = m.eviction {
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                {
-                    session.cursor.seq_pos = new_phys;
-                }
-            }
-            if filter_stop {
-                break;
-            }
-
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
-                break;
-            }
-
-            // max_think_tokens enforcement. Track whether we're inside an
-            // open <think>...</think> block and how many tokens we've
-            // emitted there. When the cap is hit, splice "</think>\n" into
-            // the stream (KV write + stdout emit + advance generated) so
-            // the model commits to an answer with the remaining budget.
-            // Same decoded-text scan budget_alert uses; counter is
-            // incremented per-iteration only when we're still inside.
-            if max_think_tokens > 0 {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let open_idx = raw_str.rfind("<think>");
-                let close_idx = raw_str.rfind("</think>");
-                let in_think = match (open_idx, close_idx) {
-                    (Some(o), Some(c)) => o > c,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if in_think {
-                    if !prev_in_think {
-                        think_count = 1;
-                    } else {
-                        think_count += 1;
-                    }
-                } else {
-                    think_count = 0;
-                }
-                prev_in_think = in_think;
-
-                if in_think && think_count >= max_think_tokens {
-                    // Force-close. Encode the close sequence and run each
-                    // token through the KV write + emit path the same way
-                    // a normally-sampled token does. This ensures the
-                    // model's next sample is conditioned on having "said"
-                    // </think>\n itself, instead of seeing a hidden-state
-                    // discontinuity. Respect max_tokens — clip the close
-                    // sequence if not enough room remains and bail.
-                    let close_tokens = tokenizer.encode("</think>\n");
-                    let budget_left = max_tokens.saturating_sub(generated);
-                    let take = close_tokens.len().min(budget_left);
-                    for &t in &close_tokens[..take] {
-                        qwen35::forward_scratch(
-                            gpu,
-                            weights,
-                            config,
-                            t,
-                            session.cursor.seq_pos,
-                            kv,
-                            dn,
-                            scratch,
-                        )
-                        .unwrap();
-                        session.cursor.seq_pos += 1;
-                        if let Some(ref ev) = m.eviction {
-                            if let Some(hipfire_runtime::triattn::EvictionResult {
-                                new_physical: new_phys,
-                                ..
-                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                            {
-                                session.cursor.seq_pos = new_phys;
-                            }
-                        }
-                        session.cursor.conversation_tokens.push(t);
-                        streamed_tokens.push(t);
-                        emit_committed_event(
-                            stdout,
-                            id,
-                            t,
-                            streamed_tokens.len() - 1,
-                            t0.elapsed().as_millis() as u64,
-                        );
-                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                        bytes_fed_to_filter = all_bytes.len();
-                        let _ = emit_filter_action(stdout, id, filter.observe(new_bytes));
-                        generated += 1;
-                    }
-                    think_count = 0;
-                    prev_in_think = false;
-                    if generated >= max_tokens {
-                        break;
-                    }
-                }
-            }
-
-            // N-gram loop detector: check if any 4-gram in the recent window
-            // repeats excessively. When detected, emit an info message and
-            // force EOS to prevent wasting the remaining token budget on
-            // repetitive output. Logic lives in `hipfire-generate` loop_guard.
-            if let Some(StopReason::NgramRepeat { count, .. }) = loop_guard.check(&streamed_tokens)
-            {
-                let window_len = loop_guard.window_len(streamed_tokens.len());
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                    id, count, window_len
-                );
-                let _ = stdout.flush();
-                break;
-            }
-
-            // Budget-alert injection: once we hit the configured token count,
-            // splice the nudge text into the stream. Tokens are emitted to
-            // stdout (so the client sees them) AND forward-fed through the KV
-            // cache (so the model's next sample is conditioned on having
-            // "said" them itself). Injected tokens count against `max_tokens`
-            // — we never exceed the caller's requested budget — so we clip
-            // the nudge if not enough room remains, and break out of the
-            // outer loop if the budget is fully spent after injection.
-            if !alert_fired
-                && budget_alert_at_tok > 0
-                && generated >= budget_alert_at_tok
-                && !budget_alert_text.is_empty()
-            {
-                alert_fired = true;
-                // Only inject while the model is inside an open <think> block.
-                // The whole point of the feature is to nudge the model's
-                // reasoning; firing past </think> just graffities the visible
-                // answer with a system-alert string. Check the raw decoded
-                // text rather than token IDs since <think> tokenizes as a
-                // multi-token sequence in Qwen3.5's vocab.
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let think_open_idx = raw_str.rfind("<think>");
-                let think_close_idx = raw_str.rfind("</think>");
-                let in_think = match (think_open_idx, think_close_idx) {
-                    (Some(o), Some(c)) => o > c,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if !in_think {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
-                    // Fall through — resample next token as normal
-                    let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
-                    let mut blocked: Vec<u32> = Vec::new();
-                    collect_unclosed_attractor_blocks(
-                        ngram_scope,
-                        &attractor_pairs,
-                        20,
-                        2,
-                        &mut blocked,
-                    );
-                    let cfg = SamplerConfig {
-                        temperature: temp,
-                        top_p,
-                        top_k: 20,
-                        repeat_penalty,
-                        repeat_window: repeat_buf_cap,
-                        presence_penalty,
-                        frequency_penalty,
-                        blocked_tokens: blocked,
-                    };
-                    next_token = sampler::sample(
-                        gpu,
-                        &scratch.logits,
-                        &scratch.sample_buf,
-                        &scratch.repeat_buf,
-                        vocab_size,
-                        ngram_scope,
-                        &cfg,
-                        &mut rng_state,
-                    );
-                    continue;
-                }
-                let nudge_tokens = tokenizer.encode(budget_alert_text);
-                let budget_left = max_tokens.saturating_sub(generated);
-                let nudge_len = nudge_tokens.len().min(budget_left);
-                // KV headroom check — don't run past physical_cap. If we don't
-                // have room for the clipped nudge, skip entirely rather than
-                // emit a partial nudge that poisons the trajectory. Under
-                // eviction the physical check is trivially satisfied (budget
-                // always holds post-evict), but we still respect the check for
-                // the non-eviction path.
-                let need_kv = session.cursor.seq_pos
-                    + nudge_len
-                    + (max_tokens - generated - nudge_len)
-                    + nl.len();
-                if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
-                    for &tok in &nudge_tokens[..nudge_len] {
-                        session.cursor.conversation_tokens.push(tok);
-                        streamed_tokens.push(tok);
-                        emit_committed_event(
-                            stdout,
-                            id,
-                            tok,
-                            streamed_tokens.len() - 1,
-                            t0.elapsed().as_millis() as u64,
-                        );
-                        // Emit the injected token's text to stdout so the client
-                        // sees it as part of the stream (will be inside <think>
-                        // if that's the current state, and get stripped client-
-                        // side just like any other think token).
-                        let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
-                        bytes_fed_to_filter = all_bytes2.len();
-                        let _ = emit_filter_action(stdout, id, filter.observe(new_bytes2));
-                        if let Err(e) = qwen35::forward_scratch(
-                            gpu,
-                            weights,
-                            config,
-                            tok,
-                            session.cursor.seq_pos,
-                            kv,
-                            dn,
-                            scratch,
-                        ) {
-                            write_error(
-                                stdout,
-                                id,
-                                &format!("qwen35 budget-alert forward_scratch failed: {e:?}"),
-                            );
-                            qwen35_restore_or_error(stdout, id, m, gpu, session);
-                            return;
-                        }
-                        session.cursor.seq_pos += 1;
-                        if let Some(ref ev) = m.eviction {
-                            if let Some(hipfire_runtime::triattn::EvictionResult {
-                                new_physical: new_phys,
-                                ..
-                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                            {
-                                session.cursor.seq_pos = new_phys;
-                            }
-                        }
-                        generated += 1;
-                    }
-                } else if nudge_len < nudge_tokens.len() {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
-                        id, nudge_len, budget_left
-                    );
-                    let _ = stdout.flush();
-                } else {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
-                }
-                // Respect max_tokens: if injection used the remainder, bail
-                // before sampling another model token.
-                if generated >= max_tokens {
-                    break;
-                }
-            }
-
-            // Decide which paired-opener tokens (if any) trip the depth
-            // threshold over a 20-token window. #111 attractor block —
-            // cheap when not tripped, ~5 µs per blocked token when
-            // tripped (single 4-byte H2D into the logits buffer
-            // performed inside sampler::sample).
-            let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
-            let mut blocked: Vec<u32> = Vec::new();
-            collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
-            let cfg = SamplerConfig {
+        // Cross-token decode state, hoisted into one value so that advancing a
+        // token is a CALL rather than a loop iteration — the quantum executor
+        // v2's march loop needs (§M3b0). The `while` stays exactly as it was:
+        // budget-alert injection can push `generated` past the iteration count,
+        // so the cap is rechecked at each loop start.
+        return Qwen35Start::Ready(Qwen35Generation {
+            session,
+            st: Qwen35DecodeState {
+                rng_state,
+                next_token: tok0,
+                generated: 0,
+                streamed_tokens: Vec::new(),
+                bytes_fed_to_filter: 0,
+                filter: chat_output_filter(m, request_stop_sequences),
+                alert_fired: false,
+                think_count: 0,
+                prev_in_think: false,
+            },
+            cfg: Qwen35DecodeCfg {
+                max_tokens,
+                max_think_tokens,
+                budget_alert_at_tok,
+                budget_alert_text: budget_alert_text.to_string(),
+                im_end_token,
+                nl_len: nl.len(),
+                vocab_size,
+                top_k,
+                repeat_buf_cap,
+                ngram_scope_start,
+                attractor_pairs,
+                loop_guard: loop_guard_from_runtime_config(),
                 temperature: temp,
                 top_p,
-                top_k: 20,
                 repeat_penalty,
-                repeat_window: repeat_buf_cap,
                 presence_penalty,
                 frequency_penalty,
-                blocked_tokens: blocked,
-            };
-            // GPU sample: reads scratch.logits (already on GPU), writes
-            // token+rng to scratch.sample_buf. Blocks only on the 8-byte
-            // D2H readback inside sampler::sample.
-            next_token = sampler::sample(
-                gpu,
-                &scratch.logits,
-                &scratch.sample_buf,
-                &scratch.repeat_buf,
-                vocab_size,
-                ngram_scope,
-                &cfg,
-                &mut rng_state,
-            );
-        }
-        // session.cursor.seq_pos is already the "next physical write slot" — advanced
-        // per-token in the decode loop above, and evicted back down to
-        // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
-
-        // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
-        // and DeltaNet state stay in sync with seq_pos.
-        if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
-            && !nl.is_empty()
-        {
-            for &t in &nl {
-                if let Err(e) = qwen35::forward_scratch(
-                    gpu,
-                    weights,
-                    config,
-                    t,
-                    session.cursor.seq_pos,
-                    kv,
-                    dn,
-                    scratch,
-                ) {
-                    write_error(
-                        stdout,
-                        id,
-                        &format!("qwen35 ChatML newline forward_scratch failed: {e:?}"),
-                    );
-                    qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return;
-                }
-                session.cursor.seq_pos += 1;
-                if let Some(ref ev) = m.eviction {
-                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                    {
-                        session.cursor.seq_pos = new_phys;
-                    }
-                }
-                session.cursor.conversation_tokens.push(t);
-            }
-        }
-
-        let t_end = Instant::now();
-        let total_s = t_end.duration_since(t0).as_secs_f64();
-        let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-        let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-        let tok_s = if total_s > 0.0 {
-            generated as f64 / total_s
-        } else {
-            0.0
-        };
-        let prefill_tok_s = if prefill_s > 0.0 {
-            prefill_tokens as f64 / prefill_s
-        } else {
-            0.0
-        };
-        let decode_tok_s = if decode_s > 0.0 {
-            generated as f64 / decode_s
-        } else {
-            0.0
-        };
-        if let Some(dir) = evidence_dir {
-            write_daemon_runtime_oneshot_evidence(
-                dir,
-                m,
-                gpu,
-                id,
-                prefill_tokens,
-                generated,
-                prefill_s,
-                decode_s,
-                prefill_s * 1000.0,
-            );
-            if let Some(hist) = moe_router_histogram.take() {
-                write_daemon_moe_router_evidence(dir, m, id, hist);
-            }
-        }
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
-            id,
-            generated,
-            tok_s,
+            },
+            nl,
+            t0,
+            t_prefill,
             prefill_tokens,
-            prefill_s * 1000.0,
-            prefill_tok_s,
-            decode_tok_s,
-            prefill_s * 1000.0,
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
-        );
-        let _ = stdout.flush();
-        qwen35_restore_or_error(stdout, id, m, gpu, session);
+            evidence_dir: evidence_dir.map(str::to_string),
+            moe_router_histogram,
+            pflash_summary,
+            pflash_bypass_reason,
+            pflash_alpha,
+        });
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware. This is the `not qwen35`
         // fallback, but it's specifically the llama (arch 0/1) state — every
@@ -3627,7 +3934,7 @@ pub fn generate(
                     m.arch_id
                 ),
             );
-            return;
+            return Qwen35Start::Handled;
         }
         let chat_template_profile = m.chat_template_profile.clone();
         let config = m.llama_config.as_ref().unwrap();
@@ -3814,5 +4121,98 @@ pub fn generate(
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
+    }
+    Qwen35Start::Handled
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The original entry point, now a thin driver over [`generate_start`]: start,
+/// march to completion, finish. Behaviour is unchanged for every caller.
+pub fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    prefill_already_done: bool,
+    prefilled_prompt_tokens: Option<usize>,
+    request_stop_sequences: &[String],
+    evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
+) {
+    match generate_start(
+        m,
+        gpu,
+        drafter_gpu,
+        stdout,
+        id,
+        prompt,
+        system_prompt,
+        temp,
+        top_p,
+        top_k,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        budget_alert_at_tok,
+        budget_alert_text,
+        max_think_tokens,
+        assistant_prefix,
+        pflash_state,
+        pflash_cfg,
+        tools,
+        messages_history,
+        think_mode,
+        prefill_already_done,
+        prefilled_prompt_tokens,
+        request_stop_sequences,
+        evidence_dir,
+        raw_override,
+    ) {
+        Qwen35Start::Handled => {}
+        Qwen35Start::Ready(mut generation) => {
+            while generation.st.generated < generation.cfg.max_tokens {
+                let tokenizer = m
+                    .tokenizer
+                    .as_ref()
+                    .expect("qwen35 model always has a tokenizer");
+                match generation.step(m, gpu, tokenizer, stdout, id) {
+                    Qwen35Step::Continue => {}
+                    Qwen35Step::Stop => break,
+                    // The unwind stays out here: qwen35_restore_or_error consumes
+                    // the session, so it cannot run while `step` holds borrows.
+                    Qwen35Step::Failed(message) => {
+                        write_error(stdout, id, &message);
+                        qwen35_restore_or_error(stdout, id, m, gpu, generation.session);
+                        return;
+                    }
+                }
+            }
+            generation.finish(m, gpu, stdout, id);
+        }
     }
 }

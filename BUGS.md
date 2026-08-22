@@ -4,6 +4,56 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## [NOT A BUG — entry was wrong, corrected 2026-08-21] "GREEDY decode is not reproducible across requests"
+
+**Retracted. Greedy decode is reproducible; the original entry mistook designed
+multi-turn accumulation for nondeterminism.** Kept rather than deleted because
+the measurement is real and the trap is easy to fall into twice.
+
+- **What is actually happening.** A `generate` with no explicit `session_id`
+  falls back to `loaded_model_default_session_id`, i.e. the single shared
+  `QWEN35_LEGACY_SESSION_ID`. Consecutive session-less requests are therefore
+  turns of ONE conversation, and the qwen35 arm says so in its own words:
+  "multi-turn: prefill only the NEW turn tokens, continuing from
+  `session.cursor.seq_pos` (KV cache + DeltaNet state are cumulative)"
+  (`hipfire-serving-core/src/generate.rs`). Repeating a request is not repeating
+  an input — the input grows each time. Different output is CORRECT.
+- **The disproof.** The same prompt three times with DISTINCT `session_id`s
+  (`s1`/`s2`/`s3`) gives `1764618420aa` three times, byte-identical to an
+  isolated single-request run. Session isolation works. `{"type":"reset"}`
+  between requests likewise restores it, because it clears the conversation.
+- The `session.reset(gpu)` inside `generate` is only a **context-full overflow
+  guard** (`seq_pos + prompt_est + max_tokens > max_seq`), not a
+  new-conversation detector. That is deliberate.
+- Original (wrong) reading, for the record: same request 3× → `1764618420aa`,
+  `11845de02f29`, `9755690dde69`, read as "stale KV or reused scratch". The
+  numbers are right; the interpretation was not.
+
+**Two things that ARE real and came out of this:**
+
+1. **A/B methodology.** Any harness issuing several session-less generates to
+   one daemon is measuring a GROWING CONVERSATION, not a repeated request. Give
+   each request a distinct `session_id` (or one generation per process). A
+   multi-generation A/B is still valid if both sides run the identical sequence
+   — the accumulation then cancels — which is why the executor-v2 M3a/M3b0
+   parity runs were unaffected.
+2. ~~**Arch-inconsistent semantics, unverified as intentional.**~~ **FIXED
+   2026-08-21.** Under identical client behaviour (no `session_id`), qwen35
+   accumulated a conversation while llama did not — the same protocol usage was
+   stateful on one arch and stateless on another, decided by arch rather than
+   deliberately.
+
+   A `generate` naming no `session_id` is now a **one-shot on every arch**: the
+   daemon resets the active session after activating it, so qwen35 no longer
+   inherits the previous request's conversation. Multi-turn is unchanged and
+   becomes explicit — send a `session_id` and state accumulates exactly as
+   before (verified byte-identical: turn 2 of an explicit session hashes
+   `e5a2bfac6e60` before and after).
+
+   `prefill_already_done` is excluded from the reset: that contract says the
+   caller already prefilled this session, so clearing it would discard the
+   prefill the request depends on.
+
 ## [Low — re-record the baseline] oq4.25++ encoder changed at 8357081d3: +93% KLD on the random-init fixture, but −26% KLD on a REAL model
 - **RESOLVED 2026-08-13, and it reverses the naive reading.** Measured on
   Qwen3.5-0.8B (real weights, one Hessian reused across both sides, both scored

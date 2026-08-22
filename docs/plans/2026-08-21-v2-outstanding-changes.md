@@ -9,39 +9,35 @@ order that matters, and because several items below were discovered by tripping
 over them rather than by reading a plan — those are exactly the ones that get
 rediscovered expensively.
 
-Last updated 2026-08-21, against `master` at `7b30c7209`. Six PRs open.
+Last updated 2026-08-21, against `master` at `660cd2bf9`. **No v2 PRs open.**
 
 ---
 
-## In flight — four open PRs
+## In flight — nothing
 
-| PR | What | State |
-|---|---|---|
-| [#266](https://github.com/xynexus/hipfire/pull/266) | P2/M1 — steer hook on the lowered path, default-off bypass; M2's exit rewritten and satisfied | green, mergeable |
-| [#267](https://github.com/xynexus/hipfire/pull/267) | P1 — load-progress sink scoped to the loading thread | green, mergeable |
-| [#268](https://github.com/xynexus/hipfire/pull/268) | `RunningStream`, `StreamId`, `SessionKey`, `StreamTable` | green, mergeable |
-| [#269](https://github.com/xynexus/hipfire/pull/269) | `hipfire-steer` per-session state (`SteerKey`, keyed registry) | green, mergeable |
-| [#270](https://github.com/xynexus/hipfire/pull/270) | this ledger | docs only |
-| [#271](https://github.com/xynexus/hipfire/pull/271) | P2/M3 forward-side thread-scoped key — **stacks on #269** | green |
+`#281` (M3a), `#283` (M3b0) and `#282` (the plan corrections) all merged on
+2026-08-21. `#194` is open but unrelated to v2.
 
-"Green" means every **required** check passes. The `rustfmt (advisory)` job fails
-on all four; it fails on `master` too (see *Pre-existing noise*).
+Landed, and what it means for the next person:
 
-### Merge order
+| | What landed |
+|---|---|
+| **M3a** | A `Generate` frame admits a `RunningStream` into `DaemonState.streams` and is retired at the dispatch site. Admission is unconditional, not flag-gated. |
+| **M3b0** | `qwen35_decode_one` — the quantum. Advancing a token is now a call, not a loop iteration. |
+| **corrections** | §M3b/M3c/M3d rewritten against the code; see the march-loop plan. |
 
-`#267` and `#269` are independent — any order, any time.
+**Next is M3b1**, the march loop itself — and read the M3b section of
+`2026-08-21-executor-v2-march-loop.md` before starting it, because it carries
+five constraints found the expensive way, including one (the per-step snapshot
+of `m.eviction` / `m.physical_cap`) that only *becomes* wrong when the march loop
+exists.
 
-`#268` is independent to merge.
-
-**Correction (2026-08-21).** This section previously said `#266` must land before
-the forward-side hook threading. That was true only of the explicit-parameter
-approach, which was measured and rejected: a `SteerKey` parameter on
-`forward_scratch` and its three siblings reaches **155 external call sites**,
-nearly all of which never steer. The thread-scoped guard that landed instead
-(`#271`) changes no forward signature, so it touches no call site in `#266` and
-is independent of it.
-
-`#271` stacks on `#269` (it needs `SteerKey`), so merge `#269` first.
+**Keeping this section current is the point.** It has now gone stale twice: it
+listed `#266`–`#271` as open long after all seven of `#266`–`#272` merged, and
+then listed `#281`–`#283` as open within minutes of their merging. A stale
+in-flight table is worse than no table — it is read as current by exactly the
+person who has not been following along. **Re-check `gh pr list` before trusting
+this section**, and update it when you open or merge anything.
 
 ---
 
@@ -82,10 +78,33 @@ Both remaining steps were blocked on state having nowhere to live. `#268` and
 
 `#268` lands the stream object only. Still to build:
 
-- **The march loop** — advance runnable streams a module at a time.
-- **Admission** — `PendingQueue` narrows from *running* a `Generate` frame to
-  *admitting* a stream and returning. `transport.rs` survives verbatim;
-  `batch_runner.rs` is deleted, not moved.
+- **The march loop** — advance runnable streams a module at a time. Its
+  prerequisite, **M3b0, is in review as #283**: there was no quantum to march.
+  Both per-token loops held every cross-token variable in stack locals, so a
+  march loop built first would have marched whole requests. `qwen35_decode_one`
+  makes advancing a token a call. The loop itself is the small part
+  (~150–250 lines); see the M3b section of the march-loop plan for the four
+  things that must move with it.
+- ~~**Admission**~~ **DONE — M3a.** A `Generate` frame admits a `RunningStream`
+  into a `StreamTable` on `DaemonState` and is retired out of it at the dispatch
+  site. `transport.rs` untouched, as the plan requires.
+
+  The seam is the **dispatch site** (`main.rs`'s `DaemonRequest::Generate` arm),
+  not inside `handlers::generate::text`. That handler has many early returns, and
+  a retire per exit path is the leak shape `ThreadSinkGuard` exists to prevent —
+  measured: the two frames that early-return on an unsupported `session_id`
+  retire correctly, and the table reads 0 after every request including those.
+
+  Two things this does NOT do. Admission is **unconditional**, not flag-gated:
+  gating it would leave the shape untested by every default run, and the flag's
+  job is selecting who *runs* an admitted stream. And `AdmitError` is currently
+  **unreachable** — the daemon is serial and retires before the next frame, so no
+  session can hold a live stream across requests until the march loop lands. Its
+  caller runs the frame anyway rather than refusing, because a refusal would be
+  user-visible.
+
+  `batch_runner.rs` is in `hipfire-server`, not the daemon; not touched. See the
+  correction in the M3 plan.
 - **The suspension boundary** — park/resume across a real forward, with output
   byte-identical to an uninterrupted run.
 - **Remove `#![allow(dead_code)]` from `stream.rs`.** It is there because the
@@ -186,9 +205,64 @@ gate regenerate instead of erroring.
 
 ---
 
+## The trace and the table partition by different things (live, from M3a)
+
+The M3 plan flagged this as "reconcile explicitly, do not assume they agree."
+They do not. `exec_trace::stream_id_of` derives a trace stream from the **request
+id**; admission keys on the **session id, falling back to the request id**. For
+every frame that carries an explicit `session_id`, the two disagree — the trace
+splits one conversation across a stream per turn.
+
+Harmless today (nothing reads the table yet), and it is M3d that pays: its exit
+is three numbers read off that trace, per stream. Reconcile before measuring, or
+the numbers partition by turn rather than by stream.
+
 ## Wording in the plans that does not match the code
 
-Three cases, all found by grepping before building. Worth the habit.
+Three cases below, all found by grepping before building — plus **eleven more**
+found by a recon pass after M3a landed, now corrected in place in
+`2026-08-21-executor-v2-march-loop.md`. The load-bearing ones, so they are not
+rediscovered from the ledger alone:
+
+* **"three per-token hook sites"** — there are **six**, across two primitives:
+  id-keyed `cancel::is_cancelled` (`arch.rs:1206`, `generate_arch.rs:1073`,
+  `events.rs:174`) and unkeyed `take_generation_cancel()` (`arch.rs:1215`,
+  `generate.rs:1557`, `generate.rs:3132`). The unkeyed one is a process-global
+  `AtomicBool` whose take is a consuming `swap(false)`, so two marching streams
+  race for one cancel. And the pick step does not hold the key it is stored
+  under — `PENDING` is keyed by request id, `RunningStream` carries a
+  `SessionKey`.
+* **"`hipGraph` capture is off on the v2 path"** — it is default **ON**
+  (deepseek4's whole decode body, plus qwen35's DFlash verify graph). Turning it
+  off is an action item across three capture families, not an observation.
+* **"the executor may march whatever quanta exist today"** contradicts the same
+  plan's exit ("interleave at quantum granularity"). On the `Generate` path the
+  only quantum that exists is the whole request: both per-token loops
+  (`generate.rs:3124`, `arch.rs:1192`) hold every cross-token variable in stack
+  locals and are not re-enterable. This is M3b's real cost, and the plan costed
+  only the loop.
+* **"each stage lands behind `HIPFIRE_DAEMON_EXECUTOR=v2`"** — no stage does.
+  `executor_v2_enabled()` has exactly one caller in the workspace and its whole
+  effect is a one-shot `tracing::warn!`; M3a admits, runs inline and retires
+  unconditionally, by design. M3b must *build* the selection, not inherit it.
+* **M3d's first measurement is not obtainable** from the M0 trace:
+  `TraceRecord.module` is documented as "0 until the module graph exists", every
+  `record()` site passes 0, and `SuperOpKind` appears in `exec_trace.rs` zero
+  times.
+* **`--listen` is never started by anything in-tree.** It exists only in
+  `main.rs` (help text, parser, dispatch); `scripts/` and `tests/` return zero,
+  and `daemon-adapter`'s `attach_or_spawn` always falls through to a stdio spawn.
+  So "two concurrent `Generate` requests" has no harness today.
+
+**Not a plan doc, same hazard class**, found while checking the quantum:
+`hipfire-dispatch/src/pipeline/superop.rs` asserts in its own doc comment that
+"qwen35, qwen2, deepseek4, minimax and lfm2moe all build a `LoweredForward` at
+load". Grepping for that type returns `hipfire-dispatch`, `hipfire-serving-core`
+and `hipfire-arch-gemma4` — **zero** in any of the five arches it names. An
+in-tree doc that is factually false about five arches, and load-bearing for
+anyone reasoning about module granularity.
+
+The original three:
 
 - **`StreamState`** — parent §M1b says "move the state into `StreamState`". No
   such type exists. What landed twice was explicit threading (`RAW_OVERRIDE` → a
