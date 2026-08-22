@@ -1224,7 +1224,42 @@ pick step — one site instead of three-and-counting, and finer.
 
 *Revertible:* yes, behind `HIPFIRE_DAEMON_EXECUTOR=v2`.
 
-### M4 — Split `Moe` into `MoeRoute` / `MoeExpert(e)` / `MoeCombine`
+### M4 — scoped 2026-08-22. qwen35 has deepseek4's problem too.
+
+**Measured before starting.** This section already concedes that deepseek4 fuses
+top-k into dispatch and must stay on a coarse `Escape`. It assumes qwen35 is
+clean. **It is not.**
+
+`moe_ffn_decode_impl` (`qwen35/moe_decode.rs:751`) is **1,200 lines** of
+dtype-conditional dispatch, and among its fast paths is an *indexed* routed-expert
+GEMV gated by `hipfire_dispatch::families::moe::oq_indexed_decode_active`
+(`moe_decode.rs:639`, `:717`), described in its own comment as "the device-side
+top-K + indexed expert GEMV path" (`:797`). Routing and expert compute are **one
+kernel** there. Indexed routed-OQ MoE decode is also the DEFAULT (`0d425bfbf`),
+per this plan's own Tier-3 note.
+
+Splitting `Moe` into route / expert / combine means **unfusing** that: materialise
+per-expert intermediates the fused kernel exists to avoid, and pay a D2H plus a
+kernel launch per expert per token. That is a throughput regression bought to
+gain suspension granularity — the same trade this plan rejects elsewhere (copying
+gemma4's per-token prefill onto qwen35).
+
+What survives: the seam is real on the *unfused* paths. `MoeScratchRef` already
+materialises `router_logits` / `topk_indices` / `topk_weights`
+(`moe_decode.rs:51-64`), and the CPU-top-K path takes a D2H sync per layer
+(`:34`) which is a natural quantum edge.
+
+**So M4 needs a decision this plan does not currently pose:** is module
+granularity worth unfusing the default MoE decode path? If not, qwen35 joins
+deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
+and `MoeExpert(e)` exists only for arches whose MoE is not fused. Decide before
+implementing; the split is not free and the fused path is the one that ships.
+
+Note also that `MoeExpert(e)` must be indexed by top-k SLOT, not expert identity:
+`LayerProgram` is built once at lowering time and which experts fire is per-token.
+Emit `k` slots and resolve the physical expert inside the binding.
+
+### M4 — Split `Moe` into `MoeRoute` / `MoeExpert(e)` / `MoeCombine` (original)
 
 Now the module is the quantum. Expect M3's exit measurement to name `Moe` as the max — and
 **if it does not, say so**, because that means the workload never routed widely and the
