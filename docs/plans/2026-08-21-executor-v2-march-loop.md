@@ -101,11 +101,75 @@ flag-off code.
 `crates/hipfire-arch-qwen35/src/qwen35/mod.rs:1000` is `let use_graph = false;`.
 Doing `arch.rs:1192` as well doubles the diff and buys nothing M3b can test.
 
+#### M3b0.5 — the quantum has to ESCAPE `generate()` first
+
+**Added 2026-08-21, after M3b0 landed and this section's estimate was checked
+against the tree.** M3b1 below said "small once M3b0 exists". That is true of the
+*loop*, and it was the wrong thing to cost.
+
+M3b0 made advancing a token a call. It did **not** make that call reachable from
+the daemon:
+
+* `qwen35_decode_one`, `Qwen35DecodeState`, `Qwen35DecodeCfg` and `Qwen35Step`
+  are all **private** to `serving-core/src/generate.rs` — no `pub`.
+* The daemon makes **one** call, to `generate(...)`
+  (`handlers/generate.rs`). Everything else is inside it.
+* The qwen35 arm begins at `generate.rs:3304` and the decode loop at `:3590`, so
+  roughly **286 lines of per-request setup** run before the first quantum is even
+  reachable: the prefill (`forward_prefill_batch`, and the multi/PFlash-compressed
+  variants), the ngram scope, and the `tok0` sample. Teardown follows the loop:
+  the `\n` trailer after `<|im_end|>`, the `done` frame with its timing
+  arithmetic, and `qwen35_restore_or_error` / `restore_into_loaded` — which
+  **consumes** the session.
+
+So a march loop cannot drive anything until `serving-core` exposes a resumable
+generation: `start()` (that setup, returning a handle) → `step()` (M3b0's
+`qwen35_decode_one`) → `finish()` (that teardown). That is a hot-path refactor on
+the order of M3b0 itself, not a by-product of the loop.
+
+**M3b0 did get the load-bearing half right:** `Qwen35DecodeState` owns no borrow
+of the GPU or the model, which is exactly what lets it live across a suspension
+while the executor hands the device to another stream. The remaining work is
+moving the setup and teardown to the same footing, and making the four items
+`pub` (or wrapping them in one `pub` handle).
+
+*Exit:* the daemon can start a generation, advance it one token, and finish it,
+with output byte-identical to today — verified the same way M3b0 was, on a real
+qwen35 artifact with at least one sampled run.
+
+**Concrete boundaries, measured** (`serving-core/src/generate.rs`, post-M3b0):
+
+| phase | lines | what it owns |
+|---|---|---|
+| `start()` | 3304 → 3590 | prefill (`forward_prefill_batch` + the multi / PFlash-compressed variants), the multi-turn auto-reset, ngram scope, `tok0` sample, `t_prefill` |
+| `step()` | — | **done**: `qwen35_decode_one` |
+| `finish()` | 3623 → 3716 | the `\n` trailer after `<|im_end|>`, the timing arithmetic, evidence + MoE-router histogram writes, the `done` frame, `qwen35_restore_or_error` |
+
+**Do `finish()` first, and take `session` BY VALUE.** That is not a style
+preference — it dissolves the constraint that shaped M3b0. M3b0's
+`Qwen35Step::Failed(String)` exists only because `qwen35_restore_or_error`
+consumes the session while `kv`/`dn` are `&mut` borrows *out of* it, so the
+unwind could not live inside the extracted function. A `finish` that **owns**
+`session` can derive `kv`/`dn` from it internally and call the restore directly —
+no `Failed` hand-back, no borrow gymnastics.
+
+What `finish()` must close over, all verified present: `prefill_tokens`
+(`= new_tokens.len()`, :3301), `t0`/`t_prefill`, `nl`, `im_end_token`,
+`evidence_dir: Option<&str>`, `DaemonMoeRouterHistogramGuard` (:3343), and the
+PFlash triple — `pflash_summary: Option<CompressedPrompt>` (:2978),
+`pflash_bypass_reason: Option<String>` (:2982), `pflash_alpha: Option<f32>`
+(:2985), which the `done` frame needs via `pflash_done_fragment`.
+
+**M3b0.5 does not decompose the way M3b0 did.** The handle's field set is
+determined by what `finish()` closes over, so "extract the phases" and "define
+the handle" are one change, not two. Budget it as one ~300-line pass with the
+M3b0 verification method attached, rather than expecting to land it in slices.
+
 #### M3b1 — the loop itself
 
-Small once M3b0 exists: ~150–250 lines across `main.rs`, `stream.rs`, `state.rs`.
-Four things must move with it, none of them optional and none in the `Generate`
-arm:
+Small **once M3b0.5 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
+`state.rs`. Four things must move with it, none of them optional and none in the
+`Generate` arm:
 
 1. **Reply routing.** `Responder` is one per process, and `out.sink` is swapped
    per *frame*. `RunningStream` gains a `ReplySink` clone plus its `request_id`,
