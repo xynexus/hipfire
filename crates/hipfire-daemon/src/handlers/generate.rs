@@ -877,6 +877,15 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         // also the fallback when admission was refused (a session already live),
         // because refusing to generate would be user-visible.
         if crate::stream::executor_v2_enabled() {
+            // Park immediately, not just after a march step. Two Generate
+            // frames are dispatched back to back before the loop ever runs, so
+            // if this stream keeps the session the NEXT frame's
+            // `generate_start` finds an empty slot and dies with "qwen35
+            // session missing decode state". The invariant is: a stream holds
+            // the session only while it is actually stepping.
+            if generation.park(m, &mut daemon_state.gpu).is_err() {
+                return;
+            }
             if let Some(s) = daemon_state
                 .streams
                 .by_session_mut(&crate::stream::session_of(msg))

@@ -1170,7 +1170,16 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
                 // Per QUANTUM, not per frame: the resident session slot holds one
                 // live KV/DeltaNet, so marching stream B without re-activating
                 // would drive B's tokens into A's cache.
-                if m.activate_session(&mut daemon_state.gpu, &session).is_err() {
+                // Resume: swap this stream's session into the resident slot and
+                // take it for the quantum. `activate_session` inside saves
+                // whichever stream parked last, which is why park-after-step is
+                // not optional.
+                if slot
+                    .as_mut()
+                    .expect("present")
+                    .resume(m, &mut daemon_state.gpu, &session)
+                    .is_err()
+                {
                     Outcome::Retired
                 } else {
                     match m.tokenizer.as_ref() {
@@ -1212,6 +1221,13 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
 
         match outcome {
             Outcome::Stepped => {
+                // Park before yielding to the next stream, so the slot is
+                // populated and the next `activate_session` has something to
+                // save. Without this the second stream dies with "qwen35
+                // session missing decode state".
+                if let (Some(m), Some(g)) = (daemon_state.model.as_mut(), slot.as_mut()) {
+                    let _ = g.park(m, &mut daemon_state.gpu);
+                }
                 if let Some(s) = daemon_state.streams.get_mut(id) {
                     s.generation = slot.take();
                 }

@@ -243,7 +243,50 @@ The full-parameter list, for costing: `budget_alert_at_tok`, `budget_alert_text`
 `repeat_window`, `request_stop_sequences`, `t0`, `temp`, `think_pair`,
 `tool_call_pair`, `top_k`, `top_p`.
 
-#### M3b1 — BLOCKED on session residency. Measured 2026-08-22 by building it.
+#### M3b1 — DONE 2026-08-22. Exit met.
+
+Two concurrent `Generate` frames interleave at token granularity under the flag,
+each byte-identical to its solo run:
+
+```
+pattern: ABABABABABABABABABABABABABABABABABABABABABABAB
+A: solo 24a4614f2685 == interleaved 24a4614f2685
+B: solo eaed6fb9a6b1 == interleaved eaed6fb9a6b1
+```
+
+Flag off is byte-identical to master on all three harnesses.
+
+**The blocker below was real and is solved by park/resume, NOT by option 3.** The
+correction that mattered: options 1 and 3 do *not* collapse, as an earlier note
+here claimed. That claim assumed option 1 restores the session into the slot
+*before* a step. It does not — a stream parks (restores) *after* its step and
+resumes (takes) *before* the next one, so `step` keeps reading its own session
+and needs no change at all. The whole fix is ~10 sites:
+
+* `Qwen35Generation::session` becomes `Option`, so the move between slot and
+  handle is trackable.
+* `park()` / `resume()` on the handle.
+* The march loop resumes before a step and **parks after** it.
+* The handler parks at stash time too — two frames are dispatched back to back
+  before the loop ever runs, so without that the second `generate_start` still
+  finds an empty slot.
+
+**The invariant, stated once:** a stream owns the session *only while it is
+stepping*. Between quanta the slot is populated, which is what gives the next
+`activate_session` something to save. Every failure on the way here was a
+violation of exactly that.
+
+Cost: one take + one restore per stream per token. `restore_into_loaded` leaked a
+`[vocab_size] f32` logits snapshot on every call (~970 KiB), harmless at one swap
+per session and *not* harmless at one per token — fixed with the `free_tensor`
+the #288 review already recommended.
+
+Option 3 (handle stops owning the session) remains a valid optimisation: it would
+remove the per-token swap entirely. It is ~60 sites and changes default-path
+semantics, so it is an optimisation with a working baseline to measure against,
+not a prerequisite.
+
+<details><summary>The blocker as originally recorded</summary>
 
 The march loop is built and works **for one stream**. Flag-off is byte-identical;
 flag-on marches a single generation to completion and its output matches the solo
