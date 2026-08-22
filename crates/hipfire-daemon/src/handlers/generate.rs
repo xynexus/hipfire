@@ -872,16 +872,41 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             // failed and reported it. Nothing to march.
             return;
         };
+        // §M3b1: under the executor flag the frame ADMITS and returns — the
+        // march loop advances it. Inline drive below is the flag-off path, and
+        // also the fallback when admission was refused (a session already live),
+        // because refusing to generate would be user-visible.
+        if crate::stream::executor_v2_enabled() {
+            if let Some(s) = daemon_state
+                .streams
+                .by_session_mut(&crate::stream::session_of(msg))
+            {
+                s.generation = Some(generation);
+                return;
+            }
+        }
         while generation.should_continue() {
             let tokenizer = match m.tokenizer.as_ref() {
                 Some(t) => t,
                 None => break,
             };
-            match generation.step(m, &mut daemon_state.gpu, tokenizer, &mut daemon_state.out.sink, id) {
+            match generation.step(
+                m,
+                &mut daemon_state.gpu,
+                tokenizer,
+                &mut daemon_state.out.sink,
+                id,
+            ) {
                 Qwen35Step::Continue => {}
                 Qwen35Step::Stop => break,
                 Qwen35Step::Failed(message) => {
-                    generation.fail(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, id, &message);
+                    generation.fail(
+                        m,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.out.sink,
+                        id,
+                        &message,
+                    );
                     return;
                 }
             }

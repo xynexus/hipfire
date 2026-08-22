@@ -243,6 +243,42 @@ The full-parameter list, for costing: `budget_alert_at_tok`, `budget_alert_text`
 `repeat_window`, `request_stop_sequences`, `t0`, `temp`, `think_pair`,
 `tool_call_pair`, `top_k`, `top_p`.
 
+#### M3b1 — BLOCKED on session residency. Measured 2026-08-22 by building it.
+
+The march loop is built and works **for one stream**. Flag-off is byte-identical;
+flag-on marches a single generation to completion and its output matches the solo
+run exactly (`24a4614f2685`). The two-stream exit **cannot be met** as designed:
+
+```
+{"type":"error","id":"B","message":"failed to save active qwen35 session: qwen35 session missing decode state"}
+```
+
+`Qwen35Generation` TAKES the session out of the model at `start()`
+(`take_from_loaded`), and `LoadedModel.active` is a **single** resident slot. So
+with stream A admitted, the slot is empty; B's `generate_start` calls
+`activate_session`, whose save step finds nothing, and B dies before its first
+token.
+
+**Item 4 above ("`activate_session` per quantum") does not fix this.** It assumes
+the session lives in the slot and merely needs swapping between quanta. It does
+not live there — the handle owns it. There is nothing to activate between.
+
+Three ways out, none of them small:
+
+1. **Per-quantum save/restore.** `restore_into_loaded` before the step,
+   `take_from_loaded` after. Correct, but that is the exact round trip #288
+   showed allocates a `[vocab_size] f32` logits tensor per call — two per token
+   per stream, and it leaked until the in-place rewind landed.
+2. **Make the resident slot a table.** Real multi-session residency. That is §M5
+   territory, not M3.
+3. **Stop the handle owning the session.** Leave it in the slot and have the
+   handle hold only decode state, so `activate_session` per quantum becomes
+   sufficient after all. This is the smallest of the three, but it means
+   unpicking `finish()`'s by-value session — the property M3b0.5 deliberately
+   chose to dissolve the `Failed(String)` hand-back.
+
+Option 3 is the recommendation, and it should be measured before it is costed.
+
 #### M3b1 — the loop itself
 
 Small **once M3b0.75 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
