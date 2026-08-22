@@ -20,6 +20,21 @@ final-norm + lm_head when not last, and leaves the residual in caller-owned
 (`qwen35/ep.rs:315-351`, `layer_end: layer_idx + 1`; second site `ep.rs:2468`),
 and the invariant is hard-asserted at `prefill_chunk.rs:2040-2046`.
 
+**Two qualifiers, verified independently before this plan landed** — they do not
+kill the band option, but they make "~1 day" optimistic:
+
+* `PrefillBandCtx` is **`pub(crate)`** (`prefill_chunk.rs:1885`) with **zero**
+  uses outside `hipfire-arch-qwen35`. An executor in the daemon cannot construct
+  a band today; it has to be exposed first.
+* `ep.rs:317` is inside **`forward_prefill_batch_ep`** (`ep.rs:215`) — the
+  expert-parallel / multi-GPU path. So the per-layer drive is proven *there*, not
+  on the single-GPU `pp == 1` default that nix1 runs. Driving the default path
+  per-layer is additional work, not a switch.
+
+What survives: the mechanism exists, is production code, and is not hypothetical.
+What changes: costing it as "~1 day" assumes a band cursor the daemon can already
+reach, and it cannot.
+
 So the first thing this plan forces is a **decision, not an implementation**:
 
 | buys | granularity | cost |
