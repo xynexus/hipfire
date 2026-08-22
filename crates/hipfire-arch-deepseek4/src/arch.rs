@@ -670,7 +670,9 @@ impl DeepseekV4 {
         // nothing. Requires the HFQM v2 routed-expert module table, which the
         // current quantizer emits for every MoE artifact.
         let paged_experts = matches!(
-            std::env::var("HIPFIRE_DEEPSEEK4_PAGED_EXPERTS").ok().as_deref(),
+            std::env::var("HIPFIRE_DEEPSEEK4_PAGED_EXPERTS")
+                .ok()
+                .as_deref(),
             Some("1" | "true" | "on" | "yes")
         );
         // KNOWN BLOCKER, measured 2026-08-22: registration currently REFUSES a
@@ -1388,7 +1390,6 @@ impl DeepseekV4 {
                 )?;
             }
         }
-
 
         // §M5 Phase 3b. Build the pager and hand it the module table plus the
         // per-layer pointer tables the paged branch allocated above. From here
