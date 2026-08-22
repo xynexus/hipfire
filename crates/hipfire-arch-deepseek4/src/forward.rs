@@ -3619,6 +3619,37 @@ fn ffn_stub(
 ///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
 ///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
 ///     ffn_out += e_out * routed_scaling_factor
+/// `ExpertResidency` over the deepseek4 weight pager.
+///
+/// Mirrors qwen35's provider exactly, including the reason it does NOT patch the
+/// pointer table: the pager maintains its registered tables on every residency
+/// transition, so a dispatch site that patched as well would be duplicating
+/// work the pager already did.
+struct PagerExpertResidency<'a> {
+    pager: &'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>,
+}
+
+impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'_> {
+    fn ensure_resident(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        selected: &[u32],
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let mut pager = self.pager.borrow_mut();
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            pager
+                .ensure_expert_module_resident(key, gpu)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 fn ffn_routed(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,

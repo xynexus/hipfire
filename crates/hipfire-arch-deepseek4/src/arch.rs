@@ -534,6 +534,7 @@ impl DeepseekV4 {
         }
 
         Ok(DeepseekV4Weights {
+            pager: None,
             token_embd: None,
             output_norm: None,
             head: None,
