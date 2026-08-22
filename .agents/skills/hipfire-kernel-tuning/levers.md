@@ -340,6 +340,74 @@ without (a) a fundamentally different LDS layout that doesn't
 serialize through register, or (b) on RDNA4 (gfx12), where
 `s_prefetch_data` may change the calculus.
 
+## 12. Barrier granularity: two small workgroups beat one big one (gfx1151)
+
+`s_barrier` couples every wave in a workgroup. Two independent 4-wave
+workgroups resident on a WGP put the same 8 waves on the SIMDs, but one
+workgroup can compute through the other's barrier; a single 8-wave workgroup
+stalls all eight together.
+
+Measured on `gemm_oq_compact_iu4x2_w64`, sweeping the wave grid at fixed
+per-wave tile (gate/up 17408x5120, B=512, hwTOPS of iu4):
+
+| WARPS_M x WARPS_N | BM x BN | waves | LDS | hwTOPS |
+|---|---|---|---|---|
+| 2 x 2 | 64 x 128 | 4 | 24576 | **60.7** |
+| 4 x 1 | 128 x 64 | 4 | 18432 | 59.4 |
+| 1 x 2 | 32 x 128 | 2 | 22528 | 58.2 |
+| 4 x 2 | 128 x 128 | 8 | 28672 | 49.3 |
+| 2 x 4 | 64 x 256 | 8 | 45056 | 50.0 |
+
+Both 8-wave shapes lose ~18%; nothing at 4 waves or fewer does. **Tile shape is
+not the variable, wave count per workgroup is.**
+
+Corollary: unused LDS is not free real estate. Spending it to grow a tile is a
+loss the moment `floor(65536 / lds_bytes)` drops to 1. Check that number before
+you grow a tile, not after.
+
+## 13. Occupancy is NOT a lever for matrix-issue-bound kernels (gfx1151)
+
+A probe issuing nothing but `v_wmma_i32_16x16x16_iu4` on registers reaches
+**109.7 TOPS with ONE wave per SIMD** (80 blocks x 64 threads), against 110.9
+at saturation and 118.8 theoretical. One wave saturates the matrix pipe as long
+as it carries >=4 independent accumulators.
+
+So do not spend register budget buying waves for a WMMA-bound kernel, and do
+not read `Occupancy [waves/SIMD]: 3` as a problem. Conversely a VGPR diet buys
+nothing: it only helps if you were spilling to scratch, which is a cliff (see
+§6) rather than a gradient -- WMt=4/WNt=4 spilled 85 VGPRs and fell from ~60 to
+37.5 TOPS.
+
+Use **110.9 TOPS**, not the 118.8 paper figure, as the gfx1151 iu4 target.
+iu8 is half that; see §10 for the cycle costs.
+
+## 14. Negative: hand-written double-K WMMA reads (LLVM already does it)
+
+An iu4 fragment is 16 K = 8 B, so a per-K-step operand read looks like a 64-bit
+`ds_load` against a 128-bit LDS interface, and the textbook fix is to read 32 K
+once and feed two K-steps from the halves.
+
+Do not bother. With the K loop fully unrolled, the s and s+1 reads are provably
+adjacent and LLVM coalesces them itself. Writing the double-K read by hand
+emits **byte-identical ISA** (only the `__hip_cuid_*` symbol differs). Confirm
+before you invest: `hipcc -S` then
+`grep -oE 'ds_load_[a-z0-9_]+' | sort | uniq -c` -- if you already see only
+`ds_load_b128`, there is nothing to widen.
+
+There is also no quadruple-K: `ds_load_b128` / `global_load_dwordx4` at 16 B are
+the widest single loads on RDNA, so 128 bits per instruction is the ceiling.
+
+## 15. Negative: `s_singleuse_vdst` is unreachable (ROCm 7.14)
+
+Checked three ways: no `single-use-vdst` subtarget feature in `llc -mattr=help`,
+no `AMDGPUInsertSingleUseVDST` symbol in `libLLVM`, and `llvm-mc -mcpu=gfx1151`
+rejects the mnemonic. Not available as an instruction, not available as an LLVM
+pass. Re-check on a toolchain bump before spending time on it.
+
+If what you want is a "do not cache this" hint, that is the nontemporal /
+TH cache-policy bits instead -- and those are already a documented fake win
+(case-studies §2: measured +2%, actually -13%).
+
 ## When you're done
 
 Commit your win (or your null-result revert) with the commit-message

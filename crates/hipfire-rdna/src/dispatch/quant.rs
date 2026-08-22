@@ -1355,15 +1355,20 @@ impl Gpu {
             &mut bi as *mut _ as *mut c_void,
             &mut si as *mut _ as *mut c_void,
         ];
-        // Must match BM / BN in the kernel.
-        const BM: usize = 64;
-        const BN: usize = 128; // WNt=4 -> BN = 2*4*16
+        // Must match BM / BN / BLOCK in the kernel.
+        const WARPS_M: usize = 2;
+        const W_MT: usize = 2;
+        const W_NT: usize = 4;
+        const BM: usize = WARPS_M * W_MT * 16;
+        const WARPS_N: usize = 2;
+        const BN: usize = WARPS_N * W_NT * 16;
+        const BLOCK: usize = WARPS_M * WARPS_N * 64;
         let func = &self.functions["gemm_oq_compact_iu4x2_w64"];
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [m.div_ceil(BM) as u32, batch_size.div_ceil(BN) as u32, 1],
-                [256, 1, 1],
+                [BLOCK as u32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

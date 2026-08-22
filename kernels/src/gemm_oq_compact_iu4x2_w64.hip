@@ -48,16 +48,27 @@ __device__ __forceinline__ uint32_t oqx2w64_pack4(uint32_t t) {
 }
 
 #define BK 64
-#define BLOCK 256   // 4 wave64 waves
+// Wave grid. Staging is 21% of runtime at BM=64 (measured by ablation), and the
+// fix is tile size, not a better copy loop: staged bytes per WMMA are
+// (BM*BK/2 + BN*BK) / ((BM/16)(BN/16)(BK/16)*2), which falls as the tile grows.
+// LDS was only 24 kB of the 64 kB available, so BM 64 -> 128 is nearly free.
+#ifndef WARPS_M
+#define WARPS_M 2
+#endif
+#ifndef WARPS_N
 #define WARPS_N 2
+#endif
+#define BLOCK (WARPS_M * WARPS_N * 64)
+#ifndef WMt
 #define WMt 2
+#endif
 #ifndef WNt
 #define WNt 4      // halved vs the 1-pass twin: two i32 accumulator sets.
                    // WNt=8 spills 113 VGPRs (2 waves); WNt=6 breaks the
                    // load macros (BN*UA/4 must divide BLOCK). So: 4.
 #endif
-#define BM (2 * WMt * 16)
-#define BN (2 * WNt * 16)
+#define BM (WARPS_M * WMt * 16)
+#define BN (WARPS_N * WNt * 16)
 #define STRIPS_PER_GROUP (256 / BK)   // 4
 
 __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
@@ -73,7 +84,7 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     // conflict, twice as bad as the 32 B stride of the old split planes. Padding
     // to 80 B (20 dwords, gcd(20,64)=4) spreads them over all 16.
 #define XPAD 16
-    __shared__ uint8_t As[2][BM * (BK / 2)], Xi[2][BN * (BK + XPAD)];
+    __shared__ __align__(16) uint8_t As[2][BM * (BK / 2)], Xi[2][BN * (BK + XPAD)];
     const int bm = blockIdx.x * BM, bn = blockIdx.y * BN, st = K / 2;
     const int xst = K;               // interleaved row stride (== K bytes)
     const int wid = threadIdx.x >> 6, wtid = threadIdx.x & 63, lane = wtid & 15;
@@ -81,9 +92,13 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     const int n_groups = K / 256;
     const int side_stride = block_stride - 128;
     const long long side_base = (long long)M * n_groups * 128LL;
-    const int UA = (BK / 2) / 4;
+    const int UA = (BK / 2) / 8;   // 8-byte A chunks per row-strip
     const int NA = BM * UA / BLOCK;
-    const int NXv = BN * UA / 4 / BLOCK;
+    // X staging in 16-byte chunks: BK/16 chunks per row, BN rows. Expressing it
+    // this way (rather than a fixed 32 B per thread) keeps the mapping valid for
+    // any BLOCK, which is what lets WARPS_M change without touching the macros.
+    const int XCPR = BK / 16;
+    const int NXv = BN * XCPR / BLOCK;
 
     i32x4 acch[WMt][WNt], accl[WMt][WNt];
     f32x4 facc[WMt][WNt];
@@ -116,24 +131,21 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         sxp[j] = Xs + (long long)cs * n_groups;
     }
 
-    uint32_t rA[NA];
-    i32x4 rXh[NXv], rXl[NXv];
+    i32x2 rA[NA];
+    i32x4 rX[NXv];
 #define LOADG(kk) \
-    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK, row = idx / UA, c = idx % UA; int r = bm + row < M ? bm + row : M - 1; rA[l] = *(const uint32_t*)(W + (long long)r * st + (kk) / 2 + c * 4); } \
+    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK, row = idx / UA, c = idx % UA; int r = bm + row < M ? bm + row : M - 1; rA[l] = *(const i32x2*)(W + (long long)r * st + (kk) / 2 + c * 8); } \
     /* X is pre-interleaved in DRAM: a strip is BK bytes per row, copied verbatim.
        Two i32x4 per thread covers 32 of the 64 strip bytes. */ \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { \
-        int q = threadIdx.x + l * BLOCK, row = q >> 1, hlf = q & 1; \
+        int q = threadIdx.x + l * BLOCK, row = q / XCPR, ch = q % XCPR; \
         int r = bn + row < B ? bn + row : B - 1; \
-        const uint8_t* xp = (const uint8_t*)X + (long long)r * xst + (kk) + hlf * 32; \
-        rXh[l] = *(const i32x4*)(xp); \
-        rXl[l] = *(const i32x4*)(xp + 16); }
+        rX[l] = *(const i32x4*)((const uint8_t*)X + (long long)r * xst + (kk) + ch * 16); }
 #define STS(bf) \
-    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK; ((uint32_t*)As[bf])[idx] = rA[l]; } \
+    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK; ((i32x2*)As[bf])[idx] = rA[l]; } \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; \
-        int row = q >> 1, hlf = q & 1; \
-        uint8_t* dp = Xi[bf] + row * (BK + XPAD) + hlf * 32; \
-        *(i32x4*)(dp) = rXh[l]; *(i32x4*)(dp + 16) = rXl[l]; }
+        int row = q / XCPR, ch = q % XCPR; \
+        *(i32x4*)(Xi[bf] + row * (BK + XPAD) + ch * 16) = rX[l]; }
 
     { LOADG(0); STS(0); }
     __syncthreads();
@@ -141,6 +153,13 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         int buf = k & 1;
         if (k + 1 < nstrip) { LOADG((k + 1) * BK); }
 #pragma unroll
+        // Every LDS read below is 128-bit at the ISA, both operands. X gets there
+        // by construction (the interleave packs hi+lo of one 16-K step into 16 B);
+        // A gets there for free -- a per-step weight fragment is only 8 B, but the
+        // full unroll makes the s and s+1 reads provably adjacent and LLVM
+        // coalesces them into ds_load_b128. Hand-writing that as an explicit
+        // double-K read emits BYTE-IDENTICAL ISA, so do not bother. 20 ds_load_b128
+        // per 64 v_wmma, zero narrower loads. See docs/perf/gfx1151-gemm-levers.md.
         for (int s = 0; s < BK / 16; s++) {
             i32x2 af[WMt], xfh[WNt], xfl[WNt];
 #pragma unroll
