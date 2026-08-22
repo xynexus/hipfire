@@ -1998,6 +1998,26 @@ fn qwen35_sample_next(
     cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
 ) {
+    // Single-stream: the resident session's logits ARE `scratch.logits`.
+    qwen35_sample_next_from(gpu, &scratch.logits, scratch, cursor, cfg, st)
+}
+
+/// Sample from an explicit logits tensor.
+///
+/// Split out from `qwen35_sample_next` because a batched forward writes
+/// **per-session** logits — one tensor per row — while the single-stream
+/// `forward_scratch` writes the one shared `scratch.logits`. Everything else is
+/// per-stream and unchanged: the attractor blocks, the `SamplerConfig`, the RNG.
+/// `scratch` is still passed for `sample_buf` / `repeat_buf`, which are scratch
+/// proper and reused sequentially across rows.
+fn qwen35_sample_next_from(
+    gpu: &mut hipfire_rdna::Gpu,
+    logits: &hipfire_rdna::GpuTensor,
+    scratch: &qwen35::Qwen35Scratch,
+    cursor: &crate::session::SessionCursor,
+    cfg: &Qwen35DecodeCfg,
+    st: &mut Qwen35DecodeState,
+) {
     // Decide which paired-opener tokens (if any) trip the depth
     // threshold over a 20-token window. #111 attractor block —
     // cheap when not tripped, ~5 µs per blocked token when
@@ -2021,7 +2041,7 @@ fn qwen35_sample_next(
     // D2H readback inside sampler::sample.
     st.next_token = sampler::sample(
         gpu,
-        &scratch.logits,
+        logits,
         &scratch.sample_buf,
         &scratch.repeat_buf,
         cfg.vocab_size,
