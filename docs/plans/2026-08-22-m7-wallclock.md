@@ -82,6 +82,50 @@ collected.
 So the crossover is not "not yet reached" — it is **not measurable**, because no
 execution mode on the decode path coalesces across streams.
 
+## Integrating it: what the remaining step actually is
+
+Wiring `march_streams` to the batched entry is **not** a plumbing job, and the
+reason is worth stating so nobody starts it expecting one.
+
+The session-residency half IS small. Park installs into `m.active`
+(`session.rs:341`), batched decode requires every session in
+`m.q35_registry.sessions` (`qwen35_decode.rs:489`), and `activate_session`
+already moves between them — so the executor need only evict the active slot
+before a batched step.
+
+**The generation-state half is the real work.** `Qwen35Generation` exposes only
+`step` / `fail` / `park` / `resume` / `should_continue` / `finish`. It privately
+owns the sampler RNG, the emitted-token count, the stop-sequence buffers and the
+per-stream `max_tokens`. `GenerateBatchDecodeEnvelope` is a *second, independent*
+generation state machine over the same session, carrying its own
+`max_tokens_remaining` and `logical_position` and doing its own sampling and
+stop detection.
+
+Driving a session through the batch path behind its handle therefore desyncs
+every one of those. Two ways out:
+
+- **(a) Make the handle authoritative.** Add a serving-core entry that steps N
+  `Qwen35Generation`s through one batched forward — `qwen35_step_batch(&mut
+  [Qwen35Generation], ..)` — so per-stream RNG, stop sequences and counters stay
+  where they already live. This is the correct shape and it is a new API, not a
+  call.
+- **(b) Abandon the handle for batched streams** and re-implement stop and
+  sampling bookkeeping against the envelope. Cheaper to write, and it duplicates
+  the exact state machine that #287's greedy-nondeterminism work went through
+  once already.
+
+(a) is right. Note also that the two paths sample independently, so they agree
+under greedy and will diverge at `temperature > 0` — any parity check between
+them must be greedy, or compare distributions rather than tokens.
+
+## Available today, without that work
+
+The batch protocol is reachable now: `generate_batch_prefill` →
+`generate_batch_decode_step` → `release_sessions`. A client that wants
+multi-stream throughput can have the 2.26× at N=16 today by using it instead of
+N independent `generate` calls. The executor integration is what makes plain
+`generate` requests benefit automatically.
+
 ## What is missing is wired-but-uncalled
 
 The batched decode machinery exists. `Qwen35DecodeBatchBackend` carries
