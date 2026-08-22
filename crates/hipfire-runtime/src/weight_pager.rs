@@ -809,11 +809,19 @@ fn expert_module_tensor_role(name: &str) -> Option<ExpertRole> {
 /// The kernel would read it happily and produce garbage — a wrong answer, not a
 /// crash — so this refuses at registration instead.
 fn module_gate_up_span_is_contiguous(module: &HfqModuleRecord) -> bool {
-    let Some(w1) = module.tensors.iter().find(|t| t.name.ends_with("w1.weight")) else {
+    let Some(w1) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w1.weight"))
+    else {
         // No w1 means this is a `gate_up_proj` module; nothing to check.
         return true;
     };
-    let Some(w3) = module.tensors.iter().find(|t| t.name.ends_with("w3.weight")) else {
+    let Some(w3) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w3.weight"))
+    else {
         return false;
     };
     match module_tensor_resident_len(w1) {
