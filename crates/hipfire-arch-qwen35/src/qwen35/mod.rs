@@ -86,6 +86,9 @@ use decode_layers::*;
 mod prefill_chunk;
 use prefill_chunk::*;
 
+mod prefill_lowered;
+use prefill_lowered::*;
+
 mod prefill_batch;
 pub use prefill_batch::*;
 
