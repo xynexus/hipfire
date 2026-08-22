@@ -134,31 +134,43 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
             #pragma unroll
             for (int t = 0; t < 4; ++t) isum[q][t] = 0;
 
-        for (int e = 0; e < n_ov; ++e) {
+        // Every q loop below is bounded by the COMPILE-TIME MAXQ and predicated,
+        // never by the runtime `nblk`. With a runtime bound, acc[q][t] and
+        // isum[q][t] cannot be assigned static registers, so LLVM falls back to
+        // M0-relative indexed register moves -- the hot loop came out at 144
+        // instructions carrying 7 MAC-ish ops (20.6 instructions per MAC), with
+        // 24 v_movrels_b32 / v_movreld_b32 plus 33 v_mov and 77 SALU of pure
+        // index bookkeeping. Predicating against MAXQ keeps q constant in each
+        // unrolled copy, which is what puts the accumulators in real registers.
+        #pragma unroll
+        for (int e = 0; e < OQCO_MAX_OV; ++e) {
+            if (e >= n_ov) break;
             const int idx = (int)table[2 * e];
             const int val = (int)(int8_t)table[2 * e + 1];
             const int8_t* xr = XT + (long long)(kbase + idx) * B;
-            for (int q = 0; q < nblk; ++q) {
+            #pragma unroll
+            for (int q = 0; q < MAXQ; ++q) {
                 const int b0 = b_off + (q << 7) + (lane << 2);
-                if (b0 >= B) break;
-                const uint32_t w4 = *(const uint32_t*)(xr + b0);
+                const uint32_t w4 = (q < nblk && b0 < B) ? *(const uint32_t*)(xr + b0) : 0u;
                 #pragma unroll
                 for (int t = 0; t < 4; ++t)
                     isum[q][t] += val * (int)(int8_t)((w4 >> (t * 8)) & 0xff);
             }
         }
         const float* xsg = XsT + (long long)g * B;
-        for (int q = 0; q < nblk; ++q) {
+        #pragma unroll
+        for (int q = 0; q < MAXQ; ++q) {
             const int b0 = b_off + (q << 7) + (lane << 2);
-            if (b0 >= B) break;
+            if (q >= nblk || b0 >= B) continue;
             #pragma unroll
             for (int t = 0; t < 4; ++t)
                 acc[q][t] += (float)isum[q][t] * sw * xsg[b0 + t];
         }
     }
-    for (int q = 0; q < nblk; ++q) {
+    #pragma unroll
+    for (int q = 0; q < MAXQ; ++q) {
         const int b0 = b_off + (q << 7) + (lane << 2);
-        if (b0 >= B) break;
+        if (q >= nblk || b0 >= B) continue;
         #pragma unroll
         for (int t = 0; t < 4; ++t)
             Y[(long long)(b0 + t) * M + row] += acc[q][t];
