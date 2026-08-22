@@ -205,6 +205,44 @@ whose values moved when #288 landed).
 determined by what the setup reads, so "extract it" and "decide its signature"
 are one change. Budget it as a single pass with the verification attached.
 
+##### The boundary above is WRONG. Measured 2026-08-22 by attempting it.
+
+Extracting `3580→3869` into a `Qwen35Generation::start(m, gpu, stdout, id)` was
+tried and reverted. The compiler enumerated **26 further identifiers** the block
+reads from `generate()`'s scope, making `start()` a **30-parameter function** —
+larger than the 29-parameter `generate()` it came out of. That alone would only
+be ugly. What makes the boundary wrong is *which* identifiers:
+
+`new_tokens` (:1344), `nl` (:1250), `im_end_token` (:162), `think_pair` (:1443)
+and `tool_call_pair` (:1436) are products of `generate()`'s **shared framing
+prologue** — chat-template rendering, tokenisation, the PFlash decision — which
+runs long before the qwen35 arm and is shared with every other arch.
+
+**The daemon has none of them.** So a `start()` cut at the arm is not merely
+awkward, it is *uncallable by the daemon*, which is the only reason to build it.
+
+So M3b0.75 is not "extract the arm's setup". It is **split `generate()` itself**:
+everything up to the loop becomes `start()`, the loop stays at the call site, and
+`finish()` already exists. The framing prologue goes with `start()` because that
+is what makes the handle constructible from a request rather than from
+`generate()`'s locals.
+
+Two consequences for whoever does it:
+
+* The natural signature is close to `generate()`'s own — which argues for taking
+  the request (or a small bundle) rather than 30 positional parameters. The file
+  already has the pattern: `Qwen35DecodeCfg` bundles 17 for the loop.
+* The other arches share that prologue. Splitting it must not fork their path —
+  the llama arm and the early-return spec-decode routes all run through it.
+
+The full-parameter list, for costing: `budget_alert_at_tok`, `budget_alert_text`,
+`evidence_dir`, `frequency_penalty`, `im_end_token`, `max_think_tokens`,
+`max_tokens`, `new_tokens`, `nl`, `pflash_alpha`, `pflash_bypass_reason`,
+`pflash_summary`, `prefill_already_done`, `prefilled_prompt_tokens`,
+`prefill_tokens`, `presence_penalty`, `q35_session`, `repeat_penalty`,
+`repeat_window`, `request_stop_sequences`, `t0`, `temp`, `think_pair`,
+`tool_call_pair`, `top_k`, `top_p`.
+
 #### M3b1 — the loop itself
 
 Small **once M3b0.75 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
