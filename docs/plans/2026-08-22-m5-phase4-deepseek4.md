@@ -71,6 +71,42 @@ qwen35 does not patch per token, it makes the selected experts resident and the
 table follows by construction. Whatever deepseek4 does must be chosen
 deliberately rather than by copying a function that nothing calls.
 
+## The migration, fully specified
+
+Traced to the bottom. Every primitive already exists and is arch-generic; what
+is missing is one struct field and one call.
+
+**The pager already owns the pointer tables.** An arch registers them with
+`register_expert_ptr_tables(layer, ..)` (`weight_pager.rs:1499`), and
+`ensure_expert_module_resident` patches the registered table on admission
+(`:1056` comment). That is why the trait doc for `ExpertResidency::ensure_resident`
+can promise that a resident expert "hence" has a live slot — the arch never
+patches anything itself, which is also why the manual `patch_expert_ptr_table`
+has no callers.
+
+**The gap is that deepseek4's decode path cannot carry a residency provider.**
+deepseek4 is top-6 and routes through `run_moe_decode_bias_aware`, which takes
+`MoeBiasAwareParams`. That struct carries `expert_gate_up_ptrs` and
+`expert_down_ptrs` — the tables — but has **no** `expert_residency` field.
+`expert_residency` lives on `MoeParams` (`families/moe.rs:367`) and is consumed
+only by `run_moe_decode` (`pipeline/mod.rs:492`). So the bias-aware sibling has
+the tables and not the hook.
+
+The work, in order:
+
+1. Add `expert_residency: Option<&'a dyn ExpertResidency>` to
+   `MoeBiasAwareParams`, mirroring `MoeParams:367`.
+2. Call `ensure_resident` for the selected experts in
+   `run_moe_decode_bias_aware`, mirroring `run_moe_decode`'s use at
+   `pipeline/mod.rs:492`.
+3. In deepseek4's loader, when paged: `register_expert_modules(hfq.modules())`
+   and `register_expert_ptr_tables` per layer, pass a residency provider into
+   the MoE params, and **stop building the per-layer `combined` upload**
+   (`arch.rs:298-330`) — that upload is the thing that dies at layer 19.
+
+Steps 1 and 2 are mechanical mirrors of code that already exists in the sibling
+function. Step 3 is the arch work, and its test is the artifact above.
+
 ## What does not block it
 
 The EP smoke on medusa is the *validation* Phase 3b asks for, and medusa is
