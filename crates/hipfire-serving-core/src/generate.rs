@@ -2339,23 +2339,30 @@ fn qwen35_decode_after_forward(
     Qwen35Step::Continue
 }
 
-fn qwen35_decode_one(
-    gpu: &mut hipfire_rdna::Gpu,
-    weights: &qwen35::Qwen35Weights,
-    config: &qwen35::Qwen35Config,
-    scratch: &qwen35::Qwen35Scratch,
-    kv: &mut hipfire_runtime::kv::KvCache,
-    dn: &mut qwen35::DeltaNetState,
-    cursor: &mut crate::session::SessionCursor,
-    eviction: Option<&crate::model::Eviction>,
-    physical_cap: usize,
+/// §M7. Everything `qwen35_decode_one` does BEFORE its forward: cancellation,
+/// the stop machinery for the token already sampled, emission, and the output
+/// filter — ending with the `filter_stop` the post-forward half consumes.
+///
+/// The third piece of the decode step. With this, `qwen35_decode_one` is
+/// literally pre -> forward -> post, and a batched driver runs pre per stream,
+/// ONE forward over the survivors' tokens, then post per stream.
+///
+/// Returns `Stop` when the step ends before committing anything — the caller
+/// must not forward that stream this round.
+enum PreForward {
+    Stop,
+    Ready { filter_stop: bool },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_decode_before_forward(
     tokenizer: &hipfire_model::tokenizer::Tokenizer,
     stdout: &mut dyn std::io::Write,
     id: &str,
     t0: Instant,
-    cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
-) -> Qwen35Step {
+    cursor: &mut crate::session::SessionCursor,
+) -> PreForward {
     // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
     // chokepoint: on entry every prior token's K/V has been written
     // via forward_scratch and seq_pos advanced; the pending `next_token`
@@ -2364,7 +2371,7 @@ fn qwen35_decode_one(
     // to a natural `max_tokens` stop — and the done frame below is
     // emitted normally.
     if hipfire_runtime::take_generation_cancel() {
-        return Qwen35Step::Stop;
+        return PreForward::Stop;
     }
     st.generated += 1;
     cursor.conversation_tokens.push(st.next_token);
@@ -2383,6 +2390,32 @@ fn qwen35_decode_one(
     let new_bytes = &all_bytes[st.bytes_fed_to_filter..];
     st.bytes_fed_to_filter = all_bytes.len();
     let filter_stop = emit_filter_action(stdout, id, st.filter.observe(new_bytes));
+    PreForward::Ready { filter_stop }
+}
+
+fn qwen35_decode_one(
+    gpu: &mut hipfire_rdna::Gpu,
+    weights: &qwen35::Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &qwen35::Qwen35Scratch,
+    kv: &mut hipfire_runtime::kv::KvCache,
+    dn: &mut qwen35::DeltaNetState,
+    cursor: &mut crate::session::SessionCursor,
+    eviction: Option<&crate::model::Eviction>,
+    physical_cap: usize,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    t0: Instant,
+    cfg: &Qwen35DecodeCfg,
+    st: &mut Qwen35DecodeState,
+) -> Qwen35Step {
+    let filter_stop = match qwen35_decode_before_forward(
+        tokenizer, stdout, id, t0, st, cursor,
+    ) {
+        PreForward::Stop => return Qwen35Step::Stop,
+        PreForward::Ready { filter_stop } => filter_stop,
+    };
 
     // Write this token's K/V to the cache FIRST so the next turn
     // always starts from a fully-written context. Stopping before
