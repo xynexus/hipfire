@@ -576,6 +576,13 @@ impl Gpu {
             } else {
                 self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
             }
+            // TIMING-ONLY ABLATION. Skips the transpose + overlay correction so
+            // the GEMM's uncorrected speed can be measured directly. Output is
+            // NUMERICALLY WRONG (the sparse overlay is simply not applied); this
+            // exists to bound what any correction scheme is competing against.
+            if std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1") {
+                return Ok(());
+            }
             self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.
             return self.oq_compact_overlay_correct_t(
