@@ -25,15 +25,33 @@ actually reaching the batched path — the kernel trace shows 256 calls, exactly
 prompt are **byte-identical** (sha256 match) whether the prompt was prefilled
 batched or per-token.
 
-## But there is a real residual, and it is NOT the 4-bit codec
+## ⚠️ CORRECTION: the fp32 "control" used below was DEGENERATE
 
-Control, same tool, `--kv-mode fp32`:
+An earlier revision of this note argued from `--kv-mode fp32` reporting
+**IDENTICAL across all layers (0.00e0)** that "the batched machinery is exactly
+right and every bit of the divergence is KVarN's own". **That inference was
+wrong.** fp32 KV fails `fa_kv_ok`, so it never takes the batched path at all —
+measured independently: prefill stays at 15.0 tok/s with or without
+`HIPFIRE_PREFILL_BATCHED=1`. The "control" was comparing per-token against
+per-token, so 0.00e0 was guaranteed and proved nothing.
 
-> **IDENTICAL across all layers (worst 0.00e0)**
+The valid control is a quantized KV that actually batches. `--kv-mode q8` (the
+tool builds the cache directly, bypassing the load-path deprecation gate):
 
-So the batched machinery — chunking, batched attention, the write ordering — is
-exactly right when KV is unquantized. Every bit of the KVarN divergence is
-KVarN's own.
+| kv mode | batched vs per-token, worst rel |
+|---|---|
+| q8 | **1.58e-2** |
+| kvarn | **1.62e-2** |
+
+Essentially equal. **The residual is not KVarN-specific.** It is the generic
+batched-vs-per-token divergence, and the first diverging layer is 0 — a
+**LinearAttention** layer with no KV at all (the first FullAttention layer is 3;
+layers 0-2 have empty KV buffers). A KV-mode difference cannot explain a
+divergence in a layer that has no KV.
+
+This also reinstates the prior finding that batched and per-token prefill export
+different hidden states for every dtype. That note was right; the "correction"
+made from the degenerate fp32 control was not.
 
 Divergence vs prompt length, batched vs per-token, first diverging layer 0 in
 every case:
@@ -111,10 +129,21 @@ Result — the flush-boundary step is gone:
 Free: prefill 216.7/217.5 tok/s (was ~217), decode 14.2, decode text sha256
 unchanged, and the `--kv-mode fp32` control still IDENTICAL across all layers.
 
-## Residual still open
+## Residual: real, but NOT a KV bug
 
-A length-dependent divergence remains (1.62e-2 at n=64, 2.29e-2 at n>=127) that
-is NOT this bug: it is present at n=64 where no block completes and every K row
-is still f32 in the window, so no quantization has occurred at all. First
-diverging layer is 0 in every case. That is a separate defect in the window
-path and is the next thing to chase.
+A length-dependent divergence remains (1.62e-2 at n=64, 2.29e-2 at n>=127). It is
+present at n=64 where no block completes and every K row is still f32 — and
+`--kv-mode q8` shows the same 1.58e-2, and the first diverging layer is 0, a
+LinearAttention layer with no KV. So it is the generic batched-vs-per-token
+difference, not KVarN and not the window path.
+
+`dump_kvarn_window` (added with this work) shows the K window and Q8 V plane
+differing on every FullAttention layer at n=64 — but both sides are fully
+populated with equal magnitudes (max 4.964 vs 4.964, all 65536 live floats
+nonzero on both), a ~0.9% relative difference in every element. That is the
+*downstream consequence* of hidden states that already differ by layer 0, not an
+independent write-side defect: identical inputs would produce identical writes.
+
+Chasing it further means the DeltaNet / LinearAttention chunked path, not the KV
+cache. `HIPFIRE_KVARN_ROTATE=0` does not remove it, so it is not the Hadamard
+rotation either.
