@@ -762,30 +762,62 @@ pub(crate) fn ensure_qwen35_forward_capability(config: &Qwen35Config) -> HipResu
 /// it looks: ~20 of the crossing locals are fields of one `dispatch_flags`
 /// value, and the scratch views all come from `s`.
 #[allow(clippy::too_many_arguments)]
-fn moe_routed_experts_and_combine<'a>(
+/// §M4 — the state that crosses the stage-A/stage-B seam, and nothing else.
+///
+/// Deliberately **owned**: every field is `Copy` or an owned `Vec`. That is what
+/// makes the two stages bindable as separate super-ops, because a binding has to
+/// hold this between two dispatch calls and cannot hold borrows of scratch or of
+/// the pager across them. Everything else stage B needs — `ffn`, `config`, `s`,
+/// the pager, the scratch views — is re-derived from arguments the caller
+/// already has, rather than captured here.
+///
+/// `MoeDecodeDispatchFlags` and `MoeDtypes` are both `Copy`, which is why the
+/// ~20 dtype booleans cost one field rather than twenty.
+pub(crate) struct MoeStageState {
+    dispatch_flags: MoeDecodeDispatchFlags,
+    moe_dtypes: hipfire_dispatch::families::moe::MoeDtypes,
+    topk_indices_cpu: Option<Vec<usize>>,
+    topk_weights_cpu: Option<Vec<f32>>,
+    paged_mixed_routed: bool,
+    x_rot_prerotated: bool,
+    ep_skip_shared: bool,
+}
+
+fn moe_routed_experts_and_combine(
     gpu: &mut Gpu,
+    pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     layer_idx: usize,
     ep_routed_out: Option<&GpuTensor>,
-    dispatch_flags: &MoeDecodeDispatchFlags,
-    topk_indices_cpu: Option<Vec<usize>>,
-    topk_weights_cpu: Option<Vec<f32>>,
-    residency_provider: Option<PagerExpertResidency<'_>>,
-    moe_dtypes: hipfire_dispatch::families::moe::MoeDtypes,
-    x_norm: &GpuTensor,
-    x_rot_local: Option<&'a GpuTensor>,
-    x_rot_prerotated: bool,
-    ep_skip_shared: bool,
-    paged_mixed_routed: bool,
-    hidden: usize,
-    mi: usize,
-    smi: usize,
-    k: usize,
-    n_exp: usize,
+    stage: MoeStageState,
 ) -> HipResult<()> {
+    let MoeStageState {
+        dispatch_flags,
+        moe_dtypes,
+        topk_indices_cpu,
+        topk_weights_cpu,
+        paged_mixed_routed,
+        x_rot_prerotated,
+        ep_skip_shared,
+    } = stage;
+    // Re-derived rather than carried: these are borrows of scratch and of the
+    // pager, which an owned carrier must not hold.
+    let residency_provider = pager.map(|p| PagerExpertResidency { pager: p });
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+    let x_rot_local = if dispatch_flags.needs_x_rot_local {
+        Some(s.x_rot_local)
+    } else {
+        None
+    };
+    let dispatch_flags = &dispatch_flags;
     // The ~20 dtype booleans that cross the seam are all fields of the one
     // `dispatch_flags` value stage A already computed, so they travel as one
     // argument and are unpacked here rather than threaded individually.
@@ -2015,26 +2047,22 @@ pub(crate) fn moe_ffn_decode_impl(
 
     moe_routed_experts_and_combine(
         gpu,
+        pager,
         ffn,
+        x_norm,
         x_residual,
         config,
         s,
         layer_idx,
         ep_routed_out,
-        &dispatch_flags,
-        topk_indices_cpu,
-        topk_weights_cpu,
-        residency_provider,
-        moe_dtypes,
-        x_norm,
-        x_rot_local,
-        x_rot_prerotated,
-        ep_skip_shared,
-        paged_mixed_routed,
-        hidden,
-        mi,
-        smi,
-        k,
-        n_exp,
+        MoeStageState {
+            dispatch_flags,
+            moe_dtypes,
+            topk_indices_cpu,
+            topk_weights_cpu,
+            paged_mixed_routed,
+            x_rot_prerotated,
+            ep_skip_shared,
+        },
     )
 }
