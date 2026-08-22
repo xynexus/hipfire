@@ -4578,6 +4578,36 @@ fn load_dflash_state_source(
 mod admission_tests {
     use super::*;
 
+    /// Every KV mode TriAttention/CASK eviction can compact is ALSO a
+    /// deprecated mode. That is not a coincidence to be discovered later: it
+    /// means eviction is reachable only behind HIPFIRE_KV_ALLOW_DEPRECATED=1,
+    /// and that deleting the deprecated KV constructors deletes eviction's last
+    /// live caller with them. Pinned here so the coupling surfaces as a failing
+    /// test rather than as dead code nobody noticed.
+    #[test]
+    fn every_evictable_kv_mode_is_deprecated() {
+        let evictable = [
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4",
+        ];
+        for m in evictable {
+            assert!(
+                triattn_can_evict_kv_mode(m),
+                "{m} should be evictable — keep this list in sync with \
+                 triattn_can_evict_kv_mode"
+            );
+            assert!(
+                DEPRECATED_KV_MODES.contains(&m),
+                "{m} is evictable but no longer deprecated: TriAttention eviction \
+                 now has a supported caller, so revisit the load-path filter that \
+                 declines the sidecar"
+            );
+        }
+        // The two supported families reach no eviction arm.
+        for m in ["fp32", "kvarn", "kvarn2", "kvarn4", "kvarn8"] {
+            assert!(!triattn_can_evict_kv_mode(m), "{m} must decline the sidecar");
+        }
+    }
+
     #[test]
     fn component_resolution_precedence_and_off_are_stable() {
         let sibling = PathBuf::from("sibling.hfq");

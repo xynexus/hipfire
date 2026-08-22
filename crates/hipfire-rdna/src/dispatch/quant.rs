@@ -523,6 +523,63 @@ impl Gpu {
     /// GEMM against it. The scratch is Gpu-owned, so callers outside this module
     /// use this rather than assembling `x_i8`/`x_scales` themselves.
     #[allow(clippy::too_many_arguments)]
+    /// Route one compact batched GEMM against an activation already quantized
+    /// into the oq8 scratch.
+    ///
+    /// Exact W4A8 via two iu4 WMMA passes plus the overlay as a K-major
+    /// accumulate is the DEFAULT: it is the same arithmetic as the iu8 core --
+    /// iu8 spends half its weight lanes on sign-extended 4-bit values the
+    /// compact format never had -- and ~1.4x faster on the 27B projection
+    /// shapes. `HIPFIRE_OQ_COMPACT_IU4X2=0` falls back to the iu8 core.
+    ///
+    /// Both `gemm_oq_compact_act_batched` and `gemm_oq_compact_grouped_prequant`
+    /// come through here, so the route is decided in exactly one place. That
+    /// matters: routing only the first left the prequant path (which serves
+    /// gate+up and q/k/v off a shared quantize) on iu8, and a kernel trace put
+    /// it at 54.8% of prefill kernel time against iu4x2's 15.1%.
+    #[allow(clippy::too_many_arguments)]
+    fn compact_batched_route(
+        &mut self,
+        w_blocks: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        ng: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
+            let xt = GpuTensor {
+                buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * k],
+                dtype: DType::Raw,
+            };
+            let xst = GpuTensor {
+                buf: unsafe { self.oq_xst_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * ng],
+                dtype: DType::F32,
+            };
+            self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
+            self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
+            // ACCUMULATES into y, so it must follow the GEMM on the same Y.
+            return self.oq_compact_overlay_correct_t(
+                w_blocks,
+                &xt,
+                &xst,
+                y,
+                m,
+                k,
+                n,
+                group,
+                block_stride,
+            );
+        }
+        self.gemm_oq_compact_grouped_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)
+    }
+
     pub fn gemm_oq_compact_act_batched(
         &mut self,
         w_blocks: &GpuTensor,
@@ -546,39 +603,7 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        // Exact W4A8 via two iu4 WMMA passes, plus the overlay as a K-major
-        // pass. This is the DEFAULT for compact batched prefill: it is the same
-        // arithmetic as the iu8 core below -- iu8 spends half its weight lanes
-        // on sign-extended 4-bit values that the compact format never had -- and
-        // ~1.4x faster on the 27B projection shapes (+14% end-to-end prefill).
-        // `HIPFIRE_OQ_COMPACT_IU4X2=0` falls back to the iu8 core.
-        if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
-            let xt = GpuTensor {
-                buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * k],
-                dtype: DType::Raw,
-            };
-            let xst = GpuTensor {
-                buf: unsafe { self.oq_xst_batch.as_ref().unwrap().buf.alias() },
-                shape: vec![n * ng],
-                dtype: DType::F32,
-            };
-            self.gemm_oq_compact_iu4x2_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)?;
-            self.oq_compact_x8_transpose(&xq, &xs, &xt, &xst, n, k, ng)?;
-            // ACCUMULATES into y, so it must follow the GEMM on the same Y.
-            return self.oq_compact_overlay_correct_t(
-                w_blocks,
-                &xt,
-                &xst,
-                y,
-                m,
-                k,
-                n,
-                GROUP,
-                block_stride,
-            );
-        }
-        self.gemm_oq_compact_grouped_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)
+        self.compact_batched_route(w_blocks, &xq, &xs, y, m, k, n, ng, GROUP, block_stride)
     }
 
     /// Compact-resident Opus W8A8 GEMM: the [`Self::gemm_oq8_grouped_wmma`] core
@@ -1593,7 +1618,7 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        self.gemm_oq_compact_grouped_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)
+        self.compact_batched_route(w_blocks, &xq, &xs, y, m, k, n, ng, GROUP, block_stride)
     }
 
     pub fn gemm_oq8_grouped_prequant(
