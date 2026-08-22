@@ -165,9 +165,49 @@ determined by what `finish()` closes over, so "extract the phases" and "define
 the handle" are one change, not two. Budget it as one ~300-line pass with the
 M3b0 verification method attached, rather than expecting to land it in slices.
 
+#### M3b0.75 — make the quantum REACHABLE from the daemon
+
+**Added 2026-08-22, measured after M3b0.5 landed.** M3b0.5 gave the qwen35 arm a
+`step()` and a `finish()` and bundled them into `Qwen35Generation`. The daemon
+still cannot drive any of it, for two reasons — and the second is the real work.
+
+**1. Everything is private.** `Qwen35Generation`, `Qwen35DecodeState`,
+`Qwen35DecodeCfg`, `Qwen35Step`, `qwen35_decode_one` and
+`qwen35_finish_generation` are all module-private in
+`serving-core/src/generate.rs`. Trivial to change; do it last, so the visibility
+matches what the daemon actually needs rather than exporting the whole set.
+
+**2. `start()` does not exist.** Current boundaries in `generate.rs`:
+
+| | line | what |
+|---|---|---|
+| qwen35 arm opens | 3580 | `if is_qwen35_family_arch_id(m.arch_id) {` |
+| **setup** | 3580→3827 | **~248 lines: this is the work** |
+| handle constructed | 3828 | `let mut generation = Qwen35Generation {` |
+| loop | 3872 | `while generation.st.generated < generation.cfg.max_tokens` |
+| teardown | 3885 | `generation.finish(...)` — done |
+
+That setup is not a cosmetic slice. It contains the prefill
+(`forward_prefill_batch` plus the multi and PFlash-compressed variants), the
+multi-turn auto-reset, the ngram scope, the `tok0` sample, and **several early
+`return`s** on error. It also reads a large fraction of `generate()`'s 29
+parameters, so a free-function `start()` inherits a parameter list on the order
+of `qwen35_finish_generation`'s sixteen.
+
+*Exit:* the daemon can call `start()` → `step()` → `finish()` and get output
+byte-identical to calling `generate()`. Verify the M3b0.5 way — real qwen35
+artifact, at least one sampled run, plus the 3-turn trailer and budget-alert
+harnesses, all compared against master **as it stands at the time**, not against
+older recorded hashes (two of those harnesses contain session-less generates,
+whose values moved when #288 landed).
+
+**Do not slice this one either.** Same reason as M3b0.5: the parameter list is
+determined by what the setup reads, so "extract it" and "decide its signature"
+are one change. Budget it as a single pass with the verification attached.
+
 #### M3b1 — the loop itself
 
-Small **once M3b0.5 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
+Small **once M3b0.75 exists**: ~150–250 lines across `main.rs`, `stream.rs`,
 `state.rs`. Four things must move with it, none of them optional and none in the
 `Generate` arm:
 
@@ -217,14 +257,35 @@ every other arch errors on `session_id` and holds one unkeyed KV. Naming the
 scope is the difference between a scoped milestone and a fixture that silently
 corrupts KV.
 
-**Harness: undecided, and it must be decided before code.** Two concurrent
-`Generate`s on ONE connection break the invariant `queue.rs` exists to protect —
-its own words are "a connection's frames are a dependency chain… the order *is*
-the declaration", which holds today only because dispatch order equals execution
-order. Two connections need a listening daemon, and **nothing in the tree starts
-one**: `--listen` appears only in `main.rs` (help text, parser, dispatch); grep
-over `scripts/` and `tests/` returns zero, and `daemon-adapter`'s
-`attach_or_spawn` always falls through to a stdio spawn.
+**Harness: DECIDED 2026-08-22 — one connection, two pipelined `generate` frames
+with distinct `session_id`s.**
+
+The transport already supports it and needs no edit: `spawn_stdin_reader` puts
+the read loop on its own thread feeding a 256-deep `sync_channel`, and the
+executor drains with `try_recv`, so two frames written back to back are both
+pending. `queue.rs`'s dependency invariant is about **mixed** frame types — a
+pipelined `generate` + `unload` running out of order — which a two-`generate`
+harness simply does not create.
+
+Distinct `session_id`s are mandatory, not hygiene: with the same id the second
+stream is refused by `AdmitError::SessionAlreadyLive` and the test silently
+measures one stream twice. Since #288 they are also what makes each stream a
+real conversation rather than a one-shot, and since the typed request gained a
+`session_id` field a client can actually send them.
+
+The two-client route via `--listen` stays unbuilt and unneeded for this exit.
+
+The original wording is kept below because the constraint it names is real; only
+the conclusion changed.
+
+> Two concurrent `Generate`s on ONE connection break the invariant `queue.rs`
+> exists to protect —
+> its own words are "a connection's frames are a dependency chain… the order *is*
+> the declaration", which holds today only because dispatch order equals execution
+> order. Two connections need a listening daemon, and **nothing in the tree starts
+> one**: `--listen` appears only in `main.rs` (help text, parser, dispatch); grep
+> over `scripts/` and `tests/` returns zero, and `daemon-adapter`'s
+> `attach_or_spawn` always falls through to a stdio spawn.
 
 The harness must also use **distinct `session_id`s**, or
 `AdmitError::SessionAlreadyLive` refuses the second stream and the test silently
