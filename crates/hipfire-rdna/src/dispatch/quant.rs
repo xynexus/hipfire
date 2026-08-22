@@ -552,6 +552,15 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
+            // Wave64 twin, where it actually wins. Benched at the 27B shapes vs
+            // the wave32 two-pass: gate/up 1.26x, B=512 1.26x, B=128 1.47x,
+            // down 1.05x, qkv 1.05x -- but wo (K=4096) 0.75x. The wave64 recipe
+            // is N-heavy, and the second i32 accumulator set forces WNt=4 rather
+            // than the 1-pass twin's 8, which is why this lands at 1.26x and not
+            // the 1.56x the 1-pass sees. Route on K: the small-K shape loses.
+            let use_w64 = group == 256
+                && k >= 5120
+                && std::env::var("HIPFIRE_OQ_COMPACT_W64").as_deref() != Ok("0");
             let xt = GpuTensor {
                 buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
                 shape: vec![n * k],
@@ -562,7 +571,11 @@ impl Gpu {
                 shape: vec![n * ng],
                 dtype: DType::F32,
             };
-            self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
+            if use_w64 {
+                self.gemm_oq_compact_iu4x2_w64(w_blocks, xq, xs, y, m, k, n, block_stride)?;
+            } else {
+                self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
+            }
             self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.
             return self.oq_compact_overlay_correct_t(
@@ -1026,6 +1039,68 @@ impl Gpu {
         const BM: usize = 64;
         const BN: usize = 256;
         let func = &self.functions["gemm_oq_compact_iu4_w64"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m.div_ceil(BM) as u32, batch_size.div_ceil(BN) as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Wave64 EXACT W4A8 compact GEMM: the tuned wave64 structure
+    /// (BK=64 strip, register-staged double buffer, b128 fragments) carrying the
+    /// two-pass activation split `x = 16*hi + lo`. Consumes int8 activations
+    /// directly and splits the digit planes into LDS. WNt is halved against the
+    /// 1-pass twin to pay for the second i32 accumulator set.
+    ///
+    /// Does NOT apply the sparse overlay -- separate pass, as for both twins.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_w64(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_oq_compact_iu4x2_w64: K must be a multiple of 256"
+        );
+        self.ensure_kernel(
+            "gemm_oq_compact_iu4x2_w64",
+            kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC,
+            "gemm_oq_compact_iu4x2_w64",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let mut si = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        // Must match BM / BN in the kernel.
+        const BM: usize = 64;
+        const BN: usize = 128; // WNt=4 -> BN = 2*4*16
+        let func = &self.functions["gemm_oq_compact_iu4x2_w64"];
         unsafe {
             self.hip.launch_kernel(
                 func,

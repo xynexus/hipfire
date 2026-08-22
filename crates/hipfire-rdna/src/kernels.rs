@@ -4302,6 +4302,11 @@ pub const GEMM_OQ_COMPACT_IU4X2_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_IU4_W64_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_iu4_w64.hip");
 
+/// Wave64 EXACT W4A8 twin of [`GEMM_OQ_COMPACT_IU4_W64_SRC`].
+/// See `kernels/src/gemm_oq_compact_iu4x2_w64.hip`.
+pub const GEMM_OQ_COMPACT_IU4X2_W64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_iu4x2_w64.hip");
+
 /// Pure iu4 WMMA issue-rate probes (no memory at all), sweeping the number of
 /// INDEPENDENT accumulator chains. See `kernels/src/wmma_iu4_noop_w64.hip`.
 pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w64.hip");

@@ -111,6 +111,19 @@ fn main() {
         }
         gpu.device_synchronize().expect("sync");
         let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // wave64 EXACT 2-pass arm — the production math on the tuned structure.
+        let w64x2ms = {
+            gpu.gemm_oq_compact_iu4x2_w64(&wb, &xqb, &xsb, &yb, m, k, b, stride)
+                .expect("warm w64x2");
+            gpu.device_synchronize().expect("sync");
+            let tw = Instant::now();
+            for _ in 0..iters {
+                gpu.gemm_oq_compact_iu4x2_w64(&wb, &xqb, &xsb, &yb, m, k, b, stride)
+                    .expect("w64x2");
+            }
+            gpu.device_synchronize().expect("sync");
+            tw.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
         // wave64 1-pass arm: nothing in the runtime routes here yet, so this is
         // purely "what would the wave64 recipe buy at our shapes".
         let w64ms = {
@@ -159,11 +172,12 @@ fn main() {
         let r2i8 = ms / ms2p;
         let r2i4 = ms2p / ms4;
         println!(
-            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x  corr={msc:>6.3}ms ({:>4.1}%) net={:>5.2}x  2p={ms2p:>7.3}ms {r2i8:>5.2}x-iu8 {r2i4:>5.2}x-1p  w64={w64ms:>7.3}ms {:>5.2}x-vs-1p",
+            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>8.3} {tops:>8.2} {ms4:>8.3} {tops4:>8.2} {:>8.2}x  corr={msc:>6.3}ms ({:>4.1}%) net={:>5.2}x  2p={ms2p:>7.3}ms {r2i8:>5.2}x-iu8 {r2i4:>5.2}x-1p  w64={w64ms:>7.3}ms {:>5.2}x-vs-1p  W64x2={w64x2ms:>7.3}ms {:>5.2}x-vs-2p",
             ms / ms4,
             100.0 * msc / ms4,
             ms / (ms4 + msc),
-            ms4 / w64ms
+            ms4 / w64ms,
+            ms2p / w64x2ms
         );
         let _ = bytes;
         let _ = gpu.free_tensor(x4b);
