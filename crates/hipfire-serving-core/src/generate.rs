@@ -1991,17 +1991,6 @@ pub enum Qwen35Step {
 /// Note this is the NORMAL path's sample. The budget-alert nudge samples
 /// separately at its own site and then issues extra single-token forwards, so a
 /// batched round must exclude a stream that is about to fire one.
-fn qwen35_sample_next(
-    gpu: &mut hipfire_rdna::Gpu,
-    scratch: &qwen35::Qwen35Scratch,
-    cursor: &crate::session::SessionCursor,
-    cfg: &Qwen35DecodeCfg,
-    st: &mut Qwen35DecodeState,
-) {
-    // Single-stream: the resident session's logits ARE `scratch.logits`.
-    qwen35_sample_next_from(gpu, &scratch.logits, scratch, cursor, cfg, st)
-}
-
 /// Sample from an explicit logits tensor.
 ///
 /// Split out from `qwen35_sample_next` because a batched forward writes
@@ -2051,11 +2040,29 @@ fn qwen35_sample_next_from(
     );
 }
 
-fn qwen35_decode_one(
+/// §M7. Everything `qwen35_decode_one` does AFTER its forward: advance the
+/// cursor, evict, emit and account for the token the forward just committed,
+/// run the stop machinery, and sample the next one.
+///
+/// Lifted verbatim so a batched driver can reuse it. The batched shape is one
+/// forward over N rows, then this per stream in a loop — every line here is
+/// per-stream and touches no model weights, so running it sequentially after a
+/// shared forward changes no result.
+///
+/// `logits` is what the forward wrote for THIS stream: `scratch.logits` on the
+/// single-stream path, the row's own session logits on the batched one.
+#[allow(clippy::too_many_arguments)]
+fn qwen35_decode_after_forward(
     gpu: &mut hipfire_rdna::Gpu,
     weights: &qwen35::Qwen35Weights,
     config: &qwen35::Qwen35Config,
     scratch: &qwen35::Qwen35Scratch,
+    logits: &hipfire_rdna::GpuTensor,
+    // Whether the output filter asked to stop, decided BEFORE the forward from
+    // the bytes the previous token produced. It crosses the seam because the
+    // filter observes a token and the stop it implies is acted on only after
+    // that token's K/V is committed.
+    filter_stop: bool,
     kv: &mut hipfire_runtime::kv::KvCache,
     dn: &mut qwen35::DeltaNetState,
     cursor: &mut crate::session::SessionCursor,
@@ -2068,56 +2075,6 @@ fn qwen35_decode_one(
     cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
 ) -> Qwen35Step {
-    // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
-    // chokepoint: on entry every prior token's K/V has been written
-    // via forward_scratch and seq_pos advanced; the pending `next_token`
-    // is sampled but not yet written. Stopping here drops only that
-    // unwritten sample, so the cache/session stay consistent — identical
-    // to a natural `max_tokens` stop — and the done frame below is
-    // emitted normally.
-    if hipfire_runtime::take_generation_cancel() {
-        return Qwen35Step::Stop;
-    }
-    st.generated += 1;
-    cursor.conversation_tokens.push(st.next_token);
-    st.streamed_tokens.push(st.next_token);
-    emit_committed_event(
-        stdout,
-        id,
-        st.next_token,
-        st.streamed_tokens.len() - 1,
-        t0.elapsed().as_millis() as u64,
-    );
-    // Incremental UTF-8 + filter routing: feed only the new
-    // bytes since last call, let the filter buffer any partial
-    // codepoint or marker prefix until disambiguated.
-    let all_bytes = tokenizer.decode_bytes(&st.streamed_tokens);
-    let new_bytes = &all_bytes[st.bytes_fed_to_filter..];
-    st.bytes_fed_to_filter = all_bytes.len();
-    let filter_stop = emit_filter_action(stdout, id, st.filter.observe(new_bytes));
-
-    // Write this token's K/V to the cache FIRST so the next turn
-    // always starts from a fully-written context. Stopping before
-    // forward_scratch used to leave a hole at the im_end/eos
-    // position — the next turn then attended over zero-init K/V
-    // at that slot.
-    //
-    // Under eviction, cursor.seq_pos is the *physical* write slot; we
-    // advance and call maybe_evict immediately so the next write
-    // never overruns physical_cap. compact_offset bookkeeping on
-    // the cache itself keeps RoPE phase correct across evictions.
-    if let Err(e) = qwen35::forward_scratch(
-        gpu,
-        weights,
-        config,
-        st.next_token,
-        cursor.seq_pos,
-        kv,
-        dn,
-        scratch,
-    ) {
-        return Qwen35Step::Failed(format!("qwen35 decode forward_scratch failed: {e:?}"));
-    }
     cursor.seq_pos += 1;
     if let Some(ev) = eviction {
         if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -2378,8 +2335,81 @@ fn qwen35_decode_one(
         }
     }
 
-    qwen35_sample_next(gpu, scratch, cursor, cfg, st);
+    qwen35_sample_next_from(gpu, logits, scratch, cursor, cfg, st);
     Qwen35Step::Continue
+}
+
+fn qwen35_decode_one(
+    gpu: &mut hipfire_rdna::Gpu,
+    weights: &qwen35::Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &qwen35::Qwen35Scratch,
+    kv: &mut hipfire_runtime::kv::KvCache,
+    dn: &mut qwen35::DeltaNetState,
+    cursor: &mut crate::session::SessionCursor,
+    eviction: Option<&crate::model::Eviction>,
+    physical_cap: usize,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    t0: Instant,
+    cfg: &Qwen35DecodeCfg,
+    st: &mut Qwen35DecodeState,
+) -> Qwen35Step {
+    // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
+    // chokepoint: on entry every prior token's K/V has been written
+    // via forward_scratch and seq_pos advanced; the pending `next_token`
+    // is sampled but not yet written. Stopping here drops only that
+    // unwritten sample, so the cache/session stay consistent — identical
+    // to a natural `max_tokens` stop — and the done frame below is
+    // emitted normally.
+    if hipfire_runtime::take_generation_cancel() {
+        return Qwen35Step::Stop;
+    }
+    st.generated += 1;
+    cursor.conversation_tokens.push(st.next_token);
+    st.streamed_tokens.push(st.next_token);
+    emit_committed_event(
+        stdout,
+        id,
+        st.next_token,
+        st.streamed_tokens.len() - 1,
+        t0.elapsed().as_millis() as u64,
+    );
+    // Incremental UTF-8 + filter routing: feed only the new
+    // bytes since last call, let the filter buffer any partial
+    // codepoint or marker prefix until disambiguated.
+    let all_bytes = tokenizer.decode_bytes(&st.streamed_tokens);
+    let new_bytes = &all_bytes[st.bytes_fed_to_filter..];
+    st.bytes_fed_to_filter = all_bytes.len();
+    let filter_stop = emit_filter_action(stdout, id, st.filter.observe(new_bytes));
+
+    // Write this token's K/V to the cache FIRST so the next turn
+    // always starts from a fully-written context. Stopping before
+    // forward_scratch used to leave a hole at the im_end/eos
+    // position — the next turn then attended over zero-init K/V
+    // at that slot.
+    //
+    // Under eviction, cursor.seq_pos is the *physical* write slot; we
+    // advance and call maybe_evict immediately so the next write
+    // never overruns physical_cap. compact_offset bookkeeping on
+    // the cache itself keeps RoPE phase correct across evictions.
+    if let Err(e) = qwen35::forward_scratch(
+        gpu,
+        weights,
+        config,
+        st.next_token,
+        cursor.seq_pos,
+        kv,
+        dn,
+        scratch,
+    ) {
+        return Qwen35Step::Failed(format!("qwen35 decode forward_scratch failed: {e:?}"));
+    }
+    qwen35_decode_after_forward(
+        gpu, weights, config, scratch, &scratch.logits, filter_stop, kv, dn, cursor,
+        eviction, physical_cap, tokenizer, stdout, id, t0, cfg, st,
+    )
 }
 
 /// Helper: render the JSON field fragment for `done` per PRD §3.1.
