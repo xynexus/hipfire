@@ -2712,6 +2712,48 @@ impl Qwen35Generation {
         )
     }
 
+    /// Take this stream's session straight out of the registry, for batched
+    /// stepping.
+    ///
+    /// `resume` cannot serve a batch: it routes through the single resident
+    /// slot via `qwen35_activate_session`, and that slot holds exactly one
+    /// session — the second stream to resume without an intervening park dies
+    /// with "qwen35 session missing decode state". A batched round needs all N
+    /// sessions held at once, so it bypasses the slot entirely, exactly as the
+    /// batched prefill and decode paths already do.
+    ///
+    /// Call `qwen35_save_active_session` first so whatever occupies the slot is
+    /// back in the registry and therefore findable here.
+    pub fn acquire_from_registry(
+        &mut self,
+        m: &mut LoadedModel,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        self.session = Some(
+            m.q35_registry
+                .sessions
+                .remove(session_id)
+                .ok_or_else(|| format!("session {session_id} is not resident in the registry"))?,
+        );
+        Ok(())
+    }
+
+    /// Put the session back where `acquire_from_registry` found it.
+    ///
+    /// The counterpart to that call and the reason a batched round leaves no
+    /// trace: the slot is untouched throughout, so a later `resume` on the
+    /// single-stream path still finds what it expects.
+    pub fn release_to_registry(&mut self, m: &mut LoadedModel, session_id: &str) {
+        if let Some(session) = self.session.take() {
+            m.q35_registry
+                .sessions
+                .insert(session_id.to_string(), session);
+        }
+    }
+
     /// §M7. Step N streams through ONE batched forward.
     ///
     /// The decode step is `pre -> forward -> post`, and only the forward touches

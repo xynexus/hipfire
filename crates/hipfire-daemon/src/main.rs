@@ -1141,9 +1141,120 @@ struct CalibrateDaemonSession {
 /// back (or retired) only after the model borrow ends. Holding
 /// `&mut streams` and `&mut model` together does not compile, and working
 /// around that by cloning would copy a live KV handle.
+/// §M7. One batched forward for every runnable stream.
+///
+/// The round-robin march steps one stream per quantum through the single
+/// resident slot, so N streams cost N full forwards and aggregate throughput is
+/// flat in N. This hands all of them to `step_batch`, which issues ONE forward
+/// and lets each handle sample from its own session's logits.
+///
+/// Sessions come from the registry, not the resident slot: the slot holds one,
+/// and `resume`-ing a second without an intervening park is the documented way
+/// to get "qwen35 session missing decode state". `qwen35_save_active_session`
+/// puts the occupant back first so every stream is findable.
+fn march_streams_batched(daemon_state: &mut state::DaemonState) {
+    let ids = daemon_state.streams.runnable();
+    if ids.len() < 2 {
+        return;
+    }
+    // Take the handles out of the table for the round; each is put back or
+    // retired below, mirroring the round-robin path's ownership.
+    let mut taken: Vec<(stream::StreamId, String, String, hipfire_serving_core::generate::Qwen35Generation)> =
+        Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(s) = daemon_state.streams.get_mut(id) {
+            if let Some(g) = s.generation.take() {
+                taken.push((id, s.request_id.clone(), s.session().as_str().to_string(), g));
+            }
+        }
+    }
+    if taken.len() < 2 {
+        // Put back whatever we took; the round-robin path will handle it.
+        for (id, _, _, g) in taken {
+            if let Some(s) = daemon_state.streams.get_mut(id) {
+                s.generation = Some(g);
+            }
+        }
+        return;
+    }
+
+    let Some(m) = daemon_state.model.as_mut() else {
+        for (id, _, _, _) in taken {
+            daemon_state.streams.retire(id);
+        }
+        return;
+    };
+    if let Err(e) = hipfire_serving_core::session::qwen35_save_active_session(m, &mut daemon_state.gpu) {
+        eprintln!("[executor] batched march: cannot free the resident slot: {e}");
+        for (id, _, _, g) in taken {
+            if let Some(s) = daemon_state.streams.get_mut(id) {
+                s.generation = Some(g);
+            }
+        }
+        return;
+    }
+    for (_, _, sid, g) in taken.iter_mut() {
+        if let Err(e) = g.acquire_from_registry(m, sid) {
+            eprintln!("[executor] batched march: {e}");
+        }
+    }
+
+    let outcomes = {
+        let mut entries: Vec<(&str, &mut hipfire_serving_core::generate::Qwen35Generation)> =
+            taken.iter_mut().map(|(_, rid, _, g)| (rid.as_str(), g)).collect();
+        let model = daemon_state.model.as_ref().expect("checked above");
+        hipfire_serving_core::generate::Qwen35Generation::step_batch(
+            &mut entries,
+            model,
+            &mut daemon_state.gpu,
+            model.tokenizer.as_ref().expect("qwen35 model has a tokenizer"),
+            &mut daemon_state.out.sink,
+        )
+    };
+    let outcomes = match outcomes {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[executor] batched march failed: {e}");
+            let m = daemon_state.model.as_mut().expect("checked above");
+            for (id, _, sid, mut g) in taken {
+                g.release_to_registry(m, &sid);
+                if let Some(s) = daemon_state.streams.get_mut(id) {
+                    s.generation = Some(g);
+                }
+            }
+            return;
+        }
+    };
+
+    for ((id, req_id, sid, mut g), step) in taken.into_iter().zip(outcomes) {
+        let m = daemon_state.model.as_mut().expect("checked above");
+        g.release_to_registry(m, &sid);
+        match step {
+            hipfire_serving_core::generate::Qwen35Step::Continue if g.should_continue() => {
+                if let Some(s) = daemon_state.streams.get_mut(id) {
+                    s.generation = Some(g);
+                }
+            }
+            hipfire_serving_core::generate::Qwen35Step::Failed(message) => {
+                g.fail(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, &req_id, &message);
+                daemon_state.streams.retire(id);
+            }
+            _ => {
+                g.finish(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, &req_id);
+                daemon_state.streams.retire(id);
+            }
+        }
+    }
+}
+
 fn march_streams(daemon_state: &mut state::DaemonState) {
     if !stream::executor_v2_enabled() {
         return;
+    }
+    if stream::executor_batched_enabled() {
+        march_streams_batched(daemon_state);
+        // Whatever the batched round could not take (fewer than two runnable,
+        // or a stream it excluded) falls through to the round-robin march.
     }
     for id in daemon_state.streams.runnable() {
         let Some((generation, req_id, session)) = daemon_state.streams.get_mut(id).and_then(|s| {
