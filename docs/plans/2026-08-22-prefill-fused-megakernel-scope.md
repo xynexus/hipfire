@@ -1,5 +1,11 @@
 # Scope: fused megakernel for the KVarN + iu4x2 batched prefill path
 
+> **STATUS 2026-08-22: EXECUTED AND KILLED.** Phase 0 (operand mapping) and a
+> second fusion attempt were carried out. The kill criterion below was met: the
+> fused kernel is 6-12% WORSE than the split pair, not 15% better. More
+> importantly, **the DRAM premise in this document is wrong** — see
+> "CORRECTION" below. Kept as the record of why, not as a plan.
+
 State box: halo, Strix Halo gfx1151, 128 GB UMA, 8000 MT/s (248.5 GB/s measured
 pure-read, 64 KB LDS/workgroup, 1536 VGPRs/SIMD). Qwen3.8-27B oq4.25++
 (`OqPlusCompact` qt 36, G=256, n_out=3), KVarN KV, `HIPFIRE_KVARN_BATCHED_PREFILL=1`,
@@ -57,7 +63,60 @@ traffic-bound, not compute-bound. Each row's 3 overlay indices are its own — t
 positions are per-row order statistics, not shared — so every row re-reads its
 own three activation rows.
 
-## Why fusion is the right lever
+## CORRECTION: the DRAM premise below is WRONG
+
+This document argued that the correction moves 303 MB against the GEMM's 47 MB
+of weights, so fusing it into a kernel that already has the activation in LDS
+deletes ~267 MB of DRAM traffic. **That is not what happens.**
+
+The arithmetic `M x ng x n_out x B` counts *gather operations*, not distinct
+bytes. The distinct working set is only `256 idx rows x B x ng` = **1.31 MB**,
+which fits in the 2 MB L2 (never mind the 32 MB MALL). Proof by physics: 267 MB
+in the measured 0.978 ms implies **273 GB/s, above the 248.5 GB/s DRAM
+ceiling** — impossible unless the reads are cache hits.
+
+So the correction is **gather-throughput-bound, not DRAM-bound**, and fusion has
+no DRAM saving to bank. It only trades L2-hot gathers for LDS gathers while
+adding register pressure. That is precisely what both attempts measured.
+
+## Phase 0 result: the WMMA operand layout forbids the proposed fix
+
+`matrix_calculator.py --architecture gfx1151 --instruction
+v_wmma_i32_16x16x16_iu4 --register-layout -B -w 32` gives, for `B[K][N]`:
+**lane `n` owns column `n`, with all 16 K values packed as nibbles across 2
+VGPRs.** The WMMA therefore *requires* b-major staging (column contiguous over
+K). A K-major tile cannot feed it, so the "K-major LDS view" proposed below is
+not available as a replacement, only as a +16 KB addition that would drop
+resident workgroups per CU from 3 to 1.
+
+A single int8 b-major tile (64 x 256 = 16,384 B, actually *smaller* than
+xh+xl's 16,896 B) would halve the overlay's LDS reads, but costs ~600 extra VALU
+ops per group per thread to re-split nibbles inside the WMMA loop — the operand
+loads read the same 4 dwords either way. Not taken.
+
+## Attempt #2 result (j-outer ordering)
+
+Attempt #1 read the 6-byte overlay record inside the `nb` loop, so it was
+fetched 4x redundantly. Attempt #2 reorders to j-outer/nb-inner, reading it once
+per row and holding only the current row's 3 entries — 166 VGPRs, **9 waves, 0
+spills**, occupancy fully preserved, parity PASS on all 7 shapes.
+
+It bought ~2%. Medians of 3, ms:
+
+| shape | fused #2 | fused #1 | split pair |
+|---|---|---|---|
+| gate/up | 3.332 | 3.415 | **3.137** |
+| down | 2.995 | 2.980 | **2.674** |
+| qkv | 1.136 | 1.143 | **0.996** |
+| wo | **0.672** | 0.674 | 0.722 |
+| gate/up B=128 | 1.865 | 1.833 | **1.698** |
+| gate/up B=512 | 6.612 | 6.757 | **6.340** |
+
+So the record redundancy was never the bottleneck — the 192 LDS byte-gathers
+are, and they do not get cheaper by reordering. Reverted; the tree keeps the
+separate k-major pass.
+
+## Why fusion looked like the right lever
 
 `gemm_oq_compact_iu4x2_wmma` **already stages the entire 256-element activation
 group in LDS** before its two WMMA passes. An overlay lookup inside that kernel
