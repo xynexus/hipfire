@@ -30,16 +30,10 @@ fn main() {
     let out = gpu
         .upload_raw(&vec![0u8; blocks as usize * 4], &[blocks as usize])
         .expect("out");
-    // Two staging sources. The small one fits L2 (2 MB) so staging pays only its
-    // instruction and __syncthreads cost; the large one exceeds the 32 MB MALL so
-    // the same kernel additionally pays real DRAM bandwidth. Their difference is
-    // the bandwidth term.
-    #[allow(dead_code)]
-    const SMALL_W: usize = 256 * 1024; // 1 MB
+    // Staging source larger than the 32 MB MALL, so staging pays real DRAM
+    // bandwidth. (The L2-vs-DRAM split was measured on rung 3 and came to 4%;
+    // see the commit for that rung.)
     const LARGE_W: usize = 16 * 1024 * 1024; // 64 MB
-    let src_small = gpu
-        .upload_raw(&vec![0u8; SMALL_W * 4], &[SMALL_W])
-        .expect("src small");
     let src_large = gpu
         .upload_raw(&vec![0u8; LARGE_W * 4], &[LARGE_W])
         .expect("src large");
