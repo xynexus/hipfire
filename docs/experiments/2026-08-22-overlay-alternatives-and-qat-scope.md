@@ -40,6 +40,38 @@ much larger and more structured.)
 less mixing, which partly cancels the finer scale. **58% worse than the overlay at
 identical bits.**
 
+## Does the rotation choice change any of this? Measured: no.
+
+The verdict above ("shared positions capture 5%") is really a claim about the
+FWHT basis, so it is fair to ask whether a different rotation rescues it. The
+quantizer does offer alternatives: `RotationVariant::{Plain, PlainG128, Givens,
+WithRmsnorm, WithSwiGLU}`, and `--rotate` is a **SpinQuant R1 deploy merge** which
+builds `R1 = FᵀM` so the codec's own FWHT composes away (`F·Fᵀ·M = M`) and the
+LEARNED rotation replaces it outright.
+
+Rather than train an M, measure the bound. The unrotated basis is where the AWQ
+channel structure that would make positions shareable is MAXIMALLY present, so it
+upper-bounds what any rotation can do for sharing:
+
+| basis | int4 | per-row overlay | shared | capture |
+|---|---|---|---|---|
+| FWHT (current) | 7.6590 | 4.4536 | 7.4852 | **5.4%** |
+| **unrotated** | 8.3732 | 4.5102 | 7.8527 | **13.5%** |
+
+Sharing does work better without the rotation — 2.5x better, so the rotation is
+genuinely part of the obstacle. But 13.5% is still nowhere near viable, and a
+learned rotation can only land BETWEEN these two. **Weight outliers are inherently
+per-row**: the AWQ insight is about ACTIVATION channels being outliers, not weight
+positions, and a row's extreme weights are a property of that row's learned
+function rather than of the channel.
+
+The second thing a better rotation could do is reduce the outlier NEED. The data
+bounds that too: FWHT beats no-rotation on plain int4 by **8.5%** (8.3732 ->
+7.6590), while the overlay is worth **41.8%**. Rotation is a ~10% lever and the
+overlay is a ~40% one — they are not substitutes, and a learned rotation would
+have to be several times better than the FWHT is over identity to make the
+overlay redundant.
+
 ## What this leaves
 
 Two options survive, and neither is a format change:

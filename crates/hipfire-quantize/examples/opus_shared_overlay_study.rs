@@ -177,6 +177,58 @@ fn main() {
             }
         }
 
+        // UNROTATED ARM. Everything above happens in the FWHT basis, and the
+        // conclusion "shared positions are worthless" is really a claim about
+        // that basis. Redo the whole comparison with NO rotation, where the
+        // AWQ channel structure that would make positions shareable still
+        // exists. If shared capture is high here, the ROTATION is the obstacle
+        // and a learned (SpinQuant) rotation could land in between.
+        let mut raw: Vec<Vec<f32>> = Vec::with_capacity(rows * ngroups);
+        let mut raw_scales: Vec<f32> = Vec::with_capacity(rows * ngroups);
+        let mut raw_row_idx: Vec<Vec<usize>> = Vec::with_capacity(rows * ngroups);
+        for r in 0..rows {
+            for g in 0..ngroups {
+                let start = (r * k + g * G) * 2;
+                let mut grp = vec![0.0f32; G];
+                for i in 0..G {
+                    let b = u16::from_le_bytes([bytes[start + 2 * i], bytes[start + 2 * i + 1]]);
+                    grp[i] = f32::from_bits((b as u32) << 16);
+                }
+                let (sc, idx) = mixed_clipsearch(&grp, N_OUT); // NO rotation
+                raw_scales.push(sc);
+                raw_row_idx.push(idx[..N_OUT].to_vec());
+                raw.push(grp);
+            }
+        }
+        let mut raw_shared: Vec<Vec<usize>> = Vec::with_capacity(ngroups);
+        for g in 0..ngroups {
+            let mut gain = vec![0.0f64; G];
+            for r in 0..rows {
+                let gi = r * ngroups + g;
+                let sc = raw_scales[gi];
+                let inv = 1.0 / sc.max(1e-12);
+                for pp in 0..G {
+                    let v = raw[gi][pp];
+                    let e4 = v - (v * inv).round().clamp(-7.0, 7.0) * sc;
+                    let e8 = v - (v * inv).round().clamp(-127.0, 127.0) * sc;
+                    gain[pp] += (e4 * e4 - e8 * e8) as f64;
+                }
+            }
+            let mut order: Vec<usize> = (0..G).collect();
+            order.sort_by(|&a, &b| gain[b].partial_cmp(&gain[a]).unwrap());
+            raw_shared.push(order[..N_OUT].to_vec());
+        }
+        let (mut raw_none, mut raw_perrow, mut raw_sh) = (0.0f64, 0.0f64, 0.0f64);
+        for r in 0..rows {
+            for g in 0..ngroups {
+                let gi = r * ngroups + g;
+                raw_none += sse_for(&raw[gi], raw_scales[gi], &[]);
+                raw_perrow += sse_for(&raw[gi], raw_scales[gi], &raw_row_idx[gi]);
+                raw_sh += sse_for(&raw[gi], raw_scales[gi], &raw_shared[g]);
+            }
+        }
+        let raw_capture = (raw_none - raw_sh) / (raw_none - raw_perrow) * 100.0;
+
         let mut sse_row = 0.0f64;
         let mut sse_shared = 0.0f64;
         let mut sse_none = 0.0f64; // pure int4, same scales: what the overlay buys
@@ -201,6 +253,10 @@ fn main() {
             sse_g64,
             (sse_g64 / sse_row - 1.0) * 100.0,
             capture
+        );
+        println!(
+            "  {:<24} {:>11.4e} {:>11.4e} {:>11.4e} {:>11} {:>7} {:>8.1}%   <- UNROTATED",
+            "", raw_none, raw_perrow, raw_sh, "", "", raw_capture
         );
     }
     println!(
