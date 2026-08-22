@@ -86,3 +86,18 @@ pre-existing 8-cell failure state (qwen2/hfq4, gemma3/q8f16+hfq4, minimax/mq4,
 qwen3_5/q8f16, qwen3_5_moe/q8f16+mq6+mq4); the flaky
 `qwen3_5_moe_indexed/oq8+(calib)` cell passed. None of the failing cells
 exercise qt=36 compact, and this path is default-off.
+
+## Measurement note: `hipfire eval` cached the A/B away
+
+The first attempt to measure this through `hipfire eval` reported *identical*
+numbers for both arms and nearly produced a "no effect" conclusion. Cause: eval
+caches rows across invocations and its key does not include the environment, so
+flipping `HIPFIRE_OQ_COMPACT_IU4X2` replayed the first arm. `--force` fixes it,
+and then eval independently reproduces the win:
+
+| route | prefill tok/s (first / reset) |
+|---|---|
+| iu8 | 194.9 / 199.4 |
+| **iu4x2** | **220.3 / 227.6** (+13.5%) |
+
+Written up in `docs/methodology/perf-benchmarking.md`.
