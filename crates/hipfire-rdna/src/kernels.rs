@@ -4317,6 +4317,11 @@ pub const GEMM_OQ_COMPACT_IU4X2_TILED_SRC: &str =
 pub const GEMM_OQ_COMPACT_LADDER_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_ladder.hip");
 
+/// int8 activations -> fragment-interleaved nibble pairs, the layout the compact
+/// WMMA B operand actually wants. See `kernels/src/act_interleave_nibbles.hip`.
+pub const ACT_INTERLEAVE_NIBBLES_SRC: &str =
+    include_str!("../../../kernels/src/act_interleave_nibbles.hip");
+
 /// Pure iu4 WMMA issue-rate probes (no memory at all), sweeping the number of
 /// INDEPENDENT accumulator chains. See `kernels/src/wmma_iu4_noop_w64.hip`.
 pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w64.hip");

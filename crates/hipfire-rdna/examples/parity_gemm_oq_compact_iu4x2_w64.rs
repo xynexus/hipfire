@@ -109,7 +109,21 @@ fn main() {
         // int8 activations, exactly as quantize_act_oq8 leaves them. The kernel
         // does the radix-16 digit split itself while staging into LDS.
         let x8: Vec<i8> = (0..b * k).map(|_| (rnd() % 256) as u8 as i8).collect();
-        let x8u: Vec<u8> = x8.iter().map(|&v| v as u8).collect();
+        // The wave64 kernel now takes FRAGMENT-INTERLEAVED nibble pairs: per
+        // column, each 16-K step is 8 bytes of hi nibbles then 8 of lo. Same
+        // byte volume as int8. The CPU oracle above still works from the
+        // original int8 values, so this also checks the interleaving itself.
+        let mut x8u = vec![0u8; b * k];
+        for col in 0..b {
+            for st in 0..k / 16 {
+                for j in 0..8 {
+                    let lo0 = x8[col * k + st * 16 + 2 * j] as u8;
+                    let hi0 = x8[col * k + st * 16 + 2 * j + 1] as u8;
+                    x8u[col * k + st * 16 + j] = (lo0 >> 4) | (hi0 & 0xf0);
+                    x8u[col * k + st * 16 + 8 + j] = (lo0 & 0xf) | ((hi0 & 0xf) << 4);
+                }
+            }
+        }
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();

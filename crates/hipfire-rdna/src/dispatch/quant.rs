@@ -572,7 +572,17 @@ impl Gpu {
                 dtype: DType::F32,
             };
             if use_w64 {
-                self.gemm_oq_compact_iu4x2_w64(w_blocks, xq, xs, y, m, k, n, block_stride)?;
+                // The wave64 kernel consumes fragment-interleaved nibble pairs,
+                // not int8. The permutation is done ONCE per activation, beside
+                // the quantize -- doing it here instead re-permuted the same
+                // activation for every projection (gate, up, q, k, v, ...) and
+                // cost 7% end to end.
+                let xilv = GpuTensor {
+                    buf: unsafe { self.oq_xilv_batch.as_ref().unwrap().buf.alias() },
+                    shape: vec![n * k],
+                    dtype: DType::Raw,
+                };
+                self.gemm_oq_compact_iu4x2_w64(w_blocks, &xilv, xs, y, m, k, n, block_stride)?;
             } else {
                 self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
             }
@@ -611,7 +621,7 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 256;
-        self.quantize_act_oq8_batched(x_rot, m, k, n)?;
+        self.quantize_act_oq8_batched_interleaved(x_rot, m, k, n)?;
         let ng = k / GROUP;
         let xq = GpuTensor {
             buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
@@ -1168,6 +1178,46 @@ impl Gpu {
     /// First-principles ladder kernel. Launch geometry is read from the two
     /// consts below, which must track the rung's tile shape.
     #[allow(clippy::too_many_arguments)]
+    /// int8 activations -> fragment-interleaved nibble pairs, in place of the
+    /// per-GEMM in-kernel split. Cross-process verified at 1.184x on the ladder
+    /// kernel; see `.agents/skills/hipfire-kernel-tuning/levers.md` §9.
+    pub fn act_interleave_nibbles(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 16, 0, "act_interleave_nibbles: K % 16 != 0");
+        self.ensure_kernel(
+            "act_interleave_nibbles",
+            kernels::ACT_INTERLEAVE_NIBBLES_SRC,
+            "act_interleave_nibbles",
+        )?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let (mut ni, mut ki) = (n as i32, k as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let total = n * (k / 16);
+        let func = &self.functions["act_interleave_nibbles"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [total.div_ceil(256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn gemm_oq_compact_ladder(
         &mut self,
         w_blocks: &GpuTensor,
@@ -1859,6 +1909,30 @@ impl Gpu {
     /// site (qkvza, gate+up) can quantize ONCE and then issue one
     /// [`Self::gemm_oq8_grouped_prequant`] per projection — the oq8 analogue of
     /// what the fused oq4 kernels do internally.
+    /// Quantize, then emit the fragment-interleaved nibble form alongside the
+    /// int8 one. Called once per activation; every compact projection off that
+    /// activation then reads the interleaved buffer with no in-kernel split.
+    pub fn quantize_act_oq8_batched_interleaved(
+        &mut self,
+        x_rot: &GpuTensor,
+        m_max: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.quantize_act_oq8_batched(x_rot, m_max, k, n)?;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xilv = GpuTensor {
+            buf: unsafe { self.oq_xilv_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        self.act_interleave_nibbles(&xq, &xilv, n, k)
+    }
+
     pub fn quantize_act_oq8_batched(
         &mut self,
         x_rot: &GpuTensor,

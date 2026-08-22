@@ -64,9 +64,18 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     const uint8_t* __restrict__ W, const int8_t* __restrict__ X,
     const float* __restrict__ Xs, float* __restrict__ Y,
     int M, int K, int B, int block_stride) {
-    __shared__ uint8_t As[2][BM * (BK / 2)], Xhs[2][BN * (BK / 2)], Xls[2][BN * (BK / 2)];
+    // X held INTERLEAVED in LDS exactly as it is in DRAM: per row, each 16-K step
+    // is 8 bytes of hi nibbles then 8 of lo. Same bytes as separate Xhs+Xls
+    // planes (BK/2 + BK/2 == BK), but staging becomes a pure copy and ONE i32x4
+    // LDS read yields both WMMA operands.
+    // XPAD: the interleaved row stride is BK=64 B = 16 dwords, and with 64 LDS
+    // banks that puts 16 consecutive lanes on only 4 distinct banks -- a 4-way
+    // conflict, twice as bad as the 32 B stride of the old split planes. Padding
+    // to 80 B (20 dwords, gcd(20,64)=4) spreads them over all 16.
+#define XPAD 16
+    __shared__ uint8_t As[2][BM * (BK / 2)], Xi[2][BN * (BK + XPAD)];
     const int bm = blockIdx.x * BM, bn = blockIdx.y * BN, st = K / 2;
-    const int xst = K;               // int8 activation row stride
+    const int xst = K;               // interleaved row stride (== K bytes)
     const int wid = threadIdx.x >> 6, wtid = threadIdx.x & 63, lane = wtid & 15;
     const int wm = wid / WARPS_N, wn = wid % WARPS_N, nstrip = K / BK;
     const int n_groups = K / 256;
@@ -111,28 +120,20 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     i32x4 rXh[NXv], rXl[NXv];
 #define LOADG(kk) \
     _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK, row = idx / UA, c = idx % UA; int r = bm + row < M ? bm + row : M - 1; rA[l] = *(const uint32_t*)(W + (long long)r * st + (kk) / 2 + c * 4); } \
+    /* X is pre-interleaved in DRAM: a strip is BK bytes per row, copied verbatim.
+       Two i32x4 per thread covers 32 of the 64 strip bytes. */ \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { \
-        int q = threadIdx.x + l * BLOCK, base = q * 4, row = base / UA, c = base % UA; \
+        int q = threadIdx.x + l * BLOCK, row = q >> 1, hlf = q & 1; \
         int r = bn + row < B ? bn + row : B - 1; \
-        const int8_t* xp = X + (long long)r * xst + (kk) + c * 8; \
-        /* 16 output nibble-bytes = 32 int8 = two i32x4 loads. */ \
-        const i32x4 s0 = *(const i32x4*)(xp); \
-        const i32x4 s1 = *(const i32x4*)(xp + 16); \
-        i32x4 vh, vl; \
-        _Pragma("unroll") for (int t = 0; t < 2; t++) { \
-            const i32x4 sv = t ? s1 : s0; \
-            uint32_t ph = 0, pl = 0, ph2 = 0, pl2 = 0; \
-            ph  = oqx2w64_pack4(((uint32_t)sv[0] >> 4) & 0x0f0f0f0fu) | (oqx2w64_pack4(((uint32_t)sv[1] >> 4) & 0x0f0f0f0fu) << 16); \
-            ph2 = oqx2w64_pack4(((uint32_t)sv[2] >> 4) & 0x0f0f0f0fu) | (oqx2w64_pack4(((uint32_t)sv[3] >> 4) & 0x0f0f0f0fu) << 16); \
-            pl  = oqx2w64_pack4((uint32_t)sv[0] & 0x0f0f0f0fu) | (oqx2w64_pack4((uint32_t)sv[1] & 0x0f0f0f0fu) << 16); \
-            pl2 = oqx2w64_pack4((uint32_t)sv[2] & 0x0f0f0f0fu) | (oqx2w64_pack4((uint32_t)sv[3] & 0x0f0f0f0fu) << 16); \
-            vh[2 * t] = (int)ph; vh[2 * t + 1] = (int)ph2; \
-            vl[2 * t] = (int)pl; vl[2 * t + 1] = (int)pl2; \
-        } \
-        rXh[l] = vh; rXl[l] = vl; }
+        const uint8_t* xp = (const uint8_t*)X + (long long)r * xst + (kk) + hlf * 32; \
+        rXh[l] = *(const i32x4*)(xp); \
+        rXl[l] = *(const i32x4*)(xp + 16); }
 #define STS(bf) \
     _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK; ((uint32_t*)As[bf])[idx] = rA[l]; } \
-    _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; ((i32x4*)Xhs[bf])[q] = rXh[l]; ((i32x4*)Xls[bf])[q] = rXl[l]; }
+    _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; \
+        int row = q >> 1, hlf = q & 1; \
+        uint8_t* dp = Xi[bf] + row * (BK + XPAD) + hlf * 32; \
+        *(i32x4*)(dp) = rXh[l]; *(i32x4*)(dp + 16) = rXl[l]; }
 
     { LOADG(0); STS(0); }
     __syncthreads();
@@ -146,9 +147,11 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
             for (int i = 0; i < WMt; i++) af[i] = *(const i32x2*)(As[buf] + (wm * WMt * 16 + i * 16 + lane) * (BK / 2) + s * 8);
 #pragma unroll
             for (int j = 0; j < WNt; j++) {
-                const int xo = (wn * WNt * 16 + j * 16 + lane) * (BK / 2) + s * 8;
-                xfh[j] = *(const i32x2*)(Xhs[buf] + xo);
-                xfl[j] = *(const i32x2*)(Xls[buf] + xo);
+                // interleaved: hi at +0, lo at +8, one 16-byte read
+                const int xo = (wn * WNt * 16 + j * 16 + lane) * (BK + XPAD) + s * 16;
+                const i32x4 xv = *(const i32x4*)(Xi[buf] + xo);
+                xfh[j][0] = xv[0]; xfh[j][1] = xv[1];
+                xfl[j][0] = xv[2]; xfl[j][1] = xv[3];
             }
 #pragma unroll
             for (int i = 0; i < WMt; i++)

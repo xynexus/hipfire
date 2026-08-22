@@ -2782,7 +2782,7 @@ pub(crate) fn forward_prefill_chunk(
                     // projection. Each shares the same int8 activation quantize
                     // via the batched scratch, so the redundancy is the quantize
                     // launch, not a re-read of x.
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+                    gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
                     for (w, y) in [
                         (&layer.wqkv, &pbs.dn_qkv_batch),
                         (&layer.wz, &pbs.dn_z_batch),
@@ -2845,7 +2845,7 @@ pub(crate) fn forward_prefill_chunk(
                     // spec-decode verify had to exclude compact entirely and why
                     // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
                     // Measured: 48 fall-throughs in a 16-token spec run.
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+                    gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
                     for (w, y) in [
                         (&layer.wqkv, &pbs.dn_qkv_batch),
                         (&layer.wz, &pbs.dn_z_batch),
@@ -3730,7 +3730,7 @@ pub(crate) fn forward_prefill_chunk(
                 } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
                     // Compact-resident Opus: one quantize of the shared rotated
                     // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched(
+                    gpu.quantize_act_oq8_batched_interleaved(
                         &pbs.x_rot_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
@@ -3747,7 +3747,7 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
                     // same buffers the fused kernel writes; downstream silu_mul
                     // is unchanged.
-                    gpu.quantize_act_oq8_batched(
+                    gpu.quantize_act_oq8_batched_interleaved(
                         &pbs.x_rot_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
@@ -4346,7 +4346,7 @@ pub(crate) fn forward_prefill_chunk(
                 } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
                     // Compact-resident Opus: one quantize of the shared rotated
                     // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+                    gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
                     for (w, y) in [
                         (&layer.wq, &pbs.fa_q_full_batch),
                         (&layer.wk, &pbs.fa_k_batch),
@@ -4363,7 +4363,7 @@ pub(crate) fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::Oq8G256),
                         "FA qkv Oq8 dispatch requires all of wq/wk/wv to be Oq8G256",
                     );
-                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+                    gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
                     for (w, y) in [
                         (&layer.wq, &pbs.fa_q_full_batch),
                         (&layer.wk, &pbs.fa_k_batch),
@@ -5772,7 +5772,7 @@ pub(crate) fn forward_prefill_chunk(
                 } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
                     // Compact-resident Opus: one quantize of the shared rotated
                     // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched(
+                    gpu.quantize_act_oq8_batched_interleaved(
                         &pbs.x_rot_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
@@ -5787,7 +5787,7 @@ pub(crate) fn forward_prefill_chunk(
                     }
                 } else if fa_ffn_is_oq8 {
                     // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
-                    gpu.quantize_act_oq8_batched(
+                    gpu.quantize_act_oq8_batched_interleaved(
                         &pbs.x_rot_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
