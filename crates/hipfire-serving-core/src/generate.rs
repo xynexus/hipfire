@@ -1952,7 +1952,7 @@ struct Qwen35DecodeCfg {
 }
 
 /// What one step of the qwen35 decode loop decided.
-enum Qwen35Step {
+pub enum Qwen35Step {
     /// The next token was sampled; the loop continues.
     Continue,
     /// A stop condition fired (EOS, terminator, filter, loop guard, cancel, or a
@@ -2555,7 +2555,7 @@ impl Qwen35Generation {
     /// per step rather than captured once, which is what §M3b1 asks for: the
     /// moment the march loop can hand `&mut LoadedModel` to another stream
     /// between quanta, a captured snapshot and a per-use read stop agreeing.
-    fn step(
+    pub fn step(
         &mut self,
         m: &LoadedModel,
         gpu: &mut hipfire_rdna::Gpu,
@@ -2604,7 +2604,30 @@ impl Qwen35Generation {
 
     /// Run the teardown and emit the `done` frame. Consumes the handle, because
     /// the session restore consumes the session.
-    fn finish(
+    /// Unwind after [`Qwen35Step::Failed`]: report and restore the session.
+    ///
+    /// Exists so a driver outside this crate can handle `Failed` without
+    /// touching `session`, which stays private because `qwen35_restore_or_error`
+    /// consumes it.
+    pub fn fail(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        stdout: &mut dyn std::io::Write,
+        id: &str,
+        message: &str,
+    ) {
+        write_error(stdout, id, message);
+        qwen35_restore_or_error(stdout, id, m, gpu, self.session);
+    }
+
+    /// True while the decode loop should keep stepping. Encapsulates the cap so
+    /// a driver does not need the private `st`/`cfg` fields.
+    pub fn should_continue(&self) -> bool {
+        self.st.generated < self.cfg.max_tokens
+    }
+
+    pub fn finish(
         self,
         m: &mut LoadedModel,
         gpu: &mut hipfire_rdna::Gpu,
