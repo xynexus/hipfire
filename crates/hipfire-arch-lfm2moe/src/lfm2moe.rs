@@ -964,8 +964,7 @@ impl Lfm2MoeWeights {
                             .upload_raw(&packed, &[packed.len()])
                             .map_err(|e2| format!("lfm2moe: pack expert L{l}E{e}: {e2:?}"))?;
                         let gu_buf = alias_into(&owner, 0, gate_up_bytes.len(), gu_dtype);
-                        let dn_buf =
-                            alias_into(&owner, gate_up_bytes.len(), w2.len(), dn_dtype);
+                        let dn_buf = alias_into(&owner, gate_up_bytes.len(), w2.len(), dn_dtype);
                         (
                             WeightTensor {
                                 buf: gu_buf,
