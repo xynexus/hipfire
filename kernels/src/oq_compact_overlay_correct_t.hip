@@ -76,7 +76,8 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
     const int8_t*  __restrict__ XT,
     const float*   __restrict__ XsT,
     float*         __restrict__ Y,
-    int M, int K, int B, int group, int block_stride
+    int M, int K, int B, int group, int block_stride,
+    int b_off                                   // first b column this launch owns
 ) {
     const int wave  = threadIdx.x >> 5;
     const int waves = blockDim.x >> 5;
@@ -105,8 +106,17 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
     //
     // XT rows are B-aligned and the block base is a multiple of 4, so the dword
     // load is always aligned.
-    constexpr int MAXQ = 4;                    // dword blocks per lane, B <= 512
-    const int nblk = (B + 127) >> 7;           // 128 b per wave-pass
+    // MAXQ dword blocks per lane x 128 b per block = 512 b per launch. `nblk`
+    // MUST be clamped to MAXQ: it indexes the acc[]/isum[] REGISTER arrays, and
+    // letting it run to (B+127)>>7 on a B > 512 batch indexes them out of bounds
+    // -- observed as a GPU memory fault in this kernel at
+    // HIPFIRE_PREFILL_MAX_BATCH=1024. The caller tiles b in 512-wide launches
+    // and passes the tile base in `b_off`; XT/XsT/Y are still indexed with the
+    // FULL B stride, since XT is [K, B] k-major and a b-tile is not contiguous.
+    constexpr int MAXQ = 4;
+    const int b_rem = B - b_off;
+    int nblk = (b_rem + 127) >> 7;
+    if (nblk > MAXQ) nblk = MAXQ;
     float acc[MAXQ][4];
     #pragma unroll
     for (int q = 0; q < MAXQ; ++q)
@@ -129,7 +139,7 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
             const int val = (int)(int8_t)table[2 * e + 1];
             const int8_t* xr = XT + (long long)(kbase + idx) * B;
             for (int q = 0; q < nblk; ++q) {
-                const int b0 = (q << 7) + (lane << 2);
+                const int b0 = b_off + (q << 7) + (lane << 2);
                 if (b0 >= B) break;
                 const uint32_t w4 = *(const uint32_t*)(xr + b0);
                 #pragma unroll
@@ -139,7 +149,7 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
         }
         const float* xsg = XsT + (long long)g * B;
         for (int q = 0; q < nblk; ++q) {
-            const int b0 = (q << 7) + (lane << 2);
+            const int b0 = b_off + (q << 7) + (lane << 2);
             if (b0 >= B) break;
             #pragma unroll
             for (int t = 0; t < 4; ++t)
@@ -147,7 +157,7 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
         }
     }
     for (int q = 0; q < nblk; ++q) {
-        const int b0 = (q << 7) + (lane << 2);
+        const int b0 = b_off + (q << 7) + (lane << 2);
         if (b0 >= B) break;
         #pragma unroll
         for (int t = 0; t < 4; ++t)

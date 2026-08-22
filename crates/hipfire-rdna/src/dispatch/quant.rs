@@ -790,13 +790,26 @@ impl Gpu {
         let (mi, ki, bi) = (m as i32, k as i32, batch_size as i32);
         let (gi, si) = (group as i32, block_stride as i32);
         let waves = 8u32;
-        self.launch_kernargs(
-            "oq_compact_overlay_correct_t",
-            [(m as u32).div_ceil(waves), 1, 1],
-            [waves * 32, 1, 1],
-            0,
-            &kernargs![ptr wp, ptr xtp, ptr xstp, ptr yp, i32 mi, i32 ki, i32 bi, i32 gi, i32 si],
-        )
+        // The kernel holds its b-slice in MAXQ=4 dword register blocks = 512
+        // columns per launch. Tile anything wider: letting its `nblk` run past
+        // MAXQ indexes acc[]/isum[] out of bounds and faults the GPU (observed
+        // at HIPFIRE_PREFILL_MAX_BATCH=1024). XT is [K, B] k-major so a b-tile
+        // is strided, not contiguous -- hence a b_off argument rather than a
+        // sub-view.
+        const B_TILE: usize = 512;
+        let mut b_off = 0usize;
+        while b_off < batch_size {
+            let boi = b_off as i32;
+            self.launch_kernargs(
+                "oq_compact_overlay_correct_t",
+                [(m as u32).div_ceil(waves), 1, 1],
+                [waves * 32, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xtp, ptr xstp, ptr yp, i32 mi, i32 ki, i32 bi, i32 gi, i32 si, i32 boi],
+            )?;
+            b_off += B_TILE;
+        }
+        Ok(())
     }
 
     /// Sparse overlay correction for the compact W4A4 path. ACCUMULATES into
