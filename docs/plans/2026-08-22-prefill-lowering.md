@@ -47,6 +47,9 @@ the critical path and should be reordered behind M3.** Decide that in writing
 before any code. Otherwise this plan is recommending a rewrite to buy something a
 cursor already provides.
 
+> **Decided 2026-08-22 in §0.1, from measurement: the cursor provides it, and
+> M2a is deferred behind M3. Read §0.1 before starting any stage below.**
+
 And either way: the two heaviest prefill ops are single indivisible launches
 whose cost scales with chunk length — the GDN recurrent kernel
 (`prefill_chunk.rs:3040`) and batched attention (`prefill_chunk.rs:4937`). A
@@ -257,6 +260,7 @@ looks green.
 
 * **The band cursor satisfies the latency contract.** Then stop: M2a is not on
   the critical path and this plan should be reordered behind M3 (§0).
+  **This stop-line fired on 2026-08-22 — see §0.1.**
 * **M2a0 cannot be built** — i.e. no probe can distinguish a correct from a
   corrupted prefill state. Then every later stage is unfalsifiable; stop rather
   than proceed on green-by-default gates.
@@ -268,3 +272,93 @@ looks green.
 * **The work starts touching `prefill_batch.rs` before chunk is done.** That is
   67 pub fns and 13 external call sites — a public-API change wearing a refactor
   costume.
+
+---
+
+## 0.1 The §0 decision, made in writing and from measurement — 2026-08-22
+
+§0 refuses to let this plan proceed until the band-cursor-vs-lowering question is
+decided in writing. It is decided here, against measurement rather than
+intuition, and **the decision is: stop. §6 stop-line 1 fires.**
+
+### What was measured
+
+`crates/hipfire-runtime/examples/profile_prefill_qwen35` (existing tool, not
+written for this), single-GPU `forward_prefill_batch`, nix1 / `gfx1103`,
+`Qwen3.6-35B-A3B--oq4.hfq` — 40 layers, the largest and slowest qwen35 case
+available on the box, so these are conservative (worst-case) numbers. Warmup 1
+was discarded as JIT; steady state is warmups 2–4, spread ≤ 0.6%.
+
+| chunk tokens | prefill wall | ÷ 40 layers = **per-layer band quantum** | ≤ 200 ms? |
+|---|---|---|---|
+| 64 | 2 398 ms | **60 ms** | yes |
+| 128 | 4 838 ms | **121 ms** | yes, 1.65× headroom |
+| **256** (`PREFILL_MAX_BATCH`, `prefill_batch.rs:5069`) | 9 726 ms | **243 ms** | **no — over by 21%** |
+| 512 | 19 434 ms | **485 ms** | no |
+
+The fit is linear to within 0.5%: **0.9497 ms per token per layer**. That is
+expected, not a coincidence — `prefill_batch.rs:6036` records that the
+`gated_delta_net` `batch_seq` loop is per-token sequential, "so the per-chunk
+DeltaNet cost is linear in N either way".
+
+### What that settles
+
+**1. Granularity is not the binding variable. Chunk size is.** A per-layer band
+quantum is `chunk_tokens × 0.95 ms`. Whether it clears the §1.1 budget is a
+property of the chunk, not of how finely the layer is decomposed.
+
+**2. Lowering cannot rescue the production default either.** From the profiled
+run at chunk 512, the MoE group — `gemm_gate_up_q8_0_wmma` 72.2%,
+`moe_topk_renorm_k8` 2.1%, `moe_down_combine_k8_batched` 1.4%,
+`fused_silu_mul_mq_rotate_batched` 1.2%, `rotate_x_mq_awq_indexed_batched` 1.2%
+— is **≈78% of layer time**. A lowered prefill's largest super-op is therefore
+`Moe` at ~0.78 × the layer, exactly as §M3d predicted it would be. At chunk 256
+that is **190 ms against a 200 ms budget that must also absorb `park_cost` and
+`realtime_model_residency_cost`** (§1.1). Full prefill lowering buys **1.28×**
+over the band cursor — less than one step of the chunk cap — and does not clear
+the contract at the production default.
+
+**3. The band cursor + a chunk cap does clear it, with margin.** 128 tokens →
+121 ms, 1.65× headroom. That is the cheap option in §0's table, and it wins on
+the measurement, not on the estimate.
+
+So M2a buys 1.28× on the quantity that already has a free 2× knob. **It is not
+on the critical path. Reorder behind M3**, per §6.
+
+### The one real gap the measurement exposed
+
+The chunk cap **already ships** for the single-sequence path — no code needed.
+`forward_prefill_batch_with_pbs_opts` reads `HIPFIRE_PREFILL_MAX_BATCH`
+(`prefill_batch.rs:6042`) as the chunk upper bound and drives the `while
+chunk_start < n` loop at `:6276`.
+
+**It does not reach the fused multi-session path, where the same variable is a
+floor, not a ceiling.** `qwen35_prefill.rs:888`, `:1033`, `:1327` all *error* —
+"scratch max_batch=… is smaller than required fused rows …; increase
+`HIPFIRE_PREFILL_MAX_BATCH`" — when it is set below the batch's total rows. So
+turning the knob down to buy prefill latency **breaks fused multi-session
+prefill** rather than chunking it.
+
+That is the concrete item on the critical path: **the fused session-batch prefill
+has no latency cap at all.** It belongs to §M2a5's file (`prefill_batch.rs`), and
+§6's last stop-line explicitly forbids opening that file as part of M2a — 67 pub
+fns, 13 external call sites. It is a separate milestone with its own gate, and it
+is worth more than every stage above it.
+
+### Not measured, and why it does not change the answer
+
+A halo (`gfx1151`) cross-check was attempted and **failed**: halo has no `hipcc`,
+so the run fell back to unvalidated pre-compiled blobs and produced no timings.
+Halo is 2–3× faster, so chunk 256 would likely clear 200 ms there — which would
+change *which chunk size to configure on which box*, a deployment-tuning
+question. It does not change the ordering: on any box where the band cursor
+misses the budget, a 1.28× lowering misses it too.
+
+### Consequences for the stages above
+
+M2a0–M2a5 are **not cancelled and not wrong** — §4's finding that the automatic
+tier reports COVERED for a prefill change it never executes is a real defect that
+outlives this decision, and M2a0 remains the prerequisite for whenever M2a is
+picked up. They are **deferred**. Do not start M2a1 on the strength of the goal
+"implement this plan"; the plan's own §0 conditioned every stage below it on this
+decision, and the decision came back negative.
