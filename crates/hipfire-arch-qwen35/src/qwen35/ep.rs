@@ -270,7 +270,7 @@ pub fn forward_prefill_batch_ep(
 
     // Per-layer cumulative LA / FA counters (replicated → identical across ranks;
     // they index dn_state.s_matrices / kv_cache.k_gpu exactly like the band
-    // offsets the PP driver threads). kv_layer_offset == fa_layer_offset.
+    // offsets the PP driver threads).
     let mut delta_off = 0usize;
     let mut fa_off = 0usize;
 
@@ -316,7 +316,6 @@ pub fn forward_prefill_batch_ep(
                 layer_start: layer_idx,
                 layer_end: layer_idx + 1,
                 delta_layer_offset: delta_off,
-                kv_layer_offset: fa_off,
                 fa_layer_offset: fa_off,
                 is_first_band: layer_idx == 0,
                 is_last_band: false, // final norm + lm_head done explicitly below
@@ -2447,7 +2446,6 @@ pub fn forward_prefill_batch_multi_with_caps(
                     layer_start: band_layer_start,
                     layer_end: band_layer_end,
                     delta_layer_offset: delta_off_per_band[b],
-                    kv_layer_offset: fa_off_per_band[b],
                     fa_layer_offset: fa_off_per_band[b],
                     is_first_band: b == 0,
                     is_last_band: b + 1 == n_bands,

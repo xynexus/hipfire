@@ -64,6 +64,7 @@
 #   HIPFIRE_TINYPREFILL_PREFILL=64
 #   HIPFIRE_TINYPREFILL_DECODE=4
 #   HIPFIRE_TINYPREFILL_TOL=1e-4
+#   HIPFIRE_TINYPREFILL_KV=q8,kvarn
 #
 # Exit: 0 = all selected cells pass, 1 = divergence/crash/blind-probe, 2 = infra,
 #       3 = nothing selected.
@@ -75,6 +76,14 @@ PREFILL="${HIPFIRE_TINYPREFILL_PREFILL:-64}"
 DECODE="${HIPFIRE_TINYPREFILL_DECODE:-4}"
 TOL="${HIPFIRE_TINYPREFILL_TOL:-1e-4}"
 SEED="${HIPFIRE_TINYPREFILL_SEED:-42}"
+# Both KV modes, because they select DIFFERENT FA arms and each leaves the other
+# untested. `fa_kv_ok` (prefill_chunk.rs:2313) holds for Q8, so FA layers take the
+# BATCHED arm; KVarN is `quantized` but none of q8/asym{2,3,4}, so it fails that
+# test and FA layers take the PER-TOKEN FALLBACK. KVarN is also the default KV
+# mode, so that fallback is production code. Verified by instrumentation, not
+# assumed: a temporary print inside the fallback fired 0 times under q8 and once
+# under kvarn.
+IFS=',' read -r -a kv_modes <<<"${HIPFIRE_TINYPREFILL_KV:-q8,kvarn}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 
@@ -120,7 +129,6 @@ for raw_family in "${families[@]}"; do
             continue
             ;;
     esac
-    echo "== tiny-prefill: $family =="
     hf_dir="$TMP/$family-hf"
     hfq="$TMP/$family-fp16.hfq"
     if ! "$Q" --emit-fixture "$family" --out "$hf_dir" --seed "$SEED" >/dev/null 2>&1; then
@@ -134,46 +142,51 @@ for raw_family in "${families[@]}"; do
         continue
     fi
 
-    out="$TMP/$family.out"
-    "$P" prefill-hash --arch "$family" --model "$hfq" \
-        --prefill "$PREFILL" --decode "$DECODE" --tol "$TOL" --seed "$SEED" \
-        >"$out" 2>"$TMP/$family.err"
-    rc=$?
-    if [ "$rc" -eq 3 ]; then
-        # Both runs landed in the same code path, so this cell compared the
-        # reference against itself. Inconclusive, and explicitly NOT a pass —
-        # counting it would recreate the false-coverage bug in a new place.
-        echo "  SKIP no batched prefill path reached (compared reference to itself)"
-        skip=$((skip + 1))
-        continue
-    fi
-    if [ "$rc" -ne 0 ]; then
-        echo "  FAIL batched prefill diverges from the per-token reference"
-        grep -E '^(max_kld|mean_kld|max_abs_diff|argmax_agree|tol):' "$out" | sed 's/^/    /'
-        tail -2 "$TMP/$family.err" | sed 's/^/    /'
-        fail=$((fail + 1))
-        continue
-    fi
-    kld="$(awk '/^max_kld:/ {print $2}' "$out")"
-    agree="$(awk '/^argmax_agree:/ {print $2}' "$out")"
+    for kv in "${kv_modes[@]}"; do
+        kv="$(echo "$kv" | xargs)"
+        [ -n "$kv" ] || continue
+        echo "== tiny-prefill: $family/$kv =="
+        out="$TMP/$family-$kv.out"
+        "$P" prefill-hash --arch "$family" --model "$hfq" --kv "$kv" \
+            --prefill "$PREFILL" --decode "$DECODE" --tol "$TOL" --seed "$SEED" \
+            >"$out" 2>"$TMP/$family-$kv.err"
+        rc=$?
+        if [ "$rc" -eq 3 ]; then
+            # Both runs landed in the same code path, so this cell compared the
+            # reference against itself. Inconclusive, and explicitly NOT a pass —
+            # counting it would recreate the false-coverage bug in a new place.
+            echo "  SKIP no batched prefill path reached (compared reference to itself)"
+            skip=$((skip + 1))
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
+            echo "  FAIL batched prefill diverges from the per-token reference"
+            grep -E '^(max_kld|mean_kld|max_abs_diff|argmax_agree|tol):' "$out" | sed 's/^/    /'
+            tail -2 "$TMP/$family-$kv.err" | sed 's/^/    /'
+            fail=$((fail + 1))
+            continue
+        fi
+        kld="$(awk '/^max_kld:/ {print $2}' "$out")"
+        agree="$(awk '/^argmax_agree:/ {print $2}' "$out")"
 
-    # Self-check: the same cell with position 0 of KV deliberately corrupted MUST
-    # fail. If it passes, the probe is not reading the prefill's KV and this
-    # gate is decoration.
-    # The probe exits non-zero under --corrupt-kv-prefix precisely when it FAILED
-    # to notice the corruption, so success here means the tripwire is live.
-    if "$P" prefill-hash --arch "$family" --model "$hfq" \
-        --prefill "$PREFILL" --decode "$DECODE" --tol "$TOL" --seed "$SEED" \
-        --corrupt-kv-prefix >"$TMP/$family.corrupt" 2>&1; then
-        ckld="$(awk '/^max_kld:/ {print $2}' "$TMP/$family.corrupt")"
-        echo "  OK  max_kld=$kld (tol=$TOL) argmax=$agree | corrupt-prefix caught at max_kld=$ckld"
-    else
-        echo "  FAIL falsifiability: probe did not catch a corrupted position-0 KV write"
-        tail -2 "$TMP/$family.corrupt" | sed 's/^/    /'
-        fail=$((fail + 1))
-        continue
-    fi
-    ran=$((ran + 1))
+        # The probe exits non-zero under --corrupt-kv-prefix precisely when it
+        # FAILED to notice the corruption, so success here means the tripwire is
+        # live. Not ceremony: it caught the KVarN case, where zeroing `k_gpu`
+        # alone changed nothing because a 64-token prefill lives entirely in the
+        # `k_window` recent-block ring.
+        if "$P" prefill-hash --arch "$family" --model "$hfq" --kv "$kv" \
+            --prefill "$PREFILL" --decode "$DECODE" --tol "$TOL" --seed "$SEED" \
+            --corrupt-kv-prefix >"$TMP/$family-$kv.corrupt" 2>&1; then
+            ckld="$(awk '/^max_kld:/ {print $2}' "$TMP/$family-$kv.corrupt")"
+            echo "  OK  max_kld=$kld (tol=$TOL) argmax=$agree | corrupt-prefix caught at max_kld=$ckld"
+        else
+            echo "  FAIL falsifiability: probe did not catch a corrupted KV prefix"
+            tail -2 "$TMP/$family-$kv.corrupt" | sed 's/^/    /'
+            fail=$((fail + 1))
+            continue
+        fi
+        ran=$((ran + 1))
+    done
 done
 
 echo "tiny-prefill-gate: ran=$ran fail=$fail skip=$skip"

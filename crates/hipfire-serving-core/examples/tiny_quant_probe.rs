@@ -42,7 +42,7 @@ use std::path::Path;
 
 use hipfire_rdna::Gpu;
 use hipfire_serving_core::tiny_harness::{
-    run_ar_hash, run_collect, run_kld, run_prefill_hash, TinyArch,
+    run_ar_hash, run_collect, run_kld, run_prefill_hash, PrefillKvMode, TinyArch,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -142,6 +142,13 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(1e-4);
             let corrupt = args.iter().any(|a| a == "--corrupt-kv-prefix");
+            let kv_mode = PrefillKvMode::parse(
+                flag(&args, "--kv").as_deref().unwrap_or("q8"),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe: {e}");
+                std::process::exit(2);
+            });
             let model = req(&args, "--model");
             let out = run_prefill_hash(
                 arch,
@@ -151,6 +158,7 @@ fn main() {
                 n_decode,
                 seed,
                 corrupt,
+                kv_mode,
             )
             .unwrap_or_else(|e| {
                 eprintln!("tiny_quant_probe prefill-hash: {e}");
@@ -159,6 +167,7 @@ fn main() {
             println!("arch: {}", arch.as_str());
             println!("n_prefill: {}", out.n_prefill);
             println!("n_decode: {}", out.n_decode);
+            println!("kv: {}", kv_mode.as_str());
             println!("max_kld: {:.8}", out.max_kld);
             println!("mean_kld: {:.8}", out.mean_kld);
             println!("max_abs_diff: {:.6}", out.max_abs_diff);

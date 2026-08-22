@@ -144,6 +144,72 @@ zero trait change.
 `forward_scratch_layers_lowered` (`lowered.rs:683`) — it loops all layers and
 appends final-norm + lm_head, which this arm must not do.
 
+> **LANDED 2026-08-22, and it was a bug fix, not a deletion.** −713 lines. The
+> "no numeric change" framing above was wrong: on real Opus artifacts the hand
+> copy diverged catastrophically from decode, and replacing it fixed that. See
+> §3.1.
+
+### 3.1 M2a1 as landed — the duplicate was not equivalent, it was broken
+
+The swap went in as scoped: the per-token FA fallback now runs
+`lower_variant(Q35Variant::FullAttn)` through `superop::run_layer_program`, and
+`run_fa_layer_body` is deleted. Every `Qwen35Bindings` field was already in scope
+(`k_dim`/`v_dim`/`n_v_heads`/`hd` at `prefill_chunk.rs:2050-2053`), so zero new
+fields and no trait change, exactly as costed.
+
+**First, the arm had no coverage — including from M2a0.** The new gate's default
+cell did not execute it. Confirmed by instrumentation rather than reasoning: a
+temporary print inside the fallback fired **0 times** under the gate. `fa_kv_ok`
+(`prefill_chunk.rs:2313`) holds for Q8 KV, so the tiny fixture's FA layers took
+the *batched* arm. KVarN is `quantized` but is none of q8/asym{2,3,4}, so it
+fails `fa_kv_ok` and routes FA to the fallback — and the same print then fired.
+**KVarN is the default KV mode**, so this fallback is production code, not a
+corner. The gate now runs both KV modes per family for that reason.
+
+**Then the A/B, on real artifacts**, batched prefill vs the per-token reference,
+64-token prefill, seeds {42,7,1234}:
+
+| model / KV | arm | before | after |
+|---|---|---|---|
+| `Qwen3.5-0.8B-Base--oq8` / kvarn | FA fallback | max KLD **0.057–0.083**, argmax **1–2 of 4** | **2.3e-5–2.9e-5**, argmax **4/4** |
+| `qwen3.5-0.8b--oq4++` / kvarn | FA fallback | max KLD **0.041–0.054**, argmax **1–4 of 4** | **5.0e-3–6.8e-3**, argmax **4/4** |
+| `Qwen3.5-0.8B-Base--oq8` / q8 | batched FA | 6.78e-5 | **6.78e-5** (identical) |
+| tiny fp16 fixture / both | both | ~1e-6 | ~1e-6 |
+
+The old fallback disagreed with decode by **as much as a deliberately corrupted
+KV cache does** (§4.1's injection reads 5.4e-2–1.0e-1) and picked a different
+token at 3 of 4 decoded positions. That is the "prefill and decode disagree, so
+it degrades on turn 2" failure this milestone exists to catch, sitting in
+production on the default KV mode.
+
+`run_fa_layer_body`'s doc claimed it was "byte-exact with the FA branch of
+`forward_scratch_layers`". Whether or not that was ever true of the *hand* decode
+arm, it is not true of what decode actually runs today — the lowered path, which
+has been the default since `lowered.rs:643`. The hand copy drifted from the arm
+it was pinned to, and nothing executed it, so nothing said so. **That is the
+argument for M2a1 restated as evidence rather than as a line count.**
+
+The identical q8 row is the scope check: the batched FA arm is untouched.
+
+**Two things this leaves open, neither in M2a1's scope:**
+
+* **`oq4++` still reads 5e-3 after the fix** — 8× better, argmax now clean, but
+  well above the tiny gate's 1e-4 tolerance. Something else in the Opus/AWQ
+  prefill path still disagrees with decode. `oq4++` is an AWQ-calibrated `+`
+  artifact, so the `awq_scale` family of bug is the first place to look. Do not
+  add a real-model `oq4++` cell to the gate until it is understood — it would
+  fail on day one.
+* **The gate's 1e-4 tolerance is calibrated for tiny fixtures (~1e-6).** Real
+  models sit at 2.7e-5 even when correct. Any real-model cell needs its own
+  tolerance, measured.
+
+*Also removed:* `kv_layer_idx` and `PrefillBandCtx::kv_layer_offset`. The counter
+existed only to feed `run_fa_layer_body`, which took it as `_kv_layer_idx` and
+ignored it, so both were dead in effect before this change. The EP driver's two
+initializers (`ep.rs:319`, `:2450`) go with the field. Nothing read it, so this
+cannot change behaviour; if the band cursor needs the offset later it comes back
+with a consumer.
+
 ### M2a2 — the flag and gate shape *(no numeric change)*
 
 Copy the four-predicate early-return shape from `decode_layers.rs:71-106`, and

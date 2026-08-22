@@ -1225,6 +1225,34 @@ pub fn run_ar_hash(
     })
 }
 
+/// Which KV cache the prefill probe builds. The choice decides which FA arm the
+/// batched prefill takes, so it is the difference between covering
+/// `prefill_chunk.rs`'s batched FA layer and covering its per-token fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillKvMode {
+    /// Q8_0 — `fa_kv_ok` holds, FA layers take the batched arm.
+    Q8,
+    /// KVarN — fails `fa_kv_ok`, FA layers take the per-token fallback. This is
+    /// the default KV mode in production.
+    Kvarn,
+}
+
+impl PrefillKvMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "q8" | "q8_0" => Ok(Self::Q8),
+            "kvarn" => Ok(Self::Kvarn),
+            other => Err(format!("prefill probe: unknown --kv mode {other:?} (q8|kvarn)")),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Q8 => "q8",
+            Self::Kvarn => "kvarn",
+        }
+    }
+}
+
 /// Result of a [`run_prefill_hash`] pass.
 ///
 /// **Why this is differential, and why it is not a hash comparison.** Every
@@ -1322,6 +1350,7 @@ fn qwen35_prefill_then_decode(
     n_prefill: usize,
     batched: bool,
     corrupt_kv_prefix: bool,
+    kv_mode: PrefillKvMode,
 ) -> Result<(u64, Vec<Vec<f32>>), String> {
     let mut model = TinyModel::load(arch, path, gpu, tokens.len() + 16)?;
 
@@ -1340,6 +1369,28 @@ fn qwen35_prefill_then_decode(
                 )
             }
         };
+        // `TinyModel::load` builds a Q8 KV, for which `fa_kv_ok` holds and the
+        // FA layers take the BATCHED arm. KVarN is `quantized` but is none of
+        // q8/asym{2,3,4}, so it fails `fa_kv_ok` (`prefill_chunk.rs:2313`) and
+        // routes FA to the per-token fallback instead. KVarN is also the default
+        // KV mode, so that fallback is live in production — and it is the arm
+        // M2a1 rewrote, which nothing else here executes.
+        //
+        // ponytail: the replaced Q8 buffers leak (GpuTensor has no pool-returning
+        // Drop). Bounded and fine for a probe process that exits immediately;
+        // free them explicitly if this ever moves somewhere long-lived.
+        if kv_mode == PrefillKvMode::Kvarn {
+            *kv = KvCache::new_gpu_kvarn(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                tokens.len() + 16,
+                4,
+            )
+            .map_err(|e| format!("prefill probe: kvarn kv: {e:?}"))?;
+        }
+
         let vocab = config.vocab_size.max(1) as u32;
         let prompt: Vec<u32> = tokens[..n_prefill].iter().map(|t| t % vocab).collect();
 
@@ -1395,6 +1446,22 @@ fn qwen35_prefill_then_decode(
                         .map_err(|e| format!("prefill probe: corrupt fill: {e:?}"))?;
                 }
             }
+            // KVarN keeps the not-yet-quantized trailing block in a separate f32
+            // recent-window ring and only flushes into `k_gpu` once a full
+            // GROUP=128 block accumulates. A 64-token prefill therefore lives
+            // ENTIRELY in `k_window`, and scribbling on `k_gpu` alone is a no-op
+            // — which is what the self-check caught: under `--kv kvarn` the
+            // corrupted run still agreed, to eight decimals. Each window buffer
+            // is `[GROUP x kv_dim]` f32, so position p owns `kv_dim` elements at
+            // `p * kv_dim`.
+            let kv_dim = kv.kv_dim.max(1);
+            for w in kv.k_window.iter() {
+                let span = (kv_dim * n_prefill.saturating_sub(1)).min(w.numel());
+                if span > 0 {
+                    gpu.fill_f32(&w.sub_offset(0, span), 0.0)
+                        .map_err(|e| format!("prefill probe: corrupt window fill: {e:?}"))?;
+                }
+            }
         }
 
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1429,6 +1496,7 @@ pub fn run_prefill_hash(
     n_decode: usize,
     seed: u64,
     corrupt_kv_prefix: bool,
+    kv_mode: PrefillKvMode,
 ) -> Result<PrefillHashOut, String> {
     if n_prefill < 2 {
         return Err("prefill probe: --prefill must be >= 2".into());
@@ -1446,9 +1514,11 @@ pub fn run_prefill_hash(
         n_prefill,
         true,
         corrupt_kv_prefix,
+        kv_mode,
     )?;
-    let (ref_state_hash, reference) =
-        qwen35_prefill_then_decode(arch, model_path, gpu, &tokens, n_prefill, false, false)?;
+    let (ref_state_hash, reference) = qwen35_prefill_then_decode(
+        arch, model_path, gpu, &tokens, n_prefill, false, false, kv_mode,
+    )?;
 
     if batched.len() != reference.len() {
         return Err(format!(
