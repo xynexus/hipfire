@@ -555,6 +555,11 @@ fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
     ))
 }
 
+/// True for every `kvarn*` token accepted by [`kvarn_bits_from_mode`].
+pub(crate) fn kv_mode_is_kvarn(kv_mode: &str) -> bool {
+    matches!(kv_mode, "kvarn" | "kvarn2" | "kvarn4" | "kvarn8")
+}
+
 pub(crate) fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
     match kv_mode {
         "kvarn8" => 8,
@@ -727,6 +732,31 @@ pub fn load_model(
         cask_off,
     );
     let dflash_requested = resolved_dflash.is_some();
+    // TriAttention/CASK eviction compacts the KV by gathering the retained
+    // positions, which every supported mode implements as a per-position copy.
+    // KVarN cannot be gathered that way: its K is 4-bit var-norm records
+    // covering 128-token BLOCKS, so dropping arbitrary positions means
+    // re-encoding every surviving block. That needs new kernels AND would
+    // re-quantize already-quantized values on every eviction cycle, compounding
+    // error the longer the context runs.
+    //
+    // Reaching `maybe_evict` with a KVarN cache used to PANIC, killing the
+    // daemon on any prompt longer than physical_cap. Decline the sidecar
+    // instead. Nothing is lost by doing so: KVarN already bounds KV cost on K
+    // by ~8x WITHOUT dropping a token, which is what eviction was there to do.
+    // The cache is then sized for the full window; `HIPFIRE_KV_PHYSICAL_CAP`
+    // still caps the allocation for operators who need a smaller one.
+    let resolved_triattn = match resolved_triattn {
+        Some(source) if kv_mode_is_kvarn(&kv_mode) => {
+            eprintln!(
+                "  TriAttention component ({}) declined: eviction cannot compact KVarN \
+                 block records — KV sized for the full context window instead",
+                source.label()
+            );
+            None
+        }
+        other => other,
+    };
     let cask_requested = resolved_triattn.is_some();
     if matches!(resolved_dflash, Some(ResolvedComponentSource::Embedded)) {
         let verify_started = std::time::Instant::now();

@@ -62,14 +62,22 @@ Worth stating because the failure mode is silent: the kernel was correct the
 whole time and every microbench still said 1.43x. Only the end-to-end number
 moved, and it moved the wrong way.
 
-## Unrelated defect found while validating
+## Unrelated defect found while validating — since FIXED
 
 `TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now`
-(`crates/hipfire-runtime/src/triattn.rs:1724`) — **panics**, it does not fall
-back. Any prompt longer than `physical_cap` (896 at max_seq 8192) kills the
-daemon under both `kvarn` and `f32` KV. This caps how long a context KVarN can
-actually serve and is why the 2k-token arm of this experiment could not be run.
-Pre-existing; not touched here.
+(`crates/hipfire-runtime/src/triattn.rs`) — **panicked**, it did not fall back.
+Any prompt longer than `physical_cap` (896 at max_seq 8192) killed the daemon
+under `kvarn`, which is why the 2k-token arm of this experiment could not be run
+at first. Fixed in a follow-up: the load path now declines a TriAttention
+sidecar under KVarN and sizes the KV for the full window, and `maybe_evict`
+returns an error rather than aborting the process. See
+`2026-08-22-triattn-kvarn-eviction.md`.
+
+With that in, the 2059-token arm runs, and the iu4x2 win holds:
+
+| prompt | iu8 | iu4x2 | |
+|---|---|---|---|
+| 2059 tok | 185.1 / 184.4 | **209.7 / 211.3** | **+13.9%** |
 
 ## Gate state
 

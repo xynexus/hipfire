@@ -1721,7 +1721,16 @@ impl EvictionCtx {
         } else if kv.quant_q8 {
             (Mode::Q8, self.n_kv_heads * (self.head_dim / 32) * 34)
         } else {
-            panic!("TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now");
+            // Recoverable, not a panic: this used to abort the whole daemon.
+            // The load path declines a TriAttention sidecar under KVarN (see
+            // load.rs), so reaching here means some other unsupported mode --
+            // fail the request, don't take the process down with it.
+            return Err(hip_bridge::HipError::new(
+                0,
+                "TriAttention eviction supports only Q8, asym2, asym3 and asym4 KV; \
+                 KVarN stores K as 4-bit records over 128-token blocks, which cannot \
+                 be compacted by a per-position gather",
+            ));
         };
         let v_bytes_per_pos = self.n_kv_heads * (self.head_dim / 32) * 34;
 
