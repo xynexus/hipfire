@@ -2861,6 +2861,12 @@ impl Qwen35Generation {
                 gpu, weights, config, &mut rows, scratch, pbs,
             )
             .map_err(|e| format!("qwen35 batched decode forward failed: {e:?}"))?;
+            // Probe, not decoration: "the batched run produced identical output"
+            // is also what a silent fallback to round-robin produces. Only a
+            // positive count from INSIDE the fused arm distinguishes them.
+            if std::env::var("HIPFIRE_BATCH_PROBE").is_ok() {
+                eprintln!("[batch-probe] fused decode rows={}", rows.len());
+            }
             drop(rows);
 
             // ── post: per stream, each sampling from its OWN logits ──

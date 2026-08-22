@@ -1152,10 +1152,14 @@ struct CalibrateDaemonSession {
 /// and `resume`-ing a second without an intervening park is the documented way
 /// to get "qwen35 session missing decode state". `qwen35_save_active_session`
 /// puts the occupant back first so every stream is findable.
-fn march_streams_batched(daemon_state: &mut state::DaemonState) {
+/// Returns the streams it actually stepped. The caller MUST skip those in the
+/// round-robin pass: without that, every stream stepped twice per march and
+/// exactly half the tokens bypassed the fused arm (measured: 8 fused rows=4
+/// steps for 64 tokens).
+fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::StreamId> {
     let ids = daemon_state.streams.runnable();
     if ids.len() < 2 {
-        return;
+        return Vec::new();
     }
     // Take the handles out of the table for the round; each is put back or
     // retired below, mirroring the round-robin path's ownership.
@@ -1175,14 +1179,14 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) {
                 s.generation = Some(g);
             }
         }
-        return;
+        return Vec::new();
     }
 
     let Some(m) = daemon_state.model.as_mut() else {
         for (id, _, _, _) in taken {
             daemon_state.streams.retire(id);
         }
-        return;
+        return Vec::new();
     };
     if let Err(e) = hipfire_serving_core::session::qwen35_save_active_session(m, &mut daemon_state.gpu) {
         eprintln!("[executor] batched march: cannot free the resident slot: {e}");
@@ -1191,7 +1195,43 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) {
                 s.generation = Some(g);
             }
         }
-        return;
+        return Vec::new();
+    }
+    // The fused batch scratch is allocated lazily by the batched PREFILL path,
+    // which never runs for plain `generate` requests — so on this path it is
+    // simply absent and `step_batch` refuses. Measured, not predicted: the first
+    // run of this code fell back to round-robin with "needs prefill-batch
+    // scratch" and produced byte-identical output, which looks like success and
+    // is not.
+    {
+        let rows_needed = taken.len();
+        let need_alloc = m
+            .q35_scratch
+            .as_ref()
+            .map(|sc| {
+                sc.prefill_batch
+                    .as_ref()
+                    .is_none_or(|pbs| pbs.max_batch < rows_needed)
+            })
+            .unwrap_or(false);
+        if need_alloc {
+            let cfg = m.q35_config.as_ref().expect("qwen35 config").clone();
+            if let Some(sc) = m.q35_scratch.as_mut() {
+                if let Some(existing) = sc.prefill_batch.take() {
+                    existing.free_gpu(&mut daemon_state.gpu);
+                }
+                match hipfire_arch_qwen35::qwen35::PrefillBatchScratch::new(
+                    &mut daemon_state.gpu,
+                    &cfg,
+                    rows_needed.max(2),
+                ) {
+                    Ok(pbs) => sc.prefill_batch = Some(pbs),
+                    Err(e) => {
+                        eprintln!("[executor] batched march: cannot allocate batch scratch: {e:?}")
+                    }
+                }
+            }
+        }
     }
     for (_, _, sid, g) in taken.iter_mut() {
         if let Err(e) = g.acquire_from_registry(m, sid) {
@@ -1222,10 +1262,11 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) {
                     s.generation = Some(g);
                 }
             }
-            return;
+            return Vec::new();
         }
     };
 
+    let stepped: Vec<stream::StreamId> = taken.iter().map(|(id, ..)| *id).collect();
     for ((id, req_id, sid, mut g), step) in taken.into_iter().zip(outcomes) {
         let m = daemon_state.model.as_mut().expect("checked above");
         g.release_to_registry(m, &sid);
@@ -1245,6 +1286,7 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) {
             }
         }
     }
+    stepped
 }
 
 /// Run the executor until nothing is runnable.
@@ -1285,12 +1327,18 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
     if !stream::executor_v2_enabled() {
         return;
     }
-    if stream::executor_batched_enabled() {
-        march_streams_batched(daemon_state);
-        // Whatever the batched round could not take (fewer than two runnable,
-        // or a stream it excluded) falls through to the round-robin march.
-    }
+    let batched: Vec<stream::StreamId> = if stream::executor_batched_enabled() {
+        march_streams_batched(daemon_state)
+    } else {
+        Vec::new()
+    };
+    // Whatever the batched round could not take (fewer than two runnable, or a
+    // stream it excluded) falls through to the round-robin march. What it DID
+    // step must not step again this march.
     for id in daemon_state.streams.runnable() {
+        if batched.contains(&id) {
+            continue;
+        }
         let Some((generation, req_id, session)) = daemon_state.streams.get_mut(id).and_then(|s| {
             s.generation
                 .take()
