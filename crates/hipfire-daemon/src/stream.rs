@@ -93,10 +93,20 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
     let session = session_of(msg);
     // priority and enqueued_at_ms are 0 because nothing schedules on them yet;
     // the march loop is what gives them meaning.
+    // Priority comes off the wire. `WorkloadSpec` has carried a `priority` field
+    // all along and admission hardcoded 0, so latency-sensitive work had no way
+    // to say so. Reusing it beats adding realtime `WorkloadClass` variants ahead
+    // of anything that consumes them — §M6 can still add those when the classes
+    // carry contracts, but the ordering lever already exists.
+    let priority = msg
+        .get("priority")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u8::MAX as u64) as u8;
     let spec = WorkloadSpec::singleton(
         session.as_str(),
         WorkloadClass::TokenDecode,
-        0,
+        priority,
         0,
         WorkloadResources::default(),
     );
@@ -278,12 +288,23 @@ impl StreamTable {
     }
 
     /// Ids the march loop may give a quantum to, in admission order.
+    /// Ids the march loop may give a quantum to, **highest priority first**,
+    /// admission order within a priority.
+    ///
+    /// The march loop steps this list in order, so a higher-priority stream is
+    /// dispatched before any lower-priority one in the same pass — which is what
+    /// makes admission→first-dispatch bounded for latency-sensitive work while
+    /// bulk streams keep running. `BTreeMap` iteration is already admission
+    /// order, and `sort_by_key` is stable, so equal priorities keep it.
     pub(crate) fn runnable(&self) -> Vec<StreamId> {
-        self.streams
+        let mut ids: Vec<(u8, StreamId)> = self
+            .streams
             .iter()
             .filter(|(_, s)| s.is_runnable())
-            .map(|(id, _)| *id)
-            .collect()
+            .map(|(id, s)| (s.spec.priority, *id))
+            .collect();
+        ids.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+        ids.into_iter().map(|(_, id)| id).collect()
     }
 
     pub(crate) fn len(&self) -> usize {
