@@ -555,9 +555,23 @@ fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
     ))
 }
 
-/// True for every `kvarn*` token accepted by [`kvarn_bits_from_mode`].
-pub(crate) fn kv_mode_is_kvarn(kv_mode: &str) -> bool {
-    matches!(kv_mode, "kvarn" | "kvarn2" | "kvarn4" | "kvarn8")
+/// KV modes whose cache TriAttention/CASK eviction can actually compact.
+///
+/// `EvictionCtx::maybe_evict` dispatches on the `KvCache` flags `quant_asym3`,
+/// `quant_asym4`, `quant_asym2` and `quant_q8`, and has no arm for anything
+/// else. These are the `kv_mode` tokens that set one of those four:
+/// `asym2/3/4` and `fwht2/3/4` (which are asym with a rotation, so they set
+/// `quant_asym*` too) and `q8`.
+///
+/// Everything else — `fp32`/unquantized and every `kvarn*` — reaches no arm.
+/// This is deliberately a WHITELIST: an unrecognised or newly added mode
+/// declines the sidecar (losing eviction, still serving) rather than failing
+/// the request the moment the cache reaches `budget + beta`.
+pub(crate) fn triattn_can_evict_kv_mode(kv_mode: &str) -> bool {
+    matches!(
+        kv_mode,
+        "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4"
+    )
 }
 
 pub(crate) fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
@@ -733,24 +747,30 @@ pub fn load_model(
     );
     let dflash_requested = resolved_dflash.is_some();
     // TriAttention/CASK eviction compacts the KV by gathering the retained
-    // positions, which every supported mode implements as a per-position copy.
-    // KVarN cannot be gathered that way: its K is 4-bit var-norm records
-    // covering 128-token BLOCKS, so dropping arbitrary positions means
-    // re-encoding every surviving block. That needs new kernels AND would
-    // re-quantize already-quantized values on every eviction cycle, compounding
-    // error the longer the context runs.
+    // positions, a per-position copy, and `maybe_evict` has an arm only for
+    // asym2/3/4 and q8 (see `triattn_can_evict_kv_mode`). Every other mode used
+    // to reach a `panic!` there — and because a sidecar makes the KV allocate at
+    // `physical_cap` (budget+beta+256) instead of `max_seq` precisely so
+    // eviction can bound VRAM, `maybe_evict` fires the moment a prompt passes
+    // that. So under `fp32` or `kvarn`, ANY prompt longer than ~physical_cap
+    // killed the daemon mid-generation.
     //
-    // Reaching `maybe_evict` with a KVarN cache used to PANIC, killing the
-    // daemon on any prompt longer than physical_cap. Decline the sidecar
-    // instead. Nothing is lost by doing so: KVarN already bounds KV cost on K
-    // by ~8x WITHOUT dropping a token, which is what eviction was there to do.
-    // The cache is then sized for the full window; `HIPFIRE_KV_PHYSICAL_CAP`
-    // still caps the allocation for operators who need a smaller one.
+    // KVarN in particular can never be compacted this way: its K is 4-bit
+    // var-norm records covering 128-token BLOCKS, so dropping arbitrary
+    // positions means re-encoding every surviving block — new kernels, plus a
+    // re-quantization of already-quantized values that would compound error on
+    // every eviction cycle.
+    //
+    // So decline the sidecar for anything not known-evictable. Nothing is lost
+    // under KVarN, which already bounds KV cost on K by ~8x WITHOUT dropping a
+    // token — that is what eviction was there to do. The cache is then sized for
+    // the full window; `HIPFIRE_KV_PHYSICAL_CAP` still caps the allocation for
+    // operators who need a smaller one.
     let resolved_triattn = match resolved_triattn {
-        Some(source) if kv_mode_is_kvarn(&kv_mode) => {
+        Some(source) if !triattn_can_evict_kv_mode(&kv_mode) => {
             eprintln!(
-                "  TriAttention component ({}) declined: eviction cannot compact KVarN \
-                 block records — KV sized for the full context window instead",
+                "  TriAttention component ({}) declined: eviction cannot compact \
+                 kv_mode={kv_mode} — KV sized for the full context window instead",
                 source.label()
             );
             None

@@ -27,19 +27,29 @@ K is the blocker.
 
 ## The fix
 
-Decline the sidecar instead of half-supporting it. The load path now filters
-`resolved_triattn` to `None` when the resolved `kv_mode` is any `kvarn*` token,
-before `cask_requested` is derived, so `physical_cap` falls through to `max_seq`
-and no eviction context is built. It says so out loud:
+Decline the sidecar instead of half-supporting it. The load path now filters `resolved_triattn`
+to `None` for any `kv_mode` that is not known-evictable, before `cask_requested`
+is derived, so `physical_cap` falls through to `max_seq` and no eviction context
+is built. It says so out loud:
 
-    TriAttention component (sibling) declined: eviction cannot compact KVarN
-    block records — KV sized for the full context window instead
+    TriAttention component (sibling) declined: eviction cannot compact
+    kv_mode=fp32 — KV sized for the full context window instead
 
 Nothing is given up. Eviction exists to bound KV cost, and KVarN already does
 that — ~8x on K, **without dropping a single token**. Stacking a lossy
 token-dropping policy on top of a lossy-compression one was never the better
 trade. `HIPFIRE_KV_PHYSICAL_CAP` still caps the allocation for operators who
 want a smaller one.
+
+**This is not a KVarN-only bug.** `maybe_evict` dispatches on `quant_asym3`,
+`quant_asym4`, `quant_asym2` and `quant_q8`; the `kv_mode` tokens that set one of
+those are `asym2/3/4`, `fwht2/3/4` (asym plus a rotation) and `q8`. **`fp32`
+reaches no arm either**, so unquantized KV + a sidecar panicked exactly the same
+way — that was the first crash seen this session, before KVarN was even
+suspected. `triattn_can_evict_kv_mode` is therefore a WHITELIST: an unrecognised
+or newly added mode declines the sidecar rather than failing a request the moment
+the cache reaches `budget + beta`. Verified `asym4` still builds eviction at
+`physical_cap=896`, unchanged.
 
 Separately, `maybe_evict`'s `panic!` is now a returned `HipError`. The load-path
 filter means it should be unreachable for KVarN, but a panic takes down the
@@ -62,3 +72,17 @@ coherent.
 that token-dropping eviction is not needed to afford it.
 
 no-gpu-ci PASS.
+
+## Where this leaves prefill throughput
+
+Worth recording, because the fix exposes it: with the sidecar declined, prefill
+on the default config is **14.4 tok/s** (kvarn) and **15.0** (fp32) — the
+per-token path. The 210 tok/s figure requires `HIPFIRE_KVARN_BATCHED_PREFILL=1`.
+Batched prefill is not reachable any other way on this model: fp32 KV fails
+`fa_kv_ok`, so it stays per-token whether or not `HIPFIRE_PREFILL_BATCHED` is
+set, and under KVarN the batched path is gated off because
+`forward_prefill_batch` runs its own batched attention and never populates the
+KVarN window/records.
+
+So the single gate between the default config and a **~14x** prefill speedup is
+the KVarN batched-prefill faithfulness bug, not anything in the GEMM.
