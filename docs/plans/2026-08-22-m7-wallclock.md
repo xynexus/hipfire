@@ -31,6 +31,42 @@ the march loop buys.
 concurrent streams produce no more tokens per second than one. Concurrency is
 being time-sliced, not exploited.
 
+## CORRECTION — the crossover exists, and here it is
+
+The section below concluded that no crossover was measurable because nothing
+coalesces across streams at decode. **That was wrong, and the error was mine:**
+I checked the callers of `select_qwen35_decode_batch_backend` and found only
+tests, then generalised. I did not check
+`run_generate_batch_decode_step_qwen35`, which **is** called — by
+`batch_executor.rs:160`, reachable from the daemon as the
+`generate_batch_decode_step` message.
+
+Driving that path directly (prefill the batch, then step it N-wide):
+
+| N | batched | v2 round-robin | inline | batched ÷ v2 |
+|---|---|---|---|---|
+| 1 | — | 24.01 | 24.10 | — |
+| 4 | **33.96** | 22.58 | — | 1.50× |
+| 16 | **50.67** | 22.43 | 10.86 | **2.26×** |
+| 32 | **55.02** | 18.42 | 7.89 | **2.99×** |
+
+**Batched decode scales with N; round-robin does not.** 33.96 → 50.67 → 55.02
+against 22.58 → 22.43 → 18.42. Against solo decode (24.0 tok/s) the batch is
+1.41× at N=4, 2.11× at N=16, 2.29× at N=32.
+
+So §M7's capacity thesis holds at wall-clock, not just in weight bytes, and the
+crossover against single-stream is **between N=1 and N=4**. The falsification
+condition — no crossover below the N whose KV fits VRAM (~129) — does not fire.
+
+**The real gap is that the v2 executor does not use this path.** Both mechanisms
+exist; the march loop round-robins one stream per quantum while the batched
+entry point sits behind a different message type. Wiring `march_streams` to
+dispatch a batched step is worth 2.26× at N=16 and 2.99× at N=32 on these
+numbers — and it is scheduling work, not kernel work.
+
+The section below is kept for the reasoning it records, but its conclusion is
+superseded by this measurement.
+
 ## Why there is no crossover to find
 
 §M7's thesis is that module-major execution beats layer-major past some N,
