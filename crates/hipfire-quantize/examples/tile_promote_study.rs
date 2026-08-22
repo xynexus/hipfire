@@ -165,7 +165,7 @@ fn main() {
                 for (n, slot) in [(1usize, 2usize), (2, 3), (3, 4)] {
                     let keep: Vec<usize> = tiles[..n]
                         .iter()
-                        .flat_map(|&(_, t)| (t * TILE..(t + 1) * TILE))
+                        .flat_map(|&(_, t)| t * TILE..(t + 1) * TILE)
                         .collect();
                     acc[slot] += sse_with_int8_at(grp, scale, &keep);
                 }
