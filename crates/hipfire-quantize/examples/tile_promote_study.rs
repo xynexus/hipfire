@@ -119,8 +119,6 @@ fn main() {
         let mut acc_shared16 = 0.0f64;
         let mut acc_sharedall = 0.0f64;
         // Tile error accumulated over ALL rows, for the share-across-everything arm.
-        let ntile = k / TILE;
-        let mut global_tile_err = vec![0.0f64; ntile];
         let mut all_rows: Vec<Vec<f32>> = Vec::new();
 
         for r in 0..rows.min(rows_cap) {
@@ -228,7 +226,6 @@ fn main() {
                 }
             }
         }
-        let _ = global_tile_err;
         if energy <= 0.0 {
             continue;
         }
