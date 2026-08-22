@@ -111,10 +111,13 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     for (int i = 0; i < WMt; i++)
 #pragma unroll
         for (int j = 0; j < WNt; j++) {
-            acch[i][j] = (i32x4){0, 0, 0, 0};
-            accl[i][j] = (i32x4){0, 0, 0, 0};
+            // acch/accl are NOT zeroed here: the first K-step of every group --
+            // including the first -- seeds its WMMA from the shared `zero4`
+            // below rather than from itself, so 64 v_mov_b32 per group fold go
+            // away. D and C may differ in a WMMA, which is what makes this work.
             facc[i][j] = (f32x4){0.f, 0.f, 0.f, 0.f};
         }
+    const i32x4 zero4 = (i32x4){0, 0, 0, 0};
 
     // Scale pointers hoisted: the row/col indices vary only in the group, so a
     // 64-bit multiply per (group, tile) becomes one per tile for the kernel.
@@ -156,6 +159,7 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     __syncthreads();
     for (int k = 0; k < nstrip; k++) {
         int buf = k & 1;
+        const bool seed = (k % STRIPS_PER_GROUP) == 0;
         if (k + 1 < nstrip) { LOADG((k + 1) * BK); }
 #pragma unroll
         // Every LDS read below is 128-bit at the ISA, both operands. X gets there
@@ -183,8 +187,15 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
                 for (int j = 0; j < WNt; j++) {
                     // ONE weight fragment, BOTH digit passes -- the whole reason
                     // two passes are not two kernels' worth of weight traffic.
-                    acch[i][j] = W64H(af[i], xfh[j], acch[i][j]);
-                    accl[i][j] = W64L(af[i], xfl[j], accl[i][j]);
+                    // `s` is compile-time here and `seed` is wave-uniform, so
+                    // this is one scalar branch around step 0, not a select.
+                    if (s == 0 && seed) {
+                        acch[i][j] = W64H(af[i], xfh[j], zero4);
+                        accl[i][j] = W64L(af[i], xfl[j], zero4);
+                    } else {
+                        acch[i][j] = W64H(af[i], xfh[j], acch[i][j]);
+                        accl[i][j] = W64L(af[i], xfl[j], accl[i][j]);
+                    }
                 }
         }
         // A compact group is 256 weights = STRIPS_PER_GROUP strips. Fold the i32
@@ -209,8 +220,6 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
                         const int v = 16 * acch[i][j][g] + accl[i][j][g];
                         facc[i][j][g] += (float)v * sw[i][g] * sx;
                     }
-                    acch[i][j] = (i32x4){0, 0, 0, 0};
-                    accl[i][j] = (i32x4){0, 0, 0, 0};
                 }
             }
         }
