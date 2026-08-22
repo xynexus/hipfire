@@ -55,6 +55,22 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_x4_transpose(
     if (k < n_groups) XsT[(long long)k * B + b] = Xs[(long long)b * n_groups + k];
 }
 
+// int8 twin of the above, for the exact W4A8 (iu4x2) path whose activation is
+// already one byte per element. Same [K, B] / [ng, B] output layout.
+__launch_bounds__(256) extern "C" __global__ void oq_compact_x8_transpose(
+    const int8_t* __restrict__ X,
+    const float*  __restrict__ Xs,
+    int8_t*       __restrict__ XT,
+    float*        __restrict__ XsT,
+    int B, int K, int n_groups
+) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y;
+    if (b >= B || k >= K) return;
+    XT[(long long)k * B + b] = X[(long long)b * K + k];
+    if (k < n_groups) XsT[(long long)k * B + b] = Xs[(long long)b * n_groups + k];
+}
+
 __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
     const uint8_t* __restrict__ W,
     const int8_t*  __restrict__ XT,

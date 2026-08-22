@@ -573,6 +573,8 @@ pub struct Gpu {
     pub oq8_xq_batch: Option<GpuTensor>, // int8 activation, N*K bytes (oq8 W8A8)
     pub oq8_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq8_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
+    pub oq_xt_batch: Option<GpuTensor>,  // K-major int8 activation, N*K (iu4x2 overlay pass)
+    pub oq_xst_batch: Option<GpuTensor>, // K-major f32 act scales, N*K/256
     // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
     // per (batch,G256) and reused by every output-row block in the projection.
     // Capacity grows to the largest bounded chunk seen and is stream-reused.
@@ -990,6 +992,8 @@ impl Gpu {
             oq8_xq_batch: None,
             oq8_xs_batch: None,
             oq8_ytmp_batch: None,
+            oq_xt_batch: None,
+            oq_xst_batch: None,
             dflash_oq_xq_batch: None,
             dflash_oq_xs_batch: None,
             paro_x_scratch: None,
@@ -2625,6 +2629,15 @@ impl Gpu {
         }
         if grow(&self.oq8_ytmp_batch, need_y) {
             self.oq8_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
+        }
+        // K-major twins for the iu4x2 overlay pass. Same sizes as xq/xs, just
+        // transposed; allocated here so the GEMM never mallocs in the hot path
+        // (doing so per call cost prefill 195.0 -> 132.2 tok/s on the 27B).
+        if grow(&self.oq_xt_batch, need_xq) {
+            self.oq_xt_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if grow(&self.oq_xst_batch, need_xs) {
+            self.oq_xst_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
         }
         Ok(())
     }

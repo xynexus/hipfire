@@ -546,6 +546,36 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
+        // Exact W4A8 via two iu4 WMMA passes, plus the overlay as a K-major
+        // pass. Same arithmetic as the iu8 core below -- iu8 spends half its
+        // weight lanes on sign-extended 4-bit values -- but ~1.4x faster on the
+        // 27B projection shapes. Opt-in until it has run a coherence battery.
+        if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() == Ok("1") {
+            let xt = GpuTensor {
+                buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * k],
+                dtype: DType::Raw,
+            };
+            let xst = GpuTensor {
+                buf: unsafe { self.oq_xst_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * ng],
+                dtype: DType::F32,
+            };
+            self.gemm_oq_compact_iu4x2_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)?;
+            self.oq_compact_x8_transpose(&xq, &xs, &xt, &xst, n, k, ng)?;
+            // ACCUMULATES into y, so it must follow the GEMM on the same Y.
+            return self.oq_compact_overlay_correct_t(
+                w_blocks,
+                &xt,
+                &xst,
+                y,
+                m,
+                k,
+                n,
+                GROUP,
+                block_stride,
+            );
+        }
         self.gemm_oq_compact_grouped_wmma(w_blocks, &xq, &xs, y, m, k, n, GROUP, block_stride)
     }
 
@@ -663,6 +693,40 @@ impl Gpu {
         let (bi, ki, ngi) = (b as i32, k as i32, n_groups as i32);
         self.launch_kernargs(
             "oq_compact_x4_transpose",
+            [(b as u32).div_ceil(256), k as u32, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr xsp, ptr xtp, ptr xstp, i32 bi, i32 ki, i32 ngi],
+        )
+    }
+
+    /// int8 twin of [`Self::oq_compact_x4_transpose`], for the exact W4A8 path
+    /// whose activation is already one byte per element.
+    pub fn oq_compact_x8_transpose(
+        &mut self,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+        b: usize,
+        k: usize,
+        n_groups: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "oq_compact_x8_transpose",
+            kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
+            "oq_compact_x8_transpose",
+        )?;
+        let (xp, xsp, xtp, xstp) = (
+            x_i8.buf.as_ptr(),
+            x_scales.buf.as_ptr(),
+            xt.buf.as_ptr(),
+            xst.buf.as_ptr(),
+        );
+        let (bi, ki, ngi) = (b as i32, k as i32, n_groups as i32);
+        self.launch_kernargs(
+            "oq_compact_x8_transpose",
             [(b as u32).div_ceil(256), k as u32, 1],
             [256, 1, 1],
             0,
