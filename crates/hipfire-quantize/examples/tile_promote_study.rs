@@ -84,8 +84,8 @@ fn main() {
 
     println!("tile-promotion study: G={G}, tile={TILE}, n_out={N_OUT}, <= {rows_cap} rows\n");
     println!(
-        "  {:<14} {:>10} {:>11} {:>11} {:>11} {:>11} {:>9}",
-        "tensor", "int4", "overlay-3", "1 tile", "2 tiles", "3 tiles", "1tile/ov"
+        "  {:<12} {:>10} {:>10} {:>10} {:>11} {:>11} {:>8}",
+        "tensor", "int4", "overlay-3", "1t/row*", "1t/16rows", "1t/allrows", "sh16/ov"
     );
 
     for sfx in ["gate_proj.weight", "down_proj.weight", "q_proj.weight"] {
@@ -110,6 +110,18 @@ fn main() {
                 .unwrap() as usize;
         let mut acc = [0.0f64; 5];
         let mut energy = 0.0f64;
+        // A WMMA A-operand tile is [16 rows][16 K]: all 16 output rows contract
+        // against the SAME activation layout, so any widening pattern -- whether
+        // iu8 tile promotion or an activation-duplication double-accumulate --
+        // must be IDENTICAL across those 16 rows. Buffer a 16-row band and score
+        // the shared choice against the per-row optimum.
+        let mut band: Vec<Vec<f32>> = Vec::with_capacity(16);
+        let mut acc_shared16 = 0.0f64;
+        let mut acc_sharedall = 0.0f64;
+        // Tile error accumulated over ALL rows, for the share-across-everything arm.
+        let ntile = k / TILE;
+        let mut global_tile_err = vec![0.0f64; ntile];
+        let mut all_rows: Vec<Vec<f32>> = Vec::new();
 
         for r in 0..rows.min(rows_cap) {
             let mut row: Vec<f32> = (0..k)
@@ -125,6 +137,8 @@ fn main() {
             }
             energy += row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
 
+            band.push(row.clone());
+            all_rows.push(row.clone());
             for grp in row.chunks(G) {
                 let amax = grp.iter().fold(0f32, |m, v| m.max(v.abs()));
                 if amax <= 0.0 {
@@ -159,19 +173,75 @@ fn main() {
                 }
             }
         }
+        // Shared-across-16-rows: per 256-group, pick the ONE tile whose promotion
+        // helps the 16-row band most, then charge every row for that choice.
+        for chunk in band.chunks(16) {
+            let ng = k / G;
+            for gi in 0..ng {
+                let mut per_tile = vec![0.0f64; G / TILE];
+                let mut scales = Vec::with_capacity(chunk.len());
+                for r in chunk {
+                    let grp = &r[gi * G..(gi + 1) * G];
+                    let sc = hipfire_quantize::codecs::symmetric_clipsearch(grp, 7.0);
+                    scales.push(sc);
+                    for t in 0..G / TILE {
+                        per_tile[t] += sse_int4(&grp[t * TILE..(t + 1) * TILE], sc);
+                    }
+                }
+                let best = per_tile
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(t, _)| t)
+                    .unwrap_or(0);
+                let keep: Vec<usize> = (best * TILE..(best + 1) * TILE).collect();
+                for (r, &sc) in chunk.iter().zip(&scales) {
+                    let grp = &r[gi * G..(gi + 1) * G];
+                    acc_shared16 += sse_with_int8_at(grp, sc, &keep);
+                }
+            }
+        }
+        // Shared across EVERY row (one tile per 256-group for the whole tensor).
+        {
+            let ng = k / G;
+            for gi in 0..ng {
+                let mut per_tile = vec![0.0f64; G / TILE];
+                let mut scales = Vec::with_capacity(all_rows.len());
+                for r in &all_rows {
+                    let grp = &r[gi * G..(gi + 1) * G];
+                    let sc = hipfire_quantize::codecs::symmetric_clipsearch(grp, 7.0);
+                    scales.push(sc);
+                    for t in 0..G / TILE {
+                        per_tile[t] += sse_int4(&grp[t * TILE..(t + 1) * TILE], sc);
+                    }
+                }
+                let best = per_tile
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(t, _)| t)
+                    .unwrap_or(0);
+                let keep: Vec<usize> = (best * TILE..(best + 1) * TILE).collect();
+                for (r, &sc) in all_rows.iter().zip(&scales) {
+                    let grp = &r[gi * G..(gi + 1) * G];
+                    acc_sharedall += sse_with_int8_at(grp, sc, &keep);
+                }
+            }
+        }
+        let _ = global_tile_err;
         if energy <= 0.0 {
             continue;
         }
         let rel: Vec<f64> = acc.iter().map(|v| v / energy).collect();
         println!(
-            "  {:<14} {:>10.3e} {:>11.3e} {:>11.3e} {:>11.3e} {:>11.3e} {:>8.2}x",
+            "  {:<12} {:>10.3e} {:>10.3e} {:>10.3e} {:>11.3e} {:>11.3e} {:>7.2}x",
             sfx.trim_end_matches(".weight"),
             rel[0],
             rel[1],
             rel[2],
-            rel[3],
-            rel[4],
-            rel[2] / rel[1]
+            acc_shared16 / energy,
+            acc_sharedall / energy,
+            (acc_shared16 / energy) / rel[1]
         );
     }
     println!("\ncost, per 256-group (no gather, no second pass, no index):");
