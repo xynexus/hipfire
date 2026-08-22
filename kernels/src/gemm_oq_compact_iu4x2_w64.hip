@@ -85,7 +85,12 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     // to 80 B (20 dwords, gcd(20,64)=4) spreads them over all 16.
 #define XPAD 16
     __shared__ __align__(16) uint8_t As[2][BM * (BK / 2)], Xi[2][BN * (BK + XPAD)];
-    const int bm = blockIdx.x * BM, bn = blockIdx.y * BN, st = K / 2;
+    // SWIZZLE: N is the FAST grid axis, M the slow one. With M fast, the whole
+    // 47 MB weight set is swept once per N-block -- 4 sweeps at B=512 against a
+    // 32 MB MALL that cannot hold one, so every sweep is a fresh DRAM read.
+    // With N fast, consecutive workgroups share an M-block, so the resident
+    // working set is ~174 kB of weights plus the whole 2.6 MB X tensor.
+    const int bm = blockIdx.y * BM, bn = blockIdx.x * BN, st = K / 2;
     const int xst = K;               // interleaved row stride (== K bytes)
     const int wid = threadIdx.x >> 6, wtid = threadIdx.x & 63, lane = wtid & 15;
     const int wm = wid / WARPS_N, wn = wid % WARPS_N, nstrip = K / BK;

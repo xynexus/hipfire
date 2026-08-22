@@ -1434,7 +1434,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [m.div_ceil(BM) as u32, batch_size.div_ceil(BN) as u32, 1],
+                [batch_size.div_ceil(BN) as u32, m.div_ceil(BM) as u32, 1],
                 [BLOCK as u32, 1, 1],
                 0,
                 self.stream_ref(),
