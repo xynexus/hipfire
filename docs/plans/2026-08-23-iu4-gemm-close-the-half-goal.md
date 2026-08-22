@@ -182,16 +182,27 @@ conflate them.
 
 Two routes, and **3a bounds 3b**:
 
-**3a. Measure per-tile hi-pass sparsity first (offline, cheap).** If every value
-in a 16-col x 16-K activation fragment has `|x| < 16` then `x_hi == 0` and that
-tile's H-pass is a no-op. Dump real Qwen3.8-27B prefill activations and
-histogram the qualifying fraction at BOTH granularities:
-  - per 16x16 fragment -- but a wave issues WNt=4 column-tiles together, so a
-    per-fragment bit diverges across `j`;
-  - uniform over the BN=128 column block -- no divergence, but needs 2048 values
-    under 16, much less likely.
-Report both fractions. This either kills the idea or sizes it, before any kernel
-work.
+**3a. CLOSED 2026-08-23 -- the hi-pass skip is dead.** Measured on real
+Qwen3.8-27B prefill activations with `HIPFIRE_HIPASS_STATS=1`
+(`act_hipass_tilemax`, max|x| per 16x16 fragment):
+
+    fragments      0 / 17,301,504  = 0.0000% dead
+    BN=128 blocks  0 /  2,162,688  = 0.0000% dead
+    mean fragment max|x| = 122.1  (of 127)
+
+Not marginal -- zero, at both granularities, over 17.3 M fragments.
+
+**The cause is structural and worth stating, because it also rules out variants
+of the idea.** Activations carry a per-group (256-K) SYMMETRIC scale, so every
+group is normalised to put its max at ~127 by construction. A 16x16 fragment
+draws 256 values from that group, so it essentially always contains a value
+>= 16, and `x_hi` is essentially never all-zero. Making this work would need a
+COARSER activation scale so some groups are genuinely small against a global
+max -- and coarse scale is already a measured dead end on quality.
+
+So there is no "skip the second pass where it is free". Halving the matrix work
+requires making ALL activations fit in 4 bits, i.e. 3b, which is now the only
+route.
 
 **3b. W4A4 via learned rotations.** `gemm_oq_compact_iu4_w64` already exists,
 and SpinQuant Cayley-SGD rotations were found to make 4-bit activations serve

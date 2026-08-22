@@ -1295,6 +1295,94 @@ impl Gpu {
         }
     }
 
+    /// Diagnostic (HIPFIRE_HIPASS_STATS=1): count how often the exact-W4A8 hi
+    /// pass would be a no-op. `x = 16*x_hi + x_lo`, so x_hi is zero exactly when
+    /// |x| < 16, and an H-pass WMMA is dead iff every value in its 16x16 fragment
+    /// is. Reports BOTH granularities that matter: per fragment, and per BN=128
+    /// column block (a wave issues WNt=4 column tiles together, so a
+    /// per-fragment decision would diverge across `j`).
+    fn hipass_stats(&mut self, x_i8: &GpuTensor, n: usize, k: usize) -> HipResult<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FRAG: AtomicU64 = AtomicU64::new(0);
+        static FRAG_DEAD: AtomicU64 = AtomicU64::new(0);
+        static BLK: AtomicU64 = AtomicU64::new(0);
+        static BLK_DEAD: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static SUMMAX: AtomicU64 = AtomicU64::new(0);
+        if n < 16 || k < 16 {
+            return Ok(());
+        }
+        let (tn, tk) = (n / 16, k / 16);
+        let out = self.alloc_tensor(&[tn * tk], DType::Raw)?;
+        self.act_hipass_tilemax(x_i8, &out, n, k)?;
+        let v = self.download_raw(&out, tn * tk)?;
+        let mut fd = 0u64;
+        let mut bd = 0u64;
+        let mut sm = 0u64;
+        for m in &v {
+            sm += *m as u64;
+            if *m < 16 {
+                fd += 1;
+            }
+        }
+        // BN=128 column block == 8 consecutive n-tiles at one k-tile.
+        let nblk = tn / 8;
+        for b in 0..nblk {
+            for t in 0..tk {
+                if (0..8).all(|i| v[(b * 8 + i) * tk + t] < 16) {
+                    bd += 1;
+                }
+            }
+        }
+        FRAG.fetch_add((tn * tk) as u64, Ordering::Relaxed);
+        FRAG_DEAD.fetch_add(fd, Ordering::Relaxed);
+        BLK.fetch_add((nblk * tk) as u64, Ordering::Relaxed);
+        BLK_DEAD.fetch_add(bd, Ordering::Relaxed);
+        SUMMAX.fetch_add(sm, Ordering::Relaxed);
+        let c = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if c % 256 == 0 {
+            let (f, fdd) = (FRAG.load(Ordering::Relaxed), FRAG_DEAD.load(Ordering::Relaxed));
+            let (bl, bld) = (BLK.load(Ordering::Relaxed), BLK_DEAD.load(Ordering::Relaxed));
+            let sx = SUMMAX.load(Ordering::Relaxed);
+            eprintln!(
+                "hipass[{c} calls]: fragments {fdd}/{f} = {:.4}% dead | BN=128 blocks {bld}/{bl} = {:.4}% dead | mean fragment max|x| = {:.1}",
+                fdd as f64 / f as f64 * 100.0,
+                bld as f64 / bl as f64 * 100.0,
+                sx as f64 / f as f64
+            );
+        }
+        Ok(())
+    }
+
+    /// Diagnostic: fill `out` with max|x| of each 16x16 fragment of `x_i8`.
+    /// `out` must hold at least (n/16)*(k/16) bytes. Used to count how often the
+    /// exact-W4A8 hi pass would be a no-op; see the kernel header.
+    pub fn act_hipass_tilemax(
+        &mut self,
+        x_i8: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "act_hipass_tilemax",
+            kernels::ACT_HIPASS_TILEMAX_SRC,
+            "act_hipass_tilemax",
+        )?;
+        let xp = x_i8.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let (ni, ki) = (n as i32, k as i32);
+        let total = (n / 16) * (k / 16);
+        self.launch_kernargs(
+            "act_hipass_tilemax",
+            [total.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr op, i32 ni, i32 ki],
+        )
+    }
+
     pub fn gemm_oq_compact_ladder(
         &mut self,
         w_blocks: &GpuTensor,
@@ -2036,6 +2124,9 @@ impl Gpu {
             dtype: DType::F32,
         };
         self.oq_compact_x8_transpose(&xq, &xs, &xt, &xst, n, k, ng)?;
+        if std::env::var("HIPFIRE_HIPASS_STATS").as_deref() == Ok("1") {
+            self.hipass_stats(&xq, n, k)?;
+        }
         self.oq_xt_gen = self.oq_act_gen;
         self.oq_xt_ng = ng;
         self.oq_xt_n = n;

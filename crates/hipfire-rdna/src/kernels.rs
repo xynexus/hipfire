@@ -4322,6 +4322,11 @@ pub const GEMM_OQ_COMPACT_LADDER_SRC: &str =
 pub const ACT_INTERLEAVE_NIBBLES_SRC: &str =
     include_str!("../../../kernels/src/act_interleave_nibbles.hip");
 
+/// Diagnostic: max|x| per 16x16 activation fragment, for counting how often the
+/// exact-W4A8 hi pass is a no-op. See `kernels/src/act_hipass_tilemax.hip`.
+pub const ACT_HIPASS_TILEMAX_SRC: &str =
+    include_str!("../../../kernels/src/act_hipass_tilemax.hip");
+
 /// Pure iu4 WMMA issue-rate probes (no memory at all), sweeping the number of
 /// INDEPENDENT accumulator chains. See `kernels/src/wmma_iu4_noop_w64.hip`.
 pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w64.hip");
