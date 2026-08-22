@@ -569,6 +569,7 @@ mod tests {
     fn generate_request_serializes_structured_messages_without_nested_prompt() {
         let req = DaemonRequest::Generate(GenerateTextRequest {
             id: "req-1".to_string(),
+            session_id: None,
             prompt: "last user text".to_string(),
             messages: Some(vec![
                 Message {

@@ -2162,14 +2162,65 @@ pub fn qwen35_validate_prefix_hash(
 
 /// Reset the active session's KV cursor to cold (rewind to position 0) without
 /// freeing the allocation — a cheap O(1) restart for a fresh turn.
+/// Rewind the resident qwen35 session to a fresh state, IN PLACE.
+///
+/// This used to be `take_from_loaded` → `reset` → `restore_into_loaded`, which
+/// round-tripped the whole session through a parked snapshot just to zero it.
+/// That was expensive and leaky: `take_from_loaded` allocates a
+/// `[vocab_size] f32` logits tensor and memcpys the scratch logits into it,
+/// `restore_into_loaded` memcpys them straight back and drops the tensor
+/// **without freeing it** — `GpuTensor` has no `Drop` — so every reset orphaned
+/// a device allocation. `steer_capture` resets twice per call, so it leaked two.
+///
+/// Doing it in place is equivalent and allocation-free. Field by field, against
+/// the old path:
+///
+/// * `cursor.seq_pos = 0` and `conversation_tokens.clear()` — the old path moved
+///   the cursor out with `mem::take`, reset it, and moved it back; net identical.
+/// * `q35_active_prefilled_generated_suffix_len = 0` — the resident-slot half of
+///   the snapshot's `prefilled_generated_suffix_len`.
+/// * the DeltaNet memsets and `kv.compact_offset = 0` — the same buffers, which
+///   travelled through the round trip untouched.
+/// * `prefix_hash = None` in the old `reset` was a **no-op**: `take_from_loaded`
+///   constructs the snapshot with `prefix_hash: None` in the first place, so
+///   there was never a stale hash to clear. Nothing to port.
+/// * the logits snapshot was copied out and straight back unchanged — pure
+///   waste, and the leak.
+///
+/// The error surface shrinks on purpose. Of the old four failure modes, only
+/// "missing decode state" is a real precondition; "missing scratch/logits", the
+/// tensor alloc and the memcpy existed **solely** to serve the snapshot. Removing
+/// the snapshot removes them, which is the point: a rewind should not be able to
+/// fail on an allocation.
 pub fn qwen35_reset_active_session(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<(), String> {
-    let mut session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
-        .map_err(|e| format!("failed to reset qwen35 session: {e}"))?;
-    session.reset(gpu);
-    session.restore_into_loaded(m, gpu)?;
+    if m.active.sequence_state.is_none() {
+        return Err(
+            "failed to reset qwen35 session: qwen35 session missing decode state".to_string(),
+        );
+    }
+    // Disjoint fields of `m.active`: the cursor and the sequence state.
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
+    m.active.q35_active_prefilled_generated_suffix_len = 0;
+    if let Some(state) = m.active.sequence_state.as_mut() {
+        if let Some(dn) = state.recurrent_as::<qwen35::DeltaNetState>() {
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(kv) = state.kv_mut() {
+            kv.compact_offset = 0;
+        }
+    }
     Ok(())
 }
 

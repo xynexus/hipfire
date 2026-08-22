@@ -402,6 +402,15 @@ with open(jsonl, "a") as out:
         gen_msg = {
             "type": "generate",
             "id": f"c{idx}_t1",
+            # Name the conversation explicitly. The multi-turn cell below relies
+            # on turn 2 continuing turn 1, which used to happen implicitly
+            # because a session-less generate joined the daemon's shared legacy
+            # session. That is no longer true: a request naming no session_id is
+            # a one-shot on every arch. Per-cell ids also stop the four cells
+            # from accumulating into ONE conversation, which is what happened
+            # before and meant later cells judged the model on a context
+            # polluted by earlier ones.
+            "session_id": f"c{idx}",
             "prompt": user_prompt,
             "system": system,
             "max_tokens": 256,
@@ -422,6 +431,10 @@ with open(jsonl, "a") as out:
             )
             out.write(json.dumps({
                 "type": "generate", "id": f"c{idx}_t2",
+                # Same session as t1 — this turn is only meaningful as a
+                # continuation ("describe what the file does" refers to the file
+                # read in turn 1).
+                "session_id": f"c{idx}",
                 "prompt": tool_resp_text, "system": "",
                 "max_tokens": 128, "temperature": 0.0, "top_p": 1.0,
                 "repeat_penalty": 1.0, "thinking": False, "max_think_tokens": 1,

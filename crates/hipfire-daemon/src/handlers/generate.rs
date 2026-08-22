@@ -127,6 +127,33 @@ pub(crate) fn rerank(
     }
 }
 
+/// The conversation a request names, if any: the typed `session_id` when the
+/// request parsed as a `GenerateTextRequest`, else the raw JSON key. An empty
+/// string counts as absent.
+///
+/// Both sources read the SAME wire key, so they cannot disagree about a given
+/// request — the typed field only makes the value reachable for a client that
+/// builds the typed request instead of hand-rolling JSON. The raw fallback
+/// stays because the typed parse fails on a malformed-but-runnable frame (a
+/// missing `prompt`, say), and such a request must still address its session.
+///
+/// One helper rather than two copies: `text` resolves this twice, and
+/// `stream::session_of` is a third site. Copies drifting is precisely how
+/// admission and the handler would end up naming different conversations.
+fn requested_session_id<'a>(
+    protocol_generate: Option<&'a hipfire_generate::GenerateTextRequest>,
+    msg: &'a serde_json::Value,
+) -> Option<&'a str> {
+    protocol_generate
+        .and_then(|req| req.session_id.as_deref())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            msg.get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     // Explicit per-request raw-prompt override (optional `"raw"` bool).
     // Absent → None → auto default (raw iff no chat_template).
@@ -173,11 +200,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             }
         }
     }
-    let session_id = msg
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(id);
+    let session_id = requested_session_id(protocol_generate.as_ref(), msg).unwrap_or(id);
     let prefill_already_done = msg
         .get("prefill_already_done")
         .and_then(|v| v.as_bool())
@@ -225,10 +248,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             return;
         }
     };
-    let session_id = msg
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+    let session_id = requested_session_id(protocol_generate.as_ref(), msg);
     let prefill_already_done = msg
         .get("prefill_already_done")
         .and_then(|v| v.as_bool())
@@ -252,6 +272,32 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         if let Err(e) = m.activate_session(&mut daemon_state.gpu, target_session_id) {
             emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
+        }
+        // A request that names NO `session_id` is a one-shot and must not
+        // inherit the previous request's conversation.
+        //
+        // Without this, session-capable arches silently differed from every
+        // other one. `supports_generate_session` is
+        // `(qwen35 && pp == 1) || lfm2-moe`; every other arch REJECTS
+        // `session_id` outright a few lines below and re-prefills from scratch,
+        // so it is stateless by construction. But here a session-less request
+        // fell back to the shared `QWEN35_LEGACY_SESSION_ID` and continued it —
+        // KV and DeltaNet state are cumulative across turns — so the same
+        // request repeated gave a different answer each time on qwen35 and the
+        // same answer every time on llama. Same protocol usage, opposite
+        // semantics, decided by arch.
+        //
+        // Multi-turn is not lost, it becomes explicit: send a `session_id` and
+        // the conversation accumulates exactly as before.
+        //
+        // `prefill_already_done` is excluded deliberately — that contract says
+        // the caller has ALREADY prefilled this session, so clearing it here
+        // would throw away the prefill the request depends on.
+        if session_id.is_none() && !prefill_already_done {
+            if let Err(e) = m.reset_active_session(&mut daemon_state.gpu) {
+                emit_error_with_id(&mut daemon_state.out.sink, id, e);
+                return;
+            }
         }
     } else if session_id.is_some() || prefill_already_done {
         emit_error_with_id(
