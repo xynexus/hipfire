@@ -72,6 +72,35 @@ overlay is a ~40% one — they are not substitutes, and a learned rotation would
 have to be several times better than the FWHT is over identity to make the
 overlay redundant.
 
+## Can a weight REARRANGEMENT group the outliers into columns? Measured: no.
+
+The tree has several rearrangement mechanisms (gptq column ordering, the codec's
+split-plane layout, the MoE expert stacking), and a global column permutation IS
+legal for a GEMM — permute `k`, permute the activation identically once per layer,
+and the product is unchanged. So the question is fair: can a permutation cluster
+the outliers into a few columns, turning the sparse overlay into a dense band?
+
+That reduces to one statistic: **is outlier-ness a column property?** Counting how
+often each column position is chosen as an outlier across all (row, group) pairs:
+
+| basis | uniform | hottest column | top-16 columns hold |
+|---|---|---|---|
+| FWHT | 1.17% | 2.46-2.76% | **7.6-8.4%** |
+| unrotated | 1.17% | 2.26-2.79% | **7.6-8.7%** |
+
+The top 16 columns are 6.25% of all columns and hold ~8% of the outliers —
+essentially what random assignment gives. The hottest single column is picked
+~2.2x more often than chance, not 20x. **There is nothing to gather.** Note this
+is the SAME in both bases, so unlike the shared-position result it is not even a
+rotation artifact: weight outliers are per-(row, column) and near-uniform over
+columns.
+
+This also subsumes the K=16-slice idea in the same form: any scheme that wants
+outliers to land in a contiguous, row-independent band needs column concentration
+that does not exist. A PER-ROW slice constraint is still open (each row picks its
+own 16-wide slice), because that keeps the adaptivity — but that is a constraint
+on selection, not a rearrangement.
+
 ## What this leaves
 
 Two options survive, and neither is a format change:

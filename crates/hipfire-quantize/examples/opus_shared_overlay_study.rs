@@ -229,6 +229,31 @@ fn main() {
         }
         let raw_capture = (raw_none - raw_sh) / (raw_none - raw_perrow) * 100.0;
 
+        // IS OUTLIER-NESS A COLUMN PROPERTY? A column permutation (any of the
+        // rearrangement schemes) can only cluster outliers if the SAME columns are
+        // outliers for many rows. Count, per column position, how many rows chose
+        // it. Uniform => every column is picked by N_OUT/G = 1.17% of rows and no
+        // permutation can concentrate anything.
+        for (label, idxs) in [("FWHT", &per_row_idx), ("raw", &raw_row_idx)] {
+            let mut hits = vec![0u32; G];
+            for gi in 0..rows * ngroups {
+                for &pp in &idxs[gi] {
+                    hits[pp] += 1;
+                }
+            }
+            let mut h = hits.clone();
+            h.sort_unstable_by(|a, b| b.cmp(a));
+            let per_col_rows = (rows * ngroups) as f64 / G as f64 * N_OUT as f64;
+            let top16: u32 = h[..16].iter().sum();
+            let total: u32 = h.iter().sum();
+            println!(
+                "     [{label:>4}] col-hit rate: uniform would be {:.2}%; hottest col {:.2}%, top-16 cols hold {:.1}% of all outliers",
+                100.0 * per_col_rows / (rows * ngroups) as f64,
+                100.0 * h[0] as f64 / (rows * ngroups) as f64,
+                100.0 * top16 as f64 / total as f64
+            );
+        }
+
         let mut sse_row = 0.0f64;
         let mut sse_shared = 0.0f64;
         let mut sse_none = 0.0f64; // pure int4, same scales: what the overlay buys
