@@ -5,6 +5,21 @@ passes. Every claim carries a `file:line` that was opened; where a count is
 possible there is a count. This subsystem has punished unmeasured estimates four
 times in one session, so nothing here is asserted from intuition.
 
+## Status — 2026-08-22
+
+| stage | state |
+|---|---|
+| §0 decision | **made** (§0.1): band cursor + the existing chunk cap wins on measurement; M2a reordered behind M3 |
+| M2a0 verification | **landed** (§4.1) — `tiny-prefill-gate.sh`; §4's false COVERED is fixed |
+| M2a1 FA fallback | **landed** (§3.1) — −713 lines, and it fixed a live numeric bug |
+| M2a2 flag | **not started, deliberately** — it gates M2a3, which §0.1 defers. A flag with nothing behind it is scaffolding |
+| M2a3/M2a4 batched bindings | **deferred** behind M3 by the §0 decision |
+| M2a5 session-batch loops | separate milestone, unchanged |
+
+M2a0 and M2a1 were landed despite the deferral because neither depends on it:
+M2a0 fixes a gate that lies about coverage today, and M2a1 turned out to fix a
+production divergence rather than merely delete a duplicate.
+
 ## 0. Read this before costing anything: the premise is false
 
 The parent plan justifies M2a with "an unlowered prefill is by definition one
