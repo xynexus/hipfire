@@ -2406,12 +2406,16 @@ pub(crate) fn forward_prefill_chunk(
         }
     }
     let ctx = DispatchCtx::new(gpu); // hoisted — arch-constant, safe to reuse per-layer
-    // §M2a2 — one decision per chunk, and the trace reports the DECISION.
+                                     // §M2a2 — one decision per chunk, and the trace reports the DECISION.
     let take_prefill_lowered = prefill_lowered_enabled();
     if prefill_backend_trace_enabled() {
         eprintln!(
             "  [prefill] batched FA layers → {} path{}",
-            if take_prefill_lowered { "lowered" } else { "direct" },
+            if take_prefill_lowered {
+                "lowered"
+            } else {
+                "direct"
+            },
             if take_prefill_lowered {
                 ""
             } else {
@@ -4496,4 +4500,3 @@ pub(crate) fn forward_prefill_chunk(
 
     Ok(())
 }
-

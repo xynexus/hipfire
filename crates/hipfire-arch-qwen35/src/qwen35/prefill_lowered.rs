@@ -122,15 +122,13 @@ impl<'a> Qwen35PrefillBindings<'a> {
         // The Q8 substrate path (gemm_q8_0_batched_chunked × 3) also
         // dispatches a Q8-stride kernel per weight, so it needs the
         // same gate when wk/wv aren't Q8.
-        let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
-            && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
+        let qkv_same_dtype =
+            layer.wk.gpu_dtype == layer.wq.gpu_dtype && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
         let fa_bridge_tape_active = gdn_tape.as_ref().is_some_and(|tape| {
-            delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
         });
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let hidden_row_bytes = tape.x_in_dim * 4;
                 let off_hidden = tape_offset * hidden_row_bytes;
@@ -168,8 +166,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             )?;
         }
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let hidden_row_bytes = tape.x_in_dim * 4;
                 let off_hidden = tape_offset * hidden_row_bytes;
@@ -512,31 +509,12 @@ impl<'a> Qwen35PrefillBindings<'a> {
             // share a dtype. Dispatch each weight to its own
             // single-weight batched GEMM, dropping the fused-kernel
             // launch-overhead optimization for correctness.
-            batched_gemm_single_weight(
-                gpu,
-                &layer.wq,
-                &pbs.x_rot_batch,
-                &pbs.fa_q_full_batch,
-                n,
-            )?;
-            batched_gemm_single_weight(
-                gpu,
-                &layer.wk,
-                &pbs.x_rot_batch,
-                &pbs.fa_k_batch,
-                n,
-            )?;
-            batched_gemm_single_weight(
-                gpu,
-                &layer.wv,
-                &pbs.x_rot_batch,
-                &pbs.fa_v_batch,
-                n,
-            )?;
+            batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+            batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+            batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
         }
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let q_full_row_bytes = tape.fa_q_full_dim * 4;
                 gpu.memcpy_dtod_at_auto(
@@ -603,8 +581,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             config.norm_eps,
         )?;
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let q_row_bytes = tape.fa_q_dim * 4;
                 gpu.memcpy_dtod_at_auto(
@@ -630,15 +607,14 @@ impl<'a> Qwen35PrefillBindings<'a> {
             // device-resident Q tensor, zero PCIe transfer. Only
             // succeeds when install_tap_gpu() was used. Falls through
             // to CPU path otherwise.
-            let gpu_handled =
-                hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-                    gpu,
-                    layer_idx,
-                    &pbs.fa_q_batch.buf,
-                    n,
-                    config.n_heads,
-                    config.head_dim,
-                )?;
+            let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+                gpu,
+                layer_idx,
+                &pbs.fa_q_batch.buf,
+                n,
+                config.n_heads,
+                config.head_dim,
+            )?;
             if !gpu_handled {
                 let n_q = config.n_heads * config.head_dim;
                 let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
@@ -734,8 +710,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             "fav",
         );
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let q_row_bytes = tape.fa_q_dim * 4;
                 let kv_row_bytes = tape.fa_kv_dim * 4;
@@ -788,11 +763,9 @@ impl<'a> Qwen35PrefillBindings<'a> {
             // point decode uses (mod.rs), which already supports n>1.
             // Rotation + tiles scratch mirror the decode path. The paired
             // attention step below is a no-op for kvarn (done here).
-            static PREFILL_KVARN_ROTATE: std::sync::OnceLock<bool> =
-                std::sync::OnceLock::new();
-            let kvarn_rotate = *PREFILL_KVARN_ROTATE.get_or_init(|| {
-                std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
-            });
+            static PREFILL_KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let kvarn_rotate = *PREFILL_KVARN_ROTATE
+                .get_or_init(|| std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0"));
             if kvarn_rotate && config.head_dim == 256 {
                 gpu.rotate_x_mq_batched(
                     &pbs.fa_k_batch,
@@ -808,10 +781,8 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 )?;
             }
             if kv_cache.kvarn_tiles.is_none() {
-                let tiles = gpu.alloc_tensor(
-                    &[config.n_kv_heads * config.head_dim * 128],
-                    DType::F32,
-                )?;
+                let tiles =
+                    gpu.alloc_tensor(&[config.n_kv_heads * config.head_dim * 128], DType::F32)?;
                 kv_cache.kvarn_tiles = Some(tiles);
             }
             let kvarn_tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
@@ -1282,8 +1253,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
                 let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
                 let pos_b = pbs.positions.sub_offset(b, 1);
-                let bias_b =
-                    q8_tree_bias.map(|bias| bias.sub_offset(b * block_cols, block_cols));
+                let bias_b = q8_tree_bias.map(|bias| bias.sub_offset(b * block_cols, block_cols));
                 gpu.attention_q8_0_kv_batched_masked(
                     &q_b,
                     &kv_cache.k_gpu[layer_idx],
@@ -1342,8 +1312,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             )?;
         }
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let q_row_bytes = tape.fa_q_dim * 4;
                 gpu.memcpy_dtod_at_auto(
@@ -1409,8 +1378,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
 
         qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let hidden_row_bytes = tape.x_in_dim * 4;
                 let off_hidden = tape_offset * hidden_row_bytes;
@@ -1618,8 +1586,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             )?;
         }
         if let Some(tape) = gdn_tape.as_ref() {
-            if delta_layer_idx < tape.fa_bridge_valid.len()
-                && tape.fa_bridge_valid[delta_layer_idx]
+            if delta_layer_idx < tape.fa_bridge_valid.len() && tape.fa_bridge_valid[delta_layer_idx]
             {
                 let hidden_row_bytes = tape.x_in_dim * 4;
                 let off_hidden = tape_offset * hidden_row_bytes;
@@ -1660,12 +1627,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
         );
-        let fa_ffn_is_6bit =
-            matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let fa_ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
-        let fa_ffn_is_fp4 =
-            matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let fa_ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let fa_ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
         let fa_ffn_is_oq8 = matches!(layer.w_gate.gpu_dtype, DType::Oq8G256);
         let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
@@ -1713,12 +1678,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
             )?;
         } else if fa_ffn_is_oq8 {
             // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
-            gpu.quantize_act_oq8_batched(
-                &pbs.x_rot_batch,
-                layer.w_gate.m,
-                layer.w_gate.k,
-                n,
-            )?;
+            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -1921,12 +1881,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
         );
-        let fa_w_down_is_6bit =
-            matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let fa_w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-        let fa_w_down_is_fp4 =
-            matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let fa_w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let fa_w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
         let fa_w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
         let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
@@ -2090,7 +2048,6 @@ impl<'a> Qwen35PrefillBindings<'a> {
         }
         Ok(())
     }
-
 }
 
 impl<'a> ForwardBindings for Qwen35PrefillBindings<'a> {
@@ -2353,8 +2310,8 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
             // kernel-vs-stride corruption mode.
             debug_assert!(
                 matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
+                    && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
                 "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
             );
             run_fused_qkvza_key(
@@ -2869,16 +2826,8 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 config.norm_eps,
                 n,
             )?;
-            gpu.memcpy_dtod_auto(
-                &pbs.dn_q_batch.buf,
-                &pbs.dn_q_raw_batch.buf,
-                n * k_dim * 4,
-            )?;
-            gpu.memcpy_dtod_auto(
-                &pbs.dn_k_batch.buf,
-                &pbs.dn_k_raw_batch.buf,
-                n * k_dim * 4,
-            )?;
+            gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+            gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
         }
 
         if let Some(tape) = gdn_tape.as_ref() {
@@ -3390,8 +3339,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
         );
-        let ffn_is_6bit =
-            matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
@@ -3600,12 +3548,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
             // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
             // same buffers the fused kernel writes; downstream silu_mul
             // is unchanged.
-            gpu.quantize_act_oq8_batched(
-                &pbs.x_rot_batch,
-                layer.w_gate.m,
-                layer.w_gate.k,
-                n,
-            )?;
+            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -3773,12 +3716,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
         );
-        let w_down_is_6bit =
-            matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-        let w_down_is_fp4 =
-            matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
         let w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
@@ -4001,7 +3942,6 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
         }
         Ok(())
     }
-
 }
 
 impl<'a> ForwardBindings for Qwen35PrefillDnBindings<'a> {
@@ -4027,7 +3967,10 @@ impl<'a> ForwardBindings for Qwen35PrefillDnBindings<'a> {
     ) -> Result<(), DispatchError> {
         let res: HipResult<()> = match op_code(op) {
             q35_op::ATTEND_DN_PREP => self.attend_dn_prep(gpu),
-            other => Err(HipError::new(0, &format!("prefill DN ATTEND opcode {other}"))),
+            other => Err(HipError::new(
+                0,
+                &format!("prefill DN ATTEND opcode {other}"),
+            )),
         };
         res.map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -4040,7 +3983,10 @@ impl<'a> ForwardBindings for Qwen35PrefillDnBindings<'a> {
     ) -> Result<(), DispatchError> {
         let res: HipResult<()> = match op_code(op) {
             q35_op::RECUR_GDN => self.recur_gdn(gpu),
-            other => Err(HipError::new(0, &format!("prefill DN RECUR opcode {other}"))),
+            other => Err(HipError::new(
+                0,
+                &format!("prefill DN RECUR opcode {other}"),
+            )),
         };
         res.map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -4067,7 +4013,10 @@ impl<'a> ForwardBindings for Qwen35PrefillDnBindings<'a> {
         let res: HipResult<()> = match op_code(op) {
             q35_op::RESID_WO => self.resid_wo(gpu),
             q35_op::RESID_DOWN_SWIGLU => self.resid_down_swiglu(gpu),
-            other => Err(HipError::new(0, &format!("prefill DN RESID opcode {other}"))),
+            other => Err(HipError::new(
+                0,
+                &format!("prefill DN RESID opcode {other}"),
+            )),
         };
         res.map_err(|e| DispatchError::Hip(e.to_string()))
     }

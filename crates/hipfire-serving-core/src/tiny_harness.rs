@@ -1242,7 +1242,9 @@ impl PrefillKvMode {
         match s {
             "q8" | "q8_0" => Ok(Self::Q8),
             "kvarn" => Ok(Self::Kvarn),
-            other => Err(format!("prefill probe: unknown --kv mode {other:?} (q8|kvarn)")),
+            other => Err(format!(
+                "prefill probe: unknown --kv mode {other:?} (q8|kvarn)"
+            )),
         }
     }
     pub fn as_str(self) -> &'static str {

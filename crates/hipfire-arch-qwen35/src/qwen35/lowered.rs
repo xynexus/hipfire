@@ -673,7 +673,10 @@ pub(crate) fn prefill_lowered_enabled() -> bool {
 pub(crate) fn prefill_backend_trace_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("HIPFIRE_PREFILL_BACKEND_TRACE").ok().as_deref() == Some("1")
+        std::env::var("HIPFIRE_PREFILL_BACKEND_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
     })
 }
 

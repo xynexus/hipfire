@@ -142,13 +142,11 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(1e-4);
             let corrupt = args.iter().any(|a| a == "--corrupt-kv-prefix");
-            let kv_mode = PrefillKvMode::parse(
-                flag(&args, "--kv").as_deref().unwrap_or("q8"),
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("tiny_quant_probe: {e}");
-                std::process::exit(2);
-            });
+            let kv_mode = PrefillKvMode::parse(flag(&args, "--kv").as_deref().unwrap_or("q8"))
+                .unwrap_or_else(|e| {
+                    eprintln!("tiny_quant_probe: {e}");
+                    std::process::exit(2);
+                });
             let model = req(&args, "--model");
             let out = run_prefill_hash(
                 arch,
