@@ -84,6 +84,10 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
 
 ### Still open, in order
 
+**Step 2 is now exhausted** — every lever in it is closed with a measurement or
+a hardware reason. What remains below is blocked on the W4A4 decision (step 3b),
+which changes the model artifact and needs the user.
+
 1. **GEMM, 50.3% of prefill, ~57% of the 110.9 TOPS ceiling.** The 21% staging
    and 20% LDS-read costs remain latency-shaped and have now resisted width,
    tile geometry, wave grid, BK, and pipelining. What is left is step 3 (4-bit
@@ -168,9 +172,15 @@ Neither responds to width or tile size, so both need structural change:
   that is 4 barrier-coupled waves, not 8, and 1 wave/SIMD is enough per the
   baseline. Genuinely uncertain -- it also tests whether the §12 mechanism is
   right.
-- **`s_prefetch_data`** on the weight stream, against the staging latency.
-- **Dual-issue the fold**: 32 `v_fmac_f32` are VOPD-eligible, `v_fma_mix_f32` is
-  not. Restructure toward dual-issuable ops.
+- ~~**`s_prefetch_data`**~~ **CLOSED 2026-08-23: gfx12-only.** Gated behind the
+  `gfx12-insts` target feature; `llvm-mc -mcpu=gfx1151` rejects the mnemonic and
+  the builtin says so outright. RDNA4 and later, full stop.
+- ~~**Dual-issue the fold**~~ **CLOSED 2026-08-23: impossible in wave64.** VOPD
+  is wave32-only and silently skipped in wave64 (`rdna35:4016`). The shipping
+  GEMM emits ZERO `v_dual_*` while wave32 kernels beside it emit 45 (attention)
+  and 14 (gated delta net). Nothing is wrong with the code — wave64 forfeits
+  dual-issue by construction, so no source restructuring can recover it. See
+  levers §20; the wave64 port's measured +8.6% is net of this loss.
 
 ### 3. Halve the matrix work: 4-bit activations
 

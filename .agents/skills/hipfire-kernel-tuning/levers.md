@@ -119,7 +119,11 @@ occupancy" — bigger budget there enables more aggressive prefetch.
 9070 XT only; if you want 9070 XT + R9700 (also gfx1201), the family
 tag `<name>.gfx12.hip` covers both. See `cross-arch.md`.
 
-**Don't try**: porting `s_prefetch_data` to gfx11. The RDNA3
+**Don't try**: porting `s_prefetch_data` to gfx11 — re-confirmed 2026-08-23 on
+ROCm 7.14, and the mechanism is now exact: the instruction is gated behind the
+`gfx12-insts` target feature. `llvm-mc -mcpu=gfx1151` answers "instruction not
+supported on this GPU", and `__builtin_amdgcn_s_prefetch_data` answers "needs
+target feature gfx12-insts". It is RDNA4 and later, full stop. The RDNA3
 intrinsic doesn't expose the same prefetch primitive.
 
 ## 6. Fused projections (multi-output kernels)
@@ -494,6 +498,32 @@ In `gemm_oq_compact_iu4x2_w64` the body reads:
 14 `ds_load_b128` hoisted, then WMMA interleaved with `lgkmcnt(12)`, `(11)`,
 `(10)`... i.e. matrix work starts as soon as the first two loads land. That is
 software pipelining; there is nothing left to hand-write. Companion to §14.
+
+## 20. wave64 forfeits VOPD entirely — a hidden cost of the wave64 port (gfx1151)
+
+**VOPD dual-issue is wave32-only and is silently skipped in wave64**
+(`rdna35:4016`, and confirmed empirically). Measured across hipfire kernels:
+
+| kernel | wave | `v_dual_*` emitted |
+|--------|------|--------------------|
+| `attention_flash_kvarn_tile_batched` | 32 | 45 |
+| `gated_delta_net` | 32 | 14 |
+| `gemm_oq_compact_iu4x2_w64` | **64** | **0** |
+
+Nothing is wrong with the GEMM's code — wave64 simply cannot dual-issue. So any
+plan of the form "restructure this to pair VALU ops" is dead on arrival in a
+wave64 kernel; don't spend time on it, and don't read `0 v_dual` as a missed
+optimization.
+
+This is a real cost to weigh against §-the wave64 port, not a free win. wave64
+was chosen for the compact GEMM because iu4 C/D takes 4 GPRs in wave64 against 8
+in wave32, buying 2x the tile before spilling, and it measured +8.6% end to end.
+That +8.6% is NET OF losing dual-issue on every VALU op in the kernel — which
+also means a wave32 variant that solved its register pressure another way is not
+obviously behind, and is worth a look if the fold or staging VALU ever becomes
+the binding constraint again.
+
+Quick check on any kernel: `hipcc ... -S -o - k.hip | grep -c v_dual_`.
 
 ## When you're done
 
