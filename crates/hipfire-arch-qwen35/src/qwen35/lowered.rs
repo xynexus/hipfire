@@ -154,7 +154,7 @@ pub(crate) struct Qwen35Bindings<'a> {
     pub(crate) hd: usize,
 }
 
-fn op_code(op: &OpBinding) -> u32 {
+pub(crate) fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
@@ -643,6 +643,41 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
 pub(crate) fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// §M2a2 — `HIPFIRE_PREFILL_LOWERED`, the batched-PREFILL lowering toggle.
+///
+/// **A separate name from `HIPFIRE_FORWARD_LOWERED` on purpose.** That one is a
+/// `OnceLock` copy-pasted into five arch crates (`lowered.rs:645`,
+/// `deepseek4/forward.rs:2324`, `qwen2/qwen2.rs:2063`, `lfm2moe/forward.rs:2047`,
+/// `minimax/forward.rs:1195`); reusing it here would make decode and prefill
+/// un-A/B-able and would move five architectures at once for a qwen35-only
+/// change.
+///
+/// **Default ON.** The prefill bindings are the same batched kernel sequences
+/// that ran inline before, moved without edit and cut on the arm's own phase
+/// boundaries, so "on" is the previous behaviour re-sequenced by
+/// `run_layer_program` rather than a new numeric path. `=0` restores the direct
+/// in-order calls, which is the rollback if the executor itself misbehaves.
+pub(crate) fn prefill_lowered_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_PREFILL_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// `HIPFIRE_PREFILL_BACKEND_TRACE=1` — name the prefill path actually taken.
+///
+/// Emitted AFTER the decision and reporting the DECISION, never one of its
+/// inputs. `decode_layers.rs:76-92` records why that matters: an earlier version
+/// there chose its message from one predicate and announced "lowered path" while
+/// the hand arms ran, in exactly the configuration the flag exists to compare.
+pub(crate) fn prefill_backend_trace_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("HIPFIRE_PREFILL_BACKEND_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// P2/M1 bypass: let a LIVE steer session run the lowered path instead of being

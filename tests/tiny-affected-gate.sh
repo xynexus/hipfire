@@ -134,12 +134,21 @@ select_spec() {
     RUN_SPEC=1
 }
 
+# The tiny gates above all feed ONE token per call to the decode path, so a
+# prefill change used to select coverage that never executed a prefill — a
+# COVERED report for untested code. See
+# docs/plans/2026-08-22-prefill-lowering.md §4.
+select_prefill() {
+    RUN_PREFILL=1
+}
+
 FAMILIES=""
 UNCOVERED=0
 UNCOVERED_REASONS=""
 RUN_QUANT=0
 RUN_STATE=0
 RUN_SPEC=0
+RUN_PREFILL=0
 PATHS="$(changed_paths)" || exit 2
 
 if [ -z "$PATHS" ]; then
@@ -155,11 +164,13 @@ while IFS= read -r path; do
 
         tests/tiny-quant-gate.sh|tests/tiny-affected-gate.sh|tests/tiny-quant-baselines.txt|\
         tests/tiny-state-gate.sh|tests/tiny-state-baselines.txt|tests/tiny-spec-gate.sh|\
+        tests/tiny-prefill-gate.sh|\
         crates/hipfire-eval/src/executor_tinyquant.rs|\
         crates/hipfire-serving-core/src/tiny_harness.rs|\
         crates/hipfire-quantize/src/fixture.rs)
             add_all_supported
             select_all_tiny
+            select_prefill
             ;;
 
         # Tokenizer / vocab loading is family-blind: every prompt for every
@@ -237,6 +248,8 @@ while IFS= read -r path; do
             # the indexed routed-expert path (see its FamilyPlan).
             add_family qwen3_5_moe_indexed
             select_all_tiny
+            # qwen35 owns the only batched prefill in the tiny tier.
+            select_prefill
             ;;
 
         crates/hipfire-arch-nemotron/*|*nemotron*.rs|*vl*.rs)
@@ -284,7 +297,7 @@ if [ -z "$FAMILIES" ]; then
 fi
 
 echo "tiny-affected-gate: selected families: $FAMILIES"
-echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC"
+echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC prefill=$RUN_PREFILL"
 if [ "$UNCOVERED" -eq 1 ]; then
     echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
     echo "  $UNCOVERED_REASONS"
@@ -307,6 +320,13 @@ if [ "$status" -eq 0 ] && [ "$RUN_STATE" -eq 1 ]; then
 fi
 if [ "$status" -eq 0 ] && [ "$RUN_SPEC" -eq 1 ]; then
     ./tests/tiny-spec-gate.sh || status=$?
+fi
+if [ "$status" -eq 0 ] && [ "$RUN_PREFILL" -eq 1 ]; then
+    # Exit 3 here means "no batched-prefill family selected", which is not a
+    # failure — the other gates still carry the verdict.
+    HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-prefill-gate.sh
+    prefill_status=$?
+    [ "$prefill_status" -eq 3 ] || status=$prefill_status
 fi
 if [ "$status" -eq 0 ] && [ "$UNCOVERED" -eq 1 ]; then
     echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
