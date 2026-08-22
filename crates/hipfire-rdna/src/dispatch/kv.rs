@@ -1712,15 +1712,82 @@ impl Gpu {
         // 1. V write (Q8_0) by absolute position.
         self.kv_cache_write_q8_0_batched(v_cache, fa_v, positions, n_kv_heads, head_dim, n)?;
 
-        // 2. K write: append to window, flush each completed 128-token block.
-        // `tiles`/`shadow` are caller-owned reusable scratch (see KvCache::kvarn_*).
+        // 2+3. Segment at 128-token block boundaries: write a run into the f32
+        // window, ATTEND those rows while their own block is still f32, and only
+        // THEN flush the completed block into 4-bit records.
+        //
+        // The order matters, and doing it the other way was a real bug. Writing
+        // every row first and attending once afterwards makes `n_full_blocks` a
+        // batch-wide scalar (`seq_len / GROUP`) applied to every row, while the
+        // kernel bounds each row by its OWN position (`positions[bid] + 1`). A row
+        // at t=50 inside a 128-row batch then reads block 0 as a 4-bit RECORD,
+        // where the per-token path reads that same K as f32 window: the batch's
+        // trailing flush retroactively quantized K the row should have seen
+        // unquantized. Measured as a divergence step at exactly the flush
+        // boundary -- n=127 2.29e-2, n=128 3.90e-2 vs per-token.
+        //
+        // This is the same segment-then-flush shape the session-batched path
+        // already uses (`kvarn.splits` / `kvarn.flushes`).
+        //
+        // Tree-verify keeps the single-call path: its bias is indexed
+        // `tree_bias[global_bid * block_cols + ...]`, so splitting the batch would
+        // renumber `global_bid` and mis-index the bias.
+        if tree_bias.is_some() {
+            let mut written = 0usize;
+            while written < n {
+                let t = start_pos + written;
+                let slot = t % GROUP;
+                let block = t / GROUP;
+                let take = (GROUP - slot).min(n - written);
+                self.memcpy_dtod_at_auto(
+                    &window.buf,
+                    slot * kv_dim * 4,
+                    &fa_k.buf,
+                    written * kv_dim * 4,
+                    take * kv_dim * 4,
+                )?;
+                written += take;
+                if slot + take == GROUP {
+                    self.kvarn_gather_k_tiles(window, tiles, 1, n_kv_heads, head_dim, GROUP)?;
+                    let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
+                    let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
+                    self.kvarn_quantize_tile(
+                        tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes, bits,
+                    )?;
+                }
+            }
+            let n_full_blocks = seq_len / GROUP;
+            return self.attention_flash_kvarn_batched_masked(
+                fa_q,
+                records,
+                window,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                seq_len,
+                n,
+                flash_partials,
+                tree_bias,
+                block_start,
+                block_cols,
+                n_full_blocks,
+                rec_bytes,
+                bits,
+            );
+        }
+
+        let q_row = n_heads * head_dim;
         let mut written = 0usize;
         while written < n {
             let t = start_pos + written;
             let slot = t % GROUP;
             let block = t / GROUP;
             let take = (GROUP - slot).min(n - written);
-            // Contiguous append: fa_k rows [written, written+take) → window slots
+            // Contiguous append: fa_k rows [written, written+take) -> window slots
             // [slot, slot+take) (both token-major, kv_dim stride).
             self.memcpy_dtod_at_auto(
                 &window.buf,
@@ -1729,10 +1796,36 @@ impl Gpu {
                 written * kv_dim * 4,
                 take * kv_dim * 4,
             )?;
-            written += take;
+            // Blocks fully flushed BEFORE this segment. Rows here whose own
+            // position lands in the current partial block therefore read the f32
+            // window, exactly as the per-token path does.
+            let q_view = fa_q.sub_offset(written * q_row, take * q_row);
+            let out_view = out.sub_offset(written * q_row, take * q_row);
+            let pos_view = positions.sub_offset(written, take);
+            self.attention_flash_kvarn_batched_masked(
+                &q_view,
+                records,
+                window,
+                v_cache,
+                &out_view,
+                &pos_view,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                t + take,
+                take,
+                flash_partials,
+                None,
+                block_start,
+                block_cols,
+                block,
+                rec_bytes,
+                bits,
+            )?;
             if slot + take == GROUP {
-                // Block complete in the window → gather + variance-norm 4-bit pack
-                // into records[block].
+                // Block complete in the window -> gather + variance-norm pack into
+                // records[block]. AFTER the attend above, never before.
                 self.kvarn_gather_k_tiles(window, tiles, 1, n_kv_heads, head_dim, GROUP)?;
                 let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
                 let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
@@ -1740,33 +1833,8 @@ impl Gpu {
                     tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes, bits,
                 )?;
             }
+            written += take;
         }
-
-        // 3. Fused KVarN flash over [0, seq_len): dequant the 4-bit records in
-        // place for the `n_full_blocks` full tiles + read the f32 window for the
-        // trailing partial tile. No f16 shadow build (Phase D2). Causal masking
-        // via positions.
-        let n_full_blocks = seq_len / GROUP;
-        self.attention_flash_kvarn_batched_masked(
-            fa_q,
-            records,
-            window,
-            v_cache,
-            out,
-            positions,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            physical_cap,
-            seq_len,
-            n,
-            flash_partials,
-            tree_bias,
-            block_start,
-            block_cols,
-            n_full_blocks,
-            rec_bytes,
-            bits,
-        )
+        Ok(())
     }
 }

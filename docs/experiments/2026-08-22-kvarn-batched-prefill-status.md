@@ -78,9 +78,43 @@ Separately: `kld_eval` is **blind to KV mode**. fp32-KV and kvarn score
 reads prefill's own logits and batched attention computes from fresh Q/K/V
 without reading the cache back. Do not use `kld_eval` to measure a KV change.
 
-## Next step
+## Root cause found and FIXED: flush-before-attend in `kvarn_attend`
 
-Diff the window-region read in `attention_flash_kvarn_tile_batched` against the
-per-token `kvarn_attend` path, at n=64 where the records are empty and only the
-window is live. A single-layer, single-head dump at n=64 should localize it to
-either the window write layout or the kernel's masking of the window half.
+The kernel's masking is correct — `seq_len = positions[global_bid] + 1` bounds
+each row by its OWN position, and `tile_end = min(tile_start + group, seq_len)`,
+so a row never reads a future token. The bug was one level up, in `kvarn_attend`.
+
+It did: write **every** row into the window (flushing completed blocks as it
+went), then run **one** flash for the whole batch with
+`n_full_blocks = seq_len / GROUP`. That scalar is derived from the batch's FINAL
+length but applied to every row, while the kernel bounds rows individually. So a
+row at t=50 inside a 128-row batch read block 0 as a **4-bit record**, where the
+per-token path reads that same K as **f32 window**: the batch's trailing flush
+retroactively quantized K the row should have seen unquantized.
+
+Fix: segment at block boundaries and **attend each segment before flushing it**,
+passing that segment's own `n_full_blocks = block`. This is the same
+segment-then-flush shape the session-batched path already used
+(`kvarn.splits` / `kvarn.flushes`). Tree-verify keeps the single-call path,
+because its bias is indexed `tree_bias[global_bid * block_cols + ...]` and
+splitting the batch would renumber `global_bid`.
+
+Result — the flush-boundary step is gone:
+
+| n | before | after |
+|---|---|---|
+| 64 | 1.62e-2 | 1.62e-2 |
+| 127 | 2.29e-2 | 2.29e-2 |
+| 128 | **3.90e-2** | **2.29e-2** |
+| 200 | **3.90e-2** | **2.29e-2** |
+
+Free: prefill 216.7/217.5 tok/s (was ~217), decode 14.2, decode text sha256
+unchanged, and the `--kv-mode fp32` control still IDENTICAL across all layers.
+
+## Residual still open
+
+A length-dependent divergence remains (1.62e-2 at n=64, 2.29e-2 at n>=127) that
+is NOT this bug: it is present at n=64 where no block completes and every K row
+is still f32 in the window, so no quantization has occurred at all. First
+diverging layer is 0 in every case. That is a separate defect in the window
+path and is the next thing to chase.
