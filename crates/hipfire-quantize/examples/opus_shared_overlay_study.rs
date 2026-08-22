@@ -70,8 +70,8 @@ fn main() {
 
     println!("shared-position overlay study: n_out={N_OUT}, G={G}, <= {max_rows} rows/tensor");
     println!(
-        "  {:<30} {:>11} {:>11} {:>11} {:>7} {:>9}",
-        "tensor", "SSE int4", "SSE per-row", "SSE shared", "ratio", "capture"
+        "  {:<24} {:>11} {:>12} {:>11} {:>11} {:>8} {:>8}",
+        "tensor", "int4 G256", "overlay 4.25", "shared", "G64 no-ov", "G64vsOv", "capture"
     );
 
     let mut tot_row = 0.0f64;
@@ -127,6 +127,30 @@ fn main() {
             }
         }
 
+        // Dump the int4 residual (rotated basis) so a low-rank alternative can be
+        // ranked against the overlay at matched bits. One tensor is enough.
+        if std::env::var("HIPFIRE_DUMP_RESIDUAL").is_ok() && suffix.contains("down_proj") {
+            let mut f = std::io::BufWriter::new(
+                std::fs::File::create("/tmp/claude-1000/residual.bin").expect("dump"),
+            );
+            use std::io::Write;
+            f.write_all(&(rows as u32).to_le_bytes()).unwrap();
+            f.write_all(&(k as u32).to_le_bytes()).unwrap();
+            for r in 0..rows {
+                for g in 0..ngroups {
+                    let gi = r * ngroups + g;
+                    let s = scales[gi];
+                    let inv = 1.0 / s.max(1e-12);
+                    for p in 0..G {
+                        let v = rot[gi][p];
+                        let q = (v * inv).round().clamp(-7.0, 7.0) * s;
+                        f.write_all(&(v - q).to_le_bytes()).unwrap();
+                    }
+                }
+            }
+            eprintln!("  dumped residual: {rows} x {k}");
+        }
+
         // Shared selection: for each group column g, rank positions by the TOTAL
         // int4->int8 error reduction summed over every row, then take the top n_out.
         // Same scales, so the two arms differ only in WHICH positions get 8 bits.
@@ -149,6 +173,29 @@ fn main() {
             shared_idx.push(order[..N_OUT].to_vec());
         }
 
+        // ALTERNATIVE AT MATCHED BITS: G=64, no overlay. Scale cost 16 b / 64 w
+        // = 0.25 b/w against G=256's 0.0625 + 3 overlays' 0.1875 = 0.25. Same
+        // 4.25 bits/weight, but no side table -> no gather at all.
+        let s1_64 = gen_fwht_signs(44, 64);
+        let s2_64 = gen_fwht_signs(1044, 64);
+        let mut sse_g64 = 0.0f64;
+        for r in 0..rows {
+            for g in 0..ngroups {
+                for sub in 0..4 {
+                    let start = (r * k + g * G + sub * 64) * 2;
+                    let mut grp = vec![0.0f32; 64];
+                    for i in 0..64 {
+                        let b =
+                            u16::from_le_bytes([bytes[start + 2 * i], bytes[start + 2 * i + 1]]);
+                        grp[i] = f32::from_bits((b as u32) << 16);
+                    }
+                    hipfire_primitives::fwht::signed_fwht(&mut grp, &s1_64, &s2_64);
+                    let (sc, _) = mixed_clipsearch(&grp, 1);
+                    sse_g64 += sse_for(&grp, sc, &[]); // no overlay
+                }
+            }
+        }
+
         let mut sse_row = 0.0f64;
         let mut sse_shared = 0.0f64;
         let mut sse_none = 0.0f64; // pure int4, same scales: what the overlay buys
@@ -165,12 +212,13 @@ fn main() {
         // capture = fraction of the per-row overlay's benefit that shared keeps
         let capture = (sse_none - sse_shared) / (sse_none - sse_row) * 100.0;
         println!(
-            "  {:<30} {:>11.4e} {:>11.4e} {:>11.4e} {:>7.2}x {:>8.1}%",
+            "  {:<24} {:>11.4e} {:>11.4e} {:>11.4e} {:>11.4e} {:>7.1}% {:>8.1}%",
             name.rsplit('.').take(3).collect::<Vec<_>>().join("."),
             sse_none,
             sse_row,
             sse_shared,
-            sse_shared / sse_row,
+            sse_g64,
+            (sse_g64 / sse_row - 1.0) * 100.0,
             capture
         );
     }
