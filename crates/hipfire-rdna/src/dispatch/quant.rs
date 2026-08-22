@@ -806,6 +806,25 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Row-coalesced write variant. The `_t` kernel's store is 67% of its
+        // runtime (ablation in the kernel header): Y is [B, M], a wave owns one
+        // row and 128 b, so 128 stores hit 128 lines at 4 bytes each. `_tr`
+        // keeps the same gather and transposes through LDS so one store covers
+        // 32 consecutive rows = a full line. Opt out with =0.
+        let row_coalesced = std::env::var("HIPFIRE_OQ_OVERLAY_ROWC").as_deref() != Ok("0");
+        if row_coalesced {
+            return self.oq_compact_overlay_correct_tr(
+                w_blocks,
+                xt,
+                xst,
+                y_f32,
+                m,
+                k,
+                batch_size,
+                group,
+                block_stride,
+            );
+        }
         self.ensure_kernel(
             "oq_compact_overlay_correct_t",
             kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
@@ -840,6 +859,54 @@ impl Gpu {
             b_off += B_TILE;
         }
         Ok(())
+    }
+
+    /// Row-coalesced twin of [`Self::oq_compact_overlay_correct_t`]: same
+    /// gather, but the accumulator is transposed through LDS so each store
+    /// covers 32 consecutive rows of `Y` instead of 32 separate cache lines.
+    /// Needs no b-tiling -- the b-block is a grid dimension, not a register
+    /// array, so there is no `nblk` to overrun.
+    #[allow(clippy::too_many_arguments)]
+    pub fn oq_compact_overlay_correct_tr(
+        &mut self,
+        w_blocks: &GpuTensor,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "oq_compact_overlay_correct_tr",
+            kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
+            "oq_compact_overlay_correct_tr",
+        )?;
+        let (wp, xtp, xstp, yp) = (
+            w_blocks.buf.as_ptr(),
+            xt.buf.as_ptr(),
+            xst.buf.as_ptr(),
+            y_f32.buf.as_ptr(),
+        );
+        let (mi, ki, bi) = (m as i32, k as i32, batch_size as i32);
+        let (gi, si) = (group as i32, block_stride as i32);
+        // Must match OQCO_ROWS / OQCO_BB in the kernel.
+        const ROWS: usize = 32;
+        const BB: usize = 128;
+        self.launch_kernargs(
+            "oq_compact_overlay_correct_tr",
+            [
+                (m as u32).div_ceil(ROWS as u32),
+                (batch_size as u32).div_ceil(BB as u32),
+                1,
+            ],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xtp, ptr xstp, ptr yp, i32 mi, i32 ki, i32 bi, i32 gi, i32 si],
+        )
     }
 
     /// Sparse overlay correction for the compact W4A4 path. ACCUMULATES into
