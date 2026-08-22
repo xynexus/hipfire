@@ -84,7 +84,7 @@ should be preferred over memory-derived mapping guesses.
 
 ## Cross-references
 
-- [`docs/methodology/perf-benchmarking.md`](../../docs/methodology/perf-benchmarking.md) — the
+- [`docs/perf/measurement-traps.md`](../../docs/perf/measurement-traps.md) — the
   bench protocol (within-session noise band, stale-binary trap,
   prompt-md5 discipline).
 - [`docs/QUANTIZATION.md`](../../docs/QUANTIZATION.md) — MQ4/HF4 design

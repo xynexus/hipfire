@@ -177,7 +177,83 @@ kill-switch (`1316f8e`) for A/B benching;
 unless you've measured a win on YOUR arch — the default off for
 RDNA is an empirical decision.
 
-## 9. Things to NOT try (negative results documented)
+## 9. Quantized-operand memory layout (gfx1151, W4A8)
+
+**When**: a WMMA kernel whose operands are packed sub-byte and must be
+unpacked before they can be issued. On gfx1151 this is the dominant
+VALU cost in a compact-Opus GEMM — an instruction census of the
+simplest correct W4A8 kernel put nibble unpacking at **20.4 of 71
+instructions per WMMA, 29% of the total**.
+
+**The ISA reason it hurts more than it looks**: of the shifts, only
+`V_DUAL_LSHLREV_B32` is dual-issuable. **Right shifts — which is what
+nibble unpacking needs — cannot co-issue on gfx1151**
+(`kb/dtypes-and-conversion.md`, VOPD tables `r35:9416-9445`). So the
+unpack is both numerous and serialising.
+
+**The lever**: make the DRAM layout match the operand layout, so there
+is no unpack. But the obvious version of this LOSES — see below.
+
+Measured on the ladder kernel, gate/up 17408x5120 B=256, parity PASS
+on every arm:
+
+| activation layout | ms | TOPS | |
+|---|---|---|---|
+| int8, split in-kernel | 2.484 | 36.7 | baseline |
+| two separate nibble planes (hi at `[0,B*K/2)`, lo after) | 3.585 | 25.5 | **-30%** |
+| **hi/lo interleaved at FRAGMENT granularity** | **2.191** | **41.7** | **+13%** |
+
+Separate planes removes every unpack instruction and still loses badly:
+it doubles the transaction count, halves their size, and reads two
+streams `B*K/2` apart. Interleaving instead — per column, each 16-K step
+stores 8 bytes of hi nibbles immediately followed by 8 of lo — makes one
+16-byte load yield both WMMA operands with no VALU, at exactly the same
+column stride and locality as int8, and the same byte volume
+(`K/2 + K/2 == K`), so it is free in DRAM.
+
+**Generalisation**: this is the same failure mode as §7 of
+`case-studies.md` (LDS-staged X share) and the `nontemporal` revert —
+**on RDNA3/3.5, a change that removes instructions but worsens the
+access pattern loses.** Count transactions and streams before counting
+ops.
+
+**Not yet landed**: the shipping compact GEMMs all take int8 and split
+in-kernel. `quantize_act_oq8_batched` already visits each value and
+could emit the interleaved form at no cost, handing the same ~13% to
+the wave32, wave64 and tiled kernels without touching them. Needs an
+audit first — the iu8 GEMM and the k-major overlay transpose also read
+`oq8_xq_batch` as plain int8.
+
+## 10. Matrix-instruction cycle costs (gfx1151) — governs FORMAT choice
+
+From the AMD matrix calculator, per 16x16x16 block:
+
+| instruction | cycles |
+|---|---|
+| `v_wmma_i32_16x16x16_iu4` | **16** |
+| `v_wmma_i32_16x16x16_iu8` | 32 |
+| `v_wmma_f32_16x16x16_bf16` | 32 |
+| `v_wmma_f32_16x16x16_f16` | 32 |
+
+Two consequences that decide format questions before any kernel is
+written:
+
+- **Exact W4A8 via two iu4 passes costs the SAME WMMA cycles as one iu8
+  pass**, while feeding the compact nibbles raw with no unpack. This is
+  why compact beats oq8 by 2.4x and dense bf16 outright on prefill
+  (`docs/experiments/2026-08-22-prefill-gap-vs-mainstream.md`).
+- **Promoting a K-tile to int8 WEIGHTS is cycle-neutral** in a W4A8
+  two-pass kernel: the normal tile already spends 2 iu4 (32 cyc) and the
+  promoted one spends 1 iu8 (32 cyc). Mixed weight precision along K
+  therefore costs only bytes, never cycles.
+
+Wave64's real property, same source: `iu4` needs **4 GPRs for C/D in
+wave64 against 8 in wave32** (the 16x16 tile spreads over 64 lanes, not
+32). Physical cost per tile is identical; the per-lane VGPR COUNT halves,
+and that is what hits the 256-VGPR wall. Wave64 buys 2x the tile before
+spilling.
+
+## 11. Things to NOT try (negative results documented)
 
 These failed in past experiments. Don't burn cycles re-running
 unless you have a NEW idea about why this time would be different.
@@ -206,6 +282,32 @@ silent garbage output (dangling stack-pointer kernargs from raw
 `HIPFIRE_GRAPH=1` only, and even then perf-neutral or slightly
 worse on most archs. Don't make it default-on without a thorough
 correctness pass.
+
+### Two separate nibble planes for activations (gfx1151)
+
+See §9. Removes all ~20 unpack instructions per WMMA and measures **30%
+SLOWER** than splitting in-kernel. Interleave at fragment granularity
+instead.
+
+### LDS weight tile to kill cross-wave redundancy (gfx1151)
+
+Ladder rung 2: all 8 waves of a workgroup share `blockIdx.x`, so each
+re-loads the same 32 weight rows — 8x redundant global traffic, ~170 GB/s
+of nominal against a 248 GB/s ceiling. Staging that tile in LDS once per
+group and reading fragments from there bought **+1%** (2.105 -> 2.086 ms).
+The redundancy was free because 4 KB per group is L2-resident; the
+nominal bandwidth figure was almost entirely cache hits. Same lesson as
+the overlay gather (`docs/perf/gfx1151-gemm-levers.md`): a big traffic
+number is not a DRAM number until you check the working set against L2.
+
+### M-blocking past 2 in a two-accumulator W4A8 kernel (gfx1151)
+
+Ladder LWMt sweep, gate/up, parity PASS each: 1 -> 35.8 TOPS (86 VGPR,
+16 waves), **2 -> 43.4 (144 VGPR, 10 waves)**, 4 -> 36.9 (256 VGPR, 5
+waves), 8 -> 16.8 (256 VGPR, **221 spills**). Peaks at 2 and falls off
+hard — lower than the R=4-8 that §2's multi-row GEMV likes, because
+exact W4A8 carries TWO i32 accumulator sets (hi and lo) so the same tile
+costs double the registers. Same shape as §3's k2x32 null result.
 
 ### LDS-staged X share on gate_up (gfx1100)
 

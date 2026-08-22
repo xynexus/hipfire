@@ -130,7 +130,7 @@ fingerprints. Soft warns on output diffs that need human eyeball.
 # CRITICAL: rm the bench exe BEFORE running the gate to bypass the
 # stale-binary trap. The gate's `ensure_build` is a no-op when the
 # binary already exists, so a "stash and re-run" flow can measure
-# the same code twice. See docs/methodology/perf-benchmarking.md.
+# the same code twice. See docs/perf/measurement-traps.md.
 rm -f target/release/examples/bench_qwen35_mq4
 ./scripts/speed-gate.sh --fast
 ```
