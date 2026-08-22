@@ -96,6 +96,28 @@ The three-way `MoeRoute` / `MoeExpert` / `MoeCombine` shape §M4 names is
 reachable only after the 4-way GEMV is unfused, or with `MoeRoute` redefined to
 include it.
 
+## What the stage split can actually be verified against here
+
+A restructure of `moe_ffn_decode_impl` is only as safe as the arms you can run,
+and the arms are better covered on this box than they look. Checked, not assumed:
+
+| arm | exercised by | here? |
+|---|---|---|
+| indexed k8, OQ4 | `Qwen3.6-35B-A3B--oq4` (k=8) | **yes** |
+| CPU top-K fallback | every tiny MoE fixture — all emit `num_experts_per_tok=2`, and `use_gpu_topk` needs k=8 | **yes** |
+| OQ8 / OQ4+ / OQ4++ / OQ4.25++ | tiny-quant `qwen3_5_moe`, `lfm2_moe` | **yes** |
+| MQ3 / MQ4 / MQ6 / q8f16 | tiny-quant | **yes** |
+| MQ2-Lloyd | `deepseek4` fixture (`--allow-mq2-lloyd`, `tiny-state-gate.sh:143`) | **yes** |
+| paged experts | `HIPFIRE_QWEN35_PAGED_EXPERTS=1` — both artifacts carry a routed-expert module table (tiny: 32 modules, 35B: 10 240); verified to register and load | **yes** |
+| ParoQuant (`ParoQ4G128`) | no fixture emits it | no |
+| EP sharding | needs multi-GPU; medusa unreachable, halo single-GPU | no |
+
+Six of eight, and crucially **both** top-K regimes: the tiny fixtures are all
+k=2 so they run the CPU fallback, while the 35B is k=8 so it runs the indexed
+path. A split verified against both, plus paged and MQ2-Lloyd, leaves only paro
+and EP unexercised — and those two should be stated as the residual risk rather
+than used as a reason not to start.
+
 ## Not claimed
 
 That the three-way split is *implemented* — it is not. What is established is
