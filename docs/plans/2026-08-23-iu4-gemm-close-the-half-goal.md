@@ -103,10 +103,17 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
      bound + break, as in the overlay) took movrel 22 -> 64: MAXDPT is 8/16, far
      larger than MAXQ=4, so the unroll multiplies copies instead of collapsing
      indices. Reverted, do not retry that shape.
-   - The kernel already carries prior attribution in a comment: **Phase D
-     (V-weighted accumulation) is ~99.9% of its runtime** (gutting it took a 3k
-     run from 9.79 s to 0.010 s). So the phase split is known; Phase D is the
-     target.
+   - **Attribution done 2026-08-23 by ablation** (kernel total 1012.5 ms):
+     Phase D (V accumulate) 360 ms = 36%, Phase A (Q.K + KVarN dequant) 264 ms
+     = 26%, Phase C `expf()` FREE, remainder ~38%. **No single dominant phase,
+     so no single big lever.** The kernel's own comment claiming "Phase D is
+     99.9%" was stale for batched prefill and has been corrected in place.
+   - PC sampling is NOT available: rocprofv3 rejects every configuration on
+     gfx1151 ("not supported on any of the agents"). Ablation is the only
+     per-phase attribution here.
+   - Static ISA reading MISLEADS on this kernel: the biggest static loop (92
+     instrs, 1 FMA, 47 SALU) is unchanged by edits to Phase D, so it is not
+     Phase D at all. Three static-driven attempts were made and all reverted.
    - Phase D's inner dim loop is `for (i = 0; i < dpt; i++) out_vec[i] += wvs *
      vq[i]` with `dpt = head_dim/32` RUNTIME. The compiler neither unrolls it nor
      gives `out_vec` static registers, so the ISA shows **1 FMA per 39-92 loop
@@ -115,11 +122,14 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
      (which took movrel 24 -> 0 in the overlay at MAXQ=4) makes it WORSE at
      MAXDPT=8/16: 22 -> 36 for one loop, -> 42 for two, -> 64 for six, with the
      biggest loop byte-identical. Tried three ways, all reverted.
-   - **The fix is to make `dpt` a template parameter** and instantiate per value
-     (head_dim/32, so 2/4/8/16), the way MAXDPT already is, with the dispatch
-     picking the instantiation. Then Phase D's inner loop fully unrolls to `dpt`
-     FMAs against static registers. That is a dispatch change, and it is the
-     single highest-value item left in attention.
+   - Templating `dpt` was probed (`kvarn_tile_body<4, NW>` with `dpt = MAXDPT`):
+     it roughly doubles ISA arithmetic density (1 FMA per 92 instructions -> 4
+     per 193) but does NOT remove the movrels, and given Phase D is only 36% the
+     e2e ceiling on it is small. Worth folding into a larger Phase D rewrite,
+     not worth a dispatch change on its own.
+   - Pointer strength-reduction in Phase D (`vbh` advances by a constant
+     `NW * v_row_stride`) is ALREADY done by LLVM -- hand-writing the induction
+     variable emits identical ISA. Negative.
 
 ## Work, in order
 

@@ -283,9 +283,27 @@ __device__ __forceinline__ void kvarn_tile_body(
     // ── Phase D: V-weighted accumulation (Q8_0) — identical to the Q8 tile. ──
     float out_vec[MAXDPT];
     for (int i = 0; i < MAXDPT; i++) out_vec[i] = 0.0f;
-    // Phase D is 99.9% of this kernel's runtime (measured: gutting it takes the
-    // kernel from 9.79 s to 0.010 s over a 3k-token run). It was reloading the
-    // Q8 block's f16 scale and recomputing the block pointer FOR EVERY DIM.
+    // ⚠️ This used to read "Phase D is 99.9% of this kernel's runtime (gutting it
+    // takes the kernel from 9.79 s to 0.010 s over a 3k-token run)". That no
+    // longer describes BATCHED PREFILL -- it was measured before the hoists
+    // below, on a different shape. Re-measured 2026-08-23 by ablation on
+    // Qwen3.8-27B, 2059-token prompt, kvarn, MAX_BATCH=512 (kernel total
+    // 1012.5 ms):
+    //
+    //   Phase D inner accumulate gutted -> 652.9 ms   Phase D = 360 ms (36%)
+    //   Phase A Q.K dequant+mac gutted  -> 748.6 ms   Phase A = 264 ms (26%)
+    //   Phase C expf() -> a subtract    -> 1049.2 ms  expf is FREE
+    //   remainder (loads, reductions, LDS, barriers)             ~38%
+    //
+    // So there is no single dominant phase here and no single big lever; treat
+    // claims otherwise with suspicion and re-ablate. Note PC sampling cannot
+    // help on this part -- rocprofv3 rejects every configuration on gfx1151
+    // ("not supported on any of the agents"), so ablation is the only per-phase
+    // attribution available.
+    //
+    // The hoists below remain worthwhile on their own terms. Phase D was
+    // reloading the Q8 block's f16 scale and recomputing the block pointer FOR
+    // EVERY DIM.
     //
     // Both are loop-invariant. A thread owns dims d0..d0+dpt-1 with d0 = tid*dpt
     // and dpt = head_dim/32, so the dims are a contiguous run that starts at a
