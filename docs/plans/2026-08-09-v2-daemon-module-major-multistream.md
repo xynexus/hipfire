@@ -1300,7 +1300,37 @@ non-`RoutedExpert` module kinds (M5c).
 byte-identical to the same model run pinned. *Falsified by* any token difference, or by
 VRAM growth — which would mean M1a regressed.
 
-### M6 — Realtime admission and the stub classes
+### M6 — priority admission landed 2026-08-22; classes still to come
+
+**M6 was mis-scoped as blocked.** Its core dependency is lossless suspension,
+which §M3c delivered — not M4 or M5. The ordering half is now in.
+
+`WorkloadSpec` has carried a `priority: u8` all along and admission hardcoded 0,
+so latency-sensitive work had no way to say so. Admission now reads `priority`
+off the wire and `StreamTable::runnable()` returns highest-priority first (stable,
+so equal priorities keep admission order). Measured, with bulk admitted FIRST:
+
+```
+dispatch order: R R b R b R b R b R b b b b b b ...
+```
+
+The `priority: 9` stream is dispatched ahead of a 60-token bulk stream that was
+admitted before it, finishes early, and bulk runs throughout. Flag-off is
+byte-identical and the §M3b1 exit is unchanged (default priority still fair-shares
+`ABAB…`).
+
+**Deliberately NOT done: the four `WorkloadClass` variants.**
+`SpeechIn`/`SpeechOut`/`VideoIn`/`VideoOut` are worth adding when they carry
+contracts and something consumes them; four variants whose only effect would be
+ordering that `priority` already provides is scaffolding. The declared
+largest-indivisible-unit and max-yield-granularity fields, the drain-budget and
+the VRAM test are the substance of M6 and remain.
+
+**This also unblocks §M3d measurement 2** (admission→first dispatch under load),
+which was previously recorded as unobtainable for want of a realtime class. It
+does not need one — it needs an ordering lever, and there is one.
+
+### M6 — Realtime admission and the stub classes (original)
 
 `SpeechIn`/`SpeechOut`/`VideoIn`/`VideoOut` land as `WorkloadClass` variants with declared
 contracts and a synthetic periodic executor. `WorkloadSpec` gains declared
