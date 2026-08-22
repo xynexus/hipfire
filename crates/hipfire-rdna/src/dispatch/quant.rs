@@ -636,6 +636,78 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Transpose the packed int4 activation to K-major for the overlay
+    /// correction: `[B, K/2]` packed -> `[K, B]` int8, and `[B, ng]` -> `[ng, B]`.
+    pub fn oq_compact_x4_transpose(
+        &mut self,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+        b: usize,
+        k: usize,
+        n_groups: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "oq_compact_x4_transpose",
+            kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
+            "oq_compact_x4_transpose",
+        )?;
+        let (xp, xsp, xtp, xstp) = (
+            x_i4.buf.as_ptr(),
+            x_scales.buf.as_ptr(),
+            xt.buf.as_ptr(),
+            xst.buf.as_ptr(),
+        );
+        let (bi, ki, ngi) = (b as i32, k as i32, n_groups as i32);
+        self.launch_kernargs(
+            "oq_compact_x4_transpose",
+            [(b as u32).div_ceil(256), k as u32, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr xsp, ptr xtp, ptr xstp, i32 bi, i32 ki, i32 ngi],
+        )
+    }
+
+    /// K-major sparse overlay correction. ACCUMULATES into `y_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn oq_compact_overlay_correct_t(
+        &mut self,
+        w_blocks: &GpuTensor,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "oq_compact_overlay_correct_t",
+            kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
+            "oq_compact_overlay_correct_t",
+        )?;
+        let (wp, xtp, xstp, yp) = (
+            w_blocks.buf.as_ptr(),
+            xt.buf.as_ptr(),
+            xst.buf.as_ptr(),
+            y_f32.buf.as_ptr(),
+        );
+        let (mi, ki, bi) = (m as i32, k as i32, batch_size as i32);
+        let (gi, si) = (group as i32, block_stride as i32);
+        let waves = 8u32;
+        self.launch_kernargs(
+            "oq_compact_overlay_correct_t",
+            [(m as u32).div_ceil(waves), 1, 1],
+            [waves * 32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xtp, ptr xstp, ptr yp, i32 mi, i32 ki, i32 bi, i32 gi, i32 si],
+        )
+    }
+
     /// Sparse overlay correction for the compact W4A4 path. ACCUMULATES into
     /// `y_f32`, so it must run AFTER `gemm_oq_compact_iu4_wmma` on the same Y.
     #[allow(clippy::too_many_arguments)]

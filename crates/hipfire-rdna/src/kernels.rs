@@ -4364,6 +4364,11 @@ pub const GEMV_OQ_COMPACT_GROUPED_V2_SRC: &str =
 /// Small-batch compact GEMM: reads each weight row ONCE and accumulates B
 /// columns, for the B <= 16 shapes where the WMMA GEMM cannot amortize the int4
 /// decode. See `kernels/src/gemv_oq_compact_multicol.hip`.
+/// K-major overlay correction + its activation transpose. See
+/// `kernels/src/oq_compact_overlay_correct_t.hip`.
+pub const OQ_COMPACT_OVERLAY_CORRECT_T_SRC: &str =
+    include_str!("../../../kernels/src/oq_compact_overlay_correct_t.hip");
+
 pub const GEMV_OQ_COMPACT_MULTICOL_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq_compact_multicol.hip");
 
