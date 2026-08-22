@@ -2712,6 +2712,167 @@ impl Qwen35Generation {
         )
     }
 
+    /// §M7. Step N streams through ONE batched forward.
+    ///
+    /// The decode step is `pre -> forward -> post`, and only the forward touches
+    /// model weights. So this runs `before_forward` for every stream, issues a
+    /// single `forward_prefill_grouped_moe_session_batch` over the survivors'
+    /// pending tokens, then runs `after_forward` for each — every handle
+    /// sampling from its OWN session's logits with its own RNG, penalties and
+    /// stop state. That is what keeps the existing generation state machine
+    /// authoritative instead of reimplementing it against a shared envelope.
+    ///
+    /// Each handle must already hold its session; how N handles come to hold
+    /// them simultaneously is the caller's problem (the single resident slot's
+    /// park/resume dance cannot do it, and the batched decode path takes them
+    /// from `q35_registry.sessions` instead).
+    ///
+    /// A stream whose `before_forward` returns `Stop` is excluded from the
+    /// round — it must not be forwarded. The same exclusion covers a stream
+    /// about to fire the budget-alert nudge, which needs extra single-token
+    /// forwards the others do not.
+    ///
+    /// Returns one outcome per entry, in order.
+    pub fn step_batch(
+        entries: &mut [(&str, &mut Qwen35Generation)],
+        m: &LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        tokenizer: &hipfire_model::tokenizer::Tokenizer,
+        stdout: &mut dyn std::io::Write,
+    ) -> Result<Vec<Qwen35Step>, String> {
+        let config = m
+            .q35_config
+            .as_ref()
+            .ok_or_else(|| "qwen35 config missing".to_string())?;
+        let weights = m
+            .q35_weights
+            .as_ref()
+            .ok_or_else(|| "qwen35 weights missing".to_string())?;
+        let scratch = m
+            .q35_scratch
+            .as_ref()
+            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+        let pbs = scratch
+            .prefill_batch
+            .as_ref()
+            .ok_or_else(|| "qwen35 batched decode needs prefill-batch scratch".to_string())?;
+
+        // Ids copied up front: the loops below hold one long-lived mutable
+        // borrow of `entries`, so it cannot also be indexed for the id.
+        let ids: Vec<String> = entries.iter().map(|(id, _)| (*id).to_string()).collect();
+        let n = entries.len();
+        let mut outcome: Vec<Option<Qwen35Step>> = (0..n).map(|_| None).collect();
+        let mut filter_stop: Vec<bool> = vec![false; n];
+
+        // ── pre: per stream, no weights touched ──
+        for (i, (id, g)) in entries.iter_mut().enumerate() {
+            let t0 = g.t0;
+            // Disjoint field paths: `st` and `session` are separate fields.
+            let st = &mut g.st;
+            let cursor = &mut g
+                .session
+                .as_mut()
+                .ok_or_else(|| "step_batch: stream does not hold its session".to_string())?
+                .cursor;
+            match qwen35_decode_before_forward(tokenizer, stdout, id, t0, st, cursor) {
+                PreForward::Stop => outcome[i] = Some(Qwen35Step::Stop),
+                PreForward::Ready { filter_stop: fs } => filter_stop[i] = fs,
+            }
+        }
+
+        // One mutable borrow of the survivors, reused by the forward and the
+        // post pass. Indexing `entries` per row cannot prove disjointness.
+        let mut live: Vec<(usize, &mut Qwen35Generation)> = entries
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| outcome[*i].is_none())
+            .map(|(i, (_, g))| (i, &mut **g))
+            .collect();
+
+        // ── forward: ONE dispatch over the survivors ──
+        if live.len() >= 2 {
+            let tokens: Vec<[u32; 1]> = live.iter().map(|(_, g)| [g.st.next_token]).collect();
+            let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> =
+                Vec::with_capacity(live.len());
+            for (slot, (_, g)) in live.iter_mut().enumerate() {
+                let session = g.session.as_mut().expect("checked in the pre pass");
+                rows.push(qwen35::DensePrefillSessionBatchRow {
+                    tokens: &tokens[slot],
+                    start_pos: session.cursor.seq_pos,
+                    kv_cache: session
+                        .sequence_state
+                        .kv
+                        .as_mut()
+                        .expect("qwen35 session always has KV"),
+                    dn_state: session
+                        .sequence_state
+                        .recurrent
+                        .as_mut()
+                        .expect("qwen35 session has DeltaNet state")
+                        .as_any_mut()
+                        .downcast_mut::<qwen35::DeltaNetState>()
+                        .expect("qwen35 session recurrent state is DeltaNetState"),
+                    logits: &session.logits,
+                });
+            }
+            qwen35::forward_prefill_grouped_moe_session_batch(
+                gpu, weights, config, &mut rows, scratch, pbs,
+            )
+            .map_err(|e| format!("qwen35 batched decode forward failed: {e:?}"))?;
+            drop(rows);
+
+            // ── post: per stream, each sampling from its OWN logits ──
+            for (i, g) in live.iter_mut() {
+                let t0 = g.t0;
+                let cfg = &g.cfg;
+                let st = &mut g.st;
+                let session = g.session.as_mut().expect("checked in the pre pass");
+                let kv = session
+                    .sequence_state
+                    .kv
+                    .as_mut()
+                    .expect("qwen35 session always has KV");
+                let dn = session
+                    .sequence_state
+                    .recurrent
+                    .as_mut()
+                    .expect("qwen35 session has DeltaNet state")
+                    .as_any_mut()
+                    .downcast_mut::<qwen35::DeltaNetState>()
+                    .expect("qwen35 session recurrent state is DeltaNetState");
+                outcome[*i] = Some(qwen35_decode_after_forward(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    &session.logits,
+                    filter_stop[*i],
+                    kv,
+                    dn,
+                    &mut session.cursor,
+                    m.eviction.as_ref(),
+                    m.physical_cap,
+                    tokenizer,
+                    stdout,
+                    &ids[*i],
+                    t0,
+                    cfg,
+                    st,
+                ));
+            }
+        } else if let Some((i, g)) = live.first_mut() {
+            // The fused entry refuses fewer than two rows, so a lone survivor
+            // steps solo rather than being dropped.
+            let idx = *i;
+            outcome[idx] = Some(g.step(m, gpu, tokenizer, stdout, &ids[idx]));
+        }
+
+        Ok(outcome
+            .into_iter()
+            .map(|o| o.unwrap_or(Qwen35Step::Continue))
+            .collect())
+    }
+
     /// Run the teardown and emit the `done` frame. Consumes the handle, because
     /// the session restore consumes the session.
     /// Unwind after [`Qwen35Step::Failed`]: report and restore the session.
