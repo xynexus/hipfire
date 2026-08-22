@@ -2310,8 +2310,17 @@ pub(crate) fn forward_prefill_chunk(
     // is a GEMV-dominated kernel histogram — measured 43:1 against GEMM on
     // Qwen3.5-0.8B--mq4. Which of the two conditions failed is what turns that
     // into something actionable, and it is invisible from outside.
+    // KVarN belongs here: the batched FullAttn arm below has a complete KVarN
+    // implementation (`kvarn_attend`, which owns the window append + 128-block
+    // flush, and threads tree_verify's bias/block_start/block_cols). Omitting it
+    // from this allowlist made that code UNREACHABLE and sent every FullAttn layer
+    // to the per-token fallback — measured on Qwen3.8-27B at 708 batched prompt
+    // tokens: 11,360 attention dispatches (= 16 FullAttn layers x 710 tokens) and
+    // 91,621 per-token `gemv_oq_compact_grouped_v3` calls against just 1,152
+    // batched GEMMs, i.e. 71.6% of prefill running the DECODE kernel.
     let fa_kv_ok = !kv_cache.quantized
         || kv_cache.quant_q8
+        || kv_cache.quant_kvarn
         || kv_cache.quant_asym4
         || kv_cache.quant_asym3
         || kv_cache.quant_asym2;
@@ -5408,57 +5417,63 @@ pub(crate) fn forward_prefill_chunk(
                         )?;
                     }
                 }
-                let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-                let plan = KvTierPlan::derive(KvTierInputs {
-                    quant_asym4: kv_cache.quant_asym4,
-                    quant_asym3: kv_cache.quant_asym3,
-                    quant_asym2: kv_cache.quant_asym2,
-                    quant_q8: kv_cache.quant_q8,
-                    quant_fwht: kv_cache.quant_fwht,
-                    quant_hfq4: false,
-                    quant_q4: false,
-                    v_mode_bits: 0,
-                    pos: start_pos,
-                    flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.capture_mode,
-                    batch_size: n,
-                    is_tree,
-                    // TODO: boundary producer not yet populated. Matches the
-                    // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
-                    // `vec![]` at every KvCache constructor and never filled, so
-                    // `KvCache::is_boundary()` is always false. Threading it here
-                    // would be a no-op AND would imply boundary layers work.
-                    // Wire all three sites together when the producer lands.
-                    is_boundary: false,
-                })
-                .map_err(|e| HipError::new(0, &e.to_string()))?;
-                let io = AttnParams {
-                    q: &pbs.fa_q_batch,
-                    k: &pbs.fa_k_batch,
-                    v: &pbs.fa_v_batch,
-                    k_cache: &kv_cache.k_gpu[layer_idx],
-                    v_cache: &kv_cache.v_gpu[layer_idx],
-                    k_scales: None,
-                    v_scales: None,
-                    pos_buf: &s.pos_buf,
-                    pos: start_pos,
-                    positions: Some(&pbs.positions),
-                    n_heads: config.n_heads,
-                    n_kv_heads: config.n_kv_heads,
-                    head_dim: config.head_dim,
-                    physical_cap: kv_cache.physical_cap,
-                    batch_size: n,
-                    max_ctx_len,
-                    flash_partials: Some(&s.flash_partials),
-                    givens_cos: kv_cache.givens_cos.as_ref(),
-                    givens_sin: kv_cache.givens_sin.as_ref(),
-                    tree_bias,
-                    block_start,
-                    block_cols,
-                    output: &pbs.fa_attn_out_batch,
-                };
-                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                // KVarN already did the fused write + causal flash in step 6
+                // (`kvarn_attend`), and KvTierPlan has no KVarN tier — it would
+                // fall through to the F32 fallback, which has no batched write,
+                // and resolve as `no implementation for KvWriteF32`. Skip.
+                if !kv_cache.quant_kvarn {
+                    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                    let plan = KvTierPlan::derive(KvTierInputs {
+                        quant_asym4: kv_cache.quant_asym4,
+                        quant_asym3: kv_cache.quant_asym3,
+                        quant_asym2: kv_cache.quant_asym2,
+                        quant_q8: kv_cache.quant_q8,
+                        quant_fwht: kv_cache.quant_fwht,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        v_mode_bits: 0,
+                        pos: start_pos,
+                        flash_mode: s.flash_mode as usize,
+                        capture_mode: gpu.capture_mode,
+                        batch_size: n,
+                        is_tree,
+                        // TODO: boundary producer not yet populated. Matches the
+                        // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
+                        // `vec![]` at every KvCache constructor and never filled, so
+                        // `KvCache::is_boundary()` is always false. Threading it here
+                        // would be a no-op AND would imply boundary layers work.
+                        // Wire all three sites together when the producer lands.
+                        is_boundary: false,
+                    })
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    let io = AttnParams {
+                        q: &pbs.fa_q_batch,
+                        k: &pbs.fa_k_batch,
+                        v: &pbs.fa_v_batch,
+                        k_cache: &kv_cache.k_gpu[layer_idx],
+                        v_cache: &kv_cache.v_gpu[layer_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &s.pos_buf,
+                        pos: start_pos,
+                        positions: Some(&pbs.positions),
+                        n_heads: config.n_heads,
+                        n_kv_heads: config.n_kv_heads,
+                        head_dim: config.head_dim,
+                        physical_cap: kv_cache.physical_cap,
+                        batch_size: n,
+                        max_ctx_len,
+                        flash_partials: Some(&s.flash_partials),
+                        givens_cos: kv_cache.givens_cos.as_ref(),
+                        givens_sin: kv_cache.givens_sin.as_ref(),
+                        tree_bias,
+                        block_start,
+                        block_cols,
+                        output: &pbs.fa_attn_out_batch,
+                    };
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
 
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 if let Some(tape) = gdn_tape.as_ref() {
