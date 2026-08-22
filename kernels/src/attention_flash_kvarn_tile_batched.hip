@@ -57,6 +57,30 @@
 // wave (shfl_xor over 32 lanes, unchanged), so only the phases that span the
 // whole tile need cross-wave work: the softmax max/sum, and the final V
 // accumulator sum.
+// Cross-lane reductions via DPP instead of the LDS pipe.
+//
+// `__shfl_xor` lowers to `ds_bpermute_b32`, a DS op on LGKMcnt — 40 of them in
+// this kernel. The XOR masks 1/2/4/8 never leave a row of 16, which is exactly
+// what DPP `row_xmask` (dpp_ctrl 0x160|mask) does on the VALU with no LDS
+// traffic; only the final xor-16 crosses rows and needs `v_permlanex16_b32`.
+// 5 DS ops -> 4 VALU + 1 permlane per reduction.
+__device__ __forceinline__ float wave32_sum_dpp(float v) {
+#define OQ_XM(M) { int s_ = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x160 | (M), 0xf, 0xf, true); \
+                   v += __builtin_bit_cast(float, s_); }
+    OQ_XM(1) OQ_XM(2) OQ_XM(4) OQ_XM(8)
+#undef OQ_XM
+    int s_ = __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v), 0u, 0u, false, false);
+    return v + __builtin_bit_cast(float, s_);
+}
+__device__ __forceinline__ float wave32_max_dpp(float v) {
+#define OQ_XM(M) { int s_ = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x160 | (M), 0xf, 0xf, true); \
+                   v = fmaxf(v, __builtin_bit_cast(float, s_)); }
+    OQ_XM(1) OQ_XM(2) OQ_XM(4) OQ_XM(8)
+#undef OQ_XM
+    int s_ = __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v), 0u, 0u, false, false);
+    return fmaxf(v, __builtin_bit_cast(float, s_));
+}
+
 template <int MAXDPT, int NW>
 __device__ __forceinline__ void kvarn_tile_body(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
@@ -199,8 +223,7 @@ __device__ __forceinline__ void kvarn_tile_body(
             }
             for (int tt = 0; tt < nt; tt++) {
                 float partial = part[tt] * __half2float(s_col[t_base + tt]);
-                for (int off = 16; off > 0; off >>= 1)
-                    partial += __shfl_xor(partial, off);
+                partial = wave32_sum_dpp(partial);
                 if (lane == 0) {
                     const int t = tile_start + t_base + tt;
                     float s = partial * scale_attn;
@@ -220,8 +243,7 @@ __device__ __forceinline__ void kvarn_tile_body(
             for (int i = 0; i < dpt; i++) {
                 partial += mq[i] * kt[d0 + i];
             }
-            for (int off = 16; off > 0; off >>= 1)
-                partial += __shfl_xor(partial, off);
+            partial = wave32_sum_dpp(partial);
             if (lane == 0) {
                 float s = partial * scale_attn;
                 if (tree_mode && t >= block_start)
@@ -236,8 +258,7 @@ __device__ __forceinline__ void kvarn_tile_body(
     float local_max = -1e30f;
     for (int i = threadIdx.x; i < tile_len; i += nthr)
         local_max = fmaxf(local_max, scores[i]);
-    for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+    local_max = wave32_max_dpp(local_max);
     if (lane == 0) wred[wv] = local_max;
     __syncthreads();
     float tile_max = wred[0];
@@ -251,8 +272,7 @@ __device__ __forceinline__ void kvarn_tile_body(
         scores[i] = e;
         local_sum += e;
     }
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off);
+    local_sum = wave32_sum_dpp(local_sum);
     __syncthreads();                            // scores[] rewritten above
     if (lane == 0) wred[wv] = local_sum;
     __syncthreads();
