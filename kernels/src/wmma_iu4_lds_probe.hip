@@ -59,8 +59,13 @@ __launch_bounds__(256) extern "C" __global__ void NAME(                        \
         const int slot = ((i & LDSP_RING) * 8) & (LDSP_WORDS - 1);             \
         const int off = (slot + lane * 2) & (LDSP_WORDS - 2);                  \
         _Pragma("unroll") for (int c = 0; c < (C); ++c) {                      \
-            const i32x2 a = *(const i32x2*)(sa + off);                         \
-            const i32x2 b = *(const i32x2*)(sb + off);                         \
+            /* +c*64 words: each chain reads a DISTINCT fragment, so the loads  \
+               cannot be hoisted to one pair feeding all C WMMAs. Without this  \
+               the probe measures ~0.25 LDS reads/WMMA at C=8 instead of 2. */  \
+            int oc = (off + c * 64) & (LDSP_WORDS - 2);                        \
+            __asm__ __volatile__("" : "+v"(oc));                               \
+            const i32x2 a = *(const i32x2*)(sa + oc);                          \
+            const i32x2 b = *(const i32x2*)(sb + oc);                          \
             acc[c] = W32(a, b, acc[c]);                                        \
         }                                                                      \
     }                                                                          \
@@ -102,8 +107,13 @@ __launch_bounds__(256) extern "C" __global__ void NAME(                        \
         const int slot = ((i & LDSP_RING) * 8) & (LDSP_WORDS - 1);             \
         const int off = (slot + lane * 2) & (LDSP_WORDS - 2);                  \
         _Pragma("unroll") for (int c = 0; c < (C); ++c) {                      \
-            const i32x2 a = *(const i32x2*)(sa + off);                         \
-            const i32x2 b = *(const i32x2*)(sb + off);                         \
+            /* +c*64 words: each chain reads a DISTINCT fragment, so the loads  \
+               cannot be hoisted to one pair feeding all C WMMAs. Without this  \
+               the probe measures ~0.25 LDS reads/WMMA at C=8 instead of 2. */  \
+            int oc = (off + c * 64) & (LDSP_WORDS - 2);                        \
+            __asm__ __volatile__("" : "+v"(oc));                               \
+            const i32x2 a = *(const i32x2*)(sa + oc);                          \
+            const i32x2 b = *(const i32x2*)(sb + oc);                          \
             acc[c] = W32(a, b, acc[c]);                                        \
         }                                                                      \
         /* 16 WMMA per 256-weight group -> fold and reset, as the real kernel */\
@@ -172,8 +182,13 @@ __launch_bounds__(256) extern "C" __global__ void NAME(                        \
         const int slot = ((i & LDSP_RING) * 8) & (LDSP_WORDS - 1);             \
         const int off = (slot + lane * 2) & (LDSP_WORDS - 2);                  \
         _Pragma("unroll") for (int c = 0; c < (C); ++c) {                      \
-            const i32x2 a = *(const i32x2*)(sa + off);                         \
-            const i32x2 b = *(const i32x2*)(sb + off);                         \
+            /* +c*64 words: each chain reads a DISTINCT fragment, so the loads  \
+               cannot be hoisted to one pair feeding all C WMMAs. Without this  \
+               the probe measures ~0.25 LDS reads/WMMA at C=8 instead of 2. */  \
+            int oc = (off + c * 64) & (LDSP_WORDS - 2);                        \
+            __asm__ __volatile__("" : "+v"(oc));                               \
+            const i32x2 a = *(const i32x2*)(sa + oc);                          \
+            const i32x2 b = *(const i32x2*)(sb + oc);                          \
             acc[c] = W32(a, b, acc[c]);                                        \
         }                                                                      \
         if ((i & 15) == 15) {                                                  \
@@ -241,8 +256,10 @@ __launch_bounds__(256) extern "C" __global__ void NAME(                        \
         const int slot = ((i & LDSP_RING) * 8) & (LDSP_WORDS - 1);             \
         const int off = (slot + lane * 2) & (LDSP_WORDS - 2);                  \
         _Pragma("unroll") for (int c = 0; c < (C); ++c) {                      \
-            const i32x2 a = *(const i32x2*)(sa[buf] + off);                    \
-            const i32x2 b = *(const i32x2*)(sb[buf] + off);                    \
+            int oc = (off + c * 64) & (LDSP_WORDS - 2);                        \
+            __asm__ __volatile__("" : "+v"(oc));                               \
+            const i32x2 a = *(const i32x2*)(sa[buf] + oc);                     \
+            const i32x2 b = *(const i32x2*)(sb[buf] + oc);                     \
             acc[c] = W32(a, b, acc[c]);                                        \
         }                                                                      \
         if ((i & 3) == 3) {                                                    \
