@@ -33,7 +33,12 @@ typedef float f32x8 __attribute__((ext_vector_type(8)));
 #define TWM 2          // wave grid rows
 #define TWN 4          // wave grid cols
 #define TWMt 2         // m-subtiles per wave
-#define TWNt 2         // n-subtiles per wave
+#define TWNt 2
+// Opt step 1 (TWNt 2->4, BN 128->256) was NEUTRAL: instructions/WMMA fell
+// 22.2 -> 19.1 and ds_load/WMMA 0.50 -> 0.38, but occupancy fell 12 -> 8 waves
+// and TOPS was unchanged (84.5 -> 83.9). At 12 waves the VALU overhead is
+// already hidden, so removing it buys nothing. Kept at 2 for the register
+// headroom the second digit pass will need.
 #define TAB (TBM * (TBK / 2))   // 2048 B
 #define TBB (TBN * (TBK / 2))   // 4096 B
 
@@ -85,17 +90,22 @@ __launch_bounds__(256) extern "C" __global__ void wmma_iu4_tiled_w32(
         gbase += (TAB + TBB) / 4;
 
         // REAL TILED ADDRESSING: fragment for (wave, subtile, k-step).
+        // Hoist ONE base pointer per operand out of the k-step loop. Every
+        // fragment address is then base + a COMPILE-TIME constant
+        // (i*16*(BK/2) + s*8, max 1560 B), which fits the DS 2addr form's 8-bit
+        // scaled offsets (<=2040 B reach, rdna35:7094) so the address falls into
+        // the instruction immediate instead of a v_add chain.
+        const uint8_t* pa = As[buf] + (wm * TWMt * 16 + lane) * (TBK / 2);
+        const uint8_t* pb = Bs[buf] + (wn * TWNt * 16 + lane) * (TBK / 2);
 #pragma unroll
         for (int s = 0; s < TBK / 16; ++s) {
             i32x2 af[TWMt], bf[TWNt];
 #pragma unroll
             for (int i = 0; i < TWMt; i++)
-                af[i] = *(const i32x2*)(As[buf] +
-                    ((wm * TWMt + i) * 16 + lane) * (TBK / 2) + s * 8);
+                af[i] = *(const i32x2*)(pa + i * 16 * (TBK / 2) + s * 8);
 #pragma unroll
             for (int j = 0; j < TWNt; j++)
-                bf[j] = *(const i32x2*)(Bs[buf] +
-                    ((wn * TWNt + j) * 16 + lane) * (TBK / 2) + s * 8);
+                bf[j] = *(const i32x2*)(pb + j * 16 * (TBK / 2) + s * 8);
 #pragma unroll
             for (int i = 0; i < TWMt; i++)
 #pragma unroll

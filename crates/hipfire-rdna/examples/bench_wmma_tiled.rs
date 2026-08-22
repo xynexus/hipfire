@@ -24,8 +24,11 @@ fn main() {
         .upload_raw(&vec![0u8; SRC_W * 4], &[SRC_W])
         .expect("src");
 
-    // per workgroup per strip: 8 waves x (BK/16=4) x (WMt*WNt=4) = 128 WMMA
-    let wmma = blocks as f64 * kstrips as f64 * 128.0;
+    // per workgroup per strip: 8 waves x (BK/16=4) x (WMt*WNt) WMMA.
+    // Keep in sync with TWMt/TWNt in the kernel.
+    const TWMT: f64 = 2.0;
+    const TWNT: f64 = 2.0;
+    let wmma = blocks as f64 * kstrips as f64 * 8.0 * 4.0 * TWMT * TWNT;
     let ops = wmma * 8192.0;
 
     gpu.wmma_iu4_tiled(&out, &src, blocks, kstrips, SRC_W)
