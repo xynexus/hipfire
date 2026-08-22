@@ -277,7 +277,40 @@ Three ways out, none of them small:
    unpicking `finish()`'s by-value session — the property M3b0.5 deliberately
    chose to dissolve the `Failed(String)` hand-back.
 
-Option 3 is the recommendation, and it should be measured before it is costed.
+**Measured 2026-08-22, by attempting it. Options 1 and 3 COLLAPSE into the same
+change.**
+
+Option 1 (per-quantum save/restore) sounded independent of option 3, and is not.
+Restoring the session into the slot before a step means `step` must read `kv`/`dn`
+from `m.active` rather than from an owned session — which *is* option 3's core
+change. Having made it, the handle no longer needs to own the session between
+quanta at all, so option 1 buys nothing and costs two GPU allocations per token
+per stream. **Discard option 1.**
+
+The option-3 surface, measured:
+
+* `step()` — **done and proven**: switching it to `m: &mut LoadedModel`, deriving
+  `kv`/`dn` from `m.active.sequence_state` and the tokenizer internally, compiles
+  cleanly. The disjoint-field borrow works, and the pattern already exists in this
+  file (the `pp > 1` path binds `&m.q35_config` alongside `&mut m.active` the same
+  way). Only the call sites needed updating.
+* `qwen35_finish_generation` — 16 `session` references, plus its by-value session
+  and the `qwen35_restore_or_error` unwind, all of which disappear when the
+  session never leaves the slot.
+* `generate_start`'s qwen35 arm — drop the `take_from_loaded`, rebind `kv`/`dn`
+  from the resident slot, and rewrite the `session.cursor` uses (22 across the
+  file).
+* `fail()` collapses to `write_error`; the handle's `session` field goes away.
+
+**It is one pass, not slices** — the same property M3b0.5 had, for the same
+reason: the session either lives in the slot or in the handle, and every site has
+to agree at once.
+
+**And note what it costs conceptually.** Leaving the session resident is a
+semantic change to the DEFAULT path, not just the flag-on one: today `m.active`
+is *empty* for the duration of a generation, and afterwards it would be
+populated. Anything that reads `m.active` mid-generate changes behaviour. That
+needs the full harness plus gates, not just a flag-off diff.
 
 #### M3b1 — the loop itself
 
