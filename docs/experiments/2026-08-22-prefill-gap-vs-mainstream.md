@@ -1,5 +1,9 @@
-# The prefill gap vs mainstream engines is the overlay, and 350 tok/s is
-# arithmetically impossible while it exists
+# The prefill gap vs mainstream engines
+
+> **⚠️ THE FORMAT CONCLUSION BELOW WAS REFUTED BY MEASUREMENT.** The arithmetic
+> said "drop the overlay, spend more bits". Two experiments on the same 2B model
+> say the opposite — see "MEASURED REFUTATION" at the end. The instruction-rate
+> and time-budget analysis stands; the *inference* drawn from it did not.
 
 State box: halo, gfx1151, 40 CU / 20 WGP, ~2.9 GHz, 248.5 GB/s measured DRAM.
 Qwen3.8-27B `OqPlusCompact` (oq4.25++), KVarN KV, batched prefill, 2059-token
@@ -104,3 +108,76 @@ settles the format question directly instead of by arithmetic. If oq8 prefill is
 
 Independently and regardless of format: the GEMM is at 74% of our own best
 measured rate, and closing that is worth 217 -> ~250 tok/s on its own.
+
+# MEASURED REFUTATION
+
+The prediction above was that the sparse overlay is a 26% structural tax and
+that a wider, overlay-free format would be faster for prefill. Both halves are
+wrong. Quantized `qwen3.5-2b--bf16` three ways and ran the identical
+2059-token prompt, kvarn KV, batched prefill:
+
+| 2B format | prefill tok/s | decode tok/s |
+|---|---|---|
+| **oq4.25 (compact, WITH the overlay)** | **1665** | **87.4** |
+| dense bf16 (no quantization at all) | 1529 | 18.9 |
+| oq8 (8-bit, NO overlay) | 700 | 63.7 |
+
+- **oq8 is 2.36x SLOWER on prefill than the compact format it was supposed to
+  beat**, and slower on decode too. Removing the overlay made everything worse.
+- **Dense bf16 loses to compact on prefill** (1529 vs 1665) and is 4.6x worse on
+  decode. So "dequantize once per chunk and run a dense bf16 GEMM" — the
+  large-batch strategy this doc attributed to llama.cpp — is already slower than
+  what we ship.
+
+## Why the arithmetic misled
+
+The instruction rates are right: iu4 is 16 cycles, iu8/bf16/f16 are 32. What the
+budget missed is that **rate is not the binding constraint — in-kernel unpacking
+is.** The compact iu4x2 path feeds nibbles **raw** to the iu4 WMMA with no
+unpack step at all. Every wider format has to unpack into int8 or bf16 operands
+before it can issue, and that work lands squarely in the inner loop. That is why
+`gemm_oq8_grouped_*` sits so far below its 32-cycle ceiling, and it is why
+adding bits *loses* even though it deletes a whole correction pass.
+
+So the overlay is not a tax we are paying for nothing. It is the price of a
+raw-nibble format, and the raw-nibble format is worth more than the overlay
+costs. **The 4.25-bit format is our fastest option on BOTH axes**, which is the
+opposite of what this document originally concluded.
+
+## What that leaves
+
+| arm | tok/s | TFLOP/s useful |
+|---|---|---|
+| 2B oq4.25 | 1665 | 6.66 |
+| 2B bf16 | 1529 | 6.12 |
+| 2B oq8 | 700 | 2.80 |
+| **27B oq4.25++** | **217** | **10.34** |
+
+The 27B is **already more FLOP-efficient than our own 2B** (10.34 vs 6.66
+TFLOP/s), so it is not anomalously slow within our own stack — the 2B is small
+enough to be launch-bound. 350 tok/s on the 27B needs 16.7 TFLOP/s useful, which
+is 28% of the 59 TOPS W4A8 ceiling against the 18% we reach now. Feasible on
+paper, but not by changing format.
+
+The remaining levers, in order of measured size:
+
+1. **GEMM efficiency.** The compact GEMM runs at 74% of our own best-measured
+   compact GEMM (39.5 vs 53.4 TOPS of iu4 issue) and 33% of the W4A8 ceiling.
+   Closing to our own best is worth roughly 217 -> 250.
+2. **The overlay correction, 23.9%.** Still the largest single non-GEMM item.
+   Fusion is dead (two attempts, both worse, gather is L2-resident) and a wider
+   format is now dead too. What is left is making the gather itself cheaper, or
+   changing what the format stores so the gather is contiguous — the
+   already-measured-weak alternatives (shared positions 5.4%, column
+   concentration ~8% vs 6.25% uniform).
+3. **Attention, 11.1%**, already improved 4.3x this branch.
+
+## Open question about the comparison itself
+
+Worth settling before more work is aimed at this number: whether the >350 tok/s
+figures are on **this same model and this same hardware**. Qwen3.8-27B is a
+hybrid — 16 full-attention plus 48 linear-attention layers — and a dense 27B
+transformer, a smaller model, or a discrete GPU would all change the target
+materially. Our own measurements say the format and the GEMM strategy are not
+the deficiency, so the next useful step is pinning the baseline rather than
+optimizing against an unanchored one.
