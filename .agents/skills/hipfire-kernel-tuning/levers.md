@@ -203,6 +203,22 @@ on every arm:
 | two separate nibble planes (hi at `[0,B*K/2)`, lo after) | 3.585 | 25.5 | **-30%** |
 | **hi/lo interleaved at FRAGMENT granularity** | **2.191** | **41.7** | **+13%** |
 
+**CROSS-PROCESS VERIFIED** per playbook §6 — `probe_commits.sh` is
+plumbed for 9B decode and does not reach this kernel, so the manual
+recipe was used: separate scratch worktree per commit, separate
+`CARGO_TARGET_DIR`, fresh process per run, `.hsaco` cache cleared each
+run. Three runs each, `af6ce02f` vs `5de3d7d2`:
+
+| | runs (ms) | median | spread |
+|---|---|---|---|
+| baseline | 2.575, 2.584, 2.618 | 2.584 | 1.7% |
+| interleaved | 2.128, 2.183, 2.201 | 2.183 | 3.4% |
+
+**1.184x, and the ranges do not overlap** (slowest candidate 2.201 is
+still faster than the fastest baseline 2.575). The same-session figure
+was 1.134x, so the win survives a fresh process and is slightly larger
+than first measured — the opposite of the §2 nontemporal fake win.
+
 Separate planes removes every unpack instruction and still loses badly:
 it doubles the transaction count, halves their size, and reads two
 streams `B*K/2` apart. Interleaving instead — per column, each 16-K step
