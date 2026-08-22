@@ -41,12 +41,15 @@
 # PATH CHECK, before anything else. The batched and per-token paths write
 # bit-different recurrent state, so if their state hashes come out EQUAL the
 # "batched" run silently fell back to the reference and the cell compared it
-# against itself. Such a cell reports SKIP, never OK. Measured: both tiny MoE
-# fixtures show that signature today — they never reach `forward_prefill_batch`
-# — so without this check they would have reported a clean pass for a path they
-# never ran. (The real 35B-A3B does take the batched path; this is a fixture
-# capability gap, not a product bug. It does mean the MoE arms of M2a4 have no
-# tiny coverage yet.)
+# against itself. Such a cell reports SKIP, never OK — without it those cells
+# would report a clean pass for a path they never ran.
+#
+# The MoE cells SKIP on gfx1103, and it is NOT a fixture gap: `arch_has_wmma`
+# (prefill_batch.rs:5782) lists gfx1100/1101/1102/1150/1151/1200/1201 and gfx1103
+# is absent, so the batched MoE prefill is not admitted on this arch at all. A
+# real Qwen3.6-35B-A3B--oq4 reports the same `distinct_paths: false`, which
+# settles it. On gfx1151/gfx12 these cells should run; if they still SKIP there,
+# the admission gate — not the gate script — is what to look at.
 #
 # SELF-CHECK. Every cell also runs with `--corrupt-kv-prefix`, which zeroes each
 # layer's K buffer at every position EXCEPT the last — position 0 included. That

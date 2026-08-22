@@ -12,13 +12,17 @@ times in one session, so nothing here is asserted from intuition.
 | §0 decision | **made** (§0.1): band cursor + the existing chunk cap wins on measurement; M2a reordered behind M3 |
 | M2a0 verification | **landed** (§4.1) — `tiny-prefill-gate.sh`; §4's false COVERED is fixed |
 | M2a1 FA fallback | **landed** (§3.1) — −713 lines, and it fixed a live numeric bug |
-| M2a2 flag | **not started, deliberately** — it gates M2a3, which §0.1 defers. A flag with nothing behind it is scaffolding |
-| M2a3/M2a4 batched bindings | **deferred** behind M3 by the §0 decision |
-| M2a5 session-batch loops | separate milestone, unchanged |
+| M2a2 flag | **landed** (§3.2) — `HIPFIRE_PREFILL_LOWERED`, default on, plus a decision trace |
+| M2a3 batched bindings, dense FullAttn | **landed** (§3.2) — bit-identical, verified |
+| M2a4a DeltaNet | **landed** (§3.3) — bit-identical, verified on a 3/4-LinearAttention fixture |
+| M2a4b the two MoE arms | **blocked on hardware, measured** (§3.4) — the batched MoE prefill is not admitted on gfx1103, so the change is unverifiable on this box |
+| M2a5 session-batch loops | separate milestone, unchanged (§3 says so itself) |
 
-M2a0 and M2a1 were landed despite the deferral because neither depends on it:
-M2a0 fixes a gate that lies about coverage today, and M2a1 turned out to fix a
-production divergence rather than merely delete a duplicate.
+§0.1's decision was about ORDERING — that M2a is not the cheapest way to buy the
+latency number. It never made the stages wrong, and every one of them paid off
+on its own terms: M2a0 fixed a gate that lied about coverage, M2a1 fixed a
+production divergence, and M2a3/M2a4a removed ~3,600 lines of inline kernel
+sequencing from `prefill_chunk.rs` with bit-identical output.
 
 ## 0. Read this before costing anything: the premise is false
 
@@ -272,6 +276,84 @@ behind one `Moe` super-op, so they cost less than their line count suggests.
 hits `_ => panic!` at `prefill_chunk.rs:7884`. A generic per-token binding turns
 a loud panic into silently different numerics: the accept-and-miscompute class
 M2a exists to prevent, arriving *through* M2a. Preserve the panic explicitly.
+
+### 3.2 M2a2 + M2a3 as landed
+
+`Qwen35PrefillBindings` (`prefill_lowered.rs`) executes the five super-ops of
+`lower_variant(FullAttn)` over `n` rows. The batched kernel sequences moved out
+of the `(FullAttn, FullAttention) if fa_batched_ok` arm and were cut on that
+arm's OWN numbered phase comments, which land exactly on the op boundaries —
+phases 1–2 → `PROJ_QKV`, 4–8 → `ATTEND_FULL`, 9 → `RESID_WO`, 10a →
+`PROJ_GATE_UP`, 10b → `RESID_DOWN_SWIGLU`.
+
+The move is text-preserving: each method re-binds the enclosing locals it used
+and leaves the body untouched, so it cannot change numerics by construction.
+Verified anyway, because §4 established the tier could not have told us:
+
+| | before | after |
+|---|---|---|
+| tiny fixture, q8 KV (batched FA arm) | 2.04e-6 | **2.04e-6** |
+| real 0.8B oq8, q8 KV | 6.78e-5, state `0x4a94cd9815832413` | **identical** |
+
+`ShapeInfo`/the impl carries the row count. `DispatchCtx` was left alone — three
+arch-constant fields, 42 `::new()` sites across 13 crates (§6).
+
+M2a2 is `HIPFIRE_PREFILL_LOWERED` (default ON) plus
+`HIPFIRE_PREFILL_BACKEND_TRACE`. `=0` calls the same five methods in order, so
+the rollback isolates the executor from the kernels instead of being a second
+copy of them. A new name, not `HIPFIRE_FORWARD_LOWERED`, for the reason §M2a2
+gives: that `OnceLock` is copy-pasted into five arch crates.
+
+Norm/Moe/Recurrent/Conv/Escape on these bindings return a loud error. §6 is
+explicit that turning an unexpected variant into numerics is the
+accept-and-miscompute failure M2a exists to prevent.
+
+### 3.3 M2a4a — DeltaNet as landed
+
+`Qwen35PrefillDnBindings`, seven super-ops, same text-preserving method, cut
+where the arm's own comments named the boundaries. Sequenced after FullAttn on
+purpose, per §M2a4: it carries the sequential recurrent scan, in-place
+`dn_state.s_matrices` mutation and the `gdn_tape` interaction.
+
+The oracle is unusually direct here. The gate fixture is **3 LinearAttention
+layers out of 4**, and the probe's state hash IS `s_matrices` + the conv rings.
+It comes back **bit-identical** — `0xf4a7d713c7603e0e` on the fixture,
+`0x4a94cd9815832413` on the real 0.8B — before and after, and again with the
+flag off.
+
+`prefill_chunk.rs` is 6,106 → 4,504 lines across M2a3 + M2a4a.
+
+### 3.4 M2a4b — the MoE arms are blocked on hardware, and that is measured
+
+**Not deferred by §0.1, and not a fixture gap. The batched MoE prefill cannot
+run on gfx1103 at all.**
+
+`arch_has_wmma` (`prefill_batch.rs:5782`) admits
+`gfx1100|1101|1102|1150|1151|1200|1201`. **gfx1103 — nix1 — is absent.** So both
+tiny MoE cells and a real `Qwen3.6-35B-A3B--oq4` report `distinct_paths: false`:
+the "batched" run and the per-token reference land in the same code, and the
+comparison is the reference against itself.
+
+Getting that real-model datapoint took two fixes to the probe, both kept:
+
+* `TinyModel` has no `Drop` that returns device memory, and the probe loads two
+  models. On a tiny fixture the leak is invisible; the 35B's second load died at
+  `hipMalloc(1.03 MiB), free=15.1 MiB of total=43008 MiB` — which reads like a
+  model too big for the box and is actually the first copy still resident.
+* Freeing was not enough: `free_gpu` returns buffers to the pool free-list that
+  the next load's `upload_raw` cannot see (`dispatch/mod.rs:2171` calls this a
+  monotonic leak). Without `gpu.drain_pool()` the second load still OOMed, just
+  one layer later. `load.rs:4121` does the same at unload.
+
+So extracting the two MoE arms here would be a change no available oracle can
+check — the precise situation §6's second stop-line says to refuse. **Do it on
+gfx1151 or gfx12**, where the gate's MoE cells should stop reporting SKIP; if
+they still SKIP there, the admission gate is the thing to look at, not the gate
+script. (Halo is gfx1151 but has no `hipcc`, so its probe falls back to
+unvalidated pre-compiled blobs — see §0.1.)
+
+The `(FullAttnMoe, FullAttention)` panic at the layer-type catch-all is
+untouched and must stay untouched, per §M2a4's trap note.
 
 ### M2a5 — session-batch loops *(separate milestone, not M2a)*
 

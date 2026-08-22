@@ -1477,6 +1477,33 @@ fn qwen35_prefill_then_decode(
         decoded.push(model.forward_logits(gpu, tokens[pos] % vocab, pos)?);
     }
 
+    // `TinyModel` has no Drop that returns device memory, and `run_prefill_hash`
+    // loads a SECOND model right after this one. On a tiny fixture the leak is
+    // invisible; on a real MoE it is fatal — the 35B-A3B's second load died at
+    // `hipMalloc(1.03 MiB), free=15.1 MiB of total=43008 MiB`, which reads like
+    // a model too big for the box and is actually the first copy still resident.
+    // Freeing here is what lets the probe run against real artifacts at all,
+    // which is the only oracle the MoE arms have.
+    if let TinyModel::Qwen35 {
+        weights,
+        kv,
+        dn,
+        scratch,
+        ..
+    } = model
+    {
+        weights.free_gpu(gpu);
+        kv.free_gpu(gpu);
+        dn.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        // `free_gpu` returns buffers to the internal pool's free-list, which the
+        // next load's `upload_raw` cannot see (`dispatch/mod.rs:2171` calls that
+        // out as a monotonic leak). Without the drain the second load still
+        // OOMs, just later — it died at layer 30 of 40 instead of 29. This is
+        // what `load.rs:4121` does at unload.
+        gpu.drain_pool();
+    }
+
     Ok((state_hash, decoded))
 }
 
