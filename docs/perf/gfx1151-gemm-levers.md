@@ -53,7 +53,7 @@ Session arc: prefill **15.4 -> 234 tok/s**. Uncorrected ceiling 324. Target 350.
 
 | lever | expected | status |
 |---|---|---|
-| **Finish the rung-5 tiled kernel** (2nd digit pass + real outputs + parity) | **1.75x** on 46% of prefill, ~234 -> 310 | designed + measured at 84.5 TOPS, not yet a GEMM |
+| ~~Finish the rung-5 tiled kernel~~ | **DONE, and it did NOT transfer** — see §E correction | correct (parity PASS) but 5-14% SLOWER than the shipping wave64 |
 | Pooled post-WMMA correction, P=64 | matches overlay quality, removes the gather | quality proven; sharing width is the cost knob, kernel unwritten |
 | Skip LDS entirely, fragments direct from global | removes the barrier | DRAM is only 4% of staged cost, so reuse is affordable |
 | KVarN batched-prefill faithfulness | unlocks batched prefill by default (**~14x** on the default path) | residual is generic batched-vs-per-token, not KVarN |
@@ -78,9 +78,34 @@ Every ingredient is cheap; the shipping kernel is 1.75x below their sum. The
 difference is how the tile is split: same BM=64 x BN=128, but 8 wave32 waves at
 114 VGPRs / 12 waves-per-SIMD versus 4 wave64 waves at 234 VGPRs / 3.
 
-**Rule of thumb this yields:** occupancy bought by *redistributing the same tile
-across more, smaller waves* wins (1.75x); occupancy bought by *shrinking the
-tile* loses (1.2x), because it discards fragment reuse.
+### ⚠ CORRECTION: the 84.5 TOPS ceiling did NOT transfer
+
+The rung-5 probe was built into a real kernel (`gemm_oq_compact_iu4x2_tiled`,
+wave32, BM=64 x BN=128, 8 waves as 2x4, 179 VGPRs, **8 waves/SIMD**, 20480 B
+LDS). It is correct — parity PASS on all 5 shapes at max|rel| 1.36e-7, first try
+— and it is **5-14% SLOWER** than the shipping wave64 kernel:
+
+| shape | tiled TOPS | shipping w64 TOPS | probe |
+|---|---|---|---|
+| gate/up | 52.3 | 54.9 | 84.5 |
+| down | 44.1 | 51.0 | 84.5 |
+| qkv | 50.0 | 52.3 | 84.5 |
+| wo | **40.0** | 37.0 | 84.5 |
+| B=512 | 49.9 | 53.0 | 84.5 |
+
+So the "1.75x available" claim was wrong, and so was the rule of thumb derived
+from it. The probe reached 84.5 TOPS because it did **not** read a real weight
+layout, load per-row f16 scales, write M x B outputs, or guard boundaries. Real
+kernels — both of them, at 179 and 234 VGPRs, at 8 and 3 waves/SIMD — land at
+~50 TOPS regardless. **The ladder is sound as a per-ingredient diagnostic and
+unsound as an absolute ceiling.**
+
+What survives: occupancy is NOT the dominant variable it appeared to be. Two
+kernels differing 179 vs 234 VGPRs and 8 vs 3 waves/SIMD perform within 10% of
+each other, and every attempt to trade registers for instructions or vice versa
+(TWNt 2->4, base hoisting, scale-pointer hoisting, WMt 2->1) came back neutral or
+worse. Something outside the register/occupancy/instruction-count axis is setting
+the ~50 TOPS plateau, and it is not yet identified.
 
 **Wave64's real property**, from the matrix calculator: `v_wmma_i32_16x16x16_iu4`
 needs 4 GPRs for C/D in wave64 against 8 in wave32 (the 16x16 tile spreads over

@@ -1161,6 +1161,59 @@ impl Gpu {
     ///
     /// Does NOT apply the sparse overlay -- separate pass, as for both twins.
     #[allow(clippy::too_many_arguments)]
+    /// Tiled wave32 exact-W4A8 compact GEMM: BM=64 x BN=128, BK=64, 8 wave32
+    /// waves as 2x4, double-buffered LDS. Same contract as
+    /// [`Self::gemm_oq_compact_iu4x2_wmma`] (int8 activations, no overlay).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_tiled(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 256, 0, "gemm_oq_compact_iu4x2_tiled: K % 256 != 0");
+        self.ensure_kernel(
+            "gemm_oq_compact_iu4x2_tiled",
+            kernels::GEMM_OQ_COMPACT_IU4X2_TILED_SRC,
+            "gemm_oq_compact_iu4x2_tiled",
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
+        let mut si = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut si as *mut _ as *mut c_void,
+        ];
+        const BM: usize = 64;
+        const BN: usize = 128;
+        let func = &self.functions["gemm_oq_compact_iu4x2_tiled"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m.div_ceil(BM) as u32, batch_size.div_ceil(BN) as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn gemm_oq_compact_iu4x2_w64(
         &mut self,
         w_blocks: &GpuTensor,
