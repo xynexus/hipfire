@@ -149,6 +149,49 @@ That is what makes the handle authoritative while still getting the single fused
 forward, and it is why (a) costs a refactor of `step` rather than a
 reimplementation of the generation state machine.
 
+### The two sampling sites, resolved — the common path is uniform
+
+The complication recorded below turns out to be smaller than it reads, and this
+is the analysis it asked for.
+
+The two `sampler::sample` sites are **not** two alternative branches of one
+step. `qwen35_decode_one` is:
+
+```
+forward -> logits -> sample                       (the normal path, :2312)
+```
+
+and separately, an env-gated feature:
+
+```
+if budget alert fires (:2170, needs HIPFIRE_EXPERIMENTAL_BUDGET_ALERT
+                        + budget_alert_at_tok + non-empty alert text):
+    sample                                        (:2218)
+    encode nudge text, push its tokens            (:2230)
+    forward_scratch EACH nudge token              (:2260, in a loop)
+```
+
+So a single `decode_one` is one forward and one sample **except** when the
+budget-alert nudge fires, in which case it is sample → N extra single-token
+forwards → sample. The alert fires at most once per generation (`st.alert_fired`
+latches) and only while inside an open `<think>` block.
+
+**What that means for the batched step.** The common path — every stream, every
+token, unless the feature is enabled and its threshold is crossed — is exactly
+`forward -> sample`, which batches in lockstep with no special handling. A
+stream whose nudge fires needs N extra forwards that the other streams do not,
+so it cannot stay in the round.
+
+That is a clean, testable condition, not a structural obstacle: the batched
+driver excludes a stream that is about to nudge and steps it solo that round,
+exactly as it would for any stream whose shape diverges. `st.alert_fired` and
+the threshold are already the predicate.
+
+So the `step` split is closer to the `run_moe_decode` extraction than the
+earlier note feared. What it is not is unconditional, and pretending the second
+site does not exist would silently drop the nudge forwards from any stream that
+fires one.
+
 ### One complication, found by reading rather than assuming
 
 The split is clean on the *batched* side but not on the handle side.
