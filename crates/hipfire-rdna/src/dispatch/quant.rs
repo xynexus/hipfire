@@ -974,9 +974,12 @@ impl Gpu {
         chains: u32,
         fold: bool,
         stage: Option<(&GpuTensor, usize)>,
+        dbuf: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let name = if stage.is_some() {
+        let name = if stage.is_some() && dbuf {
+            format!("wmma_iu4_dbuf_w32_c{chains}")
+        } else if stage.is_some() {
             format!("wmma_iu4_stage_w32_c{chains}")
         } else if fold {
             format!("wmma_iu4_fold_w32_c{chains}")

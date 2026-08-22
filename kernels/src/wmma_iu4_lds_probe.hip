@@ -191,6 +191,89 @@ __launch_bounds__(256) extern "C" __global__ void NAME(                        \
     if (t == 255) out[blockIdx.x] = (int32_t)s;                                \
 }
 
+// Rung 4: DOUBLE-BUFFERED staging, which is what the real kernel does and the
+// rung-3 probe deliberately does not.
+//
+// Rung 3 pays TWO barriers per period and cannot overlap the global load with
+// compute: sync, load->LDS, sync, compute. Double buffering issues the NEXT
+// period's global loads into registers up front, computes the current period out
+// of the resident buffer, and stores to the other buffer behind a SINGLE barrier
+// at the period boundary -- so global latency hides under the matrix work and the
+// barrier count halves. LDS doubles to 32 KB, which still leaves room in the
+// 64 kB visible half (rdna35:1278-1280).
+#define LDS_DBUF_W32(NAME, C)                                                  \
+__launch_bounds__(256) extern "C" __global__ void NAME(                        \
+    int32_t* __restrict__ out, const int32_t* __restrict__ src,                \
+    int iters, int srcmask) {                                                  \
+    __shared__ int32_t sa[2][LDSP_WORDS];                                      \
+    __shared__ int32_t sb[2][LDSP_WORDS];                                      \
+    const int t = threadIdx.x;                                                 \
+    const int lane = t & 31;                                                   \
+    i32x8 acc[C];                                                              \
+    float8 facc[C];                                                            \
+    _Pragma("unroll") for (int c = 0; c < (C); ++c) {                          \
+        acc[c] = (i32x8){c, c+1, c+2, c+3, c+4, c+5, c+6, c+7};                \
+        facc[c] = (float8){0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};                   \
+    }                                                                          \
+    const float sx = 1.0009765625f;                                            \
+    int gbase = blockIdx.x * LDSP_WORDS * 4;                                   \
+    i32x4 ra[2], rb[2];                                                        \
+    /* prime buffer 0 */                                                       \
+    _Pragma("unroll") for (int l = 0; l < 2; ++l) {                            \
+        const int j = (t + l * 256) * 4;                                       \
+        *(i32x4*)(sa[0] + j) = *(const i32x4*)(src + ((gbase + j) & srcmask)); \
+        *(i32x4*)(sb[0] + j) =                                                 \
+            *(const i32x4*)(src + ((gbase + j + LDSP_WORDS) & srcmask));       \
+    }                                                                          \
+    gbase += LDSP_WORDS * 2;                                                   \
+    __syncthreads();                                                           \
+    for (int i = 0; i < iters; ++i) {                                          \
+        const int buf = (i >> 2) & 1;                                          \
+        if ((i & 3) == 0) {                                                    \
+            /* issue the NEXT period's loads now; they retire under the WMMA */\
+            _Pragma("unroll") for (int l = 0; l < 2; ++l) {                    \
+                const int j = (t + l * 256) * 4;                               \
+                ra[l] = *(const i32x4*)(src + ((gbase + j) & srcmask));        \
+                rb[l] = *(const i32x4*)(src + ((gbase + j + LDSP_WORDS) & srcmask)); \
+            }                                                                  \
+            gbase += LDSP_WORDS * 2;                                           \
+        }                                                                      \
+        const int slot = ((i & LDSP_RING) * 8) & (LDSP_WORDS - 1);             \
+        const int off = (slot + lane * 2) & (LDSP_WORDS - 2);                  \
+        _Pragma("unroll") for (int c = 0; c < (C); ++c) {                      \
+            const i32x2 a = *(const i32x2*)(sa[buf] + off);                    \
+            const i32x2 b = *(const i32x2*)(sb[buf] + off);                    \
+            acc[c] = W32(a, b, acc[c]);                                        \
+        }                                                                      \
+        if ((i & 3) == 3) {                                                    \
+            _Pragma("unroll") for (int l = 0; l < 2; ++l) {                    \
+                const int j = (t + l * 256) * 4;                               \
+                *(i32x4*)(sa[buf ^ 1] + j) = ra[l];                            \
+                *(i32x4*)(sb[buf ^ 1] + j) = rb[l];                            \
+            }                                                                  \
+            __syncthreads();   /* ONE barrier per period, not two */           \
+        }                                                                      \
+        if ((i & 15) == 15) {                                                  \
+            const float sw = __builtin_amdgcn_rcpf((float)(i + 2));            \
+            _Pragma("unroll") for (int c = 0; c < (C); ++c) {                  \
+                _Pragma("unroll") for (int e = 0; e < 8; ++e)                  \
+                    facc[c][e] += (float)acc[c][e] * sw * sx;                  \
+                acc[c] = (i32x8){0,0,0,0,0,0,0,0};                             \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    float s = 0.f;                                                             \
+    _Pragma("unroll") for (int c = 0; c < (C); ++c)                            \
+        _Pragma("unroll") for (int e = 0; e < 8; ++e) s += facc[c][e];         \
+    if (t == 255) out[blockIdx.x] = (int32_t)s;                                \
+}
+
+LDS_DBUF_W32(wmma_iu4_dbuf_w32_c1, 1)
+LDS_DBUF_W32(wmma_iu4_dbuf_w32_c2, 2)
+LDS_DBUF_W32(wmma_iu4_dbuf_w32_c4, 4)
+LDS_DBUF_W32(wmma_iu4_dbuf_w32_c8, 8)
+LDS_DBUF_W32(wmma_iu4_dbuf_w32_c16, 16)
+
 LDS_STAGE_W32(wmma_iu4_stage_w32_c1, 1)
 LDS_STAGE_W32(wmma_iu4_stage_w32_c2, 2)
 LDS_STAGE_W32(wmma_iu4_stage_w32_c4, 4)

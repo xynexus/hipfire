@@ -24,7 +24,7 @@ fn main() {
     println!("gfx1151 iu4 issue peak = 119 TOPS; shipping compact GEMM = 48.2 TOPS\n");
     println!(
         "  {:>7} {:>11} {:>10} {:>11} {:>10} {:>11} {:>8}",
-        "chains", "issue", "+LDS", "+fold", "+stage L2", "+stage DRAM", "vs 48.2"
+        "chains", "issue", "+LDS", "+fold", "+stage", "+dbuf", "vs 48.2"
     );
 
     let out = gpu
@@ -34,6 +34,7 @@ fn main() {
     // instruction and __syncthreads cost; the large one exceeds the 32 MB MALL so
     // the same kernel additionally pays real DRAM bandwidth. Their difference is
     // the bandwidth term.
+    #[allow(dead_code)]
     const SMALL_W: usize = 256 * 1024; // 1 MB
     const LARGE_W: usize = 16 * 1024 * 1024; // 64 MB
     let src_small = gpu
@@ -49,14 +50,26 @@ fn main() {
         let time = |gpu: &mut hipfire_rdna::Gpu, mode: u8| -> Option<f64> {
             let run = |g: &mut hipfire_rdna::Gpu| match mode {
                 0 => g.wmma_iu4_noop(&out, blocks, iters, c, false),
-                1 => g.wmma_iu4_lds_probe(&out, blocks, iters, c, false, None),
-                2 => g.wmma_iu4_lds_probe(&out, blocks, iters, c, true, None),
-                3 => {
-                    g.wmma_iu4_lds_probe(&out, blocks, iters, c, true, Some((&src_small, SMALL_W)))
-                }
-                _ => {
-                    g.wmma_iu4_lds_probe(&out, blocks, iters, c, true, Some((&src_large, LARGE_W)))
-                }
+                1 => g.wmma_iu4_lds_probe(&out, blocks, iters, c, false, None, false),
+                2 => g.wmma_iu4_lds_probe(&out, blocks, iters, c, true, None, false),
+                3 => g.wmma_iu4_lds_probe(
+                    &out,
+                    blocks,
+                    iters,
+                    c,
+                    true,
+                    Some((&src_large, LARGE_W)),
+                    false,
+                ),
+                _ => g.wmma_iu4_lds_probe(
+                    &out,
+                    blocks,
+                    iters,
+                    c,
+                    true,
+                    Some((&src_large, LARGE_W)),
+                    true,
+                ),
             };
             run(gpu).ok()?;
             gpu.device_synchronize().ok()?;
