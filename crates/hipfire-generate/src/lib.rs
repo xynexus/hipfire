@@ -113,6 +113,16 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateTextRequest {
     pub id: String,
+    /// The conversation this request belongs to. Absent means a one-shot: the
+    /// daemon starts from a clean session instead of continuing a previous
+    /// request.
+    ///
+    /// The daemon has honoured a `session_id` on the wire for a long time, but
+    /// only by reading it out of the raw JSON — it was never a field here, so a
+    /// client building this typed request **could not address a session at
+    /// all**. Same key, same semantics; this just makes it reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
@@ -178,6 +188,9 @@ impl GenerateTextRequest {
         let messages = messages.into_iter().collect::<Vec<_>>();
         Self {
             id,
+            // OpenAI-shaped callers resend the whole `messages` history each
+            // turn, so they are stateless by protocol and want no session.
+            session_id: None,
             prompt: openai_chat_last_user_prompt(messages.iter().copied()),
             messages: Some(openai_chat_messages_to_prompt_messages(
                 messages.iter().copied(),
@@ -1900,10 +1913,54 @@ mod tests {
         );
     }
 
+    /// The gap this closes: the daemon has always honoured `session_id` on the
+    /// wire, but read it only out of raw JSON. A client building the typed
+    /// request had no way to send one, so "multi-turn is still available, just
+    /// pass a session_id" was not actually reachable from this API.
+    ///
+    /// Both directions matter. Deserialization is the daemon's side (it must
+    /// see the same key it already reads); serialization is the client's (it
+    /// must be able to emit one) — and it must stay ABSENT when unset, or every
+    /// existing request would grow a `"session_id":null` and change the wire
+    /// format for callers that never asked for a session.
+    #[test]
+    fn session_id_is_reachable_from_the_typed_request() {
+        let json = serde_json::json!({
+            "id": "r1",
+            "prompt": "hi",
+            "session_id": "conv-7",
+            "temperature": 0.0,
+            "max_tokens": 8,
+        });
+        let req: GenerateTextRequest = serde_json::from_value(json).expect("parse");
+        assert_eq!(
+            req.session_id.as_deref(),
+            Some("conv-7"),
+            "the daemon reads this key out of raw JSON; the typed field must see the same one"
+        );
+
+        let round = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            round.get("session_id").and_then(|v| v.as_str()),
+            Some("conv-7"),
+            "a typed client must be able to EMIT a session_id, not just parse one"
+        );
+
+        let mut unset = req;
+        unset.session_id = None;
+        let v = serde_json::to_value(&unset).expect("serialize");
+        assert!(
+            v.get("session_id").is_none(),
+            "unset must serialize to an ABSENT key, not null — otherwise every \
+             session-less request changes shape on the wire"
+        );
+    }
+
     #[test]
     fn generate_text_request_preserves_server_daemon_contract() {
         let req = GenerateTextRequest {
             id: "chatcmpl-1".to_string(),
+            session_id: None,
             prompt: "Hello".to_string(),
             messages: None,
             sampling: GenerationSamplingPolicy {
