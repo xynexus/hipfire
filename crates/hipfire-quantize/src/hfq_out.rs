@@ -421,6 +421,17 @@ fn expert_role_rank(name: &str) -> u8 {
         Some("gate_up_proj") | Some("gate_proj") => 0,
         Some("up_proj") => 1,
         Some("down_proj") => 2,
+        // §M5 Phase 3. deepseek4, minimax and lfm2moe name their projections
+        // w1 / w3 / w2, which all fell into the unordered bucket below — so
+        // within a module they were ordered by source index, i.e. by whatever
+        // the upstream checkpoint happened to emit, rather than by role. The
+        // shared expert-residency unit wants role order to be a property of
+        // the format, not of the exporter. w1 is the gate, w3 the up, w2 the
+        // down, so they take the same three ranks as their long-named
+        // equivalents above.
+        Some("w1") => 0,
+        Some("w3") => 1,
+        Some("w2") => 2,
         _ => 3,
     }
 }
@@ -1742,6 +1753,59 @@ fn write_zeroes(f: &mut File, mut n: u64) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// §M5 Phase 3. deepseek4/minimax/lfm2moe emit `w1`/`w2`/`w3`, and every
+    /// one of them used to fall into the `_ => 3` bucket, so within a module
+    /// they were ordered by whatever the exporter happened to write. The
+    /// fixtures emit **w1, w2, w3**, so this reordering is real and observable
+    /// (verified end to end: the same fixture quantizes to fnv64
+    /// 2fc310746b9f6a13 before and 87b9330f45a6b9d5 after).
+    ///
+    /// Worth pinning because the tiny gates CANNOT catch a regression here —
+    /// KLD and state hashes read tensors by name and are invariant to order.
+    #[test]
+    fn short_projection_names_get_the_same_role_ranks_as_long_ones() {
+        let r = |n: &str| expert_role_rank(n);
+        // gate, up, down — the long names, unchanged.
+        assert_eq!(r("layers.0.mlp.experts.0.gate_up_proj.weight"), 0);
+        assert_eq!(r("layers.0.mlp.experts.0.up_proj.weight"), 1);
+        assert_eq!(r("layers.0.mlp.experts.0.down_proj.weight"), 2);
+        // the same three roles, short-named.
+        assert_eq!(r("layers.0.ffn.experts.0.w1.weight"), 0);
+        assert_eq!(r("layers.0.ffn.experts.0.w3.weight"), 1);
+        assert_eq!(r("layers.0.ffn.experts.0.w2.weight"), 2);
+        // anything else still sorts last, by source order.
+        assert_eq!(r("layers.0.ffn.experts.0.something.weight"), 3);
+        // not an expert tensor at all.
+        assert_eq!(r("layers.0.attn.q_proj.weight"), u8::MAX);
+
+        // And the ordering it produces: source w1, w2, w3 -> canonical w1, w3, w2.
+        let mk = |n: &str| HfqTensor {
+            name: n.to_string(),
+            quant_type: QuantType::F32,
+            shape: vec![1, 1],
+            group_size: 0,
+            data: Vec::new(),
+            spilled_len: 0,
+        };
+        let src = vec![
+            mk("layers.0.ffn.experts.0.w1.weight"),
+            mk("layers.0.ffn.experts.0.w2.weight"),
+            mk("layers.0.ffn.experts.0.w3.weight"),
+        ];
+        let ordered: Vec<&str> = canonical_tensor_order(&src)
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "layers.0.ffn.experts.0.w1.weight",
+                "layers.0.ffn.experts.0.w3.weight",
+                "layers.0.ffn.experts.0.w2.weight",
+            ]
+        );
+    }
     use super::*;
 
     #[cfg(target_os = "linux")]
