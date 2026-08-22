@@ -2530,7 +2530,7 @@ fn qwen35_finish_generation(
 /// defeat the interleaving it exists to enable. That property is why
 /// `Qwen35DecodeState` was built borrow-free in M3b0 and why `Qwen35DecodeCfg`
 /// had its lifetime removed — this type is what both were for.
-struct Qwen35Generation {
+pub struct Qwen35Generation {
     session: Qwen35RequestSessionState,
     st: Qwen35DecodeState,
     cfg: Qwen35DecodeCfg,
@@ -2646,6 +2646,24 @@ impl Qwen35Generation {
     }
 }
 
+/// What [`generate_start`] decided.
+pub enum Qwen35Start {
+    /// A qwen35 AR generation is prefilled and ready to be marched.
+    Ready(Qwen35Generation),
+    /// Nothing to march: the request was served by another route (spec-decode,
+    /// VL, the llama path) or already failed and reported it.
+    Handled,
+}
+
+#[allow(clippy::too_many_arguments)]
+/// [`generate`] minus the decode loop: frames the prompt, prefills, and returns
+/// the handle the caller marches. Executor v2 §M3b0.75 — the entry the executor
+/// uses instead of running a whole request inline.
+///
+/// The split is HERE, above the framing prologue, not at the qwen35 arm. The
+/// prologue is what produces `new_tokens` / `nl` / `im_end_token` / the attractor
+/// pairs; a cut below it yields a function the daemon cannot call, because it
+/// holds none of those. Measured and recorded in the M3b0.75 plan note.
 #[allow(clippy::too_many_arguments)]
 /// The default autoregressive text generate path for the qwen35 / qwen3 (llama)
 /// families, and the central text dispatcher: frames the prompt (chat template
@@ -2654,7 +2672,7 @@ impl Qwen35Generation {
 /// Delegates to the spec-decode fast paths ([`generate_mtp`], [`generate_dflash`],
 /// [`generate_multi`]) and to the non-qwen35 arch paths ([`generate_deepseek4`]
 /// etc.) when the loaded model calls for them.
-pub fn generate(
+pub fn generate_start(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
     drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
@@ -2687,7 +2705,7 @@ pub fn generate(
     // has no chat_template). Threaded rather than read from a global — see
     // `effective_raw` for the cross-request leak that motivated it.
     raw_override: Option<bool>,
-) {
+) -> Qwen35Start {
     // No RNG reset here any more. This used to seed a process-global CPU sampler
     // state so a request would not inherit RNG from its predecessor; the global
     // is gone (v2 plan, M1b), because with streams interleaved at module
@@ -2732,7 +2750,7 @@ pub fn generate(
             request_stop_sequences,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // Compress runs on the PFlash drafter handle when one is set (hetero
@@ -2775,7 +2793,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_ZAYA {
         // ZAYA1 — CCA attention + EDA/MoD MoE, routed through the shared
@@ -2806,7 +2824,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_NEMOTRON_H || m.arch_id == ARCH_ID_MAMBA2 {
         // nemotron_h / mamba2 — routed through the Mamba-capable ServingBackend
@@ -2837,7 +2855,7 @@ pub fn generate(
             evidence_dir,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_GEMMA3_TEXT {
         // arch_id=12 (gemma3 text, e.g. medgemma-*-text). Plain dense-AR via the
@@ -2867,7 +2885,7 @@ pub fn generate(
             repeat_penalty,
             repeat_window,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_GEMMA3_VL {
         // arch_id=13 (gemma3-vl / full MedGemma) with no media payload. Image and
@@ -2898,7 +2916,7 @@ pub fn generate(
             repeat_penalty,
             repeat_window,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_DEEPSEEK4_FLASH {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
@@ -2931,7 +2949,7 @@ pub fn generate(
             tools,
             messages_history,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if m.arch_id == ARCH_ID_MINIMAX_M2 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
@@ -2965,7 +2983,7 @@ pub fn generate(
             messages_history,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     #[cfg(feature = "arch-lfm2moe")]
     if m.arch_id == ARCH_ID_LFM2_MOE {
@@ -3001,7 +3019,7 @@ pub fn generate(
             prefilled_prompt_tokens,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
@@ -3033,7 +3051,7 @@ pub fn generate(
             request_stop_sequences,
             raw_override,
         );
-        return;
+        return Qwen35Start::Handled;
     }
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
@@ -3052,7 +3070,7 @@ pub fn generate(
             id,
             "prefill_already_done is not supported on DFlash-loaded models",
         );
-        return;
+        return Qwen35Start::Handled;
     }
     if prefill_already_done && pflash_state.is_some() {
         write_error(
@@ -3060,7 +3078,7 @@ pub fn generate(
             id,
             "prefill_already_done is not supported when PFlash state is loaded",
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // KVarN (and the deferred-hierarchical two-tier cache built on it) require the
@@ -3141,7 +3159,7 @@ pub fn generate(
             budget_alert_text,
             pflash_state,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     // MTP spec-decode: qwen35 model with a co-trained MTP head, no DFlash
@@ -3179,7 +3197,7 @@ pub fn generate(
             budget_alert_text,
             pflash_state,
         );
-        return;
+        return Qwen35Start::Handled;
     }
 
     let is_qwen35_ar = is_qwen35_family_arch_id(m.arch_id);
@@ -3188,7 +3206,7 @@ pub fn generate(
             Ok(session) => Some(session),
             Err(e) => {
                 write_error(stdout, id, &format!("qwen35 request session state: {e}"));
-                return;
+                return Qwen35Start::Handled;
             }
         }
     } else {
@@ -3535,7 +3553,7 @@ pub fn generate(
             if let Some(session) = q35_session.take() {
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
             }
-            return;
+            return Qwen35Start::Handled;
         }
     } else if absolute_pos + budget_prefill_tokens + max_tokens + trailer > m.max_seq {
         let _ = writeln!(
@@ -3547,7 +3565,7 @@ pub fn generate(
         if let Some(session) = q35_session.take() {
             qwen35_restore_or_error(stdout, id, m, gpu, session);
         }
-        return;
+        return Qwen35Start::Handled;
     }
 
     let im_end_token = if im_end.len() == 1 {
@@ -3595,7 +3613,7 @@ pub fn generate(
                     ),
                 );
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
-                return;
+                return Qwen35Start::Handled;
             }
         }
         let config = m.q35_config.as_ref().unwrap();
@@ -3733,7 +3751,7 @@ pub fn generate(
                 ) {
                     write_error(stdout, id, &format!("prefill failed: {e}"));
                     qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return;
+                    return Qwen35Start::Handled;
                 }
                 session.cursor.seq_pos += new_tokens.len();
             }
@@ -3825,7 +3843,7 @@ pub fn generate(
         // v2's march loop needs (§M3b0). The `while` stays exactly as it was:
         // budget-alert injection can push `generated` past the iteration count,
         // so the cap is rechecked at each loop start.
-        let mut generation = Qwen35Generation {
+        return Qwen35Start::Ready(Qwen35Generation {
             session,
             st: Qwen35DecodeState {
                 rng_state,
@@ -3866,23 +3884,7 @@ pub fn generate(
             pflash_summary,
             pflash_bypass_reason,
             pflash_alpha,
-        };
-        // `while` rather than `for`: budget-alert injection can push `generated`
-        // past the iteration count, so the cap is rechecked at each loop start.
-        while generation.st.generated < generation.cfg.max_tokens {
-            match generation.step(m, gpu, tokenizer, stdout, id) {
-                Qwen35Step::Continue => {}
-                Qwen35Step::Stop => break,
-                // The unwind stays out here: `qwen35_restore_or_error` consumes
-                // the session, so it cannot run while `step` holds borrows of it.
-                Qwen35Step::Failed(message) => {
-                    write_error(stdout, id, &message);
-                    qwen35_restore_or_error(stdout, id, m, gpu, generation.session);
-                    return;
-                }
-            }
-        }
-        generation.finish(m, gpu, stdout, id);
+        });
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware. This is the `not qwen35`
         // fallback, but it's specifically the llama (arch 0/1) state — every
@@ -3900,7 +3902,7 @@ pub fn generate(
                     m.arch_id
                 ),
             );
-            return;
+            return Qwen35Start::Handled;
         }
         let chat_template_profile = m.chat_template_profile.clone();
         let config = m.llama_config.as_ref().unwrap();
@@ -4087,5 +4089,98 @@ pub fn generate(
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
+    }
+    Qwen35Start::Handled
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The original entry point, now a thin driver over [`generate_start`]: start,
+/// march to completion, finish. Behaviour is unchanged for every caller.
+pub fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
+    stdout: &mut dyn std::io::Write,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+    think_mode: ThinkMode,
+    prefill_already_done: bool,
+    prefilled_prompt_tokens: Option<usize>,
+    request_stop_sequences: &[String],
+    evidence_dir: Option<&str>,
+    // Explicit per-request `"raw"` override; `None` = auto (raw iff the model
+    // has no chat_template). Threaded rather than read from a global — see
+    // `effective_raw` for the cross-request leak that motivated it.
+    raw_override: Option<bool>,
+) {
+    match generate_start(
+        m,
+        gpu,
+        drafter_gpu,
+        stdout,
+        id,
+        prompt,
+        system_prompt,
+        temp,
+        top_p,
+        top_k,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        budget_alert_at_tok,
+        budget_alert_text,
+        max_think_tokens,
+        assistant_prefix,
+        pflash_state,
+        pflash_cfg,
+        tools,
+        messages_history,
+        think_mode,
+        prefill_already_done,
+        prefilled_prompt_tokens,
+        request_stop_sequences,
+        evidence_dir,
+        raw_override,
+    ) {
+        Qwen35Start::Handled => {}
+        Qwen35Start::Ready(mut generation) => {
+            while generation.st.generated < generation.cfg.max_tokens {
+                let tokenizer = m
+                    .tokenizer
+                    .as_ref()
+                    .expect("qwen35 model always has a tokenizer");
+                match generation.step(m, gpu, tokenizer, stdout, id) {
+                    Qwen35Step::Continue => {}
+                    Qwen35Step::Stop => break,
+                    // The unwind stays out here: qwen35_restore_or_error consumes
+                    // the session, so it cannot run while `step` holds borrows.
+                    Qwen35Step::Failed(message) => {
+                        write_error(stdout, id, &message);
+                        qwen35_restore_or_error(stdout, id, m, gpu, generation.session);
+                        return;
+                    }
+                }
+            }
+            generation.finish(m, gpu, stdout, id);
+        }
     }
 }
