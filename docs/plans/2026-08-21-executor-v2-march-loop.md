@@ -487,7 +487,26 @@ every decode path routed through the march loop, which is M3c at the earliest.
 
 </details>
 
-### M3c — the suspension boundary
+### M3c — DONE 2026-08-22. Satisfied by M3b1's park/resume.
+
+M3b1's mechanism *is* the suspension boundary, and the exit was demonstrated
+deliberately rather than assumed. Two streams of unequal length, so one is parked
+mid-generation while the other keeps running:
+
+```
+pattern: SLSLSLSLSLSLSLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+S(8):  solo 65e5577ea38e == interleaved 65e5577ea38e
+L(40): solo 81a97280bed1 == interleaved 81a97280bed1
+```
+
+`L` was parked and resumed eight times mid-generation, then ran uninterrupted,
+and its output is identical to never having been parked. Also verified under
+*full* contention (two 40-token streams): still `81a97280bed1`.
+
+`hipGraph` is a non-issue for this scope, as the corrected note below says:
+qwen35 AR is graph-free by the hard `let use_graph = false;`.
+
+### M3c — the suspension boundary (original text)
 
 Park and resume across a real forward. `RunningStream`'s cursor contract already
 exists and is tested at the type level; this makes it true of an actual forward.
@@ -515,7 +534,37 @@ with the parsed `HIPFIRE_GRAPH` deliberately discarded on the next line. Do not
 widen the v2 scope to deepseek4 without dealing with the graph first — the
 smallest possible quantum there is one whole captured forward.
 
-### M3d — the exit measurements
+### M3d — one of three measured; the other two are not obtainable yet
+
+**(3) bulk throughput — measured, and the naive reading is wrong.** Two equal
+40-token streams, fully contended, against one solo:
+
+| | tok/s |
+|---|---|
+| X solo | 68.2 |
+| X contended | 31.7 |
+| Y contended | 34.0 |
+| **aggregate** | **0.963× solo** |
+
+Per-stream is 0.465, which *looks* like a miss against the ≥0.6 bar and is not
+one: two equal streams sharing one GPU serially should each get about half. That
+is fair sharing. **The ≥0.6 bar is written for one realtime plus one bulk** — it
+exists to stop measurement (2) being gamed by starving the bulk job — and that
+shape needs the realtime class from §M6, so the bar cannot be applied yet.
+
+The number that *is* meaningful here: **interleaving costs ~3.7% aggregate
+throughput**. That is the price of the per-token park/resume swap, and it is what
+option 3 (handle stops owning the session) would buy back. Small enough that
+option 3 stays an optimisation.
+
+**(1) module duration by `SuperOpKind` — still not obtainable.** `TraceRecord.module`
+is documented "0 until the module graph exists", every `record()` site passes 0,
+and `SuperOpKind` appears in `exec_trace.rs` zero times. Unchanged by M3b1.
+
+**(2) realtime admission→first dispatch — not obtainable.** There is no realtime
+`WorkloadClass` to admit; that is §M6.
+
+### M3d — the exit measurements (original text)
 
 The parent plan's exit is three numbers read from the M0 trace, one
 realtime-class stream against one bulk stream. They are measurements, not a build
