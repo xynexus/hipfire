@@ -127,29 +127,10 @@ fn main() {
             }
         }
 
-        // Dump the int4 residual (rotated basis) so a low-rank alternative can be
-        // ranked against the overlay at matched bits. One tensor is enough.
-        if std::env::var("HIPFIRE_DUMP_RESIDUAL").is_ok() && suffix.contains("down_proj") {
-            let mut f = std::io::BufWriter::new(
-                std::fs::File::create("/tmp/claude-1000/residual.bin").expect("dump"),
-            );
-            use std::io::Write;
-            f.write_all(&(rows as u32).to_le_bytes()).unwrap();
-            f.write_all(&(k as u32).to_le_bytes()).unwrap();
-            for r in 0..rows {
-                for g in 0..ngroups {
-                    let gi = r * ngroups + g;
-                    let s = scales[gi];
-                    let inv = 1.0 / s.max(1e-12);
-                    for p in 0..G {
-                        let v = rot[gi][p];
-                        let q = (v * inv).round().clamp(-7.0, 7.0) * s;
-                        f.write_all(&(v - q).to_le_bytes()).unwrap();
-                    }
-                }
-            }
-            eprintln!("  dumped residual: {rows} x {k}");
-        }
+        // (A one-off residual dump lived here while ranking the low-rank
+        // alternative — see docs/experiments/2026-08-22-overlay-alternatives-and-qat-scope.md
+        // for the result. Removed: hipfire-quantize forbids raw std::env::var,
+        // and registering an env var for a throwaway probe is not worth it.)
 
         // Shared selection: for each group column g, rank positions by the TOTAL
         // int4->int8 error reduction summed over every row, then take the top n_out.
