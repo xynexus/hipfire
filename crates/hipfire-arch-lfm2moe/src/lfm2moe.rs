@@ -432,6 +432,18 @@ fn oqplus_compact_to_moe_oq8_blocks(data: &[u8], m: usize, k: usize) -> Result<V
     Ok(out)
 }
 
+/// A non-owning `GpuTensor` view at `byte_offset` into `owner`. Mirrors the
+/// slab aliasing qwen35 already does (`loading.rs:alias_raw_tensor`); the view
+/// must never be freed — see `ExpertWeights::owner`.
+fn alias_into(owner: &GpuTensor, byte_offset: usize, len: usize, dtype: DType) -> GpuTensor {
+    let ptr = unsafe { (owner.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
+    GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len) },
+        shape: vec![len],
+        dtype,
+    }
+}
+
 fn upload_wt_raw(
     gpu: &mut Gpu,
     data: &[u8],
@@ -546,6 +558,17 @@ pub struct DenseFfn {
 pub struct ExpertWeights {
     pub gate_up: WeightTensor, // [2*moe_inter, hidden]
     pub down: WeightTensor,    // [hidden, moe_inter]
+    /// §M5 Phase 2. The single allocation that actually owns this expert's
+    /// bytes; `gate_up.buf` and `down.buf` are non-owning views into it at
+    /// relative offsets. `None` on the paths that still upload the two
+    /// projections separately (each then owns its own buffer, as before).
+    ///
+    /// This exists because `WeightTensor::free_all` frees `self.buf`
+    /// unconditionally — its `is_alias` guard covers only the ParoQuant
+    /// rotation, not the main buffer. So ownership has to be tracked out here
+    /// rather than on the tensors, and `free_gpu` below is the only place that
+    /// knows which it is.
+    pub owner: Option<GpuTensor>,
 }
 
 /// Top-4 MoE FFN (sigmoid + expert_bias routing).
@@ -615,8 +638,37 @@ impl DenseFfn {
 
 impl ExpertWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.gate_up.free_all(gpu);
-        self.down.free_all(gpu);
+        match self.owner {
+            // Packed: the two projections are views, so freeing them would be a
+            // double free. Release their sidecars by hand, then the one owner.
+            Some(owner) => {
+                if let Some(paro) = self.gate_up.paro {
+                    if !paro.is_alias {
+                        let _ = gpu.free_tensor(paro.pairs);
+                        let _ = gpu.free_tensor(paro.theta);
+                        let _ = gpu.free_tensor(paro.channel_scales);
+                    }
+                }
+                if let Some(awq) = self.gate_up.awq_scale {
+                    let _ = gpu.free_tensor(awq);
+                }
+                if let Some(paro) = self.down.paro {
+                    if !paro.is_alias {
+                        let _ = gpu.free_tensor(paro.pairs);
+                        let _ = gpu.free_tensor(paro.theta);
+                        let _ = gpu.free_tensor(paro.channel_scales);
+                    }
+                }
+                if let Some(awq) = self.down.awq_scale {
+                    let _ = gpu.free_tensor(awq);
+                }
+                let _ = gpu.free_tensor(owner);
+            }
+            None => {
+                self.gate_up.free_all(gpu);
+                self.down.free_all(gpu);
+            }
+        }
     }
 }
 
@@ -876,22 +928,72 @@ impl Lfm2MoeWeights {
                     gate_up_bytes.extend_from_slice(&w3);
                     // OQ blobs are already in kernel-block layout → upload raw tagged
                     // Oq4/Oq8 (NOT wt_from_raw, whose OQ arm runs the dense repack).
-                    let mut gate_up = if qt1 == OQ4_CANONICAL_QT {
-                        upload_wt_raw(gpu, &gate_up_bytes, DType::Oq4G256, 2 * moe_inter, hidden)
-                    } else if qt1 == OQ_PLUS_COMPACT_QT {
-                        upload_wt_raw(gpu, &gate_up_bytes, DType::Oq8G256, 2 * moe_inter, hidden)
+                    // §M5 Phase 2 — one owning allocation per expert.
+                    //
+                    // Both projections used to be their own `upload_raw`, i.e.
+                    // a bare `hipMalloc` with no pooling, giving
+                    // `2 x n_exp x n_layers` buffer objects. When the on-disk
+                    // bytes are already in kernel-block layout (the OQ arms,
+                    // which upload verbatim) they can share one allocation with
+                    // the two tensors aliasing into it at relative offsets —
+                    // the same shape qwen35's slab path and the pager's
+                    // `register_expert_module` already use. Halves the BO count
+                    // and changes no byte any kernel reads.
+                    //
+                    // The non-OQ arm still goes through `wt_from_raw`, which
+                    // repacks rather than uploading verbatim, so it keeps two
+                    // owned buffers and `owner` stays `None`.
+                    let packable = (qt1 == OQ4_CANONICAL_QT || qt1 == OQ_PLUS_COMPACT_QT)
+                        && (qt2 == OQ4_CANONICAL_QT || qt2 == OQ_PLUS_COMPACT_QT);
+                    let (mut gate_up, mut down, owner) = if packable {
+                        let gu_dtype = if qt1 == OQ4_CANONICAL_QT {
+                            DType::Oq4G256
+                        } else {
+                            DType::Oq8G256
+                        };
+                        let dn_dtype = if qt2 == OQ4_CANONICAL_QT {
+                            DType::Oq4G256
+                        } else {
+                            DType::Oq8G256
+                        };
+                        let mut packed =
+                            Vec::with_capacity(gate_up_bytes.len().saturating_add(w2.len()));
+                        packed.extend_from_slice(&gate_up_bytes);
+                        packed.extend_from_slice(&w2);
+                        let owner = gpu
+                            .upload_raw(&packed, &[packed.len()])
+                            .map_err(|e2| format!("lfm2moe: pack expert L{l}E{e}: {e2:?}"))?;
+                        let gu_buf = alias_into(&owner, 0, gate_up_bytes.len(), gu_dtype);
+                        let dn_buf =
+                            alias_into(&owner, gate_up_bytes.len(), w2.len(), dn_dtype);
+                        (
+                            WeightTensor {
+                                buf: gu_buf,
+                                gpu_dtype: gu_dtype,
+                                m: 2 * moe_inter,
+                                k: hidden,
+                                row_stride: 0,
+                                paro: None,
+                                awq_scale: None,
+                            },
+                            WeightTensor {
+                                buf: dn_buf,
+                                gpu_dtype: dn_dtype,
+                                m: hidden,
+                                k: moe_inter,
+                                row_stride: 0,
+                                paro: None,
+                                awq_scale: None,
+                            },
+                            Some(owner),
+                        )
                     } else {
-                        wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
-                    }
-                    .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
-                    let mut down = if qt2 == OQ4_CANONICAL_QT {
-                        upload_wt_raw(gpu, &w2, DType::Oq4G256, hidden, moe_inter)
-                    } else if qt2 == OQ_PLUS_COMPACT_QT {
-                        upload_wt_raw(gpu, &w2, DType::Oq8G256, hidden, moe_inter)
-                    } else {
-                        wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
-                    }
-                    .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
+                        let gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
+                            .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
+                        let down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
+                            .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
+                        (gate_up, down, None)
+                    };
                     // AWQ scales: shared per layer, emitted once on expert 0 by the
                     // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
                     // Attach the gate_up scale (len hidden) to expert 0's gate_up and
@@ -923,7 +1025,11 @@ impl Lfm2MoeWeights {
                             );
                         }
                     }
-                    experts.push(ExpertWeights { gate_up, down });
+                    experts.push(ExpertWeights {
+                        gate_up,
+                        down,
+                        owner,
+                    });
                 }
                 let gu_bytes: Vec<u8> = experts
                     .iter()
