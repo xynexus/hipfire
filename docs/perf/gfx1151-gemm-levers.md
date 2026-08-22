@@ -130,6 +130,31 @@ count than on blocking.
   (`rdna35:4048, 4102`); `ds_bpermute` uses the LDS pipe. Neither is a free
   substitute for LDS operand delivery — which is moot anyway, since supply is ~1%.
 
+## F2. Ablation attribution for the tiled kernel (gate/up, B=256)
+
+Measured on `gemm_oq_compact_iu4x2_tiled`, each ablation with a **full Rust
+rebuild** (see the `include_str!` trap below — the first attempt at this table
+was entirely invalid without it, and read "every ablation is free"):
+
+| ablation | time | share |
+|---|---|---|
+| baseline | 1.776 ms | — |
+| minus the 2nd iu4 pass (half the matrix work) | 1.362 | **23%** |
+| minus all global staging (W and Xq reads) | 1.290 | **27%** |
+| minus real output writes | -3% | 3% |
+| minus per-row f16 scale loads | ~0% | ~0% |
+| remainder (LDS reads, fold, loop skeleton) | — | ~50% |
+
+Note the shape of this: the kernel is NOT dominated by any single term. Matrix
+work and staging are each about a quarter, and half is everything else. That is
+why every single-lever attempt on it has returned neutral.
+
+Also measured, and negative: proper double buffering (issue the next strip's
+global loads before the compute, one barrier instead of two) is **4% SLOWER**
+here (1.823 vs 1.746 ms) — holding the staged values in registers across the
+compute costs more than the barrier saves, at 189 vs 179 VGPRs. Rung 4 measured
+double buffering as a 1.22x WIN in the synthetic probe; it does not transfer.
+
 ## G. Measurement traps that produced wrong answers here
 
 Each of these caused a wrong conclusion in this session before being caught.
@@ -137,7 +162,7 @@ Each of these caused a wrong conclusion in this session before being caught.
 | trap | signature | guard |
 |---|---|---|
 | `hipfire eval` caches, key excludes the environment | identical A/B numbers, same `started_utc` | `--force` |
-| `include_str!` bakes kernel source into the binary | ablation changes nothing | always `cargo build`; empty-kernel control |
+| `include_str!` bakes kernel source into the binary | ablation changes nothing | always `cargo build` the CONSUMING BINARY; deleting the `.hsaco` only re-JITs the string already compiled in. Hit again 2026-08-23: a whole ablation sweep read "everything is free" until the rebuild was added, after which the same ablations showed 23% and 27%. |
 | Hot-path `hipMalloc` | microbench and e2e disagree in *direction* | persistent scratch |
 | Edit silently didn't apply (rustfmt had collapsed the line) | flat A/B against a strong microbench | confirm the new kernel in a **kernel trace** |
 | Probe operands hoisted into registers | ISA shows 0 LDS reads | launder the offset through inline asm; count `ds_load` |
