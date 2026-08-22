@@ -4319,6 +4319,11 @@ pub const WMMA_IU4_NOOP_W32_SRC: &str = include_str!("../../../kernels/src/wmma_
 pub const WMMA_IU4_LDS_PROBE_SRC: &str =
     include_str!("../../../kernels/src/wmma_iu4_lds_probe.hip");
 
+/// Rung 5: real GEMM tiling (BM=64 BN=128 BK=64, 8 wave32 waves as 2x4).
+/// See `kernels/src/wmma_iu4_tiled_probe.hip`.
+pub const WMMA_IU4_TILED_PROBE_SRC: &str =
+    include_str!("../../../kernels/src/wmma_iu4_tiled_probe.hip");
+
 /// Sparse overlay correction for the compact W4A4 path: adds the
 /// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
 /// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.

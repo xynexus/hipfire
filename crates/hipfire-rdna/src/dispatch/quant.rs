@@ -1020,6 +1020,44 @@ impl Gpu {
         }
     }
 
+    /// Rung 5 probe: real GEMM tiling. `kstrips` BK=64 strips.
+    pub fn wmma_iu4_tiled(
+        &mut self,
+        out: &GpuTensor,
+        src: &GpuTensor,
+        blocks: u32,
+        kstrips: i32,
+        src_words: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "wmma_iu4_tiled_probe",
+            kernels::WMMA_IU4_TILED_PROBE_SRC,
+            "wmma_iu4_tiled_w32",
+        )?;
+        let op = out.buf.as_ptr();
+        let sp = src.buf.as_ptr();
+        let mut ks = kstrips;
+        let mut sm = (src_words - 1) as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut ks as *mut _ as *mut c_void,
+            &mut sm as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions["wmma_iu4_tiled_w32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn wmma_iu4_noop(
         &mut self,
         out: &GpuTensor,
