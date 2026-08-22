@@ -121,6 +121,12 @@ Nothing below is falsifiable without it. **Do not start M2a1 until it lands.**
 *Exit:* a prefill probe that FAILS on a deliberately corrupted KV write at
 position 0 of a 64-token prefill.
 
+> **LANDED 2026-08-22.** `tiny_quant_probe prefill-hash` +
+> `tests/tiny-prefill-gate.sh`, wired into `tiny-affected-gate.sh` behind a new
+> `select_prefill`. §4's false COVERED is fixed: a `prefill_chunk.rs` edit now
+> reports `prefill=1` and runs a gate that executes a prefill. See §4.1 for what
+> it measures, what it refuses to call a pass, and the two findings it produced.
+
 ### M2a1 — proving ground: the FA per-token fallback arm *(net −650 lines)*
 
 `prefill_chunk.rs:6042-6087` (46 lines) is a per-token loop over
@@ -224,6 +230,86 @@ tier reads either.**
   `prefill_batch.rs`, `lowered.rs`, `decode_layers.rs` — and `lower_variant` is
   documented "Pure → unit-testable" with no test.
 
+## 4.1 M2a0 as built, and the two things measurement changed — 2026-08-22
+
+Built as `tiny_quant_probe prefill-hash` (`tiny_harness.rs::run_prefill_hash`)
+and `tests/tiny-prefill-gate.sh`, selected by a new `select_prefill` in
+`tiny-affected-gate.sh`. A `crates/hipfire-arch-qwen35/*` edit now reports
+`prefill=1` and runs a gate that actually prefills.
+
+**It is differential, so there is no baseline.** Same tokens through
+`forward_prefill_batch` and through per-token `forward_scratch` — §4's item 2,
+the reference already in-tree — then decode past the prefill teacher-forced and
+compare. Causal attention means the first decoded position reads every KV row
+the prefill wrote, which is the coverage `smoke-generate-batch-prefill.sh:517`
+lacks. Nothing to re-record, nothing keyed to a toolchain version, and no way for
+a stale-but-matching row to look like a pass.
+
+**Two things the plan specified had to change, both on measurement:**
+
+**1. Not a hash comparison.** §4 asks for a hash of KV and `s_matrices`. The two
+paths cannot match bit-exactly — batched runs GEMM over `n` rows, the reference
+runs GEMV per token, so they reassociate differently. Requiring equal hashes is
+the parity-oracle trap. The probe compares distributions instead: max
+KL(ref ‖ batched) over the decoded positions, plus argmax agreement. Measured on
+nix1/gfx1103, seeds {42,7,99,1234} × decode {4,16} at prefill 64:
+
+| | max KLD |
+|---|---|
+| clean reassociation noise | 1.5e-6 … 1.2e-5 |
+| corrupted KV prefix | 5.3e-2 … 1.1e-1 |
+
+`tol = 1e-4` sits ~8× above the worst noise and ~530× below the weakest signal.
+
+(KV is *not* byte-hashed directly. `Gpu::alloc_tensor` hands out pool-recycled
+memory, so a KV ring's unwritten tail is whatever the last tenant left. The
+decode comparison covers KV instead, and reads all of it.)
+
+**2. Corrupting position 0 alone is too weak to be the self-check.** The exit
+line names position 0 of a 64-token prefill. Built that way first; it fails on
+measurement. On a random-weight fixture attention is near-uniform, so zeroing one
+row of 64 moves max KLD by only 2×–44× and lands *under* any workable tolerance
+for some token seeds — the check passed or failed on the seed. The gate now
+injects the failure this milestone actually exists to catch, which §4 states in
+its own words: **KV correct at position n−1 and garbage at 0..n−2**, position 0
+included. That separates by 4482×–68844×, stably across seeds.
+
+### The two findings
+
+**The MoE fixtures never reach the batched prefill.** `qwen3_5_moe` and
+`qwen3_5_moe_indexed` return max KLD of *exactly* 0.0 and identical recurrent-state
+hashes — the signature of both runs taking the same code path. Confirmed by
+construction: setting `HIPFIRE_PREFILL_BATCHED=0` collapses the *dense* `qwen3_5`
+cell to that same signature (0.0, equal hashes), while unset it reads 2.04e-6
+with differing hashes. So the two MoE cells were comparing the reference against
+itself and would have reported a clean pass for a path they never ran — the
+false-coverage bug reappearing inside its own fix.
+
+The gate now checks `distinct_paths` (state hashes must *differ*) before anything
+else and reports **SKIP, never OK**, when they do not:
+
+```
+== tiny-prefill: qwen3_5 ==
+  OK  max_kld=0.00000204 (tol=1e-4) argmax=4/4 | corrupt-prefix caught at max_kld=0.05443969
+== tiny-prefill: qwen3_5_moe ==
+  SKIP no batched prefill path reached (compared reference to itself)
+== tiny-prefill: qwen3_5_moe_indexed ==
+  SKIP no batched prefill path reached (compared reference to itself)
+tiny-prefill-gate: ran=1 fail=0 skip=2
+```
+
+**Consequence for §M2a4: the MoE arms have no tiny coverage.** The real
+35B-A3B does take the batched path (§0.1 profiled it), so this is a fixture
+capability gap, not a product bug — but M2a4 cannot be gated by this probe until
+the MoE fixture reaches `forward_prefill_batch`. Budget that with M2a4, and do
+not read the dense cell's green as covering the MoE arms.
+
+**Unrelated, pre-existing, and confirmed on a clean `HEAD` worktree:**
+`tiny-quant-gate` fails `qwen3_5_moe/kld:oq8+(calib)` and `oq8++(calib)` at
+0.005677 vs baseline 0.008147. Not caused by this work. The measured value is
+*lower* (better) than the baseline, the same shape as `513d7a494` "the oq4.25++
+move is an improvement", so it likely wants a re-record rather than a fix.
+
 **M2a0's minimum:**
 
 1. A prefill probe in `tiny_harness.rs` that prefills N tokens and hashes **KV
@@ -321,6 +407,15 @@ the contract at the production default.
 **3. The band cursor + a chunk cap does clear it, with margin.** 128 tokens →
 121 ms, 1.65× headroom. That is the cheap option in §0's table, and it wins on
 the measurement, not on the estimate.
+
+Stated precisely, because it matters for which stop-line fired: **at the shipped
+default the band cursor alone does NOT satisfy the contract** (243 ms). What
+satisfies it is the band cursor *plus* the cap knob that already exists. So §6
+stop-line 1 fires on the pair, and what it settles is **ordering** — M2a is not
+the cheapest way to buy the latency number — not that the stages below are
+unnecessary. M2a0 in particular was never conditioned on this decision at all:
+§4's false-coverage defect is live today, and §6 stop-line 2 makes M2a0 the gate
+for every later stage whenever they are picked up.
 
 So M2a buys 1.28× on the quantity that already has a free 2× knob. **It is not
 on the critical path. Reorder behind M3**, per §6.

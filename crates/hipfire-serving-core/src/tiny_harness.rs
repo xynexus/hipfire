@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hipfire_dispatch::pipeline::superop::LoweredForward;
-use hipfire_rdna::Gpu;
+use hipfire_rdna::{Gpu, GpuTensor};
 
 use hipfire_runtime::arch::{Architecture, SimpleAr};
 use hipfire_runtime::calibration::CalibCollector;
@@ -1222,6 +1222,279 @@ pub fn run_ar_hash(
         n_steps: len,
         prompt_len,
         last_token: next_token,
+    })
+}
+
+/// Result of a [`run_prefill_hash`] pass.
+///
+/// **Why this is differential, and why it is not a hash comparison.** Every
+/// other tiny probe records a baseline and diffs against it, which is how a
+/// prefill change the gate never executes still reports COVERED. This probe
+/// carries its own in-tree oracle instead: the same tokens are driven through
+/// `forward_prefill_batch` and through the per-token `forward_scratch` path —
+/// the branch `qwen35_prefill.rs:150-166` already takes when
+/// `replay_as_generated_suffix || hier_enabled`, and which
+/// `qwen35_prefill_owned_session_serial_segment` takes unconditionally — and the
+/// two must agree.
+///
+/// They cannot agree *bit-exactly*: the batched path runs GEMM kernels over `n`
+/// rows and the reference runs GEMV per token, so float reassociation differs by
+/// construction. Hashing the two and requiring equality is the parity-oracle
+/// trap; this compares them numerically instead, on the two measures that
+/// separate reassociation noise from a real state bug — KL divergence between
+/// the post-prefill decode distributions, and whether the two paths pick the
+/// same argmax at every decoded position.
+pub struct PrefillHashOut {
+    /// Max KL(ref || batched) over the decoded positions, nats.
+    pub max_kld: f64,
+    pub mean_kld: f64,
+    /// Decoded positions where both paths chose the same argmax token.
+    pub argmax_agree: usize,
+    /// Largest absolute logit difference seen, any position.
+    pub max_abs_diff: f32,
+    /// Byte hash of the DeltaNet recurrent state after each path's prefill.
+    /// Never compared for EQUALITY as a correctness signal — the two paths
+    /// reassociate differently, so they are expected to differ. They are
+    /// compared for INEQUALITY instead: see [`PrefillHashOut::distinct_paths`].
+    pub batched_state_hash: u64,
+    pub ref_state_hash: u64,
+    pub n_prefill: usize,
+    pub n_decode: usize,
+}
+
+impl PrefillHashOut {
+    /// True when the batched prefill left the model in the same state as the
+    /// per-token reference, to within `max_kld_tol` and with every decoded
+    /// argmax matching.
+    pub fn agrees(&self, max_kld_tol: f64) -> bool {
+        self.max_kld <= max_kld_tol && self.argmax_agree == self.n_decode
+    }
+
+    /// True when the two runs actually took different code paths.
+    ///
+    /// **A false here invalidates the cell — it is not a pass.** The batched and
+    /// per-token paths write bit-different recurrent state (GEMM vs GEMV
+    /// reassociation), so equal state hashes mean the "batched" run silently
+    /// fell back to the reference and the probe compared it against itself.
+    ///
+    /// Measured, not assumed: `HIPFIRE_PREFILL_BATCHED=0` collapses the qwen3_5
+    /// cell's hashes to equal and its max KLD to exactly 0.0, which is the
+    /// fallback's signature. Both tiny MoE fixtures show that signature with the
+    /// flag UNSET — they never reach `forward_prefill_batch` at all — so without
+    /// this check they would report a clean pass for a path they never ran,
+    /// which is the exact false-coverage failure this milestone exists to end.
+    pub fn distinct_paths(&self) -> bool {
+        self.batched_state_hash != self.ref_state_hash
+    }
+}
+
+/// Hash a device buffer's full contents. Safe for the DeltaNet recurrent state
+/// (`s_matrices`, `conv_states`): the scan writes every element, so there is no
+/// uninitialized tail. **Not** safe for KV buffers — `Gpu::alloc_tensor` hands
+/// out pool-recycled memory, so a KV ring's unwritten positions hold whatever
+/// the last tenant left there. KV is covered by the decode comparison instead,
+/// which reads all of it.
+fn hash_tensor_bytes(gpu: &Gpu, t: &GpuTensor, mut h: u64) -> Result<u64, String> {
+    let bytes = gpu
+        .download_raw(t, t.byte_size())
+        .map_err(|e| format!("prefill probe: download_raw: {e:?}"))?;
+    for c in bytes.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = hash_mix(h, u64::from_le_bytes(w));
+    }
+    Ok(h)
+}
+
+/// Prefill `n_prefill` tokens (batched or per-token), then decode the rest of
+/// `tokens` teacher-forced, returning the recurrent-state hash and the
+/// per-position decode logits.
+///
+/// The decode is what covers KV: with causal attention, step `n_prefill` reads
+/// every position the prefill wrote, so a prefill that gets position 0 wrong and
+/// position n−1 right — the exact failure `smoke-generate-batch-prefill.sh` is
+/// blind to, since it compares only the final-position logit — shows up here.
+fn qwen35_prefill_then_decode(
+    arch: TinyArch,
+    path: &Path,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    n_prefill: usize,
+    batched: bool,
+    corrupt_kv_prefix: bool,
+) -> Result<(u64, Vec<Vec<f32>>), String> {
+    let mut model = TinyModel::load(arch, path, gpu, tokens.len() + 16)?;
+
+    let state_hash = {
+        let (config, weights, kv, dn, scratch) = match &mut model {
+            TinyModel::Qwen35 {
+                config,
+                weights,
+                kv,
+                dn,
+                scratch,
+            } => (config, weights, kv, dn, scratch),
+            _ => {
+                return Err(
+                    "prefill probe: only the qwen3_5 arch has a batched prefill to check".into(),
+                )
+            }
+        };
+        let vocab = config.vocab_size.max(1) as u32;
+        let prompt: Vec<u32> = tokens[..n_prefill].iter().map(|t| t % vocab).collect();
+
+        if batched {
+            qwen35::forward_prefill_batch(
+                gpu, weights, config, &prompt, 0, kv, dn, scratch, None, None, None, None,
+            )
+            .map_err(|e| format!("qwen35 forward_prefill_batch: {e:?}"))?;
+        } else {
+            for (pos, &t) in prompt.iter().enumerate() {
+                qwen35::forward_scratch(gpu, weights, config, t, pos, kv, dn, scratch)
+                    .map_err(|e| format!("qwen35 forward_scratch: {e:?}"))?;
+            }
+        }
+
+        // Falsifiability injection (see `--corrupt-kv-pos0`): scribble over the
+        // start of layer 0's K buffer, which is position 0's row under any
+        // token-major layout. A probe that still agrees after this is not
+        // reading the prefill's KV at all, and every stage gated on it would be
+        // green by default.
+        if corrupt_kv_prefix {
+            // Reproduce the exact failure this milestone exists to catch: KV
+            // correct at the final position and garbage everywhere before it.
+            // That is what `smoke-generate-batch-prefill.sh` cannot see, because
+            // it compares only the final-position logit — so a lowered prefill
+            // with this bug passes it and then degrades on turn 2.
+            //
+            // Zeroing position 0 ALONE was tried first and rejected on
+            // measurement: on a random-weight fixture attention is near-uniform,
+            // so one row of 64 moves max KLD by only 2x-44x over the noise floor
+            // and sometimes lands under any tolerance with headroom. A check
+            // that passes or fails on the token seed is not a check.
+            //
+            // Every layer, not just layer 0: qwen3.5 interleaves LinearAttention
+            // (DeltaNet, writes no KV) with FullAttention, so scribbling on
+            // layer 0 alone is silently a no-op on a fixture whose first layer
+            // is recurrent — which is how a falsifiability check becomes false
+            // reassurance.
+            //
+            // The per-layer K buffer is token-major (`physical_cap x per-token
+            // blocks`, see `KvCache::new_gpu_q8_capped`), so positions
+            // `0..n_prefill-1` own the leading `(n_prefill-1) * numel /
+            // physical_cap` elements.
+            if kv.k_gpu.is_empty() {
+                return Err("prefill probe: KV cache has no layers to corrupt".into());
+            }
+            let cap = kv.physical_cap.max(1);
+            for k in kv.k_gpu.iter() {
+                let per_pos = (k.numel() / cap).max(1);
+                let span = (per_pos * n_prefill.saturating_sub(1)).min(k.numel());
+                if span > 0 {
+                    gpu.fill_f32(&k.sub_offset(0, span), 0.0)
+                        .map_err(|e| format!("prefill probe: corrupt fill: {e:?}"))?;
+                }
+            }
+        }
+
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for t in dn.s_matrices.iter().chain(dn.conv_states.iter()) {
+            h = hash_tensor_bytes(gpu, t, h)?;
+        }
+        h
+    };
+
+    let vocab = model.vocab().max(1) as u32;
+    let mut decoded = Vec::new();
+    for pos in n_prefill..tokens.len() {
+        decoded.push(model.forward_logits(gpu, tokens[pos] % vocab, pos)?);
+    }
+
+    Ok((state_hash, decoded))
+}
+
+/// M2a0's probe: does the batched prefill leave the same KV and DeltaNet state
+/// as the per-token reference?
+///
+/// `corrupt_kv_prefix` deliberately damages the batched run's KV at every position
+/// except the last — the "correct at n-1, garbage at 0..n-2" failure this
+/// milestone exists to catch, position 0 included — so the probe's own
+/// falsifiability can be demonstrated. With it set, `agrees()` MUST be false.
+/// That is the exit criterion for this stage.
+pub fn run_prefill_hash(
+    arch: TinyArch,
+    model_path: &Path,
+    gpu: &mut Gpu,
+    n_prefill: usize,
+    n_decode: usize,
+    seed: u64,
+    corrupt_kv_prefix: bool,
+) -> Result<PrefillHashOut, String> {
+    if n_prefill < 2 {
+        return Err("prefill probe: --prefill must be >= 2".into());
+    }
+    if n_decode == 0 {
+        return Err("prefill probe: --decode must be > 0 (it is what covers KV)".into());
+    }
+    let tokens = synthetic_tokens(n_prefill + n_decode, seed);
+
+    let (batched_state_hash, batched) = qwen35_prefill_then_decode(
+        arch,
+        model_path,
+        gpu,
+        &tokens,
+        n_prefill,
+        true,
+        corrupt_kv_prefix,
+    )?;
+    let (ref_state_hash, reference) =
+        qwen35_prefill_then_decode(arch, model_path, gpu, &tokens, n_prefill, false, false)?;
+
+    if batched.len() != reference.len() {
+        return Err(format!(
+            "prefill probe: decoded {} positions batched vs {} reference",
+            batched.len(),
+            reference.len()
+        ));
+    }
+
+    let mut max_kld = 0.0f64;
+    let mut sum_kld = 0.0f64;
+    let mut argmax_agree = 0usize;
+    let mut max_abs_diff = 0.0f32;
+    for (b, r) in batched.iter().zip(reference.iter()) {
+        let lb = log_softmax(b);
+        let lr = log_softmax(r);
+        let mut kld = 0.0f64;
+        for (&pb, &pr) in lb.iter().zip(lr.iter()) {
+            // KL(ref || batched): the reference is the trusted distribution.
+            kld += (pr as f64).exp() * (pr as f64 - pb as f64);
+        }
+        let kld = kld.max(0.0);
+        sum_kld += kld;
+        if kld > max_kld {
+            max_kld = kld;
+        }
+        if argmax(b) == argmax(r) {
+            argmax_agree += 1;
+        }
+        for (&vb, &vr) in b.iter().zip(r.iter()) {
+            let d = (vb - vr).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+    }
+
+    Ok(PrefillHashOut {
+        max_kld,
+        mean_kld: sum_kld / batched.len().max(1) as f64,
+        argmax_agree,
+        max_abs_diff,
+        batched_state_hash,
+        ref_state_hash,
+        n_prefill,
+        n_decode,
     })
 }
 

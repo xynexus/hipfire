@@ -41,7 +41,9 @@
 use std::path::Path;
 
 use hipfire_rdna::Gpu;
-use hipfire_serving_core::tiny_harness::{run_ar_hash, run_collect, run_kld, TinyArch};
+use hipfire_serving_core::tiny_harness::{
+    run_ar_hash, run_collect, run_kld, run_prefill_hash, TinyArch,
+};
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -121,6 +123,78 @@ fn main() {
             println!("n_tensors: {}", r.n_tensors);
             println!("consistency: {:.6}", r.consistency);
             println!("calib_out: {}", r.out_path);
+        }
+        // M2a0: the only tiny probe that executes a PREFILL. Differential, not
+        // baseline-diffed — it drives the same tokens through the batched
+        // prefill and the in-tree per-token reference and requires them to
+        // agree within tolerance, so there is no baseline to go stale.
+        // `--corrupt-kv-prefix` proves it can still fail.
+        "prefill-hash" | "prefill_hash" => {
+            let n_prefill: usize = flag(&args, "--prefill")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(64);
+            let n_decode: usize = flag(&args, "--decode")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(4);
+            // Batched GEMM vs per-token GEMV reassociate, so the bar is
+            // "same distribution", not "same bits". Calibrate with --tol.
+            let tol: f64 = flag(&args, "--tol")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(1e-4);
+            let corrupt = args.iter().any(|a| a == "--corrupt-kv-prefix");
+            let model = req(&args, "--model");
+            let out = run_prefill_hash(
+                arch,
+                Path::new(&model),
+                &mut gpu,
+                n_prefill,
+                n_decode,
+                seed,
+                corrupt,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe prefill-hash: {e}");
+                std::process::exit(1);
+            });
+            println!("arch: {}", arch.as_str());
+            println!("n_prefill: {}", out.n_prefill);
+            println!("n_decode: {}", out.n_decode);
+            println!("max_kld: {:.8}", out.max_kld);
+            println!("mean_kld: {:.8}", out.mean_kld);
+            println!("max_abs_diff: {:.6}", out.max_abs_diff);
+            println!("argmax_agree: {}/{}", out.argmax_agree, out.n_decode);
+            println!("batched_state_hash: 0x{:016x}", out.batched_state_hash);
+            println!("ref_state_hash:     0x{:016x}", out.ref_state_hash);
+            println!("tol: {tol:.8}");
+            println!("distinct_paths: {}", out.distinct_paths());
+            println!("agrees: {}", out.agrees(tol));
+            if !out.distinct_paths() {
+                // Exit 3 = inconclusive, NOT a pass: the two runs landed in the
+                // same code path, so this cell compared the reference against
+                // itself and proves nothing about the batched prefill.
+                eprintln!(
+                    "tiny_quant_probe prefill-hash: INCONCLUSIVE — batched and reference                      left identical recurrent state, so the batched prefill path was                      never reached for this fixture"
+                );
+                std::process::exit(3);
+            }
+            if corrupt {
+                // Falsifiability run: agreement here means the probe is blind.
+                println!("corrupt_kv_prefix: true");
+                if out.agrees(tol) {
+                    eprintln!(
+                        "tiny_quant_probe prefill-hash: FALSIFIABILITY FAILED — the probe \
+                         still agrees with a corrupted position-0 KV write, so it cannot \
+                         gate a prefill change"
+                    );
+                    std::process::exit(1);
+                }
+            } else if !out.agrees(tol) {
+                eprintln!(
+                    "tiny_quant_probe prefill-hash: batched prefill DIVERGES from the \
+                     per-token reference"
+                );
+                std::process::exit(1);
+            }
         }
         "ar-hash" | "ar_hash" => {
             let prompt_len: usize = flag(&args, "--prompt-len")
