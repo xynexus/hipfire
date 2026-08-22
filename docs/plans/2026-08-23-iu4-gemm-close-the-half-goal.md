@@ -92,8 +92,19 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
    ~535 MB per gate/up call to consume a 2.6 MB activation. Needs cross-row
    sharing, which needs either big row blocks (register-bound) or a CSC-style
    reorder (write-bound). No cheap version identified.
-3. **Attention, 14.1%.** Never examined. Now the third-largest item and the only
-   one with no measurements at all.
+3. **Attention, 14.1%** (`attention_flash_kvarn_tile_batched`, 1030 ms / 1168
+   calls). First scan done, no fix yet. What it says:
+   - 42-53 VGPRs, 16 waves/SIMD, no spills, no LDS. Not occupancy-limited.
+   - Its three largest loops are **SALU-dominated**: 47 SALU / 39 VALU / 1 global
+     load out of 92 instructions. That is scalar address and index math, not
+     memory and not float work.
+   - 11 `v_movrel` per kernel, but only 3 land in the biggest loop, so levers §16
+     is NOT the lever here. An attempt to apply it anyway (compile-time MAXDPT
+     bound + break, as in the overlay) took movrel 22 -> 64: MAXDPT is 8/16, far
+     larger than MAXQ=4, so the unroll multiplies copies instead of collapsing
+     indices. Reverted, do not retry that shape.
+   - 21 distinct loops and no single obvious hot one. This needs per-loop
+     attribution from a real profile, not static ISA reading, before any edit.
 
 ## Work, in order
 
