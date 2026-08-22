@@ -748,603 +748,72 @@ pub(crate) fn ensure_qwen35_forward_capability(config: &Qwen35Config) -> HipResu
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
 /// buffers, never allocates.
-pub(crate) fn moe_ffn_decode_impl(
+/// §M4 stage B — the routed-expert half of `moe_ffn_decode_impl`, lifted
+/// verbatim.
+///
+/// The seam is `── 4. Top-K routed experts ──`: everything before it (norm,
+/// the fused 4-way GEMV, top-K, the shared expert) is stage A; everything from
+/// it is the routed experts and the combine. That is the boundary
+/// `2026-08-22-m4-premise-falsified.md` identifies as reachable without
+/// unfusing the 4-way GEMV, and it is where a second scheduling quantum would
+/// go.
+///
+/// The parameter list is what the seam actually costs, and it is smaller than
+/// it looks: ~20 of the crossing locals are fields of one `dispatch_flags`
+/// value, and the scratch views all come from `s`.
+#[allow(clippy::too_many_arguments)]
+fn moe_routed_experts_and_combine<'a>(
     gpu: &mut Gpu,
-    pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
-    x_rot_prerotated: bool,
     layer_idx: usize,
-    // EP (Ship 6 substrate-EP). `ep_routed_out = Some(partial)` redirects the
-    // routed combine + shared-down into a zeroed partial (the EP executor
-    // all-reduces it and adds into x_residual once); `None` = single-GPU into
-    // x_residual (byte-identical). `ep_skip_shared` skips the shared-expert
-    // down on rank>0 so the replicated shared expert is summed once.
     ep_routed_out: Option<&GpuTensor>,
+    dispatch_flags: &MoeDecodeDispatchFlags,
+    topk_indices_cpu: Option<Vec<usize>>,
+    topk_weights_cpu: Option<Vec<f32>>,
+    residency_provider: Option<PagerExpertResidency<'_>>,
+    moe_dtypes: hipfire_dispatch::families::moe::MoeDtypes,
+    x_norm: &GpuTensor,
+    x_rot_local: Option<&'a GpuTensor>,
+    x_rot_prerotated: bool,
     ep_skip_shared: bool,
+    paged_mixed_routed: bool,
+    hidden: usize,
+    mi: usize,
+    smi: usize,
+    k: usize,
+    n_exp: usize,
 ) -> HipResult<()> {
-    let hidden = config.dim;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let k = config.num_experts_per_tok;
-    let n_exp = config.num_experts;
-    // Residency provider for the lowered MoE path. `Some` exactly when this model
-    // is paged; a fully-resident model gets `None` and the lowered path keeps
-    // top-K on-device with no readback, unchanged.
-    let residency_provider = pager.map(|p| PagerExpertResidency { pager: p });
-    let _ = hidden;
-
-    let router_logits = s.router_logits;
-    let scalar_buf = s.scalar_buf;
+    // The ~20 dtype booleans that cross the seam are all fields of the one
+    // `dispatch_flags` value stage A already computed, so they travel as one
+    // argument and are unpacked here rather than threaded individually.
+    let MoeDecodeDispatchFlags {
+        gate_side_mq4: _,
+        shared_gate_up_mq4: _,
+        routed_mq4,
+        routed_mq6: _,
+        routed_mq2_lloyd: _,
+        routed_paro: _,
+        routed_gate_up_mq4,
+        routed_gate_up_mq6: _,
+        routed_gate_up_mq2_lloyd: _,
+        routed_gate_up_paro: _,
+        routed_dtype_indexable_mq4,
+        routed_dtype_indexable_mq6,
+        routed_dtype_indexable_mq2_lloyd,
+        routed_dtype_indexable_paro,
+        routed_dtype_indexable_oq4,
+        routed_dtype_indexable_oq8,
+        routed_path: _,
+        use_gpu_topk,
+        needs_x_rot_local: _,
+    } = *dispatch_flags;
+    // Scratch views, taken from the same `MoeScratchRef` stage A used.
     let gate_up_buf = s.gate_up_buf;
-    let gate_buf = s.gate_buf;
-    let up_buf = s.up_buf;
     let ffn_hidden = s.ffn_hidden;
     let ffn_out = s.ffn_out;
-
-    // Phase 2a-iii: rotate x_norm once per layer and share the rotated
-    // buffer across every MQ4 GEMV that consumes it. Two independent users:
-    //   1. The 4-way fused gate-side GEMV (gate_side_mq4) — requires router,
-    //      shared_expert_gate, shared_expert.{gate,up} all MQ4G256.
-    //   2. The indexed routed-expert gate_up GEMV (routed_gate_up_mq4) — fires
-    //      whenever the routed gate_up family is MQ4G256, independent of the
-    //      gate-side family's dtype.
-    // We compute x_rot_local if EITHER user will fire. Models with a Q8
-    // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
-    // the device-side top-K + indexed expert GEMV path — only the 4-way
-    // fused GEMV falls back to four individual `weight_gemv` calls.
-    let prefill_dtypes = MoePrefillDtypes::from_ffn(ffn);
-    let dispatch_flags = if let Some(dtypes) = prefill_dtypes {
-        moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some(), config.dim, mi)
-    } else {
-        let gate_side_mq4 = config.has_shared_expert
-            && ffn.router.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-            && ffn
-                .experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-        let shared_gate_up_mq4 = config.has_shared_expert
-            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
-        MoeDecodeDispatchFlags {
-            gate_side_mq4,
-            shared_gate_up_mq4,
-            routed_mq4: false,
-            routed_mq6: false,
-            routed_mq2_lloyd: false,
-            routed_paro: false,
-            routed_gate_up_mq4: false,
-            routed_gate_up_mq6: false,
-            routed_gate_up_mq2_lloyd: false,
-            routed_gate_up_paro: false,
-            routed_dtype_indexable_mq4: false,
-            routed_dtype_indexable_mq6: false,
-            routed_dtype_indexable_mq2_lloyd: false,
-            routed_dtype_indexable_paro: false,
-            routed_dtype_indexable_oq4: false,
-            routed_dtype_indexable_oq8: false,
-            routed_path: MoeDecodeIndexedRoutedPath::None,
-            use_gpu_topk: false,
-            needs_x_rot_local: gate_side_mq4,
-        }
-    };
-    let gate_side_mq4 = dispatch_flags.gate_side_mq4;
-    let shared_gate_up_mq4 = dispatch_flags.shared_gate_up_mq4;
-    let routed_mq4 = dispatch_flags.routed_mq4;
-    let routed_gate_up_mq4 = dispatch_flags.routed_gate_up_mq4;
-    let routed_gate_up_paro = dispatch_flags.routed_gate_up_paro;
-    let routed_dtype_indexable_mq4 = dispatch_flags.routed_dtype_indexable_mq4;
-    let routed_dtype_indexable_mq6 = dispatch_flags.routed_dtype_indexable_mq6;
-    let routed_dtype_indexable_mq2_lloyd = dispatch_flags.routed_dtype_indexable_mq2_lloyd;
-    let routed_dtype_indexable_paro = dispatch_flags.routed_dtype_indexable_paro;
-    let routed_dtype_indexable_oq4 = dispatch_flags.routed_dtype_indexable_oq4;
-    let routed_dtype_indexable_oq8 = dispatch_flags.routed_dtype_indexable_oq8;
-    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
-    // device and the indexed MoE kernels consume topk_indices /
-    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
-    // Note: this no longer requires `gate_side_mq4`. The device-side
-    // `moe_topk_renorm_k8` kernel and the indexed gate_up/down GEMVs
-    // consume router_logits/topk_indices/topk_weights/x_rot from device
-    // buffers regardless of how router_logits was produced (fused-4 or
-    // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
-    // are now first-class for graph capture. Mixed-kmap A3B layers
-    // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
-    // of the HFQ4 ones — same control flow, different kernel binary.
-    let use_gpu_topk = dispatch_flags.use_gpu_topk;
-    let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
-    // Why a routed decode was refused is otherwise invisible: the dispatch error
-    // carries only `use_gpu_topk`/`routed_experts_resident`, not the dtypes that
-    // decided them, so a refusal on a paged or mixed artifact is unattributable
-    // from outside. `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1` names them.
-    if std::env::var("HIPFIRE_QWEN35_MOE_DTYPE_DEBUG").as_deref() == Ok("1") {
-        match prefill_dtypes {
-            Some(d) => eprintln!(
-                "[moe-dtype] layer={} experts_resident={} n_dtypes={} gate_up={:?} down={:?} \
-                 uniform(gu/dn)={}/{} profile={:?} k={} oq_indexed_gate={} \
-                 idx(mq4/mq6/mq2l/paro/oq4/oq8)={}/{}/{}/{}/{}/{} path={:?} use_gpu_topk={}",
-                ffn.layer_idx,
-                !ffn.experts.is_empty(),
-                ffn.expert_gate_up_dtypes.len(),
-                d.expert_gate_up,
-                d.expert_down,
-                d.expert_gate_up_uniform,
-                d.expert_down_uniform,
-                d.routed_profile,
-                k,
-                qwen35_moe_oq_indexed_decode_active(config.dim, mi, k),
-                routed_dtype_indexable_mq4,
-                routed_dtype_indexable_mq6,
-                routed_dtype_indexable_mq2_lloyd,
-                routed_dtype_indexable_paro,
-                routed_dtype_indexable_oq4,
-                routed_dtype_indexable_oq8,
-                dispatch_flags.routed_path,
-                use_gpu_topk,
-            ),
-            None => eprintln!(
-                "[moe-dtype] layer={} MoePrefillDtypes::from_ffn returned None \
-                 (experts_resident={} n_gate_up_dtypes={} expert_gate_up_dtype={:?}) \
-                 -> every indexed path disabled",
-                ffn.layer_idx,
-                !ffn.experts.is_empty(),
-                ffn.expert_gate_up_dtypes.len(),
-                ffn.expert_gate_up_dtype,
-            ),
-        }
-    }
-
-    let paged_mixed_routed = ffn.experts.is_empty()
-        && prefill_dtypes.is_some_and(|dtypes| dtypes.routed_profile.is_mixed());
-    let x_rot_local = if needs_x_rot_local {
-        if !routed_gate_up_paro {
-            // FWHT-rotated path needs the MQ sign LUT.
-            gpu.ensure_mq_signs()?;
-        }
-        if !x_rot_prerotated {
-            if routed_gate_up_paro {
-                // ParoQuant routed experts: use the per-layer shared Givens
-                // rotation (from `ffn.paro_shared.gate_up_*`). The loader
-                // builds every expert's `paro` alias from the same sidecars,
-                // so experts[0].gate_up.paro is the canonical handle.
-                let paro = ffn.experts[0]
-                    .gate_up
-                    .paro
-                    .as_ref()
-                    .expect("routed_gate_up_paro implies experts[0].gate_up.paro.is_some()");
-                hipfire_runtime::weights::rotate_x_paro_for(
-                    gpu,
-                    paro,
-                    x_norm,
-                    s.x_rot_local,
-                    config.dim,
-                )?;
-            } else {
-                // F2 / F1: AWQ-aware FWHT rotate. All MQ4 weights in this
-                // layer consume the same post-rmsnorm x, so they share the
-                // same input basis → identical imatrix → byte-identical
-                // AWQ scales. When gate_side_mq4 is true the 4-way fused
-                // GEMV expects rotation aligned with `ffn.router`'s AWQ
-                // scale; otherwise pick `ffn.experts[0].gate_up` as the
-                // routed-expert representative for the indexed kernel
-                // path. When AWQ is disabled (no sidecar),
-                // `rotate_x_mq_for` routes to the non-AWQ kernel —
-                // byte-identical to pre-F2 either way.
-                if ffn.experts.is_empty() && !gate_side_mq4 {
-                    gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
-                    paged_moe_debug_sync(gpu, "after paged rotate_x_mq")?;
-                } else {
-                    let next_lin = if gate_side_mq4 {
-                        &ffn.router
-                    } else {
-                        &ffn.experts[0].gate_up
-                    };
-                    rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
-                }
-            }
-        }
-        // else caller guarantees s.x_rot_local already holds the rotated x.
-        Some(s.x_rot_local)
-    } else {
-        None
-    };
-    // The routed dtypes come from the per-expert dtype tables, NOT from
-    // `ffn.experts`. Under paged residency `experts` is empty by design, so
-    // `experts.first()` yields nothing there — and the previous
-    // `.unwrap_or(DType::F32)` turned "I don't know" into a confident F32,
-    // which the executor's own resolution then read as a non-indexable routed
-    // dtype and refused with `decode-routed-dtype-unsupported-no-fallback`.
-    //
-    // That produced two independent resolutions of the same fact that disagreed:
-    // the arch-side flags above resolved `Uniform(Oq4G256)` / `use_gpu_topk=true`
-    // from `expert_gate_up_dtypes`, while this snapshot said F32. Measured on a
-    // paged Qwen3.6-35B-A3B--oq4 artifact, which is why paged MoE decode failed
-    // for EVERY routed format, not just Opus.
-    //
-    // `moe_expert_gate_up_dtype`/`moe_expert_down_dtype` already prefer the dtype
-    // tables and fall back to resident experts, so they are correct in both modes.
-    let routed_gate_up_dtype = moe_expert_gate_up_dtype(ffn, 0).ok_or_else(|| {
-        HipError::new(
-            0,
-            "moe decode: routed gate_up dtype unknown (no per-expert dtype table \
-             and no resident experts) — cannot resolve a routed dispatch path",
-        )
-    })?;
-    let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
-        HipError::new(
-            0,
-            "moe decode: routed down dtype unknown (no per-expert dtype table \
-             and no resident experts) — cannot resolve a routed dispatch path",
-        )
-    })?;
-    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
-        router: ffn.router.gpu_dtype,
-        shared_gate: ffn.shared_expert_gate.gpu_dtype,
-        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        // `.all()` over an EMPTY iterator is vacuously true, so the old form
-        // claimed "every routed expert is MQ4" for any paged model regardless of
-        // its actual format. Read the dtype table first, and when neither source
-        // knows, answer `false` — an unknown must not present as uniformity.
-        experts_all_gate_up_mq4: if !ffn.expert_gate_up_dtypes.is_empty() {
-            ffn.expert_gate_up_dtypes
-                .iter()
-                .all(|d| *d == DType::MQ4G256)
-        } else if !ffn.experts.is_empty() {
-            ffn.experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
-        } else {
-            false
-        },
-        routed_gate_up: routed_gate_up_dtype,
-        routed_down: routed_down_dtype,
-        has_paro_shared: ffn.paro_shared.is_some(),
-    };
-    // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
-    // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
-    let run_centralized_moe = |gpu: &mut Gpu| -> HipResult<()> {
-        // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
-        // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged
-        // mode (`ffn.experts` is empty — only the indexed GPU-top-K path runs
-        // there), matching master's `ffn.experts[..]` indexing requirement.
-        let routed_experts: Vec<(
-            hipfire_dispatch::families::gemv::WeightRef<'_>,
-            hipfire_dispatch::families::gemv::WeightRef<'_>,
-        )> = ffn
-            .experts
-            .iter()
-            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
-            .collect();
-
-        // Routed geometry comes from `moe_expert_shape`, which prefers
-        // `ffn.expert_shape` and only then falls back to a resident expert.
-        // `ffn.experts.first()` is None under paged residency, and the previous
-        // `map_or(0, ..)` marshalled ZEROS to the executor — which then launched
-        // the indexed down GEMV with `grid.x = 0` and failed
-        // `hipModuleLaunchKernel: invalid argument`. Same silent-default shape as
-        // the routed dtypes above, one struct over.
-        let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
-            HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
-        })?;
-        let moe_params = hipfire_dispatch::families::moe::MoeParams {
-            layer: layer_idx,
-            dtypes: moe_dtypes,
-            batch_size: 1,
-            hidden,
-            mi,
-            smi,
-            k,
-            n_exp,
-            norm_topk_prob: config.norm_topk_prob,
-            x_rot_prerotated,
-            x_norm,
-            x_residual,
-            routed_out: ep_routed_out,
-            skip_shared: ep_skip_shared,
-            router: ffn.router.dispatch_ref(),
-            shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
-            shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
-            shared_up_w: ffn.shared_expert.up.dispatch_ref(),
-            shared_down_w: ffn.shared_expert.down.dispatch_ref(),
-            expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
-            expert_down_ptrs: &ffn.expert_down_ptrs,
-            expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
-            expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-            // Option A: the lowered path reads top-k back and makes the
-            // selected experts resident before dispatch. The pointer table
-            // follows automatically (push), so this only supplies residency.
-            expert_residency: residency_provider
-                .as_ref()
-                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
-            routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
-                config.dim,
-                mi,
-                config.num_experts_per_tok,
-            ),
-            // From `routed_shape`, NOT `ffn.experts.first()`: under paged
-            // residency `experts` is empty, so the `map_or(0, ...)` form master
-            // uses would silently dispatch with k/m/n = 0. `routed_shape` is
-            // read from the layout and is correct either way.
-            routed_gate_up_k: routed_shape.gate_up_k,
-            routed_down_m: routed_shape.down_m,
-            routed_down_k: routed_shape.down_k,
-            routed_experts: &routed_experts,
-            routed_gate_up_paro: ffn.experts.first().and_then(|e| {
-                e.gate_up
-                    .paro
-                    .as_ref()
-                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                        pairs: &p.pairs,
-                        theta: &p.theta,
-                        scales: &p.channel_scales,
-                        krot: p.krot as usize,
-                    })
-            }),
-            routed_down_paro: ffn.experts.first().and_then(|e| {
-                e.down
-                    .paro
-                    .as_ref()
-                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                        pairs: &p.pairs,
-                        theta: &p.theta,
-                        scales: &p.channel_scales,
-                        krot: p.krot as usize,
-                    })
-            }),
-            router_logits: s.router_logits,
-            scalar_buf: s.scalar_buf,
-            x_rot_local: s.x_rot_local,
-            gate_up_buf: s.gate_up_buf,
-            gate_buf: s.gate_buf,
-            up_buf: s.up_buf,
-            ffn_hidden: s.ffn_hidden,
-            ffn_out: s.ffn_out,
-            gate_batch: s.gate_batch,
-            up_batch: s.up_batch,
-            rot_batch: s.rot_batch,
-            topk_indices: s.topk_indices,
-            topk_weights: s.topk_weights,
-            down_expanded: s.down_expanded,
-            x_rot_expanded: s.x_rot_expanded,
-        };
-        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-        hipfire_runtime::dispatch::moe_family()
-            .run(&ctx, gpu, &moe_params)
-            .map_err(HipError::from)?;
-        Ok(())
-    };
-    if std::env::var("HIPFIRE_QWEN35_MOE_LEGACY_INLINE")
-        .ok()
-        .as_deref()
-        != Some("1")
-    {
-        return run_centralized_moe(gpu);
-    }
-
-    // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
-    // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
-    // into `fused_qkvza_hfq4g256` saves 3 launch submits per MoE layer and
-    // lets underused tails (shared_expert_gate_m=1, router_m=256) co-schedule
-    // with the larger 512-row gate/up bodies. 40 layers × 3 saved launches
-    // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
-    let shared_gate = slice_f32_view(gate_buf, 0, smi);
-    let shared_up = slice_f32_view(up_buf, 0, smi);
-    if gate_side_mq4 {
-        // All-MQ4 gate-side: use the 4-way fused prerotated GEMV. Router,
-        // shared_expert_gate, shared_expert.gate, shared_expert.up — all
-        // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
-        // rotated at quant time, so `gemv_hfq4g256` inner loop with the
-        // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local is Some");
-        gpu.fused_qkvza_hfq4g256(
-            &ffn.router.buf,
-            &ffn.shared_expert_gate.buf,
-            &ffn.shared_expert.gate.buf,
-            &ffn.shared_expert.up.buf,
-            xr,
-            router_logits,
-            scalar_buf,
-            &shared_gate,
-            &shared_up,
-            ffn.router.m,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert.gate.m,
-            ffn.shared_expert.up.m,
-            ffn.router.k,
-        )?;
-    } else {
-        // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
-        // weight_gemv handles its own rotation for MQ4 weights internally
-        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
-        // so the externally-computed `x_rot_local` is preserved for the
-        // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
-        weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
-        if ffn.experts.is_empty() {
-            paged_moe_debug_sync(gpu, "after paged router gemv")?;
-        }
-        if config.has_shared_expert {
-            weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
-            if shared_gate_up_mq4 {
-                // Mixed router/scalar dtypes cannot use the 4-way fused gate-side
-                // kernel, but shared gate+up can still share one MQ4 rotation.
-                if x_rot_prerotated
-                    && ffn.shared_expert.gate.awq_scale.is_none()
-                    && ffn.shared_expert.up.awq_scale.is_none()
-                {
-                    gpu.fused_gate_up_hfq4g256(
-                        &ffn.shared_expert.gate.buf,
-                        &ffn.shared_expert.up.buf,
-                        s.x_rot_local,
-                        &shared_gate,
-                        &shared_up,
-                        ffn.shared_expert.gate.m,
-                        ffn.shared_expert.up.m,
-                        ffn.shared_expert.gate.k,
-                    )?;
-                } else {
-                    gpu.ensure_mq_signs()?;
-                    let shared_x_rot = GpuTensor {
-                        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                        dtype: DType::F32,
-                    };
-                    rotate_x_mq_for(
-                        gpu,
-                        &ffn.shared_expert.gate,
-                        x_norm,
-                        &shared_x_rot,
-                        ffn.shared_expert.gate.k,
-                    )?;
-                    gpu.fused_gate_up_hfq4g256(
-                        &ffn.shared_expert.gate.buf,
-                        &ffn.shared_expert.up.buf,
-                        &shared_x_rot,
-                        &shared_gate,
-                        &shared_up,
-                        ffn.shared_expert.gate.m,
-                        ffn.shared_expert.up.m,
-                        ffn.shared_expert.gate.k,
-                    )?;
-                }
-            } else {
-                weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-                weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
-            }
-        }
-    }
-
-    // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
-    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) =
-        if use_gpu_topk {
-            // GPU path: split softmax + top-K + renorm into two kernels so
-            // the routing path uses identical softmax math to gpu.softmax_f32
-            // (and thus to a CPU reference). The fused
-            // moe_softmax_topk_renorm_k8 variant produced topk_weights that
-            // differed from gpu.softmax_f32 + manual `*w /= sum` by exactly
-            // 1 ULP per element, which compounds across 30+ MoE layers and
-            // 8 experts/layer into a structural attractor on Qwen3.5-A3B
-            // and 122B-A10B at MQ4. The new moe_topk_renorm_k8 takes
-            // pre-softmaxed probs and uses direct division for renorm.
-            gpu.softmax_f32(router_logits)?;
-            gpu.moe_topk_renorm_k8(
-                router_logits,
-                s.topk_indices,
-                s.topk_weights,
-                n_exp,
-                config.norm_topk_prob,
-            )?;
-            if ffn.experts.is_empty() {
-                paged_moe_debug_sync(gpu, "after paged topk")?;
-            }
-            if moe_router_histogram_active() {
-                let indices = download_i32_tensor(gpu, s.topk_indices, k)?
-                    .into_iter()
-                    .map(router_index_i32_to_usize)
-                    .collect::<Vec<_>>();
-                let weights = gpu.download_f32(s.topk_weights)?;
-                record_moe_router_selection(layer_idx, &indices, &weights);
-            }
-            (None, None)
-        } else {
-            // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
-            gpu.softmax_f32(router_logits)?;
-            let probs = gpu.download_f32(router_logits)?;
-            let mut indices: Vec<usize> = (0..n_exp).collect();
-            indices.select_nth_unstable_by(k - 1, |&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-            topk_indices.sort_by(|&a, &b| {
-                probs[b]
-                    .partial_cmp(&probs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-            if config.norm_topk_prob {
-                let sum: f32 = topk_weights.iter().sum();
-                if sum > 0.0 {
-                    for w in topk_weights.iter_mut() {
-                        *w /= sum;
-                    }
-                }
-            }
-            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
-            (Some(topk_indices), Some(topk_weights))
-        };
-    if ffn.experts.is_empty() {
-        if let (Some(indices), Some(weights)) =
-            (topk_indices_cpu.as_ref(), topk_weights_cpu.as_ref())
-        {
-            upload_cpu_topk_to_device(gpu, indices, weights, s.topk_indices, s.topk_weights)?;
-        }
-    }
-    if ffn.experts.is_empty() {
-        // The D2H top-k readback is a full device sync per MoE layer per token —
-        // one of the candidates for the paged path's CPU cost, so it is timed
-        // separately from the pager phases inside `ensure_paged_experts_resident`.
-        let indices = if let Some(indices) = topk_indices_cpu.as_ref() {
-            indices.clone()
-        } else {
-            use hipfire_runtime::weight_pager::page_timing::{self, Phase};
-            let raw = page_timing::timed(Phase::TopkReadback, || {
-                download_i32_tensor(gpu, s.topk_indices, k)
-            })?;
-            raw.into_iter()
-                .map(router_index_i32_to_usize)
-                .collect::<Vec<_>>()
-        };
-        ensure_paged_experts_resident(gpu, pager, ffn, &indices)?;
-        paged_moe_debug_sync(gpu, "after paged expert residency")?;
-    }
-
-    // The shared-expert gate scalar (in `scalar_buf`) is the RAW logit from
-    // the 4-way fused GEMV — sigmoid is applied internally by
-    // `gemv_hfq4g256_residual_sigmoid_scaled_gpu`, eliminating the separate
-    // 1-elem `sigmoid_f32` launch (~40 saved per forward on A3B).
-    if config.has_shared_expert {
-        if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
-            fused_silu_mul_rotate_mq_for(
-                gpu,
-                &ffn.shared_expert.down,
-                &shared_gate,
-                &shared_up,
-                &x_rot_alias,
-                smi,
-            )?;
-            gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-                &ffn.shared_expert.down.buf,
-                &x_rot_alias,
-                x_residual,
-                scalar_buf,
-                ffn.shared_expert.down.m,
-                ffn.shared_expert.down.k,
-            )?;
-        } else {
-            // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
-            gpu.sigmoid_f32(scalar_buf)?;
-            // Non-MQ fallback: pre-2a-ii path.
-            let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
-            gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
-            weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
-            gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
-        }
-    }
-
     // ── 4. Top-K routed experts ──
     if routed_mq4 {
         gpu.ensure_mq_signs()?;
@@ -1948,4 +1417,624 @@ pub(crate) fn moe_ffn_decode_impl(
         .run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
     Ok(())
+}
+
+pub(crate) fn moe_ffn_decode_impl(
+    gpu: &mut Gpu,
+    pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+    x_rot_prerotated: bool,
+    layer_idx: usize,
+    // EP (Ship 6 substrate-EP). `ep_routed_out = Some(partial)` redirects the
+    // routed combine + shared-down into a zeroed partial (the EP executor
+    // all-reduces it and adds into x_residual once); `None` = single-GPU into
+    // x_residual (byte-identical). `ep_skip_shared` skips the shared-expert
+    // down on rank>0 so the replicated shared expert is summed once.
+    ep_routed_out: Option<&GpuTensor>,
+    ep_skip_shared: bool,
+) -> HipResult<()> {
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+    // Residency provider for the lowered MoE path. `Some` exactly when this model
+    // is paged; a fully-resident model gets `None` and the lowered path keeps
+    // top-K on-device with no readback, unchanged.
+    let residency_provider = pager.map(|p| PagerExpertResidency { pager: p });
+    let _ = hidden;
+
+    let router_logits = s.router_logits;
+    let scalar_buf = s.scalar_buf;
+    let gate_buf = s.gate_buf;
+    let up_buf = s.up_buf;
+    let ffn_hidden = s.ffn_hidden;
+    let ffn_out = s.ffn_out;
+
+    // Phase 2a-iii: rotate x_norm once per layer and share the rotated
+    // buffer across every MQ4 GEMV that consumes it. Two independent users:
+    //   1. The 4-way fused gate-side GEMV (gate_side_mq4) — requires router,
+    //      shared_expert_gate, shared_expert.{gate,up} all MQ4G256.
+    //   2. The indexed routed-expert gate_up GEMV (routed_gate_up_mq4) — fires
+    //      whenever the routed gate_up family is MQ4G256, independent of the
+    //      gate-side family's dtype.
+    // We compute x_rot_local if EITHER user will fire. Models with a Q8
+    // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
+    // the device-side top-K + indexed expert GEMV path — only the 4-way
+    // fused GEMV falls back to four individual `weight_gemv` calls.
+    let prefill_dtypes = MoePrefillDtypes::from_ffn(ffn);
+    let dispatch_flags = if let Some(dtypes) = prefill_dtypes {
+        moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some(), config.dim, mi)
+    } else {
+        let gate_side_mq4 = config.has_shared_expert
+            && ffn.router.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+            && ffn
+                .experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
+        let shared_gate_up_mq4 = config.has_shared_expert
+            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
+        MoeDecodeDispatchFlags {
+            gate_side_mq4,
+            shared_gate_up_mq4,
+            routed_mq4: false,
+            routed_mq6: false,
+            routed_mq2_lloyd: false,
+            routed_paro: false,
+            routed_gate_up_mq4: false,
+            routed_gate_up_mq6: false,
+            routed_gate_up_mq2_lloyd: false,
+            routed_gate_up_paro: false,
+            routed_dtype_indexable_mq4: false,
+            routed_dtype_indexable_mq6: false,
+            routed_dtype_indexable_mq2_lloyd: false,
+            routed_dtype_indexable_paro: false,
+            routed_dtype_indexable_oq4: false,
+            routed_dtype_indexable_oq8: false,
+            routed_path: MoeDecodeIndexedRoutedPath::None,
+            use_gpu_topk: false,
+            needs_x_rot_local: gate_side_mq4,
+        }
+    };
+    let gate_side_mq4 = dispatch_flags.gate_side_mq4;
+    let shared_gate_up_mq4 = dispatch_flags.shared_gate_up_mq4;
+    let routed_gate_up_paro = dispatch_flags.routed_gate_up_paro;
+    let routed_dtype_indexable_mq4 = dispatch_flags.routed_dtype_indexable_mq4;
+    let routed_dtype_indexable_mq6 = dispatch_flags.routed_dtype_indexable_mq6;
+    let routed_dtype_indexable_mq2_lloyd = dispatch_flags.routed_dtype_indexable_mq2_lloyd;
+    let routed_dtype_indexable_paro = dispatch_flags.routed_dtype_indexable_paro;
+    let routed_dtype_indexable_oq4 = dispatch_flags.routed_dtype_indexable_oq4;
+    let routed_dtype_indexable_oq8 = dispatch_flags.routed_dtype_indexable_oq8;
+    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
+    // device and the indexed MoE kernels consume topk_indices /
+    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
+    // Note: this no longer requires `gate_side_mq4`. The device-side
+    // `moe_topk_renorm_k8` kernel and the indexed gate_up/down GEMVs
+    // consume router_logits/topk_indices/topk_weights/x_rot from device
+    // buffers regardless of how router_logits was produced (fused-4 or
+    // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
+    // are now first-class for graph capture. Mixed-kmap A3B layers
+    // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
+    // of the HFQ4 ones — same control flow, different kernel binary.
+    let use_gpu_topk = dispatch_flags.use_gpu_topk;
+    let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
+    // Why a routed decode was refused is otherwise invisible: the dispatch error
+    // carries only `use_gpu_topk`/`routed_experts_resident`, not the dtypes that
+    // decided them, so a refusal on a paged or mixed artifact is unattributable
+    // from outside. `HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1` names them.
+    if std::env::var("HIPFIRE_QWEN35_MOE_DTYPE_DEBUG").as_deref() == Ok("1") {
+        match prefill_dtypes {
+            Some(d) => eprintln!(
+                "[moe-dtype] layer={} experts_resident={} n_dtypes={} gate_up={:?} down={:?} \
+                 uniform(gu/dn)={}/{} profile={:?} k={} oq_indexed_gate={} \
+                 idx(mq4/mq6/mq2l/paro/oq4/oq8)={}/{}/{}/{}/{}/{} path={:?} use_gpu_topk={}",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                d.expert_gate_up,
+                d.expert_down,
+                d.expert_gate_up_uniform,
+                d.expert_down_uniform,
+                d.routed_profile,
+                k,
+                qwen35_moe_oq_indexed_decode_active(config.dim, mi, k),
+                routed_dtype_indexable_mq4,
+                routed_dtype_indexable_mq6,
+                routed_dtype_indexable_mq2_lloyd,
+                routed_dtype_indexable_paro,
+                routed_dtype_indexable_oq4,
+                routed_dtype_indexable_oq8,
+                dispatch_flags.routed_path,
+                use_gpu_topk,
+            ),
+            None => eprintln!(
+                "[moe-dtype] layer={} MoePrefillDtypes::from_ffn returned None \
+                 (experts_resident={} n_gate_up_dtypes={} expert_gate_up_dtype={:?}) \
+                 -> every indexed path disabled",
+                ffn.layer_idx,
+                !ffn.experts.is_empty(),
+                ffn.expert_gate_up_dtypes.len(),
+                ffn.expert_gate_up_dtype,
+            ),
+        }
+    }
+
+    let paged_mixed_routed = ffn.experts.is_empty()
+        && prefill_dtypes.is_some_and(|dtypes| dtypes.routed_profile.is_mixed());
+    let x_rot_local = if needs_x_rot_local {
+        if !routed_gate_up_paro {
+            // FWHT-rotated path needs the MQ sign LUT.
+            gpu.ensure_mq_signs()?;
+        }
+        if !x_rot_prerotated {
+            if routed_gate_up_paro {
+                // ParoQuant routed experts: use the per-layer shared Givens
+                // rotation (from `ffn.paro_shared.gate_up_*`). The loader
+                // builds every expert's `paro` alias from the same sidecars,
+                // so experts[0].gate_up.paro is the canonical handle.
+                let paro = ffn.experts[0]
+                    .gate_up
+                    .paro
+                    .as_ref()
+                    .expect("routed_gate_up_paro implies experts[0].gate_up.paro.is_some()");
+                hipfire_runtime::weights::rotate_x_paro_for(
+                    gpu,
+                    paro,
+                    x_norm,
+                    s.x_rot_local,
+                    config.dim,
+                )?;
+            } else {
+                // F2 / F1: AWQ-aware FWHT rotate. All MQ4 weights in this
+                // layer consume the same post-rmsnorm x, so they share the
+                // same input basis → identical imatrix → byte-identical
+                // AWQ scales. When gate_side_mq4 is true the 4-way fused
+                // GEMV expects rotation aligned with `ffn.router`'s AWQ
+                // scale; otherwise pick `ffn.experts[0].gate_up` as the
+                // routed-expert representative for the indexed kernel
+                // path. When AWQ is disabled (no sidecar),
+                // `rotate_x_mq_for` routes to the non-AWQ kernel —
+                // byte-identical to pre-F2 either way.
+                if ffn.experts.is_empty() && !gate_side_mq4 {
+                    gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
+                    paged_moe_debug_sync(gpu, "after paged rotate_x_mq")?;
+                } else {
+                    let next_lin = if gate_side_mq4 {
+                        &ffn.router
+                    } else {
+                        &ffn.experts[0].gate_up
+                    };
+                    rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
+                }
+            }
+        }
+        // else caller guarantees s.x_rot_local already holds the rotated x.
+        Some(s.x_rot_local)
+    } else {
+        None
+    };
+    // The routed dtypes come from the per-expert dtype tables, NOT from
+    // `ffn.experts`. Under paged residency `experts` is empty by design, so
+    // `experts.first()` yields nothing there — and the previous
+    // `.unwrap_or(DType::F32)` turned "I don't know" into a confident F32,
+    // which the executor's own resolution then read as a non-indexable routed
+    // dtype and refused with `decode-routed-dtype-unsupported-no-fallback`.
+    //
+    // That produced two independent resolutions of the same fact that disagreed:
+    // the arch-side flags above resolved `Uniform(Oq4G256)` / `use_gpu_topk=true`
+    // from `expert_gate_up_dtypes`, while this snapshot said F32. Measured on a
+    // paged Qwen3.6-35B-A3B--oq4 artifact, which is why paged MoE decode failed
+    // for EVERY routed format, not just Opus.
+    //
+    // `moe_expert_gate_up_dtype`/`moe_expert_down_dtype` already prefer the dtype
+    // tables and fall back to resident experts, so they are correct in both modes.
+    let routed_gate_up_dtype = moe_expert_gate_up_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed gate_up dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
+    let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
+        HipError::new(
+            0,
+            "moe decode: routed down dtype unknown (no per-expert dtype table \
+             and no resident experts) — cannot resolve a routed dispatch path",
+        )
+    })?;
+    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
+        router: ffn.router.gpu_dtype,
+        shared_gate: ffn.shared_expert_gate.gpu_dtype,
+        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        // `.all()` over an EMPTY iterator is vacuously true, so the old form
+        // claimed "every routed expert is MQ4" for any paged model regardless of
+        // its actual format. Read the dtype table first, and when neither source
+        // knows, answer `false` — an unknown must not present as uniformity.
+        experts_all_gate_up_mq4: if !ffn.expert_gate_up_dtypes.is_empty() {
+            ffn.expert_gate_up_dtypes
+                .iter()
+                .all(|d| *d == DType::MQ4G256)
+        } else if !ffn.experts.is_empty() {
+            ffn.experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        } else {
+            false
+        },
+        routed_gate_up: routed_gate_up_dtype,
+        routed_down: routed_down_dtype,
+        has_paro_shared: ffn.paro_shared.is_some(),
+    };
+    // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
+    // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
+    let run_centralized_moe = |gpu: &mut Gpu| -> HipResult<()> {
+        // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
+        // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged
+        // mode (`ffn.experts` is empty — only the indexed GPU-top-K path runs
+        // there), matching master's `ffn.experts[..]` indexing requirement.
+        let routed_experts: Vec<(
+            hipfire_dispatch::families::gemv::WeightRef<'_>,
+            hipfire_dispatch::families::gemv::WeightRef<'_>,
+        )> = ffn
+            .experts
+            .iter()
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+            .collect();
+
+        // Routed geometry comes from `moe_expert_shape`, which prefers
+        // `ffn.expert_shape` and only then falls back to a resident expert.
+        // `ffn.experts.first()` is None under paged residency, and the previous
+        // `map_or(0, ..)` marshalled ZEROS to the executor — which then launched
+        // the indexed down GEMV with `grid.x = 0` and failed
+        // `hipModuleLaunchKernel: invalid argument`. Same silent-default shape as
+        // the routed dtypes above, one struct over.
+        let routed_shape = moe_expert_shape(ffn).ok_or_else(|| {
+            HipError::new(0, "missing MoE expert shape metadata for routed dispatch")
+        })?;
+        let moe_params = hipfire_dispatch::families::moe::MoeParams {
+            layer: layer_idx,
+            dtypes: moe_dtypes,
+            batch_size: 1,
+            hidden,
+            mi,
+            smi,
+            k,
+            n_exp,
+            norm_topk_prob: config.norm_topk_prob,
+            x_rot_prerotated,
+            x_norm,
+            x_residual,
+            routed_out: ep_routed_out,
+            skip_shared: ep_skip_shared,
+            router: ffn.router.dispatch_ref(),
+            shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
+            shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
+            shared_up_w: ffn.shared_expert.up.dispatch_ref(),
+            shared_down_w: ffn.shared_expert.down.dispatch_ref(),
+            expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+            expert_down_ptrs: &ffn.expert_down_ptrs,
+            expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+            expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+            // Option A: the lowered path reads top-k back and makes the
+            // selected experts resident before dispatch. The pointer table
+            // follows automatically (push), so this only supplies residency.
+            expert_residency: residency_provider
+                .as_ref()
+                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
+            routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(
+                config.dim,
+                mi,
+                config.num_experts_per_tok,
+            ),
+            // From `routed_shape`, NOT `ffn.experts.first()`: under paged
+            // residency `experts` is empty, so the `map_or(0, ...)` form master
+            // uses would silently dispatch with k/m/n = 0. `routed_shape` is
+            // read from the layout and is correct either way.
+            routed_gate_up_k: routed_shape.gate_up_k,
+            routed_down_m: routed_shape.down_m,
+            routed_down_k: routed_shape.down_k,
+            routed_experts: &routed_experts,
+            routed_gate_up_paro: ffn.experts.first().and_then(|e| {
+                e.gate_up
+                    .paro
+                    .as_ref()
+                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
+                        pairs: &p.pairs,
+                        theta: &p.theta,
+                        scales: &p.channel_scales,
+                        krot: p.krot as usize,
+                    })
+            }),
+            routed_down_paro: ffn.experts.first().and_then(|e| {
+                e.down
+                    .paro
+                    .as_ref()
+                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
+                        pairs: &p.pairs,
+                        theta: &p.theta,
+                        scales: &p.channel_scales,
+                        krot: p.krot as usize,
+                    })
+            }),
+            router_logits: s.router_logits,
+            scalar_buf: s.scalar_buf,
+            x_rot_local: s.x_rot_local,
+            gate_up_buf: s.gate_up_buf,
+            gate_buf: s.gate_buf,
+            up_buf: s.up_buf,
+            ffn_hidden: s.ffn_hidden,
+            ffn_out: s.ffn_out,
+            gate_batch: s.gate_batch,
+            up_batch: s.up_batch,
+            rot_batch: s.rot_batch,
+            topk_indices: s.topk_indices,
+            topk_weights: s.topk_weights,
+            down_expanded: s.down_expanded,
+            x_rot_expanded: s.x_rot_expanded,
+        };
+        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+        hipfire_runtime::dispatch::moe_family()
+            .run(&ctx, gpu, &moe_params)
+            .map_err(HipError::from)?;
+        Ok(())
+    };
+    if std::env::var("HIPFIRE_QWEN35_MOE_LEGACY_INLINE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return run_centralized_moe(gpu);
+    }
+
+    // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
+    // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
+    // into `fused_qkvza_hfq4g256` saves 3 launch submits per MoE layer and
+    // lets underused tails (shared_expert_gate_m=1, router_m=256) co-schedule
+    // with the larger 512-row gate/up bodies. 40 layers × 3 saved launches
+    // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
+    let shared_gate = slice_f32_view(gate_buf, 0, smi);
+    let shared_up = slice_f32_view(up_buf, 0, smi);
+    if gate_side_mq4 {
+        // All-MQ4 gate-side: use the 4-way fused prerotated GEMV. Router,
+        // shared_expert_gate, shared_expert.gate, shared_expert.up — all
+        // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
+        // rotated at quant time, so `gemv_hfq4g256` inner loop with the
+        // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local is Some");
+        gpu.fused_qkvza_hfq4g256(
+            &ffn.router.buf,
+            &ffn.shared_expert_gate.buf,
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            xr,
+            router_logits,
+            scalar_buf,
+            &shared_gate,
+            &shared_up,
+            ffn.router.m,
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.router.k,
+        )?;
+    } else {
+        // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
+        // weight_gemv handles its own rotation for MQ4 weights internally
+        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
+        // so the externally-computed `x_rot_local` is preserved for the
+        // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
+        weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
+        if ffn.experts.is_empty() {
+            paged_moe_debug_sync(gpu, "after paged router gemv")?;
+        }
+        if config.has_shared_expert {
+            weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
+            if shared_gate_up_mq4 {
+                // Mixed router/scalar dtypes cannot use the 4-way fused gate-side
+                // kernel, but shared gate+up can still share one MQ4 rotation.
+                if x_rot_prerotated
+                    && ffn.shared_expert.gate.awq_scale.is_none()
+                    && ffn.shared_expert.up.awq_scale.is_none()
+                {
+                    gpu.fused_gate_up_hfq4g256(
+                        &ffn.shared_expert.gate.buf,
+                        &ffn.shared_expert.up.buf,
+                        s.x_rot_local,
+                        &shared_gate,
+                        &shared_up,
+                        ffn.shared_expert.gate.m,
+                        ffn.shared_expert.up.m,
+                        ffn.shared_expert.gate.k,
+                    )?;
+                } else {
+                    gpu.ensure_mq_signs()?;
+                    let shared_x_rot = GpuTensor {
+                        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                        dtype: DType::F32,
+                    };
+                    rotate_x_mq_for(
+                        gpu,
+                        &ffn.shared_expert.gate,
+                        x_norm,
+                        &shared_x_rot,
+                        ffn.shared_expert.gate.k,
+                    )?;
+                    gpu.fused_gate_up_hfq4g256(
+                        &ffn.shared_expert.gate.buf,
+                        &ffn.shared_expert.up.buf,
+                        &shared_x_rot,
+                        &shared_gate,
+                        &shared_up,
+                        ffn.shared_expert.gate.m,
+                        ffn.shared_expert.up.m,
+                        ffn.shared_expert.gate.k,
+                    )?;
+                }
+            } else {
+                weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+                weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
+            }
+        }
+    }
+
+    // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
+    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) =
+        if use_gpu_topk {
+            // GPU path: split softmax + top-K + renorm into two kernels so
+            // the routing path uses identical softmax math to gpu.softmax_f32
+            // (and thus to a CPU reference). The fused
+            // moe_softmax_topk_renorm_k8 variant produced topk_weights that
+            // differed from gpu.softmax_f32 + manual `*w /= sum` by exactly
+            // 1 ULP per element, which compounds across 30+ MoE layers and
+            // 8 experts/layer into a structural attractor on Qwen3.5-A3B
+            // and 122B-A10B at MQ4. The new moe_topk_renorm_k8 takes
+            // pre-softmaxed probs and uses direct division for renorm.
+            gpu.softmax_f32(router_logits)?;
+            gpu.moe_topk_renorm_k8(
+                router_logits,
+                s.topk_indices,
+                s.topk_weights,
+                n_exp,
+                config.norm_topk_prob,
+            )?;
+            if ffn.experts.is_empty() {
+                paged_moe_debug_sync(gpu, "after paged topk")?;
+            }
+            if moe_router_histogram_active() {
+                let indices = download_i32_tensor(gpu, s.topk_indices, k)?
+                    .into_iter()
+                    .map(router_index_i32_to_usize)
+                    .collect::<Vec<_>>();
+                let weights = gpu.download_f32(s.topk_weights)?;
+                record_moe_router_selection(layer_idx, &indices, &weights);
+            }
+            (None, None)
+        } else {
+            // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
+            gpu.softmax_f32(router_logits)?;
+            let probs = gpu.download_f32(router_logits)?;
+            let mut indices: Vec<usize> = (0..n_exp).collect();
+            indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+            topk_indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+            if config.norm_topk_prob {
+                let sum: f32 = topk_weights.iter().sum();
+                if sum > 0.0 {
+                    for w in topk_weights.iter_mut() {
+                        *w /= sum;
+                    }
+                }
+            }
+            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
+            (Some(topk_indices), Some(topk_weights))
+        };
+    if ffn.experts.is_empty() {
+        if let (Some(indices), Some(weights)) =
+            (topk_indices_cpu.as_ref(), topk_weights_cpu.as_ref())
+        {
+            upload_cpu_topk_to_device(gpu, indices, weights, s.topk_indices, s.topk_weights)?;
+        }
+    }
+    if ffn.experts.is_empty() {
+        // The D2H top-k readback is a full device sync per MoE layer per token —
+        // one of the candidates for the paged path's CPU cost, so it is timed
+        // separately from the pager phases inside `ensure_paged_experts_resident`.
+        let indices = if let Some(indices) = topk_indices_cpu.as_ref() {
+            indices.clone()
+        } else {
+            use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+            let raw = page_timing::timed(Phase::TopkReadback, || {
+                download_i32_tensor(gpu, s.topk_indices, k)
+            })?;
+            raw.into_iter()
+                .map(router_index_i32_to_usize)
+                .collect::<Vec<_>>()
+        };
+        ensure_paged_experts_resident(gpu, pager, ffn, &indices)?;
+        paged_moe_debug_sync(gpu, "after paged expert residency")?;
+    }
+
+    // The shared-expert gate scalar (in `scalar_buf`) is the RAW logit from
+    // the 4-way fused GEMV — sigmoid is applied internally by
+    // `gemv_hfq4g256_residual_sigmoid_scaled_gpu`, eliminating the separate
+    // 1-elem `sigmoid_f32` launch (~40 saved per forward on A3B).
+    if config.has_shared_expert {
+        if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
+            fused_silu_mul_rotate_mq_for(
+                gpu,
+                &ffn.shared_expert.down,
+                &shared_gate,
+                &shared_up,
+                &x_rot_alias,
+                smi,
+            )?;
+            gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
+                &ffn.shared_expert.down.buf,
+                &x_rot_alias,
+                x_residual,
+                scalar_buf,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+            )?;
+        } else {
+            // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
+            gpu.sigmoid_f32(scalar_buf)?;
+            // Non-MQ fallback: pre-2a-ii path.
+            let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
+            gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
+            weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
+            gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
+        }
+    }
+
+    moe_routed_experts_and_combine(
+        gpu,
+        ffn,
+        x_residual,
+        config,
+        s,
+        layer_idx,
+        ep_routed_out,
+        &dispatch_flags,
+        topk_indices_cpu,
+        topk_weights_cpu,
+        residency_provider,
+        moe_dtypes,
+        x_norm,
+        x_rot_local,
+        x_rot_prerotated,
+        ep_skip_shared,
+        paged_mixed_routed,
+        hidden,
+        mi,
+        smi,
+        k,
+        n_exp,
+    )
 }
