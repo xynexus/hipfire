@@ -1269,9 +1269,14 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
     let stepped: Vec<stream::StreamId> = taken.iter().map(|(id, ..)| *id).collect();
     for ((id, req_id, sid, mut g), step) in taken.into_iter().zip(outcomes) {
         let m = daemon_state.model.as_mut().expect("checked above");
-        g.release_to_registry(m, &sid);
+        // Release ONLY on the continue path. `finish` and `fail` both consume
+        // the session themselves — releasing first leaves the handle empty and
+        // `finish` panics with "finish requires a resumed stream". Measured: the
+        // daemon died at the first stream to hit EOS, ~32 tokens in, and the
+        // truncated-but-plausible output read as a 32-token cap.
         match step {
             hipfire_serving_core::generate::Qwen35Step::Continue if g.should_continue() => {
+                g.release_to_registry(m, &sid);
                 if let Some(s) = daemon_state.streams.get_mut(id) {
                     s.generation = Some(g);
                 }
