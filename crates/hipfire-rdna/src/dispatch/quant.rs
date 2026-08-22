@@ -547,10 +547,12 @@ impl Gpu {
             dtype: DType::F32,
         };
         // Exact W4A8 via two iu4 WMMA passes, plus the overlay as a K-major
-        // pass. Same arithmetic as the iu8 core below -- iu8 spends half its
-        // weight lanes on sign-extended 4-bit values -- but ~1.4x faster on the
-        // 27B projection shapes. Opt-in until it has run a coherence battery.
-        if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() == Ok("1") {
+        // pass. This is the DEFAULT for compact batched prefill: it is the same
+        // arithmetic as the iu8 core below -- iu8 spends half its weight lanes
+        // on sign-extended 4-bit values that the compact format never had -- and
+        // ~1.4x faster on the 27B projection shapes (+14% end-to-end prefill).
+        // `HIPFIRE_OQ_COMPACT_IU4X2=0` falls back to the iu8 core.
+        if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
             let xt = GpuTensor {
                 buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
                 shape: vec![n * k],

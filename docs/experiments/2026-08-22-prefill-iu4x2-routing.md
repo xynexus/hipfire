@@ -45,8 +45,8 @@ Under the 1.43x the GEMM microbench predicts for these projection shapes, becaus
 prefill also spends time in attention, rotation, norms and lm_head, and neither
 prompt fills the B=256 tile the bench measures.
 
-Opt-in via `HIPFIRE_OQ_COMPACT_IU4X2=1`. Default stays off pending a coherence
-battery. `gemm_oq_compact_residual_act_batched` delegates to the same function,
+**This is now the default**; `HIPFIRE_OQ_COMPACT_IU4X2=0` falls back to the iu8
+core. See "Quality" below for what earned the flip. `gemm_oq_compact_residual_act_batched` delegates to the same function,
 so one edit covers the plain and residual arms both.
 
 ## The trap this cost
@@ -101,3 +101,30 @@ and then eval independently reproduces the win:
 | **iu4x2** | **220.3 / 227.6** (+13.5%) |
 
 Written up in `docs/methodology/perf-benchmarking.md`.
+
+## Quality — what earned the default
+
+iu4x2 is **not** bit-identical to iu8 end-to-end, and it is worth being exact
+about why: the two compute the same products, but iu8 folds the sparse overlay
+into the same i32 accumulator before the single f32 rescale, whereas the iu4x2
+route adds the overlay into `y` as a separate f32 accumulate pass. Same
+arithmetic, different rounding order.
+
+Measured with the daemon's `kld_eval`, 4092 scored tokens from
+`benchmarks/calib/calib-1m.txt`, reference built on the iu8 path, fp32 KV:
+
+| scored path | mean KLD vs iu8 ref | p99 | ppl |
+|---|---|---|---|
+| iu8, batched (self — control) | **1.9e-10** | 2.2e-10 | 6.3037 |
+| **iu4x2, batched** | **2.96e-4** | 4.28e-4 | 6.2991 |
+| iu8, **per-token** prefill | 1.50e-4 | 2.07e-4 | 6.3014 |
+
+The control pins the floor at 1.9e-10, so 2.96e-4 is a real divergence, not
+noise. The third row is the yardstick that makes it acceptable: **batched vs
+per-token prefill on the same kernel is 1.50e-4** — an already-shipped
+difference, and the default path. iu4x2 sits at 2x that, the same order of
+magnitude, inside the numerical envelope prefill already occupies.
+
+Perplexity moves by less than 0.005 across all three (and iu4x2 is nominally the
+lowest, which is noise at this scale, not an improvement). Generated text is
+byte-identical to iu8 on the 240-, 539- and 2059-token prompts.
