@@ -107,6 +107,35 @@ The work, in order:
 Steps 1 and 2 are mechanical mirrors of code that already exists in the sibling
 function. Step 3 is the arch work, and its test is the artifact above.
 
+### Step 3's shape, and its fast test loop
+
+Steps 1 and 2 are done (`ds4-biasaware-residency-hook`): `MoeBiasAwareParams`
+now carries `layer_idx` and `expert_residency`, and `run_moe_decode_bias_aware`
+consults the provider between the top-K and the indexed GEMV. Every caller
+passes `None`, so it is inert.
+
+Step 3 is four parts, and it is more than "register the modules":
+
+1. **Somewhere to hold the pager.** qwen35 threads
+   `Option<&RefCell<WeightPager>>` as a parameter (`qwen35/mod.rs:3332`).
+   deepseek4's `ffn_routed(cfg, weights, state, gpu, layer_idx, routed_out)` has
+   no such parameter, and there are three call sites
+   (`forward.rs:1962`, `:2101`, `:2650`) plus their callers.
+2. **A residency provider.** qwen35 has a local `PagerExpertResidency { pager }`
+   implementing the generic trait; deepseek4 needs the equivalent, or that type
+   moves somewhere shared.
+3. **Loader registration.** `register_expert_modules(hfq.modules())` plus
+   `register_expert_ptr_tables` per layer. deepseek4's loader has **no paged
+   branch at all** today — grep finds nothing.
+4. **Drop the `combined` upload** (`arch.rs:298-330`) on the paged path. This is
+   the 1152 MiB-per-layer allocation that dies at layer 19.
+
+**The test loop is fast, which matters more than the size.** The tiny deepseek4
+fixture quantizes to an artifact carrying **16 RoutedExpert modules** (2 layers ×
+8 experts), so paging can be exercised in seconds against `tiny-quant-gate` /
+`tiny-state-gate` rather than a ten-minute 82.78 GB load. Develop against the
+fixture; use the big artifact once, as the acceptance test.
+
 ## What does not block it
 
 The EP smoke on medusa is the *validation* Phase 3b asks for, and medusa is
