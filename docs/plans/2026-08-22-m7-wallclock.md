@@ -149,6 +149,24 @@ That is what makes the handle authoritative while still getting the single fused
 forward, and it is why (a) costs a refactor of `step` rather than a
 reimplementation of the generation state machine.
 
+### One complication, found by reading rather than assuming
+
+The split is clean on the *batched* side but not on the handle side.
+`qwen35_decode_one` (`generate.rs:1981`, ~365 lines) has **two** `sampler::sample`
+call sites, in different branches — around `:2219` and `:2330` — not one sampling
+point with a forward either side.
+
+So "split `step` into a sample half and a forward half" is not a single cut. It
+needs the branch structure resolved first: which arms sample before their
+forward, which after, and whether both can be expressed as
+`forward -> logits -> sample` without changing either arm's behaviour. That is
+the actual first task, and it is a reading task before it is an editing one.
+
+This does not change the design — the handle must stay authoritative, and the
+batched forward is still `forward_prefill_grouped_moe_session_batch` over N
+single-token rows. It changes the estimate: the `step` split is not the
+mechanical extraction the `run_moe_decode` split was.
+
 ## Available today, without that work
 
 The batch protocol is reachable now: `generate_batch_prefill` →
