@@ -32,6 +32,40 @@ path's entire 17.09 GiB.
 
 Per tensor: **0.834 MiB fused vs 1.63 MiB unfused, ≈1.96×.**
 
+## Exactly why: the arch layout stores every expert twice
+
+The ratio is not approximately 2×, it is 2.000× by construction.
+`oq4_arch_combined_len` (`hipfire-runtime/src/oq4_arch.rs:34`) is
+
+```
+m*(k/2)  +  m*ng*4  +  m*ng*132          ng = k/256
+```
+
+and its own doc names the three regions:
+
+- `[split nibbles m*(k/2)]` — prefill MMQ/f16, at `sub_offset 0`
+- `[split f32 scales m*ng]` — prefill weight-scale region
+- `[interleaved m*ng*132]` — decode GEMVs, `[f32 scale][128 nibbles]` per group
+
+The **interleaved region alone is the compact MoE-block layout** the indexed path
+uses. So the arch layout is the compact one *plus* a second, differently-shaped
+copy of the same weights for prefill:
+
+| m | k | arch combined | MoE blocks | ratio |
+|---|---|---|---|---|
+| 2048 | 4096 | 8.25 MiB | 4.12 MiB | **2.000×** |
+| 4096 | 2048 | 8.25 MiB | 4.12 MiB | **2.000×** |
+| 1024 | 2048 | 2.06 MiB | 1.03 MiB | **2.000×** |
+
+Measured was 1.96× (1.63 vs 0.834 MiB/tensor); the shortfall is the non-expert
+weights, which are in both modes and use neither layout.
+
+**And the indexed path proves the second copy is not necessary.** It serves both
+prefill and decode from the interleaved form alone — batched
+`moe_topk_renorm_k8_batched` plus the indexed kernels for prefill, indexed GEMVs
+for decode. The dual-region layout is the general path that predates them, not a
+requirement.
+
 ## What that settles
 
 **It is payload expansion, not allocator overhead.** The buffer-object count is
