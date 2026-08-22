@@ -963,6 +963,43 @@ impl Gpu {
     /// Launch one of the pure iu4 WMMA issue-rate probes. `chains` selects the
     /// number of independent accumulator chains (1/2/4/8/16/32); `wave64`
     /// selects which family. No memory is touched by the kernel.
+    /// Launch one iu4 WMMA OPERAND-SUPPLY probe. Same shape as
+    /// [`Self::wmma_iu4_noop`], but every WMMA re-reads A and B from LDS, so the
+    /// gap between the two curves is the cost of operand supply alone.
+    pub fn wmma_iu4_lds_probe(
+        &mut self,
+        out: &GpuTensor,
+        blocks: u32,
+        iters: i32,
+        chains: u32,
+        fold: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = if fold {
+            format!("wmma_iu4_fold_w32_c{chains}")
+        } else {
+            format!("wmma_iu4_lds_w32_c{chains}")
+        };
+        self.ensure_kernel("wmma_iu4_lds_probe", kernels::WMMA_IU4_LDS_PROBE_SRC, &name)?;
+        let op = out.buf.as_ptr();
+        let mut it = iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &mut it as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[&name];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn wmma_iu4_noop(
         &mut self,
         out: &GpuTensor,

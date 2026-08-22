@@ -4313,6 +4313,12 @@ pub const WMMA_IU4_NOOP_W64_SRC: &str = include_str!("../../../kernels/src/wmma_
 /// wave32 twin of the above.
 pub const WMMA_IU4_NOOP_W32_SRC: &str = include_str!("../../../kernels/src/wmma_iu4_noop_w32.hip");
 
+/// iu4 WMMA OPERAND-SUPPLY probe: same chain sweep as the no-op issue probe, but
+/// both operands are re-read from LDS every instruction.
+/// See `kernels/src/wmma_iu4_lds_probe.hip`.
+pub const WMMA_IU4_LDS_PROBE_SRC: &str =
+    include_str!("../../../kernels/src/wmma_iu4_lds_probe.hip");
+
 /// Sparse overlay correction for the compact W4A4 path: adds the
 /// `val * x[idx]` term that `gemm_oq_compact_iu4_wmma` leaves out because an
 /// int8 overlay value does not fit an int4 WMMA lane. Accumulates into Y.
