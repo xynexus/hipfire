@@ -593,7 +593,17 @@ impl Gpu {
             if std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1") {
                 return Ok(());
             }
-            self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
+            // Skip when the hoisted quantize already built XT for THIS
+            // activation. Keyed on the generation counter plus ng: a group other
+            // than 256 gives XsT a different layout, and the hoisted path only
+            // ever emits ng = k/256.
+            let hoisted = self.oq_xt_gen == self.oq_act_gen
+                && self.oq_xt_ng == ng
+                && self.oq_xt_n == n
+                && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
+            if !hoisted {
+                self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
+            }
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.
             return self.oq_compact_overlay_correct_t(
                 w_blocks,
@@ -2002,7 +2012,34 @@ impl Gpu {
             shape: vec![n * k],
             dtype: DType::Raw,
         };
-        self.act_interleave_nibbles(&xq, &xilv, n, k)
+        self.act_interleave_nibbles(&xq, &xilv, n, k)?;
+        // Also produce the k-major twin the sparse overlay reads. Same argument
+        // as the interleave above: it is a function of the ACTIVATION, so doing
+        // it here rather than per projection stops gate/up/q/k/v each redoing it.
+        if k % 256 != 0 {
+            return Ok(());
+        }
+        let ng = k / 256;
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        let xt = GpuTensor {
+            buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xst = GpuTensor {
+            buf: unsafe { self.oq_xst_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        self.oq_compact_x8_transpose(&xq, &xs, &xt, &xst, n, k, ng)?;
+        self.oq_xt_gen = self.oq_act_gen;
+        self.oq_xt_ng = ng;
+        self.oq_xt_n = n;
+        Ok(())
     }
 
     pub fn quantize_act_oq8_batched(
@@ -2012,6 +2049,8 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        // Any re-quantize invalidates the k-major twin above.
+        self.oq_act_gen = self.oq_act_gen.wrapping_add(1);
         const GROUP: usize = 256;
         self.ensure_oq8_scratch_batched(n, k, m_max)?;
         let ng = k / GROUP;

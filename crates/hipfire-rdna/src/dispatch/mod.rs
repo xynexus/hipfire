@@ -576,6 +576,17 @@ pub struct Gpu {
     pub oq_xt_batch: Option<GpuTensor>,  // K-major int8 activation, N*K (iu4x2 overlay pass)
     pub oq_xst_batch: Option<GpuTensor>, // K-major f32 act scales, N*K/256
     pub oq_xilv_batch: Option<GpuTensor>, // fragment-interleaved nibble pairs, N*K
+    // The k-major transpose feeding the sparse overlay depends only on the
+    // ACTIVATION, so gate/up (and q/k/v) were each redoing the same permutation:
+    // 4463 transposes against 2303 quantizes in a prefill trace. These let the
+    // per-projection route skip it when the hoisted quantize already produced
+    // it. A generation counter, not a pointer check -- the activation scratch is
+    // reused across layers, so the pointer is identical while the contents are
+    // not. `oq_act_gen` starts at 1 so a fresh Gpu never matches.
+    pub oq_act_gen: u64,
+    pub oq_xt_gen: u64,
+    pub oq_xt_ng: usize,
+    pub oq_xt_n: usize,
     // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
     // per (batch,G256) and reused by every output-row block in the projection.
     // Capacity grows to the largest bounded chunk seen and is stream-reused.
@@ -996,6 +1007,10 @@ impl Gpu {
             oq_xt_batch: None,
             oq_xst_batch: None,
             oq_xilv_batch: None,
+            oq_act_gen: 1,
+            oq_xt_gen: 0,
+            oq_xt_ng: 0,
+            oq_xt_n: 0,
             dflash_oq_xq_batch: None,
             dflash_oq_xs_batch: None,
             paro_x_scratch: None,
