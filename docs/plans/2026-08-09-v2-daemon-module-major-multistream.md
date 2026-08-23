@@ -1300,6 +1300,35 @@ non-`RoutedExpert` module kinds (M5c).
 byte-identical to the same model run pinned. *Falsified by* any token difference, or by
 VRAM growth — which would mean M1a regressed.
 
+**Paged-expert bring-up on DeepSeek-V4-Flash, measured 2026-08-22/23 (nix1,
+gfx1103, 43008 MiB).** Artifact:
+`/srv/hipfire/staging/DeepSeek-V4-Flash-w13--attnq8.oq4.hfq` (85.3 GB) — experts
+oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
+`HIPFIRE_DEEPSEEK4_PAGED_EXPERTS=1` registers 11008 routed expert modules and the
+82.8 GB predecessor loads in 58 s on a 43 GB device. Three findings:
+
+1. **The fused MoE entry test asked for the wrong thing.** It gated on
+   `expert_gate_up_blob`, which paging deliberately does not upload, so every
+   paged layer fell into a fallback that no longer exists. Fixed by gating on the
+   ptr tables the dispatch actually reads.
+2. **Expert admission is incompatible with HIP graph capture.** The residency
+   hook does a blocking D2H inside the captured region and dispatch fails with
+   "would make the legacy stream depend on a capturing blocking stream".
+   Admission is a host decision; it has to be resolved *before* capture, not
+   inside it. With `HIPFIRE_DEEPSEEK4_GRAPH=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0`
+   decode runs to completion with no error — and emits degenerate output
+   (BOS x13), so paged decode executes but is not yet correct.
+3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
+   "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
+   layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
+   reference on this box, so the A/B needs either halo (128 GB / ~120 GB GTT,
+   where 85.3 GB fits pinned) or a smaller MoE whose pinned form fits in 43 GB.
+   Pick one before treating M5 as measurable here.
+
+Also landed for this: `--tensor-source` now accepts FP8 E4M3 archives, without
+which the attention repair was impossible — DeepSeek ships FP8, and the surgical
+re-encode path refused every tensor in the .hfa.
+
 ### M6 — priority admission landed 2026-08-22; classes still to come
 
 **M6 was mis-scoped as blocked.** Its core dependency is lossless suspension,
