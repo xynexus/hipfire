@@ -334,6 +334,11 @@ impl Qwen35RequestSessionState {
             )
             .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
         }
+        // Free the snapshot. `GpuTensor` has no `Drop`, so letting `self.logits`
+        // fall out of scope orphaned the allocation — ~970 KiB per call at a
+        // 248320 vocab. Harmless-ish when this ran once per session swap; not
+        // harmless now that the march loop parks a stream every token.
+        let _ = gpu.free_tensor(self.logits);
         // Install the saved session as the active resident slot in one move (C2b)
         // — replaces the former field-by-field spread of cursor / sequence_state /
         // suffix-len into `m.active`.

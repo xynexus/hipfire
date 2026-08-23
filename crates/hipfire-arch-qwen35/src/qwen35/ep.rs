@@ -270,7 +270,7 @@ pub fn forward_prefill_batch_ep(
 
     // Per-layer cumulative LA / FA counters (replicated → identical across ranks;
     // they index dn_state.s_matrices / kv_cache.k_gpu exactly like the band
-    // offsets the PP driver threads). kv_layer_offset == fa_layer_offset.
+    // offsets the PP driver threads).
     let mut delta_off = 0usize;
     let mut fa_off = 0usize;
 

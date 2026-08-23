@@ -1224,7 +1224,42 @@ pick step — one site instead of three-and-counting, and finer.
 
 *Revertible:* yes, behind `HIPFIRE_DAEMON_EXECUTOR=v2`.
 
-### M4 — Split `Moe` into `MoeRoute` / `MoeExpert(e)` / `MoeCombine`
+### M4 — scoped 2026-08-22. qwen35 has deepseek4's problem too.
+
+**Measured before starting.** This section already concedes that deepseek4 fuses
+top-k into dispatch and must stay on a coarse `Escape`. It assumes qwen35 is
+clean. **It is not.**
+
+`moe_ffn_decode_impl` (`qwen35/moe_decode.rs:751`) is **1,200 lines** of
+dtype-conditional dispatch, and among its fast paths is an *indexed* routed-expert
+GEMV gated by `hipfire_dispatch::families::moe::oq_indexed_decode_active`
+(`moe_decode.rs:639`, `:717`), described in its own comment as "the device-side
+top-K + indexed expert GEMV path" (`:797`). Routing and expert compute are **one
+kernel** there. Indexed routed-OQ MoE decode is also the DEFAULT (`0d425bfbf`),
+per this plan's own Tier-3 note.
+
+Splitting `Moe` into route / expert / combine means **unfusing** that: materialise
+per-expert intermediates the fused kernel exists to avoid, and pay a D2H plus a
+kernel launch per expert per token. That is a throughput regression bought to
+gain suspension granularity — the same trade this plan rejects elsewhere (copying
+gemma4's per-token prefill onto qwen35).
+
+What survives: the seam is real on the *unfused* paths. `MoeScratchRef` already
+materialises `router_logits` / `topk_indices` / `topk_weights`
+(`moe_decode.rs:51-64`), and the CPU-top-K path takes a D2H sync per layer
+(`:34`) which is a natural quantum edge.
+
+**So M4 needs a decision this plan does not currently pose:** is module
+granularity worth unfusing the default MoE decode path? If not, qwen35 joins
+deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
+and `MoeExpert(e)` exists only for arches whose MoE is not fused. Decide before
+implementing; the split is not free and the fused path is the one that ships.
+
+Note also that `MoeExpert(e)` must be indexed by top-k SLOT, not expert identity:
+`LayerProgram` is built once at lowering time and which experts fire is per-token.
+Emit `k` slots and resolve the physical expert inside the binding.
+
+### M4 — Split `Moe` into `MoeRoute` / `MoeExpert(e)` / `MoeCombine` (original)
 
 Now the module is the quantum. Expect M3's exit measurement to name `Moe` as the max — and
 **if it does not, say so**, because that means the workload never routed widely and the
@@ -1265,7 +1300,75 @@ non-`RoutedExpert` module kinds (M5c).
 byte-identical to the same model run pinned. *Falsified by* any token difference, or by
 VRAM growth — which would mean M1a regressed.
 
-### M6 — Realtime admission and the stub classes
+### M6 — priority admission landed 2026-08-22; classes still to come
+
+**M6 was mis-scoped as blocked.** Its core dependency is lossless suspension,
+which §M3c delivered — not M4 or M5. The ordering half is now in.
+
+`WorkloadSpec` has carried a `priority: u8` all along and admission hardcoded 0,
+so latency-sensitive work had no way to say so. Admission now reads `priority`
+off the wire and `StreamTable::runnable()` returns highest-priority first (stable,
+so equal priorities keep admission order). Measured, with bulk admitted FIRST:
+
+```
+dispatch order: R R b R b R b R b R b b b b b b ...
+```
+
+The `priority: 9` stream is dispatched ahead of a 60-token bulk stream that was
+admitted before it, finishes early, and bulk runs throughout. Flag-off is
+byte-identical and the §M3b1 exit is unchanged (default priority still fair-shares
+`ABAB…`).
+
+**Deliberately NOT done: the four `WorkloadClass` variants.**
+`SpeechIn`/`SpeechOut`/`VideoIn`/`VideoOut` are worth adding when they carry
+contracts and something consumes them; four variants whose only effect would be
+ordering that `priority` already provides is scaffolding. The declared
+largest-indivisible-unit and max-yield-granularity fields, the drain-budget and
+the VRAM test are the substance of M6 and remain.
+
+**Scoped 2026-08-22 — the remaining three, measured rather than assumed.**
+
+*The drain budget's formula omits the term that dominates.* §1.1 states
+
+```
+admit(realtime) ⟺ drain_to_suspend + realtime_model_residency_cost ≤ 200 ms
+```
+
+§M3d measurement 2 measured the thing that inequality is supposed to bound:
+**81.4 ms** admission→first RT token, of which **~71 ms is RT's own prefill** and
+only ~10–17 ms is queueing. Prefill appears in neither term. So the inequality as
+written would admit on a budget accounting for ~12% of the observed latency, and
+would keep passing as prefill grew with context length. It is not implementable
+as specified — it needs either a prefill term or a preemptible prefill, and
+`2026-08-22-prefill-lowering.md` argues the second. **Blocked on that decision,
+not on M4.**
+
+*The VRAM test is real and cheaper than expected, but it is a load-path change.*
+The assumption that one model is resident is **wrong**: `DaemonState` carries
+`resident_models: HashMap<String, LoadedModel>` of parked workers, documented as
+"there is no eviction policy" (`state.rs:40-42`). So unbounded residency growth
+is a live hazard, not a hypothetical one, and the test guards something.
+Accounting is available — `gpu.hip.get_vram_info() -> (free, total)`
+(`hip-bridge/src/ffi.rs:1764`), reachable directly off `DaemonState.gpu`, with a
+reserve-subtraction precedent in `vram_ceiling` (`layer_stream.rs:2846`).
+What makes this more than a small patch is that the useful guard **refuses a
+load**, which is a user-visible behaviour change to a path outside the executor.
+Wants a decision before it lands.
+
+*The declared granularity fields stay unbuilt, for the reason this section
+already gives.* `largest_indivisible_unit` and `max_yield_granularity` have no
+consumer until a forward loop can act on them. The yield point now exists —
+`run_layer_program_from(.., start, budget)` — but nothing calls it with a real
+budget, and that caller is M4's. Adding the fields first is the same scaffolding
+this section declined for the four `WorkloadClass` variants.
+
+**Net: M6's remainder is decision-blocked, not effort-blocked.**
+
+**This also unblocks §M3d measurement 2** (admission→first dispatch under load),
+which was previously recorded as unobtainable for want of a realtime class. It
+does not need one — it needs an ordering lever, and there is one.
+
+### M6 — Realtime admission and the stub classes (original)
 
 `SpeechIn`/`SpeechOut`/`VideoIn`/`VideoOut` land as `WorkloadClass` variants with declared
 contracts and a synthetic periodic executor. `WorkloadSpec` gains declared

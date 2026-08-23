@@ -1129,6 +1129,127 @@ struct CalibrateDaemonSession {
     session: hipfire_runtime::calibration::layer_stream::DaemonCalibration,
 }
 
+/// Advance every runnable stream by ONE token, then return.
+///
+/// Executor v2 §M3b1. This is the march loop: serial by design, because the
+/// parallelism in shared-weight decoding is intra-kernel, not across threads.
+/// One quantum per stream per pass is what lets two requests interleave instead
+/// of one draining to completion while the other waits.
+///
+/// Structured to hold at most one borrow of `daemon_state` at a time: the
+/// generation is TAKEN OUT of the table before the model is borrowed, and put
+/// back (or retired) only after the model borrow ends. Holding
+/// `&mut streams` and `&mut model` together does not compile, and working
+/// around that by cloning would copy a live KV handle.
+fn march_streams(daemon_state: &mut state::DaemonState) {
+    if !stream::executor_v2_enabled() {
+        return;
+    }
+    for id in daemon_state.streams.runnable() {
+        let Some((generation, req_id, session)) = daemon_state.streams.get_mut(id).and_then(|s| {
+            s.generation
+                .take()
+                .map(|g| (g, s.request_id.clone(), s.session().as_str().to_string()))
+        }) else {
+            continue;
+        };
+        // `fail` and `finish` both consume the handle, and only one of them runs.
+        // An Option makes that move trackable instead of fighting the borrow
+        // checker across match arms.
+        let mut slot = Some(generation);
+
+        enum Outcome {
+            Stepped,
+            Done,
+            Retired,
+        }
+
+        let outcome = match daemon_state.model.as_mut() {
+            None => Outcome::Retired,
+            Some(m) => {
+                // Per QUANTUM, not per frame: the resident session slot holds one
+                // live KV/DeltaNet, so marching stream B without re-activating
+                // would drive B's tokens into A's cache.
+                // Resume: swap this stream's session into the resident slot and
+                // take it for the quantum. `activate_session` inside saves
+                // whichever stream parked last, which is why park-after-step is
+                // not optional.
+                if slot
+                    .as_mut()
+                    .expect("present")
+                    .resume(m, &mut daemon_state.gpu, &session)
+                    .is_err()
+                {
+                    Outcome::Retired
+                } else {
+                    match m.tokenizer.as_ref() {
+                        None => Outcome::Retired,
+                        Some(_) => {
+                            let tok = m.tokenizer.as_ref().expect("checked above");
+                            let g = slot.as_mut().expect("present until consumed");
+                            match g.step(
+                                m,
+                                &mut daemon_state.gpu,
+                                tok,
+                                &mut daemon_state.out.sink,
+                                &req_id,
+                            ) {
+                                hipfire_serving_core::generate::Qwen35Step::Continue => {
+                                    if slot.as_ref().is_some_and(|g| g.should_continue()) {
+                                        Outcome::Stepped
+                                    } else {
+                                        Outcome::Done
+                                    }
+                                }
+                                hipfire_serving_core::generate::Qwen35Step::Stop => Outcome::Done,
+                                hipfire_serving_core::generate::Qwen35Step::Failed(message) => {
+                                    slot.take().expect("present until consumed").fail(
+                                        m,
+                                        &mut daemon_state.gpu,
+                                        &mut daemon_state.out.sink,
+                                        &req_id,
+                                        &message,
+                                    );
+                                    Outcome::Retired
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Outcome::Stepped => {
+                // Park before yielding to the next stream, so the slot is
+                // populated and the next `activate_session` has something to
+                // save. Without this the second stream dies with "qwen35
+                // session missing decode state".
+                if let (Some(m), Some(g)) = (daemon_state.model.as_mut(), slot.as_mut()) {
+                    let _ = g.park(m, &mut daemon_state.gpu);
+                }
+                if let Some(s) = daemon_state.streams.get_mut(id) {
+                    s.generation = slot.take();
+                }
+            }
+            Outcome::Done => {
+                if let (Some(m), Some(g)) = (daemon_state.model.as_mut(), slot.take()) {
+                    g.finish(
+                        m,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.out.sink,
+                        &req_id,
+                    );
+                }
+                daemon_state.streams.retire(id);
+            }
+            Outcome::Retired => {
+                daemon_state.streams.retire(id);
+            }
+        }
+    }
+}
+
 fn main() {
     // Cooperative generation cancellation: install the SIGUSR1 handler so the
     // HTTP server can abort an in-flight generation (on client disconnect)
@@ -1290,7 +1411,10 @@ fn main() {
     // connections.
     let mut pending = queue::PendingQueue::default();
     loop {
-        if pending.is_empty() {
+        // Block only when there is nothing to run AND nothing to march. With a
+        // live stream mid-generation an unconditional `recv` would park the
+        // executor forever waiting on a client that is waiting on us.
+        if pending.is_empty() && daemon_state.streams.runnable().is_empty() {
             // Nothing in hand: block until something arrives, and stop when every
             // reader has hung up (stdin EOF, or the listener shutting down).
             match inbound.recv() {
@@ -1304,6 +1428,7 @@ fn main() {
             pending.push(frame);
         }
         let Some(frame) = pending.pop_next() else {
+            march_streams(&mut daemon_state);
             continue;
         };
         // Scheduling decisions are otherwise unobservable from outside: replies
@@ -1472,9 +1597,17 @@ fn main() {
                 let admitted = stream::admit_generate(&mut daemon_state, &msg);
                 handlers::generate::text(&mut daemon_state, &msg);
                 if let Some(id) = admitted {
-                    // Retire on the way out, so the table returns to empty. With
-                    // no march loop yet there is nobody to hand the stream to.
-                    daemon_state.streams.retire(id);
+                    // Retire here only on the INLINE path. Under the executor
+                    // flag the handler stashed a generation on this stream and
+                    // the march loop below owns its lifetime; retiring now would
+                    // drop a half-run request on the floor.
+                    let marching = daemon_state
+                        .streams
+                        .get(id)
+                        .is_some_and(|s| s.generation.is_some());
+                    if !marching {
+                        daemon_state.streams.retire(id);
+                    }
                 }
             }
 

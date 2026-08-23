@@ -93,10 +93,20 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
     let session = session_of(msg);
     // priority and enqueued_at_ms are 0 because nothing schedules on them yet;
     // the march loop is what gives them meaning.
+    // Priority comes off the wire. `WorkloadSpec` has carried a `priority` field
+    // all along and admission hardcoded 0, so latency-sensitive work had no way
+    // to say so. Reusing it beats adding realtime `WorkloadClass` variants ahead
+    // of anything that consumes them — §M6 can still add those when the classes
+    // carry contracts, but the ordering lever already exists.
+    let priority = msg
+        .get("priority")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u8::MAX as u64) as u8;
     let spec = WorkloadSpec::singleton(
         session.as_str(),
         WorkloadClass::TokenDecode,
-        0,
+        priority,
         0,
         WorkloadResources::default(),
     );
@@ -111,6 +121,11 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
         Err(AdmitError::SessionAlreadyLive(_)) => return None,
     };
     if let Some(stream) = state.streams.get_mut(id) {
+        stream.request_id = msg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0")
+            .to_string();
         stream.run();
     }
     Some(id)
@@ -273,12 +288,23 @@ impl StreamTable {
     }
 
     /// Ids the march loop may give a quantum to, in admission order.
+    /// Ids the march loop may give a quantum to, **highest priority first**,
+    /// admission order within a priority.
+    ///
+    /// The march loop steps this list in order, so a higher-priority stream is
+    /// dispatched before any lower-priority one in the same pass — which is what
+    /// makes admission→first-dispatch bounded for latency-sensitive work while
+    /// bulk streams keep running. `BTreeMap` iteration is already admission
+    /// order, and `sort_by_key` is stable, so equal priorities keep it.
     pub(crate) fn runnable(&self) -> Vec<StreamId> {
-        self.streams
+        let mut ids: Vec<(u8, StreamId)> = self
+            .streams
             .iter()
             .filter(|(_, s)| s.is_runnable())
-            .map(|(id, _)| *id)
-            .collect()
+            .map(|(id, s)| (s.spec.priority, *id))
+            .collect();
+        ids.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+        ids.into_iter().map(|(_, id)| id).collect()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -345,9 +371,17 @@ pub(crate) enum StreamStatus {
 /// file does not change the behaviour of any existing path. The migration is
 /// §M1d's remaining third, and it needs a place to move the state *to* before it
 /// can move it.
-#[derive(Debug)]
 pub(crate) struct RunningStream {
     pub(crate) id: StreamId,
+    /// The in-flight generation this stream advances, once admitted under the
+    /// executor flag. `None` on the inline path, where `generate` is driven to
+    /// completion inside the request instead.
+    pub(crate) generation: Option<hipfire_serving_core::generate::Qwen35Generation>,
+    /// The request id this stream's frames are tagged with. Stored because the
+    /// march loop emits `token`/`done` long after the frame that created it, and
+    /// `session` is NOT a substitute — they differ whenever a client sends an
+    /// explicit `session_id`.
+    pub(crate) request_id: String,
     /// The wire identity this stream was admitted for. Immutable: rebinding a
     /// live stream to a different session would silently redirect its KV and
     /// conversation state, so a session change is a new stream, not a mutation.
@@ -379,6 +413,21 @@ pub(crate) struct RunningStream {
     pub(crate) steer: Option<SteerSpec>,
 }
 
+impl std::fmt::Debug for RunningStream {
+    /// Hand-written because `Qwen35Generation` is not `Debug` and should not be
+    /// made so just to satisfy a derive here — the same reasoning the plan gives
+    /// for not adding a derive in `transport.rs`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningStream")
+            .field("id", &self.id)
+            .field("session", &self.session)
+            .field("status", &self.status)
+            .field("cursor", &self.cursor)
+            .field("generation", &self.generation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunningStream {
     /// Admit a stream. Starts at cursor zero in `Admitted`.
     ///
@@ -394,6 +443,8 @@ impl RunningStream {
             id,
             session,
             spec,
+            generation: None,
+            request_id: String::new(),
             cursor: StreamCursor::default(),
             status: StreamStatus::Admitted,
             rng,

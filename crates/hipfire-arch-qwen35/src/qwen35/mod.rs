@@ -86,6 +86,21 @@ use decode_layers::*;
 mod prefill_chunk;
 use prefill_chunk::*;
 
+// origin/master's M2a prefill-lowering refactor (4061 lines) landed here while
+// this branch had rewritten the SAME prefill body for compact Opus / W4A4. The
+// merge kept THIS branch's `prefill_chunk` body, because origin's lowered
+// version has zero OqCompactG256 handling and dropping ours would have removed
+// batched compact prefill entirely (the 313 tok/s serving path).
+//
+// The module is kept compiled but unused so the refactor is not silently lost
+// and stays mergeable. Integrating it = re-applying the compact/W4A4 arms on top
+// of run_layer_program. Tracked in
+// docs/experiments/2026-08-23-merge-origin-prefill-lowering.md.
+#[allow(dead_code, unused_imports)]
+mod prefill_lowered;
+#[allow(unused_imports)]
+use prefill_lowered::*;
+
 mod prefill_batch;
 pub use prefill_batch::*;
 
