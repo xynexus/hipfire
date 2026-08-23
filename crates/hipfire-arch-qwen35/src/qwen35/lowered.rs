@@ -659,9 +659,6 @@ pub(crate) fn forward_lowered_enabled() -> bool {
 /// boundaries, so "on" is the previous behaviour re-sequenced by
 /// `run_layer_program` rather than a new numeric path. `=0` restores the direct
 /// in-order calls, which is the rollback if the executor itself misbehaves.
-// Consumed only by origin/master's M2a prefill_lowered path, which this
-// branch keeps compiled-but-unused (see qwen35/mod.rs).
-#[allow(dead_code)]
 pub(crate) fn prefill_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("HIPFIRE_PREFILL_LOWERED").ok().as_deref() != Some("0"))
@@ -673,9 +670,6 @@ pub(crate) fn prefill_lowered_enabled() -> bool {
 /// inputs. `decode_layers.rs:76-92` records why that matters: an earlier version
 /// there chose its message from one predicate and announced "lowered path" while
 /// the hand arms ran, in exactly the configuration the flag exists to compare.
-// Consumed only by origin/master's M2a prefill_lowered path, which this
-// branch keeps compiled-but-unused (see qwen35/mod.rs).
-#[allow(dead_code)]
 pub(crate) fn prefill_backend_trace_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {

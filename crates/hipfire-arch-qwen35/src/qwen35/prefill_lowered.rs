@@ -103,6 +103,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
@@ -257,6 +258,23 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.wq.k,
                 n,
             )?;
+                } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.wq.m,
+                        layer.wq.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.wq, &pbs.fa_q_full_batch),
+                        (&layer.wk, &pbs.fa_k_batch),
+                        (&layer.wv, &pbs.fa_v_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
         } else if qkv_is_oq8 && qkv_same_dtype {
             // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
             // off the shared FWHT-rotated activation.
@@ -265,7 +283,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     && matches!(layer.wv.gpu_dtype, DType::Oq8G256),
                 "FA qkv Oq8 dispatch requires all of wq/wk/wv to be Oq8G256",
             );
-            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
             for (w, y) in [
                 (&layer.wq, &pbs.fa_q_full_batch),
                 (&layer.wk, &pbs.fa_k_batch),
@@ -1324,57 +1342,65 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 )?;
             }
         }
-        let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-        let plan = KvTierPlan::derive(KvTierInputs {
-            quant_asym4: kv_cache.quant_asym4,
-            quant_asym3: kv_cache.quant_asym3,
-            quant_asym2: kv_cache.quant_asym2,
-            quant_q8: kv_cache.quant_q8,
-            quant_fwht: kv_cache.quant_fwht,
-            quant_hfq4: false,
-            quant_q4: false,
-            v_mode_bits: 0,
-            pos: start_pos,
-            flash_mode: s.flash_mode as usize,
-            capture_mode: gpu.capture_mode,
-            batch_size: n,
-            is_tree,
-            // TODO: boundary producer not yet populated. Matches the
-            // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
-            // `vec![]` at every KvCache constructor and never filled, so
-            // `KvCache::is_boundary()` is always false. Threading it here
-            // would be a no-op AND would imply boundary layers work.
-            // Wire all three sites together when the producer lands.
-            is_boundary: false,
-        })
-        .map_err(|e| HipError::new(0, &e.to_string()))?;
-        let io = AttnParams {
-            q: &pbs.fa_q_batch,
-            k: &pbs.fa_k_batch,
-            v: &pbs.fa_v_batch,
-            k_cache: &kv_cache.k_gpu[layer_idx],
-            v_cache: &kv_cache.v_gpu[layer_idx],
-            k_scales: None,
-            v_scales: None,
-            pos_buf: &s.pos_buf,
-            pos: start_pos,
-            positions: Some(&pbs.positions),
-            n_heads: config.n_heads,
-            n_kv_heads: config.n_kv_heads,
-            head_dim: config.head_dim,
-            physical_cap: kv_cache.physical_cap,
-            batch_size: n,
-            max_ctx_len,
-            flash_partials: Some(&s.flash_partials),
-            givens_cos: kv_cache.givens_cos.as_ref(),
-            givens_sin: kv_cache.givens_sin.as_ref(),
-            tree_bias,
-            block_start,
-            block_cols,
-            output: &pbs.fa_attn_out_batch,
-        };
-        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+        // KVarN already did the fused write + causal flash in step 6
+        // (`kvarn_attend`), and KvTierPlan has no KVarN tier -- it would fall
+        // through to the F32 fallback, which has no batched write, and resolve
+        // as `no implementation for KvWriteF32`. Skip. Pairs with admitting
+        // quant_kvarn into `fa_kv_ok`; admitting it without this guard is
+        // exactly how that error reappears.
+        if !kv_cache.quant_kvarn {
+            let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+            let plan = KvTierPlan::derive(KvTierInputs {
+                quant_asym4: kv_cache.quant_asym4,
+                quant_asym3: kv_cache.quant_asym3,
+                quant_asym2: kv_cache.quant_asym2,
+                quant_q8: kv_cache.quant_q8,
+                quant_fwht: kv_cache.quant_fwht,
+                quant_hfq4: false,
+                quant_q4: false,
+                v_mode_bits: 0,
+                pos: start_pos,
+                flash_mode: s.flash_mode as usize,
+                capture_mode: gpu.capture_mode,
+                batch_size: n,
+                is_tree,
+                // TODO: boundary producer not yet populated. Matches the
+                // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
+                // `vec![]` at every KvCache constructor and never filled, so
+                // `KvCache::is_boundary()` is always false. Threading it here
+                // would be a no-op AND would imply boundary layers work.
+                // Wire all three sites together when the producer lands.
+                is_boundary: false,
+            })
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &pbs.fa_q_batch,
+                k: &pbs.fa_k_batch,
+                v: &pbs.fa_v_batch,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &s.pos_buf,
+                pos: start_pos,
+                positions: Some(&pbs.positions),
+                n_heads: config.n_heads,
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: n,
+                max_ctx_len,
+                flash_partials: Some(&s.flash_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias,
+                block_start,
+                block_cols,
+                output: &pbs.fa_attn_out_batch,
+            };
+            execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+        }
 
         qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         if let Some(tape) = gdn_tape.as_ref() {
@@ -1419,6 +1445,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -1455,6 +1482,19 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.wo.k,
                 n,
             )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
+                    )?;
         } else if fa_wo_is_oq8 {
             // Opus W8A8: fa_wo_input is FWHT-rotated above.
             gpu.gemm_oq8_grouped_residual_act_batched(
@@ -1626,6 +1666,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
@@ -1676,9 +1717,25 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.w_gate.k,
                 n,
             )?;
+                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
         } else if fa_ffn_is_oq8 {
             // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
-            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -1880,6 +1937,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
@@ -1916,6 +1974,19 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.w_down.k,
                 n,
             )?;
+                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                        bs,
+                    )?;
         } else if fa_w_down_is_oq8 {
             // Opus W8A8: ffn_hidden_batch is FWHT-rotated above.
             gpu.gemm_oq8_grouped_residual_act_batched(
@@ -2244,6 +2315,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
@@ -2562,7 +2634,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
             // projection. Each shares the same int8 activation quantize
             // via the batched scratch, so the redundancy is the quantize
             // launch, not a re-read of x.
-            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
             for (w, y) in [
                 (&layer.wqkv, &pbs.dn_qkv_batch),
                 (&layer.wz, &pbs.dn_z_batch),
@@ -2612,6 +2684,34 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wqkv.k,
                 n,
             )?;
+                } else if matches!(layer.wqkv.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: the SAME W8A8 math as the oq8 arm
+                    // above, decoding OqPlusCompact blocks in-kernel.
+                    //
+                    // Without this arm compact fell through to the final `else`,
+                    // which hard-codes `FusedQkvzaHfq4G256` — so a 136-byte
+                    // [f16 scale][128 nibbles][3x(u8 idx, i8 val)] block was read
+                    // as an HFQ4G256 block. Two layouts sharing no field, and no
+                    // error: just wrong numbers. That is what made compact's
+                    // BATCHED prefill unusable, which is why the batched
+                    // spec-decode verify had to exclude compact entirely and why
+                    // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
+                    // Measured: 48 fall-throughs in a 16-token spec run.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.wqkv.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.wqkv, &pbs.dn_qkv_batch),
+                        (&layer.wz, &pbs.dn_z_batch),
+                        (&layer.w_beta, &pbs.dn_beta_batch),
+                        (&layer.w_alpha, &pbs.dn_alpha_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
         } else {
             run_fused_qkvza_key(
                 gpu,
@@ -3074,6 +3174,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -3121,6 +3222,19 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wo.k,
                 n,
             )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus o_proj: identical W8A8 math to the oq8
+                    // arm below, decoding the OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
+                    )?;
         } else if wo_is_oq8 {
             // Opus W8A8 o_proj: grouped int8-WMMA GEMM into scratch +
             // residual add (no fused oq8 residual kernel), mirroring the
@@ -3338,6 +3452,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
@@ -3544,11 +3659,27 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.w_gate.k,
                 n,
             )?;
+                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
         } else if ffn_is_oq8 {
             // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
             // same buffers the fused kernel writes; downstream silu_mul
             // is unchanged.
-            gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -3715,6 +3846,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // weights are rotated offline too. Omitting it here fed the
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
+                | DType::OqCompactG256
         );
         let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
@@ -3773,6 +3905,19 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.w_down.k,
                 n,
             )?;
+                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                        bs,
+                    )?;
         } else if w_down_is_oq8 {
             // Opus W8A8 down: grouped int8-WMMA GEMM + residual add.
             gpu.gemm_oq8_grouped_residual_act_batched(
