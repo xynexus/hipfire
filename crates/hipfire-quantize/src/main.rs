@@ -6170,16 +6170,76 @@ fn run_hfq_source_pipeline(
             let (src_bytes, src_dtype, src_shape) = archive
                 .tensor_bytes(shard, &t.name)
                 .map_err(|e| format!("read {} from --tensor-source: {e}", t.name))?;
-            let src_qt = match src_dtype.as_str() {
-                "BF16" => QuantType::BF16,
-                "F16" => QuantType::F16,
-                "F32" => QuantType::F32,
-                other => {
-                    return Err(format!(
-                        "--tensor-source {} has dtype {other}; only BF16/F16/F32 sources quantize",
-                        t.name
-                    ))
+            // DeepSeek V4 and MiniMax-M2 ship FP8 natively, so the .hfa holds
+            // E4M3 bytes plus a sibling scale — the safetensors reader already
+            // dequantizes that pair, but this path used to refuse it, which made
+            // `--tensor-source` useless for exactly the models whose attention
+            // tensors need re-encoding.
+            let (src_bytes, src_qt) = if src_dtype == "F8_E4M3" || src_dtype == "I8" {
+                let stem = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+                let mut pair = None;
+                for cand in [format!("{stem}.scale"), format!("{stem}.weight_scale_inv")] {
+                    if let Some(sh) = index.get(&cand) {
+                        let got = archive
+                            .tensor_bytes(sh, &cand)
+                            .map_err(|e| format!("read scale {cand} from --tensor-source: {e}"))?;
+                        pair = Some((cand, got));
+                        break;
+                    }
                 }
+                let (sname, (sbytes, sdtype, sshape)) = pair.ok_or_else(|| {
+                    format!(
+                        "--tensor-source {} is {src_dtype} but neither {stem}.scale nor \
+                         {stem}.weight_scale_inv is present to dequantize it",
+                        t.name
+                    )
+                })?;
+                let f32s = match sdtype.as_str() {
+                    "F8_E8M0" | "UE8M0" | "I8" => {
+                        dequantize_e4m3_ue8m0_to_f32(&src_bytes, &src_shape, &sbytes, &sshape)
+                    }
+                    "F32" => {
+                        dequantize_e4m3_f32scale_to_f32(&src_bytes, &src_shape, &sbytes, &sshape)
+                    }
+                    other => {
+                        return Err(format!(
+                        "--tensor-source scale {sname} has dtype {other}; expected F8_E8M0 or F32"
+                    ))
+                    }
+                };
+                if hipfire_env::FP8_SRC_STATS.flag() {
+                    let n = f32s.len().max(1);
+                    let (mn, mx) = f32s
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+                    let mean = f32s.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
+                    let absmean = f32s.iter().map(|v| v.abs() as f64).sum::<f64>() / n as f64;
+                    let zeros = f32s.iter().filter(|v| **v == 0.0).count();
+                    let nans = f32s.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!(
+                        "[fp8-src] {} shape={:?} scale={} min={mn:.5} max={mx:.5} mean={mean:.6} \
+                         absmean={absmean:.6} zeros={zeros}/{n} nonfinite={nans}",
+                        t.name, src_shape, sname
+                    );
+                }
+                let mut raw = Vec::with_capacity(f32s.len() * 4);
+                for v in &f32s {
+                    raw.extend_from_slice(&v.to_le_bytes());
+                }
+                (raw, QuantType::F32)
+            } else {
+                let qt = match src_dtype.as_str() {
+                    "BF16" => QuantType::BF16,
+                    "F16" => QuantType::F16,
+                    "F32" => QuantType::F32,
+                    other => {
+                        return Err(format!(
+                            "--tensor-source {} has dtype {other}; only BF16/F16/F32/F8_E4M3 sources quantize",
+                            t.name
+                        ))
+                    }
+                };
+                (src_bytes, qt)
             };
             let shape_u32: Vec<u32> = src_shape.iter().map(|d| *d as u32).collect();
             let (data, qt, group_size, label) = quantize_hfq_source_tensor(

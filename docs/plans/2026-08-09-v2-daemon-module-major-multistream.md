@@ -1216,6 +1216,68 @@ M0 trace:
 3. **Bulk throughput, loaded versus solo — ≥ 0.6×.** Without this, (2) is trivially
    satisfiable by refusing to run the bulk job.
 
+**M3d measurement 3 — MEASURED 2026-08-23, PASSES.** nix1/gfx1103,
+Qwen3.6-35B-A3B--oq4, kvarn, `HIPFIRE_DAEMON_EXECUTOR=v2`. Bulk = 96 tokens,
+realtime = 32 tokens at `priority: 9`. Per-stream `tok_s` read off each `done`
+frame, three reps:
+
+| rep | bulk solo | bulk loaded | ratio | realtime |
+|---|---|---|---|---|
+| 1 | 18.400 | 13.300 | **0.723** | 9.200 |
+| 2 | 18.600 | 13.300 | **0.715** | 9.200 |
+| 3 | 18.600 | 13.300 | **0.715** | 9.200 |
+
+Comfortably above the **0.6x** floor, and reproducible to three decimal places —
+so priority admission is not buying realtime latency by starving bulk.
+
+Read the exit's wording carefully before quoting this number: it specifies **one**
+realtime stream and one bulk stream. A first attempt used FOUR realtime streams
+and got 7.100 tok/s loaded, a ratio of 0.386 — a clear "fail" against a criterion
+it was not measuring. That figure is worth keeping as the scaling datapoint it
+actually is (bulk keeps ~39% against 4x priority-9 competition), but it is not
+measurement 3.
+
+**M3d measurement 2 — NOT obtainable from the trace as it stands. Measured
+2026-08-23.** This plan says measurements 2 and 3 "are obtainable today", and
+§M6 adds that measurement 2 "does not need [a realtime class] — it needs an
+ordering lever, and there is one". Both are wrong, for two independent reasons
+that a trace dump makes plain:
+
+- **Admission is not stream-attributed.** Every `dispatch_begin` and
+  `dispatch_end` record carries `stream: None`; only `token_emitted` carries a
+  real id. So the generate frame's dispatch — which IS the admission — cannot be
+  tied to the stream it admitted.
+- **No per-quantum event exists.** `TraceEvent` has no variant the march loop
+  emits when it hands a stream a quantum, so "first dispatch" has nothing to
+  anchor to even if admission were attributed.
+
+Measurement 2 therefore needs instrumentation before it needs a run: stream-scope
+the generate frame's `DispatchBegin` (or add an `Admitted` variant), and add a
+per-quantum event. That is a small change, but it is a change — not a
+measurement someone forgot to take.
+
+**A sampling trap worth recording, because it produced a confident wrong
+reading.** Under executor v2 a `generate` frame only ADMITS a stream; the march
+loop runs only once the pending queue is empty (`pop_next() -> None`). So an
+`executor_trace` frame sent in the same stdin batch is serviced BEFORE a single
+token exists, and reports `token_count: 0` with no stream ids. Under v1, where
+generate executes inline during frame dispatch, the identical request order
+reports all 128 tokens. Comparing the two naively says "the v2 executor records
+no tokens" — a serious-sounding defect that does not exist. Moving the request
+after `unload` (which drains the streams) gives the true v2 picture:
+
+    record_count=142  token_count=128
+    events={dispatch_begin: 5, vram_sample: 5, dispatch_end: 4, token_emitted: 128}
+    inter_token_gap p50 45.68 ms / p99 47.71 ms / max 50.67 ms
+
+For a MID-run snapshot, `--listen` works where stdin cannot: the frame loop
+services one pending frame per iteration and marches only when none remain
+(`main.rs`), so a socket client's request is handled between march rounds.
+
+Still outstanding for M3d: measurement 1 (p99/max module duration and which
+`SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
+dimension.
+
 *Breaks:* everything that assumed a forward runs to completion. `hipGraph` capture is one
 indivisible quantum by construction — **off on the v2 path** until its WCET is declared,
 since a declared WCET that ignores an enabled graph is exactly the failure the contract
@@ -1299,6 +1361,178 @@ non-`RoutedExpert` module kinds (M5c).
 *Exit:* run a model whose expert set is 3× the pager budget to completion, greedy,
 byte-identical to the same model run pinned. *Falsified by* any token difference, or by
 VRAM growth — which would mean M1a regressed.
+
+**Paged-expert bring-up on DeepSeek-V4-Flash, measured 2026-08-22/23 (nix1,
+gfx1103, 43008 MiB).** Artifact:
+`/srv/hipfire/staging/DeepSeek-V4-Flash-w13--attnq8.oq4.hfq` (85.3 GB) — experts
+oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
+`HIPFIRE_DEEPSEEK4_PAGED_EXPERTS=1` registers 11008 routed expert modules and the
+82.8 GB predecessor loads in 58 s on a 43 GB device. Three findings:
+
+1. **The fused MoE entry test asked for the wrong thing.** It gated on
+   `expert_gate_up_blob`, which paging deliberately does not upload, so every
+   paged layer fell into a fallback that no longer exists. Fixed by gating on the
+   ptr tables the dispatch actually reads.
+2. **Expert admission is incompatible with HIP graph capture.** The residency
+   hook does a blocking D2H inside the captured region and dispatch fails with
+   "would make the legacy stream depend on a capturing blocking stream".
+   Admission is a host decision; it has to be resolved *before* capture, not
+   inside it. With `HIPFIRE_DEEPSEEK4_GRAPH=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0`
+   decode runs to completion with no error — and emits degenerate output
+   (BOS x13). **That degeneracy is NOT a pager defect.** Traced with
+   `HIPFIRE_DEEPSEEK4_DUMP_STATE`, it originates in PREFILL at layer 0, before any
+   expert is touched: `hc_compute_control_batched` turns finite HC streams
+   (absmean 0.000439) and finite `hc_fn` into an all-NaN control vector for
+   exactly the 9 real token rows (`hc_c` nan=216 = 9 x 24), while the zero padding
+   rows come out clean. NaN then propagates to the router scores, and a top-k over
+   NaN fails every comparison and returns index 0 six times — which is why the
+   pager admitted exactly one expert, expert 0, on every layer. Fix that kernel
+   before drawing any conclusion about paged decode correctness.
+
+   Four hypotheses were tested and rejected on the way: a stream-ordering race on
+   the residency D2H (adding `device_synchronize` changed nothing), a tensor-view
+   offset (`GpuTensor` has no offset field), the FP8->Q8_F16 attention re-encode
+   (`layers.0.attn.wo_a.weight` dequantizes to min=-0.23438 max=0.25000
+   absmean=0.020271, 0 non-finite), and zero embeddings feeding a norm (the 9 real
+   embedding rows are healthy; it is the zero rows that survive).
+
+   **Fixed 2026-08-23.** The eight HC globals were uploaded with
+   `upload_global_raw` (bytes verbatim) while all three HC kernels declare their
+   weight parameters `const __half*`. DeepSeek-V4-Flash stores them F32, so the
+   bytes were reinterpreted as pairs of halves — and since a 16-bit word lands on
+   the all-ones exponent about 1 time in 32, a 16384-wide dot product escapes NaN
+   with probability ~(31/32)^8192. `upload_global_as_f16` now converts.
+   `hc_head_scale` is excluded: it is host-read into an f32 field and passed by
+   value. Every NaN in the chain above is gone (`hc_c` nan=216 -> 0, absmean
+   0.637; `hc_x_in` nan=36864 -> 0; `l3_end_streams` nan=147456 -> 0).
+
+   **With that fixed, paged expert routing works.** Same artifact, same box:
+   1342 admissions across 254 distinct experts (was 40 admissions, expert 0
+   only), per-layer top-k indices varied (`l3=[154,185,13,140,80,159]`,
+   `l42=[151,55,232,160,198,240]`), scores probability-shaped and weights
+   descending (`[0.613,0.444,0.348,0.275,0.274,0.246]`). Layers 0-3 are
+   numerically healthy (end_streams absmean 1.32 -> 1.85, max ~20, no NaN), and
+   generation runs to a natural EOS.
+
+   **The remaining mojibake is expected, not a defect.** The artifact's routed
+   experts are `qt=19` = MQ2G256Lloyd — 2-bit — even though it was built with
+   `--format oq4`. That is deliberate: `hipfire-quantize` routes DeepSeek V4
+   per-expert tensors "through the MQ2-Lloyd path for every DeepSeek-specialized
+   format, including OQ dense formats", because the deepseek4 routed-MoE kernels
+   are MQ2-Lloyd-specific and an OQ4 expert payload would be raw-concatenated and
+   then read through the wrong kernel family. `--format oq4` therefore applies to
+   attention, shared experts and head (all `qt=34`) but never to routed experts.
+   MQ2's documented failure mode in this repo is precisely mojibake — the
+   `HIPFIRE_ALLOW_MQ2` gate exists because "the uniform 4-level codebook collapses
+   at every model size validated locally". A 2-bit routed-expert MoE producing
+   incoherent text is the format behaving as characterised, not the executor
+   misbehaving.
+
+   The Q8_F16 attention re-encode is also cleared on reasoning rather than
+   measurement: MQ4/HFQ4 weights are STORED FWHT-rotated, which is why that arm
+   feeds the rotated activation buffer; Q8 weights come from plain FP8 source, so
+   the plain buffer is the correct pairing. There was never an Oq4 arm for `wo_a`
+   at all — that is the error the re-encode was done to clear.
+
+   **This does not block M5's exit.** The exit is a PARITY test — paged output
+   byte-identical to pinned output — not a quality test. Mojibake is admissible
+   evidence so long as it is the same mojibake. Coherent output would need routed
+   experts above 2 bits, which needs a deepseek4 routed-MoE kernel family that
+   speaks a wider format — a separate piece of work from the executor.
+
+## M5 exit — RUN, root-caused, FIXED, and PASSING (2026-08-23, nix1)
+
+**Result: the exit passes.** Output is byte-identical across a 4.3x swing in
+eviction pressure and a 6x swing in budget:
+
+| arm | budget | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| reference | 24 GB | 4474 | 1084 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 3x oversubscribed | 8 GB | 5846 | 4716 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 6x oversubscribed | 4 GB | — | — | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+The 8 GB arm reproduces exactly on a repeat run. Touched set is ~23 GB, so 8 GB
+is ~3x oversubscribed as the exit requires.
+
+**Root cause of the first, falsified attempt: PREFILL COULD NOT ADMIT EXPERTS.**
+`MoeBiasAwarePrefillParams` had no `expert_residency` field at all — the decode
+twin has had one since the pager landed. So a paged model dispatched its entire
+prompt pass against whatever the device pointer table happened to hold: entries
+only for experts some *earlier decode* had admitted, and null for everything
+else, since eviction nulls slots. Output therefore depended on eviction history,
+which is exactly what the first A/B measured. The field, a union-over-rows
+admission in `run_moe_prefill_bias_aware` (prefill routes B tokens
+independently, so the set is up to B x k_top and needs dedup), and the wiring in
+deepseek4's `ffn_batched` close it.
+
+Two consequences worth keeping:
+
+- The fix is confirmed by an OOM, not just by parity. With prefill admitting its
+  real working set, `PinAll` now exhausts VRAM at layer 15
+  (`hipMalloc 6.75 MiB, free=18.8 MiB of 43008`). Before the fix it fitted only
+  because prefill silently used a fraction of the experts it needed. The pinned
+  reference is genuinely unavailable for this model on a 43 GB box — the
+  large-budget LazyLru arm stands in for it.
+- Of the two pre-fix arms, the `PinAll` one (16 tokens, `88570cc71755...`) was
+  the WRONG one. Every corrected run at every budget agrees on
+  `552280dbd78c...`, the value the pre-fix LazyLru arm happened to produce.
+
+### The falsified first attempt, and the hypotheses it cost
+
+An earlier note here claimed the exit needed halo because 85.3 GB does not fit
+pinned in 43 GB. **That was wrong**, and it cost a milestone. `ResidencyPolicy`
+already names the reference: `PinAll` IS "pinned" (§M5 Phase 1 — "PinAll is a
+name not a sentinel"), and it runs on this box. So both arms of the parity test
+are executable here:
+
+| arm | policy | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| A (reference) | `PinAll` | 3859 | 0 | 16 | `88570cc71755cfbf07171689d5183f8a` |
+| B | `LazyLru` 9.1 GB | 5725 | 4440 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+Working set is 3859 x 7077888 B = 27.3 GB, so a 9.1 GB budget makes the touched
+expert set exactly **3x the pager budget**, which is what the exit asks for. The
+budget is respected (9088008192 bytes, 1284 modules resident) and eviction really
+runs (4440 evictions).
+
+**This attempt was falsified: the outputs differed.** Both arms were individually
+reproducible — A twice at `88570cc7...`/16 tokens, B twice at `552280db...`/22
+tokens — so this is systematic, not noise. Per the exit's own wording, this is
+reported rather than tuned around.
+
+Three eviction-path hypotheses tested and REJECTED, so they are not retried:
+
+- *`patch_expert_ptr_table` is never called.* True — it has zero call sites — but
+  it is a superseded pull-based API. Admission publishes through
+  `write_expert_ptr_slot` ("push hook 1 of 3"), so the table is maintained.
+- *Eviction leaves a stale pointer.* It does not; "push hook 2 of 3" nulls the
+  slot BEFORE freeing the buffer, deliberately, with the reasoning in-line.
+- *A selection evicts its own experts.* `ensure_resident` admits k_top one at a
+  time with nothing pinning the earlier ones, so admitting expert 6 could evict
+  expert 1 and null its live slot. Instrumented with a post-admission residency
+  assertion: **0 hits** over the whole run. Newly admitted modules sit at the LRU
+  back, so with 1284 resident the current six are never the eviction candidates.
+  The assertion is kept as a cheap guard.
+
+Two further suspects were then checked and cleared before the real cause turned
+up: dropping `_handle` from `transport.fetch` (the transport is synchronous and
+`TransferHandle` is an explicit forward-compat no-op) and a short
+`copy_len < len` leaving an uninitialised tail in a recycled pool buffer
+(`read_into_staging` returns `(rel, len)` and errors on short reads).
+
+The clue that broke it open was per-prompt: with two prompts, e0 was IDENTICAL
+across arms and only e1 diverged — pointing at table state carried between
+requests rather than at the expert data itself.
+3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
+   "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
+   layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
+   reference on this box, so the A/B needs either halo (128 GB / ~120 GB GTT,
+   where 85.3 GB fits pinned) or a smaller MoE whose pinned form fits in 43 GB.
+   Pick one before treating M5 as measurable here.
+
+Also landed for this: `--tensor-source` now accepts FP8 E4M3 archives, without
+which the attention repair was impossible — DeepSeek ships FP8, and the surgical
+re-encode path refused every tensor in the .hfa.
 
 ### M6 — priority admission landed 2026-08-22; classes still to come
 
@@ -1386,6 +1620,47 @@ resumes from its cursor with output byte-identical to an uninterrupted run.
 N ∈ {1, 4, 16, 64, 128}, and the crossover N at which module-major beats layer-major on the
 same box. *Falsified if* there is no crossover below the N whose KV fits in VRAM — in which
 case report it rather than tune around it.
+
+**Measured 2026-08-22 (nix1, gfx1103, Qwen3.6-35B-A3B--oq4, kvarn, max_seq 1024).**
+`HIPFIRE_DAEMON_EXECUTOR=v2` + `HIPFIRE_DAEMON_EXECUTOR_BATCHED=1`, one fused
+`forward_prefill_grouped_moe_session_batch` per march over all runnable streams.
+Decode-only throughput (wall minus a separately measured 32.3 s load), two reps:
+
+| N | round-robin tok/s | batched tok/s | ratio |
+|---|---|---|---|
+| 2  | 26.95 / 22.32 | 19.46 / 22.91 | ~1.0 (noise) |
+| 4  | 20.83 / 21.21 | 22.26 / 26.13 | 1.15x |
+| 8  | 13.51 / 12.12 | 23.04 / 24.18 | 1.84x |
+| 16 | 10.53 / 8.05  | 14.57 / 11.40 | 1.40x |
+| 32 | 5.79 / 5.12   | 7.45 / 7.63   | 1.38x |
+| 64 | 5.08 / 5.24   | 7.58 / 7.59   | 1.47x |
+
+**Crossover N is ~4**, well below the N whose KV fits in VRAM (N=64 ran
+comfortably), so the capacity thesis is **not falsified**. Round-robin falls off
+steeply with N (26.95 -> 5.08 tok/s) while batched stays roughly flat above N=8
+(23-24 tok/s at N=8, 7.6 at N=64) — the batch is absorbing the per-stream cost
+the round-robin march pays serially.
+
+Two measurement traps worth recording, because both produced a *plausible*
+number:
+
+- The N=4 entry in a first sweep showed batched LOSING (15.8 vs 17.6 tok/s).
+  That sweep used 16-token streams, where decode is ~3.5 s against a ~32 s load;
+  load-time variance alone is +/-60% at that scale. Re-measured with 96-token
+  streams the sign flips. Do not measure this at small N with short streams.
+- Batched output is bit-deterministic (identical md5 across reps at every N) and
+  byte-identical to round-robin at N<=16 with short streams, but diverges from
+  round-robin in 4/16 streams at 96 tokens and at N>=32. The divergent
+  continuations are coherent near-tie swaps, and both modes are individually
+  reproducible, which is consistent with float non-associativity in the batched
+  GEMM amplified by autoregressive feedback rather than state corruption —
+  *consistent with*, not proven. Bit-exact parity with sequential decode is not
+  an M7 exit criterion, but it is not established either.
+
+`HIPFIRE_BATCH_PROBE=1` reports the row count from inside the fused arm. Use it:
+three separate defects in this path each produced byte-identical output while
+the fused arm never ran, ran on half the tokens, or crashed after emitting a
+plausible prefix (see the commits on `m7-batch-driver`).
 
 ### M8 — Training onto the same substrate
 

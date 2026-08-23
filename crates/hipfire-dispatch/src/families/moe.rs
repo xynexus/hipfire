@@ -456,6 +456,18 @@ pub struct MoeBiasAwareParams<'a> {
     pub rot_batch: &'a GpuTensor,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
     pub down_expanded: &'a GpuTensor,
+    /// Layer index, needed only to name the layer to `ExpertResidency`.
+    pub layer_idx: usize,
+    /// Paged-expert residency, mirroring `MoeParams::expert_residency`.
+    ///
+    /// The bias-aware path carried the pointer TABLES but not this hook, so an
+    /// arch decoding through it (deepseek4, top-6) could not use the pager at
+    /// all and had to upload every expert resident. That is what makes an
+    /// 82.8 GB artifact die at layer 19 of 43 on a 43 GB device.
+    ///
+    /// `None` on a fully-resident model — every caller today — and the dispatch
+    /// is then byte-identical to before.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
 }
 
 // ── DeepSeek-V4 batched/prefill MoE parameters ─────────
@@ -492,6 +504,13 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub route_scale: f32,
     pub swiglu_limit: f32,
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
+    /// Paged-expert residency, mirroring `MoeBiasAwareParams::expert_residency`.
+    ///
+    /// PREFILL needs this as much as decode does. Without it the prefill pass
+    /// dispatches against whatever the device pointer table happens to hold —
+    /// null for every expert no earlier decode admitted, and eviction NULLS
+    /// slots, so a paged model silently prefills against missing experts.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
     // routing
     pub routing: MoePrefillRouting<'a>,
     pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]

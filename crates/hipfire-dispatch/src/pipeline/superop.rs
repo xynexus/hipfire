@@ -537,15 +537,86 @@ pub fn run_layer_program<B: ForwardBindings>(
     program: &LayerProgram,
     bindings: &mut B,
 ) -> Result<(), DispatchError> {
-    for op in program {
+    run_layer_program_from(gpu, ctx, program, bindings, 0, usize::MAX).map(|_| ())
+}
+
+/// The half-open op range one quantum covers, clamped to the program.
+///
+/// Split out as a pure function purely so it is testable: a `ForwardBindings`
+/// mock would need a real `Gpu`, so the dispatch loop itself cannot be unit
+/// tested, but the bounds arithmetic is where an off-by-one would silently skip
+/// or repeat a super-op.
+fn quantum_range(len: usize, start: usize, budget: usize) -> (usize, usize) {
+    let begin = start.min(len);
+    let end = begin.saturating_add(budget).min(len);
+    (begin, end)
+}
+
+/// Run at most `budget` super-ops of `program`, starting at `start`, and return
+/// the index to resume from. A return equal to `program.len()` means the program
+/// finished.
+///
+/// **This is the yield point module-major execution needs.** Until now
+/// `run_layer_program` was an unconditional `for op in program`, with no way to
+/// stop between ops — which is why §M3's suspension is per-token rather than
+/// per-module, why §M6's drain budget cannot be honoured mid-forward, and why
+/// `StreamCursor::module` has had no producer since it landed.
+///
+/// It changes nothing on its own: `run_layer_program` passes `usize::MAX`, so
+/// every existing caller runs the whole program in one call exactly as before.
+/// What it adds is the *option* of stopping.
+///
+/// On error the position is lost, which matches every current caller — a failed
+/// dispatch retires the stream rather than resuming it. Return the partial index
+/// too if that ever stops being true.
+pub fn run_layer_program_from<B: ForwardBindings>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    program: &LayerProgram,
+    bindings: &mut B,
+    start: usize,
+    budget: usize,
+) -> Result<usize, DispatchError> {
+    let (begin, end) = quantum_range(program.len(), start, budget);
+    for op in &program[begin..end] {
         dispatch_super_op(gpu, ctx, op, bindings)?;
     }
-    Ok(())
+    Ok(end)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arithmetic behind the module-major yield point. An off-by-one here
+    /// silently skips or repeats a super-op, which is a wrong forward with no
+    /// error — the accept-and-miscompute class.
+    #[test]
+    fn quantum_range_clamps_and_advances_without_gaps_or_overlap() {
+        // whole program in one quantum: what every existing caller does
+        assert_eq!(quantum_range(5, 0, usize::MAX), (0, 5));
+        // budget smaller than the program
+        assert_eq!(quantum_range(5, 0, 2), (0, 2));
+        assert_eq!(quantum_range(5, 2, 2), (2, 4));
+        assert_eq!(quantum_range(5, 4, 2), (4, 5), "clamps at the end");
+        // resuming exactly at the end is a finished program, not a panic
+        assert_eq!(quantum_range(5, 5, 2), (5, 5));
+        // start past the end is clamped, not a slice panic
+        assert_eq!(quantum_range(5, 9, 2), (5, 5));
+        // saturating: start + budget must not wrap
+        assert_eq!(quantum_range(5, 3, usize::MAX), (3, 5));
+        // zero budget makes no progress rather than running one op
+        assert_eq!(quantum_range(5, 1, 0), (1, 1));
+        // walking a program in quanta covers every index exactly once
+        let mut seen = Vec::new();
+        let mut i = 0;
+        while i < 5 {
+            let (b, e) = quantum_range(5, i, 2);
+            seen.extend(b..e);
+            i = e;
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
 
     fn fk() -> KernelKey {
         KernelKey::FusedQkvHfq4G256
