@@ -1742,6 +1742,11 @@ enum MoeDecodeIndexedRoutedPath {
     ParoQ4G128,
     Oq4,
     Oq8,
+    /// Routed experts kept at ~4.25 bits/weight resident, read by the
+    /// `gemv_oq_compact_moe_*` GEMVs. Distinct from `Oq8` because that path is
+    /// the SAME weights unpacked to one int8 each at load -- 1.80x more bytes,
+    /// compounding with the driver's 2 MiB GTT rounding into 3.5x.
+    OqCompact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1762,6 +1767,7 @@ struct MoeDecodeDispatchFlags {
     routed_dtype_indexable_paro: bool,
     routed_dtype_indexable_oq4: bool,
     routed_dtype_indexable_oq8: bool,
+    routed_dtype_indexable_oq_compact: bool,
     routed_path: MoeDecodeIndexedRoutedPath,
     use_gpu_topk: bool,
     needs_x_rot_local: bool,
@@ -1807,12 +1813,21 @@ fn moe_decode_dispatch_flags_for_dtypes(
     let routed_oq8 = dtypes.expert_down == DType::Oq8G256 && dtypes.expert_down_uniform;
     let routed_gate_up_oq8 =
         dtypes.expert_gate_up == DType::Oq8G256 && dtypes.expert_gate_up_uniform;
+    // Compact-resident routed experts. Same indexed dispatch as the OQ4/OQ8 arms
+    // and the same uniformity requirement; what differs is only that the bytes
+    // were never expanded at load.
+    let routed_oq_compact =
+        dtypes.expert_down == DType::OqCompactG256 && dtypes.expert_down_uniform;
+    let routed_gate_up_oq_compact =
+        dtypes.expert_gate_up == DType::OqCompactG256 && dtypes.expert_gate_up_uniform;
     let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
     let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
     let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
     let routed_dtype_indexable_oq4 = oq_indexed_decode && routed_oq4 && routed_gate_up_oq4;
     let routed_dtype_indexable_oq8 = oq_indexed_decode && routed_oq8 && routed_gate_up_oq8;
+    let routed_dtype_indexable_oq_compact =
+        oq_indexed_decode && routed_oq_compact && routed_gate_up_oq_compact;
     let routed_path = if routed_dtype_indexable_mq4 {
         MoeDecodeIndexedRoutedPath::Mq4
     } else if routed_dtype_indexable_mq6 {
@@ -1825,6 +1840,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
         MoeDecodeIndexedRoutedPath::Oq4
     } else if routed_dtype_indexable_oq8 {
         MoeDecodeIndexedRoutedPath::Oq8
+    } else if routed_dtype_indexable_oq_compact {
+        MoeDecodeIndexedRoutedPath::OqCompact
     } else {
         MoeDecodeIndexedRoutedPath::None
     };
@@ -1837,6 +1854,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
         || routed_gate_up_paro
         || routed_dtype_indexable_oq4
         || routed_dtype_indexable_oq8
+        || routed_dtype_indexable_oq_compact
         || dtypes.routed_profile.is_mixed();
     MoeDecodeDispatchFlags {
         gate_side_mq4,
@@ -1855,6 +1873,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
         routed_dtype_indexable_paro,
         routed_dtype_indexable_oq4,
         routed_dtype_indexable_oq8,
+        routed_dtype_indexable_oq_compact,
         routed_path,
         use_gpu_topk,
         needs_x_rot_local,

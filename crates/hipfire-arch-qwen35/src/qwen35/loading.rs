@@ -6481,6 +6481,24 @@ fn load_moe_expert(
     {
         return load_weight_tensor(hfq, gpu, slabs, name, m, k);
     }
+    // COMPACT-RESIDENT ROUTED EXPERTS. `load_weight_tensor` routes OqPlusCompact
+    // through `oq8_arch_load`, which keeps the split compact planes and tags them
+    // `OqCompactG256` -- read by the `gemv_oq_compact_moe_*` GEMVs and by
+    // `gemm_oq_compact_moe_grouped_wmma`. Without this the arm below unpacks the
+    // same weights to one int8 each, 1.80x the bytes, on the tensor class that
+    // dominates a MoE model.
+    //
+    // Gated on the SAME switch dense tensors use, not a second one: if the two
+    // could disagree, a model would carry compact dense weights and expanded
+    // experts with nothing naming the inconsistency. When the switch is off we
+    // must NOT fall through to `load_weight_tensor` either -- for a routed expert
+    // that yields the DENSE combined Oq8 layout, which the indexed kernels do not
+    // read; the expansion below produces the indexed MoE BLOCK layout they do.
+    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
+        && hipfire_runtime::oq8_arch::compact_resident_enabled()
+    {
+        return load_weight_tensor(hfq, gpu, slabs, name, m, k);
+    }
     let (dtype, blocks) = match qt {
         Some(OQ4_CANONICAL_QT) => {
             let (_info, data) = qwen35_tensor_data_vec(hfq, name)

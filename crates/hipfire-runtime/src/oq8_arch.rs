@@ -428,7 +428,12 @@ fn dim_selected(var: &hipfire_env::EnvVar, value: usize) -> bool {
 /// escape hatch: a call site with no compact arm REFUSES loudly (see the
 /// OqCompactG256 guards in qwen35), so an unwired path fails visibly rather than
 /// corrupting, and unsetting is the documented workaround.
-fn compact_resident_enabled() -> bool {
+/// Whether OqPlusCompact tensors stay compact on the device.
+///
+/// Public because routed MoE experts consult it too (`load_moe_expert`), and
+/// they must make the SAME choice as dense tensors from the SAME switch -- a
+/// second env var for experts would let the two disagree silently.
+pub fn compact_resident_enabled() -> bool {
     !matches!(
         hipfire_env::OQ_COMPACT_RESIDENT
             .get()

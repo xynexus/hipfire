@@ -80,10 +80,26 @@ pub(crate) struct MoeScratchRef<'a> {
     bucket_y_down: &'a GpuTensor,
 }
 
+/// Compact block stride (`130 + 2*N_out`) recovered from a resident expert
+/// tensor's byte length.
+///
+/// The compact GEMVs need it to place the side plane, and it is NOT a constant:
+/// N_out is a quantizer choice per artifact. Deriving it from the bytes rather
+/// than threading a field through the layout keeps it impossible for the two to
+/// disagree -- a stale field would silently read the neighbouring group's scale.
+///
+/// Returns 0 when there is nothing to derive it from (paged residency, where
+/// `experts` is empty); callers must not take the compact path then.
+fn compact_block_stride(bytes: usize, m: usize, k: usize) -> usize {
+    let groups = m * (k / 256);
+    if groups == 0 { 0 } else { bytes / groups }
+}
+
 impl<'a> MoeScratchRef<'a> {
     /// View into a Qwen35Scratch's MoE fields. Panics if the caller didn't
     /// allocate MoE scratch (config.num_experts == 0).
-    pub(crate) fn from_scratch(s: &'a Qwen35Scratch) -> Self {
+    
+pub(crate) fn from_scratch(s: &'a Qwen35Scratch) -> Self {
         Self {
             router_logits: s
                 .moe_router_logits
@@ -829,6 +845,7 @@ pub(crate) fn moe_ffn_decode_impl(
             routed_dtype_indexable_paro: false,
             routed_dtype_indexable_oq4: false,
             routed_dtype_indexable_oq8: false,
+            routed_dtype_indexable_oq_compact: false,
             routed_path: MoeDecodeIndexedRoutedPath::None,
             use_gpu_topk: false,
             needs_x_rot_local: gate_side_mq4,
@@ -845,6 +862,7 @@ pub(crate) fn moe_ffn_decode_impl(
     let routed_dtype_indexable_paro = dispatch_flags.routed_dtype_indexable_paro;
     let routed_dtype_indexable_oq4 = dispatch_flags.routed_dtype_indexable_oq4;
     let routed_dtype_indexable_oq8 = dispatch_flags.routed_dtype_indexable_oq8;
+    let routed_dtype_indexable_oq_compact = dispatch_flags.routed_dtype_indexable_oq_compact;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -1469,7 +1487,10 @@ pub(crate) fn moe_ffn_decode_impl(
                 gate_up_k,
                 k,
             )?;
-        } else if routed_dtype_indexable_oq4 || routed_dtype_indexable_oq8 {
+        } else if routed_dtype_indexable_oq4
+            || routed_dtype_indexable_oq8
+            || routed_dtype_indexable_oq_compact
+        {
             // Opus Quant indexed gate_up (OQ4 132 B/group, OQ8 260 B/group from
             // OqPlusCompact-expanded experts).
             //
@@ -1493,6 +1514,47 @@ pub(crate) fn moe_ffn_decode_impl(
             // Resident decode is a single token, so use the single-token
             // kernel; paged decode keeps the batched layout because its top-k
             // buffer is [N x K_TOP].
+            if routed_dtype_indexable_oq_compact {
+                // Compact-resident experts: same dispatch, same x contract; the
+                // weights simply were never expanded to int8 at load.
+                let bs = ffn
+                    .experts
+                    .first()
+                    .map(|e| compact_block_stride(e.gate_up.buf.buf.size(), 2 * mi, gate_up_k))
+                    .unwrap_or(0);
+                assert!(
+                    bs >= 132,
+                    "compact routed gate_up needs resident experts to derive block_stride \
+                     (got {bs}); paged + indexed compact is not wired"
+                );
+                if ffn.experts.is_empty() {
+                    gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        k,
+                        1,
+                        true,
+                        bs,
+                    )?;
+                } else {
+                    gpu.gemv_oq_compact_moe_gate_up_k8_indexed(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        true,
+                        bs,
+                    )?;
+                }
+            } else {
             match (routed_dtype_indexable_oq4, ffn.experts.is_empty()) {
                 (true, true) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
@@ -1538,6 +1600,7 @@ pub(crate) fn moe_ffn_decode_impl(
                     gate_up_k,
                     true,
                 )?,
+            }
             }
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
@@ -1671,6 +1734,27 @@ pub(crate) fn moe_ffn_decode_impl(
                 down_k,
                 k,
                 1,
+            )?;
+        } else if routed_dtype_indexable_oq_compact {
+            let bs = ffn
+                .experts
+                .first()
+                .map(|e| compact_block_stride(e.down.buf.buf.size(), down_m, down_k))
+                .unwrap_or(0);
+            assert!(
+                bs >= 132,
+                "compact routed down needs resident experts to derive block_stride (got {bs})"
+            );
+            gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs,
+                s.topk_indices,
+                s.rot_batch,
+                s.down_expanded,
+                down_m,
+                down_k,
+                k,
+                1,
+                bs,
             )?;
         } else {
             // routed_dtype_indexable_paro
