@@ -1326,6 +1326,34 @@ that arrives while ANOTHER stream is mid-prefill waits out that prefill — up t
 window, because there is no quantum boundary to pause at. Prefill lowering is
 what shrinks it.
 
+**The mid-prefill arrival case, measured over `--listen` (2026-08-23).** Every
+earlier number here was taken over the stdin protocol, which drains every frame
+before the march runs — so a realtime request could never arrive *while* a bulk
+prefill was in flight, and that is the case the 200 ms contract is actually
+about. `--listen` can express it: a second connection injects the request 2 s
+into a bulk prefill.
+
+Client-observed send -> first token for the priority-9 request, two reps:
+
+| config | client TTFT | trace admission -> first token |
+|---|---|---|
+| today (both flags off) | **8516.7 / 8505.5 ms** | 454.0 / 451.5 ms |
+| `MARCH_PREFILL` + `STRICT_PRIORITY`, band 16 | **575.2 / 571.0 ms** | 489.1 / 487.1 ms |
+
+**14.8x**, and the contract goes from missed by 42x to missed by ~2.9x.
+
+The two columns are the finding. With the flags off they disagree by ~8 seconds:
+the trace says 454 ms because ADMISSION ITSELF was delayed — the realtime frame
+sat unread in the channel while the bulk prefill occupied the frame handler, and
+`Admitted` is only recorded once the daemon gets to it. A metric anchored at
+admission cannot see a queue it never entered. With the flags on the two columns
+close to within ~86 ms, because prefill runs in the march and the frame loop
+regains control between bands.
+
+So `admission_to_first_quantum_ns` is the right instrument for scheduling INSIDE
+the executor and the wrong one for end-to-end latency; the client stopwatch is
+the honest number for the contract. Both are reported above deliberately.
+
 Still outstanding for M3d: measurement 1 (p99/max module duration and which
 `SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
 dimension.
