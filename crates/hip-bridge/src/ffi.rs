@@ -869,6 +869,9 @@ impl HipRuntime {
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
+        if code == 0 {
+            alloc_stats::record(size);
+        }
         // Attach the requested size. A bare "hipMalloc: out of memory" cannot
         // distinguish a sizing bug (an absurd request) from genuine pressure or a
         // pool-placement problem, and this allocator is the only place the size
@@ -1886,3 +1889,68 @@ unsafe impl Send for Graph {}
 /// Executable (instantiated) graph ready for replay.
 pub struct GraphExec(HipGraphExec);
 unsafe impl Send for GraphExec {}
+
+/// Device-allocation accounting for `HIPFIRE_ALLOC_REPORT=1`.
+///
+/// Lives at `hipMalloc` rather than in `GpuPool` because the pool is NOT the
+/// choke point: a 35B MoE load routes only 2.04 GiB of scratch through
+/// `alloc_tensor` while consuming 63 GiB, so a pool-level histogram measures
+/// the wrong layer entirely. Every device byte passes through here.
+///
+/// Off by default -- the Mutex is not something to take per allocation for a
+/// diagnostic nobody is reading.
+pub mod alloc_stats {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("HIPFIRE_ALLOC_REPORT").as_deref() == Ok("1"))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn hist() -> &'static Mutex<(usize, HashMap<usize, (usize, usize)>)> {
+        static H: OnceLock<Mutex<(usize, HashMap<usize, (usize, usize)>)>> = OnceLock::new();
+        H.get_or_init(|| Mutex::new((0, HashMap::new())))
+    }
+
+    /// Record one successful device allocation of `size` bytes.
+    pub fn record(size: usize) {
+        if !enabled() {
+            return;
+        }
+        if let Ok(mut h) = hist().lock() {
+            h.0 += size;
+            let e = h.1.entry(size).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += size;
+        }
+    }
+
+    /// Breakdown of device allocations, largest aggregate first.
+    pub fn report(top_n: usize) -> String {
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        let Ok(h) = hist().lock() else {
+            return "alloc report: lock poisoned".to_string();
+        };
+        let mut rows: Vec<(usize, usize, usize)> =
+            h.1.iter().map(|(s, (c, b))| (*b, *s, *c)).collect();
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let n_calls: usize = rows.iter().map(|r| r.2).sum();
+        let mut out = format!(
+            "hipMalloc: {:.2} GiB across {} allocations, {} distinct sizes",
+            gib(h.0),
+            n_calls,
+            rows.len()
+        );
+        for (bytes, size, count) in rows.into_iter().take(top_n) {
+            out.push_str(&format!(
+                "\n  {:>8.2} GiB  {:>8} x {:>12} B",
+                gib(bytes),
+                count,
+                size
+            ));
+        }
+        out
+    }
+}

@@ -24,6 +24,7 @@ pub use error::{
     HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
+pub use ffi::alloc_stats;
 pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, ImportedBuffer,

@@ -2123,6 +2123,12 @@ impl Gpu {
 
     // ── Tensor allocation ───────────────────────────────────────
 
+    /// Device-allocation breakdown for `HIPFIRE_ALLOC_REPORT=1`. See
+    /// [`hip_bridge::alloc_stats`].
+    pub fn alloc_report(&self, top_n: usize) -> String {
+        hip_bridge::alloc_stats::report(top_n)
+    }
+
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let numel: usize = shape.iter().product();

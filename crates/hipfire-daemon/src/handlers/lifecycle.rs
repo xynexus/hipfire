@@ -580,6 +580,11 @@ pub(crate) fn load(
     // Explicit, so progress stops at exactly the point the old `set_sink(None)`
     // stopped it rather than at end of scope.
     drop(progress_guard);
+    // Printed for FAILED loads too -- an allocation breakdown is most wanted
+    // exactly when the load ran out of memory.
+    if std::env::var("HIPFIRE_ALLOC_REPORT").as_deref() == Ok("1") {
+        eprintln!("{}", daemon_state.gpu.alloc_report(12));
+    }
     match load_result {
         Ok(mut m) => {
             daemon_state

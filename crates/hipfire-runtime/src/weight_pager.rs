@@ -839,6 +839,58 @@ fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
     })
 }
 
+/// Round a device allocation to what it actually costs in GTT.
+///
+/// MEASURED on gfx1151 (`examples/gtt_granularity`), not assumed: hipMalloc
+/// rounds a GTT allocation up to a multiple of 2 MiB once it crosses 2 MiB, and
+/// to a 1 MiB granule below that. 5 MiB costs 6, 9 MiB costs 10, and -- the case
+/// that matters -- a routed-expert tensor of 2,129,920 B (2 MiB + 32 KiB) costs
+/// a full 4 MiB, a 1.969x tax.
+///
+/// Every OQ routed-expert tensor lands a hair over a power of two, because the
+/// 260-byte block carries a 4-byte scale on top of 256 payload bytes. So the
+/// tax applies to essentially all of them: a 35B MoE load requested 33.58 GiB
+/// from hipMalloc and consumed 63.10 GiB of GTT.
+pub fn gtt_alloc_cost(bytes: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    if bytes == 0 {
+        return 0;
+    }
+    let granule = if bytes > 2 * MIB { 2 * MIB } else { MIB };
+    bytes.div_ceil(granule) * granule
+}
+
+/// Estimated resident device bytes for an artifact's routed-expert modules, and
+/// what those same modules occupy on disk.
+///
+/// Returns `(resident, on_disk)` so a caller can price the whole artifact as
+/// `file_len - on_disk + resident`. The two differ for two compounding reasons,
+/// both measured:
+///
+/// 1. `OqPlusCompact` routed experts are EXPANDED to `Oq8G256` on load
+///    (`load_moe_expert`), 4.25 bits/weight becoming 8.125 -- 1.80x.
+/// 2. Each expert tensor is its own allocation, so each pays the GTT rounding
+///    above -- another 1.88x.
+///
+/// Together that is why a 17.93 GiB MoE artifact consumes 63 GiB, and why the
+/// 122B (63.9 GiB) does not fit in 124 GiB of unified memory.
+///
+/// Unreadable or unrecognized modules fall back to their disk length rather
+/// than erroring: this feeds an admission estimate, and refusing to load
+/// because a size could not be predicted is worse than predicting it low.
+pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
+    let mut resident = 0u64;
+    let mut on_disk = 0u64;
+    for module in hfq.modules() {
+        on_disk += module.data_size as u64;
+        for tensor in &module.tensors {
+            let len = module_tensor_resident_len(tensor).unwrap_or(tensor.data_size);
+            resident += gtt_alloc_cost(len) as u64;
+        }
+    }
+    (resident, on_disk)
+}
+
 fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerError> {
     if !module_requires_host_repack(module) {
         // Still validate unsupported transformed storage before accepting its
@@ -1363,7 +1415,9 @@ impl WeightPager {
             .module_catalog
             .iter()
             .filter(|(key, _)| key.layer == layer)
-            .map(|(_, module)| module_resident_len(module).map(|size| size as u64))
+            .map(|(_, module)| {
+                module_resident_len(module).map(|size| gtt_alloc_cost(size) as u64)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let need: u64 = sizes.iter().take(k).sum();
@@ -1401,7 +1455,13 @@ impl WeightPager {
             .catalog
             .get(&id)
             .ok_or(WeightPagerError::NotRegistered(id))?;
-        let need = range.len as u64;
+        // What the DRIVER will take, not what we asked for. Charging the raw
+        // length under-counts by up to 1.969x (see `gtt_alloc_cost`), and it
+        // under-counts hardest on exactly the budget-constrained runs paging
+        // exists to serve -- the pager would sit "correctly" at an 8 GiB budget
+        // while holding ~15 GiB of GTT. That is the already-documented 122B
+        // failure mode below: accounting at budget, RSS at zero, GTT climbing.
+        let need = gtt_alloc_cost(range.len) as u64;
         // Hard cap: a single weight that exceeds `vram_budget_bytes` can't
         // fit no matter how much we evict. Reject up front rather than
         // dutifully draining the residency map and then fetching anyway —
@@ -1463,7 +1523,11 @@ impl WeightPager {
             .get(&key)
             .cloned()
             .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
-        let need = module_resident_len(&module)? as u64;
+        // One allocation per module (gate_up + down contiguous), so the GTT
+        // rounding applies once to the whole module rather than per tensor --
+        // which is why module paging is cheaper than the per-tensor resident
+        // path even before eviction.
+        let need = gtt_alloc_cost(module_resident_len(&module)?) as u64;
         self.would_fit(need)?;
         if self
             .config
@@ -2496,5 +2560,41 @@ mod tests {
         // Default is u64::MAX; even u64::MAX - 1 fits.
         assert!(pager.would_fit(u64::MAX - 1).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod gtt_cost_tests {
+    use super::gtt_alloc_cost;
+
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn exact_power_of_two_sizes_pay_exactly() {
+        assert_eq!(gtt_alloc_cost(MIB), MIB);
+        assert_eq!(gtt_alloc_cost(2 * MIB), 2 * MIB);
+        assert_eq!(gtt_alloc_cost(6 * MIB), 6 * MIB);
+    }
+
+    #[test]
+    fn routed_expert_sizes_pay_the_measured_tax() {
+        // The two sizes a 35B-A3B load actually requests, and the GTT the
+        // gtt_granularity probe measured for them.
+        assert_eq!(gtt_alloc_cost(1_064_960), 2 * MIB);
+        assert_eq!(gtt_alloc_cost(2_129_920), 4 * MIB);
+    }
+
+    #[test]
+    fn rounds_to_two_mib_not_to_a_power_of_two() {
+        // 5 MiB measured at 6 MiB, not 8: the granule is 2 MiB, not the next
+        // power of two. 9 MiB measured at 10.
+        assert_eq!(gtt_alloc_cost(5 * MIB), 6 * MIB);
+        assert_eq!(gtt_alloc_cost(9 * MIB), 10 * MIB);
+        assert_eq!(gtt_alloc_cost(3 * MIB), 4 * MIB);
+    }
+
+    #[test]
+    fn zero_is_free() {
+        assert_eq!(gtt_alloc_cost(0), 0);
     }
 }

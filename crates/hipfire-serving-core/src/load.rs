@@ -687,8 +687,8 @@ fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), 
     }
     let gib = |b: u64| b as f64 / (1 << 30) as f64;
     Err(format!(
-        "refusing to load: artifact is {:.1} GiB and only {:.1} GiB is available \
-         (MemAvailable), leaving no room for the {:.1} GiB system reserve. \
+        "refusing to load: this model needs about {:.1} GiB resident and only {:.1} GiB is \
+         available (MemAvailable), leaving no room for the {:.1} GiB system reserve. \
          This machine has unified memory -- GPU allocations come out of the same \
          pool as everything else, so overcommitting here does not fail the loader, \
          it invokes the OOM killer on whatever else is running. \
@@ -710,11 +710,18 @@ fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), 
 /// itself was not even the first victim, which is exactly why the loader has to
 /// be the one to refuse.
 ///
-/// The artifact's on-disk size is the estimate. It is approximate in both
-/// directions -- it omits the KV cache and scratch (which the reserve absorbs),
-/// and it over-counts when `paged_experts` is on and most experts stay on host
-/// -- so this is a guard against the catastrophic case, not a precise admission
-/// test. Anything unreadable (no `/proc`, no `stat`) skips the check: never
+/// The estimate is NOT the artifact's on-disk size. That was the first version
+/// of this guard and it was wrong by 3.5x on exactly the models that need it:
+/// it admitted the 122B, which then exhausted GTT at layer 35 of 48. Routed MoE
+/// experts cost far more resident than stored, for two compounding reasons that
+/// [`estimated_module_resident_bytes`] prices -- a compact-to-Oq8 expansion on
+/// load, and the driver's 2 MiB GTT rounding applied per expert tensor.
+///
+/// Still approximate: it omits the KV cache and scratch (the reserve absorbs
+/// those, ~6 GiB measured across three models) and over-counts when
+/// `paged_experts` is on and most experts stay on host. A guard against the
+/// catastrophic case, not a precise admission test. Anything unreadable (no
+/// `/proc`, no `stat`, an index that will not parse) skips the check: never
 /// block a load because a diagnostic could not be read.
 fn check_load_headroom(path: &str) -> Result<(), String> {
     if std::env::var("HIPFIRE_LOAD_MEM_CHECK").as_deref() == Ok("0") {
@@ -726,12 +733,25 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
     let Some(available) = mem_available_bytes() else {
         return Ok(());
     };
+    // Price the routed-expert modules at what they will actually occupy, and the
+    // rest of the file at its disk size. An artifact with no module table (any
+    // dense model) leaves this equal to the file length, which the dense
+    // measurements support: 1.37x on a 27B, where the excess is the fixed
+    // overhead the reserve already covers.
+    let need = match HfqFile::open_index_only(Path::new(path)) {
+        Ok(index) => {
+            let (resident, on_disk) =
+                hipfire_runtime::weight_pager::estimated_module_resident_bytes(&index);
+            meta.len().saturating_sub(on_disk).saturating_add(resident)
+        }
+        Err(_) => meta.len(),
+    };
     let reserve = std::env::var("HIPFIRE_LOAD_MEM_RESERVE_GIB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|gib| gib << 30)
         .unwrap_or(LOAD_MEM_RESERVE_BYTES);
-    load_headroom_verdict(meta.len(), available, reserve)
+    load_headroom_verdict(need, available, reserve)
 }
 
 #[cfg(test)]
