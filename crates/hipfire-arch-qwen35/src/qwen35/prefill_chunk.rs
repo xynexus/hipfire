@@ -1054,6 +1054,24 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         path2_shape.gate_up_source_rows,
                         0,
                     )?,
+                    // Compact-resident Opus routed experts. 4.25 bits/weight against
+                    // Oq8's 8.06 -- 1.90x less weight traffic on the axis that binds
+                    // for routed MoE. block_stride comes from the expert's own blocks;
+                    // the kernel derives side_stride and n_ov from it and applies the
+                    // overlay inline, so no expert-indexed correction pass is needed.
+                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_rot_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                        super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
+                    )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_gate_up_ptrs,
                         tile_ids,
@@ -1578,6 +1596,20 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         m_total,
                         path2_shape.down_source_rows,
                         0,
+                    )?,
+                    // Compact routed down. See the gate_up arm.
+                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                        super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].down)?,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_down_ptrs,

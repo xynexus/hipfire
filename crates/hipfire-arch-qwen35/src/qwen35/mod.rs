@@ -2359,6 +2359,9 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // ADMISSION check while no such arm existed -- that is what
         // moe_routed_dispatch_supported_for_dtype is for; keep the two distinct.
         DType::Oq4G256 => arch.starts_with("gfx11"),
+        // Compact routed experts: gemm_oq_compact_moe_grouped_wmma backs both
+        // path-2 arms, so this cannot reach the `other => panic!` fallthrough.
+        DType::OqCompactG256 => arch.starts_with("gfx11"),
         // ⚠️ Oq8G256 grouped is OPT-IN and OFF by default: the kernel is FAST and
         // WRONG. gemm_oq8g256_moe_grouped_wmma + its path-2 arms exist and route
         // (Qwen3.6-35B-A3B 215.0 -> 391.0 tok/s, 1.8x), but the output degenerates

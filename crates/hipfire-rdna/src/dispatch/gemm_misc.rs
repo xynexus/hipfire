@@ -558,6 +558,69 @@ impl Gpu {
         result
     }
 
+    pub fn gemm_oq_compact_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+        // Compact block stride (136 at the shipped N_out=3). The kernel derives
+        // side_stride = stride - 128 and n_ov = (side_stride - 2) / 2 from it.
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_oq_compact_moe_grouped_wmma";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_OQ_COMPACT_MOE_GROUPED_WMMA_SRC,
+            kernel_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+        let expert_ptr = expert_weight_ptrs.buf.as_ptr();
+        let tile_ptr = expert_tile_ids.buf.as_ptr();
+        let sorted_ptr = sorted_slot_index.buf.as_ptr();
+        let y_ptr = y_grouped.buf.as_ptr();
+        let m_value = m as i32;
+        let k_value = k as i32;
+        let row_div_value = x_row_div as i32;
+        let total_value = m_total as i32;
+        let stride_value = block_stride as i32;
+        let row_tiles = m.div_ceil(16) as u32;
+        let slot_tiles = m_total.div_ceil(16) as u32;
+        let bytes = crate::profile::gemv_oq8g256_moe_bytes(m, k, m_total)
+            + x_src_rows * k * 2
+            + m_total * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_kernargs(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![
+                ptr expert_ptr,
+                ptr tile_ptr,
+                ptr sorted_ptr,
+                ptr x_f16_ptr,
+                ptr y_ptr,
+                i32 m_value,
+                i32 k_value,
+                i32 row_div_value,
+                i32 total_value,
+                i32 stride_value
+            ],
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_mq3g256_residual_wmma(
         &mut self,
         a_raw: &GpuTensor,

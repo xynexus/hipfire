@@ -1511,6 +1511,12 @@ pub const GEMM_OQ4G256_MOE_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ8G256_MOE_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq8g256_moe_grouped_wmma.hip");
 
+/// OqPlusCompact grouped MoE GEMM. Split-plane weights (nibble plane, then side
+/// records carrying the f16 scale and the outlier corrections), overlay applied
+/// inline. See `kernels/src/gemm_oq_compact_moe_grouped_wmma.hip`.
+pub const GEMM_OQ_COMPACT_MOE_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_moe_grouped_wmma.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
