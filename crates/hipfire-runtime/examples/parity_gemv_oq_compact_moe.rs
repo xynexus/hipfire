@@ -423,7 +423,7 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
             m = info.shape[0] as usize;
             k = info.shape[1] as usize;
         }
-        compact_flags.push(info.quant_type == QuantType_OQPLUS_COMPACT);
+        compact_flags.push(info.quant_type == OQPLUS_COMPACT_QT);
         raw.push(buf.to_vec());
     }
     let n_compact = compact_flags.iter().filter(|c| **c).count();
@@ -611,7 +611,7 @@ fn decode_logical_oq8_canonical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
     w
 }
 
-const QuantType_OQPLUS_COMPACT: u8 = hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT;
+const OQPLUS_COMPACT_QT: u8 = hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT;
 
 fn main() {
     let mut a = std::env::args().skip(1);
