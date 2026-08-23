@@ -148,7 +148,29 @@ batched path engages, and it is now **default-on**. Serving prefill
 **15.4 -> 313 tok/s (20x)**, TTFT 46.7 s -> 2.3 s. That one line is worth more
 than every kernel change in this plan combined.
 
-**2. W4A4 needs no requantization and is wired.** The 4.25-bit floor constrains
+**2. W4A4 is wired, needs no requantization — and the KLD says it does not earn
+default-on.** Measured against the bf16 twin (Qwen3.6-27B, 8 chunks / 8184
+tokens):
+
+    A4=0 (W4A8)   mean_kld 0.1215   p99 0.3867
+    A4=1 (W4A4)   mean_kld 0.1882   p99 0.5390
+
+**+55% mean KLD, +39% p99, to buy +13% prefill.** Stays opt-in. Two traps
+recorded with it: perplexity IMPROVED under W4A4 (8.78 -> 8.61) while KLD got 55%
+worse -- lower ppl against a corpus is not agreement with the reference, the model
+is confidently DIFFERENT -- and `--quality-max-chunks` defaults to UNBOUNDED,
+which with a bf16 27B reference never terminates (three ~28 min stalls before it
+was bounded). Score future A4 work on KLD.
+
+**Step 3 of this plan is therefore closed as written.** Halving the matrix work
+is still the only 2x available, but the lever is activation CONDITIONING, not the
+kernel and not weight bits -- the two budgets are not fungible (weights are fixed
+on disk under a per-tensor bpw knapsack; activation precision is transient,
+chosen per projection site, and free on disk). The in-tree tool for that is
+SpinQuant-style learned rotations, which are prefill-only, which is exactly where
+this path runs. That is a different project from this plan.
+
+**2b. Original W4A4 note, for the record.** The 4.25-bit floor constrains
 WEIGHTS; W4A4 narrows the ACTIVATION. Weights stay compact 4.25-bit, only the
 activation drops to int4, so the radix-16 pair collapses to one iu4 pass.
 `+13%` through the daemon (301 -> 341 tok/s), all four checkable answers correct
