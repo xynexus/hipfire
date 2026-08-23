@@ -53,6 +53,24 @@ pub(crate) fn executor_v2_enabled() -> bool {
     std::env::var("HIPFIRE_DAEMON_EXECUTOR").is_ok_and(|v| v == "v2")
 }
 
+/// §M7. Step all runnable streams through ONE batched forward instead of one
+/// stream per quantum.
+///
+/// Off by default, and requires the v2 executor. The round-robin march is
+/// correct but does not scale: measured aggregate throughput is flat-to-falling
+/// in N (24.0 -> 22.4 -> 18.4 tok/s at N=1/16/32) because every stream pays its
+/// own full forward. The batched decode path reaches 50.7 tok/s at N=16 on the
+/// same model, which is what this is for.
+pub(crate) fn executor_batched_enabled() -> bool {
+    executor_v2_enabled()
+        && matches!(
+            std::env::var("HIPFIRE_DAEMON_EXECUTOR_BATCHED")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        )
+}
+
 /// The session a `Generate` frame is admitted under.
 ///
 /// Deliberately the SAME fallback `handlers::generate::text` applies — an
