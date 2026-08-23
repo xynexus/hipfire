@@ -500,6 +500,33 @@ pub trait ActivationCapture: Send + Sync {
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
+/// Diagnostic: count and total bytes of `upload_raw` calls, i.e. one bare
+/// `hipMalloc` each with no pooling. Off unless `HIPFIRE_UPLOAD_RAW_CENSUS=1`.
+/// Exists to answer "where did the VRAM go" for §M5 — a per-tensor loader and a
+/// packed one move identical payload but differ enormously in buffer-object
+/// count, and only the count explains an OOM at 11.6 GiB of payload.
+pub static UPLOAD_RAW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static UPLOAD_RAW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn upload_raw_census(len: usize) {
+    // Resolved once: this is called per weight tensor, ~20k times on a 256-expert
+    // load, and an env read each time is pure waste.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("HIPFIRE_UPLOAD_RAW_CENSUS").as_deref() == Ok("1")) {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = UPLOAD_RAW_COUNT.fetch_add(1, Relaxed) + 1;
+    let b = UPLOAD_RAW_BYTES.fetch_add(len as u64, Relaxed) + len as u64;
+    // Log on a coarse ladder so the trace stays readable across 20k calls.
+    if n % 2048 == 0 {
+        eprintln!(
+            "[upload_raw census] calls={n} bytes={:.2} GiB",
+            b as f64 / (1u64 << 30) as f64
+        );
+    }
+}
+
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
@@ -2198,6 +2225,7 @@ impl Gpu {
     /// `docs/plans/2026-08-20-v2-prerequisites-autonomous.md`.
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
+        upload_raw_census(data.len());
         let buf = self.hip.malloc(data.len())?;
         self.hip.memcpy_htod(&buf, data)?;
         Ok(GpuTensor {
