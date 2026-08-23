@@ -6207,7 +6207,7 @@ fn run_hfq_source_pipeline(
                         ))
                     }
                 };
-                if std::env::var("HIPFIRE_FP8_SRC_STATS").is_ok() {
+                if hipfire_env::FP8_SRC_STATS.flag() {
                     let n = f32s.len().max(1);
                     let (mn, mx) = f32s.iter().fold((f32::MAX, f32::MIN), |(a, b), v| {
                         (a.min(*v), b.max(*v))
