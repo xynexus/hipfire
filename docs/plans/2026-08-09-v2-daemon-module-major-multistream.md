@@ -1317,7 +1317,22 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    Admission is a host decision; it has to be resolved *before* capture, not
    inside it. With `HIPFIRE_DEEPSEEK4_GRAPH=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0`
    decode runs to completion with no error — and emits degenerate output
-   (BOS x13), so paged decode executes but is not yet correct.
+   (BOS x13). **That degeneracy is NOT a pager defect.** Traced with
+   `HIPFIRE_DEEPSEEK4_DUMP_STATE`, it originates in PREFILL at layer 0, before any
+   expert is touched: `hc_compute_control_batched` turns finite HC streams
+   (absmean 0.000439) and finite `hc_fn` into an all-NaN control vector for
+   exactly the 9 real token rows (`hc_c` nan=216 = 9 x 24), while the zero padding
+   rows come out clean. NaN then propagates to the router scores, and a top-k over
+   NaN fails every comparison and returns index 0 six times — which is why the
+   pager admitted exactly one expert, expert 0, on every layer. Fix that kernel
+   before drawing any conclusion about paged decode correctness.
+
+   Four hypotheses were tested and rejected on the way: a stream-ordering race on
+   the residency D2H (adding `device_synchronize` changed nothing), a tensor-view
+   offset (`GpuTensor` has no offset field), the FP8->Q8_F16 attention re-encode
+   (`layers.0.attn.wo_a.weight` dequantizes to min=-0.23438 max=0.25000
+   absmean=0.020271, 0 non-finite), and zero embeddings feeding a norm (the 9 real
+   embedding rows are healthy; it is the zero rows that survive).
 3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
    "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
    layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
