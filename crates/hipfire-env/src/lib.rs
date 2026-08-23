@@ -376,6 +376,13 @@ env_vars! {
         "Fraction of tensors placed in the high tier by the tiered MQ router. \
          `--tier-ratio` wins over this. Default 0.30.";
 
+    FP8_SRC_STATS = "HIPFIRE_FP8_SRC_STATS", Developer,
+        "Set 1 to print min/max/mean/absmean/zero/non-finite statistics for each \
+         tensor dequantized from an FP8 E4M3 `--tensor-source` archive. Diagnostic \
+         for `--tensor-format` repairs of natively-FP8 models (DeepSeek V4, \
+         MiniMax-M2), where a wrong scale pairing yields plausible bytes but \
+         garbage weights.";
+
     // ── Quantizer: research-format opt-in gates (hipfire-quantize) ──────────
     ALLOW_MQ2 = "HIPFIRE_ALLOW_MQ2", Developer,
         "Set 1 to allow `--format mq2`, equivalent to `--allow-mq2`. Gated \
