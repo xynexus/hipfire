@@ -254,7 +254,7 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
         arch,
         qwen35::qwen35_kvarn_fused_batch_enabled(),
     )
-        .map_err(|e| format!("qwen35 grouped-MoE decode unsupported model contract: {e}"))?;
+    .map_err(|e| format!("qwen35 grouped-MoE decode unsupported model contract: {e}"))?;
     Ok(())
 }
 
@@ -633,7 +633,11 @@ pub fn run_generate_batch_decode_step_qwen35(
         {
             Ok(()) => backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
             Err(reason) => {
-                if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE").ok().as_deref() == Some("1") {
+                if std::env::var("HIPFIRE_DECODE_BACKEND_TRACE")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
                     eprintln!("  [decode] fused dense declined: {reason}");
                 }
             }
