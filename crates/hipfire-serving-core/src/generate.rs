@@ -3677,20 +3677,36 @@ pub fn generate_start(
                     }
                 }
             }
+            // DEFAULT-ON since the coherence battery (2026-08-23). The guard below
+            // used to require HIPFIRE_KVARN_BATCHED_PREFILL=1; it now takes the
+            // per-token path only when explicitly asked with =0.
+            //
+            // Note the flag is deliberately NOT symmetric with the spec-decode
+            // gate above (`kvarn_specdecode_ok`), which still requires an
+            // explicit =1. Engaging a DFlash drafter under KVarN measured 5.77
+            // tok/s against plain decode's 14.4 -- 2.5x SLOWER, because verify
+            // runs per-token. Flipping both together would have quietly
+            // regressed every drafter user. So:
+            //
+            //   unset -> batched prefill, drafter OFF   (new default)
+            //   =1    -> batched prefill, drafter ON    (unchanged opt-in)
+            //   =0    -> per-token prefill, drafter OFF (full rollback)
             if kv.quant_kvarn
                 && std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
                     .ok()
                     .as_deref()
-                    != Some("1")
+                    == Some("0")
             {
-                // KVarN (and the deferred-hierarchical two-tier cache built on it)
-                // require the per-token attention dispatch (kv_cache_attention_dispatch):
-                // the batched forward_prefill_batch runs its own batched attention and
-                // never populates the KVarN window/records (nor the hier hot ring), so
-                // the prompt KV is wrong and decode degenerates. Prefill per-token via
-                // forward_scratch — the same path decode already uses below, and the one
-                // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
-                // kvarn is a KV-memory mode, not a throughput one.
+                // Historical reason for this path, kept because it explains the shape:
+                // KVarN was said to require the per-token attention dispatch, since the
+                // batched forward never populated the KVarN window/records and the
+                // prompt KV came out wrong. That stopped being true when
+                // prefill_chunk.rs took over the batched KVarN write, and the remaining
+                // batched/per-token divergence closed with 8ea5a303e (attend each
+                // segment BEFORE flushing it). Battery 2026-08-23, 150 greedy tokens,
+                // batched vs per-token: BYTE-IDENTICAL on every model where the batched
+                // path engages (qwen3.5-2b/4b bf16, Qwen3.5/3.6/3.8-27B oq4.25++), with
+                // prefill 15-21 -> 308-1573 tok/s. Reachable with =0 for rollback.
                 // Only the LAST prompt token's logits are ever read; the rest
                 // are discarded. On Qwen3.8-27B the lm_head is 675 MB at
                 // oq4.25 (vocab 248320 x 5120) = ~2.9 ms per call, so running

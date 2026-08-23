@@ -64,7 +64,13 @@ landed AFTER the guard commit and is the only change to `kvarn_attend` since.
 The guard commit had observed "wording differs because batched and per-token
 export measurably different hidden states"; that divergence is now gone.
 
-## What remains before flipping the default
+## RESOLVED 2026-08-23 — default flipped
+
+The battery ran; see
+`docs/experiments/2026-08-23-kvarn-batched-prefill-battery.md`. Batched is now the
+default, with `=0` for rollback. What follows was the open list at the time.
+
+## What remained before flipping the default
 
 The bar `7224715da` set was "the full coherence battery across the KVarN model
 set". Today's evidence is stronger in kind (byte-identical, not merely fluent)
