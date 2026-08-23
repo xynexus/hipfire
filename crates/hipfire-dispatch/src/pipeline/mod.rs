@@ -524,11 +524,25 @@ fn run_moe_decode_routed(
                     sums,
                     &x[..x.len().min(6)]
                 );
-                if let Some(st) = p.expert_gate_up_strides {
+                for (label, tbl) in [
+                    ("gate_up", p.expert_gate_up_strides),
+                    ("down", p.expert_down_strides),
+                ] {
+                    let Some(st) = tbl else { continue };
                     let raw = gpu.download_f32(st).unwrap_or_default();
-                    let as_i32: Vec<i32> =
-                        raw.iter().take(8).map(|v| v.to_bits() as i32).collect();
-                    eprintln!("[feed] gate_up strides[0..8]={as_i32:?}");
+                    let v: Vec<i32> = raw.iter().map(|f| f.to_bits() as i32).collect();
+                    let zeros = v.iter().filter(|s| **s == 0).count();
+                    let mut kinds: std::collections::BTreeMap<i32, usize> =
+                        std::collections::BTreeMap::new();
+                    for s in &v {
+                        *kinds.entry(*s).or_default() += 1;
+                    }
+                    eprintln!(
+                        "[feed] {label} strides: n={} zeros(Oq8)={zeros} distinct={:?} head={:?}",
+                        v.len(),
+                        kinds,
+                        &v[..v.len().min(8)]
+                    );
                 }
             }
         }

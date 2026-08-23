@@ -6500,8 +6500,52 @@ fn load_moe_expert(
     // must NOT fall through to `load_weight_tensor` either -- for a routed expert
     // that yields the DENSE combined Oq8 layout, which the indexed kernels do not
     // read; the expansion below produces the indexed MoE BLOCK layout they do.
-    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT) && layer_compact_dispatchable {
-        return load_weight_tensor(hfq, gpu, slabs, name, m, k);
+    // DIAGNOSTIC: force every Nth expert to expand, manufacturing a genuinely
+    // mixed layer on a model that has none. The point is to test mixed handling
+    // against a KNOWN-GOOD reference -- a uniformly-compact 35B-A3B is
+    // byte-identical to its expanded self, so if forcing a mix changes a single
+    // token, mixed handling is broken, and if it does not, the problem is
+    // elsewhere. The 122B is the only artifact that mixes naturally and it takes
+    // four minutes a run with no reference to compare against.
+    //
+    // Keyed off the expert index parsed from the tensor name; anything
+    // unparseable is left compact.
+    let force_expand = std::env::var("HIPFIRE_MOE_FORCE_EXPAND_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 1)
+        .is_some_and(|n| {
+            name.split(".experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|idx| idx.parse::<usize>().ok())
+                .is_some_and(|idx| idx % n == 0)
+        });
+    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
+        && layer_compact_dispatchable
+        && !force_expand
+    {
+        let wt = load_weight_tensor(hfq, gpu, slabs, name, m, k)?;
+        // VERIFY, do not assume. `oq8_arch_load` keeps compact planes only when
+        // `compact_resident_enabled() && compact_shape_selected(m, k)`; when the
+        // shape bisect hooks (HIPFIRE_OQ_COMPACT_RESIDENT_ONLY_M/_K) exclude this
+        // tensor it returns the DENSE combined Oq8 layout instead. That layout is
+        // NOT the indexed MoE block layout (260 B/group) the indexed kernels
+        // read, and nothing downstream can tell the two apart -- both are tagged
+        // Oq8G256 -- so accepting it here hands a dense-laid-out tensor to a
+        // block-strided read and serves garbage.
+        //
+        // Caught by the shape bisect itself: narrowing compact residency to the
+        // gate_up shape alone made a 35B-A3B emit "!!!!" while both all-compact
+        // and all-Oq8 were byte-identical.
+        if wt.gpu_dtype == DType::OqCompactG256 {
+            return Ok(wt);
+        }
+        // Fall through to the MoE-block expansion below, which produces the
+        // layout the indexed kernels actually read. The rejected tensor's buffer
+        // is dropped rather than freed -- `gpu` is a shared reference here, and
+        // this path only runs under the diagnostic shape hooks.
+        drop(wt);
     }
     let (dtype, blocks) = match qt {
         Some(OQ4_CANONICAL_QT) => {
@@ -6707,6 +6751,17 @@ fn load_moe_ffn(
         .iter()
         .map(|e| stride_of(&e.down, config.dim, mi))
         .collect();
+    if std::env::var("HIPFIRE_MOE_FEED_DEBUG").as_deref() == Ok("1") && layer_idx < 2 {
+        let cnt = |f: &dyn Fn(&ExpertWeights) -> bool| experts.iter().filter(|e| f(e)).count();
+        eprintln!(
+            "[moe] layer {layer_idx}: gate_up compact={} oq8={} awq={} | down compact={} awq={}",
+            cnt(&|e| e.gate_up.gpu_dtype == DType::OqCompactG256),
+            cnt(&|e| e.gate_up.gpu_dtype == DType::Oq8G256),
+            cnt(&|e| e.gate_up.awq_scale.is_some()),
+            cnt(&|e| e.down.gpu_dtype == DType::OqCompactG256),
+            cnt(&|e| e.down.awq_scale.is_some()),
+        );
+    }
     let (expert_gate_up_strides, expert_down_strides) = if experts.is_empty() {
         (None, None)
     } else {

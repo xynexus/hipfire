@@ -415,6 +415,9 @@ fn main() {
         all &= run_down(&mut gpu, 512, 512, n_exp, 1, layout);
         all &= run_down(&mut gpu, 2048, 512, n_exp, 3, layout);
         all &= run_down(&mut gpu, 1024, 1024, n_exp, 2, layout);
+        // The 122B's exact routed shapes: gate_up [2048,3072] (ng=12, not a
+        // power of two) and down [3072,1024].
+        all &= run_down(&mut gpu, 3072, 1024, n_exp, 2, layout);
     }
 
     println!("{}", if all { "ALL PASS" } else { "FAILURES PRESENT" });

@@ -1963,6 +1963,33 @@ pub(crate) fn prefill_moe_ffn_body_batched(
              and no resident experts) — cannot resolve a routed dispatch path",
         )
     })?;
+    // EXPERT 0 IS NOT THE LAYER -- the decode-side twin of this override is in
+    // `moe_decode.rs`, and omitting it HERE is why the 122B garbled after the
+    // decode side was fixed. Mixed-precision promotion leaves some routed
+    // experts compact and some Oq8 in one layer; whichever expert zero happens
+    // to be, the layer must dispatch through the compact GEMVs, because only
+    // they read a per-expert stride table.
+    //
+    // The failure mode is quiet, which is why it survived a fault-free run: a
+    // layer whose expert 0 is Oq8 reports Oq8, so the Oq8 kernel reads its
+    // COMPACT experts at a 260-byte stride and runs off the end of a 136-byte
+    // one. Neighbouring expert allocations are mapped, so there is no page
+    // fault -- just another expert's weights read as this one's. Structured but
+    // wrong output, not a crash.
+    let routed_representative_compact = {
+        let servable = |d: &DType| matches!(d, DType::OqCompactG256 | DType::Oq8G256);
+        let gu = &ffn.expert_gate_up_dtypes;
+        let dn = &ffn.expert_down_dtypes;
+        !gu.is_empty()
+            && gu.iter().all(servable)
+            && dn.iter().all(servable)
+            && gu.iter().chain(dn.iter()).any(|d| *d == DType::OqCompactG256)
+    };
+    let (routed_gate_up_dtype, routed_down_dtype) = if routed_representative_compact {
+        (DType::OqCompactG256, DType::OqCompactG256)
+    } else {
+        (routed_gate_up_dtype, routed_down_dtype)
+    };
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared_gate: ffn.shared_expert_gate.gpu_dtype,
