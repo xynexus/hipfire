@@ -3703,7 +3703,13 @@ fn ffn_routed(
             .unwrap_or(2.2)
     });
 
-    if layer.expert_gate_up_blob.is_some() {
+    // Gate on the PTR TABLES, not the blob. The dispatch below reads only
+    // `expert_gate_up_ptrs` / `expert_w2_ptrs`; the blob merely owns the memory
+    // behind them in the fully-resident case. Under paged experts the pager owns
+    // that memory and fills the same tables, so a blob check sent every paged
+    // layer to the dead per-expert fallback — decode died at the first MoE layer
+    // with "no separate w1/w3 blobs".
+    if layer.expert_gate_up_ptrs.is_some() && layer.expert_w2_ptrs.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
         // k_top per-expert silu_clamp+rotate. Replaces the per-expert
         // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
