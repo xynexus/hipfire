@@ -135,6 +135,51 @@ which changes the model artifact and needs the user.
      `NW * v_row_stride`) is ALREADY done by LLVM -- hand-writing the induction
      variable emits identical ISA. Negative.
 
+## Update 2026-08-23 (late) — the bottleneck was never the GEMM
+
+Three things landed after the section below was written, and together they
+change what this plan is even about.
+
+**1. Serving prefill was 15.4 tok/s, not 256.** Every number in this plan came
+from `bench_qwen35_speed`. The daemon took a per-token path, gated by an opt-in
+(`HIPFIRE_KVARN_BATCHED_PREFILL`) added the day before pending a coherence
+battery. The battery ran: byte-identical output on all 5 models where the
+batched path engages, and it is now **default-on**. Serving prefill
+**15.4 -> 313 tok/s (20x)**, TTFT 46.7 s -> 2.3 s. That one line is worth more
+than every kernel change in this plan combined.
+
+**2. W4A4 needs no requantization and is wired.** The 4.25-bit floor constrains
+WEIGHTS; W4A4 narrows the ACTIVATION. Weights stay compact 4.25-bit, only the
+activation drops to int4, so the radix-16 pair collapses to one iu4 pass.
+`+13%` through the daemon (301 -> 341 tok/s), all four checkable answers correct
+on both models that reach them, all 9 coherence detectors OK. **Opt-in
+(`HIPFIRE_OQ_COMPACT_A4=1`) until a KLD lands** -- it genuinely changes numerics,
+unlike the kvarn flip.
+
+**3. origin's M2a prefill lowering is integrated**, byte-identical and at the
+same tok/s, with our compact arms re-applied on top of `run_layer_program`.
+
+## The gap that now blocks two separate things
+
+**MoE prefill is not batched.** A model with `DeltaNetMoe`/`FullAttnMoe` layers
+fails the `all(DeltaNet|FullAttn)` arm of the batched gate by construction, so
+every MoE model prefills per-token. Measured: Qwen3.6-35B-A3B (3B active)
+**54.8 tok/s** against dense Qwen3.8-27B (27B active) **179.8 tok/s** -- 3.3x
+slower per token with 1/9th the active parameters.
+
+That single gap blocks:
+
+- **MoE serving prefill** directly.
+- **PFlash**, entirely. PFlash works (compresses 9904 -> 2480 tokens, target then
+  prefills at 273.8 vs 179.8), but a drafter's scoring pass IS its own prefill,
+  and the only tokenizer-compatible drafter here is an A3B MoE. Scoring costs
+  182.5 s against a 55.1 s target prefill -- a 3.3x net loss. Once MoE batches,
+  an A3B drafter at even 3x the dense rate gives ~27 s against 55 s, i.e. ~2x,
+  growing with prompt length.
+
+**This is now the highest-value open item in the file**, ahead of anything left
+in the GEMM. See `docs/experiments/2026-08-23-pflash-blocked-on-moe-batched-prefill.md`.
+
 ## Work, in order
 
 ### 0. Frame it: what fraction of prefill is the GEMM?
