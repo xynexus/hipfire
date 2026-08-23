@@ -784,8 +784,49 @@ fn expert_module_tensor_role(name: &str) -> Option<ExpertRole> {
         Some(ExpertRole::GateUp)
     } else if name.ends_with("down_proj.weight") {
         Some(ExpertRole::Down)
+    } else if name.ends_with("w1.weight") {
+        // deepseek4 / minimax / lfm2moe name their projections w1 (gate), w3
+        // (up), w2 (down), and store gate and up as SEPARATE tensors that the
+        // arch concatenates into one gate_up buffer. `ExpertRole::GateUp` is a
+        // single span, so w1 can only stand for gate_up when w3 immediately
+        // follows it — which `expert_role_rank`'s w1/w3/w2 ordering guarantees
+        // and `module_gate_up_span_is_contiguous` below verifies per module.
+        Some(ExpertRole::GateUp)
+    } else if name.ends_with("w2.weight") {
+        Some(ExpertRole::Down)
     } else {
+        // w3 deliberately has no role: it is the tail of the gate_up span that
+        // w1 already names, not a third slot.
         None
+    }
+}
+
+/// Verify that a `w1`/`w3` module really does store gate and up back to back.
+///
+/// This is the guard that keeps the w1-as-gate_up mapping honest. An artifact
+/// quantized before the w1/w3/w2 role ranks lays each expert out **w1, w2, w3**,
+/// so a gate_up span starting at w1 would run straight into the DOWN weights.
+/// The kernel would read it happily and produce garbage — a wrong answer, not a
+/// crash — so this refuses at registration instead.
+fn module_gate_up_span_is_contiguous(module: &HfqModuleRecord) -> bool {
+    let Some(w1) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w1.weight"))
+    else {
+        // No w1 means this is a `gate_up_proj` module; nothing to check.
+        return true;
+    };
+    let Some(w3) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w3.weight"))
+    else {
+        return false;
+    };
+    match module_tensor_resident_len(w1) {
+        Ok(len) => w1.rel_offset.saturating_add(len) == w3.rel_offset,
+        Err(_) => false,
     }
 }
 
@@ -1240,6 +1281,13 @@ impl WeightPager {
         let expert = module.expert.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
         })?;
+        if !module_gate_up_span_is_contiguous(&module) {
+            return Err(WeightPagerError::InvalidModule(format!(
+                "module {:?} (layer {:?} expert {:?}) stores w1 and w3 non-adjacently, so \
+                 gate_up cannot be one span; re-quantize with the w1/w3/w2 role ranks",
+                module.module_id, module.layer, module.expert
+            )));
+        }
         if find_module_tensor_rel_ptr(&module, ExpertRole::GateUp).is_none()
             || find_module_tensor_rel_ptr(&module, ExpertRole::Down).is_none()
         {
