@@ -717,6 +717,24 @@ pub fn emit_qwen35_owned_prefill_checkpoint(
 /// Grouped-MoE batched suffix prefill: the fused kernel path for Qwen3.5 MoE
 /// (arch_id 6), prefilling the whole suffix in batched layer passes with the
 /// expert-grouped FFN.
+/// Token cap for a single fused multi-session prefill dispatch.
+///
+/// `HIPFIRE_PREFILL_MAX_BATCH` cannot do this job: for the fused path it is a
+/// **floor**, not a ceiling — `qwen35_prefill_scratch_target_batch` returns
+/// `configured.max(required_rows)`, so lowering it grows the scratch to fit the
+/// batch anyway and the whole prefill still goes out as one indivisible
+/// dispatch. That is what leaves fused prefill with no latency cap at all.
+///
+/// Unset or `0` keeps the single-dispatch behaviour exactly. A value of 1 is
+/// rejected along with 0 because a 1-token band would drive the batched path
+/// per-token.
+fn fused_prefill_chunk_tokens() -> Option<usize> {
+    std::env::var("HIPFIRE_PREFILL_FUSED_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 2)
+}
+
 pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
@@ -1037,27 +1055,113 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             ));
         }
         let pbs = scratch.prefill_batch.as_ref().unwrap();
-        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
-            .iter_mut()
-            .zip(prepared.iter())
-            .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
-                tokens: &spec.tokens,
-                start_pos: state.cursor.seq_pos,
-                kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
-                dn_state: state
-                    .sequence_state
-                    .recurrent
-                    .as_mut()
-                    .expect("qwen35 session dn")
-                    .as_any_mut()
-                    .downcast_mut::<qwen35::DeltaNetState>()
-                    .expect("qwen35 session dn"),
-                logits: &state.logits,
-            })
-            .collect();
-        qwen35::forward_prefill_grouped_moe_session_batch(
-            gpu, weights, config, &mut rows, scratch, pbs,
-        )
+        match fused_prefill_chunk_tokens() {
+            // Default: one dispatch for the whole batch, exactly as before.
+            None => {
+                let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+                    .iter_mut()
+                    .zip(prepared.iter())
+                    .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
+                        tokens: &spec.tokens,
+                        start_pos: state.cursor.seq_pos,
+                        kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
+                        dn_state: state
+                            .sequence_state
+                            .recurrent
+                            .as_mut()
+                            .expect("qwen35 session dn")
+                            .as_any_mut()
+                            .downcast_mut::<qwen35::DeltaNetState>()
+                            .expect("qwen35 session dn"),
+                        logits: &state.logits,
+                    })
+                    .collect();
+                qwen35::forward_prefill_grouped_moe_session_batch(
+                    gpu, weights, config, &mut rows, scratch, pbs,
+                )
+            }
+            // Capped: walk the batch in `step`-token bands so no single
+            // dispatch is longer than the operator asked for. Each band is an
+            // ordinary continuation call — same thing a second conversation
+            // turn does — so the KV and DeltaNet state carry across bands.
+            Some(step) => {
+                // Every band must keep ALL sessions, because the fused entry
+                // rejects a batch of fewer than two rows outright
+                // (`validate_dense_prefill_session_batch_shape`). Banding
+                // naively on the longest session strands the ragged tail as a
+                // one-row dispatch and the whole prefill fails — measured, not
+                // predicted. The batch kernel has its own `singleton_tail`
+                // handling for that tail, but only inside a call that started
+                // with two or more rows, so the banding must not split it out.
+                //
+                // So: cut bands inside the SHORTEST session, and let the final
+                // band run to each session's own end. Every band then carries
+                // every session. The cost is that the last band is up to
+                // `step + (max_len - min_len)` tokens rather than `step` — the
+                // cap is honoured except across the ragged tail, which is the
+                // spread in prompt lengths.
+                let min_len = prepared.iter().map(|s| s.tokens.len()).min().unwrap_or(0);
+                let mut starts: Vec<usize> = Vec::new();
+                let mut at = 0usize;
+                while at.saturating_add(step) < min_len {
+                    starts.push(at);
+                    at = at.saturating_add(step);
+                }
+                starts.push(at);
+                let last = starts.len() - 1;
+
+                let mut band_result = Ok(());
+                for (i, &begin) in starts.iter().enumerate() {
+                    let is_last = i == last;
+                    let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+                        .iter_mut()
+                        .zip(prepared.iter())
+                        .map(|((_, state), spec)| {
+                            let end = if is_last {
+                                spec.tokens.len()
+                            } else {
+                                begin.saturating_add(step).min(spec.tokens.len())
+                            };
+                            qwen35::DensePrefillSessionBatchRow {
+                                tokens: &spec.tokens[begin..end],
+                                start_pos: state.cursor.seq_pos + begin,
+                                kv_cache: state
+                                    .sequence_state
+                                    .kv
+                                    .as_mut()
+                                    .expect("qwen35 session KV"),
+                                dn_state: state
+                                    .sequence_state
+                                    .recurrent
+                                    .as_mut()
+                                    .expect("qwen35 session dn")
+                                    .as_any_mut()
+                                    .downcast_mut::<qwen35::DeltaNetState>()
+                                    .expect("qwen35 session dn"),
+                                logits: &state.logits,
+                            }
+                        })
+                        .collect();
+                    if let Err(e) = qwen35::forward_prefill_grouped_moe_session_batch(
+                        gpu, weights, config, &mut rows, scratch, pbs,
+                    ) {
+                        band_result = Err(e);
+                        break;
+                    }
+                }
+                // The bands together cover exactly the tokens the single
+                // dispatch would have, so report the shape it would have.
+                band_result.map(|()| qwen35::DensePrefillSessionBatchShape {
+                    sessions: prepared.len(),
+                    total_tokens: prepared.iter().map(|s| s.tokens.len()).sum(),
+                    max_tokens_per_session: prepared
+                        .iter()
+                        .map(|s| s.tokens.len())
+                        .max()
+                        .unwrap_or(0),
+                })
+            }
+        }
     };
 
     let shape = match worker_result {

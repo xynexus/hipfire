@@ -13,6 +13,60 @@
 // root-level imports and arch aliases that the crate root sets up.
 use crate::*;
 
+/// §M6's VRAM test — the admission half of §1.1's contract.
+///
+/// `planned_usage_for_load` has always computed what a load will need, but
+/// nothing compared it against what the device actually has: the plan is
+/// recorded AFTER a successful load (`set_worker_usage`) and never used to admit
+/// one. So an over-large load fails by exhausting the device part-way through
+/// rather than being refused. That failure is measured, not hypothetical — see
+/// `docs/plans/2026-08-22-m4-decided.md`, where a load dies at layer 25 of 40
+/// with 15.9 MiB free of 43008 MiB, reporting a failed 2 MiB `hipMalloc` that
+/// tells the operator nothing about the actual cause.
+///
+/// Off unless `HIPFIRE_DAEMON_VRAM_RESERVE_MB` is set, so the default path is
+/// unchanged. When set, an over-large load is refused up front and the error
+/// names every term.
+///
+/// The reserve is the point: `planned` counts model bytes only, so KV, scratch
+/// and fragmentation must come out of headroom the operator declares.
+fn vram_admission_check(
+    gpu: &hipfire_rdna::Gpu,
+    planned: &ResidentResourceUsage,
+) -> Result<(), String> {
+    let reserve_mb: u64 = match std::env::var("HIPFIRE_DAEMON_VRAM_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|mb| *mb > 0)
+    {
+        Some(mb) => mb,
+        None => return Ok(()),
+    };
+    let reserve = reserve_mb.saturating_mul(1024 * 1024);
+    // A probe failure must not become a refusal: not knowing the free byte count
+    // is not evidence that the load will not fit.
+    let Ok((free, total)) = gpu.hip.get_vram_info() else {
+        return Ok(());
+    };
+    let (free, total) = (free as u64, total as u64);
+    let need = planned.vram_bytes.saturating_add(reserve);
+    if need <= free {
+        return Ok(());
+    }
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    Err(format!(
+        "load refused by VRAM admission: {} needs {:.0} MiB (model {:.0} MiB + reserve {} MiB) \
+         but only {:.0} MiB of {:.0} MiB is free. Lower HIPFIRE_DAEMON_VRAM_RESERVE_MB, unload a \
+         resident worker, or use a smaller artifact.",
+        planned.model_path,
+        mib(need),
+        mib(planned.vram_bytes),
+        reserve_mb,
+        mib(free),
+        mib(total),
+    ))
+}
+
 pub(crate) fn load(
     daemon_state: &mut DaemonState,
     msg: &serde_json::Value,
@@ -492,6 +546,11 @@ pub(crate) fn load(
     let planned_resource_usage = daemon_state
         .resource_reservations
         .planned_usage_for_load(path, protocol_load.as_ref().map(|req| &req.params));
+    if let Err(err) = vram_admission_check(&daemon_state.gpu, &planned_resource_usage) {
+        write_error(&mut daemon_state.out.sink, "", &err);
+        let _ = daemon_state.out.sink.flush();
+        return;
+    }
     if let Err(err) = daemon_state
         .resource_reservations
         .release_placeholders(&mut daemon_state.gpu)
