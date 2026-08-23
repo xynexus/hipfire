@@ -1352,13 +1352,33 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    numerically healthy (end_streams absmean 1.32 -> 1.85, max ~20, no NaN), and
    generation runs to a natural EOS.
 
-   Output is still not coherent — finite mojibake rather than BOS forever. That
-   is a numerical-quality problem, not a crash, and the pager is no longer
-   implicated in it. Remaining suspects, in order: the oq4 expert quantization
-   built from the FP8 safetensors, and the Q8_F16 attention re-encode, whose
-   dispatch arm feeds the PLAIN activation buffer where the Oq4/MQ4 arms feed the
-   FWHT-rotated one. Testing the second means re-encoding attention to mq4/hfq4
-   (the rotated arm) instead of q8f16 and comparing.
+   **The remaining mojibake is expected, not a defect.** The artifact's routed
+   experts are `qt=19` = MQ2G256Lloyd — 2-bit — even though it was built with
+   `--format oq4`. That is deliberate: `hipfire-quantize` routes DeepSeek V4
+   per-expert tensors "through the MQ2-Lloyd path for every DeepSeek-specialized
+   format, including OQ dense formats", because the deepseek4 routed-MoE kernels
+   are MQ2-Lloyd-specific and an OQ4 expert payload would be raw-concatenated and
+   then read through the wrong kernel family. `--format oq4` therefore applies to
+   attention, shared experts and head (all `qt=34`) but never to routed experts.
+   MQ2's documented failure mode in this repo is precisely mojibake — the
+   `HIPFIRE_ALLOW_MQ2` gate exists because "the uniform 4-level codebook collapses
+   at every model size validated locally". A 2-bit routed-expert MoE producing
+   incoherent text is the format behaving as characterised, not the executor
+   misbehaving.
+
+   The Q8_F16 attention re-encode is also cleared on reasoning rather than
+   measurement: MQ4/HFQ4 weights are STORED FWHT-rotated, which is why that arm
+   feeds the rotated activation buffer; Q8 weights come from plain FP8 source, so
+   the plain buffer is the correct pairing. There was never an Oq4 arm for `wo_a`
+   at all — that is the error the re-encode was done to clear.
+
+   **This does not block M5's exit.** The exit is a PARITY test — paged output
+   byte-identical to pinned output — not a quality test. Mojibake is admissible
+   evidence so long as it is the same mojibake. The only real blocker for M5's
+   exit remains the pinned reference: 85.3 GB does not fit in nix1's 43 GB, so
+   the A/B needs halo or a smaller MoE. Coherent output would need routed experts
+   above 2 bits, which needs a deepseek4 routed-MoE kernel family that speaks a
+   wider format — a separate piece of work from the executor.
 3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
    "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
    layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
