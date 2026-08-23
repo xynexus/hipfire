@@ -736,7 +736,6 @@ impl SamplerRng {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,8 +789,20 @@ mod tests {
     #[test]
     fn top_k_64_is_seeded_and_excludes_the_tail() {
         let logits: Vec<f32> = (0..96).map(|index| index as f32 * 0.03125).collect();
-        let first = sample_top_k_top_p(&logits, 1.0, 64, 0.95, &mut SamplerRng::from_seed(0x1357_9bdf));
-        let second = sample_top_k_top_p(&logits, 1.0, 64, 0.95, &mut SamplerRng::from_seed(0x1357_9bdf));
+        let first = sample_top_k_top_p(
+            &logits,
+            1.0,
+            64,
+            0.95,
+            &mut SamplerRng::from_seed(0x1357_9bdf),
+        );
+        let second = sample_top_k_top_p(
+            &logits,
+            1.0,
+            64,
+            0.95,
+            &mut SamplerRng::from_seed(0x1357_9bdf),
+        );
         assert_eq!(first, second);
         assert!(first >= 32, "top-k 64 admitted tail token {first}");
     }

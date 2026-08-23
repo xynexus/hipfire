@@ -2246,3 +2246,39 @@ fixture move OPPOSITE to the real model on oq4.25++
 (`docs/tiny-quant-gate-8-failures.md`). One real-MoE run on LFM2.5-8B-A1B would
 inform both: quantize either side of `8357081d3`, and separately with `lm_head`
 capture on and off.
+
+## 5. Two `qwen3_5_moe` cells drifted ~10–15% worse and the tolerance hid it
+
+`tests/tiny-quant-baselines.txt` last recorded `qwen3_5_moe` on **2026-07-22**
+(`753df2b27`). 83 quant commits landed since. Re-measuring on master
+`2121401b3` (gfx1103):
+
+| cell | baseline (Jul 22) | now | Δ |
+|---|---|---|---|
+| `oq8+` / `oq8++` (calib) | 0.008147 | 0.005677 | **−30%** (better; re-recorded) |
+| `oq4` | 0.175872 | 0.194060 | **+10.3%** (worse) |
+| `oq4.25++` (calib) | 0.165681 | 0.190065 | **+14.7%** (worse) |
+
+Only the oq8 pair FAILED, because the per-cell tolerance is **0.25 relative** —
+wide enough to swallow a 15% regression silently. The two oq8 lines are
+re-recorded; the oq4 lines are deliberately **left stale so the drift stays
+visible**, which is why the gate still reports those numbers against July.
+
+**This is not the gfx1103 first-run position effect (~8.6%).** Two independent
+runs gave 0.19406/0.19407 for `oq4` and 0.190065/0.19007 for `oq4.25++` —
+identical to four digits. It is deterministic.
+
+The pointed part: `oq4.25++` is the premier format in the quant priority
+hierarchy, and it has lost its margin. In July it beat `oq4+` clearly
+(0.1657 vs 0.1951); now they are within noise of each other (0.1901 vs 0.1947).
+Whatever moved it took away the reason to prefer it on this fixture.
+
+Not bisected — that is 83 commits of GPU re-quantization. Candidates that touch
+exactly this path: `72cd1c10b` (MoE routers stay lossless BF16),
+`80c498b37` (undercovered routed experts go to W8). Both would plausibly explain
+the oq8 improvement; neither obviously explains the oq4 regression.
+
+Caveat that applies to all of it, per §3: these are seeded random-init tiny
+fixtures with no outlier structure, so an AWQ/Hessian format can move opposite
+to the real model here. The finding is "the gate's numbers moved and nobody
+noticed", not yet "oq4.25++ regressed on real weights".
