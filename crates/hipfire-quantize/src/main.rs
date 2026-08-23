@@ -6207,6 +6207,21 @@ fn run_hfq_source_pipeline(
                         ))
                     }
                 };
+                if std::env::var("HIPFIRE_FP8_SRC_STATS").is_ok() {
+                    let n = f32s.len().max(1);
+                    let (mn, mx) = f32s.iter().fold((f32::MAX, f32::MIN), |(a, b), v| {
+                        (a.min(*v), b.max(*v))
+                    });
+                    let mean = f32s.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
+                    let absmean = f32s.iter().map(|v| v.abs() as f64).sum::<f64>() / n as f64;
+                    let zeros = f32s.iter().filter(|v| **v == 0.0).count();
+                    let nans = f32s.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!(
+                        "[fp8-src] {} shape={:?} scale={} min={mn:.5} max={mx:.5} mean={mean:.6} \
+                         absmean={absmean:.6} zeros={zeros}/{n} nonfinite={nans}",
+                        t.name, src_shape, sname
+                    );
+                }
                 let mut raw = Vec::with_capacity(f32s.len() * 4);
                 for v in &f32s {
                     raw.extend_from_slice(&v.to_le_bytes());
