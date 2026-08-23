@@ -180,14 +180,21 @@ Order of preference:
 
 1. **If you spawned it, kill the pid you recorded.** An explicit pid cannot match
    your own shell. `tests/agentic-gate.sh` is the worked example.
-2. **Otherwise use `scripts/killproc.sh`**, which excludes the caller, every
-   ancestor, and the caller's whole process group, and names every pid it
-   signals instead of failing silently:
+2. **Otherwise use `scripts/pkill-safe.sh`** — a drop-in taking pkill's own
+   flags and exit codes, which refuses to signal the caller, any ancestor, or
+   the caller's process group:
 
-       scripts/killproc.sh hipfire-daemon hipfire-eval   # exact names
-       scripts/killproc.sh --pattern 'python .*train\.py'
-       scripts/killproc.sh --dry-run hipfire-daemon
-       scripts/killproc.sh --self-check
+       scripts/pkill-safe.sh hipfire-daemon
+       scripts/pkill-safe.sh -f 'python .*train\.py'   # the dangerous form, safe
+       scripts/pkill-safe.sh --self-check
+
+   It is symlinked to `~/.hipfire/bin/pkill`, which is ahead of `/usr/bin` on
+   PATH, so **plain scripts and fresh `bash -c` get it automatically**.
+   ⚠️ A shell FUNCTION outranks PATH, and Claude Code installs a `pkill` function
+   in its command shells that guards `$CLAUDE_PID` (the agent process) — NOT the
+   caller shell, which is the thing that dies with `exit 144`. Inside an agent
+   command shell the symlink is therefore shadowed; call the script by path when
+   you want the caller-shell guarantee.
 
 ## Artifact Names
 

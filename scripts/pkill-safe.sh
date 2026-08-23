@@ -2,122 +2,103 @@
 # SPDX-License-Identifier: Apache-2.0
 # hipfire — see LICENSE and NOTICE in the project root.
 #
-# Kill processes without killing yourself.
+# A drop-in `pkill` that cannot kill the shell running it.
 #
-# THE TRAP THIS EXISTS FOR. `pkill -f <pattern>` matches the FULL COMMAND LINE of
-# every process — including the shell running the pkill, whose command line
-# contains the pattern by construction. It kills its own shell and surfaces as a
-# bare `exit 144` with no output, which reads like the command silently did
-# nothing. AGENTS.md documents it; it is still easy to walk into, because the
-# same hazard appears in any hand-rolled `ps -eo args | grep | kill` — the
-# `[p]attern` bracket trick does NOT save you there, since your shell's command
-# line genuinely contains the pattern via its own arguments.
+# Install it as `pkill` ahead of /usr/bin on PATH (on this box, ~/.hipfire/bin)
+# so it is what you get by reflex. It takes pkill's own arguments and returns
+# pkill's exit codes, so existing muscle memory and existing scripts keep
+# working -- they just stop being able to shoot the caller.
 #
-# This script excludes the caller AND its whole ancestor chain, always, in both
-# modes. It is also LOUD: it names every pid it signals and says so when nothing
-# matched, because silence is what makes the original failure confusing.
+# SCOPE, MEASURED. A shell FUNCTION outranks PATH, and Claude Code installs a
+# `pkill` function in its command shells that protects $CLAUDE_PID (the agent
+# process). So:
 #
-# BEST OPTION IS STILL NOT THIS SCRIPT. If you SPAWNED the process, record its
-# pid and kill that pid — an explicit pid cannot match your own shell. See
-# tests/agentic-gate.sh, which tracks the daemon it starts. Reach for this only
-# for a process you did not spawn.
+#   * in a plain script or a fresh `bash -c`  -> this file is what runs. Verified.
+#   * in a Claude Code command shell          -> the harness function runs instead.
 #
-#   scripts/killproc.sh hipfire-daemon hipfire-eval   # exact names (pgrep -x)
-#   scripts/killproc.sh --pattern 'python .*train\.py'
-#   scripts/killproc.sh --dry-run hipfire-daemon
-#   scripts/killproc.sh --kill hipfire-daemon         # SIGKILL after 5s grace
-#   scripts/killproc.sh --self-check
+# The two guards protect DIFFERENT things and neither subsumes the other: the
+# harness protects the agent's own pid, this protects the CALLER SHELL and its
+# process group. The caller shell is the one that actually dies with `exit 144`,
+# and the harness does not cover it -- which is how this trap still landed twice
+# in one session inside those very shells. Invoke this file explicitly
+# (`scripts/pkill-safe.sh ...`) when you want the caller-shell guarantee.
+#
+# THE TRAP. `pkill -f <pat>` matches the FULL COMMAND LINE of every process,
+# including the shell running the pkill, whose command line contains the pattern
+# by construction. It kills its own shell and surfaces as a bare `exit 144` with
+# no output, which reads like the command silently did nothing. The same hazard
+# is in any hand-rolled `ps -eo args | grep | kill`, and the `[p]attern` bracket
+# trick does NOT save you there -- your shell's command line genuinely contains
+# the pattern via its own arguments.
+#
+# WHAT IT REFUSES TO SIGNAL: the caller, every ancestor up to init, and the
+# caller's whole process group (which covers the subshells and `pgrep` that the
+# selection itself spawns). It says so on stderr rather than skipping silently.
+#
+# STILL BETTER: if you SPAWNED the process, record its pid and kill that pid.
+# An explicit pid cannot match your own shell. tests/agentic-gate.sh does this.
+#
+#   pkill hipfire-daemon              # exact-ish, same as system pkill
+#   pkill -f 'python .*train\.py'     # the dangerous form, now safe
+#   pkill -9 hipfire-daemon
+#   pkill --self-check
 set -uo pipefail
 
-DRY=0; SIG=TERM; HARD=0; MODE=exact; PATTERN=""
-usage() { sed -n '5,30p' "$0" | sed 's/^# \?//'; exit "${1:-0}"; }
+[ "${1:-}" = "--self-check" ] && { SELFCHECK=1; shift; } || SELFCHECK=0
 
-# Everything it must never signal: the caller, every ancestor up to init, and
-# the caller's whole PROCESS GROUP. The group matters because a selector also
-# matches the caller's own DESCENDANTS -- the subshells and `pgrep` that the
-# selection itself spawns carry the pattern in their command lines. Ancestor
-# exclusion alone does not cover those; the self-check below caught exactly that
-# (a self-matching pattern selected 3 pids on the first draft).
-ancestors() {
-    local p=$$
-    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
-        printf '%s\n' "$p"
-        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
-    done
-    local mypg; mypg=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-    [ -n "$mypg" ] && ps -eo pid=,pgid= | awk -v g="$mypg" '$2==g {print $1}'
-}
-
-self_check() {
-    local excl; excl=$(ancestors | tr '\n' ' ')
-    case " $excl " in *" $$ "*) ;; *) echo "FAIL: ancestors omits self"; exit 1;; esac
-    local n; n=$(ancestors | wc -l)
-    [ "$n" -ge 2 ] || { echo "FAIL: ancestors found $n, expected >=2 (self+parent)"; exit 1; }
-    # a pattern matching THIS shell must select nothing after exclusion
-    local hits; hits=$(select_pids pattern 'killproc' | wc -l)
-    [ "$hits" -eq 0 ] || { echo "FAIL: self-matching pattern selected $hits pid(s)"; exit 1; }
-    # and a name that cannot exist selects nothing, without error
-    [ -z "$(select_pids exact 'definitely-not-a-real-process-xyz')" ] || { echo "FAIL: bogus name matched"; exit 1; }
-    echo "killproc self-check OK (excluded: $excl)"
-}
-
-select_pids() {         # $1=mode $2=target -> safe-to-signal pids
-    local mode=$1 target=$2 raw
-    if [ "$mode" = exact ]; then raw=$(pgrep -x -- "$target" 2>/dev/null)
-    else raw=$(pgrep -f -- "$target" 2>/dev/null); fi
-    [ -n "$raw" ] || return 0
-    local mypg; mypg=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-    local anc; anc=$(ancestors)
-    local p pg
-    for p in $raw; do
-        case " $(printf '%s ' $anc) " in *" $p "*) continue ;; esac
-        pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
-        # Empty pgid = the process is already gone. `pgrep` lists short-lived
-        # children of the selection itself (the pgrep/subshell), which exit
-        # before we can read their group; signalling a dead pid is at best noise
-        # and at worst hits a recycled pid, so drop them.
-        [ -n "$pg" ] || continue
-        [ "$pg" = "$mypg" ] && continue
-        printf '%s\n' "$p"
-    done
-}
-
+SIG=TERM
+args=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run) DRY=1; shift ;;
-        --kill)    HARD=1; shift ;;
-        --pattern) MODE=pattern; PATTERN=${2:?--pattern needs a regex}; shift 2 ;;
-        --self-check) self_check; exit 0 ;;
-        -h|--help) usage 0 ;;
-        --) shift; break ;;
-        -*) echo "killproc: unknown flag $1" >&2; usage 2 ;;
-        *)  break ;;
+        # pkill's signal forms. Everything else is a pgrep selection flag and is
+        # passed through untouched, so -f/-x/-u/-P/-g/-n/-o/--ns/... all work.
+        -[0-9]|-[0-9][0-9]) SIG=${1#-}; shift ;;
+        -SIG*|-[A-Z][A-Z]*)  SIG=${1#-}; SIG=${SIG#SIG}; shift ;;
+        --signal) SIG=${2:?--signal needs a value}; SIG=${SIG#SIG}; shift 2 ;;
+        *) args+=("$1"); shift ;;
     esac
 done
 
-targets=()
-[ "$MODE" = pattern ] && targets=("$PATTERN") || targets=("$@")
-[ ${#targets[@]} -gt 0 ] || { echo "killproc: nothing to do (no target given)" >&2; usage 2; }
-
-total=0
-for t in "${targets[@]}"; do
-    pids=$(select_pids "$MODE" "$t")
-    if [ -z "$pids" ]; then echo "killproc: no match for '$t'"; continue; fi
-    for p in $pids; do
-        cmd=$(ps -o args= -p "$p" 2>/dev/null | cut -c1-70)
-        if [ "$DRY" = 1 ]; then echo "killproc: WOULD signal $p  ($cmd)"
-        else echo "killproc: SIG$SIG -> $p  ($cmd)"; kill "-$SIG" "$p" 2>/dev/null; fi
-        total=$((total+1))
+forbidden() {           # caller + ancestors + caller's process group
+    local p=$$
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+        printf '%s\n' "$p"; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     done
-done
+    local g; g=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    [ -n "$g" ] && ps -eo pid=,pgid= | awk -v g="$g" '$2==g {print $1}'
+}
 
-if [ "$HARD" = 1 ] && [ "$DRY" = 0 ] && [ "$total" -gt 0 ]; then
-    sleep 5
-    for t in "${targets[@]}"; do
-        for p in $(select_pids "$MODE" "$t"); do
-            echo "killproc: still alive, SIGKILL -> $p"; kill -9 "$p" 2>/dev/null
-        done
+select_pids() {
+    local raw; raw=$(pgrep "${args[@]}" 2>/dev/null) || true
+    [ -n "$raw" ] || return 0
+    local mypg; mypg=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    local bad; bad=" $(forbidden | tr '\n' ' ') "
+    local p pg
+    for p in $raw; do
+        case "$bad" in *" $p "*) SKIPPED=$((SKIPPED+1)); continue ;; esac
+        pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+        # empty pgid => already exiting (typically the pgrep we just spawned);
+        # signalling a dead pid is noise at best, a recycled pid at worst.
+        [ -n "$pg" ] || continue
+        [ "$pg" = "$mypg" ] && { SKIPPED=$((SKIPPED+1)); continue; }
+        printf '%s\n' "$p"
     done
+}
+
+if [ "$SELFCHECK" = 1 ]; then
+    args=(-f "pkill-safe")
+    SKIPPED=0; hits=$(select_pids | wc -l)
+    [ "$hits" -eq 0 ] || { echo "FAIL: a pattern matching this very process selected $hits pid(s)"; exit 1; }
+    args=(-x "definitely-not-a-real-process-xyz")
+    SKIPPED=0; [ -z "$(select_pids)" ] || { echo "FAIL: bogus name matched"; exit 1; }
+    echo "pkill-safe self-check OK"; exit 0
 fi
-echo "killproc: signalled $total process(es)"
+
+[ ${#args[@]} -gt 0 ] || { echo "pkill-safe: no pattern given" >&2; exit 2; }
+
+SKIPPED=0
+mapfile -t pids < <(select_pids)
+[ "$SKIPPED" -gt 0 ] && echo "pkill-safe: refused $SKIPPED self/ancestor/process-group match(es)" >&2
+if [ ${#pids[@]} -eq 0 ]; then exit 1; fi     # pkill: 1 == nothing matched
+for p in "${pids[@]}"; do kill "-$SIG" "$p" 2>/dev/null; done
 exit 0
