@@ -2052,6 +2052,132 @@ fn qwen35_sample_next_from(
 /// `logits` is what the forward wrote for THIS stream: `scratch.logits` on the
 /// single-stream path, the row's own session logits on the batched one.
 #[allow(clippy::too_many_arguments)]
+/// Prefill `tokens` into the session, honouring the eviction window and the
+/// latency band. Extracted from `generate_start` so the SAME code can run either
+/// as one call (today) or as a sequence of bands driven by the executor — the
+/// band boundaries are already committed KV states, so a caller may stop between
+/// them.
+///
+/// Returns the number of prompt tokens consumed. That is `tokens.len()` unless a
+/// caller-supplied band budget cut it short, which is how a low-priority prefill
+/// becomes preemptible.
+#[allow(clippy::too_many_arguments)]
+fn qwen35_prefill_tokens(
+    gpu: &mut hipfire_rdna::Gpu,
+    weights: &qwen35::Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &qwen35::Qwen35Scratch,
+    kv: &mut hipfire_runtime::kv::KvCache,
+    dn: &mut qwen35::DeltaNetState,
+    cursor: &mut crate::session::SessionCursor,
+    eviction: Option<&crate::model::Eviction>,
+    tokens: &[u32],
+    id: &str,
+) -> Result<usize, String> {
+    if kv.quant_kvarn {
+        // KVarN (and the deferred-hierarchical two-tier cache built on it)
+        // require the per-token attention dispatch (kv_cache_attention_dispatch):
+        // the batched forward_prefill_batch runs its own batched attention and
+        // never populates the KVarN window/records (nor the hier hot ring), so
+        // the prompt KV is wrong and decode degenerates. Prefill per-token via
+        // forward_scratch — the same path decode already uses below, and the one
+        // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
+        // kvarn is a KV-memory mode, not a throughput one.
+        for &tok in tokens {
+            qwen35::forward_scratch(gpu, weights, config, tok, cursor.seq_pos, kv, dn, scratch)
+                .unwrap();
+            cursor.seq_pos += 1;
+        }
+    } else if eviction.is_some() || prefill_band_tokens().is_some() {
+        // Chunked prefill. Two independent reasons to cut, and they
+        // compose by taking the smaller cut:
+        //
+        //   * eviction — chunk to the (budget+beta) window so physical
+        //     never exceeds `physical_cap`. A MEMORY bound.
+        //   * `HIPFIRE_PREFILL_BAND_TOKENS` — chunk so no single dispatch
+        //     runs longer than the operator will tolerate. A LATENCY
+        //     bound, and the one that makes a low-priority prefill
+        //     preemptible: each band ends at a committed KV boundary with
+        //     `seq_pos` advanced, which is exactly the state a second
+        //     conversation turn resumes from. Nothing extra is pinned.
+        //
+        // Previously this loop existed only when eviction was configured,
+        // so an operator who wanted a latency cap had to enable an unrelated
+        // memory feature to get one.
+        let band = prefill_band_tokens();
+        let window = eviction.as_ref().map(|ev| ev.budget() + ev.beta());
+        let mut remaining: &[u32] = tokens;
+        while !remaining.is_empty() {
+            let space = window
+                .map(|w| w.saturating_sub(cursor.seq_pos).max(1))
+                .unwrap_or(usize::MAX);
+            let chunk_len = remaining.len().min(space).min(band.unwrap_or(usize::MAX));
+            let (chunk, rest) = remaining.split_at(chunk_len);
+            if prefill_path_trace() {
+                eprintln!(
+                    "[prefill-path] id={id} band chunk_len={chunk_len} at seq_pos={} remaining={}",
+                    cursor.seq_pos,
+                    remaining.len(),
+                );
+            }
+            qwen35::forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                chunk,
+                cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            cursor.seq_pos += chunk_len;
+            if let Some(ref ev) = eviction {
+                if let Some(hipfire_runtime::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, cursor.seq_pos).unwrap()
+                {
+                    cursor.seq_pos = new_phys;
+                }
+            }
+            remaining = rest;
+        }
+    } else {
+        // A prefill failure here used to `.unwrap()`, which killed the
+        // whole daemon process — the client saw the socket close with no
+        // explanation. That is not hypothetical: the paged-MoE capability
+        // refusals (`unsupported moe.decode-*`) surface exactly here, so a
+        // configuration the runtime deliberately declines took down every
+        // other session on the worker. Report it and unwind like the other
+        // fallible steps in this function do.
+        if let Err(e) = qwen35::forward_prefill_batch(
+            gpu,
+            weights,
+            config,
+            tokens,
+            cursor.seq_pos,
+            kv,
+            dn,
+            scratch,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            // The caller reports and unwinds; this function does not own the
+            // session, so it cannot restore it.
+            return Err(format!("prefill failed: {e}"));
+        }
+        cursor.seq_pos += tokens.len();
+    }
+    Ok(tokens.len())
+}
+
 fn qwen35_decode_after_forward(
     gpu: &mut hipfire_rdna::Gpu,
     weights: &qwen35::Qwen35Weights,
@@ -4108,115 +4234,24 @@ pub fn generate_start(
                     m.eviction.is_some(),
                 );
             }
-            if kv.quant_kvarn {
-                // KVarN (and the deferred-hierarchical two-tier cache built on it)
-                // require the per-token attention dispatch (kv_cache_attention_dispatch):
-                // the batched forward_prefill_batch runs its own batched attention and
-                // never populates the KVarN window/records (nor the hier hot ring), so
-                // the prompt KV is wrong and decode degenerates. Prefill per-token via
-                // forward_scratch — the same path decode already uses below, and the one
-                // proven coherent for kvarn/hier (infer_qwen35). Slower prefill, but
-                // kvarn is a KV-memory mode, not a throughput one.
-                for &tok in &new_tokens {
-                    qwen35::forward_scratch(
-                        gpu,
-                        weights,
-                        config,
-                        tok,
-                        session.cursor.seq_pos,
-                        kv,
-                        dn,
-                        scratch,
-                    )
-                    .unwrap();
-                    session.cursor.seq_pos += 1;
-                }
-            } else if m.eviction.is_some() || prefill_band_tokens().is_some() {
-                // Chunked prefill. Two independent reasons to cut, and they
-                // compose by taking the smaller cut:
-                //
-                //   * eviction — chunk to the (budget+beta) window so physical
-                //     never exceeds `physical_cap`. A MEMORY bound.
-                //   * `HIPFIRE_PREFILL_BAND_TOKENS` — chunk so no single dispatch
-                //     runs longer than the operator will tolerate. A LATENCY
-                //     bound, and the one that makes a low-priority prefill
-                //     preemptible: each band ends at a committed KV boundary with
-                //     `seq_pos` advanced, which is exactly the state a second
-                //     conversation turn resumes from. Nothing extra is pinned.
-                //
-                // Previously this loop existed only when eviction was configured,
-                // so an operator who wanted a latency cap had to enable an unrelated
-                // memory feature to get one.
-                let band = prefill_band_tokens();
-                let window = m.eviction.as_ref().map(|ev| ev.budget() + ev.beta());
-                let mut remaining: &[u32] = &new_tokens;
-                while !remaining.is_empty() {
-                    let space = window
-                        .map(|w| w.saturating_sub(session.cursor.seq_pos).max(1))
-                        .unwrap_or(usize::MAX);
-                    let chunk_len = remaining.len().min(space).min(band.unwrap_or(usize::MAX));
-                    let (chunk, rest) = remaining.split_at(chunk_len);
-                    if prefill_path_trace() {
-                        eprintln!(
-                            "[prefill-path] id={id} band chunk_len={chunk_len} at seq_pos={} remaining={}",
-                            session.cursor.seq_pos,
-                            remaining.len(),
-                        );
-                    }
-                    qwen35::forward_prefill_batch(
-                        gpu,
-                        weights,
-                        config,
-                        chunk,
-                        session.cursor.seq_pos,
-                        kv,
-                        dn,
-                        scratch,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap();
-                    session.cursor.seq_pos += chunk_len;
-                    if let Some(ref ev) = m.eviction {
-                        if let Some(hipfire_runtime::triattn::EvictionResult {
-                            new_physical: new_phys,
-                            ..
-                        }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                        {
-                            session.cursor.seq_pos = new_phys;
-                        }
-                    }
-                    remaining = rest;
-                }
-            } else {
-                // A prefill failure here used to `.unwrap()`, which killed the
-                // whole daemon process — the client saw the socket close with no
-                // explanation. That is not hypothetical: the paged-MoE capability
-                // refusals (`unsupported moe.decode-*`) surface exactly here, so a
-                // configuration the runtime deliberately declines took down every
-                // other session on the worker. Report it and unwind like the other
-                // fallible steps in this function do.
-                if let Err(e) = qwen35::forward_prefill_batch(
-                    gpu,
-                    weights,
-                    config,
-                    &new_tokens,
-                    session.cursor.seq_pos,
-                    kv,
-                    dn,
-                    scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                ) {
-                    write_error(stdout, id, &format!("prefill failed: {e}"));
+            match qwen35_prefill_tokens(
+                gpu,
+                weights,
+                config,
+                scratch,
+                kv,
+                dn,
+                &mut session.cursor,
+                m.eviction.as_ref(),
+                &new_tokens,
+                id,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    write_error(stdout, id, &e);
                     qwen35_restore_or_error(stdout, id, m, gpu, session);
                     return Qwen35Start::Handled;
                 }
-                session.cursor.seq_pos += new_tokens.len();
             }
             session
                 .cursor
