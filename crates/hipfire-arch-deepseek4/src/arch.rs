@@ -359,10 +359,19 @@ impl DeepseekV4 {
         Ok(())
     }
 
-    /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
-    /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
-    /// quantizer stored F16 bytes. The conversion cost is one host-side
-    /// f16→f32 pass; norms are tiny (~4 KB each) so this is negligible.
+    /// Upload a small global HFQ tensor as F32 on GPU, accepting either F16 or
+    /// F32 on disk. Used for norms and attention sinks, where the kernel side
+    /// (`rmsnorm_f32`) wants F32 but the on-disk width depends on what the
+    /// source checkpoint carried.
+    ///
+    /// F32 is accepted because it occurs: DeepSeek-V4-Flash stores
+    /// `layers.*.attn.attn_sink` as F32, and requiring F16 rejected the whole
+    /// 82.8 GB artifact at load with `expected F16 bytes (128 = 2 × 64), got
+    /// 256`. These tensors are `[n_heads]` — 64 values — so the width costs
+    /// nothing either way and there is no reason to refuse one of them.
+    ///
+    /// The conversion is one host-side pass; norms are ~4 KB each and sinks are
+    /// 256 bytes, so it is negligible.
     fn upload_global_f16_as_f32(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -373,23 +382,35 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         let n: usize = shape.iter().product();
-        if bytes.len() != n * 2 {
+        let f32_vals: Vec<f32> = if bytes.len() == n * 2 {
+            (0..n)
+                .map(|i| {
+                    let lo = bytes[i * 2];
+                    let hi = bytes[i * 2 + 1];
+                    hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([lo, hi]))
+                })
+                .collect()
+        } else if bytes.len() == n * 4 {
+            (0..n)
+                .map(|i| {
+                    f32::from_le_bytes([
+                        bytes[i * 4],
+                        bytes[i * 4 + 1],
+                        bytes[i * 4 + 2],
+                        bytes[i * 4 + 3],
+                    ])
+                })
+                .collect()
+        } else {
             return Err(format!(
-                "deepseek4: '{name}' expected F16 bytes ({} = 2 × {}), got {}",
+                "deepseek4: '{name}' expected F16 ({} = 2 × {n}) or F32 ({} = 4 × {n}) bytes, got {}",
                 n * 2,
-                n,
+                n * 4,
                 bytes.len()
             ));
-        }
-        let f32_vals: Vec<f32> = (0..n)
-            .map(|i| {
-                let lo = bytes[i * 2];
-                let hi = bytes[i * 2 + 1];
-                hipfire_runtime::quant::f16_to_f32(u16::from_le_bytes([lo, hi]))
-            })
-            .collect();
+        };
         gpu.upload_f32(&f32_vals, &shape)
-            .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
+            .map_err(|e| format!("deepseek4: upload global '{name}' as f32 failed: {e:?}"))
     }
 
     pub fn load_weights_host_only_walk(
