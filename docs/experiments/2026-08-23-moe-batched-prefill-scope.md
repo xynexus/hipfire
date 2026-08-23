@@ -66,6 +66,29 @@ compact shared-expert support in the FFN body, then the admission in 1.
 **Not done here, and deliberately not half-done**: adding the admission without
 2 and 3 produces silently wrong numbers rather than an error.
 
+## Confirmed: no compact MoE path exists anywhere
+
+Checked the dispatch layer directly rather than inferring from prefill_chunk:
+
+- `FusedGateUp*` kernel keys exist for Hfq4G256, Mq3G256Lloyd, Mq4G256Lloyd,
+  Hfq6G256, Q4K, Q8_0, Hfq3G256, Hfp4G32, Oq4G256, Oq8G256 -- **no compact**.
+- `OqCompactG256` appears in dispatch only as GEMV entries
+  (`GemvOqCompactG256Prerotated`, `gemv_table.rs`) -- decode-side, not a fused
+  gate_up.
+- `kernels/src/` has no compact MoE kernel at all.
+
+So the shared-expert gate_up needs either a new fused compact kernel or a
+two-GEMM fallback through the generic compact path
+(`quantize_act_oq8_batched_interleaved` -> `gemm_oq_compact_grouped_prequant`),
+which is what the dense arms already do and is the cheaper route.
+
+**One hook worth using rather than hand-rolling:** `hipfire-dispatch/src/types.rs`
+already classifies `Oq4G256 | Oq8G256 | OqCompactG256 => RotationPlan::FwhtG256`
+(and `OqCompactG128 => FwhtG128`). The MoE arm's ad-hoc
+`let is_mq = matches!(.., MQ4G256 | MQ6G256)` is exactly the thing that should be
+asking `RotationPlan` instead -- the dtype->rotation mapping is already centralised
+and correct for compact, it is just not consulted here.
+
 ## Current state is safe
 
 With the veto removed, Qwen3.6-35B-A3B still declines -- correctly, on
