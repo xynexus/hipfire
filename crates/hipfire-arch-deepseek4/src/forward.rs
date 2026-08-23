@@ -8522,6 +8522,14 @@ fn mhc_pre_batched(
     )
     .map_err(|e| format!("hc_compute_control_batched l{layer_idx}: {e:?}"))?;
 
+    if layer_idx == 0 {
+        // Tag by phase: mhc_pre_batched runs TWICE per layer (attn, then ffn),
+        // and dump_buf writes one path per tag — an untagged dump silently shows
+        // the second call's state and reads as evidence about the first.
+        let ph = if is_attn { "attn" } else { "ffn" };
+        dump_buf(gpu, &format!("02a_l0_{ph}_hc_c_pre_alpha"), &pbs.hc_c_batch);
+        dump_buf(gpu, &format!("02a_l0_{ph}_streams_in"), &pbs.streams_batch);
+    }
     // 2. α-rescale c in place per batch.
     gpu.hc_apply_alpha_batched(&pbs.hc_c_batch, hc_scale, hc_base, batch_size as i32)
         .map_err(|e| format!("hc_apply_alpha_batched l{layer_idx}: {e:?}"))?;
