@@ -2128,10 +2128,58 @@ pub fn prefill_batch_pbs_eligible(
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
     // eight conditions, so the histogram cannot say which one.
     //
-    // Note the MoE-specific shape: a model with DeltaNetMoe/FullAttnMoe layers
-    // fails the `all(DeltaNet|FullAttn)` arm by construction, so for any MoE
-    // model batched prefill REQUIRES dn_state.quant == Q8.
+    // `all_layers_dense_la` is reported for context only -- it is NO LONGER a
+    // condition. It used to be, and it vetoed every MoE model before the
+    // per-layer MoE arms could be consulted.
+    // Name the FIRST layer that fails the per-layer term, and why. The
+    // aggregate below cannot: it is one `all(..)` over a match with five arms,
+    // so a false verdict says nothing about which arm or which dtype.
     if hipfire_rdna::kernel_trace::enabled() {
+        for (i, lw) in weights.layers.iter().enumerate() {
+            let (kind, ok, detail) = match lw {
+                LayerWeights::DeltaNet(l) => ("DeltaNet", true, format!("{:?}", l.wqkv.gpu_dtype)),
+                LayerWeights::FullAttn(_) => ("FullAttn", true, String::new()),
+                LayerWeights::DeltaNetMoe(l) => (
+                    "DeltaNetMoe",
+                    moe_ffn_batched_admissible(&l.ffn, arch),
+                    format!(
+                        "wqkv={:?} ffn_admissible={}",
+                        l.wqkv.gpu_dtype,
+                        moe_ffn_batched_admissible(&l.ffn, arch)
+                    ),
+                ),
+                LayerWeights::FullAttnMoe(l) => (
+                    "FullAttnMoe",
+                    moe_ffn_batched_admissible(&l.ffn, arch),
+                    format!(
+                        "wq={:?} ffn_admissible={}",
+                        l.wq.gpu_dtype,
+                        moe_ffn_batched_admissible(&l.ffn, arch)
+                    ),
+                ),
+            };
+            if !ok {
+                eprintln!("[kernel-trace] per-layer DECLINE at layer {i} ({kind}): {detail}");
+                let ffn = match lw {
+                    LayerWeights::DeltaNetMoe(l) => Some(&l.ffn),
+                    LayerWeights::FullAttnMoe(l) => Some(&l.ffn),
+                    _ => None,
+                };
+                if let Some(ffn) = ffn {
+                    if let Some(d) = MoePrefillDtypes::from_ffn(ffn) {
+                        eprintln!(
+                            "[kernel-trace]   dtypes router={:?} shared_gate={:?} shared_up={:?} shared_down={:?} expert_gate_up={:?} expert_down={:?} gu_uniform={} down_uniform={}",
+                            d.router, d.shared_expert_gate, d.shared_expert_up,
+                            d.shared_expert_down, d.expert_gate_up, d.expert_down,
+                            d.expert_gate_up_uniform, d.expert_down_uniform
+                        );
+                    } else {
+                        eprintln!("[kernel-trace]   MoePrefillDtypes::from_ffn returned None");
+                    }
+                }
+                break;
+            }
+        }
         let all_dense_la = weights
             .layers
             .iter()
@@ -2144,10 +2192,20 @@ pub fn prefill_batch_pbs_eligible(
     !force_fallback
         && n >= MIN_BATCH
         && matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16)
-        && (weights
-                .layers
-                .iter()
-                .all(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_))))
+        // NOTE: there used to be an `all(DeltaNet | FullAttn)` term here, which
+        // rejected every MoE model outright -- and therefore made the
+        // DeltaNetMoe / FullAttnMoe arms of the per-layer `all(..)` below DEAD
+        // CODE, permanently. Those arms are complete: they check moe_topk_ok,
+        // moe_router_logits_present, the projection dtypes, and
+        // moe_ffn_batched_admissible. prefill_chunk.rs has the matching
+        // `(LayerWeights::DeltaNetMoe(..), LinearAttention)` and
+        // `(LayerWeights::FullAttnMoe(..), FullAttention)` bodies.
+        //
+        // Measured on Qwen3.6-35B-A3B before removal: every MoE-specific input
+        // passed -- moe_topk_ok=true (K=8, E=256), router_logits=true,
+        // dn_quant=FP32, n=720 -- and only all_layers_dense_la=false declined it.
+        // The per-layer term below is the real gate; this one was a blanket veto
+        // sitting in front of it.
         && weights.layers.iter().any(|lw| matches!(
             lw,
             LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
