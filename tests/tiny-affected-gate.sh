@@ -311,25 +311,72 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
+# Every selected gate runs, and the verdict is aggregated afterwards.
+#
+# These gates were previously chained on `[ "$status" -eq 0 ]`, so the FIRST
+# non-zero exit skipped every later one. That silently included exit 3, which
+# per this script's own header means "inconclusive", not "failed" — so two
+# missing `qwen3_5_moe_indexed` baselines were enough to stop the state, spec
+# and prefill gates from running at all, and their coverage had to be obtained
+# by invoking them by hand. A run that reports nothing about three of four
+# gates is worse than a slow one.
+#
+# `status` holds the worst hard failure (1 = failed, 2 = infrastructure);
+# `inconclusive` records that some gate could not reach a verdict. A hard
+# failure outranks an inconclusive row in the final exit code.
 status=0
+inconclusive=0
+
+# Classify one gate's exit: 0 pass, 3 inconclusive, anything else a failure.
+# Sets `status` / `inconclusive` in the caller's scope.
+classify_gate() {
+    local label=$1 rc=$2
+    case "$rc" in
+        0) ;;
+        3)
+            inconclusive=1
+            echo "tiny-affected-gate: $label INCONCLUSIVE (exit 3)"
+            ;;
+        *)
+            [ "$status" -eq 0 ] && status=$rc
+            echo "tiny-affected-gate: $label FAILED (exit $rc)"
+            ;;
+    esac
+}
+
 if [ "$RUN_QUANT" -eq 1 ]; then
-    HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-quant-gate.sh || status=$?
+    HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-quant-gate.sh
+    classify_gate tiny-quant $?
 fi
-if [ "$status" -eq 0 ] && [ "$RUN_STATE" -eq 1 ]; then
-    HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-state-gate.sh || status=$?
+if [ "$RUN_STATE" -eq 1 ]; then
+    HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-state-gate.sh
+    classify_gate tiny-state $?
 fi
-if [ "$status" -eq 0 ] && [ "$RUN_SPEC" -eq 1 ]; then
-    ./tests/tiny-spec-gate.sh || status=$?
+if [ "$RUN_SPEC" -eq 1 ]; then
+    ./tests/tiny-spec-gate.sh
+    classify_gate tiny-spec $?
 fi
-if [ "$status" -eq 0 ] && [ "$RUN_PREFILL" -eq 1 ]; then
-    # Exit 3 here means "no batched-prefill family selected", which is not a
-    # failure — the other gates still carry the verdict.
+if [ "$RUN_PREFILL" -eq 1 ]; then
+    # Exit 3 here means "no batched-prefill family selected", which is not even
+    # inconclusive — the other gates still carry the verdict. So this one gate
+    # keeps its own rule rather than going through classify_gate.
     HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-prefill-gate.sh
     prefill_status=$?
-    [ "$prefill_status" -eq 3 ] || status=$prefill_status
+    if [ "$prefill_status" -ne 0 ] && [ "$prefill_status" -ne 3 ]; then
+        [ "$status" -eq 0 ] && status=$prefill_status
+        echo "tiny-affected-gate: tiny-prefill FAILED (exit $prefill_status)"
+    fi
 fi
-if [ "$status" -eq 0 ] && [ "$UNCOVERED" -eq 1 ]; then
+
+if [ "$status" -ne 0 ]; then
+    exit "$status"
+fi
+if [ "$UNCOVERED" -eq 1 ]; then
     echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
     exit 3
 fi
-exit "$status"
+if [ "$inconclusive" -eq 1 ]; then
+    echo "tiny-affected-gate: INCONCLUSIVE -> some gate reached no verdict"
+    exit 3
+fi
+exit 0
