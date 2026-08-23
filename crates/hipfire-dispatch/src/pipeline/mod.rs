@@ -1055,6 +1055,37 @@ pub fn run_moe_decode_bias_aware(
         p.route_scale,
     ))?;
 
+    // 1b. Paged residency. Mirrors `run_moe_decode`'s use of the same provider:
+    //     read the chosen experts back, make them resident, and let the pager
+    //     patch its registered pointer tables. Must sit between the top-K above
+    //     and the indexed GEMV below, which dereferences those tables.
+    //
+    //     Only runs when a provider is attached, i.e. paged models. Fully
+    //     resident models pay nothing and keep top-K entirely on-device.
+    if let Some(residency) = p.expert_residency {
+        hip!(gpu.bind_thread())?;
+        let mut idx = vec![0i32; p.k_top];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k_top * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let selected: Vec<u32> = idx
+            .iter()
+            .filter(|v| **v >= 0 && (**v as usize) < p.n_exp)
+            .map(|v| *v as u32)
+            .collect();
+        // An index outside [0, n_exp) means the bias-aware top-K produced
+        // garbage; dispatching would index the pointer table out of bounds.
+        // Refuse by name rather than faulting the device.
+        if selected.len() != idx.len() {
+            return Err(DispatchError::Hip(format!(
+                "deepseek4 bias-aware top-k produced an out-of-range expert index \
+                 (n_exp={}, got {:?})",
+                p.n_exp, idx
+            )));
+        }
+        residency.ensure_resident(gpu, p.layer_idx, &selected)?;
+    }
+
     // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
     //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
     hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(

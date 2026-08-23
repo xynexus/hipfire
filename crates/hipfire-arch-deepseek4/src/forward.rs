@@ -3741,6 +3741,13 @@ fn ffn_routed(
         // `out += ...`, so a zeroed partial yields exactly the routed sum.
         let out_target = routed_out.unwrap_or(ffn_out);
         let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
+            layer_idx,
+            // deepseek4 uploads every expert resident today, so there is no
+            // pager to consult. This is the seam §M5 Phase 4 needs: once the
+            // loader registers modules and pointer tables, this becomes
+            // `Some(provider)` and the dispatch pages instead of requiring the
+            // whole 82.8 GB to fit.
+            expert_residency: None,
             hidden: cfg.hidden_size,
             mi: im,
             k_top,
