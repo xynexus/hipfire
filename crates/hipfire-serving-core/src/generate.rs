@@ -1978,6 +1978,59 @@ pub enum Qwen35Step {
 /// operation is the code that was there before, so output is byte-identical by
 /// construction rather than by argument.
 #[allow(clippy::too_many_arguments)]
+/// §M7's sample half, lifted verbatim out of `qwen35_decode_one`.
+///
+/// This is the second of the two halves a batched step needs. The forward that
+/// produced `scratch.logits` has already run; everything here is per-stream and
+/// touches no GPU weights — the attractor block list, the per-stream
+/// `SamplerConfig`, the RNG. That is precisely the state a batched driver must
+/// keep with each `Qwen35Generation` rather than reimplement against a shared
+/// envelope, and making it a function is what lets N handles each sample from
+/// their own logits after one shared forward.
+///
+/// Note this is the NORMAL path's sample. The budget-alert nudge samples
+/// separately at its own site and then issues extra single-token forwards, so a
+/// batched round must exclude a stream that is about to fire one.
+fn qwen35_sample_next(
+    gpu: &mut hipfire_rdna::Gpu,
+    scratch: &qwen35::Qwen35Scratch,
+    cursor: &crate::session::SessionCursor,
+    cfg: &Qwen35DecodeCfg,
+    st: &mut Qwen35DecodeState,
+) {
+    // Decide which paired-opener tokens (if any) trip the depth
+    // threshold over a 20-token window. #111 attractor block —
+    // cheap when not tripped, ~5 µs per blocked token when
+    // tripped (single 4-byte H2D into the logits buffer
+    // performed inside sampler::sample).
+    let ngram_scope = &cursor.conversation_tokens[cfg.ngram_scope_start..];
+    let mut blocked: Vec<u32> = Vec::new();
+    collect_unclosed_attractor_blocks(ngram_scope, &cfg.attractor_pairs, 20, 2, &mut blocked);
+    let sampler_cfg = SamplerConfig {
+        temperature: cfg.temperature,
+        top_p: cfg.top_p,
+        top_k: cfg.top_k,
+        repeat_penalty: cfg.repeat_penalty,
+        repeat_window: cfg.repeat_buf_cap,
+        presence_penalty: cfg.presence_penalty,
+        frequency_penalty: cfg.frequency_penalty,
+        blocked_tokens: blocked,
+    };
+    // GPU sample: reads scratch.logits (already on GPU), writes
+    // token+rng to scratch.sample_buf. Blocks only on the 8-byte
+    // D2H readback inside sampler::sample.
+    st.next_token = sampler::sample(
+        gpu,
+        &scratch.logits,
+        &scratch.sample_buf,
+        &scratch.repeat_buf,
+        cfg.vocab_size,
+        ngram_scope,
+        &sampler_cfg,
+        &mut st.rng_state,
+    );
+}
+
 fn qwen35_decode_one(
     gpu: &mut hipfire_rdna::Gpu,
     weights: &qwen35::Qwen35Weights,
@@ -2305,37 +2358,7 @@ fn qwen35_decode_one(
         }
     }
 
-    // Decide which paired-opener tokens (if any) trip the depth
-    // threshold over a 20-token window. #111 attractor block —
-    // cheap when not tripped, ~5 µs per blocked token when
-    // tripped (single 4-byte H2D into the logits buffer
-    // performed inside sampler::sample).
-    let ngram_scope = &cursor.conversation_tokens[cfg.ngram_scope_start..];
-    let mut blocked: Vec<u32> = Vec::new();
-    collect_unclosed_attractor_blocks(ngram_scope, &cfg.attractor_pairs, 20, 2, &mut blocked);
-    let sampler_cfg = SamplerConfig {
-        temperature: cfg.temperature,
-        top_p: cfg.top_p,
-        top_k: cfg.top_k,
-        repeat_penalty: cfg.repeat_penalty,
-        repeat_window: cfg.repeat_buf_cap,
-        presence_penalty: cfg.presence_penalty,
-        frequency_penalty: cfg.frequency_penalty,
-        blocked_tokens: blocked,
-    };
-    // GPU sample: reads scratch.logits (already on GPU), writes
-    // token+rng to scratch.sample_buf. Blocks only on the 8-byte
-    // D2H readback inside sampler::sample.
-    st.next_token = sampler::sample(
-        gpu,
-        &scratch.logits,
-        &scratch.sample_buf,
-        &scratch.repeat_buf,
-        cfg.vocab_size,
-        ngram_scope,
-        &sampler_cfg,
-        &mut st.rng_state,
-    );
+    qwen35_sample_next(gpu, scratch, cursor, cfg, st);
     Qwen35Step::Continue
 }
 

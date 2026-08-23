@@ -479,10 +479,7 @@ fn parse_ldlq_report(stderr: &str) -> Option<LdlqReport> {
     let pooled = stderr
         .lines()
         .find(|l| l.contains("LDLQ pooled:"))
-        .and_then(|l| {
-            l.split_whitespace()
-                .find_map(|t| t.parse::<u64>().ok())
-        })
+        .and_then(|l| l.split_whitespace().find_map(|t| t.parse::<u64>().ok()))
         .unwrap_or(0);
     Some(LdlqReport {
         success: field("success="),
