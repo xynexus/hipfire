@@ -29,6 +29,39 @@ use hipfire_runtime::hfq::{
 /// The marker is zero-sized; trait dispatch uses the type, not a value.
 pub struct DeepseekV4;
 
+/// IEEE-754 binary32 -> binary16, round-to-nearest-even, with overflow to inf
+/// and subnormal support. Local because the runtime exposes only f16 -> f32.
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xff) as i32;
+    let mut mant = (bits & 0x007f_ffff) as u32;
+    if exp == 0xff {
+        // Inf or NaN. Preserve NaN-ness with a non-zero payload.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    exp -= 127 - 15;
+    if exp >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow -> signed zero
+        }
+        mant |= 0x0080_0000;
+        let shift = (14 - exp) as u32;
+        let round = 1u32 << (shift - 1);
+        let sub = (mant + round - 1 + ((mant >> shift) & 1)) >> shift;
+        return sign | sub as u16;
+    }
+    let round = mant & 0x1fff;
+    let mut half = ((exp as u32) << 10) | (mant >> 13);
+    if round > 0x1000 || (round == 0x1000 && (half & 1) == 1) {
+        half += 1; // ties-to-even; a carry into the exponent is correct
+    }
+    sign | half as u16
+}
+
 impl DeepseekV4 {
     /// Phase 1.5 walk: verify every expected DeepSeek V4 tensor is present in
     /// the HFQ index. No GPU upload. Returns a populated `Weights` with
@@ -416,6 +449,54 @@ impl DeepseekV4 {
     ///
     /// The conversion is one host-side pass; norms are ~4 KB each and sinks are
     /// 256 bytes, so it is negligible.
+    /// Upload a global whose KERNEL contract is `__half`, converting when the
+    /// artifact stores it F32.
+    ///
+    /// `upload_global_raw` sends bytes through untouched, so an F32 tensor bound
+    /// to a `const __half*` parameter is reinterpreted, not converted. That is
+    /// not a benign precision issue: over a 16384-wide dot product the odds that
+    /// no 16-bit half-word lands on the all-ones exponent are ~(31/32)^8192, so
+    /// essentially every output is NaN. DeepSeek-V4-Flash stores the six
+    /// hyper-connection globals F32 and every control value came out NaN in
+    /// layer-0 prefill.
+    fn upload_global_as_f16(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data_pread(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        let n: usize = shape.iter().product();
+        if bytes.len() == n * 2 {
+            // Already F16: the kernel contract is met, send it as-is.
+            return gpu
+                .upload_raw(&bytes, &shape)
+                .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"));
+        }
+        if bytes.len() != n * 4 {
+            return Err(format!(
+                "deepseek4: '{name}' expected F16 ({} = 2 × {n}) or F32 ({} = 4 × {n}) bytes, got {}",
+                n * 2,
+                n * 4,
+                bytes.len()
+            ));
+        }
+        let mut half_bytes = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = f32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ]);
+            half_bytes.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        gpu.upload_raw(&half_bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' as f16 failed: {e:?}"))
+    }
+
     fn upload_global_f16_as_f32(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -817,8 +898,8 @@ impl DeepseekV4 {
         weights.head = Some(Self::upload_quant_or_f16(hfq, gpu, "head.weight")?);
 
         // Head HC mix tensors — F16 raw on GPU; scale is scalar host-side.
-        weights.hc_head_fn = Some(Self::upload_global_raw(hfq, gpu, "hc_head_fn")?);
-        weights.hc_head_base = Some(Self::upload_global_raw(hfq, gpu, "hc_head_base")?);
+        weights.hc_head_fn = Some(Self::upload_global_as_f16(hfq, gpu, "hc_head_fn")?);
+        weights.hc_head_base = Some(Self::upload_global_as_f16(hfq, gpu, "hc_head_base")?);
         {
             let (info, bytes) = hfq
                 .tensor_data_pread("hc_head_scale")
@@ -999,32 +1080,32 @@ impl DeepseekV4 {
             }
 
             // Hyper-Connections (F16 small matrices).
-            layer.hc_attn_base = Some(Self::upload_global_raw(
+            layer.hc_attn_base = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_base"),
             )?);
-            layer.hc_attn_fn = Some(Self::upload_global_raw(
+            layer.hc_attn_fn = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_fn"),
             )?);
-            layer.hc_attn_scale = Some(Self::upload_global_raw(
+            layer.hc_attn_scale = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_scale"),
             )?);
-            layer.hc_ffn_base = Some(Self::upload_global_raw(
+            layer.hc_ffn_base = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_base"),
             )?);
-            layer.hc_ffn_fn = Some(Self::upload_global_raw(
+            layer.hc_ffn_fn = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_fn"),
             )?);
-            layer.hc_ffn_scale = Some(Self::upload_global_raw(
+            layer.hc_ffn_scale = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_scale"),
@@ -1197,28 +1278,28 @@ impl DeepseekV4 {
                 )?);
 
                 // HC blocks (same shape as main layer).
-                mtp.hc_attn_base = Some(Self::upload_global_raw(
+                mtp.hc_attn_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_base",
                 )?);
-                mtp.hc_attn_fn = Some(Self::upload_global_raw(
+                mtp.hc_attn_fn = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_fn",
                 )?);
-                mtp.hc_attn_scale = Some(Self::upload_global_raw(
+                mtp.hc_attn_scale = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_scale",
                 )?);
-                mtp.hc_ffn_base = Some(Self::upload_global_raw(
+                mtp.hc_ffn_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_ffn_base",
                 )?);
-                mtp.hc_ffn_fn = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
-                mtp.hc_ffn_scale = Some(Self::upload_global_raw(
+                mtp.hc_ffn_fn = Some(Self::upload_global_as_f16(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
+                mtp.hc_ffn_scale = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_ffn_scale",
@@ -1286,12 +1367,12 @@ impl DeepseekV4 {
                 // proves MTP was trained WITH head-HC mix on its lm_head path —
                 // the v3 paper's "logits = OutHead @ norm(h_i^k)" should be
                 // read with norm(h_i^k) = norm(head_hc_mix(streams)) on DeepSeek V4.
-                mtp.mtp_hc_head_fn = Some(Self::upload_global_raw(
+                mtp.mtp_hc_head_fn = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_head_fn",
                 )?);
-                mtp.mtp_hc_head_base = Some(Self::upload_global_raw(
+                mtp.mtp_hc_head_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_head_base",
@@ -1467,6 +1548,39 @@ impl DeepseekV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `upload_global_as_f16` exists because F32 bytes bound to a `const
+    /// __half*` are reinterpreted, not converted. Check the conversion against
+    /// `f16_to_f32` (the runtime's existing inverse) plus the edge cases that
+    /// distinguish a real implementation from a truncating one.
+    #[test]
+    fn f32_to_f16_bits_round_trips_through_the_runtime_inverse() {
+        for v in [
+            0.0f32, -0.0, 1.0, -1.0, 0.5, -0.03125, 2048.0, -2048.0, 0.029747, 1.2138, 2.200491,
+            65504.0,   // largest finite half
+            -65504.0,
+            6.1035156e-5, // smallest normal half
+        ] {
+            let back = hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(v));
+            assert!(
+                (back - v).abs() <= v.abs() * 1e-3 + 1e-7,
+                "round trip {v} -> {back}"
+            );
+        }
+        // Overflow saturates to infinity rather than wrapping to a NaN pattern,
+        // which is the failure that motivated this helper.
+        assert_eq!(f32_to_f16_bits(1.0e30), 0x7c00);
+        assert_eq!(f32_to_f16_bits(-1.0e30), 0xfc00);
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        // Underflow gives signed zero, not a denormal-shaped NaN.
+        assert_eq!(f32_to_f16_bits(1.0e-30), 0x0000);
+        assert_eq!(f32_to_f16_bits(-1.0e-30), 0x8000);
+        // NaN stays NaN.
+        assert!(hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+        // Subnormal halves are representable, not flushed.
+        let sub = hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(1.0e-7));
+        assert!(sub > 0.0 && sub < 1.0e-6, "subnormal flushed: {sub}");
+    }
 
     #[test]
     fn deepseek4_arch_id_is_nine() {
