@@ -1171,6 +1171,14 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
     )> = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(s) = daemon_state.streams.get_mut(id) {
+            // A prefilling stream has no decodable token yet. Leaving it in the
+            // table hands it to the round-robin pass, which advances it one
+            // prefill band per quantum. Taking it here would be worse than
+            // useless: the caller skips whatever this batch claims, so the
+            // stream's prefill would never advance at all.
+            if s.generation.as_ref().is_some_and(|g| g.is_prefilling()) {
+                continue;
+            }
             if let Some(g) = s.generation.take() {
                 taken.push((
                     id,
@@ -1369,6 +1377,7 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
     if !stream::executor_v2_enabled() {
         return;
     }
+    stream::warn_if_banding_without_priority();
     let batched: Vec<stream::StreamId> = if stream::executor_batched_enabled() {
         march_streams_batched(daemon_state)
     } else {

@@ -2779,6 +2779,17 @@ pub struct Qwen35Generation {
     /// `Some` while this stream owns the session; `None` while it is parked
     /// back in the model's resident slot. Only one place holds it at a time.
     session: Option<Qwen35RequestSessionState>,
+    /// Prompt tokens not yet prefilled. NON-EMPTY means this handle is still in
+    /// its prefill phase and `st.next_token` is NOT yet meaningful — nothing may
+    /// read it until the last band drains and `tok0` is sampled.
+    ///
+    /// Prefill used to run to completion inside `generate_start`, which made it
+    /// one indivisible unit ahead of the executor and put a whole prompt's
+    /// latency in front of any higher-priority stream. Carrying the remainder
+    /// here lets `step` advance it one band at a time, so the march's existing
+    /// priority ordering interleaves it — no suspend/resume machinery needed,
+    /// because a band boundary is already a committed KV state.
+    prefill_pending: Vec<u32>,
     st: Qwen35DecodeState,
     cfg: Qwen35DecodeCfg,
     /// The ChatML `\n` tokens; `finish` forwards them when the turn ended on
@@ -2802,6 +2813,77 @@ impl Qwen35Generation {
     /// per step rather than captured once, which is what §M3b1 asks for: the
     /// moment the march loop can hand `&mut LoadedModel` to another stream
     /// between quanta, a captured snapshot and a per-use read stop agreeing.
+    /// Advance the prefill by one band. Returns `Continue` until the prompt is
+    /// drained, then samples `tok0` and hands the handle over to decoding.
+    ///
+    /// The band size is `HIPFIRE_PREFILL_BAND_TOKENS`; unset means the whole
+    /// remaining prompt in one call, which is the pre-existing behaviour moved
+    /// under the march rather than a new cost.
+    fn prefill_band(
+        &mut self,
+        m: &LoadedModel,
+        gpu: &mut hipfire_rdna::Gpu,
+        id: &str,
+    ) -> Qwen35Step {
+        let config = m.q35_config.as_ref().unwrap();
+        let weights = m.q35_weights.as_ref().unwrap();
+        let scratch = m.q35_scratch.as_ref().unwrap();
+        let band = prefill_band_tokens().unwrap_or(usize::MAX);
+        let take = self.prefill_pending.len().min(band);
+        let chunk: Vec<u32> = self.prefill_pending[..take].to_vec();
+        let session = self
+            .session
+            .as_mut()
+            .expect("stream must be resumed before it is stepped");
+        let kv = session
+            .sequence_state
+            .kv
+            .as_mut()
+            .expect("qwen35 session always has KV");
+        let dn = session
+            .sequence_state
+            .recurrent
+            .as_mut()
+            .expect("qwen35 session has DeltaNet state")
+            .as_any_mut()
+            .downcast_mut::<qwen35::DeltaNetState>()
+            .expect("qwen35 session recurrent state is DeltaNetState");
+        if let Err(e) = qwen35_prefill_tokens(
+            gpu,
+            weights,
+            config,
+            scratch,
+            kv,
+            dn,
+            &mut session.cursor,
+            m.eviction.as_ref(),
+            &chunk,
+            id,
+        ) {
+            return Qwen35Step::Failed(e);
+        }
+        // Record the band's tokens as they commit, not the whole prompt at the
+        // end. `cfg.ngram_scope_start` was set to index PAST the prompt, so by
+        // the time the last band drains, `conversation_tokens.len()` has reached
+        // exactly that index and the first sample sees an empty scope — the same
+        // scope the inline path gave it.
+        session.cursor.conversation_tokens.extend_from_slice(&chunk);
+        self.prefill_pending.drain(..take);
+        if !self.prefill_pending.is_empty() {
+            return Qwen35Step::Continue;
+        }
+        qwen35_sample_next_from(
+            gpu,
+            &scratch.logits,
+            scratch,
+            &mut session.cursor,
+            &self.cfg,
+            &mut self.st,
+        );
+        self.t_prefill = Instant::now();
+        Qwen35Step::Continue
+    }
+
     pub fn step(
         &mut self,
         m: &LoadedModel,
@@ -2813,6 +2895,16 @@ impl Qwen35Generation {
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();
         let scratch = m.q35_scratch.as_ref().unwrap();
+        // Prefill phase: advance ONE band and return. The march gives the next
+        // quantum to whichever stream its priority order picks, so a
+        // higher-priority arrival overtakes here instead of waiting out the whole
+        // prompt. The band boundary is a committed KV state — `seq_pos` advanced,
+        // K/V and recurrent written — which is what a continued conversation turn
+        // resumes from, so stopping between bands preserves nothing extra and
+        // loses nothing.
+        if !self.prefill_pending.is_empty() {
+            return self.prefill_band(m, gpu, id);
+        }
         // Disjoint field paths: kv and recurrent are distinct fields of
         // session.sequence_state, and cursor is a third field of session.
         let session = self
@@ -3114,6 +3206,15 @@ impl Qwen35Generation {
         Ok(())
     }
 
+    /// Still in the prefill phase, so `st.next_token` is not yet meaningful and
+    /// this stream cannot contribute a row to a decode batch. The batched march
+    /// must leave it to the round-robin pass — marking it stepped in a batch it
+    /// did not join would starve its prefill, because the caller skips whatever
+    /// the batch claims.
+    pub fn is_prefilling(&self) -> bool {
+        !self.prefill_pending.is_empty()
+    }
+
     pub fn should_continue(&self) -> bool {
         self.st.generated < self.cfg.max_tokens
     }
@@ -3127,6 +3228,7 @@ impl Qwen35Generation {
     ) {
         let Qwen35Generation {
             session,
+            prefill_pending: _,
             st,
             cfg,
             nl,
@@ -3204,6 +3306,20 @@ pub enum Qwen35Start {
 /// Log which prefill arm each request takes (`HIPFIRE_PREFILL_PATH_TRACE`).
 fn prefill_path_trace() -> bool {
     std::env::var("HIPFIRE_PREFILL_PATH_TRACE").is_ok()
+}
+
+/// Run prefill inside the march loop instead of the frame handler
+/// (`HIPFIRE_MARCH_PREFILL`).
+///
+/// Off by default while it earns trust: it moves the single most
+/// correctness-sensitive step in the request onto a different schedule, and the
+/// failure mode — a first-sample n-gram scope taken before rather than after the
+/// prompt is recorded — is silent divergence rather than an error.
+fn march_driven_prefill() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_MARCH_PREFILL").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 fn prefill_band_tokens() -> Option<usize> {
@@ -4227,37 +4343,47 @@ pub fn generate_start(
                     "single_dispatch"
                 };
                 eprintln!(
-                    "[prefill-path] id={id} arm={arm} tokens={} seq_pos={} band={:?} eviction={}",
+                    "[prefill-path] id={id} arm={arm} tokens={} seq_pos={} band={:?} eviction={} march={}",
                     new_tokens.len(),
                     session.cursor.seq_pos,
                     prefill_band_tokens(),
                     m.eviction.is_some(),
+                    march_driven_prefill(),
                 );
             }
-            match qwen35_prefill_tokens(
-                gpu,
-                weights,
-                config,
-                scratch,
-                kv,
-                dn,
-                &mut session.cursor,
-                m.eviction.as_ref(),
-                &new_tokens,
-                id,
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    write_error(stdout, id, &e);
-                    qwen35_restore_or_error(stdout, id, m, gpu, session);
-                    return Qwen35Start::Handled;
+            if !march_driven_prefill() {
+                match qwen35_prefill_tokens(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    kv,
+                    dn,
+                    &mut session.cursor,
+                    m.eviction.as_ref(),
+                    &new_tokens,
+                    id,
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        write_error(stdout, id, &e);
+                        qwen35_restore_or_error(stdout, id, m, gpu, session);
+                        return Qwen35Start::Handled;
+                    }
                 }
+                session
+                    .cursor
+                    .conversation_tokens
+                    .extend_from_slice(&new_tokens);
             }
-            session
-                .cursor
-                .conversation_tokens
-                .extend_from_slice(&new_tokens);
         }
+        // Deferred prefill carries the prompt on the handle instead. The extend
+        // above and the sample below both move to the transition in `step`.
+        let deferred_prefill: Vec<u32> = if prefill_already_done || !march_driven_prefill() {
+            Vec::new()
+        } else {
+            new_tokens.clone()
+        };
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
         // prompt). Prior design included the user's prompt as an anti-loop
@@ -4272,7 +4398,12 @@ pub fn generate_start(
                 .len()
                 .saturating_sub(session.prefilled_generated_suffix_len)
         } else {
-            session.cursor.conversation_tokens.len()
+            // Deferred prefill has NOT extended `conversation_tokens` yet, and
+            // this index must describe the state after it does — the first
+            // sample's n-gram scope is empty by construction (`#111`), and it
+            // stops being empty if the index is taken before the extend. The
+            // extend is deterministic, so add its length here.
+            session.cursor.conversation_tokens.len() + deferred_prefill.len()
         };
         session.prefilled_generated_suffix_len = 0;
 
@@ -4298,7 +4429,14 @@ pub fn generate_start(
             .collect();
 
         // First sample: use conversation so far as scope.
-        let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
+        // Clamp: under march-driven prefill `ngram_scope_start` deliberately
+        // indexes PAST a `conversation_tokens` the deferred prefill has not
+        // written yet, so slicing it raw panics. The clamped slice is empty,
+        // which is correct — `cfg0` below is only consumed when prefill already
+        // ran, and `step` re-derives the scope from `cfg.ngram_scope_start` once
+        // the prompt is recorded.
+        let ngram_scope = &session.cursor.conversation_tokens
+            [ngram_scope_start.min(session.cursor.conversation_tokens.len())..];
         // #111 attractor block: empty `ngram_scope` on first sample (no
         // generated tokens yet), so the unclosed-depth is always 0 and
         // `blocked` is empty. Still call collect_* for symmetry with
@@ -4321,16 +4459,25 @@ pub fn generate_start(
             frequency_penalty,
             blocked_tokens: blocked0,
         };
-        let tok0 = sampler::sample(
-            gpu,
-            &scratch.logits,
-            &scratch.sample_buf,
-            &scratch.repeat_buf,
-            vocab_size,
-            ngram_scope,
-            &cfg0,
-            &mut rng_state,
-        );
+        // Under march-driven prefill nothing has run yet, so there are no logits
+        // to sample from. `st.next_token` stays a placeholder that NOTHING may
+        // read while `prefill_pending` is non-empty; `step` fills it in on the
+        // band that drains the prompt, using the same `cfg` fields this block
+        // would have used.
+        let tok0 = if !deferred_prefill.is_empty() {
+            0
+        } else {
+            sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                vocab_size,
+                ngram_scope,
+                &cfg0,
+                &mut rng_state,
+            )
+        };
         // First token is ready (sample_top_p's D2H forces GPU sync). This is
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
@@ -4343,6 +4490,7 @@ pub fn generate_start(
         // so the cap is rechecked at each loop start.
         return Qwen35Start::Ready(Qwen35Generation {
             session: Some(session),
+            prefill_pending: deferred_prefill,
             st: Qwen35DecodeState {
                 rng_state,
                 next_token: tok0,
