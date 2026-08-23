@@ -3646,6 +3646,24 @@ impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'
                 .ensure_expert_module_resident(key, gpu)
                 .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
         }
+        // Admitting expert k can evict expert 1 of the same selection, and
+        // eviction NULLS that expert's slot in the device pointer table — the
+        // indexed GEMV would then read a null pointer for a live routing choice.
+        // Newly admitted modules sit at the LRU back so this should be
+        // unreachable; verify rather than assume, because the symptom is a
+        // silently different output, not a fault.
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            if !pager.is_expert_module_resident(key) {
+                return Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "deepseek4 l{layer}: expert {expert} was evicted by its own \
+                     selection's admission loop (selected={selected:?})"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -3703,7 +3721,13 @@ fn ffn_routed(
             .unwrap_or(2.2)
     });
 
-    if layer.expert_gate_up_blob.is_some() {
+    // Gate on the PTR TABLES, not the blob. The dispatch below reads only
+    // `expert_gate_up_ptrs` / `expert_w2_ptrs`; the blob merely owns the memory
+    // behind them in the fully-resident case. Under paged experts the pager owns
+    // that memory and fills the same tables, so a blob check sent every paged
+    // layer to the dead per-expert fallback — decode died at the first MoE layer
+    // with "no separate w1/w3 blobs".
+    if layer.expert_gate_up_ptrs.is_some() && layer.expert_w2_ptrs.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
         // k_top per-expert silu_clamp+rotate. Replaces the per-expert
         // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
@@ -8166,6 +8190,13 @@ fn ffn_batched(
             .map_err(|e| format!("deepseek4_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
         }
     }
+    // Same provider the decode path builds; prefill needs it for the same
+    // reason. `None` on a fully-resident model, so dispatch is unchanged there.
+    let prefill_residency = weights
+        .pager
+        .as_ref()
+        .map(|pager| PagerExpertResidency { pager });
+
     let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
         hidden,
         mi: im,
@@ -8175,6 +8206,9 @@ fn ffn_batched(
         route_scale,
         swiglu_limit: cfg.swiglu_limit,
         layer_idx,
+        expert_residency: prefill_residency
+            .as_ref()
+            .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
         routing,
         scores: &pbs.moe_scores_batch,
         topk_indices: &pbs.moe_topk_indices_batch,
@@ -8516,6 +8550,14 @@ fn mhc_pre_batched(
     )
     .map_err(|e| format!("hc_compute_control_batched l{layer_idx}: {e:?}"))?;
 
+    if layer_idx == 0 {
+        // Tag by phase: mhc_pre_batched runs TWICE per layer (attn, then ffn),
+        // and dump_buf writes one path per tag — an untagged dump silently shows
+        // the second call's state and reads as evidence about the first.
+        let ph = if is_attn { "attn" } else { "ffn" };
+        dump_buf(gpu, &format!("02a_l0_{ph}_hc_c_pre_alpha"), &pbs.hc_c_batch);
+        dump_buf(gpu, &format!("02a_l0_{ph}_streams_in"), &pbs.streams_batch);
+    }
     // 2. α-rescale c in place per batch.
     gpu.hc_apply_alpha_batched(&pbs.hc_c_batch, hc_scale, hc_base, batch_size as i32)
         .map_err(|e| format!("hc_apply_alpha_batched l{layer_idx}: {e:?}"))?;

@@ -1440,6 +1440,13 @@ impl WeightPager {
         Ok(())
     }
 
+    /// Is this expert module currently resident? Lets a caller verify that a
+    /// whole top-k selection survived its own admission loop — admitting the
+    /// last expert can evict an earlier one, and the evicted slot is nulled.
+    pub fn is_expert_module_resident(&self, key: ExpertModuleKey) -> bool {
+        self.resident_modules.contains_key(&key)
+    }
+
     pub fn ensure_expert_module_resident(
         &mut self,
         key: ExpertModuleKey,

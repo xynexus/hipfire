@@ -1300,6 +1300,178 @@ non-`RoutedExpert` module kinds (M5c).
 byte-identical to the same model run pinned. *Falsified by* any token difference, or by
 VRAM growth — which would mean M1a regressed.
 
+**Paged-expert bring-up on DeepSeek-V4-Flash, measured 2026-08-22/23 (nix1,
+gfx1103, 43008 MiB).** Artifact:
+`/srv/hipfire/staging/DeepSeek-V4-Flash-w13--attnq8.oq4.hfq` (85.3 GB) — experts
+oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
+`HIPFIRE_DEEPSEEK4_PAGED_EXPERTS=1` registers 11008 routed expert modules and the
+82.8 GB predecessor loads in 58 s on a 43 GB device. Three findings:
+
+1. **The fused MoE entry test asked for the wrong thing.** It gated on
+   `expert_gate_up_blob`, which paging deliberately does not upload, so every
+   paged layer fell into a fallback that no longer exists. Fixed by gating on the
+   ptr tables the dispatch actually reads.
+2. **Expert admission is incompatible with HIP graph capture.** The residency
+   hook does a blocking D2H inside the captured region and dispatch fails with
+   "would make the legacy stream depend on a capturing blocking stream".
+   Admission is a host decision; it has to be resolved *before* capture, not
+   inside it. With `HIPFIRE_DEEPSEEK4_GRAPH=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0`
+   decode runs to completion with no error — and emits degenerate output
+   (BOS x13). **That degeneracy is NOT a pager defect.** Traced with
+   `HIPFIRE_DEEPSEEK4_DUMP_STATE`, it originates in PREFILL at layer 0, before any
+   expert is touched: `hc_compute_control_batched` turns finite HC streams
+   (absmean 0.000439) and finite `hc_fn` into an all-NaN control vector for
+   exactly the 9 real token rows (`hc_c` nan=216 = 9 x 24), while the zero padding
+   rows come out clean. NaN then propagates to the router scores, and a top-k over
+   NaN fails every comparison and returns index 0 six times — which is why the
+   pager admitted exactly one expert, expert 0, on every layer. Fix that kernel
+   before drawing any conclusion about paged decode correctness.
+
+   Four hypotheses were tested and rejected on the way: a stream-ordering race on
+   the residency D2H (adding `device_synchronize` changed nothing), a tensor-view
+   offset (`GpuTensor` has no offset field), the FP8->Q8_F16 attention re-encode
+   (`layers.0.attn.wo_a.weight` dequantizes to min=-0.23438 max=0.25000
+   absmean=0.020271, 0 non-finite), and zero embeddings feeding a norm (the 9 real
+   embedding rows are healthy; it is the zero rows that survive).
+
+   **Fixed 2026-08-23.** The eight HC globals were uploaded with
+   `upload_global_raw` (bytes verbatim) while all three HC kernels declare their
+   weight parameters `const __half*`. DeepSeek-V4-Flash stores them F32, so the
+   bytes were reinterpreted as pairs of halves — and since a 16-bit word lands on
+   the all-ones exponent about 1 time in 32, a 16384-wide dot product escapes NaN
+   with probability ~(31/32)^8192. `upload_global_as_f16` now converts.
+   `hc_head_scale` is excluded: it is host-read into an f32 field and passed by
+   value. Every NaN in the chain above is gone (`hc_c` nan=216 -> 0, absmean
+   0.637; `hc_x_in` nan=36864 -> 0; `l3_end_streams` nan=147456 -> 0).
+
+   **With that fixed, paged expert routing works.** Same artifact, same box:
+   1342 admissions across 254 distinct experts (was 40 admissions, expert 0
+   only), per-layer top-k indices varied (`l3=[154,185,13,140,80,159]`,
+   `l42=[151,55,232,160,198,240]`), scores probability-shaped and weights
+   descending (`[0.613,0.444,0.348,0.275,0.274,0.246]`). Layers 0-3 are
+   numerically healthy (end_streams absmean 1.32 -> 1.85, max ~20, no NaN), and
+   generation runs to a natural EOS.
+
+   **The remaining mojibake is expected, not a defect.** The artifact's routed
+   experts are `qt=19` = MQ2G256Lloyd — 2-bit — even though it was built with
+   `--format oq4`. That is deliberate: `hipfire-quantize` routes DeepSeek V4
+   per-expert tensors "through the MQ2-Lloyd path for every DeepSeek-specialized
+   format, including OQ dense formats", because the deepseek4 routed-MoE kernels
+   are MQ2-Lloyd-specific and an OQ4 expert payload would be raw-concatenated and
+   then read through the wrong kernel family. `--format oq4` therefore applies to
+   attention, shared experts and head (all `qt=34`) but never to routed experts.
+   MQ2's documented failure mode in this repo is precisely mojibake — the
+   `HIPFIRE_ALLOW_MQ2` gate exists because "the uniform 4-level codebook collapses
+   at every model size validated locally". A 2-bit routed-expert MoE producing
+   incoherent text is the format behaving as characterised, not the executor
+   misbehaving.
+
+   The Q8_F16 attention re-encode is also cleared on reasoning rather than
+   measurement: MQ4/HFQ4 weights are STORED FWHT-rotated, which is why that arm
+   feeds the rotated activation buffer; Q8 weights come from plain FP8 source, so
+   the plain buffer is the correct pairing. There was never an Oq4 arm for `wo_a`
+   at all — that is the error the re-encode was done to clear.
+
+   **This does not block M5's exit.** The exit is a PARITY test — paged output
+   byte-identical to pinned output — not a quality test. Mojibake is admissible
+   evidence so long as it is the same mojibake. Coherent output would need routed
+   experts above 2 bits, which needs a deepseek4 routed-MoE kernel family that
+   speaks a wider format — a separate piece of work from the executor.
+
+## M5 exit — RUN, root-caused, FIXED, and PASSING (2026-08-23, nix1)
+
+**Result: the exit passes.** Output is byte-identical across a 4.3x swing in
+eviction pressure and a 6x swing in budget:
+
+| arm | budget | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| reference | 24 GB | 4474 | 1084 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 3x oversubscribed | 8 GB | 5846 | 4716 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 6x oversubscribed | 4 GB | — | — | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+The 8 GB arm reproduces exactly on a repeat run. Touched set is ~23 GB, so 8 GB
+is ~3x oversubscribed as the exit requires.
+
+**Root cause of the first, falsified attempt: PREFILL COULD NOT ADMIT EXPERTS.**
+`MoeBiasAwarePrefillParams` had no `expert_residency` field at all — the decode
+twin has had one since the pager landed. So a paged model dispatched its entire
+prompt pass against whatever the device pointer table happened to hold: entries
+only for experts some *earlier decode* had admitted, and null for everything
+else, since eviction nulls slots. Output therefore depended on eviction history,
+which is exactly what the first A/B measured. The field, a union-over-rows
+admission in `run_moe_prefill_bias_aware` (prefill routes B tokens
+independently, so the set is up to B x k_top and needs dedup), and the wiring in
+deepseek4's `ffn_batched` close it.
+
+Two consequences worth keeping:
+
+- The fix is confirmed by an OOM, not just by parity. With prefill admitting its
+  real working set, `PinAll` now exhausts VRAM at layer 15
+  (`hipMalloc 6.75 MiB, free=18.8 MiB of 43008`). Before the fix it fitted only
+  because prefill silently used a fraction of the experts it needed. The pinned
+  reference is genuinely unavailable for this model on a 43 GB box — the
+  large-budget LazyLru arm stands in for it.
+- Of the two pre-fix arms, the `PinAll` one (16 tokens, `88570cc71755...`) was
+  the WRONG one. Every corrected run at every budget agrees on
+  `552280dbd78c...`, the value the pre-fix LazyLru arm happened to produce.
+
+### The falsified first attempt, and the hypotheses it cost
+
+An earlier note here claimed the exit needed halo because 85.3 GB does not fit
+pinned in 43 GB. **That was wrong**, and it cost a milestone. `ResidencyPolicy`
+already names the reference: `PinAll` IS "pinned" (§M5 Phase 1 — "PinAll is a
+name not a sentinel"), and it runs on this box. So both arms of the parity test
+are executable here:
+
+| arm | policy | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| A (reference) | `PinAll` | 3859 | 0 | 16 | `88570cc71755cfbf07171689d5183f8a` |
+| B | `LazyLru` 9.1 GB | 5725 | 4440 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+Working set is 3859 x 7077888 B = 27.3 GB, so a 9.1 GB budget makes the touched
+expert set exactly **3x the pager budget**, which is what the exit asks for. The
+budget is respected (9088008192 bytes, 1284 modules resident) and eviction really
+runs (4440 evictions).
+
+**This attempt was falsified: the outputs differed.** Both arms were individually
+reproducible — A twice at `88570cc7...`/16 tokens, B twice at `552280db...`/22
+tokens — so this is systematic, not noise. Per the exit's own wording, this is
+reported rather than tuned around.
+
+Three eviction-path hypotheses tested and REJECTED, so they are not retried:
+
+- *`patch_expert_ptr_table` is never called.* True — it has zero call sites — but
+  it is a superseded pull-based API. Admission publishes through
+  `write_expert_ptr_slot` ("push hook 1 of 3"), so the table is maintained.
+- *Eviction leaves a stale pointer.* It does not; "push hook 2 of 3" nulls the
+  slot BEFORE freeing the buffer, deliberately, with the reasoning in-line.
+- *A selection evicts its own experts.* `ensure_resident` admits k_top one at a
+  time with nothing pinning the earlier ones, so admitting expert 6 could evict
+  expert 1 and null its live slot. Instrumented with a post-admission residency
+  assertion: **0 hits** over the whole run. Newly admitted modules sit at the LRU
+  back, so with 1284 resident the current six are never the eviction candidates.
+  The assertion is kept as a cheap guard.
+
+Two further suspects were then checked and cleared before the real cause turned
+up: dropping `_handle` from `transport.fetch` (the transport is synchronous and
+`TransferHandle` is an explicit forward-compat no-op) and a short
+`copy_len < len` leaving an uninitialised tail in a recycled pool buffer
+(`read_into_staging` returns `(rel, len)` and errors on short reads).
+
+The clue that broke it open was per-prompt: with two prompts, e0 was IDENTICAL
+across arms and only e1 diverged — pointing at table state carried between
+requests rather than at the expert data itself.
+3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
+   "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
+   layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
+   reference on this box, so the A/B needs either halo (128 GB / ~120 GB GTT,
+   where 85.3 GB fits pinned) or a smaller MoE whose pinned form fits in 43 GB.
+   Pick one before treating M5 as measurable here.
+
+Also landed for this: `--tensor-source` now accepts FP8 E4M3 archives, without
+which the attention repair was impossible — DeepSeek ships FP8, and the surgical
+re-encode path refused every tensor in the .hfa.
+
 ### M6 — priority admission landed 2026-08-22; classes still to come
 
 **M6 was mis-scoped as blocked.** Its core dependency is lossless suspension,

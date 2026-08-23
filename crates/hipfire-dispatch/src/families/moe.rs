@@ -504,6 +504,13 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub route_scale: f32,
     pub swiglu_limit: f32,
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
+    /// Paged-expert residency, mirroring `MoeBiasAwareParams::expert_residency`.
+    ///
+    /// PREFILL needs this as much as decode does. Without it the prefill pass
+    /// dispatches against whatever the device pointer table happens to hold —
+    /// null for every expert no earlier decode admitted, and eviction NULLS
+    /// slots, so a paged model silently prefills against missing experts.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
     // routing
     pub routing: MoePrefillRouting<'a>,
     pub scores: &'a GpuTensor, // post-sqrt_softplus moe_scores_batch [B, n_exp]
