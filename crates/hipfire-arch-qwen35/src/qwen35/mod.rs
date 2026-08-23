@@ -2358,7 +2358,20 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // `other => panic!` fallthrough. It was briefly added here to satisfy an
         // ADMISSION check while no such arm existed -- that is what
         // moe_routed_dispatch_supported_for_dtype is for; keep the two distinct.
-        DType::Oq4G256 | DType::Oq8G256 => arch.starts_with("gfx11"),
+        DType::Oq4G256 => arch.starts_with("gfx11"),
+        // ⚠️ Oq8G256 grouped is OPT-IN and OFF by default: the kernel is FAST and
+        // WRONG. gemm_oq8g256_moe_grouped_wmma + its path-2 arms exist and route
+        // (Qwen3.6-35B-A3B 215.0 -> 391.0 tok/s, 1.8x), but the output degenerates
+        // into echoing the prompt, while the same model on path-1 answers 4/4.
+        // So the grouped DISPATCH is right and the OQ8 decode is not -- most
+        // likely the weight_byte_offset: the Oq4 sibling documents a nonzero
+        // offset for the combined layout resident qt=34/37 experts load into, and
+        // this passes 0 on the strength of the path-1 kernel addressing blocks
+        // directly. Verify against a known-good reference before flipping.
+        DType::Oq8G256 => {
+            arch.starts_with("gfx11")
+                && std::env::var("HIPFIRE_MOE_OQ8_GROUPED").as_deref() == Ok("1")
+        }
         _ => false,
     }
 }

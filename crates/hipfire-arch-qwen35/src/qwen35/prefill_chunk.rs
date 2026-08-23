@@ -817,25 +817,55 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // Paged experts retain page-in orchestration here. Mixed resident experts
     // use the same one-expert buckets so each launch interprets its weight
     // pointer with the correct low-bit or raw layout.
-    // The MoE routed decision, reported where it is MADE. Path 2 (scatter +
-    // grouped WMMA) lives entirely inside the bucketed branch below, so a
-    // resident-expert model never reaches it however eligible its dtype is --
-    // which is invisible from outside and cost several kernel traces to find.
-    if super::feature_report::wanted() {
-    super::feature_report::note(
-        "moe_routed",
-        if routed_expert_buckets.is_none() {
-            format!(
-                "indexed GEMV path-1 (resident experts: the grouped path-2 block is inside the \
-                 bucketed branch, so it is not reachable here) gate_up={:?}",
-                dtypes.expert_gate_up
-            )
-        } else {
-            format!("bucketed branch (grouped path-2 eligible per dtype {:?})", dtypes.expert_gate_up)
-        },
+    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) — default ON for gfx11/
+    // gfx12, where the grouped-WMMA kernel is validated. Empirical lift on
+    // Qwen3.5-A3B mq4 prefill=256: gfx1100 7900 XTX 1396 -> 2983 tok/s (+114%);
+    // gfx1201 R9700 1016 -> 2966 tok/s (+192%). CDNA wave64 (gfx9*) and pre-WMMA
+    // RDNA (gfx10*) stay on the per-token indexed GEMV. `HIPFIRE_MOE_GROUPED_GEMM=0`
+    // opts out.
+    //
+    // HOISTED out of the bucketed block so a RESIDENT, uniform-dtype model can
+    // reach it. Buckets are built only for paged (`ffn.experts.is_empty()`) or
+    // mixed-profile models, so a resident model previously fell through to
+    // section 6 and the per-token GEMV however eligible its dtype was. The
+    // path-2 core needs no buckets: the scatter and unscatter are GPU-side off
+    // topk_indices, and the CPU bucket download exists for PAGING.
+    static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
+    let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
+        moe_grouped_gemm_path2_enabled_from_env(
+            std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
+        )
+    });
+    let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
+        dtypes.expert_gate_up,
+        &gpu.arch,
+        (use_path2 || dtypes.routed_profile.is_mixed())
+            && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
     );
+    // Report the DECISION, not one of its inputs. An earlier version of this
+    // line keyed on `routed_expert_buckets` and kept printing "not reachable
+    // here" after the hoist had made it reachable -- the exact failure the rule
+    // in feature_report.rs warns about.
+    if super::feature_report::wanted() {
+        super::feature_report::note(
+            "moe_routed",
+            if path2_eligible {
+                format!(
+                    "GROUPED path-2 (scatter + grouped WMMA) gate_up={:?} buckets={}",
+                    dtypes.expert_gate_up,
+                    routed_expert_buckets.is_some()
+                )
+            } else {
+                format!(
+                    "indexed GEMV path-1 (dtype {:?} not path-2 eligible on {}) buckets={}",
+                    dtypes.expert_gate_up,
+                    gpu.arch,
+                    routed_expert_buckets.is_some()
+                )
+            },
+        );
     }
-    if routed_expert_buckets.is_some() {
+    if routed_expert_buckets.is_some() || path2_eligible {
         // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
         //
         // Gate/up for top-K experts (per token) → [N × K_TOP × mi]. Each
@@ -845,27 +875,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         let down_k = expert_shape.down_k;
         let gate_up_k = expert_shape.gate_up_k;
 
-        // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) — default ON for
-        // gfx11/gfx12, where the grouped-WMMA kernel is validated (gfx11 routes
-        // to `gemm_hfq4g256_moe_grouped_wmma_k2` via the base w32 WMMA builtin,
-        // gfx12 to the `_gfx12` variant). Empirical lift on Qwen3.5-A3B mq4
-        // prefill=256: gfx1100 7900 XTX 1396 → 2983 tok/s (+114%); gfx1201
-        // R9700 1016 → 2966 tok/s (uniform-mq4.hfq, +192%). CDNA wave64 (gfx9*)
-        // and pre-WMMA RDNA (gfx10*) stay on the per-token indexed_batched
-        // GEMV path. Opt out with `HIPFIRE_MOE_GROUPED_GEMM=0`.
-        // Cached read — getenv on every layer × MoE call adds up.
-        static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
-        let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
-            moe_grouped_gemm_path2_enabled_from_env(
-                std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
-            )
-        });
-        let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
-            dtypes.expert_gate_up,
-            &gpu.arch,
-            (use_path2 || dtypes.routed_profile.is_mixed())
-                && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
-        );
         // m_total — computed during gate_up scatter, reused for down. Avoids
         // a second dtoh sync per MoE layer.
         let mut path2_m_total: usize = 0;
