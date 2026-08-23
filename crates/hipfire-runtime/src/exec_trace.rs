@@ -334,9 +334,8 @@ pub fn snapshot_json() -> serde_json::Value {
     };
 
     let gaps = inter_token_gaps_ns(&snapshot, NO_STREAM);
-    let gap_stats = percentiles(&gaps).map(|(p50, p99, max)| {
-        serde_json::json!({ "p50_ns": p50, "p99_ns": p99, "max_ns": max })
-    });
+    let gap_stats = percentiles(&gaps)
+        .map(|(p50, p99, max)| serde_json::json!({ "p50_ns": p50, "p99_ns": p99, "max_ns": max }));
 
     let span_ns = match (snapshot.records.first(), snapshot.records.last()) {
         (Some(first), Some(last)) => last.t_ns.saturating_sub(first.t_ns),
