@@ -520,7 +520,10 @@ fn upload_raw_census(len: usize) {
     let b = UPLOAD_RAW_BYTES.fetch_add(len as u64, Relaxed) + len as u64;
     // Log on a coarse ladder so the trace stays readable across 20k calls.
     if n % 2048 == 0 {
-        eprintln!("[upload_raw census] calls={n} bytes={:.2} GiB", b as f64 / (1u64 << 30) as f64);
+        eprintln!(
+            "[upload_raw census] calls={n} bytes={:.2} GiB",
+            b as f64 / (1u64 << 30) as f64
+        );
     }
 }
 
