@@ -1425,11 +1425,16 @@ impl DeepseekV4 {
             let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
                 hfq.path(),
                 hipfire_runtime::weight_pager::PagerConfig {
-                    // `u64::MAX` is the pager's "never evict" sentinel on this
-                    // base. #310 renames it `ResidencyPolicy::PinAll`; this uses
-                    // the shape that exists on master so the two land
-                    // independently.
-                    vram_budget_bytes: budget.unwrap_or(u64::MAX),
+                    // No budget set = pin everything. #310 landed the rename,
+                    // so the old `u64::MAX` sentinel is now a named policy.
+                    residency: match budget {
+                        Some(vram_budget_bytes) => {
+                            hipfire_runtime::weight_pager::ResidencyPolicy::LazyLru {
+                                vram_budget_bytes,
+                            }
+                        }
+                        None => hipfire_runtime::weight_pager::ResidencyPolicy::PinAll,
+                    },
                     trace: matches!(
                         std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_TRACE")
                             .ok()
