@@ -1237,10 +1237,46 @@ it was not measuring. That figure is worth keeping as the scaling datapoint it
 actually is (bulk keeps ~39% against 4x priority-9 competition), but it is not
 measurement 3.
 
+**M3d measurement 2 — NOT obtainable from the trace as it stands. Measured
+2026-08-23.** This plan says measurements 2 and 3 "are obtainable today", and
+§M6 adds that measurement 2 "does not need [a realtime class] — it needs an
+ordering lever, and there is one". Both are wrong, for two independent reasons
+that a trace dump makes plain:
+
+- **Admission is not stream-attributed.** Every `dispatch_begin` and
+  `dispatch_end` record carries `stream: None`; only `token_emitted` carries a
+  real id. So the generate frame's dispatch — which IS the admission — cannot be
+  tied to the stream it admitted.
+- **No per-quantum event exists.** `TraceEvent` has no variant the march loop
+  emits when it hands a stream a quantum, so "first dispatch" has nothing to
+  anchor to even if admission were attributed.
+
+Measurement 2 therefore needs instrumentation before it needs a run: stream-scope
+the generate frame's `DispatchBegin` (or add an `Admitted` variant), and add a
+per-quantum event. That is a small change, but it is a change — not a
+measurement someone forgot to take.
+
+**A sampling trap worth recording, because it produced a confident wrong
+reading.** Under executor v2 a `generate` frame only ADMITS a stream; the march
+loop runs only once the pending queue is empty (`pop_next() -> None`). So an
+`executor_trace` frame sent in the same stdin batch is serviced BEFORE a single
+token exists, and reports `token_count: 0` with no stream ids. Under v1, where
+generate executes inline during frame dispatch, the identical request order
+reports all 128 tokens. Comparing the two naively says "the v2 executor records
+no tokens" — a serious-sounding defect that does not exist. Moving the request
+after `unload` (which drains the streams) gives the true v2 picture:
+
+    record_count=142  token_count=128
+    events={dispatch_begin: 5, vram_sample: 5, dispatch_end: 4, token_emitted: 128}
+    inter_token_gap p50 45.68 ms / p99 47.71 ms / max 50.67 ms
+
+For a MID-run snapshot, `--listen` works where stdin cannot: the frame loop
+services one pending frame per iteration and marches only when none remain
+(`main.rs`), so a socket client's request is handled between march rounds.
+
 Still outstanding for M3d: measurement 1 (p99/max module duration and which
 `SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
-dimension, and measurement 2 (admission -> first dispatch under saturating load)
-is not yet run.
+dimension.
 
 *Breaks:* everything that assumed a forward runs to completion. `hipGraph` capture is one
 indivisible quantum by construction — **off on the v2 path** until its WCET is declared,
