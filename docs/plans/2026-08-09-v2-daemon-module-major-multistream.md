@@ -1216,6 +1216,32 @@ M0 trace:
 3. **Bulk throughput, loaded versus solo — ≥ 0.6×.** Without this, (2) is trivially
    satisfiable by refusing to run the bulk job.
 
+**M3d measurement 3 — MEASURED 2026-08-23, PASSES.** nix1/gfx1103,
+Qwen3.6-35B-A3B--oq4, kvarn, `HIPFIRE_DAEMON_EXECUTOR=v2`. Bulk = 96 tokens,
+realtime = 32 tokens at `priority: 9`. Per-stream `tok_s` read off each `done`
+frame, three reps:
+
+| rep | bulk solo | bulk loaded | ratio | realtime |
+|---|---|---|---|---|
+| 1 | 18.400 | 13.300 | **0.723** | 9.200 |
+| 2 | 18.600 | 13.300 | **0.715** | 9.200 |
+| 3 | 18.600 | 13.300 | **0.715** | 9.200 |
+
+Comfortably above the **0.6x** floor, and reproducible to three decimal places —
+so priority admission is not buying realtime latency by starving bulk.
+
+Read the exit's wording carefully before quoting this number: it specifies **one**
+realtime stream and one bulk stream. A first attempt used FOUR realtime streams
+and got 7.100 tok/s loaded, a ratio of 0.386 — a clear "fail" against a criterion
+it was not measuring. That figure is worth keeping as the scaling datapoint it
+actually is (bulk keeps ~39% against 4x priority-9 competition), but it is not
+measurement 3.
+
+Still outstanding for M3d: measurement 1 (p99/max module duration and which
+`SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
+dimension, and measurement 2 (admission -> first dispatch under saturating load)
+is not yet run.
+
 *Breaks:* everything that assumed a forward runs to completion. `hipGraph` capture is one
 indivisible quantum by construction — **off on the v2 path** until its WCET is declared,
 since a declared WCET that ignores an enabled graph is exactly the failure the contract
