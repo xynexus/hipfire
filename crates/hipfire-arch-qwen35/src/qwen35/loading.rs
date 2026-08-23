@@ -6459,6 +6459,10 @@ fn load_moe_expert(
     m: usize,
     k: usize,
     oq_indexed_decode: bool,
+    // Every routed expert in THIS layer is OqPlusCompact, so the layer can be
+    // dispatched compact. False forces the Oq8 expansion below -- see the call
+    // site for why the decision cannot be made per tensor.
+    layer_uniform_compact: bool,
 ) -> HipResult<WeightTensor> {
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
@@ -6494,9 +6498,7 @@ fn load_moe_expert(
     // must NOT fall through to `load_weight_tensor` either -- for a routed expert
     // that yields the DENSE combined Oq8 layout, which the indexed kernels do not
     // read; the expansion below produces the indexed MoE BLOCK layout they do.
-    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
-        && hipfire_runtime::oq8_arch::compact_resident_enabled()
-    {
+    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT) && layer_uniform_compact {
         return load_weight_tensor(hfq, gpu, slabs, name, m, k);
     }
     let (dtype, blocks) = match qt {
@@ -6602,6 +6604,39 @@ fn load_moe_ffn(
         config.moe_intermediate_size,
         config.num_experts_per_tok,
     );
+    // Compact residency is a per-LAYER decision, not per-tensor. The indexed
+    // GEMVs take ONE layout for every expert they touch -- the layout is a
+    // launch parameter, and `expert_ptrs` carries addresses, not descriptors --
+    // so a layer holding both compact and Oq8 experts would hand compact bytes
+    // to a 260-byte-stride read. That is a GPU memory fault, not wrong numbers:
+    // observed on the 122B, which mixes 23,288 compact routed experts with 1,288
+    // Oq8 ones (mixed-precision promotion) across 37 of its 48 layers.
+    //
+    // The expansion is what USED to hide this. Unpacking compact to Oq8 at load
+    // made every routed expert uniformly Oq8, so no layer was ever mixed at the
+    // dispatch. Keeping compact makes the mixture visible, and the layer has to
+    // pick one.
+    //
+    // So: keep compact only where the whole layer is compact, and otherwise
+    // expand exactly as before. A uniformly-compact model (the 35B-A3B) gets the
+    // full saving; a mixed one stays correct at its old footprint. Lifting this
+    // needs a per-expert stride table so one kernel can serve both layouts --
+    // worth doing, since it is what the 122B actually needs, but it is a kernel
+    // contract change and does not belong in a correctness fix.
+    let layer_uniform_compact = hipfire_runtime::oq8_arch::compact_resident_enabled()
+        && (0..n_exp).all(|x| {
+            [
+                format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+                format!("{p}.mlp.experts.{x}.down_proj.weight"),
+            ]
+            .iter()
+            .all(|name| {
+                qwen35_tensor_name_candidates(name)
+                    .into_iter()
+                    .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type))
+                    == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
+            })
+        });
     for x in 0..n_exp {
         let gate_up = load_moe_expert(
             hfq,
@@ -6611,6 +6646,7 @@ fn load_moe_ffn(
             2 * mi,
             config.dim,
             oq_indexed_decode,
+            layer_uniform_compact,
         )?;
         let down = load_moe_expert(
             hfq,
@@ -6620,6 +6656,7 @@ fn load_moe_ffn(
             config.dim,
             mi,
             oq_indexed_decode,
+            layer_uniform_compact,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }
