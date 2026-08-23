@@ -487,7 +487,10 @@ fn run_moe_decode_routed(
             2 * p.mi,
             gate_up_k,
         ))?;
-    } else if res.routed_indexable_oq4 || res.routed_indexable_oq8 {
+    } else if res.routed_indexable_oq4
+        || res.routed_indexable_oq8
+        || res.routed_indexable_oq_compact
+    {
         // Opus Quant indexed gate_up (OQ4 132 B/group, OQ8 260 B/group
         // OqPlusCompact-expanded). Batched variant with batch=1 (single-token
         // decode).
@@ -506,6 +509,29 @@ fn run_moe_decode_routed(
             p.k,
             1,
         ))?;
+        if std::env::var("HIPFIRE_MOE_FEED_DEBUG").as_deref() == Ok("1") {
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let x = gpu.download_f32(p.x_rot_expanded).unwrap_or_default();
+                let sums: f64 = x.iter().map(|v| *v as f64 * *v as f64).sum();
+                eprintln!(
+                    "[feed] compact={} oq4={} oq8={} | x_rot_expanded len={} ||x||^2={:.6e} head={:?}",
+                    res.routed_indexable_oq_compact,
+                    res.routed_indexable_oq4,
+                    res.routed_indexable_oq8,
+                    x.len(),
+                    sums,
+                    &x[..x.len().min(6)]
+                );
+                if let Some(st) = p.expert_gate_up_strides {
+                    let raw = gpu.download_f32(st).unwrap_or_default();
+                    let as_i32: Vec<i32> =
+                        raw.iter().take(8).map(|v| v.to_bits() as i32).collect();
+                    eprintln!("[feed] gate_up strides[0..8]={as_i32:?}");
+                }
+            }
+        }
         if res.routed_indexable_oq_compact {
             // Compact-resident experts, possibly MIXED with promoted Oq8 ones in
             // this layer: the per-expert stride table (0 = Oq8) tells the kernel

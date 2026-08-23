@@ -234,24 +234,25 @@ impl MoeResolution {
             oq_indexed_decode && (d.routed_down == Oq4G256) && routed_gate_up_oq4;
         let routed_indexable_oq8 =
             oq_indexed_decode && (d.routed_down == Oq8G256) && routed_gate_up_oq8;
-        // ⚠️ OPT-IN, OFF BY DEFAULT. The compact GEMVs themselves are verified
-        // (parity_gemv_oq_compact_moe: 21 cases, including MIXED layers, and an
-        // Oq8 expert routed through them is BIT-IDENTICAL to the Oq8 kernel).
-        // Routing a compact layer through the INDEXED path is what is not yet
-        // right: with this flag on, a uniformly-compact 35B-A3B that produced
-        // byte-identical text through the generic CPU-top-K fallback emits "!!!!".
+        // Compact-resident routed experts on the indexed path. ON by default:
+        // verified byte-identical to the expanded Oq8 reference on a 35B-A3B.
         //
-        // The kernels are not the suspect -- the harness covers them against an
-        // f64 oracle. Something in the indexed feed differs from what the generic
-        // path supplies, and until that is found this must not be the default.
-        // Compact RESIDENCY (the 2.83x memory win) does not depend on it: with
-        // the flag off, compact layers keep taking the generic fallback exactly
-        // as they did when that win was measured.
+        // It shipped OFF for one commit because a compact layer produced "!!!!".
+        // The kernels were never the problem -- the cause was that the OQ branch
+        // above tests only `oq4 || oq8`, so a compact layer fell PAST it into the
+        // paro arm and was decoded as ParoQ4G128, while also skipping the
+        // per-slot `rotate_x_mq_awq_indexed_batched` that branch performs. Two
+        // faults from one missing disjunct, and neither was visible in the
+        // kernels: HIPFIRE_MOE_FEED_DEBUG=1 found it by showing the probe inside
+        // that branch never firing.
+        //
+        // HIPFIRE_MOE_COMPACT_INDEXED=0 forces the generic CPU-top-K fallback,
+        // which is correct but slower and does not need the stride table.
         let routed_gate_up_oq_compact = d.routed_gate_up == OqCompactG256;
         let routed_indexable_oq_compact = oq_indexed_decode
             && (d.routed_down == OqCompactG256)
             && routed_gate_up_oq_compact
-            && std::env::var("HIPFIRE_MOE_COMPACT_INDEXED").as_deref() == Ok("1");
+            && std::env::var("HIPFIRE_MOE_COMPACT_INDEXED").as_deref() != Ok("0");
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq6
