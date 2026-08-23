@@ -169,7 +169,25 @@ NOT work, so nobody re-derives them:
 
 Beware `pkill -f hipfire-daemon` in a wrapper script: `-f` matches the full
 command line of the shell running it, so it kills its own shell and surfaces as
-a bare `exit 144` with no output. Use `pkill -x hipfire-daemon`.
+a bare `exit 144` with no output.
+
+The same hazard is in ANY hand-rolled `ps -eo args | grep | kill`, and the
+`[p]attern` bracket trick does NOT save you there — your shell's command line
+genuinely contains the pattern via its own arguments. `pkill -x` avoids the
+narrow case; it does not avoid that one.
+
+Order of preference:
+
+1. **If you spawned it, kill the pid you recorded.** An explicit pid cannot match
+   your own shell. `tests/agentic-gate.sh` is the worked example.
+2. **Otherwise use `scripts/killproc.sh`**, which excludes the caller, every
+   ancestor, and the caller's whole process group, and names every pid it
+   signals instead of failing silently:
+
+       scripts/killproc.sh hipfire-daemon hipfire-eval   # exact names
+       scripts/killproc.sh --pattern 'python .*train\.py'
+       scripts/killproc.sh --dry-run hipfire-daemon
+       scripts/killproc.sh --self-check
 
 ## Artifact Names
 
