@@ -1333,6 +1333,32 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    (`layers.0.attn.wo_a.weight` dequantizes to min=-0.23438 max=0.25000
    absmean=0.020271, 0 non-finite), and zero embeddings feeding a norm (the 9 real
    embedding rows are healthy; it is the zero rows that survive).
+
+   **Fixed 2026-08-23.** The eight HC globals were uploaded with
+   `upload_global_raw` (bytes verbatim) while all three HC kernels declare their
+   weight parameters `const __half*`. DeepSeek-V4-Flash stores them F32, so the
+   bytes were reinterpreted as pairs of halves — and since a 16-bit word lands on
+   the all-ones exponent about 1 time in 32, a 16384-wide dot product escapes NaN
+   with probability ~(31/32)^8192. `upload_global_as_f16` now converts.
+   `hc_head_scale` is excluded: it is host-read into an f32 field and passed by
+   value. Every NaN in the chain above is gone (`hc_c` nan=216 -> 0, absmean
+   0.637; `hc_x_in` nan=36864 -> 0; `l3_end_streams` nan=147456 -> 0).
+
+   **With that fixed, paged expert routing works.** Same artifact, same box:
+   1342 admissions across 254 distinct experts (was 40 admissions, expert 0
+   only), per-layer top-k indices varied (`l3=[154,185,13,140,80,159]`,
+   `l42=[151,55,232,160,198,240]`), scores probability-shaped and weights
+   descending (`[0.613,0.444,0.348,0.275,0.274,0.246]`). Layers 0-3 are
+   numerically healthy (end_streams absmean 1.32 -> 1.85, max ~20, no NaN), and
+   generation runs to a natural EOS.
+
+   Output is still not coherent — finite mojibake rather than BOS forever. That
+   is a numerical-quality problem, not a crash, and the pager is no longer
+   implicated in it. Remaining suspects, in order: the oq4 expert quantization
+   built from the FP8 safetensors, and the Q8_F16 attention re-encode, whose
+   dispatch arm feeds the PLAIN activation buffer where the Oq4/MQ4 arms feed the
+   FWHT-rotated one. Testing the second means re-encoding attention to mq4/hfq4
+   (the rotated arm) instead of q8f16 and comparing.
 3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
    "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
    layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
