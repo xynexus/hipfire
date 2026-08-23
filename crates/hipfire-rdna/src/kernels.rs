@@ -1363,6 +1363,15 @@ pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_OQ8G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq8g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Compact-resident indexed MoE GEMV family — the compact twins of the OQ8G256
+/// family above, reading `split_compact_planes` output (nibble plane then side
+/// records) instead of the expanded 260 B int8 blocks. These are what let routed
+/// experts stay at ~4.25 bits/weight resident rather than being unpacked to one
+/// int8 per weight by `load_moe_expert`; dense tensors have been compact-resident
+/// by default since `oq8_arch_load` learned the split.
+pub const GEMV_OQ_COMPACT_MOE_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_moe_indexed.hip");
+
 /// QTIP3 (trellis-coded 3-bit) indexed MoE GEMV family. Same indexed dispatch +
 /// expert-pointer contract as the OQ4/HFQ4 siblings; the per-group expert block
 /// is the QTIP 100 B layout `[f32 scale | 96 B of 3-bit trellis symbols]` with
