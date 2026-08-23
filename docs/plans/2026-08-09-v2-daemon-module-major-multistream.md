@@ -1274,6 +1274,38 @@ For a MID-run snapshot, `--listen` works where stdin cannot: the frame loop
 services one pending frame per iteration and marches only when none remain
 (`main.rs`), so a socket client's request is handled between march rounds.
 
+**M3d measurement 2 — INSTRUMENTED AND MEASURED 2026-08-23. The 200 ms contract
+is NOT met.** Two stream-scoped `TraceEvent` variants were added: `Admitted`
+(recorded where `admit_generate` inserts the stream, `aux` = priority) and
+`QuantumBegin` (recorded in both march paths, round-robin and batched).
+`QuantumBegin` is the `Yielded`-shaped variant the enum reserved in a comment and
+declined to define because "today nothing can construct it" — M3's march loop
+constructs it. Both key on `request_id`, which is what `events::emit_text_bytes`
+already uses, so admission, quanta and tokens form one correlatable series.
+`exec_trace::admission_to_first_quantum_ns` derives the measurement and
+`snapshot_json` reports it under `admission`.
+
+Measured, bulk (priority 0) admitted FIRST and realtime (priority 9) second,
+three reps:
+
+| rep | realtime (p9) | bulk (p0) |
+|---|---|---|
+| 1 | **659.44 ms** | 1474.20 ms |
+| 2 | **652.94 ms** | 1463.86 ms |
+| 3 | **652.97 ms** | 1462.27 ms |
+
+Priority ordering demonstrably works — the realtime stream takes the first
+quantum ahead of the bulk stream that was admitted before it. But **659 ms is
+3.3x the 200 ms contract**, and the cause is visible in the same trace: the bulk
+stream's prefill (~762 ms, per its `done` frame) is a single indivisible unit
+sitting between admission and first quantum. Nothing can preempt it.
+
+That is the same wall §M2a names: **prefill lowering is what the 200 ms contract
+is blocked on**, and this is now a measured number rather than an argument. Note
+also that with the stdin protocol both streams are admitted before the march
+begins, so this figure is the *floor* — a realtime request arriving mid-prefill
+over `--listen` waits at least as long.
+
 Still outstanding for M3d: measurement 1 (p99/max module duration and which
 `SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
 dimension.

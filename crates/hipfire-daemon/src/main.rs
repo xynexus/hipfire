@@ -1244,6 +1244,16 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
             }
         }
     }
+    // Same quantum event as the round-robin path: a batched round hands every
+    // row in it a slice, so each row gets one record.
+    for (_, req_id, _, _) in taken.iter() {
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::QuantumBegin,
+            hipfire_runtime::exec_trace::stream_id_of(req_id),
+            0,
+            0,
+        );
+    }
     for (_, _, sid, g) in taken.iter_mut() {
         if let Err(e) = g.acquire_from_registry(m, sid) {
             eprintln!("[executor] batched march: {e}");
@@ -1378,6 +1388,14 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
         }) else {
             continue;
         };
+        // The march is handing this stream a slice. First one per stream is
+        // "first dispatch" for §M3d measurement 2.
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::QuantumBegin,
+            hipfire_runtime::exec_trace::stream_id_of(&req_id),
+            0,
+            0,
+        );
         // `fail` and `finish` both consume the handle, and only one of them runs.
         // An Option makes that move trackable instead of fighting the borrow
         // checker across match arms.

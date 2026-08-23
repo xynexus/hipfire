@@ -145,6 +145,18 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
             .unwrap_or("0")
             .to_string();
         stream.run();
+        // §M3d measurement 2 needs an admission instant that can be attributed to
+        // a stream. `DispatchBegin` cannot serve: it is frame-scoped and carries
+        // `stream: NO_STREAM`, so the frame that admits is indistinguishable from
+        // the frame that unloads a model. Keyed on `request_id` because that is
+        // what `events::emit_text_bytes` uses, so admission, quanta and tokens
+        // land on one correlatable series.
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::Admitted,
+            hipfire_runtime::exec_trace::stream_id_of(&stream.request_id),
+            0,
+            priority as u64,
+        );
     }
     Some(id)
 }
