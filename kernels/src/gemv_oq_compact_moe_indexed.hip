@@ -39,6 +39,10 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
+// Oq8G256 interleaved block: [f32 scale | 256 int8]. Present here because a
+// mixed layer routes its promoted experts through these kernels too.
+#define OQCM_OQ8_BLK 260
+
 #define OQCM_LO(w, j) ((int)((((uint32_t)(w)) >> (8 * (j))) & 0xf) << 28 >> 28)
 #define OQCM_HI(w, j) ((int)((((uint32_t)(w)) >> (8 * (j) + 4)) & 0xf) << 28 >> 28)
 
@@ -54,6 +58,42 @@ __device__ __forceinline__ float oqc_moe_row_dot(
     int row, int M, int K, int block_stride, int lane
 ) {
     const int ng = K / 256;
+
+    // MIXED-PRECISION LAYERS. `block_stride` arrives from a PER-EXPERT table,
+    // and 0 means this expert was promoted to Oq8G256 while its neighbours
+    // stayed compact -- so one launch has to serve both layouts.
+    //
+    // 0 as the sentinel, not 260: a compact stride is `130 + 2*N_out`, and 260
+    // satisfies that at N_out=65, so a stride cannot identify its own layout.
+    //
+    // The branch is WORKGROUP-UNIFORM -- a whole workgroup shares one expert_id
+    // (it comes from blockIdx.y/z, never from the lane) -- so it costs a scalar
+    // compare, not divergence.
+    //
+    // The arithmetic below is the Oq8 kernel's, term for term and in its order,
+    // so an Oq8 expert routed through here is BIT-IDENTICAL to routing it
+    // through `gemv_oq8g256_moe_*`.
+    if (block_stride == 0) {
+        const char* __restrict__ row_ptr =
+            (const char*)A + (long long)row * ng * OQCM_OQ8_BLK;
+        const int boff = lane * 8;
+        float acc8 = 0.0f;
+        for (int g = 0; g < ng; ++g) {
+            const char* gp = row_ptr + (long long)g * OQCM_OQ8_BLK;
+            const float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+            const signed char* w8 = (const signed char*)(gp + 4 + boff);
+            const int base = g * 256 + boff;
+            float gsum = 0.0f;
+            #pragma unroll
+            for (int n = 0; n < 8; n++) {
+                gsum += (float)w8[n] * x[base + n];
+            }
+            acc8 += sc * gsum;
+        }
+        for (int off = 16; off > 0; off >>= 1) acc8 += __shfl_down(acc8, off);
+        return acc8;
+    }
+
     const int side_stride = block_stride - 128;
     const int n_ov = (block_stride - 130) >> 1;
 
@@ -112,21 +152,24 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq_compact_moe_gate_up_k8_indexed(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [k_top]
+    const int* __restrict__ expert_strides,              // [n_exp], 0 = Oq8
     const float* __restrict__ x,                         // [K] or [K_TOP x K]
     float* __restrict__ y_gate,                          // [K_TOP x MI]
     float* __restrict__ y_up,                            // [K_TOP x MI]
-    int M, int K, int x_per_slot, int block_stride
+    int M, int K, int x_per_slot
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
     const int krank = blockIdx.y;
     const int lane = threadIdx.x;
 
+    const int expert_id = topk_indices[krank];
     const uint8_t* __restrict__ A =
-        reinterpret_cast<const uint8_t*>(expert_ptrs[topk_indices[krank]]);
+        reinterpret_cast<const uint8_t*>(expert_ptrs[expert_id]);
     const float* __restrict__ x_row = x + (long long)(x_per_slot ? krank : 0) * K;
 
-    const float acc = oqc_moe_row_dot(A, x_row, row, M, K, block_stride, lane);
+    const float acc =
+        oqc_moe_row_dot(A, x_row, row, M, K, expert_strides[expert_id], lane);
 
     if (lane == 0) {
         const int mi = M >> 1;
@@ -140,10 +183,11 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq_compact_moe_gate_up_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [N x K_TOP]
+    const int* __restrict__ expert_strides,              // [n_exp], 0 = Oq8
     const float* __restrict__ x,                    // [N x K] or [N x K_TOP x K]
     float* __restrict__ y_gate,                          // [N x K_TOP x MI]
     float* __restrict__ y_up,                            // [N x K_TOP x MI]
-    int M, int K, int K_TOP, int x_per_slot, int block_stride
+    int M, int K, int K_TOP, int x_per_slot
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -151,12 +195,14 @@ extern "C" __global__ void gemv_oq_compact_moe_gate_up_k8_indexed_batched(
     const int bid = blockIdx.z;
     const int lane = threadIdx.x;
 
-    const uint8_t* __restrict__ A = reinterpret_cast<const uint8_t*>(
-        expert_ptrs[topk_indices[bid * K_TOP + krank]]);
+    const int expert_id = topk_indices[bid * K_TOP + krank];
+    const uint8_t* __restrict__ A =
+        reinterpret_cast<const uint8_t*>(expert_ptrs[expert_id]);
     const float* __restrict__ x_row =
         x + (x_per_slot ? ((long long)bid * K_TOP + krank) : (long long)bid) * K;
 
-    const float acc = oqc_moe_row_dot(A, x_row, row, M, K, block_stride, lane);
+    const float acc =
+        oqc_moe_row_dot(A, x_row, row, M, K, expert_strides[expert_id], lane);
 
     if (lane == 0) {
         const int mi = M >> 1;
@@ -173,9 +219,10 @@ __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int*   __restrict__ topk_indices,              // [N x K_TOP]
+    const int*   __restrict__ expert_strides,            // [n_exp], 0 = Oq8
     const float* __restrict__ rot_batch,                 // [N x K_TOP x K]
     float*       __restrict__ expert_outputs,            // [N x K_TOP x M]
-    int M, int K, int K_TOP, int block_stride
+    int M, int K, int K_TOP
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -183,12 +230,14 @@ extern "C" __global__ void gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
     const int bid = blockIdx.z;
     const int lane = threadIdx.x;
 
-    const uint8_t* __restrict__ A = reinterpret_cast<const uint8_t*>(
-        expert_ptrs[topk_indices[bid * K_TOP + krank]]);
+    const int expert_id = topk_indices[bid * K_TOP + krank];
+    const uint8_t* __restrict__ A =
+        reinterpret_cast<const uint8_t*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
         rot_batch + ((long long)bid * K_TOP + krank) * K;
 
-    const float acc = oqc_moe_row_dot(A, x, row, M, K, block_stride, lane);
+    const float acc =
+        oqc_moe_row_dot(A, x, row, M, K, expert_strides[expert_id], lane);
 
     if (lane == 0) {
         expert_outputs[((long long)bid * K_TOP + krank) * (long long)M + row] = acc;

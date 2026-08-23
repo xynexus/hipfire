@@ -506,7 +506,26 @@ fn run_moe_decode_routed(
             p.k,
             1,
         ))?;
-        if res.routed_indexable_oq4 {
+        if res.routed_indexable_oq_compact {
+            // Compact-resident experts, possibly MIXED with promoted Oq8 ones in
+            // this layer: the per-expert stride table (0 = Oq8) tells the kernel
+            // which each is, so one launch serves both.
+            hip!(gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.expert_gate_up_strides.expect(
+                    "compact routed gate_up needs the per-expert stride table",
+                ),
+                p.x_rot_expanded,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+                1,
+                true,
+            ))?;
+        } else if res.routed_indexable_oq4 {
             hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -615,6 +634,19 @@ fn run_moe_decode_routed(
         hip!(gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq_compact {
+        hip!(gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.expert_down_strides
+                .expect("compact routed down needs the per-expert stride table"),
             p.rot_batch,
             p.down_expanded,
             down_m,
@@ -2094,7 +2126,7 @@ pub fn run_moe_prefill(
                 // must precede the FWHT, so one rotation cannot serve them all.
                 // With no sidecars this is the plain rotation replicated per
                 // slot, which the kernels still require.
-                dt @ (DType::Oq4G256 | DType::Oq8G256) => {
+                dt @ (DType::Oq4G256 | DType::Oq8G256 | DType::OqCompactG256) => {
                     hip!(gpu.rotate_x_mq_awq_indexed_batched(
                         p.x_norm_batch,
                         p.expert_gate_up_awq_ptrs,
@@ -2104,7 +2136,26 @@ pub fn run_moe_prefill(
                         k_top,
                         n,
                     ))?;
-                    if dt == DType::Oq4G256 {
+                    if dt == DType::OqCompactG256 {
+                        // Compact-resident, possibly mixed with promoted Oq8
+                        // experts in this layer -- the stride table disambiguates
+                        // per expert.
+                        hip!(gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                            p.expert_gate_up_ptrs,
+                            p.topk_indices,
+                            p.expert_gate_up_strides.expect(
+                                "compact routed gate_up needs the per-expert stride table",
+                            ),
+                            p.x_rot_expanded,
+                            p.gate_batch,
+                            p.up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true,
+                        ))
+                    } else if dt == DType::Oq4G256 {
                         hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                             p.expert_gate_up_ptrs,
                             p.topk_indices,
@@ -2385,6 +2436,20 @@ pub fn run_moe_prefill(
                 k_top,
                 n,
             )),
+            DType::OqCompactG256 => {
+                hip!(gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.expert_down_strides
+                        .expect("compact routed down needs the per-expert stride table"),
+                    p.rot_batch,
+                    p.down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                ))
+            }
             DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
                 p.expert_down_ptrs,
                 p.topk_indices,

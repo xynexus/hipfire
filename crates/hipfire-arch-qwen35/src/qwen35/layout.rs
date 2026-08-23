@@ -104,6 +104,26 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
 
+    /// Device-side per-expert compact block stride (`130 + 2*N_out`), or **0**
+    /// where that expert is `Oq8G256`. `[num_experts]` i32.
+    ///
+    /// This is what lets ONE indexed launch serve a layer that mixes compact and
+    /// Oq8 routed experts, which mixed-precision promotion produces routinely --
+    /// the 122B mixes them across 37 of its 48 layers. Without it the layout is
+    /// a launch-wide constant, and the only way to dispatch a mixed layer is to
+    /// expand its compact experts at load until the layer is uniform, at 1.80x
+    /// the bytes.
+    ///
+    /// 0 as the Oq8 sentinel rather than 260: a compact stride is `130 + 2*N_out`
+    /// and 260 satisfies that at N_out=65, so a stride cannot identify its own
+    /// layout.
+    /// `None` on paths that never dispatch the compact GEMVs (paged residency,
+    /// calibration) -- an absent table is the honest encoding there, and the
+    /// dispatch asserts on it rather than reading a table of zeros that would
+    /// silently mean "every expert is Oq8".
+    pub expert_gate_up_strides: Option<GpuTensor>,
+    pub expert_down_strides: Option<GpuTensor>,
+
     /// Device-side per-expert AWQ scale pointers, same shape and construction
     /// as `expert_gate_up_ptrs` (a 0 entry means that expert has no sidecar).
     ///
@@ -553,6 +573,12 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
     let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
+    if let Some(t) = ffn.expert_gate_up_strides {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = ffn.expert_down_strides {
+        let _ = gpu.free_tensor(t);
+    }
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
     for e in ffn.experts {

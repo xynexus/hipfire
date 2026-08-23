@@ -1864,6 +1864,8 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_strides: None,
+        expert_down_strides: None,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
         // Resident: the scales are owned by `experts[i].*.awq_scale`.
@@ -6459,10 +6461,10 @@ fn load_moe_expert(
     m: usize,
     k: usize,
     oq_indexed_decode: bool,
-    // Every routed expert in THIS layer is OqPlusCompact, so the layer can be
-    // dispatched compact. False forces the Oq8 expansion below -- see the call
-    // site for why the decision cannot be made per tensor.
-    layer_uniform_compact: bool,
+    // Every routed expert in THIS layer is a layout the per-expert stride table
+    // can describe (OqPlusCompact or Oq8G256), so the layer can be dispatched
+    // through the compact GEMVs. False forces the Oq8 expansion below.
+    layer_compact_dispatchable: bool,
 ) -> HipResult<WeightTensor> {
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
@@ -6498,7 +6500,7 @@ fn load_moe_expert(
     // must NOT fall through to `load_weight_tensor` either -- for a routed expert
     // that yields the DENSE combined Oq8 layout, which the indexed kernels do not
     // read; the expansion below produces the indexed MoE BLOCK layout they do.
-    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT) && layer_uniform_compact {
+    if qt == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT) && layer_compact_dispatchable {
         return load_weight_tensor(hfq, gpu, slabs, name, m, k);
     }
     let (dtype, blocks) = match qt {
@@ -6604,26 +6606,20 @@ fn load_moe_ffn(
         config.moe_intermediate_size,
         config.num_experts_per_tok,
     );
-    // Compact residency is a per-LAYER decision, not per-tensor. The indexed
-    // GEMVs take ONE layout for every expert they touch -- the layout is a
-    // launch parameter, and `expert_ptrs` carries addresses, not descriptors --
-    // so a layer holding both compact and Oq8 experts would hand compact bytes
-    // to a 260-byte-stride read. That is a GPU memory fault, not wrong numbers:
-    // observed on the 122B, which mixes 23,288 compact routed experts with 1,288
-    // Oq8 ones (mixed-precision promotion) across 37 of its 48 layers.
+    // Compact residency is a per-LAYER decision, and the per-expert stride table
+    // is what makes the layer's rule cheap: the compact GEMVs read each expert's
+    // layout from `expert_*_strides` (0 = Oq8), so ONE launch serves a layer that
+    // mixes compact and promoted experts. That is the common case in a
+    // mixed-precision artifact -- the 122B mixes them across 37 of its 48 layers
+    // -- and before the table existed the only way to dispatch such a layer was
+    // to expand its compact experts at load until it was uniform, at 1.80x the
+    // bytes.
     //
-    // The expansion is what USED to hide this. Unpacking compact to Oq8 at load
-    // made every routed expert uniformly Oq8, so no layer was ever mixed at the
-    // dispatch. Keeping compact makes the mixture visible, and the layer has to
-    // pick one.
-    //
-    // So: keep compact only where the whole layer is compact, and otherwise
-    // expand exactly as before. A uniformly-compact model (the 35B-A3B) gets the
-    // full saving; a mixed one stays correct at its old footprint. Lifting this
-    // needs a per-expert stride table so one kernel can serve both layouts --
-    // worth doing, since it is what the 122B actually needs, but it is a kernel
-    // contract change and does not belong in a correctness fix.
-    let layer_uniform_compact = hipfire_runtime::oq8_arch::compact_resident_enabled()
+    // The remaining requirement is narrower: every routed expert must be one of
+    // the two layouts the table can describe. A layer carrying a full-precision
+    // fallback expert (`QuantWithFullPrecisionFallback`) takes a different path
+    // entirely, which has no compact arm, so those layers keep the expansion.
+    let layer_compact_dispatchable = hipfire_runtime::oq8_arch::compact_resident_enabled()
         && (0..n_exp).all(|x| {
             [
                 format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
@@ -6631,10 +6627,13 @@ fn load_moe_ffn(
             ]
             .iter()
             .all(|name| {
-                qwen35_tensor_name_candidates(name)
-                    .into_iter()
-                    .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type))
-                    == Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
+                matches!(
+                    qwen35_tensor_name_candidates(name)
+                        .into_iter()
+                        .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type)),
+                    Some(qt) if qt == hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT
+                        || qt == hipfire_runtime::oq_moe::OQ8_CANONICAL_QT
+                )
             })
         });
     for x in 0..n_exp {
@@ -6646,7 +6645,7 @@ fn load_moe_ffn(
             2 * mi,
             config.dim,
             oq_indexed_decode,
-            layer_uniform_compact,
+            layer_compact_dispatchable,
         )?;
         let down = load_moe_expert(
             hfq,
@@ -6656,7 +6655,7 @@ fn load_moe_ffn(
             config.dim,
             mi,
             oq_indexed_decode,
-            layer_uniform_compact,
+            layer_compact_dispatchable,
         )?;
         experts.push(ExpertWeights { gate_up, down });
     }
@@ -6678,6 +6677,50 @@ fn load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+    // Per-expert layout descriptors. The pointer tables carry addresses only, so
+    // without these a launch has ONE layout for every expert it touches, and a
+    // mixed-precision layer cannot be dispatched at all -- which is why compact
+    // routed experts previously had to be expanded until each layer was uniform.
+    let stride_of = |t: &WeightTensor, m: usize, k: usize| -> i32 {
+        if t.gpu_dtype != DType::OqCompactG256 {
+            return 0; // Oq8G256 or anything else: no compact stride.
+        }
+        let groups = m * (k / 256);
+        if groups == 0 {
+            return 0;
+        }
+        let stride = t.buf.buf.size() / groups;
+        // Derived from the tensor's own bytes, never trusted from a config: a
+        // wrong stride does not fail, it silently reads the neighbouring group's
+        // scale.
+        assert!(
+            stride >= 132 && (stride - 130) % 2 == 0,
+            "compact routed expert stride {stride} invalid (expected 130 + 2*N_out, N_out >= 1)"
+        );
+        stride as i32
+    };
+    let gu_strides: Vec<i32> = experts
+        .iter()
+        .map(|e| stride_of(&e.gate_up, 2 * mi, config.dim))
+        .collect();
+    let dn_strides: Vec<i32> = experts
+        .iter()
+        .map(|e| stride_of(&e.down, config.dim, mi))
+        .collect();
+    let (expert_gate_up_strides, expert_down_strides) = if experts.is_empty() {
+        (None, None)
+    } else {
+        // Allocated as F32 purely for the 4-byte element size -- the kernel
+        // reads it as `const int*`. Same convention as the pointer tables above,
+        // which are F32 tensors holding u64 addresses.
+        let gu_t = gpu.alloc_tensor(&[n_exp], DType::F32)?;
+        let dn_t = gpu.alloc_tensor(&[n_exp], DType::F32)?;
+        let gu_sb: Vec<u8> = gu_strides.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let dn_sb: Vec<u8> = dn_strides.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&gu_t.buf, &gu_sb)?;
+        gpu.hip.memcpy_htod(&dn_t.buf, &dn_sb)?;
+        (Some(gu_t), Some(dn_t))
+    };
     let expert_gate_up_dtype = experts.first().map(|e| e.gate_up.gpu_dtype);
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
@@ -6692,6 +6735,8 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_strides,
+        expert_down_strides,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
         // Resident: the scales are owned by `experts[i].*.awq_scale`.
@@ -6828,6 +6873,8 @@ fn load_moe_ffn_paged(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_gate_up_strides: None,
+        expert_down_strides: None,
         expert_gate_up_awq_ptrs,
         expert_down_awq_ptrs,
         expert_gate_up_awq,

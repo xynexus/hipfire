@@ -1360,7 +1360,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 // scale. See `rotate_x_mq_awq_indexed_batched`; with no
                 // sidecars (paged mode included) this is the plain rotation
                 // replicated per slot, which the kernels still require.
-                dt @ (DType::Oq4G256 | DType::Oq8G256) => {
+                dt @ (DType::Oq4G256 | DType::Oq8G256 | DType::OqCompactG256) => {
                     let x_rot_slots = pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
                     gpu.rotate_x_mq_awq_indexed_batched(
                         &pbs.x_norm_batch,
@@ -1371,7 +1371,29 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         k_top,
                         n,
                     )?;
-                    if dt == DType::Oq4G256 {
+                    if dt == DType::OqCompactG256 {
+                        // Compact-resident experts, possibly MIXED with promoted
+                        // Oq8 ones in this same layer -- the stride table tells
+                        // the kernel which each is. This arm's absence is what
+                        // faulted the 122B: compact bytes reached the Oq8 branch
+                        // below and were read at a 260-byte stride.
+                        let strides = ffn.expert_gate_up_strides.as_ref().expect(
+                            "compact routed gate_up needs the per-expert stride table",
+                        );
+                        gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                            &ffn.expert_gate_up_ptrs,
+                            topk_indices,
+                            strides,
+                            x_rot_slots,
+                            gate_batch,
+                            up_batch,
+                            2 * mi,
+                            gate_up_k,
+                            k_top,
+                            n,
+                            true, // x_rot_slots is [N x K_TOP x dim]
+                        )?;
+                    } else if dt == DType::Oq4G256 {
                         gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                             &ffn.expert_gate_up_ptrs,
                             topk_indices,
@@ -1869,6 +1891,23 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         k_top,
                         n,
                     )?,
+                    DType::OqCompactG256 => {
+                        let strides = ffn
+                            .expert_down_strides
+                            .as_ref()
+                            .expect("compact routed down needs the per-expert stride table");
+                        gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
+                            &ffn.expert_down_ptrs,
+                            topk_indices,
+                            strides,
+                            rot_batch,
+                            down_expanded,
+                            down_m,
+                            down_k,
+                            k_top,
+                            n,
+                        )?
+                    }
                     other => panic!(
                         "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                                  experts[0].down dtype {other:?} — admit predicate should \
@@ -1986,6 +2025,8 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_strides: ffn.expert_gate_up_strides.as_ref(),
+        expert_down_strides: ffn.expert_down_strides.as_ref(),
         expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         routed_oq_arch_combined: !hipfire_dispatch::families::moe::oq_indexed_decode_active(

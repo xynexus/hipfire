@@ -80,20 +80,6 @@ pub(crate) struct MoeScratchRef<'a> {
     bucket_y_down: &'a GpuTensor,
 }
 
-/// Compact block stride (`130 + 2*N_out`) recovered from a resident expert
-/// tensor's byte length.
-///
-/// The compact GEMVs need it to place the side plane, and it is NOT a constant:
-/// N_out is a quantizer choice per artifact. Deriving it from the bytes rather
-/// than threading a field through the layout keeps it impossible for the two to
-/// disagree -- a stale field would silently read the neighbouring group's scale.
-///
-/// Returns 0 when there is nothing to derive it from (paged residency, where
-/// `experts` is empty); callers must not take the compact path then.
-fn compact_block_stride(bytes: usize, m: usize, k: usize) -> usize {
-    let groups = m * (k / 256);
-    if groups == 0 { 0 } else { bytes / groups }
-}
 
 impl<'a> MoeScratchRef<'a> {
     /// View into a Qwen35Scratch's MoE fields. Panics if the caller didn't
@@ -993,6 +979,31 @@ pub(crate) fn moe_ffn_decode_impl(
              and no resident experts) — cannot resolve a routed dispatch path",
         )
     })?;
+    // EXPERT 0 IS NOT THE LAYER. Mixed-precision promotion leaves some routed
+    // experts compact and others Oq8 in the SAME layer, so the dtype of expert
+    // zero names one expert, not the dispatch path. When every expert is a
+    // layout the per-expert stride table can describe and at least one is
+    // compact, the layer must go through the compact GEMVs -- they are the only
+    // ones that read a per-expert layout; the Oq8 kernels take it as a
+    // launch-wide constant.
+    //
+    // Getting this wrong is a GPU memory fault, not a slow path: layer 0 of the
+    // 122B holds 226 compact experts and 30 Oq8 ones, expert 0 is Oq8, and
+    // reporting Oq8 fed those 226 compact tensors to a 260-byte-stride read.
+    let routed_representative_compact = {
+        let servable = |d: &DType| matches!(d, DType::OqCompactG256 | DType::Oq8G256);
+        let gu = &ffn.expert_gate_up_dtypes;
+        let dn = &ffn.expert_down_dtypes;
+        !gu.is_empty()
+            && gu.iter().all(servable)
+            && dn.iter().all(servable)
+            && gu.iter().chain(dn.iter()).any(|d| *d == DType::OqCompactG256)
+    };
+    let routed_gate_up_dtype = if routed_representative_compact {
+        DType::OqCompactG256
+    } else {
+        routed_gate_up_dtype
+    };
     let routed_down_dtype = moe_expert_down_dtype(ffn, 0).ok_or_else(|| {
         HipError::new(
             0,
@@ -1021,7 +1032,11 @@ pub(crate) fn moe_ffn_decode_impl(
             false
         },
         routed_gate_up: routed_gate_up_dtype,
-        routed_down: routed_down_dtype,
+        routed_down: if routed_representative_compact {
+            DType::OqCompactG256
+        } else {
+            routed_down_dtype
+        },
         has_paro_shared: ffn.paro_shared.is_some(),
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
@@ -1072,6 +1087,8 @@ pub(crate) fn moe_ffn_decode_impl(
             shared_down_w: ffn.shared_expert.down.dispatch_ref(),
             expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
             expert_down_ptrs: &ffn.expert_down_ptrs,
+            expert_gate_up_strides: ffn.expert_gate_up_strides.as_ref(),
+            expert_down_strides: ffn.expert_down_strides.as_ref(),
             expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
             expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
             // Option A: the lowered path reads top-k back and makes the
@@ -1517,20 +1534,15 @@ pub(crate) fn moe_ffn_decode_impl(
             if routed_dtype_indexable_oq_compact {
                 // Compact-resident experts: same dispatch, same x contract; the
                 // weights simply were never expanded to int8 at load.
-                let bs = ffn
-                    .experts
-                    .first()
-                    .map(|e| compact_block_stride(e.gate_up.buf.buf.size(), 2 * mi, gate_up_k))
-                    .unwrap_or(0);
-                assert!(
-                    bs >= 132,
-                    "compact routed gate_up needs resident experts to derive block_stride \
-                     (got {bs}); paged + indexed compact is not wired"
+                let strides = ffn.expert_gate_up_strides.as_ref().expect(
+                    "compact routed gate_up needs the per-expert stride table; \
+                     paged + indexed compact is not wired",
                 );
                 if ffn.experts.is_empty() {
                     gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
                         &ffn.expert_gate_up_ptrs,
                         s.topk_indices,
+                        strides,
                         xs,
                         s.gate_batch,
                         s.up_batch,
@@ -1539,19 +1551,18 @@ pub(crate) fn moe_ffn_decode_impl(
                         k,
                         1,
                         true,
-                        bs,
                     )?;
                 } else {
                     gpu.gemv_oq_compact_moe_gate_up_k8_indexed(
                         &ffn.expert_gate_up_ptrs,
                         s.topk_indices,
+                        strides,
                         xs,
                         s.gate_batch,
                         s.up_batch,
                         2 * mi,
                         gate_up_k,
                         true,
-                        bs,
                     )?;
                 }
             } else {
@@ -1736,25 +1747,20 @@ pub(crate) fn moe_ffn_decode_impl(
                 1,
             )?;
         } else if routed_dtype_indexable_oq_compact {
-            let bs = ffn
-                .experts
-                .first()
-                .map(|e| compact_block_stride(e.down.buf.buf.size(), down_m, down_k))
-                .unwrap_or(0);
-            assert!(
-                bs >= 132,
-                "compact routed down needs resident experts to derive block_stride (got {bs})"
-            );
+            let strides = ffn
+                .expert_down_strides
+                .as_ref()
+                .expect("compact routed down needs the per-expert stride table");
             gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
                 &ffn.expert_down_ptrs,
                 s.topk_indices,
+                strides,
                 s.rot_batch,
                 s.down_expanded,
                 down_m,
                 down_k,
                 k,
                 1,
-                bs,
             )?;
         } else {
             // routed_dtype_indexable_paro
@@ -1968,6 +1974,8 @@ pub(crate) fn moe_ffn_decode_impl(
         shared_down_w: ffn.shared_expert.down.dispatch_ref(),
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_gate_up_strides: ffn.expert_gate_up_strides.as_ref(),
+        expert_down_strides: ffn.expert_down_strides.as_ref(),
         expert_gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
         // Option A: the lowered path reads top-k back and makes the

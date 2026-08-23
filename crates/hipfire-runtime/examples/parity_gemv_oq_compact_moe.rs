@@ -128,6 +128,62 @@ fn decode_logical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
     w
 }
 
+/// Which experts stay compact. `Mixed` alternates, which is what a promoted
+/// artifact really looks like -- and is the case the per-expert stride table
+/// exists for.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    AllCompact,
+    AllOq8,
+    Mixed,
+}
+
+impl Layout {
+    fn compact(self, e: usize) -> bool {
+        match self {
+            Layout::AllCompact => true,
+            Layout::AllOq8 => false,
+            Layout::Mixed => e % 2 == 0,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Layout::AllCompact => "compact",
+            Layout::AllOq8 => "oq8-via-compact",
+            Layout::Mixed => "MIXED",
+        }
+    }
+}
+
+/// The device-side `[n_exp]` i32 table: compact block stride, or 0 for Oq8.
+fn stride_table(gpu: &mut Gpu, layout: Layout, n_exp: usize) -> hipfire_rdna::GpuTensor {
+    let v: Vec<f32> = (0..n_exp)
+        .map(|e| {
+            let st: i32 = if layout.compact(e) { BLOCK_STRIDE as i32 } else { 0 };
+            f32::from_bits(st as u32)
+        })
+        .collect();
+    gpu.upload_f32(&v, &[n_exp]).unwrap()
+}
+
+/// Per-expert device blobs under `layout`: compact experts get split planes,
+/// promoted ones the expanded Oq8 blocks -- both decoded from the SAME raw
+/// compact source, so the logical weights are identical either way.
+fn layout_blobs(raw: &[Vec<u8>], layout: Layout, m: usize, k: usize) -> Vec<Vec<u8>> {
+    raw.iter()
+        .enumerate()
+        .map(|(e, b)| {
+            if layout.compact(e) {
+                let mut owned = b.clone();
+                normalize_compact_overlays(&mut owned, m, k, GROUP);
+                split_compact_planes(&owned, m, k, GROUP)
+            } else {
+                oqplus_compact_to_moe_oq8_blocks(b, m, k).expect("expand")
+            }
+        })
+        .collect()
+}
+
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -142,7 +198,15 @@ fn max_rel(a: &[f32], b: &[f32]) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch: usize) -> bool {
+fn run_case(
+    gpu: &mut Gpu,
+    label: &str,
+    m: usize,
+    k: usize,
+    n_exp: usize,
+    batch: usize,
+    layout: Layout,
+) -> bool {
     let ng = k / GROUP;
     let mi = m / 2;
 
@@ -184,16 +248,11 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch:
         .map(|b| oqplus_compact_to_moe_oq8_blocks(b, m, k).expect("expand"))
         .collect();
     // ── compact split planes (under test) ───────────────────────────────────
-    let cmp_blobs: Vec<Vec<u8>> = raw
-        .iter()
-        .map(|b| {
-            let mut owned = b.clone();
-            normalize_compact_overlays(&mut owned, m, k, GROUP);
-            split_compact_planes(&owned, m, k, GROUP)
-        })
-        .collect();
-    assert_eq!(cmp_blobs[0].len(), m * ng * BLOCK_STRIDE, "split preserves bytes");
-    let saving = oq8_blobs[0].len() as f64 / cmp_blobs[0].len() as f64;
+    let cmp_blobs: Vec<Vec<u8>> = layout_blobs(&raw, layout, m, k);
+    let bytes_now: usize = cmp_blobs.iter().map(|b| b.len()).sum();
+    let bytes_oq8: usize = oq8_blobs.iter().map(|b| b.len()).sum();
+    let saving = bytes_oq8 as f64 / bytes_now as f64;
+    let _ = ng;
 
     let up = |g: &mut Gpu, blobs: &[Vec<u8>]| -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
         let ts: Vec<_> = blobs
@@ -212,6 +271,7 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch:
     };
     let (_keep8, ptr8) = up(gpu, &oq8_blobs);
     let (_keepc, ptrc) = up(gpu, &cmp_blobs);
+    let strides = stride_table(gpu, layout, n_exp);
 
     let idx_t = gpu
         .upload_raw(&topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[topk.len()])
@@ -224,10 +284,10 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch:
 
     if batch == 1 {
         gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8, &idx_t, &x_t, &g8, &u8_, m, k, true).unwrap();
-        gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptrc, &idx_t, &x_t, &gc, &uc, m, k, true, BLOCK_STRIDE).unwrap();
+        gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, true).unwrap();
     } else {
         gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(&ptr8, &idx_t, &x_t, &g8, &u8_, m, k, K_TOP, batch, true).unwrap();
-        gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(&ptrc, &idx_t, &x_t, &gc, &uc, m, k, K_TOP, batch, true, BLOCK_STRIDE).unwrap();
+        gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(&ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, K_TOP, batch, true).unwrap();
     }
     gpu.device_synchronize().unwrap();
 
@@ -249,8 +309,9 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch:
     let ex = max_rel(&y8, &yc);
     let ok = ec <= e8.max(1e-6) * 4.0 && ex < 1e-5;
     println!(
-        "  {label:<28} oq8-vs-oracle {e8:.3e}  compact-vs-oracle {ec:.3e}  \
-         compact-vs-oq8 {ex:.3e}  bytes {saving:.3}x  {}",
+        "  {:<34} oq8-vs-oracle {e8:.3e}  under-test-vs-oracle {ec:.3e}  \
+         cross {ex:.3e}  bytes {saving:.3}x  {}",
+        format!("{label} [{}]", layout.label()),
         if ok { "PASS" } else { "FAIL" }
     );
     ok
@@ -258,7 +319,7 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, n_exp: usize, batch:
 
 /// `down` writes `expert_outputs[N x K_TOP x M]` with no gate|up split, so it
 /// needs its own comparison rather than a flag on `run_case`.
-fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize) -> bool {
+fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layout: Layout) -> bool {
     let raw: Vec<Vec<u8>> = (0..n_exp).map(|e| build_expert(71 + e as u32, m, k)).collect();
     let logical: Vec<Vec<f32>> = raw.iter().map(|b| decode_logical(b, m, k)).collect();
     let topk: Vec<i32> = (0..batch * K_TOP).map(|j| (j % n_exp) as i32).collect();
@@ -285,14 +346,7 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize) -> bo
         .iter()
         .map(|b| oqplus_compact_to_moe_oq8_blocks(b, m, k).expect("expand"))
         .collect();
-    let cmp_blobs: Vec<Vec<u8>> = raw
-        .iter()
-        .map(|b| {
-            let mut owned = b.clone();
-            normalize_compact_overlays(&mut owned, m, k, GROUP);
-            split_compact_planes(&owned, m, k, GROUP)
-        })
-        .collect();
+    let cmp_blobs: Vec<Vec<u8>> = layout_blobs(&raw, layout, m, k);
 
     let up = |g: &mut Gpu, blobs: &[Vec<u8>]| -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
         let ts: Vec<_> = blobs.iter().map(|b| g.upload_raw(b, &[b.len()]).unwrap()).collect();
@@ -308,6 +362,7 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize) -> bo
     };
     let (_k8, ptr8) = up(gpu, &oq8_blobs);
     let (_kc, ptrc) = up(gpu, &cmp_blobs);
+    let strides = stride_table(gpu, layout, n_exp);
     let idx_t = gpu
         .upload_raw(&topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[topk.len()])
         .unwrap();
@@ -318,7 +373,7 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize) -> bo
     gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(&ptr8, &idx_t, &x_t, &o8, m, k, K_TOP, batch)
         .unwrap();
     gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
-        &ptrc, &idx_t, &x_t, &oc, m, k, K_TOP, batch, BLOCK_STRIDE,
+        &ptrc, &idx_t, &strides, &x_t, &oc, m, k, K_TOP, batch,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
@@ -330,8 +385,8 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize) -> bo
     let ex = max_rel(&y8, &yc);
     let ok = ec <= e8.max(1e-6) * 4.0 && ex < 1e-5;
     println!(
-        "  {:<28} oq8-vs-oracle {e8:.3e}  compact-vs-oracle {ec:.3e}  compact-vs-oq8 {ex:.3e}  {}",
-        format!("down M={m} K={k} N={batch}"),
+        "  {:<34} oq8-vs-oracle {e8:.3e}  under-test-vs-oracle {ec:.3e}  cross {ex:.3e}  {}",
+        format!("down M={m} K={k} N={batch} [{}]", layout.label()),
         if ok { "PASS" } else { "FAIL" }
     );
     ok
@@ -348,17 +403,19 @@ fn main() {
     let mut gpu = Gpu::init().unwrap();
     println!("compact-resident indexed MoE GEMV parity (M={m} K={k} experts={n_exp})");
     let mut all = true;
-    all &= run_case(&mut gpu, "gate_up (batch=1)", m, k, n_exp, 1);
-    all &= run_case(&mut gpu, "gate_up batched (N=3)", m, k, n_exp, 3);
-    // A second K exercising a different group count, and a non-square shape
-    // closer to a real `down` projection.
-    all &= run_case(&mut gpu, "gate_up K=512", m, 512, n_exp, 2);
-    all &= run_case(&mut gpu, "gate_up M=256 K=2048", 256, 2048, n_exp, 2);
-    // `down` is the other shape in a real layer: K is the moe_intermediate, so
-    // it is much smaller and the group count much lower than gate_up's.
-    all &= run_down(&mut gpu, 512, 512, n_exp, 1);
-    all &= run_down(&mut gpu, 2048, 512, n_exp, 3);
-    all &= run_down(&mut gpu, 1024, 1024, n_exp, 2);
+    for layout in [Layout::AllCompact, Layout::AllOq8, Layout::Mixed] {
+        all &= run_case(&mut gpu, "gate_up (batch=1)", m, k, n_exp, 1, layout);
+        all &= run_case(&mut gpu, "gate_up batched (N=3)", m, k, n_exp, 3, layout);
+        // A second K exercising a different group count, and a shape closer to a
+        // real `down` projection.
+        all &= run_case(&mut gpu, "gate_up K=512", m, 512, n_exp, 2, layout);
+        all &= run_case(&mut gpu, "gate_up M=256 K=2048", 256, 2048, n_exp, 2, layout);
+        // `down` is the other shape in a real layer: K is the moe_intermediate,
+        // so it is smaller and the group count much lower than gate_up's.
+        all &= run_down(&mut gpu, 512, 512, n_exp, 1, layout);
+        all &= run_down(&mut gpu, 2048, 512, n_exp, 3, layout);
+        all &= run_down(&mut gpu, 1024, 1024, n_exp, 2, layout);
+    }
 
     println!("{}", if all { "ALL PASS" } else { "FAILURES PRESENT" });
     if !all {

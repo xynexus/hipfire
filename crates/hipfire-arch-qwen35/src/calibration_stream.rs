@@ -1716,6 +1716,10 @@ fn load_streamed_moe_ffn(
         let expert_gate_up_ptrs = pending.push_tensor(upload_pointer_table(gpu, &gate_up_ptrs)?);
         let expert_down_ptrs = pending.push_tensor(upload_pointer_table(gpu, &down_ptrs)?);
         Ok(MoeFfnWeights {
+            // Calibration never dispatches the compact indexed GEMVs, so there
+            // is no stride table to build.
+            expert_gate_up_strides: None,
+            expert_down_strides: None,
             router: pending.take_weight(router),
             experts: expert_weights,
             shared_expert: SharedExpertWeights {

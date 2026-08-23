@@ -1659,6 +1659,15 @@ struct MoePrefillDtypes {
     expert_down: DType,
     expert_gate_up_uniform: bool,
     expert_down_uniform: bool,
+    /// Every routed expert is `OqCompactG256` or `Oq8G256`, and at least one is
+    /// compact -- so the layer must go through the compact GEMVs, which take a
+    /// per-expert stride table and serve both layouts in one launch.
+    ///
+    /// Not the same as uniformity, and that is the point: mixed-precision
+    /// promotion puts both dtypes in one layer (the 122B, 37 of 48 layers), and
+    /// before the stride table existed the only way to dispatch such a layer was
+    /// to expand the compact experts at load until it was uniform.
+    routed_oq_mixed_compact: bool,
     routed_profile: RoutedExpertDtypeProfile,
 }
 
@@ -1675,6 +1684,7 @@ impl MoePrefillDtypes {
             expert_down: dtype,
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
+            routed_oq_mixed_compact: dtype == DType::OqCompactG256,
             routed_profile: RoutedExpertDtypeProfile::Uniform(dtype),
         }
     }
@@ -1702,6 +1712,8 @@ impl MoePrefillDtypes {
                     expert_down: ffn.expert_down_dtype?,
                     expert_gate_up_uniform: true,
                     expert_down_uniform: true,
+                    routed_oq_mixed_compact: ffn.expert_gate_up_dtype?
+                        == DType::OqCompactG256,
                     routed_profile: RoutedExpertDtypeProfile::Uniform(ffn.expert_gate_up_dtype?),
                 });
             } else {
@@ -1712,10 +1724,30 @@ impl MoePrefillDtypes {
         // Mixed execution uses the low-bit dtype as its representative so the
         // existing rotation/admission helpers describe the quantized basis,
         // independent of whether expert zero happens to be a raw fallback.
+        let servable_by_stride_table =
+            |&d: &DType| matches!(d, DType::OqCompactG256 | DType::Oq8G256);
+        let oq_mixed_compact = gate_up_dtypes.iter().all(servable_by_stride_table)
+            && down_dtypes.iter().all(servable_by_stride_table)
+            && gate_up_dtypes
+                .iter()
+                .chain(down_dtypes.iter())
+                .any(|&d| d == DType::OqCompactG256);
         let (expert_gate_up, expert_down) = match routed_profile {
             RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, .. } => {
                 (quant, quant)
             }
+            // A layer mixing compact and promoted experts reports COMPACT as its
+            // representative, because that is the kernel family able to serve it
+            // -- the compact GEMVs read a per-expert stride table, the Oq8 ones
+            // take the layout as a launch-wide constant.
+            //
+            // Same reasoning as the fallback arm above: the representative names
+            // the execution path, not whichever dtype expert zero happens to
+            // carry. Getting this wrong is not a slow path, it is a GPU memory
+            // fault -- a mixed layer whose expert 0 was Oq8 reported Oq8, and
+            // prefill (which matches on this dtype rather than on the dispatch
+            // flags) fed compact bytes to a 260-byte-stride read.
+            _ if oq_mixed_compact => (DType::OqCompactG256, DType::OqCompactG256),
             _ => (first_gate_up, first_down),
         };
         Some(Self {
@@ -1728,6 +1760,7 @@ impl MoePrefillDtypes {
             expert_down,
             expert_gate_up_uniform: gate_up_dtypes.iter().all(|&dtype| dtype == first_gate_up),
             expert_down_uniform: down_dtypes.iter().all(|&dtype| dtype == first_down),
+            routed_oq_mixed_compact: oq_mixed_compact,
             routed_profile,
         })
     }
@@ -1813,13 +1846,12 @@ fn moe_decode_dispatch_flags_for_dtypes(
     let routed_oq8 = dtypes.expert_down == DType::Oq8G256 && dtypes.expert_down_uniform;
     let routed_gate_up_oq8 =
         dtypes.expert_gate_up == DType::Oq8G256 && dtypes.expert_gate_up_uniform;
-    // Compact-resident routed experts. Same indexed dispatch as the OQ4/OQ8 arms
-    // and the same uniformity requirement; what differs is only that the bytes
-    // were never expanded at load.
-    let routed_oq_compact =
-        dtypes.expert_down == DType::OqCompactG256 && dtypes.expert_down_uniform;
-    let routed_gate_up_oq_compact =
-        dtypes.expert_gate_up == DType::OqCompactG256 && dtypes.expert_gate_up_uniform;
+    // Compact-resident routed experts. Deliberately NOT a uniformity test like
+    // the OQ4/OQ8 arms above: the compact GEMVs take a per-expert stride table,
+    // so one launch serves a layer that mixes compact and Oq8 experts. That is
+    // the common case in a promoted artifact, not an edge case.
+    let routed_oq_compact = dtypes.routed_oq_mixed_compact;
+    let routed_gate_up_oq_compact = dtypes.routed_oq_mixed_compact;
     let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
     let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;

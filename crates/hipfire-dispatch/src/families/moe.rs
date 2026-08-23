@@ -152,6 +152,11 @@ pub struct MoeResolution {
     pub routed_indexable_oq4: bool,
     /// Opus Quant W8A16 routed experts (Oq8G256 gate_up + down, 260 B/group).
     pub routed_indexable_oq8: bool,
+    /// Routed experts are compact-resident, possibly MIXED with promoted Oq8
+    /// ones in the same layer. Dispatches the `gemv_oq_compact_moe_*` kernels,
+    /// which read a PER-EXPERT stride table (0 = Oq8) and so can serve both
+    /// layouts in one launch.
+    pub routed_indexable_oq_compact: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
@@ -229,12 +234,31 @@ impl MoeResolution {
             oq_indexed_decode && (d.routed_down == Oq4G256) && routed_gate_up_oq4;
         let routed_indexable_oq8 =
             oq_indexed_decode && (d.routed_down == Oq8G256) && routed_gate_up_oq8;
+        // ⚠️ OPT-IN, OFF BY DEFAULT. The compact GEMVs themselves are verified
+        // (parity_gemv_oq_compact_moe: 21 cases, including MIXED layers, and an
+        // Oq8 expert routed through them is BIT-IDENTICAL to the Oq8 kernel).
+        // Routing a compact layer through the INDEXED path is what is not yet
+        // right: with this flag on, a uniformly-compact 35B-A3B that produced
+        // byte-identical text through the generic CPU-top-K fallback emits "!!!!".
+        //
+        // The kernels are not the suspect -- the harness covers them against an
+        // f64 oracle. Something in the indexed feed differs from what the generic
+        // path supplies, and until that is found this must not be the default.
+        // Compact RESIDENCY (the 2.83x memory win) does not depend on it: with
+        // the flag off, compact layers keep taking the generic fallback exactly
+        // as they did when that win was measured.
+        let routed_gate_up_oq_compact = d.routed_gate_up == OqCompactG256;
+        let routed_indexable_oq_compact = oq_indexed_decode
+            && (d.routed_down == OqCompactG256)
+            && routed_gate_up_oq_compact
+            && std::env::var("HIPFIRE_MOE_COMPACT_INDEXED").as_deref() == Ok("1");
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq6
             || routed_indexable_paro
             || routed_indexable_oq4
-            || routed_indexable_oq8;
+            || routed_indexable_oq8
+            || routed_indexable_oq_compact;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         // OQ routed experts are FWHT-rotated (same signs as MQ, gen_fwht_signs
@@ -244,7 +268,8 @@ impl MoeResolution {
             || routed_gate_up_mq6
             || routed_gate_up_paro
             || routed_gate_up_oq4
-            || routed_gate_up_oq8;
+            || routed_gate_up_oq8
+            || routed_gate_up_oq_compact;
 
         Self {
             gate_side_mq4,
@@ -253,6 +278,7 @@ impl MoeResolution {
             routed_indexable_paro,
             routed_indexable_oq4,
             routed_indexable_oq8,
+            routed_indexable_oq_compact,
             use_gpu_topk,
             needs_x_rot_local,
         }
@@ -264,6 +290,7 @@ impl MoeResolution {
             || self.routed_indexable_paro
             || self.routed_indexable_oq4
             || self.routed_indexable_oq8
+            || self.routed_indexable_oq_compact
     }
 }
 
@@ -351,6 +378,12 @@ pub struct MoeParams<'a> {
     // routed expert pointer tables + dims
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert compact block stride (0 = that expert is Oq8), `[n_exp]` i32.
+    /// `None` where no compact routed expert is resident. Required whenever
+    /// `routed_indexable_oq_compact` is set -- it is what lets one launch serve a
+    /// layer that mixes compact and promoted experts.
+    pub expert_gate_up_strides: Option<&'a GpuTensor>,
+    pub expert_down_strides: Option<&'a GpuTensor>,
     /// Per-expert AWQ scale pointer tables, same shape and construction as the
     /// weight pointer tables above. Routed experts do NOT share one AWQ scale
     /// (each sees a different token subset, so a different imatrix), and the
@@ -448,6 +481,12 @@ pub struct MoeBiasAwareParams<'a> {
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert compact block stride (0 = that expert is Oq8), `[n_exp]` i32.
+    /// `None` where no compact routed expert is resident. Required whenever
+    /// `routed_indexable_oq_compact` is set -- it is what lets one launch serve a
+    /// layer that mixes compact and promoted experts.
+    pub expert_gate_up_strides: Option<&'a GpuTensor>,
+    pub expert_down_strides: Option<&'a GpuTensor>,
     // scratch buffers (model-owned)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
@@ -519,6 +558,12 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     // routed expert pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert compact block stride (0 = that expert is Oq8), `[n_exp]` i32.
+    /// `None` where no compact routed expert is resident. Required whenever
+    /// `routed_indexable_oq_compact` is set -- it is what lets one launch serve a
+    /// layer that mixes compact and promoted experts.
+    pub expert_gate_up_strides: Option<&'a GpuTensor>,
+    pub expert_down_strides: Option<&'a GpuTensor>,
     // activation / residual
     pub x_rot: &'a GpuTensor,   // ffn_x_rot_batch [B, hidden]
     pub ffn_out: &'a GpuTensor, // ffn_out_batch [B, hidden] (accumulate target)
@@ -612,6 +657,12 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Per-expert compact block stride (0 = that expert is Oq8), `[n_exp]` i32.
+    /// `None` where no compact routed expert is resident. Required whenever
+    /// `routed_indexable_oq_compact` is set -- it is what lets one launch serve a
+    /// layer that mixes compact and promoted experts.
+    pub expert_gate_up_strides: Option<&'a GpuTensor>,
+    pub expert_down_strides: Option<&'a GpuTensor>,
     /// Per-expert AWQ scale pointer tables — see [`MoeParams`]'s fields of the
     /// same name.
     pub expert_gate_up_awq_ptrs: Option<&'a GpuTensor>,

@@ -9,18 +9,6 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-/// A compact G=256 block is `[f16 scale][128 nibbles][N_out x (u8 idx, i8 val)]`,
-/// so a valid stride is `130 + 2*N_out` with `N_out >= 1`. The MoE GEMVs derive
-/// `side_stride` and `N_out` from it, and a wrong value silently reads the
-/// neighbouring group's scale rather than failing -- so check it at dispatch,
-/// where the number is still attributable to a caller.
-fn assert_compact_moe_block_stride(block_stride: usize) {
-    assert!(
-        block_stride >= 132 && (block_stride - 130) % 2 == 0,
-        "compact MoE block_stride {block_stride} invalid (expected 130 + 2*N_out, N_out >= 1)"
-    );
-}
-
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -4072,20 +4060,25 @@ impl Gpu {
     /// Compact twin of [`Self::gemv_oq8g256_moe_gate_up_k8_indexed`]: same
     /// dispatch, same outputs, but reads the split compact planes so the experts
     /// never have to be expanded to int8 at load.
+    ///
+    /// `expert_strides` is `[n_exp]` i32 giving each expert's compact block
+    /// stride, or **0** where that expert was promoted to Oq8G256. That is what
+    /// lets ONE launch serve a mixed-precision layer, which artifacts really do
+    /// contain -- the 122B mixes compact and Oq8 routed experts across 37 of its
+    /// 48 layers. Build it with `expert_stride_table`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_oq_compact_moe_gate_up_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
         topk_indices: &GpuTensor,
+        expert_strides: &GpuTensor,
         x: &GpuTensor,
         y_gate: &GpuTensor,
         y_up: &GpuTensor,
         m: usize,
         k: usize,
         x_per_slot: bool,
-        block_stride: usize,
     ) -> HipResult<()> {
-        assert_compact_moe_block_stride(block_stride);
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_oq_compact_moe_indexed",
@@ -4094,19 +4087,19 @@ impl Gpu {
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
+        let sp = expert_strides.buf.as_ptr();
         let xp = x.buf.as_ptr();
         let ygp = y_gate.buf.as_ptr();
         let yup = y_up.buf.as_ptr();
         let (m_val, k_val) = (m as i32, k as i32);
         let xps = i32::from(x_per_slot);
-        let bs = block_stride as i32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_gate_up_k8_indexed",
             [m as u32, 8, 1],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup,
-                       i32 m_val, i32 k_val, i32 xps, i32 bs],
+            &kernargs![ptr pp, ptr ip, ptr sp, ptr xp, ptr ygp, ptr yup,
+                       i32 m_val, i32 k_val, i32 xps],
         )
     }
 
@@ -4116,6 +4109,7 @@ impl Gpu {
         &mut self,
         expert_ptrs: &GpuTensor,
         topk_indices: &GpuTensor,
+        expert_strides: &GpuTensor,
         x: &GpuTensor,
         y_gate: &GpuTensor,
         y_up: &GpuTensor,
@@ -4124,9 +4118,7 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
         x_per_slot: bool,
-        block_stride: usize,
     ) -> HipResult<()> {
-        assert_compact_moe_block_stride(block_stride);
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_oq_compact_moe_indexed",
@@ -4135,19 +4127,19 @@ impl Gpu {
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
+        let sp = expert_strides.buf.as_ptr();
         let xp = x.buf.as_ptr();
         let ygp = y_gate.buf.as_ptr();
         let yup = y_up.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
         let xps = i32::from(x_per_slot);
-        let bs = block_stride as i32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup,
-                       i32 m_val, i32 k_val, i32 kt, i32 xps, i32 bs],
+            &kernargs![ptr pp, ptr ip, ptr sp, ptr xp, ptr ygp, ptr yup,
+                       i32 m_val, i32 k_val, i32 kt, i32 xps],
         )
     }
 
@@ -4157,15 +4149,14 @@ impl Gpu {
         &mut self,
         expert_ptrs: &GpuTensor,
         topk_indices: &GpuTensor,
+        expert_strides: &GpuTensor,
         rot_batch: &GpuTensor,
         expert_outputs: &GpuTensor,
         m: usize,
         k: usize,
         k_top: usize,
         batch_size: usize,
-        block_stride: usize,
     ) -> HipResult<()> {
-        assert_compact_moe_block_stride(block_stride);
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_oq_compact_moe_indexed",
@@ -4174,17 +4165,17 @@ impl Gpu {
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
+        let sp = expert_strides.buf.as_ptr();
         let rp = rot_batch.buf.as_ptr();
         let op = expert_outputs.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
-        let bs = block_stride as i32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_down_k8_indexed_batched_expanded",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &kernargs![ptr pp, ptr ip, ptr rp, ptr op,
-                       i32 m_val, i32 k_val, i32 kt, i32 bs],
+            &kernargs![ptr pp, ptr ip, ptr sp, ptr rp, ptr op,
+                       i32 m_val, i32 k_val, i32 kt],
         )
     }
 

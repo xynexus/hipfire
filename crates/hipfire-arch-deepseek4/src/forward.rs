@@ -3825,6 +3825,9 @@ fn ffn_routed(
             gate_bias: bias_dev,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: w2_ptrs,
+            // DeepSeek-V4 routed experts are never OqPlusCompact.
+            expert_gate_up_strides: None,
+            expert_down_strides: None,
             topk_indices: topk_idx_dev,
             topk_weights: topk_w_dev,
             gate_batch,
@@ -8215,6 +8218,9 @@ fn ffn_batched(
         topk_weights: &pbs.moe_topk_weights_batch,
         expert_gate_up_ptrs: gate_up_ptrs,
         expert_down_ptrs: w2_ptrs,
+        // DeepSeek-V4 routed experts are never OqPlusCompact.
+        expert_gate_up_strides: None,
+        expert_down_strides: None,
         x_rot: &pbs.ffn_x_rot_batch,
         ffn_out: &pbs.ffn_out_batch,
         expert_token_counts: &pbs.moe_expert_token_counts,

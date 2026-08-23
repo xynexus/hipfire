@@ -899,18 +899,23 @@ pub fn gtt_alloc_cost(bytes: usize) -> usize {
 pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
     let mut resident = 0u64;
     let mut on_disk = 0u64;
-    // The loader keeps routed experts compact only where the WHOLE LAYER is
-    // compact -- the indexed GEMVs take one layout for every expert they touch.
-    // Estimating per tensor would under-price a mixed artifact and admit a load
-    // that cannot fit. Checked model-wide rather than per layer because that is
-    // the conservative direction: a model with any Oq8 routed expert is priced
-    // as if every layer expands, and on the 122B that is nearly true (37 of 48
-    // layers are mixed).
+    // The loader keeps routed experts compact where every expert in the layer is
+    // a layout the per-expert stride table can describe -- compact or Oq8. A
+    // layer carrying a full-precision fallback expert takes a path with no
+    // compact arm and keeps the expansion, so check that model-wide, which is
+    // the conservative direction.
     let compact_resident = crate::oq8_arch::compact_resident_enabled()
         && hfq.modules().iter().all(|m| {
             m.tensors
                 .iter()
-                .all(|t| t.quant_type == QuantType::OqPlusCompact.code())
+                // Sidecars, not weights: a routed expert carries an F16
+                // `awq_scale` alongside its two projections, and judging the
+                // layer on those would reject every real artifact.
+                .filter(|t| !t.name.contains("awq_scale"))
+                .all(|t| {
+                    t.quant_type == QuantType::OqPlusCompact.code()
+                        || t.quant_type == QuantType::Oq8G256.code()
+                })
         });
     for module in hfq.modules() {
         on_disk += module.data_size as u64;
