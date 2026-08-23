@@ -1294,17 +1294,37 @@ three reps:
 | 2 | **652.94 ms** | 1463.86 ms |
 | 3 | **652.97 ms** | 1462.27 ms |
 
-Priority ordering demonstrably works — the realtime stream takes the first
-quantum ahead of the bulk stream that was admitted before it. But **659 ms is
-3.3x the 200 ms contract**, and the cause is visible in the same trace: the bulk
-stream's prefill (~762 ms, per its `done` frame) is a single indivisible unit
-sitting between admission and first quantum. Nothing can preempt it.
+**Read the gap correctly: it contains the stream's OWN prefill.** `admit_generate`
+records `Admitted`, and the same frame handler then calls `generate_start`, which
+"frames and prefills" (`handlers/generate.rs`) before the march ever runs. So
+`Admitted -> first QuantumBegin` necessarily spans that stream's own prefill, and
+the raw gap is not a scheduling latency. Subtracting each stream's `prefill_ms`
+from its own `done` frame:
 
-That is the same wall §M2a names: **prefill lowering is what the 200 ms contract
-is blocked on**, and this is now a measured number rather than an argument. Note
-also that with the stdin protocol both streams are admitted before the march
-begins, so this figure is the *floor* — a realtime request arriving mid-prefill
-over `--listen` waits at least as long.
+| stream | gap | own prefill | scheduling delay |
+|---|---|---|---|
+| realtime (p9) | 659.4 ms | 647.0 ms | **12.4 ms** |
+| bulk (p0) | 1474.2 ms | 762.1 ms | 712.1 ms |
+
+**So the 200 ms contract is met, at 12.4 ms** — priority admission puts the
+realtime stream on the GPU one quantum after its own prefill finishes, ahead of a
+bulk stream admitted before it. The bulk stream absorbs the interference (712 ms),
+which is the trade the priority lever exists to make.
+
+An earlier revision of this section claimed the 659 ms was the realtime stream
+queueing behind the bulk stream's prefill and concluded the contract failed by
+3.3x. That was wrong: the two streams' prefills are 647 ms and 762 ms, and each
+gap matches its OWN prefill to within ~13 ms. The lesson is that this metric is
+only a scheduling number after its prefill term is removed, so
+`admission_to_first_quantum_ns` should be read alongside `prefill_ms`, never
+alone.
+
+The residual hazard is narrower than "the contract fails", and it is still §M2a:
+a prefill is indivisible and runs in the frame handler, so a realtime request
+that arrives while ANOTHER stream is mid-prefill waits out that prefill — up to
+~762 ms here. Pausing or migrating low-priority streams does not help in that
+window, because there is no quantum boundary to pause at. Prefill lowering is
+what shrinks it.
 
 Still outstanding for M3d: measurement 1 (p99/max module duration and which
 `SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
