@@ -3060,6 +3060,33 @@ pub enum Qwen35Start {
 /// Delegates to the spec-decode fast paths ([`generate_mtp`], [`generate_dflash`],
 /// [`generate_multi`]) and to the non-qwen35 arch paths ([`generate_deepseek4`]
 /// etc.) when the loaded model calls for them.
+/// Latency band for inline prefill, in tokens (`HIPFIRE_PREFILL_BAND_TOKENS`).
+///
+/// A prefill dispatch is indivisible, so it sets the floor on how long a
+/// higher-priority stream waits for the GPU. Banding cuts it into pieces that
+/// each end at a committed KV boundary — `seq_pos` advanced, KV and recurrent
+/// state written — which is precisely the state a continued conversation turn
+/// resumes from, so nothing extra has to be preserved to stop between bands.
+///
+/// Unset keeps the single-dispatch behaviour. Values below 2 are rejected for
+/// the same reason the fused-batch knob rejects them: a 1-token band drives the
+/// batched path per token, which is the serial path wearing a different name.
+///
+/// Measured free: total prefill was flat across unbanded / 128 / 32 / 8-token
+/// bands (14952 / 14917 / 14903 / 14918 ms on a two-session prompt), so the band
+/// size can be chosen from the latency target alone.
+/// Log which prefill arm each request takes (`HIPFIRE_PREFILL_PATH_TRACE`).
+fn prefill_path_trace() -> bool {
+    std::env::var("HIPFIRE_PREFILL_PATH_TRACE").is_ok()
+}
+
+fn prefill_band_tokens() -> Option<usize> {
+    std::env::var("HIPFIRE_PREFILL_BAND_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 2)
+}
+
 pub fn generate_start(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
@@ -4060,6 +4087,27 @@ pub fn generate_start(
                     }
                 }
             }
+            // Which prefill arm ran, and why. Three arms serve `generate` and
+            // they differ by orders of magnitude in granularity, so "which one
+            // did it take" is the first question of any prefill investigation —
+            // and until now the only way to answer it was to read the source and
+            // guess. Two separate wrong conclusions were reached that way.
+            if prefill_path_trace() {
+                let arm = if kv.quant_kvarn {
+                    "per_token(kvarn)"
+                } else if m.eviction.is_some() || prefill_band_tokens().is_some() {
+                    "chunked"
+                } else {
+                    "single_dispatch"
+                };
+                eprintln!(
+                    "[prefill-path] id={id} arm={arm} tokens={} seq_pos={} band={:?} eviction={}",
+                    new_tokens.len(),
+                    session.cursor.seq_pos,
+                    prefill_band_tokens(),
+                    m.eviction.is_some(),
+                );
+            }
             if kv.quant_kvarn {
                 // KVarN (and the deferred-hierarchical two-tier cache built on it)
                 // require the per-token attention dispatch (kv_cache_attention_dispatch):
@@ -4083,13 +4131,38 @@ pub fn generate_start(
                     .unwrap();
                     session.cursor.seq_pos += 1;
                 }
-            } else if let Some(ref ev) = m.eviction {
-                let window = ev.budget() + ev.beta();
+            } else if m.eviction.is_some() || prefill_band_tokens().is_some() {
+                // Chunked prefill. Two independent reasons to cut, and they
+                // compose by taking the smaller cut:
+                //
+                //   * eviction — chunk to the (budget+beta) window so physical
+                //     never exceeds `physical_cap`. A MEMORY bound.
+                //   * `HIPFIRE_PREFILL_BAND_TOKENS` — chunk so no single dispatch
+                //     runs longer than the operator will tolerate. A LATENCY
+                //     bound, and the one that makes a low-priority prefill
+                //     preemptible: each band ends at a committed KV boundary with
+                //     `seq_pos` advanced, which is exactly the state a second
+                //     conversation turn resumes from. Nothing extra is pinned.
+                //
+                // Previously this loop existed only when eviction was configured,
+                // so an operator who wanted a latency cap had to enable an unrelated
+                // memory feature to get one.
+                let band = prefill_band_tokens();
+                let window = m.eviction.as_ref().map(|ev| ev.budget() + ev.beta());
                 let mut remaining: &[u32] = &new_tokens;
                 while !remaining.is_empty() {
-                    let space = window.saturating_sub(session.cursor.seq_pos).max(1);
-                    let chunk_len = remaining.len().min(space);
+                    let space = window
+                        .map(|w| w.saturating_sub(session.cursor.seq_pos).max(1))
+                        .unwrap_or(usize::MAX);
+                    let chunk_len = remaining.len().min(space).min(band.unwrap_or(usize::MAX));
                     let (chunk, rest) = remaining.split_at(chunk_len);
+                    if prefill_path_trace() {
+                        eprintln!(
+                            "[prefill-path] id={id} band chunk_len={chunk_len} at seq_pos={} remaining={}",
+                            session.cursor.seq_pos,
+                            remaining.len(),
+                        );
+                    }
                     qwen35::forward_prefill_batch(
                         gpu,
                         weights,
@@ -4106,12 +4179,14 @@ pub fn generate_start(
                     )
                     .unwrap();
                     session.cursor.seq_pos += chunk_len;
-                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
-                    {
-                        session.cursor.seq_pos = new_phys;
+                    if let Some(ref ev) = m.eviction {
+                        if let Some(hipfire_runtime::triattn::EvictionResult {
+                            new_physical: new_phys,
+                            ..
+                        }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
+                        {
+                            session.cursor.seq_pos = new_phys;
+                        }
                     }
                     remaining = rest;
                 }
