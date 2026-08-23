@@ -571,6 +571,42 @@ impl Gpu {
                 shape: vec![n * ng],
                 dtype: DType::F32,
             };
+            if oq_compact_a4() && group == 256 && oq4_act_group() == 256 {
+                // W4A4. Weights are the SAME compact 4.25-bit blocks -- only the
+                // activation narrows -- so the bits/weight floor is untouched.
+                // The bulk nibble under each overlay entry is zeroed by the
+                // loader, so those positions contribute 0 here and the sparse
+                // overlay below corrects them, exactly as in the W4A8 twin.
+                let x4 = GpuTensor {
+                    buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
+                    shape: vec![n * k / 2],
+                    dtype: DType::Raw,
+                };
+                let s4 = GpuTensor {
+                    buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+                    shape: vec![n * ng],
+                    dtype: DType::F32,
+                };
+                self.gemm_oq_compact_iu4_w64(w_blocks, &x4, &s4, y, m, k, n, block_stride)?;
+                if std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1") {
+                    return Ok(());
+                }
+                // The overlay must see the SAME int4 activation the GEMM used:
+                // the correction replaces a bulk nibble the GEMM read as zero, so
+                // it has to be scaled on the int4 grid, not the int8 one.
+                self.oq_compact_x4_transpose(&x4, &s4, &xt, &xst, n, k, ng)?;
+                return self.oq_compact_overlay_correct_t(
+                    w_blocks,
+                    &xt,
+                    &xst,
+                    y,
+                    m,
+                    k,
+                    n,
+                    group,
+                    block_stride,
+                );
+            }
             if use_w64 {
                 // The wave64 kernel consumes fragment-interleaved nibble pairs,
                 // not int8. The permutation is done ONCE per activation, beside
@@ -1341,8 +1377,14 @@ impl Gpu {
         SUMMAX.fetch_add(sm, Ordering::Relaxed);
         let c = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if c % 256 == 0 {
-            let (f, fdd) = (FRAG.load(Ordering::Relaxed), FRAG_DEAD.load(Ordering::Relaxed));
-            let (bl, bld) = (BLK.load(Ordering::Relaxed), BLK_DEAD.load(Ordering::Relaxed));
+            let (f, fdd) = (
+                FRAG.load(Ordering::Relaxed),
+                FRAG_DEAD.load(Ordering::Relaxed),
+            );
+            let (bl, bld) = (
+                BLK.load(Ordering::Relaxed),
+                BLK_DEAD.load(Ordering::Relaxed),
+            );
             let sx = SUMMAX.load(Ordering::Relaxed);
             eprintln!(
                 "hipass[{c} calls]: fragments {fdd}/{f} = {:.4}% dead | BN=128 blocks {bld}/{bl} = {:.4}% dead | mean fragment max|x| = {:.1}",
@@ -2101,6 +2143,22 @@ impl Gpu {
             dtype: DType::Raw,
         };
         self.act_interleave_nibbles(&xq, &xilv, n, k)?;
+        // W4A4: same activation, int4 grid. Produced here for the same reason as
+        // the interleave -- it is a function of the ACTIVATION, so every compact
+        // projection off it reuses one quantize.
+        if oq_compact_a4() && k % 256 == 0 && oq4_act_group() == 256 {
+            let x4 = GpuTensor {
+                buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * k / 2],
+                dtype: DType::Raw,
+            };
+            let s4 = GpuTensor {
+                buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * (k / 256)],
+                dtype: DType::F32,
+            };
+            self.quantize_act_oq4(x_rot, &x4, &s4, n, k, 256)?;
+        }
         // Also produce the k-major twin the sparse overlay reads. Same argument
         // as the interleave above: it is a function of the ACTIVATION, so doing
         // it here rather than per projection stops gate/up/q/k/v each redoing it.
@@ -2497,4 +2555,16 @@ mod tests {
             assert_eq!(dflash_plain_kernel(dtype, false), (expected, stride));
         }
     }
+}
+
+/// W4A4 opt-in. Weights stay compact 4.25-bit -- only the ACTIVATION narrows to
+/// int4, which turns the exact radix-16 pair (x = 16*x_hi + x_lo, two iu4 WMMA
+/// passes) into a single iu4 pass. The bits/weight floor is untouched because
+/// nothing about the weight encoding changes. Kernel-level 1.66x at the 27B
+/// prefill shapes (gate/up B=512: 2.87 ms W4A8 -> 1.733 ms W4A4).
+/// Both call sites additionally require `oq4_act_group() == 256`: the compact
+/// GEMM's fold indexes the activation scale by WEIGHT group, so a finer
+/// activation group would silently misalign the two.
+fn oq_compact_a4() -> bool {
+    std::env::var("HIPFIRE_OQ_COMPACT_A4").as_deref() == Ok("1")
 }

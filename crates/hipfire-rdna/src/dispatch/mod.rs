@@ -2653,6 +2653,12 @@ impl Gpu {
         if grow(&self.oq_xt_batch, need_xq) {
             self.oq_xt_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
         }
+        if grow(&self.oq4_xq_batch, need_xq / 2) {
+            self.oq4_xq_batch = Some(self.alloc_tensor(&[need_xq / 2], DType::Raw)?);
+        }
+        if grow(&self.oq4_xs_batch, need_xs) {
+            self.oq4_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
         if grow(&self.oq_xst_batch, need_xs) {
             self.oq_xst_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
         }
