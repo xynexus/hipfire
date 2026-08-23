@@ -2762,7 +2762,9 @@ mod tests {
         let lease = scheduler.next_batch(0).unwrap();
         assert_eq!(lease.granted_ms, 0);
 
-        assert!(scheduler.reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS).is_empty());
+        assert!(scheduler
+            .reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS)
+            .is_empty());
         assert_eq!(
             scheduler.reap_expired_leases(DEFAULT_LEASE_TIMEOUT_MS + 1),
             vec![lease.lease_id]

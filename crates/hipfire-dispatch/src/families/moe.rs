@@ -456,6 +456,18 @@ pub struct MoeBiasAwareParams<'a> {
     pub rot_batch: &'a GpuTensor,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
     pub down_expanded: &'a GpuTensor,
+    /// Layer index, needed only to name the layer to `ExpertResidency`.
+    pub layer_idx: usize,
+    /// Paged-expert residency, mirroring `MoeParams::expert_residency`.
+    ///
+    /// The bias-aware path carried the pointer TABLES but not this hook, so an
+    /// arch decoding through it (deepseek4, top-6) could not use the pager at
+    /// all and had to upload every expert resident. That is what makes an
+    /// 82.8 GB artifact die at layer 19 of 43 on a 43 GB device.
+    ///
+    /// `None` on a fully-resident model — every caller today — and the dispatch
+    /// is then byte-identical to before.
+    pub expert_residency: Option<&'a dyn ExpertResidency>,
 }
 
 // ── DeepSeek-V4 batched/prefill MoE parameters ─────────
