@@ -492,6 +492,13 @@ impl DeepseekV4LayerWeights {
 /// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
 /// tensors are quantized alongside main layers).
 pub struct DeepseekV4Weights {
+    /// §M5 Phase 3b. Expert pager, `Some` only when paged experts are enabled.
+    ///
+    /// Lives here rather than being threaded as a parameter because
+    /// `ffn_routed` already takes `&DeepseekV4Weights`, and there is exactly one
+    /// constructor — so the pager reaches the dispatch site with no signature
+    /// churn across its three call sites.
+    pub pager: Option<std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>>,
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
     pub token_embd: Option<hipfire_rdna::GpuTensor>,

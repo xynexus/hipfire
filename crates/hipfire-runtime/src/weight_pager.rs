@@ -784,8 +784,49 @@ fn expert_module_tensor_role(name: &str) -> Option<ExpertRole> {
         Some(ExpertRole::GateUp)
     } else if name.ends_with("down_proj.weight") {
         Some(ExpertRole::Down)
+    } else if name.ends_with("w1.weight") {
+        // deepseek4 / minimax / lfm2moe name their projections w1 (gate), w3
+        // (up), w2 (down), and store gate and up as SEPARATE tensors that the
+        // arch concatenates into one gate_up buffer. `ExpertRole::GateUp` is a
+        // single span, so w1 can only stand for gate_up when w3 immediately
+        // follows it — which `expert_role_rank`'s w1/w3/w2 ordering guarantees
+        // and `module_gate_up_span_is_contiguous` below verifies per module.
+        Some(ExpertRole::GateUp)
+    } else if name.ends_with("w2.weight") {
+        Some(ExpertRole::Down)
     } else {
+        // w3 deliberately has no role: it is the tail of the gate_up span that
+        // w1 already names, not a third slot.
         None
+    }
+}
+
+/// Verify that a `w1`/`w3` module really does store gate and up back to back.
+///
+/// This is the guard that keeps the w1-as-gate_up mapping honest. An artifact
+/// quantized before the w1/w3/w2 role ranks lays each expert out **w1, w2, w3**,
+/// so a gate_up span starting at w1 would run straight into the DOWN weights.
+/// The kernel would read it happily and produce garbage — a wrong answer, not a
+/// crash — so this refuses at registration instead.
+fn module_gate_up_span_is_contiguous(module: &HfqModuleRecord) -> bool {
+    let Some(w1) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w1.weight"))
+    else {
+        // No w1 means this is a `gate_up_proj` module; nothing to check.
+        return true;
+    };
+    let Some(w3) = module
+        .tensors
+        .iter()
+        .find(|t| t.name.ends_with("w3.weight"))
+    else {
+        return false;
+    };
+    match module_tensor_resident_len(w1) {
+        Ok(len) => w1.rel_offset.saturating_add(len) == w3.rel_offset,
+        Err(_) => false,
     }
 }
 
@@ -997,20 +1038,55 @@ impl Drop for AlignedHostBuffer {
 /// belong on `Qwen35Config`, not here.
 #[derive(Debug, Clone)]
 pub struct PagerConfig {
-    /// Soft cap on VRAM bytes the pager is allowed to hold for paged weights.
-    /// Eviction kicks in when adding a new resident weight would exceed this.
-    /// `u64::MAX` means "unlimited" (effectively disables eviction — useful
-    /// for testing the routing path without VRAM pressure).
-    pub vram_budget_bytes: u64,
+    /// How registered weights are kept resident. See [`ResidencyPolicy`].
+    pub residency: ResidencyPolicy,
     /// If true, the pager prints structured residency events to stderr.
     /// Disabled by default; useful when debugging eviction policy.
     pub trace: bool,
 }
 
+/// What the pager does when a weight is needed.
+///
+/// This was previously a magic value: `vram_budget_bytes == u64::MAX` meant
+/// "never evict" and anything else meant "evict LRU against this budget", with
+/// three separate `!= u64::MAX` guards spelling the distinction out at each use.
+/// The two behaviours are now named, because §M5 needs `PinAll` to be a stated
+/// policy an artifact can ask for — not a sentinel that happens to fall out of
+/// an unlimited budget.
+///
+/// **This is a rename, not a new mechanism.** `PinAll` does exactly what
+/// `u64::MAX` did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyPolicy {
+    /// Every registered weight stays resident for the model's lifetime. No
+    /// eviction, no LRU walk on admission.
+    PinAll,
+    /// Admit on demand and evict LRU against a byte budget.
+    LazyLru {
+        /// Soft cap on VRAM bytes the pager may hold for paged weights.
+        /// Eviction runs when admitting a weight would exceed it.
+        vram_budget_bytes: u64,
+    },
+}
+
+impl PagerConfig {
+    /// The eviction budget, or `None` when nothing is ever evicted. Every
+    /// budget consult goes through here so `PinAll` cannot be half-honoured.
+    pub fn eviction_budget(&self) -> Option<u64> {
+        match self.residency {
+            ResidencyPolicy::PinAll => None,
+            // A `LazyLru` asking for u64::MAX is asking for PinAll; treat it as
+            // such rather than doing an LRU walk that can never free anything.
+            ResidencyPolicy::LazyLru { vram_budget_bytes } if vram_budget_bytes == u64::MAX => None,
+            ResidencyPolicy::LazyLru { vram_budget_bytes } => Some(vram_budget_bytes),
+        }
+    }
+}
+
 impl Default for PagerConfig {
     fn default() -> Self {
         Self {
-            vram_budget_bytes: u64::MAX,
+            residency: ResidencyPolicy::PinAll,
             trace: false,
         }
     }
@@ -1205,6 +1281,13 @@ impl WeightPager {
         let expert = module.expert.ok_or_else(|| {
             WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
         })?;
+        if !module_gate_up_span_is_contiguous(&module) {
+            return Err(WeightPagerError::InvalidModule(format!(
+                "module {:?} (layer {:?} expert {:?}) stores w1 and w3 non-adjacently, so \
+                 gate_up cannot be one span; re-quantize with the w1/w3/w2 role ranks",
+                module.module_id, module.layer, module.expert
+            )));
+        }
         if find_module_tensor_rel_ptr(&module, ExpertRole::GateUp).is_none()
             || find_module_tensor_rel_ptr(&module, ExpertRole::Down).is_none()
         {
@@ -1329,8 +1412,10 @@ impl WeightPager {
         self.would_fit(need)?;
         // Evict if cold-loading `id` would exceed budget. Skip when budget is
         // u64::MAX (the unlimited / testing default — saves the LRU walk).
-        if self.config.vram_budget_bytes != u64::MAX
-            && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
+        if self
+            .config
+            .eviction_budget()
+            .is_some_and(|budget| self.vram_used_bytes.saturating_add(need) > budget)
         {
             self.evict_lru_until(need, gpu)?;
         }
@@ -1355,6 +1440,13 @@ impl WeightPager {
         Ok(())
     }
 
+    /// Is this expert module currently resident? Lets a caller verify that a
+    /// whole top-k selection survived its own admission loop — admitting the
+    /// last expert can evict an earlier one, and the evicted slot is nulled.
+    pub fn is_expert_module_resident(&self, key: ExpertModuleKey) -> bool {
+        self.resident_modules.contains_key(&key)
+    }
+
     pub fn ensure_expert_module_resident(
         &mut self,
         key: ExpertModuleKey,
@@ -1373,8 +1465,10 @@ impl WeightPager {
             .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
         let need = module_resident_len(&module)? as u64;
         self.would_fit(need)?;
-        if self.config.vram_budget_bytes != u64::MAX
-            && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
+        if self
+            .config
+            .eviction_budget()
+            .is_some_and(|budget| self.vram_used_bytes.saturating_add(need) > budget)
         {
             self.evict_lru_until(need, gpu)?;
         }
@@ -1634,7 +1728,7 @@ impl WeightPager {
         // the budget. Without this guard, `target_used` saturates to 0 and
         // the loop drains the residency map without erroring.
         self.would_fit(need_bytes)?;
-        let budget = self.config.vram_budget_bytes;
+        let budget = self.config.eviction_budget().unwrap_or(u64::MAX);
         // How much we need to free so that vram_used + need <= budget.
         let target_used = budget.saturating_sub(need_bytes);
         while self.vram_used_bytes > target_used && !self.lru.is_empty() {
@@ -1785,8 +1879,10 @@ impl WeightPager {
     /// and `evict_lru_until`; exposed so unit tests can exercise the
     /// invariant without constructing a real Gpu.
     pub fn would_fit(&self, need: u64) -> Result<(), WeightPagerError> {
-        let budget = self.config.vram_budget_bytes;
-        if budget != u64::MAX && need > budget {
+        let Some(budget) = self.config.eviction_budget() else {
+            return Ok(());
+        };
+        if need > budget {
             return Err(WeightPagerError::BudgetExhausted {
                 need_bytes: need,
                 in_use: self.vram_used_bytes,
@@ -1841,7 +1937,7 @@ impl std::fmt::Display for WeightPagerError {
             } => write!(
                 f,
                 "weight pager: cannot evict to fit {need_bytes} bytes \
-                 (in_use={in_use}, budget={budget}); raise vram_budget_bytes \
+                 (in_use={in_use}, budget={budget}); raise the LazyLru budget \
                  or reduce paged working set"
             ),
             Self::Unimplemented(why) => write!(f, "weight pager: unimplemented ({why})"),
@@ -2315,6 +2411,41 @@ mod tests {
     /// and the loop exited cleanly even though the subsequent fetch in
     /// `ensure_resident` would push usage past the cap.
     #[test]
+    /// `PinAll` must never evict and never reject. Both were previously
+    /// spelled `vram_budget_bytes == u64::MAX`, and the old code carried that
+    /// comparison at three separate sites — miss one and a pinned pager quietly
+    /// starts evicting. Routing every consult through `eviction_budget()` is
+    /// what this asserts.
+    #[test]
+    fn pin_all_never_budgets_and_lazy_lru_does() {
+        let pin = PagerConfig {
+            residency: ResidencyPolicy::PinAll,
+            trace: false,
+        };
+        assert_eq!(pin.eviction_budget(), None);
+        // The default has always been "no eviction"; it must stay that way.
+        assert_eq!(PagerConfig::default().eviction_budget(), None);
+
+        let lazy = PagerConfig {
+            residency: ResidencyPolicy::LazyLru {
+                vram_budget_bytes: 100,
+            },
+            trace: false,
+        };
+        assert_eq!(lazy.eviction_budget(), Some(100));
+
+        // A LazyLru of u64::MAX is PinAll spelled the old way. It must NOT come
+        // back as Some(u64::MAX), or `evict_lru_until` walks the LRU to free
+        // bytes it can never need.
+        let unlimited = PagerConfig {
+            residency: ResidencyPolicy::LazyLru {
+                vram_budget_bytes: u64::MAX,
+            },
+            trace: false,
+        };
+        assert_eq!(unlimited.eviction_budget(), None);
+    }
+
     fn would_fit_rejects_need_bigger_than_budget() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-budget-{}.bin", std::process::id()));
@@ -2325,7 +2456,9 @@ mod tests {
         let pager = WeightPager::with_pread_transport(
             &path,
             PagerConfig {
-                vram_budget_bytes: 100,
+                residency: ResidencyPolicy::LazyLru {
+                    vram_budget_bytes: 100,
+                },
                 trace: false,
             },
         )

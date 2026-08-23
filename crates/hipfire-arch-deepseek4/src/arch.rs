@@ -29,6 +29,39 @@ use hipfire_runtime::hfq::{
 /// The marker is zero-sized; trait dispatch uses the type, not a value.
 pub struct DeepseekV4;
 
+/// IEEE-754 binary32 -> binary16, round-to-nearest-even, with overflow to inf
+/// and subnormal support. Local because the runtime exposes only f16 -> f32.
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xff) as i32;
+    let mut mant = (bits & 0x007f_ffff) as u32;
+    if exp == 0xff {
+        // Inf or NaN. Preserve NaN-ness with a non-zero payload.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    exp -= 127 - 15;
+    if exp >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow -> signed zero
+        }
+        mant |= 0x0080_0000;
+        let shift = (14 - exp) as u32;
+        let round = 1u32 << (shift - 1);
+        let sub = (mant + round - 1 + ((mant >> shift) & 1)) >> shift;
+        return sign | sub as u16;
+    }
+    let round = mant & 0x1fff;
+    let mut half = ((exp as u32) << 10) | (mant >> 13);
+    if round > 0x1000 || (round == 0x1000 && (half & 1) == 1) {
+        half += 1; // ties-to-even; a carry into the exponent is correct
+    }
+    sign | half as u16
+}
+
 impl DeepseekV4 {
     /// Phase 1.5 walk: verify every expected DeepSeek V4 tensor is present in
     /// the HFQ index. No GPU upload. Returns a populated `Weights` with
@@ -183,6 +216,50 @@ impl DeepseekV4 {
     /// The non-owned w2 (down) ptr reuses the compact base — its rotate input
     /// is 0 regardless, so the down weights read don't matter. `shard = None`
     /// uploads all experts (single-GPU, byte-identical to the original).
+    /// §M5 Phase 3b. Paged variant: allocate the pointer tables the pager will
+    /// maintain, record the strides the kernels need, and upload NOTHING.
+    ///
+    /// The tables are left zeroed on purpose — a slot is only valid once the
+    /// pager has made that expert resident, which it does per token via
+    /// `ExpertResidency`. Reading an unpopulated slot would mean dispatching an
+    /// expert nobody asked for.
+    ///
+    /// Strides come from expert 0's tensor *info*, never its bytes, so this
+    /// costs no I/O: the whole point is that the 1152 MiB-per-layer `combined`
+    /// upload does not happen.
+    fn register_layer_routed_experts_paged(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<(), String> {
+        let info_of = |name: &str| -> Result<usize, String> {
+            hfq.find_tensor_info(name)
+                .map(|i| i.data_size)
+                .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))
+        };
+        let w2_stride = info_of(&format!("{prefix}.ffn.experts.0.w2.weight"))?;
+        let w1_stride = info_of(&format!("{prefix}.ffn.experts.0.w1.weight"))?;
+        let w3_stride = info_of(&format!("{prefix}.ffn.experts.0.w3.weight"))?;
+        if w1_stride != w3_stride {
+            return Err(format!(
+                "deepseek4: {prefix} w1/w3 stride mismatch: w1={w1_stride} w3={w3_stride}"
+            ));
+        }
+        let mut alloc = |what: &str| {
+            gpu.alloc_tensor(&[2 * n_exp], hipfire_rdna::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc paged ptr table {prefix}.{what}: {e:?}"))
+        };
+        let w2_ptrs = alloc("w2")?;
+        let gate_up_ptrs = alloc("gate_up")?;
+        layer.expert_w2_ptrs = Some(w2_ptrs);
+        layer.expert_w2_stride = w2_stride;
+        layer.expert_gate_up_ptrs = Some(gate_up_ptrs);
+        layer.expert_gate_up_stride = w1_stride + w3_stride;
+        Ok(())
+    }
+
     fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -372,6 +449,54 @@ impl DeepseekV4 {
     ///
     /// The conversion is one host-side pass; norms are ~4 KB each and sinks are
     /// 256 bytes, so it is negligible.
+    /// Upload a global whose KERNEL contract is `__half`, converting when the
+    /// artifact stores it F32.
+    ///
+    /// `upload_global_raw` sends bytes through untouched, so an F32 tensor bound
+    /// to a `const __half*` parameter is reinterpreted, not converted. That is
+    /// not a benign precision issue: over a 16384-wide dot product the odds that
+    /// no 16-bit half-word lands on the all-ones exponent are ~(31/32)^8192, so
+    /// essentially every output is NaN. DeepSeek-V4-Flash stores the six
+    /// hyper-connection globals F32 and every control value came out NaN in
+    /// layer-0 prefill.
+    fn upload_global_as_f16(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data_pread(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        let n: usize = shape.iter().product();
+        if bytes.len() == n * 2 {
+            // Already F16: the kernel contract is met, send it as-is.
+            return gpu
+                .upload_raw(&bytes, &shape)
+                .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"));
+        }
+        if bytes.len() != n * 4 {
+            return Err(format!(
+                "deepseek4: '{name}' expected F16 ({} = 2 × {n}) or F32 ({} = 4 × {n}) bytes, got {}",
+                n * 2,
+                n * 4,
+                bytes.len()
+            ));
+        }
+        let mut half_bytes = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = f32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ]);
+            half_bytes.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        gpu.upload_raw(&half_bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' as f16 failed: {e:?}"))
+    }
+
     fn upload_global_f16_as_f32(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -555,6 +680,7 @@ impl DeepseekV4 {
         }
 
         Ok(DeepseekV4Weights {
+            pager: None,
             token_embd: None,
             output_norm: None,
             head: None,
@@ -640,6 +766,42 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
+        // §M5 Phase 3b. Paged routed experts: the pager owns the expert bytes
+        // and keeps the pointer tables live, so nothing is uploaded up front.
+        // Off by default — a model that fits stays fully resident and pays
+        // nothing. Requires the HFQM v2 routed-expert module table, which the
+        // current quantizer emits for every MoE artifact.
+        let paged_experts = matches!(
+            std::env::var("HIPFIRE_DEEPSEEK4_PAGED_EXPERTS")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "on" | "yes")
+        );
+        // KNOWN BLOCKER, measured 2026-08-22: registration currently REFUSES a
+        // deepseek4 artifact even though it ships all 11 008 module records.
+        // `expert_module_tensor_role` (weight_pager.rs:782) resolves a role only
+        // from `gate_up_proj.weight` / `down_proj.weight`; deepseek4 names its
+        // projections `w1` / `w3` / `w2`, so no role matches and
+        // `register_expert_module` reports "missing gate_up_proj or down_proj".
+        //
+        // Renaming is NOT the fix. deepseek4 stores w1 and w3 as SEPARATE
+        // tensors that the loader concatenates into gate_up; `ExpertRole::GateUp`
+        // is a single tensor. Mapping `w1 -> GateUp` would page in half the
+        // weight and hand the kernel a buffer whose second half is another
+        // expert's bytes — silent corruption, not a load error. The pager needs
+        // a two-tensor GateUp (concatenate at page-in), or the quantizer needs
+        // to emit a fused gate_up for this family.
+        //
+        // §M5's plan says grouping is "family-independent already", and
+        // `expert_key` is. Role resolution is not, and the w1/w3 split makes
+        // that structural rather than cosmetic.
+        if paged_experts && hfq.modules().is_empty() {
+            return Err(
+                "HIPFIRE_DEEPSEEK4_PAGED_EXPERTS=1 requires an HFQM v2 routed-expert module \
+                 table; regenerate the artifact with the current hipfire-quantize"
+                    .to_string(),
+            );
+        }
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -736,8 +898,8 @@ impl DeepseekV4 {
         weights.head = Some(Self::upload_quant_or_f16(hfq, gpu, "head.weight")?);
 
         // Head HC mix tensors — F16 raw on GPU; scale is scalar host-side.
-        weights.hc_head_fn = Some(Self::upload_global_raw(hfq, gpu, "hc_head_fn")?);
-        weights.hc_head_base = Some(Self::upload_global_raw(hfq, gpu, "hc_head_base")?);
+        weights.hc_head_fn = Some(Self::upload_global_as_f16(hfq, gpu, "hc_head_fn")?);
+        weights.hc_head_base = Some(Self::upload_global_as_f16(hfq, gpu, "hc_head_base")?);
         {
             let (info, bytes) = hfq
                 .tensor_data_pread("hc_head_scale")
@@ -918,32 +1080,32 @@ impl DeepseekV4 {
             }
 
             // Hyper-Connections (F16 small matrices).
-            layer.hc_attn_base = Some(Self::upload_global_raw(
+            layer.hc_attn_base = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_base"),
             )?);
-            layer.hc_attn_fn = Some(Self::upload_global_raw(
+            layer.hc_attn_fn = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_fn"),
             )?);
-            layer.hc_attn_scale = Some(Self::upload_global_raw(
+            layer.hc_attn_scale = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_attn_scale"),
             )?);
-            layer.hc_ffn_base = Some(Self::upload_global_raw(
+            layer.hc_ffn_base = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_base"),
             )?);
-            layer.hc_ffn_fn = Some(Self::upload_global_raw(
+            layer.hc_ffn_fn = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_fn"),
             )?);
-            layer.hc_ffn_scale = Some(Self::upload_global_raw(
+            layer.hc_ffn_scale = Some(Self::upload_global_as_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.hc_ffn_scale"),
@@ -1116,28 +1278,28 @@ impl DeepseekV4 {
                 )?);
 
                 // HC blocks (same shape as main layer).
-                mtp.hc_attn_base = Some(Self::upload_global_raw(
+                mtp.hc_attn_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_base",
                 )?);
-                mtp.hc_attn_fn = Some(Self::upload_global_raw(
+                mtp.hc_attn_fn = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_fn",
                 )?);
-                mtp.hc_attn_scale = Some(Self::upload_global_raw(
+                mtp.hc_attn_scale = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_attn_scale",
                 )?);
-                mtp.hc_ffn_base = Some(Self::upload_global_raw(
+                mtp.hc_ffn_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_ffn_base",
                 )?);
-                mtp.hc_ffn_fn = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
-                mtp.hc_ffn_scale = Some(Self::upload_global_raw(
+                mtp.hc_ffn_fn = Some(Self::upload_global_as_f16(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
+                mtp.hc_ffn_scale = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_ffn_scale",
@@ -1205,12 +1367,12 @@ impl DeepseekV4 {
                 // proves MTP was trained WITH head-HC mix on its lm_head path —
                 // the v3 paper's "logits = OutHead @ norm(h_i^k)" should be
                 // read with norm(h_i^k) = norm(head_hc_mix(streams)) on DeepSeek V4.
-                mtp.mtp_hc_head_fn = Some(Self::upload_global_raw(
+                mtp.mtp_hc_head_fn = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_head_fn",
                 )?);
-                mtp.mtp_hc_head_base = Some(Self::upload_global_raw(
+                mtp.mtp_hc_head_base = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
                     "mtp.0.hc_head_base",
@@ -1285,14 +1447,24 @@ impl DeepseekV4 {
                     "experts",
                 );
                 let n_exp = cfg.n_routed_experts;
-                Self::upload_layer_routed_experts(
-                    hfq,
-                    gpu,
-                    &format!("layers.{l}"),
-                    n_exp,
-                    layer,
-                    shard,
-                )?;
+                if paged_experts {
+                    Self::register_layer_routed_experts_paged(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                    )?;
+                } else {
+                    Self::upload_layer_routed_experts(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                        shard,
+                    )?;
+                }
             }
         }
 
@@ -1321,6 +1493,54 @@ impl DeepseekV4 {
             }
         }
 
+        // §M5 Phase 3b. Build the pager and hand it the module table plus the
+        // per-layer pointer tables the paged branch allocated above. From here
+        // `ensure_expert_module_resident` both pages the bytes in and patches
+        // the slot the kernel dereferences, which is why the dispatch side
+        // never patches anything itself.
+        if paged_experts {
+            let budget = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|b| *b > 0);
+            let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
+                hfq.path(),
+                hipfire_runtime::weight_pager::PagerConfig {
+                    // No budget set = pin everything. #310 landed the rename,
+                    // so the old `u64::MAX` sentinel is now a named policy.
+                    residency: match budget {
+                        Some(vram_budget_bytes) => {
+                            hipfire_runtime::weight_pager::ResidencyPolicy::LazyLru {
+                                vram_budget_bytes,
+                            }
+                        }
+                        None => hipfire_runtime::weight_pager::ResidencyPolicy::PinAll,
+                    },
+                    trace: matches!(
+                        std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_TRACE")
+                            .ok()
+                            .as_deref(),
+                        Some("1" | "true" | "on" | "yes")
+                    ),
+                },
+            )
+            .map_err(|e| format!("deepseek4: open expert module pager: {e}"))?;
+            let registered = pager
+                .register_expert_modules(hfq.modules().iter().cloned())
+                .map_err(|e| format!("deepseek4: register expert modules: {e}"))?;
+            for (l, layer) in weights.layers.iter_mut().enumerate() {
+                if let (Some(gu), Some(dn)) = (
+                    layer.expert_gate_up_ptrs.as_ref(),
+                    layer.expert_w2_ptrs.as_ref(),
+                ) {
+                    pager.register_expert_ptr_tables(l as u16, gu, dn);
+                }
+            }
+            eprintln!(
+                "deepseek4: paged experts enabled: registered {registered} routed expert modules"
+            );
+            weights.pager = Some(std::cell::RefCell::new(pager));
+        }
         Ok(weights)
     }
 }
@@ -1328,6 +1548,39 @@ impl DeepseekV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `upload_global_as_f16` exists because F32 bytes bound to a `const
+    /// __half*` are reinterpreted, not converted. Check the conversion against
+    /// `f16_to_f32` (the runtime's existing inverse) plus the edge cases that
+    /// distinguish a real implementation from a truncating one.
+    #[test]
+    fn f32_to_f16_bits_round_trips_through_the_runtime_inverse() {
+        for v in [
+            0.0f32, -0.0, 1.0, -1.0, 0.5, -0.03125, 2048.0, -2048.0, 0.029747, 1.2138, 2.200491,
+            65504.0,   // largest finite half
+            -65504.0,
+            6.1035156e-5, // smallest normal half
+        ] {
+            let back = hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(v));
+            assert!(
+                (back - v).abs() <= v.abs() * 1e-3 + 1e-7,
+                "round trip {v} -> {back}"
+            );
+        }
+        // Overflow saturates to infinity rather than wrapping to a NaN pattern,
+        // which is the failure that motivated this helper.
+        assert_eq!(f32_to_f16_bits(1.0e30), 0x7c00);
+        assert_eq!(f32_to_f16_bits(-1.0e30), 0xfc00);
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        // Underflow gives signed zero, not a denormal-shaped NaN.
+        assert_eq!(f32_to_f16_bits(1.0e-30), 0x0000);
+        assert_eq!(f32_to_f16_bits(-1.0e-30), 0x8000);
+        // NaN stays NaN.
+        assert!(hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+        // Subnormal halves are representable, not flushed.
+        let sub = hipfire_runtime::quant::f16_to_f32(f32_to_f16_bits(1.0e-7));
+        assert!(sub > 0.0 && sub < 1.0e-6, "subnormal flushed: {sub}");
+    }
 
     #[test]
     fn deepseek4_arch_id_is_nine() {
