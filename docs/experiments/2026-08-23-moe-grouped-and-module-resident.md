@@ -65,13 +65,36 @@ the win is ~0. At n=2048 an expert holds ~64 tokens = 4 tiles, and the current
 shape re-reads its weights 4x where weight-stationary reads them once. The gain
 scales with tokens-per-expert = n·k_top/E.
 
-Sketch, with the register constraint that shapes it: holding A for all of an
-expert's token tiles needs accumulators for every tile at once (16 rows x T
-tokens), which does not fit for large T. So a block owns one output row tile and
-**P token tiles**, keeps the weight K-slice in LDS across the inner loop over
-those P, and carries 16x16xP/64 accumulators per lane — P=4 is 16 per lane in
-wave64, comfortable. That gives P-fold weight reuse rather than unbounded, and
-degrades to today's kernel at P=1.
+**CORRECTION.** An earlier draft claimed a register wall: that holding a weight
+tile while sweeping an expert's token tiles needs accumulators for every tile at
+once, so a block could only take P≈4 tiles. That is wrong, and the error was loop
+order. It is only true with K outermost. Weight-stationary puts TOKEN TILES
+outermost and K innermost, so exactly ONE accumulator is live — the full K
+reduction for (row_tile, token_tile) completes before moving to the next tile.
+
+The real question is whether the weight ROW-TILE (16 rows x full K) fits in LDS,
+and at this model's dimensions (dim=2048, moe_intermediate=512) it comfortably
+does, as OQ8 260 B blocks:
+
+| projection | m | k | 16-row tile | LDS headroom left |
+|---|---|---|---|---|
+| gate_up | 1024 | 2048 | **32.5 KB** | 31.5 KB |
+| down | 2048 | 512 | **8.1 KB** | 55.9 KB |
+
+So the weight is read **once per (expert, row-tile)** and reuse is bounded only by
+tokens-per-expert, not by registers and not by a P parameter:
+
+    tokens/expert T = n*k_top/E,  weight reads today = ceil(T/16),  module-resident = 1
+
+    n=512    T=16    1 tile   -> 1x today, 1x resident  (no gain)
+    n=1024   T=32    2 tiles  -> 2x today, 1x resident
+    n=2048   T=64    4 tiles  -> 4x today, 1x resident
+    n=4096   T=128   8 tiles  -> 8x today, 1x resident
+
+The size-dependence stands — at the current ubatch of 512 it buys nothing — but
+the ceiling is higher than the P-limited sketch implied, and it grows linearly
+with batch. Note the headroom also leaves room to double-buffer the activation
+tiles against the weight load, which is what keeps the sweep from stalling.
 
 ## Order
 
