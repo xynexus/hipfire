@@ -3619,6 +3619,37 @@ fn ffn_stub(
 ///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
 ///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
 ///     ffn_out += e_out * routed_scaling_factor
+/// `ExpertResidency` over the deepseek4 weight pager.
+///
+/// Mirrors qwen35's provider exactly, including the reason it does NOT patch the
+/// pointer table: the pager maintains its registered tables on every residency
+/// transition, so a dispatch site that patched as well would be duplicating
+/// work the pager already did.
+struct PagerExpertResidency<'a> {
+    pager: &'a std::cell::RefCell<hipfire_runtime::weight_pager::WeightPager>,
+}
+
+impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'_> {
+    fn ensure_resident(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        selected: &[u32],
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let mut pager = self.pager.borrow_mut();
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            pager
+                .ensure_expert_module_resident(key, gpu)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 fn ffn_routed(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -3636,9 +3667,18 @@ fn ffn_routed(
         return Ok(());
     }
     let layer = weights.resolve_layer(layer_idx);
-    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
+    // Paged experts have no resident blob by design — the pager owns the bytes
+    // and keeps the pointer tables live — so a missing blob only means "not
+    // uploaded" when there is no pager.
+    if weights.pager.is_none()
+        && (layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none())
+    {
         return Ok(()); // experts not uploaded; nothing to dispatch
     }
+    let residency = weights
+        .pager
+        .as_ref()
+        .map(|pager| PagerExpertResidency { pager });
 
     // 1. Run router: compute unbiased scores on-device. DeepSeek V4's selection
     //    uses BIASED scores while the routing weights use UNBIASED scores
@@ -3742,12 +3782,12 @@ fn ffn_routed(
         let out_target = routed_out.unwrap_or(ffn_out);
         let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
             layer_idx,
-            // deepseek4 uploads every expert resident today, so there is no
-            // pager to consult. This is the seam §M5 Phase 4 needs: once the
-            // loader registers modules and pointer tables, this becomes
-            // `Some(provider)` and the dispatch pages instead of requiring the
-            // whole 82.8 GB to fit.
-            expert_residency: None,
+            // `Some` exactly when the loader registered a pager, i.e. paged
+            // experts. Fully-resident models pass `None` and dispatch is
+            // unchanged.
+            expert_residency: residency
+                .as_ref()
+                .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
             hidden: cfg.hidden_size,
             mi: im,
             k_top,
