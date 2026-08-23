@@ -64,7 +64,9 @@ pub(crate) fn executor_v2_enabled() -> bool {
 pub(crate) fn executor_batched_enabled() -> bool {
     executor_v2_enabled()
         && matches!(
-            std::env::var("HIPFIRE_DAEMON_EXECUTOR_BATCHED").ok().as_deref(),
+            std::env::var("HIPFIRE_DAEMON_EXECUTOR_BATCHED")
+                .ok()
+                .as_deref(),
             Some("1" | "true" | "on" | "yes")
         )
 }

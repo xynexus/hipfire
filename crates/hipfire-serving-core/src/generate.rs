@@ -2410,9 +2410,7 @@ fn qwen35_decode_one(
     cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
 ) -> Qwen35Step {
-    let filter_stop = match qwen35_decode_before_forward(
-        tokenizer, stdout, id, t0, st, cursor,
-    ) {
+    let filter_stop = match qwen35_decode_before_forward(tokenizer, stdout, id, t0, st, cursor) {
         PreForward::Stop => return Qwen35Step::Stop,
         PreForward::Ready { filter_stop } => filter_stop,
     };
@@ -2440,8 +2438,23 @@ fn qwen35_decode_one(
         return Qwen35Step::Failed(format!("qwen35 decode forward_scratch failed: {e:?}"));
     }
     qwen35_decode_after_forward(
-        gpu, weights, config, scratch, &scratch.logits, filter_stop, kv, dn, cursor,
-        eviction, physical_cap, tokenizer, stdout, id, t0, cfg, st,
+        gpu,
+        weights,
+        config,
+        scratch,
+        &scratch.logits,
+        filter_stop,
+        kv,
+        dn,
+        cursor,
+        eviction,
+        physical_cap,
+        tokenizer,
+        stdout,
+        id,
+        t0,
+        cfg,
+        st,
     )
 }
 

@@ -1163,12 +1163,21 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
     }
     // Take the handles out of the table for the round; each is put back or
     // retired below, mirroring the round-robin path's ownership.
-    let mut taken: Vec<(stream::StreamId, String, String, hipfire_serving_core::generate::Qwen35Generation)> =
-        Vec::with_capacity(ids.len());
+    let mut taken: Vec<(
+        stream::StreamId,
+        String,
+        String,
+        hipfire_serving_core::generate::Qwen35Generation,
+    )> = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(s) = daemon_state.streams.get_mut(id) {
             if let Some(g) = s.generation.take() {
-                taken.push((id, s.request_id.clone(), s.session().as_str().to_string(), g));
+                taken.push((
+                    id,
+                    s.request_id.clone(),
+                    s.session().as_str().to_string(),
+                    g,
+                ));
             }
         }
     }
@@ -1188,7 +1197,9 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
         }
         return Vec::new();
     };
-    if let Err(e) = hipfire_serving_core::session::qwen35_save_active_session(m, &mut daemon_state.gpu) {
+    if let Err(e) =
+        hipfire_serving_core::session::qwen35_save_active_session(m, &mut daemon_state.gpu)
+    {
         eprintln!("[executor] batched march: cannot free the resident slot: {e}");
         for (id, _, _, g) in taken {
             if let Some(s) = daemon_state.streams.get_mut(id) {
@@ -1240,14 +1251,19 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
     }
 
     let outcomes = {
-        let mut entries: Vec<(&str, &mut hipfire_serving_core::generate::Qwen35Generation)> =
-            taken.iter_mut().map(|(_, rid, _, g)| (rid.as_str(), g)).collect();
+        let mut entries: Vec<(&str, &mut hipfire_serving_core::generate::Qwen35Generation)> = taken
+            .iter_mut()
+            .map(|(_, rid, _, g)| (rid.as_str(), g))
+            .collect();
         let model = daemon_state.model.as_ref().expect("checked above");
         hipfire_serving_core::generate::Qwen35Generation::step_batch(
             &mut entries,
             model,
             &mut daemon_state.gpu,
-            model.tokenizer.as_ref().expect("qwen35 model has a tokenizer"),
+            model
+                .tokenizer
+                .as_ref()
+                .expect("qwen35 model has a tokenizer"),
             &mut daemon_state.out.sink,
         )
     };
@@ -1282,11 +1298,22 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
                 }
             }
             hipfire_serving_core::generate::Qwen35Step::Failed(message) => {
-                g.fail(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, &req_id, &message);
+                g.fail(
+                    m,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.out.sink,
+                    &req_id,
+                    &message,
+                );
                 daemon_state.streams.retire(id);
             }
             _ => {
-                g.finish(m, &mut daemon_state.gpu, &mut daemon_state.out.sink, &req_id);
+                g.finish(
+                    m,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.out.sink,
+                    &req_id,
+                );
                 daemon_state.streams.retire(id);
             }
         }
