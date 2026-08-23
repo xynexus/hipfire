@@ -1028,6 +1028,10 @@ pub fn run_moe_decode_bias_aware(
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k_top * 4) };
         hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        if std::env::var("HIPFIRE_TOPK_PROBE").is_ok() {
+            let asf: Vec<f32> = idx.iter().map(|v| f32::from_bits(*v as u32)).collect();
+            eprintln!("[topk-probe] l{} i32={:?} f32={:?}", p.layer_idx, idx, asf);
+        }
         let selected: Vec<u32> = idx
             .iter()
             .filter(|v| **v >= 0 && (**v as usize) < p.n_exp)
