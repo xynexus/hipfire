@@ -1387,6 +1387,47 @@ N ∈ {1, 4, 16, 64, 128}, and the crossover N at which module-major beats layer
 same box. *Falsified if* there is no crossover below the N whose KV fits in VRAM — in which
 case report it rather than tune around it.
 
+**Measured 2026-08-22 (nix1, gfx1103, Qwen3.6-35B-A3B--oq4, kvarn, max_seq 1024).**
+`HIPFIRE_DAEMON_EXECUTOR=v2` + `HIPFIRE_DAEMON_EXECUTOR_BATCHED=1`, one fused
+`forward_prefill_grouped_moe_session_batch` per march over all runnable streams.
+Decode-only throughput (wall minus a separately measured 32.3 s load), two reps:
+
+| N | round-robin tok/s | batched tok/s | ratio |
+|---|---|---|---|
+| 2  | 26.95 / 22.32 | 19.46 / 22.91 | ~1.0 (noise) |
+| 4  | 20.83 / 21.21 | 22.26 / 26.13 | 1.15x |
+| 8  | 13.51 / 12.12 | 23.04 / 24.18 | 1.84x |
+| 16 | 10.53 / 8.05  | 14.57 / 11.40 | 1.40x |
+| 32 | 5.79 / 5.12   | 7.45 / 7.63   | 1.38x |
+| 64 | 5.08 / 5.24   | 7.58 / 7.59   | 1.47x |
+
+**Crossover N is ~4**, well below the N whose KV fits in VRAM (N=64 ran
+comfortably), so the capacity thesis is **not falsified**. Round-robin falls off
+steeply with N (26.95 -> 5.08 tok/s) while batched stays roughly flat above N=8
+(23-24 tok/s at N=8, 7.6 at N=64) — the batch is absorbing the per-stream cost
+the round-robin march pays serially.
+
+Two measurement traps worth recording, because both produced a *plausible*
+number:
+
+- The N=4 entry in a first sweep showed batched LOSING (15.8 vs 17.6 tok/s).
+  That sweep used 16-token streams, where decode is ~3.5 s against a ~32 s load;
+  load-time variance alone is +/-60% at that scale. Re-measured with 96-token
+  streams the sign flips. Do not measure this at small N with short streams.
+- Batched output is bit-deterministic (identical md5 across reps at every N) and
+  byte-identical to round-robin at N<=16 with short streams, but diverges from
+  round-robin in 4/16 streams at 96 tokens and at N>=32. The divergent
+  continuations are coherent near-tie swaps, and both modes are individually
+  reproducible, which is consistent with float non-associativity in the batched
+  GEMM amplified by autoregressive feedback rather than state corruption —
+  *consistent with*, not proven. Bit-exact parity with sequential decode is not
+  an M7 exit criterion, but it is not established either.
+
+`HIPFIRE_BATCH_PROBE=1` reports the row count from inside the fused arm. Use it:
+three separate defects in this path each produced byte-identical output while
+the fused arm never ran, ran on half the tokens, or crashed after emitting a
+plausible prefix (see the commits on `m7-batch-driver`).
+
 ### M8 — Training onto the same substrate
 
 Per §1.5. *Exit:* a LoRA training step and an interactive decode step interleaved at module
