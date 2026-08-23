@@ -841,23 +841,41 @@ fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
 
 /// Round a device allocation to what it actually costs in GTT.
 ///
-/// MEASURED on gfx1151 (`examples/gtt_granularity`), not assumed: hipMalloc
-/// rounds a GTT allocation up to a multiple of 2 MiB once it crosses 2 MiB, and
-/// to a 1 MiB granule below that. 5 MiB costs 6, 9 MiB costs 10, and -- the case
-/// that matters -- a routed-expert tensor of 2,129,920 B (2 MiB + 32 KiB) costs
-/// a full 4 MiB, a 1.969x tax.
+/// MEASURED on gfx1151 (`examples/gtt_granularity`), not assumed. Three regimes:
 ///
-/// Every OQ routed-expert tensor lands a hair over a power of two, because the
-/// 260-byte block carries a 4-byte scale on top of 256 payload bytes. So the
-/// tax applies to essentially all of them: a 35B MoE load requested 33.58 GiB
-/// from hipMalloc and consumed 63.10 GiB of GTT.
+/// | requested | rounds to | measured |
+/// |---|---|---|
+/// | <= 512 KiB | page-granular, effectively exact | 96 KiB -> 96 KiB |
+/// | 512 KiB .. 2 MiB | next power of two | 1.25 / 1.5 / 1.75 MiB -> 2 MiB |
+/// | > 2 MiB | next multiple of 2 MiB | 5 MiB -> 6, 9 MiB -> 10 |
+///
+/// Above 2 MiB the granule is 2 MiB and NOT the next power of two -- 5 MiB
+/// costs 6, not 8 -- which is what distinguishes this from a buddy allocator
+/// and what makes grouping small allocations worthwhile.
+///
+/// The tax lands on OQ weights specifically because every OQ block is a 4-byte
+/// scale on top of a power-of-two payload (260 = 4 + 256, 132 = 4 + 128). That
+/// puts every routed-expert tensor a hair OVER a boundary: 2,129,920 B is
+/// 2 MiB + 32 KiB and costs a full 4 MiB. 1.6% over the line, 97% tax.
+///
+/// Known imprecision: between 256 and 512 KiB the driver rounds on some coarser
+/// internal granule than a page (307,200 B measured at ~348 KiB), so this
+/// under-estimates by ~12% there. It does not matter for the callers -- routed
+/// expert tensors are >= 1 MiB -- and over-estimating small allocations is the
+/// worse error, since it was charging a 32 KiB scale block a full MiB.
 pub fn gtt_alloc_cost(bytes: usize) -> usize {
+    const KIB: usize = 1 << 10;
     const MIB: usize = 1 << 20;
     if bytes == 0 {
         return 0;
     }
-    let granule = if bytes > 2 * MIB { 2 * MIB } else { MIB };
-    bytes.div_ceil(granule) * granule
+    if bytes <= 512 * KIB {
+        return bytes.div_ceil(4 * KIB) * (4 * KIB);
+    }
+    if bytes <= 2 * MIB {
+        return bytes.next_power_of_two();
+    }
+    bytes.div_ceil(2 * MIB) * (2 * MIB)
 }
 
 /// Estimated resident device bytes for an artifact's routed-expert modules, and
@@ -2567,30 +2585,72 @@ mod tests {
 mod gtt_cost_tests {
     use super::gtt_alloc_cost;
 
+    const KIB: usize = 1 << 10;
     const MIB: usize = 1 << 20;
 
+    /// Every row is a measured pair from `examples/gtt_granularity` on gfx1151.
     #[test]
-    fn exact_power_of_two_sizes_pay_exactly() {
-        assert_eq!(gtt_alloc_cost(MIB), MIB);
-        assert_eq!(gtt_alloc_cost(2 * MIB), 2 * MIB);
-        assert_eq!(gtt_alloc_cost(6 * MIB), 6 * MIB);
+    fn matches_the_measured_table() {
+        let measured: &[(usize, usize)] = &[
+            // page-granular regime
+            (4 * KIB, 4 * KIB),
+            (32 * KIB, 32 * KIB),
+            (96 * KIB, 96 * KIB),
+            (512 * KIB, 512 * KIB),
+            // next-power-of-two regime
+            (768 * KIB, MIB),
+            (MIB, MIB),
+            (1_310_720, 2 * MIB),
+            (1_572_864, 2 * MIB),
+            (1_835_008, 2 * MIB),
+            (2 * MIB, 2 * MIB),
+            // 2 MiB-multiple regime -- NOT next-power-of-two
+            (2_129_920, 4 * MIB),
+            (2_621_440, 4 * MIB),
+            (3 * MIB, 4 * MIB),
+            (4_325_376, 6 * MIB),
+            (5 * MIB, 6 * MIB),
+            (6 * MIB, 6 * MIB),
+            (9 * MIB, 10 * MIB),
+        ];
+        for &(request, expect) in measured {
+            assert_eq!(
+                gtt_alloc_cost(request),
+                expect,
+                "gtt_alloc_cost({request}) should be {expect}"
+            );
+        }
     }
 
     #[test]
-    fn routed_expert_sizes_pay_the_measured_tax() {
-        // The two sizes a 35B-A3B load actually requests, and the GTT the
-        // gtt_granularity probe measured for them.
+    fn the_two_routed_expert_sizes_pay_the_tax() {
+        // What a 35B-A3B load actually requests per expert, today.
         assert_eq!(gtt_alloc_cost(1_064_960), 2 * MIB);
         assert_eq!(gtt_alloc_cost(2_129_920), 4 * MIB);
     }
 
     #[test]
-    fn rounds_to_two_mib_not_to_a_power_of_two() {
-        // 5 MiB measured at 6 MiB, not 8: the granule is 2 MiB, not the next
-        // power of two. 9 MiB measured at 10.
-        assert_eq!(gtt_alloc_cost(5 * MIB), 6 * MIB);
-        assert_eq!(gtt_alloc_cost(9 * MIB), 10 * MIB);
-        assert_eq!(gtt_alloc_cost(3 * MIB), 4 * MIB);
+    fn splitting_the_scale_plane_removes_the_tax() {
+        // The point of grouping scales: the payload plane is exactly a power of
+        // two (1 byte per weight, and weight counts are powers of two), so it
+        // pays nothing -- and the scales, grouped per layer, are one clean
+        // allocation instead of 128 boundary-crossing ones.
+        assert_eq!(gtt_alloc_cost(2 * MIB), 2 * MIB);
+        assert_eq!(gtt_alloc_cost(MIB), MIB);
+        assert_eq!(gtt_alloc_cost(6 * MIB), 6 * MIB);
+        // Same weights, same scales, 1.969x less GTT.
+        let split = gtt_alloc_cost(2 * MIB) + gtt_alloc_cost(MIB);
+        let interleaved = gtt_alloc_cost(2_129_920) + gtt_alloc_cost(1_064_960);
+        assert_eq!(interleaved, 6 * MIB);
+        assert_eq!(split, 3 * MIB);
+    }
+
+    #[test]
+    fn a_small_scale_block_is_not_charged_a_whole_mib() {
+        // The bug this replaced: charging a 1 MiB granule below 2 MiB made a
+        // 32 KiB scale block cost 32x what it does.
+        assert_eq!(gtt_alloc_cost(32 * KIB), 32 * KIB);
+        assert_eq!(gtt_alloc_cost(49_152), 49_152);
     }
 
     #[test]
