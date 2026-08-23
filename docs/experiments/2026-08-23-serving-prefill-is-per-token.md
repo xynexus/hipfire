@@ -1,72 +1,88 @@
-# ⚠️ Serving prefill never reaches the batched path — 15.4 vs 286 tok/s
+# Why serving prefill is 15.4 tok/s — and why it need not be
 
 State box: halo, gfx1151, Qwen3.8-27B oq4.25++ +CASK, kvarn KV, MAX_BATCH=512,
-ROCm 7.14. Found 2026-08-23 while trying to validate W4A4 quality.
+ROCm 7.14, 2026-08-23.
 
-## The finding
+## ⚠️ Correction
 
-`bench_qwen35_speed` and the **daemon** disagree by ~19x on the same model, same
-machine, same prompt shape:
+An earlier draft of this file claimed the batched-prefill gate "is never
+reached" and called this "a serving-integration problem". **Both were wrong.**
+The batched path is reached exactly when asked for; it is gated by a deliberate
+opt-in that I added myself the day before, in `7224715da`.
 
-| harness | prefill |
-|---------|---------|
-| `bench_qwen35_speed --prefill 2059` | **286-329 tok/s** |
-| `hipfire-daemon` (stdin protocol, 720-token prompt) | **15.4 tok/s** |
+## The answer
 
-A `rocprofv3 --kernel-trace` of the daemon says why, unambiguously:
+`hipfire-serving-core/src/generate.rs`:
 
+```rust
+if kv.quant_kvarn
+    && std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL").ok().as_deref() != Some("1")
+{
+    // per-token forward_scratch loop
+}
 ```
-DAEMON kernel profile (45.8 s GPU):
-  gemv_oq_compact_grouped_v3      361,097 calls   41,917.8 ms   91.4%
-  gated_delta_net_f32              34,944 calls    1,691.0 ms    3.7%
-  attention_flash_kvarn_tile_batched 11,648 calls    531.8 ms    1.2%
-```
 
-**361,097 GEMV calls to prefill 720 tokens**, and ZERO calls to
-`gemm_oq_compact_iu4x2_w64`. The daemon prefills with the per-token DECODE
-kernel — one full weight sweep per token.
+Every daemon run in this investigation passed `HIPFIRE_KV_MODE=kvarn`, which is
+precisely the trigger. The per-token fallback was self-inflicted by the test
+setup, not a defect.
 
-## It is not "declined", it is not reached
+`7224715da` (2026-08-22) had already established the guard's stated reason was
+obsolete — `prefill_chunk.rs` handles KVarN explicitly ("kvarn_attend owns the
+batched write") — measured 15.4 -> 48.1 tok/s, and deliberately left it opt-in:
 
-Two independent eligibility diagnostics exist and BOTH stay silent under the
-daemon:
+> Behind HIPFIRE_KVARN_BATCHED_PREFILL=1 rather than default-on: the original
+> guard cites a real failure mode, so this wants the full coherence battery
+> across the KVarN model set before flipping.
 
-- `[kernel-trace] pbs_eligible inputs: ...` (`qwen35::prefill_batch_pbs_eligible`,
-  under `HIPFIRE_KERNEL_TRACE=1`)
-- `[prefill-eligible] final=... base=... kv_f32=...`
-  (`prefill_batch.rs`, under `HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1`)
+So the honest answer to "why doesn't the daemon reach the batched path" is:
+**because it was deliberately left opt-in, pending a coherence battery.**
 
-Neither prints. So `forward_prefill_batch` is never entered and the gate is never
-evaluated — this is not a gate returning false, it is a different code path.
-Ruled out along the way: `--state fp32` (the `dn_state.quant ∈ {FP32,FP16}`
-condition) changes nothing, and the prompt is far above `MIN_BATCH`.
+## What is new today
 
-## Why this matters more than any kernel work
+Two things, and together they are most of the evidence that battery was for.
 
-Every prefill optimization in this session and the ones before it was measured
-through `bench_qwen35_speed`:
+**1. The batched path is now 310 tok/s, not 48.1.** The 6.4x since 08-22 is this
+session's kernel work — overlay unroll + LDS-transposed store, GEMM grid
+swizzle, zero-seeded accumulators, hoisted k-major transpose.
 
-  216.3 -> 256.3 tok/s from the goal round (overlay, swizzle, zero-seed, hoist)
-  +14.9% more from opt-in W4A4
+| | prefill | TTFT | overall |
+|---|---|---|---|
+| per-token (default) | 15.4 tok/s | 46.7 s | 3.3 tok/s |
+| batched (flag on) | **310.2 tok/s** | **2.3 s** | 12.4 tok/s |
 
-**None of it is on the path serving uses.** Against a 15.4 tok/s serving
-baseline, reaching the batched path at all is worth ~19x — an order of magnitude
-more than the ~1.2x the kernel work bought, and it is a serving-integration
-problem, not a kernel problem.
+**20.1x prefill, 20x TTFT.** Decode unchanged at 14.5, as expected.
 
-It also blocks quality work: there is currently no route from a text-producing
-harness (`coherence_probe`, `hipfire eval`, the daemon) to the batched GEMM, so
-W4A4 activations cannot be validated end to end. That is why W4A4 ships opt-in
-and off.
+**2. Output is now BYTE-IDENTICAL, where on 08-22 it differed.** Two prompts,
+200 greedy tokens each, `coherence_probe`, both verdicts OK:
 
-## Open questions for whoever picks this up
+    lp2 @200 greedy tokens: IDENTICAL CONTENT
+    lp3 @200 greedy tokens: IDENTICAL CONTENT
 
-1. Which prefill entry does the daemon actually call for arch qwen35? It is not
-   `forward_prefill_batch`. Start by tracing the call path from
-   `DaemonRequest::Generate` down, rather than from the gate up — the gate is a
-   dead end by construction here.
-2. Is `bench_qwen35_speed` representative of what serving WOULD do once it
-   reaches the batched path, or does it bypass state/KV bookkeeping serving
-   needs? If the latter, the 286 tok/s figure is optimistic and needs restating.
-3. Does DFlash/spec-decode force the per-token route (`tape_in_play`), and is it
-   on by default for this artifact?
+That is a real change in behaviour, and the cause is identifiable. `8ea5a303e`
+("attend each KVarN segment BEFORE flushing it, not after the whole batch")
+landed AFTER the guard commit and is the only change to `kvarn_attend` since.
+The guard commit had observed "wording differs because batched and per-token
+export measurably different hidden states"; that divergence is now gone.
+
+## What remains before flipping the default
+
+The bar `7224715da` set was "the full coherence battery across the KVarN model
+set". Today's evidence is stronger in kind (byte-identical, not merely fluent)
+but narrower in scope: ONE model, two prompts, greedy only. To close it:
+
+1. Run the coherence battery across the KVarN model set, not just Qwen3.8-27B.
+2. A KLD comparison batched-vs-per-token would be better than token equality,
+   since greedy equality can mask small logit drift that sampling would expose.
+3. Check non-greedy sampling, which the identical-token test does not cover.
+
+Until then the flag stays opt-in — but note the cost of leaving it there is now
+20x on serving prefill, not the 3.1x it was when the decision was made. That
+changes the balance enough to be worth revisiting deliberately rather than by
+default.
+
+## Unrelated, still true
+
+`hipfire eval`/`coherence_probe` reach the daemon, so any quality work on the
+BATCHED path (e.g. validating W4A4 activations) must set
+`HIPFIRE_KVARN_BATCHED_PREFILL=1` or it silently measures the per-token path
+instead. That is how the W4A4 quality check failed earlier today.
