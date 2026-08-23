@@ -34,6 +34,26 @@ that has none, and the 35B-A3B stayed byte-identical to its expanded reference.
 Mixed handling -- kernel, stride table, representative, dispatch -- is correct
 end to end on a real model against a real reference.
 
+## Compact decode verified on the 122B's REAL weights
+
+Added `parity_gemv_oq_compact_moe --hfq <artifact> <layer> <n_exp>`: reads real
+routed-expert bytes straight out of the container and runs both decode paths plus
+an oracle. **No model load**, so it works on a model too large to serve.
+
+Layers 0, 1, 24, 47 of `oq4.25++fix`, 16 experts each: all PASS at ~1e-7, with
+compact-kernel, production-expansion and oracle all agreeing.
+
+It first reported FAIL on layers 0 and 1 (2.16e-1) and PASS on 24 and 47, which
+looked like the smoking gun. It was the ORACLE: the harness's hand-rolled
+f16->f32 flushed subnormals to zero, and real group scales go subnormal while
+generated ones do not. The tell was `compact-vs-expanded = 2.3e-7` while BOTH
+disagreed with the oracle by the same 1.7e-3 -- when the two independent
+implementations agree and only the referee objects, the referee is wrong. Now
+uses `hipfire_primitives::conv::f16_to_f32`.
+
+Lesson worth keeping: an oracle that is only correct on the data the test
+generates is not an oracle.
+
 ## The one anomaly, unexplained
 
 Expanding a QUARTER of the 122B's compact experts

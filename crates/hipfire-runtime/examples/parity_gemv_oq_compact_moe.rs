@@ -35,6 +35,7 @@
 //!   cargo run --release -p hipfire-runtime --example parity_gemv_oq_compact_moe [M K n_exp]
 
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::oq8_arch::{normalize_compact_overlays, split_compact_planes};
 use hipfire_runtime::oq_moe::oqplus_compact_to_moe_oq8_blocks;
 
@@ -62,14 +63,16 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | mant
 }
 
+/// The PRODUCTION conversion, not a hand-rolled one.
+///
+/// The hand-rolled version this replaces returned `sign` for `exp == 0`, i.e. it
+/// flushed every subnormal f16 to zero. Synthetic scales are generated in a
+/// normal range so it never showed there, and real artifacts carry subnormal
+/// group scales -- which made the ORACLE wrong on real 122B weights while both
+/// production paths agreed with each other to 2.3e-7. An oracle that is only
+/// correct on the data the test generates is not an oracle.
 fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-    if exp == 0 {
-        return f32::from_bits(sign);
-    }
-    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+    hipfire_primitives::conv::f16_to_f32(bits)
 }
 
 fn sext4(nib: u8) -> i32 {
@@ -392,6 +395,224 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layou
     ok
 }
 
+/// Compare both decode paths on an artifact's REAL routed-expert bytes.
+///
+/// The synthetic cases prove the kernel against a generator I wrote; this proves
+/// it against weights a quantizer actually emitted, including whatever overlay
+/// index distribution, duplicate pattern and scale range that artifact happens
+/// to carry. It needs no model load, so it works for a model too large to serve.
+fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
+    let hfq = match HfqFile::open(std::path::Path::new(path)) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  cannot open {path}: {e}");
+            return false;
+        }
+    };
+    let mut raw = Vec::new();
+    let mut compact_flags = Vec::new();
+    let (mut m, mut k) = (0usize, 0usize);
+    for e in 0..n_exp {
+        let name =
+            format!("model.language_model.layers.{layer}.mlp.experts.{e}.gate_up_proj.weight");
+        let Some((info, buf)) = hfq.tensor_data_pread(&name) else {
+            println!("  tensor not found: {name}");
+            return false;
+        };
+        if m == 0 {
+            m = info.shape[0] as usize;
+            k = info.shape[1] as usize;
+        }
+        compact_flags.push(info.quant_type == QuantType_OQPLUS_COMPACT);
+        raw.push(buf.to_vec());
+    }
+    let n_compact = compact_flags.iter().filter(|c| **c).count();
+    println!(
+        "  layer {layer}: M={m} K={k}  {n_compact} compact / {} promoted of {n_exp}",
+        n_exp - n_compact
+    );
+
+    // Oracle from the on-disk bytes, independent of either kernel.
+    let logical: Vec<Vec<f32>> = raw
+        .iter()
+        .zip(&compact_flags)
+        .map(|(b, is_c)| {
+            if *is_c {
+                decode_logical(b, m, k)
+            } else {
+                decode_logical_oq8_canonical(b, m, k)
+            }
+        })
+        .collect();
+
+    let topk: Vec<i32> = (0..K_TOP).map(|j| (j % n_exp) as i32).collect();
+    let mut rng = lcg(0x5EED);
+    let x: Vec<f32> = (0..K_TOP * k)
+        .map(|_| ((rng() % 2001) as f32 - 1000.0) / 1000.0)
+        .collect();
+
+    let mut oracle = vec![0f32; K_TOP * m];
+    for t in 0..K_TOP {
+        let e = topk[t] as usize;
+        let xr = &x[t * k..t * k + k];
+        for row in 0..m {
+            let mut acc = 0f64;
+            for j in 0..k {
+                acc += logical[e][row * k + j] as f64 * xr[j] as f64;
+            }
+            oracle[t * m + row] = acc as f32;
+        }
+    }
+
+    // Device blobs exactly as the loader builds them.
+    let blobs: Vec<Vec<u8>> = raw
+        .iter()
+        .zip(&compact_flags)
+        .map(|(b, is_c)| {
+            if *is_c {
+                let mut owned = b.clone();
+                normalize_compact_overlays(&mut owned, m, k, GROUP);
+                split_compact_planes(&owned, m, k, GROUP)
+            } else {
+                hipfire_runtime::oq_moe::oq8_canonical_to_moe_blocks(b, m, k).expect("oq8 canonical")
+            }
+        })
+        .collect();
+    let strides: Vec<f32> = compact_flags
+        .iter()
+        .zip(&raw)
+        .map(|(is_c, b)| {
+            let st: i32 = if *is_c {
+                (b.len() / (m * (k / GROUP))) as i32
+            } else {
+                0
+            };
+            f32::from_bits(st as u32)
+        })
+        .collect();
+
+    let ts: Vec<_> = blobs
+        .iter()
+        .map(|b| gpu.upload_raw(b, &[b.len()]).unwrap())
+        .collect();
+    let ptrs: Vec<f32> = ts
+        .iter()
+        .flat_map(|t| {
+            let p = t.buf.as_ptr() as u64;
+            [f32::from_bits(p as u32), f32::from_bits((p >> 32) as u32)]
+        })
+        .collect();
+    let ptr_t = gpu.upload_f32(&ptrs, &[2 * ts.len()]).unwrap();
+    let st_t = gpu.upload_f32(&strides, &[strides.len()]).unwrap();
+    let idx_t = gpu
+        .upload_raw(
+            &topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &[topk.len()],
+        )
+        .unwrap();
+    let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
+    let mi = m / 2;
+    let g = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+    let u = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+
+    gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptr_t, &idx_t, &st_t, &x_t, &g, &u, m, k, true)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+
+    let (gv, uv) = (gpu.download_f32(&g).unwrap(), gpu.download_f32(&u).unwrap());
+    let mut y = vec![0f32; K_TOP * m];
+    for s in 0..K_TOP {
+        y[s * m..s * m + mi].copy_from_slice(&gv[s * mi..s * mi + mi]);
+        y[s * m + mi..s * m + m].copy_from_slice(&uv[s * mi..s * mi + mi]);
+    }
+    let err = max_rel(&oracle, &y);
+    let ok = err < 1e-5;
+    println!(
+        "  {:<34} kernel-vs-oracle {err:.3e}  {}",
+        "REAL WEIGHTS",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    // THIRD OPINION: the production expansion path on the same real bytes, run
+    // through the shipping Oq8 kernel. If the compact kernel matches THIS but
+    // not the oracle, the oracle is what is wrong.
+    let oq8_blobs: Vec<Vec<u8>> = raw
+        .iter()
+        .zip(&compact_flags)
+        .map(|(b, is_c)| {
+            if *is_c {
+                oqplus_compact_to_moe_oq8_blocks(b, m, k).expect("expand")
+            } else {
+                hipfire_runtime::oq_moe::oq8_canonical_to_moe_blocks(b, m, k).expect("canonical")
+            }
+        })
+        .collect();
+    let ts8: Vec<_> = oq8_blobs
+        .iter()
+        .map(|b| gpu.upload_raw(b, &[b.len()]).unwrap())
+        .collect();
+    let ptrs8: Vec<f32> = ts8
+        .iter()
+        .flat_map(|t| {
+            let p = t.buf.as_ptr() as u64;
+            [f32::from_bits(p as u32), f32::from_bits((p >> 32) as u32)]
+        })
+        .collect();
+    let ptr8_t = gpu.upload_f32(&ptrs8, &[2 * ts8.len()]).unwrap();
+    let g8 = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+    let u8_ = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8_t, &idx_t, &x_t, &g8, &u8_, m, k, true)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let (gv8, uv8) = (
+        gpu.download_f32(&g8).unwrap(),
+        gpu.download_f32(&u8_).unwrap(),
+    );
+    let mut y8 = vec![0f32; K_TOP * m];
+    for s in 0..K_TOP {
+        y8[s * m..s * m + mi].copy_from_slice(&gv8[s * mi..s * mi + mi]);
+        y8[s * m + mi..s * m + m].copy_from_slice(&uv8[s * mi..s * mi + mi]);
+    }
+    println!(
+        "  {:<34} expanded-vs-oracle {:.3e}   compact-vs-expanded {:.3e}",
+        "cross-checks",
+        max_rel(&oracle, &y8),
+        max_rel(&y8, &y)
+    );
+
+    // Per-slot, so a failure names the expert rather than the layer.
+    for t in 0..K_TOP {
+        let e = topk[t] as usize;
+        let se = max_rel(&oracle[t * m..(t + 1) * m], &y[t * m..(t + 1) * m]);
+        let stride = raw[e].len() / (m * (k / GROUP));
+        println!(
+            "      slot {t} expert {e}: err {se:.3e}  {}  bytes={} stride={stride} n_ov={}",
+            if compact_flags[e] { "compact" } else { "promoted" },
+            raw[e].len(),
+            (stride as i64 - 130) / 2,
+        );
+    }
+    ok
+}
+
+/// Decode canonical Oq8 (`[f16 scale][256 int8]`, 258 B/group) to logical f32.
+fn decode_logical_oq8_canonical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
+    const SRC: usize = 258;
+    let ng = k / GROUP;
+    let mut w = vec![0f32; m * k];
+    for row in 0..m {
+        for g in 0..ng {
+            let base = (row * ng + g) * SRC;
+            let scale = f16_bits_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            for i in 0..GROUP {
+                w[row * k + g * GROUP + i] = scale * (blob[base + 2 + i] as i8) as f32;
+            }
+        }
+    }
+    w
+}
+
+const QuantType_OQPLUS_COMPACT: u8 = hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT;
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
@@ -401,6 +622,17 @@ fn main() {
     assert_eq!(k % GROUP, 0, "K must be a multiple of {GROUP}");
 
     let mut gpu = Gpu::init().unwrap();
+    // `--hfq <path> <layer> <n_exp>`: check real artifact bytes instead.
+    if std::env::args().nth(1).as_deref() == Some("--hfq") {
+        let a: Vec<String> = std::env::args().skip(2).collect();
+        let path = a.first().cloned().unwrap_or_default();
+        let layer: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let n: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
+        println!("REAL-WEIGHT parity: {path}");
+        let ok = run_real(&mut gpu, &path, layer, n);
+        println!("{}", if ok { "PASS" } else { "FAIL" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     println!("compact-resident indexed MoE GEMV parity (M={m} K={k} experts={n_exp})");
     let mut all = true;
     for layout in [Layout::AllCompact, Layout::AllOq8, Layout::Mixed] {
