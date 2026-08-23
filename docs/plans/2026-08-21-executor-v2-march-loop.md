@@ -557,6 +557,37 @@ throughput**. That is the price of the per-token park/resume swap, and it is wha
 option 3 (handle stops owning the session) would buy back. Small enough that
 option 3 stays an optimisation.
 
+**(2) admission → first dispatch — MEASURED 2026-08-22, and the result relocates
+the latency problem.** Priority admission (§M6) made this obtainable; it never
+needed a realtime `WorkloadClass`.
+
+RT admitted with `priority: 9` while a 200-token bulk stream is in steady-state
+decode, timed externally with a reader thread so pipe buffering cannot confound
+it:
+
+| | |
+|---|---|
+| admission → first RT token | **81.4 ms** (88.1 ms on an earlier run) |
+| of which RT's own prefill | ~71 ms |
+| queueing behind bulk decode | ~10–17 ms ≈ **one bulk quantum** |
+| **bulk tokens emitted during the window** | **0** |
+
+Two conclusions, and the second is the important one.
+
+Priority ordering does its job: once a stream is admitted, it waits at most about
+one quantum for its first decode dispatch. That is the bound §M6 wanted.
+
+**But the latency is prefill-dominated, and prefill is not preemptible.**
+`generate_start` runs the whole prefill inline in the dispatch handler, so
+admitting RT stalls the march loop completely — which is why bulk emitted *zero*
+tokens in that window. Roughly 88% of the observed latency is RT's own prefill,
+and none of it is schedulable.
+
+So the realtime latency lever is **prefill preemptibility, not decode ordering** —
+which is exactly the argument `2026-08-22-prefill-lowering.md` §0 makes for a band
+cursor. §M6's drain budget cannot be honoured while a whole prefill is one
+indivisible dispatch, no matter how the decode quanta are ordered.
+
 **(1) module duration by `SuperOpKind` — still not obtainable.** `TraceRecord.module`
 is documented "0 until the module graph exists", every `record()` site passes 0,
 and `SuperOpKind` appears in `exec_trace.rs` zero times. Unchanged by M3b1.
