@@ -3308,17 +3308,23 @@ fn prefill_path_trace() -> bool {
     std::env::var("HIPFIRE_PREFILL_PATH_TRACE").is_ok()
 }
 
-/// Run prefill inside the march loop instead of the frame handler
-/// (`HIPFIRE_MARCH_PREFILL`).
+/// Run prefill inside the march loop instead of the frame handler.
+/// ON by default; `HIPFIRE_MARCH_PREFILL=0` restores the frame-handler prefill.
 ///
-/// Off by default while it earns trust: it moves the single most
-/// correctness-sensitive step in the request onto a different schedule, and the
-/// failure mode — a first-sample n-gram scope taken before rather than after the
-/// prompt is recorded — is silent divergence rather than an error.
+/// Defaulted on once the case it exists for was finally measurable. Over the
+/// stdin protocol it looked worth only ~13%, because stdin drains every frame
+/// before the march and so a request can never arrive mid-prefill. Over
+/// `--listen`, injecting a priority-9 request 2 s into a bulk prefill:
+///
+///   frame-handler prefill   8516.7 / 8505.5 ms client time to first token
+///   march-driven + strict    575.2 /  571.0 ms
+///
+/// 14.8x. Parity is byte-identical on both drivers — the executor-v2 march and
+/// the inline `generate` loop — banded and unbanded.
 fn march_driven_prefill() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HIPFIRE_MARCH_PREFILL").ok().as_deref(),
-        Some("1" | "true" | "on" | "yes")
+        Some("0" | "false" | "off" | "no")
     )
 }
 
