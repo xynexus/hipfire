@@ -8190,6 +8190,13 @@ fn ffn_batched(
             .map_err(|e| format!("deepseek4_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
         }
     }
+    // Same provider the decode path builds; prefill needs it for the same
+    // reason. `None` on a fully-resident model, so dispatch is unchanged there.
+    let prefill_residency = weights
+        .pager
+        .as_ref()
+        .map(|pager| PagerExpertResidency { pager });
+
     let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
         hidden,
         mi: im,
@@ -8199,6 +8206,9 @@ fn ffn_batched(
         route_scale,
         swiglu_limit: cfg.swiglu_limit,
         layer_idx,
+        expert_residency: prefill_residency
+            .as_ref()
+            .map(|r| r as &dyn hipfire_dispatch::families::moe::ExpertResidency),
         routing,
         scores: &pbs.moe_scores_batch,
         topk_indices: &pbs.moe_topk_indices_batch,

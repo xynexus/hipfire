@@ -1328,6 +1328,37 @@ pub fn run_moe_prefill_bias_aware(
         }
     }
 
+    // Paged residency for PREFILL. The decode twin has had this since the pager
+    // landed; prefill did not, so a paged model dispatched its whole prompt pass
+    // against a pointer table holding entries only for experts some earlier
+    // decode had admitted — null for everything else.
+    //
+    // Union over all rows: prefill routes B tokens independently, so the set is
+    // up to B * k_top and needs dedup before admission.
+    if let Some(residency) = p.expert_residency {
+        hip!(gpu.bind_thread())?;
+        let n = batch_size * k_top;
+        let mut idx = vec![0i32; n];
+        let bytes = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, n * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let mut selected: Vec<u32> = Vec::with_capacity(n);
+        for v in &idx {
+            if *v >= 0 && (*v as usize) < n_exp {
+                let e = *v as u32;
+                if !selected.contains(&e) {
+                    selected.push(e);
+                }
+            }
+        }
+        if selected.len() != n {
+            // Not fatal on its own — duplicates across rows are normal and are
+            // exactly what the dedup above removes. An out-of-range index is
+            // not, but the decode twin already refuses those by name, so keep
+            // prefill permissive and let the shared guard speak.
+        }
+        residency.ensure_resident(gpu, p.layer_idx, &selected)?;
+    }
+
     // DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default.
     if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
         use std::io::Write;

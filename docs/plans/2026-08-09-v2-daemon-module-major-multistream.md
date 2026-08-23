@@ -1378,7 +1378,44 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    experts above 2 bits, which needs a deepseek4 routed-MoE kernel family that
    speaks a wider format — a separate piece of work from the executor.
 
-## M5 exit — RUN, and FALSIFIED (2026-08-23, nix1)
+## M5 exit — RUN, root-caused, FIXED, and PASSING (2026-08-23, nix1)
+
+**Result: the exit passes.** Output is byte-identical across a 4.3x swing in
+eviction pressure and a 6x swing in budget:
+
+| arm | budget | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| reference | 24 GB | 4474 | 1084 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 3x oversubscribed | 8 GB | 5846 | 4716 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+| 6x oversubscribed | 4 GB | — | — | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+The 8 GB arm reproduces exactly on a repeat run. Touched set is ~23 GB, so 8 GB
+is ~3x oversubscribed as the exit requires.
+
+**Root cause of the first, falsified attempt: PREFILL COULD NOT ADMIT EXPERTS.**
+`MoeBiasAwarePrefillParams` had no `expert_residency` field at all — the decode
+twin has had one since the pager landed. So a paged model dispatched its entire
+prompt pass against whatever the device pointer table happened to hold: entries
+only for experts some *earlier decode* had admitted, and null for everything
+else, since eviction nulls slots. Output therefore depended on eviction history,
+which is exactly what the first A/B measured. The field, a union-over-rows
+admission in `run_moe_prefill_bias_aware` (prefill routes B tokens
+independently, so the set is up to B x k_top and needs dedup), and the wiring in
+deepseek4's `ffn_batched` close it.
+
+Two consequences worth keeping:
+
+- The fix is confirmed by an OOM, not just by parity. With prefill admitting its
+  real working set, `PinAll` now exhausts VRAM at layer 15
+  (`hipMalloc 6.75 MiB, free=18.8 MiB of 43008`). Before the fix it fitted only
+  because prefill silently used a fraction of the experts it needed. The pinned
+  reference is genuinely unavailable for this model on a 43 GB box — the
+  large-budget LazyLru arm stands in for it.
+- Of the two pre-fix arms, the `PinAll` one (16 tokens, `88570cc71755...`) was
+  the WRONG one. Every corrected run at every budget agrees on
+  `552280dbd78c...`, the value the pre-fix LazyLru arm happened to produce.
+
+### The falsified first attempt, and the hypotheses it cost
 
 An earlier note here claimed the exit needed halo because 85.3 GB does not fit
 pinned in 43 GB. **That was wrong**, and it cost a milestone. `ResidencyPolicy`
@@ -1396,7 +1433,7 @@ expert set exactly **3x the pager budget**, which is what the exit asks for. The
 budget is respected (9088008192 bytes, 1284 modules resident) and eviction really
 runs (4440 evictions).
 
-**The exit is falsified: the outputs differ.** Both arms are individually
+**This attempt was falsified: the outputs differed.** Both arms were individually
 reproducible — A twice at `88570cc7...`/16 tokens, B twice at `552280db...`/22
 tokens — so this is systematic, not noise. Per the exit's own wording, this is
 reported rather than tuned around.
@@ -1415,11 +1452,15 @@ Three eviction-path hypotheses tested and REJECTED, so they are not retried:
   back, so with 1284 resident the current six are never the eviction candidates.
   The assertion is kept as a cheap guard.
 
-Next suspect, untested: `ensure_expert_module_resident`'s non-repack branch does
-`let (tensor, _handle) = self.transport.fetch(...)` and drops `_handle`
-immediately. MQ2G256Lloyd experts (this artifact's routed format) take that
-branch, not the pooled host-repack branch. What that handle owns, and whether
-dropping it is safe across re-admission churn, is where to look next.
+Two further suspects were then checked and cleared before the real cause turned
+up: dropping `_handle` from `transport.fetch` (the transport is synchronous and
+`TransferHandle` is an explicit forward-compat no-op) and a short
+`copy_len < len` leaving an uninitialised tail in a recycled pool buffer
+(`read_into_staging` returns `(rel, len)` and errors on short reads).
+
+The clue that broke it open was per-prompt: with two prompts, e0 was IDENTICAL
+across arms and only e1 diverged — pointing at table state carried between
+requests rather than at the expert data itself.
 3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
    "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
    layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident
