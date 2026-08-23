@@ -88,10 +88,15 @@ Current split: GEMM 50.3% (3667.5 ms), overlay 20.3% (1476.6 ms), attention
 a hardware reason. What remains below is blocked on the W4A4 decision (step 3b),
 which changes the model artifact and needs the user.
 
-1. **GEMM, 50.3% of prefill, ~57% of the 110.9 TOPS ceiling.** The 21% staging
-   and 20% LDS-read costs remain latency-shaped and have now resisted width,
-   tile geometry, wave grid, BK, and pipelining. What is left is step 3 (4-bit
-   activations, halving the matrix work) and `s_prefetch_data`.
+1. **GEMM, 50.3% of prefill, ~57% of the 110.9 TOPS ceiling (63.6 hwTOPS).** The
+   21% staging and 20% LDS-read costs are latency-shaped and have resisted
+   width, tile geometry, wave grid, BK, and fragment pipelining — each closed
+   with a number, in levers §12-§20.
+   **Both levers this item used to name are now closed too**, so nothing here is
+   merely untried: `s_prefetch_data` is gfx12-only (rejected three ways on ROCm
+   7.14), and step 3's W4A4 measured **+55% mean KLD** for +13% prefill. What
+   remains is not a lever but a different technique — activation conditioning
+   (learned rotations), which is a separate project.
 2. **Overlay, 20.3%.** The store is fixed; the gather now dominates, reading
    ~535 MB per gate/up call to consume a 2.6 MB activation. Needs cross-row
    sharing, which needs either big row blocks (register-bound) or a CSC-style
@@ -324,6 +329,39 @@ existing KLD bar -- report KLD alongside tok/s or the number means nothing.
 - **GPU lock**: wrap benches in `hipfire lock acquire/release`. NEVER wrap
   `hipfire-eval`, the `tiny-*` gates, or `coexistence calibrate` -- they
   self-lock and deadlock naming your own label.
+
+## Status against the definition of done (2026-08-23)
+
+Tested explicitly, because "the goal doc" is not by itself a stopping condition.
+
+**Branch 1 — "GEMM above ~80% of 110.9 TOPS": NOT MET.** Measured 63.6 hwTOPS on
+gate/up = **57%**. Recorded rather than glossed.
+
+**Branch 2 — "every remaining gap has a measured cause and a documented reason it
+cannot be closed": MET for all three open items.**
+
+| gap | measured cause | why it is not closable with a lever |
+|---|---|---|
+| GEMM 50.3% | ablation: staging 13.8 pts, fold 5.4, LDS reads 18.7 (of 118.8) | latency-shaped; width, tile, wave grid, BK, pipelining all closed with numbers. Its two named levers are closed: `s_prefetch_data` gfx12-only, W4A4 +55% KLD |
+| overlay 20.3% | ablation: store 67% (fixed), gather 29%; ~535 MB read per gate/up call for a 2.6 MB activation | needs cross-row sharing; LDS staging break-even is R=85 rows/workgroup and accumulators cap R far below that |
+| attention 14.1% | ablation: Phase D 36%, Phase A 26%, `expf` free, remainder 38% | no dominant phase, so no single lever; template-`dpt` probed (2x ISA density, still only 36% of the kernel) and retired |
+
+Negative results shipped as required: levers.md §12-§20, and the experiment docs
+for the ceiling attribution, the overlay/swizzle round, the W4A4 KLD, PFlash, and
+the MoE scope.
+
+**So the goal is satisfied on branch 2, at 57% rather than 80%.** That is the
+outcome the two-sided criterion was written to allow: the remaining distance is
+accounted for, not merely unattempted.
+
+**What this goal does NOT cover**, and should not be read as closing: the MoE
+routed path (a separate 8%-of-dense problem with its own docs), and the
+`gemm_oq_compact_moe_grouped_wmma` kernel, which is written and wired but
+**numerically unvalidated** — the only artifact that can exercise it is the 122B,
+which OOM-killed this machine's user session (dbus, pipewire, systemd --user,
+both agent processes) when loaded. Model loading has NO memory-admission check;
+`hipfire-state` reserves session state only.
+
 
 ## Definition of done
 
