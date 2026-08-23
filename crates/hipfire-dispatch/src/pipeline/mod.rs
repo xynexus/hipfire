@@ -1074,14 +1074,12 @@ pub fn run_moe_decode_bias_aware(
             // "the top-k kernel did not write" from "it was handed an all-zero
             // score buffer and every expert tied at 0".
             let mut sc = vec![0f32; p.n_exp.min(8)];
-            let scb = unsafe {
-                std::slice::from_raw_parts_mut(sc.as_mut_ptr() as *mut u8, sc.len() * 4)
-            };
+            let scb =
+                unsafe { std::slice::from_raw_parts_mut(sc.as_mut_ptr() as *mut u8, sc.len() * 4) };
             let sc_ok = gpu.hip.memcpy_dtoh(scb, &p.scores.buf).is_ok();
             let mut wt = vec![0f32; p.k_top];
-            let wtb = unsafe {
-                std::slice::from_raw_parts_mut(wt.as_mut_ptr() as *mut u8, p.k_top * 4)
-            };
+            let wtb =
+                unsafe { std::slice::from_raw_parts_mut(wt.as_mut_ptr() as *mut u8, p.k_top * 4) };
             let wt_ok = gpu.hip.memcpy_dtoh(wtb, &p.topk_weights.buf).is_ok();
             eprintln!(
                 "[topk-probe] l{} idx={:?} idx_as_f32={:?} scores[..{}]={:?} (ok={sc_ok}) weights={:?} (ok={wt_ok})",

@@ -6203,15 +6203,15 @@ fn run_hfq_source_pipeline(
                     }
                     other => {
                         return Err(format!(
-                            "--tensor-source scale {sname} has dtype {other}; expected F8_E8M0 or F32"
-                        ))
+                        "--tensor-source scale {sname} has dtype {other}; expected F8_E8M0 or F32"
+                    ))
                     }
                 };
                 if hipfire_env::FP8_SRC_STATS.flag() {
                     let n = f32s.len().max(1);
-                    let (mn, mx) = f32s.iter().fold((f32::MAX, f32::MIN), |(a, b), v| {
-                        (a.min(*v), b.max(*v))
-                    });
+                    let (mn, mx) = f32s
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
                     let mean = f32s.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
                     let absmean = f32s.iter().map(|v| v.abs() as f64).sum::<f64>() / n as f64;
                     let zeros = f32s.iter().filter(|v| **v == 0.0).count();

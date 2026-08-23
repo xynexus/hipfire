@@ -1298,7 +1298,11 @@ impl DeepseekV4 {
                     gpu,
                     "mtp.0.hc_ffn_base",
                 )?);
-                mtp.hc_ffn_fn = Some(Self::upload_global_as_f16(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
+                mtp.hc_ffn_fn = Some(Self::upload_global_as_f16(
+                    mtp_source,
+                    gpu,
+                    "mtp.0.hc_ffn_fn",
+                )?);
                 mtp.hc_ffn_scale = Some(Self::upload_global_as_f16(
                     mtp_source,
                     gpu,
@@ -1556,8 +1560,18 @@ mod tests {
     #[test]
     fn f32_to_f16_bits_round_trips_through_the_runtime_inverse() {
         for v in [
-            0.0f32, -0.0, 1.0, -1.0, 0.5, -0.03125, 2048.0, -2048.0, 0.029747, 1.2138, 2.200491,
-            65504.0,   // largest finite half
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.03125,
+            2048.0,
+            -2048.0,
+            0.029747,
+            1.2138,
+            2.200491,
+            65504.0, // largest finite half
             -65504.0,
             6.1035156e-5, // smallest normal half
         ] {
