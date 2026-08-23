@@ -654,6 +654,117 @@ pub fn resolve_tiny_model_state(
 /// scratch/KV/state for that family, resolve the chat template and eviction
 /// policy, and wire any optional DFlash drafter. The single-GPU entry point
 /// (multi-GPU goes through [`load_model_pp`]).
+/// Default slack left for the rest of the system after a load, in bytes.
+///
+/// Not a KV estimate: the KV cache is sized after the config is parsed, well
+/// past this point. 4 GiB is enough to keep the session's supervisor processes
+/// alive so a too-large load fails as a refusal instead of as a reaping.
+const LOAD_MEM_RESERVE_BYTES: u64 = 4 << 30;
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+///
+/// `MemAvailable`, not `MemFree`: reclaimable page cache is genuinely available
+/// to a load, and on this box the cache is routinely tens of GiB. Reading
+/// `MemFree` would refuse loads that fit comfortably.
+fn mem_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        let kb: u64 = line
+            .strip_prefix("MemAvailable:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    })
+}
+
+/// Decide whether a load of `need` bytes may proceed. Split out from
+/// [`check_load_headroom`] so the arithmetic is testable without `/proc`.
+fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), String> {
+    if need.saturating_add(reserve) <= available {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1 << 30) as f64;
+    Err(format!(
+        "refusing to load: artifact is {:.1} GiB and only {:.1} GiB is available \
+         (MemAvailable), leaving no room for the {:.1} GiB system reserve. \
+         This machine has unified memory -- GPU allocations come out of the same \
+         pool as everything else, so overcommitting here does not fail the loader, \
+         it invokes the OOM killer on whatever else is running. \
+         Free memory, or set HIPFIRE_LOAD_MEM_RESERVE_GIB=<n> to lower the reserve, \
+         or HIPFIRE_LOAD_MEM_CHECK=0 to skip this check entirely.",
+        gib(need),
+        gib(available),
+        gib(reserve),
+    ))
+}
+
+/// Refuse a load that cannot fit in available system memory.
+///
+/// Loading is the one place that commits tens of GiB in a single unattended
+/// step, and on a UMA APU there is no separate VRAM pool to run out of first:
+/// an over-large load walks `MemAvailable` to zero and the kernel reaps whatever
+/// it likes. Observed on halo: a 68 GB artifact against ~40 GB of headroom took
+/// out dbus, pipewire, `systemd --user`, and both agent processes -- the loader
+/// itself was not even the first victim, which is exactly why the loader has to
+/// be the one to refuse.
+///
+/// The artifact's on-disk size is the estimate. It is approximate in both
+/// directions -- it omits the KV cache and scratch (which the reserve absorbs),
+/// and it over-counts when `paged_experts` is on and most experts stay on host
+/// -- so this is a guard against the catastrophic case, not a precise admission
+/// test. Anything unreadable (no `/proc`, no `stat`) skips the check: never
+/// block a load because a diagnostic could not be read.
+fn check_load_headroom(path: &str) -> Result<(), String> {
+    if std::env::var("HIPFIRE_LOAD_MEM_CHECK").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let Some(available) = mem_available_bytes() else {
+        return Ok(());
+    };
+    let reserve = std::env::var("HIPFIRE_LOAD_MEM_RESERVE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|gib| gib << 30)
+        .unwrap_or(LOAD_MEM_RESERVE_BYTES);
+    load_headroom_verdict(meta.len(), available, reserve)
+}
+
+#[cfg(test)]
+mod load_headroom_tests {
+    use super::load_headroom_verdict;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn fits_with_reserve_to_spare() {
+        assert!(load_headroom_verdict(60 * GIB, 100 * GIB, 4 * GIB).is_ok());
+    }
+
+    #[test]
+    fn exactly_meeting_the_reserve_is_allowed() {
+        assert!(load_headroom_verdict(96 * GIB, 100 * GIB, 4 * GIB).is_ok());
+    }
+
+    #[test]
+    fn eating_into_the_reserve_is_refused() {
+        // The halo case: a 68 GiB artifact against 40 GiB of headroom.
+        let err = load_headroom_verdict(68 * GIB, 40 * GIB, 4 * GIB).unwrap_err();
+        assert!(err.contains("68.0 GiB"), "names the artifact size: {err}");
+        assert!(err.contains("40.0 GiB"), "names what is available: {err}");
+        assert!(err.contains("HIPFIRE_LOAD_MEM_CHECK=0"), "names the override: {err}");
+    }
+
+    #[test]
+    fn a_huge_estimate_does_not_wrap_into_a_pass() {
+        assert!(load_headroom_verdict(u64::MAX, 100 * GIB, 4 * GIB).is_err());
+    }
+}
+
 pub fn load_model(
     path: &str,
     max_seq: usize,
@@ -666,6 +777,7 @@ pub fn load_model(
     pp: usize,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
+    check_load_headroom(path)?;
     // The serving path takes hipfire containers only. A HuggingFace
     // safetensors directory is an external format: converting it is offline
     // tooling's job (AGENTS.md — "conversion and compatibility concerns are
