@@ -1374,11 +1374,52 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
 
    **This does not block M5's exit.** The exit is a PARITY test — paged output
    byte-identical to pinned output — not a quality test. Mojibake is admissible
-   evidence so long as it is the same mojibake. The only real blocker for M5's
-   exit remains the pinned reference: 85.3 GB does not fit in nix1's 43 GB, so
-   the A/B needs halo or a smaller MoE. Coherent output would need routed experts
-   above 2 bits, which needs a deepseek4 routed-MoE kernel family that speaks a
-   wider format — a separate piece of work from the executor.
+   evidence so long as it is the same mojibake. Coherent output would need routed
+   experts above 2 bits, which needs a deepseek4 routed-MoE kernel family that
+   speaks a wider format — a separate piece of work from the executor.
+
+## M5 exit — RUN, and FALSIFIED (2026-08-23, nix1)
+
+An earlier note here claimed the exit needed halo because 85.3 GB does not fit
+pinned in 43 GB. **That was wrong**, and it cost a milestone. `ResidencyPolicy`
+already names the reference: `PinAll` IS "pinned" (§M5 Phase 1 — "PinAll is a
+name not a sentinel"), and it runs on this box. So both arms of the parity test
+are executable here:
+
+| arm | policy | admissions | evictions | tokens | md5 |
+|---|---|---|---|---|---|
+| A (reference) | `PinAll` | 3859 | 0 | 16 | `88570cc71755cfbf07171689d5183f8a` |
+| B | `LazyLru` 9.1 GB | 5725 | 4440 | 22 | `552280dbd78cad3df56d9acd48f71828` |
+
+Working set is 3859 x 7077888 B = 27.3 GB, so a 9.1 GB budget makes the touched
+expert set exactly **3x the pager budget**, which is what the exit asks for. The
+budget is respected (9088008192 bytes, 1284 modules resident) and eviction really
+runs (4440 evictions).
+
+**The exit is falsified: the outputs differ.** Both arms are individually
+reproducible — A twice at `88570cc7...`/16 tokens, B twice at `552280db...`/22
+tokens — so this is systematic, not noise. Per the exit's own wording, this is
+reported rather than tuned around.
+
+Three eviction-path hypotheses tested and REJECTED, so they are not retried:
+
+- *`patch_expert_ptr_table` is never called.* True — it has zero call sites — but
+  it is a superseded pull-based API. Admission publishes through
+  `write_expert_ptr_slot` ("push hook 1 of 3"), so the table is maintained.
+- *Eviction leaves a stale pointer.* It does not; "push hook 2 of 3" nulls the
+  slot BEFORE freeing the buffer, deliberately, with the reasoning in-line.
+- *A selection evicts its own experts.* `ensure_resident` admits k_top one at a
+  time with nothing pinning the earlier ones, so admitting expert 6 could evict
+  expert 1 and null its live slot. Instrumented with a post-admission residency
+  assertion: **0 hits** over the whole run. Newly admitted modules sit at the LRU
+  back, so with 1284 resident the current six are never the eviction candidates.
+  The assertion is kept as a cheap guard.
+
+Next suspect, untested: `ensure_expert_module_resident`'s non-repack branch does
+`let (tensor, _handle) = self.transport.fetch(...)` and drops `_handle`
+immediately. MQ2G256Lloyd experts (this artifact's routed format) take that
+branch, not the pooled host-repack branch. What that handle owns, and whether
+dropping it is safe across re-admission churn, is where to look next.
 3. **M5's exit cannot be run on nix1 for this model.** The exit asks for output
    "byte-identical to the same model run pinned"; pinned, this artifact OOMs at
    layer 19 (`hipMalloc 1152 MiB, free 521.9 MiB of 43008`). There is no resident

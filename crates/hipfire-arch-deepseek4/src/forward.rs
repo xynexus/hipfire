@@ -3646,6 +3646,24 @@ impl hipfire_dispatch::families::moe::ExpertResidency for PagerExpertResidency<'
                 .ensure_expert_module_resident(key, gpu)
                 .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
         }
+        // Admitting expert k can evict expert 1 of the same selection, and
+        // eviction NULLS that expert's slot in the device pointer table — the
+        // indexed GEMV would then read a null pointer for a live routing choice.
+        // Newly admitted modules sit at the LRU back so this should be
+        // unreachable; verify rather than assume, because the symptom is a
+        // silently different output, not a fault.
+        for &expert in selected {
+            let key = hipfire_runtime::weight_pager::ExpertModuleKey {
+                layer: layer as u16,
+                expert: expert as u16,
+            };
+            if !pager.is_expert_module_resident(key) {
+                return Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "deepseek4 l{layer}: expert {expert} was evicted by its own \
+                     selection's admission loop (selected={selected:?})"
+                )));
+            }
+        }
         Ok(())
     }
 }
