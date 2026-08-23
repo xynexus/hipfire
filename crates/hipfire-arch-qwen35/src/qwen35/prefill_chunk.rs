@@ -821,6 +821,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // grouped WMMA) lives entirely inside the bucketed branch below, so a
     // resident-expert model never reaches it however eligible its dtype is --
     // which is invisible from outside and cost several kernel traces to find.
+    if super::feature_report::wanted() {
     super::feature_report::note(
         "moe_routed",
         if routed_expert_buckets.is_none() {
@@ -833,6 +834,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             format!("bucketed branch (grouped path-2 eligible per dtype {:?})", dtypes.expert_gate_up)
         },
     );
+    }
     if routed_expert_buckets.is_some() {
         // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
         //
