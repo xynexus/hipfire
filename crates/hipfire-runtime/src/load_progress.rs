@@ -186,8 +186,16 @@ mod tests {
         tb.join().unwrap();
 
         // 1..=10 sums to 55. Each thread must see exactly its own reports.
-        assert_eq!(a.load(Ordering::Relaxed), 55, "thread A saw the wrong reports");
-        assert_eq!(b.load(Ordering::Relaxed), 55_000, "thread B saw the wrong reports");
+        assert_eq!(
+            a.load(Ordering::Relaxed),
+            55,
+            "thread A saw the wrong reports"
+        );
+        assert_eq!(
+            b.load(Ordering::Relaxed),
+            55_000,
+            "thread B saw the wrong reports"
+        );
     }
 
     /// The guard must restore on drop, so a load that fails partway does not
@@ -210,7 +218,11 @@ mod tests {
             assert_eq!(inner.load(Ordering::Relaxed), 7);
         }
         report(3, 10, "weights");
-        assert_eq!(outer.load(Ordering::Relaxed), 3, "outer sink was not restored");
+        assert_eq!(
+            outer.load(Ordering::Relaxed),
+            3,
+            "outer sink was not restored"
+        );
         let _ = set_thread_sink(None);
     }
 

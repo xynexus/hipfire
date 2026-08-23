@@ -597,7 +597,11 @@ impl ModelGpuStorage {
     }
 }
 
-pub(super) fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor: GpuTensor) {
+pub(super) fn free_tensor_maybe_slab(
+    gpu: &mut Gpu,
+    slabs: Option<&ModelGpuStorage>,
+    tensor: GpuTensor,
+) {
     if slabs.is_some_and(|s| s.contains_tensor(&tensor)) {
         std::mem::forget(tensor);
     } else {
@@ -605,7 +609,11 @@ pub(super) fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStora
     }
 }
 
-pub(super) fn free_weight_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, wt: WeightTensor) {
+pub(super) fn free_weight_tensor_maybe_slab(
+    gpu: &mut Gpu,
+    slabs: Option<&ModelGpuStorage>,
+    wt: WeightTensor,
+) {
     if let Some(scale) = wt.awq_scale {
         let _ = gpu.free_tensor(scale);
     }

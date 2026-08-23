@@ -4724,7 +4724,15 @@ pub fn load_weights(
         let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
             hfq.path(),
             hipfire_runtime::weight_pager::PagerConfig {
-                vram_budget_bytes: config.vram_budget_bytes,
+                // u64::MAX has always meant "never evict"; say so now that the
+                // pager has a name for it.
+                residency: if config.vram_budget_bytes == u64::MAX {
+                    hipfire_runtime::weight_pager::ResidencyPolicy::PinAll
+                } else {
+                    hipfire_runtime::weight_pager::ResidencyPolicy::LazyLru {
+                        vram_budget_bytes: config.vram_budget_bytes,
+                    }
+                },
                 trace: matches!(
                     std::env::var("HIPFIRE_QWEN35_EXPERT_CACHE_TRACE")
                         .ok()
