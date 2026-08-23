@@ -1498,6 +1498,44 @@ ordering that `priority` already provides is scaffolding. The declared
 largest-indivisible-unit and max-yield-granularity fields, the drain-budget and
 the VRAM test are the substance of M6 and remain.
 
+**Scoped 2026-08-22 — the remaining three, measured rather than assumed.**
+
+*The drain budget's formula omits the term that dominates.* §1.1 states
+
+```
+admit(realtime) ⟺ drain_to_suspend + realtime_model_residency_cost ≤ 200 ms
+```
+
+§M3d measurement 2 measured the thing that inequality is supposed to bound:
+**81.4 ms** admission→first RT token, of which **~71 ms is RT's own prefill** and
+only ~10–17 ms is queueing. Prefill appears in neither term. So the inequality as
+written would admit on a budget accounting for ~12% of the observed latency, and
+would keep passing as prefill grew with context length. It is not implementable
+as specified — it needs either a prefill term or a preemptible prefill, and
+`2026-08-22-prefill-lowering.md` argues the second. **Blocked on that decision,
+not on M4.**
+
+*The VRAM test is real and cheaper than expected, but it is a load-path change.*
+The assumption that one model is resident is **wrong**: `DaemonState` carries
+`resident_models: HashMap<String, LoadedModel>` of parked workers, documented as
+"there is no eviction policy" (`state.rs:40-42`). So unbounded residency growth
+is a live hazard, not a hypothetical one, and the test guards something.
+Accounting is available — `gpu.hip.get_vram_info() -> (free, total)`
+(`hip-bridge/src/ffi.rs:1764`), reachable directly off `DaemonState.gpu`, with a
+reserve-subtraction precedent in `vram_ceiling` (`layer_stream.rs:2846`).
+What makes this more than a small patch is that the useful guard **refuses a
+load**, which is a user-visible behaviour change to a path outside the executor.
+Wants a decision before it lands.
+
+*The declared granularity fields stay unbuilt, for the reason this section
+already gives.* `largest_indivisible_unit` and `max_yield_granularity` have no
+consumer until a forward loop can act on them. The yield point now exists —
+`run_layer_program_from(.., start, budget)` — but nothing calls it with a real
+budget, and that caller is M4's. Adding the fields first is the same scaffolding
+this section declined for the four `WorkloadClass` variants.
+
+**Net: M6's remainder is decision-blocked, not effort-blocked.**
+
 **This also unblocks §M3d measurement 2** (admission→first dispatch under load),
 which was previously recorded as unobtainable for want of a realtime class. It
 does not need one — it needs an ordering lever, and there is one.

@@ -16422,14 +16422,20 @@ mod tests {
         );
         // The exact fused name still comes FIRST — the fallback must never
         // shadow a real fused entry.
-        assert_eq!(c[0], "model.language_model.layers.0.experts.7.gate_up_proj.weight");
+        assert_eq!(
+            c[0],
+            "model.language_model.layers.0.experts.7.gate_up_proj.weight"
+        );
         for want in [
             "model.language_model.layers.0.experts.7.gate_proj",
             "model.language_model.layers.0.experts.7.up_proj",
             // and through the short-prefix variant the collector may have used
             "model.layers.0.experts.7.gate_proj",
         ] {
-            assert!(c.iter().any(|x| x == want), "missing candidate {want}; got {c:?}");
+            assert!(
+                c.iter().any(|x| x == want),
+                "missing candidate {want}; got {c:?}"
+            );
         }
         // A name with no fused segment gains no split variants.
         let d = calibration_tensor_name_candidates("model.layers.0.experts.7.down_proj.weight");

@@ -304,179 +304,44 @@ macro_rules! moe_step {
     };
 }
 
-pub fn run_moe_decode(
+/// §M4 stage B on the path that actually runs — the routed-expert half of
+/// `run_moe_decode`.
+///
+/// The seam is immediately after `moe_topk_renorm_k8`: stage A is the router
+/// GEMV, the shared expert and top-K; stage B is the routed experts and the
+/// combine. `2026-08-22-m4-premise-falsified.md` argues those are already
+/// separate dispatches; this makes the boundary a function on the DEFAULT
+/// decode path (`moe_family().run()` -> here), not on the legacy inline body in
+/// `qwen35/moe_decode.rs`, which returns early unless
+/// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE=1`.
+///
+/// Only ten locals cross, and all of them are either resolution state or views
+/// derived from `p` — which is why this split is cheap where the legacy one was
+/// not.
+#[allow(clippy::too_many_arguments)]
+fn run_moe_decode_routed(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams,
+    res: &crate::families::moe::MoeResolution,
+    __step: std::time::Instant,
 ) -> Result<(), DispatchError> {
-    use crate::families::moe::MoeResolution;
     macro_rules! hip {
         ($e:expr) => {
             $e.map_err(|e| DispatchError::Hip(e.to_string()))
         };
     }
-
-    // Runtime guard matching the bias-aware decode guard (not debug_assert —
-    // that would be stripped in release). batch_size=1 is the only valid
-    // decode width; >1 must route to grouped prefill (Step 8).
-    check_moe_decode_batch_size(p.batch_size)?;
-
-    // Shape admission, not just the flag: the indexed OQ path's FWHT rotates are
-    // G256 on both sides (K = hidden, K = mi), and the kernels are k8-only.
-    // See `oq_indexed_admissible`.
-    let res = MoeResolution::resolve_with_oq_indexed(
-        &p.dtypes,
-        p.k,
-        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi, p.k),
-    );
-
-    // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
-    // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
-    // GPU work. `resolve` is a pure, side-effect-free function of dtypes + k, so
-    // running it first then guarding is equivalent to guarding pre-resolve while
-    // letting us key the dtype check off `res.use_gpu_topk`. This turns the
-    // deep `select_nth_unstable_by` panic in the fallback into a clean error.
-    // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
-    // [1, n_exp] (MQ4 k=4, F32 k=2, …).
-    let __step = std::time::Instant::now();
-    moe_step!(__step, "enter run_moe_decode");
-    check_moe_decode_supported(
-        res.use_gpu_topk,
-        p.k,
-        p.n_exp,
-        !p.routed_experts.is_empty(),
-        p.expert_residency.is_some(),
-    )?;
-    moe_step!(__step, "after check_moe_decode_supported");
-
-    // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
-    // routed-combine accumulate into that zeroed partial (all-reduced by the EP
-    // executor and added into x_residual once). `None` → x_residual directly
-    // (single-GPU, byte-identical).
+    let res = *res;
+    // Re-derived, not carried: each is a pure function of `p` and `res`, so the
+    // seam needs no state beyond the resolution itself.
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
-
-    // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
-        if !res.routed_indexable_paro {
-            hip!(gpu.ensure_mq_signs())?;
-        }
-        if !p.x_rot_prerotated {
-            if res.routed_indexable_paro {
-                let paro = p
-                    .routed_gate_up_paro
-                    .as_ref()
-                    .expect("routed_indexable_paro implies gate_up paro sidecar");
-                hip!(gpu.givens_rotate_to(
-                    p.x_norm,
-                    p.x_rot_local,
-                    &paro.pairs,
-                    &paro.theta,
-                    &paro.scales,
-                    1,
-                    p.hidden,
-                    paro.krot,
-                ))?;
-            } else if res.gate_side_mq4 {
-                if let Some(awq) = p.router.awq_scale {
-                    hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
-                } else {
-                    hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
-                }
-            } else {
-                // !gate_side_mq4 but routed MQ4/MQ6: no AWQ on MoE expert weights
-                // in Phase 1 targets (A3B). Byte-identical for models without AWQ.
-                hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
-            }
-        }
         Some(p.x_rot_local)
     } else {
         None
     };
-
-    moe_step!(__step, "after x_rot_local block");
-    // ── Gate-side GEMV ───────────────────────────────────────────────────────
-    // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
     let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
     let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
-    if res.gate_side_mq4 {
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
-        hip!(gpu.fused_qkvza_hfq4g256(
-            &p.router.buf,
-            &p.shared_expert_gate.buf,
-            &p.shared_gate_w.buf,
-            &p.shared_up_w.buf,
-            xr,
-            p.router_logits,
-            p.scalar_buf,
-            &shared_gate,
-            &shared_up,
-            p.router.m,
-            p.shared_expert_gate.m,
-            p.shared_gate_w.m,
-            p.shared_up_w.m,
-            p.router.k,
-        ))?;
-    } else {
-        static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
-        let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        moe_gemv_plain(ctx, gpu, gemv, &p.router, p.x_norm, p.router_logits)?;
-        moe_gemv_plain(
-            ctx,
-            gpu,
-            gemv,
-            &p.shared_expert_gate,
-            p.x_norm,
-            p.scalar_buf,
-        )?;
-        moe_gemv_plain(ctx, gpu, gemv, &p.shared_gate_w, p.x_norm, &shared_gate)?;
-        moe_gemv_plain(ctx, gpu, gemv, &p.shared_up_w, p.x_norm, &shared_up)?;
-    }
-
-    // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
-    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
-    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
-    // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
-    // layers outside the {k=8, MQ4G256|MQ6G256|ParoQ4G128-routed} fast path
-    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
-    // dispatch migration behavior-preserving.
-    //
-    // The fallback is self-contained: it does softmax → CPU top-K + renorm →
-    // shared-expert down → generic per-expert routed loop, then returns. It
-    // does NOT fall through to the indexed GPU-top-K path below (which assumes
-    // k=8 + an indexable routed dtype).
-    moe_step!(__step, "after gate-side GEMV");
-    if !res.use_gpu_topk {
-        return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
-    }
-    // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
-    if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
-        if gpu.hip.device_synchronize().is_ok() {
-            if let Ok(all) = gpu.download_f32(p.router_logits) {
-                use std::io::Write;
-                let path = format!("{dump_path}.router_raw_p");
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    let _ = f.write_all(&(0u32).to_le_bytes());
-                    for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
-                        let _ = f.write_all(&v.to_le_bytes());
-                    }
-                }
-            }
-        }
-    }
-    hip!(gpu.softmax_f32(p.router_logits))?;
-    moe_step!(__step, "after softmax_f32");
-    hip!(gpu.moe_topk_renorm_k8(
-        p.router_logits,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp,
-        p.norm_topk_prob
-    ))?;
-    // Paged residency (option A): make the selected experts resident before the
     // indexed kernels dereference their pointer-table slots.
     //
     // This costs a D2H sync per MoE layer per token, which this path otherwise
@@ -797,6 +662,181 @@ pub fn run_moe_decode(
     ))?;
 
     Ok(())
+}
+
+pub fn run_moe_decode(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MoeResolution;
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+
+    // Runtime guard matching the bias-aware decode guard (not debug_assert —
+    // that would be stripped in release). batch_size=1 is the only valid
+    // decode width; >1 must route to grouped prefill (Step 8).
+    check_moe_decode_batch_size(p.batch_size)?;
+
+    // Shape admission, not just the flag: the indexed OQ path's FWHT rotates are
+    // G256 on both sides (K = hidden, K = mi), and the kernels are k8-only.
+    // See `oq_indexed_admissible`.
+    let res = MoeResolution::resolve_with_oq_indexed(
+        &p.dtypes,
+        p.k,
+        crate::families::moe::oq_indexed_decode_active(p.hidden, p.mi, p.k),
+    );
+
+    // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
+    // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
+    // GPU work. `resolve` is a pure, side-effect-free function of dtypes + k, so
+    // running it first then guarding is equivalent to guarding pre-resolve while
+    // letting us key the dtype check off `res.use_gpu_topk`. This turns the
+    // deep `select_nth_unstable_by` panic in the fallback into a clean error.
+    // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
+    // [1, n_exp] (MQ4 k=4, F32 k=2, …).
+    let __step = std::time::Instant::now();
+    moe_step!(__step, "enter run_moe_decode");
+    check_moe_decode_supported(
+        res.use_gpu_topk,
+        p.k,
+        p.n_exp,
+        !p.routed_experts.is_empty(),
+        p.expert_residency.is_some(),
+    )?;
+    moe_step!(__step, "after check_moe_decode_supported");
+
+    // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
+    // routed-combine accumulate into that zeroed partial (all-reduced by the EP
+    // executor and added into x_residual once). `None` → x_residual directly
+    // (single-GPU, byte-identical).
+
+    // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
+    let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
+        if !res.routed_indexable_paro {
+            hip!(gpu.ensure_mq_signs())?;
+        }
+        if !p.x_rot_prerotated {
+            if res.routed_indexable_paro {
+                let paro = p
+                    .routed_gate_up_paro
+                    .as_ref()
+                    .expect("routed_indexable_paro implies gate_up paro sidecar");
+                hip!(gpu.givens_rotate_to(
+                    p.x_norm,
+                    p.x_rot_local,
+                    &paro.pairs,
+                    &paro.theta,
+                    &paro.scales,
+                    1,
+                    p.hidden,
+                    paro.krot,
+                ))?;
+            } else if res.gate_side_mq4 {
+                if let Some(awq) = p.router.awq_scale {
+                    hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
+                } else {
+                    hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
+                }
+            } else {
+                // !gate_side_mq4 but routed MQ4/MQ6: no AWQ on MoE expert weights
+                // in Phase 1 targets (A3B). Byte-identical for models without AWQ.
+                hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
+            }
+        }
+        Some(p.x_rot_local)
+    } else {
+        None
+    };
+
+    moe_step!(__step, "after x_rot_local block");
+    // ── Gate-side GEMV ───────────────────────────────────────────────────────
+    // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
+    let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
+    let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
+    if res.gate_side_mq4 {
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        hip!(gpu.fused_qkvza_hfq4g256(
+            &p.router.buf,
+            &p.shared_expert_gate.buf,
+            &p.shared_gate_w.buf,
+            &p.shared_up_w.buf,
+            xr,
+            p.router_logits,
+            p.scalar_buf,
+            &shared_gate,
+            &shared_up,
+            p.router.m,
+            p.shared_expert_gate.m,
+            p.shared_gate_w.m,
+            p.shared_up_w.m,
+            p.router.k,
+        ))?;
+    } else {
+        static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
+        let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
+        moe_gemv_plain(ctx, gpu, gemv, &p.router, p.x_norm, p.router_logits)?;
+        moe_gemv_plain(
+            ctx,
+            gpu,
+            gemv,
+            &p.shared_expert_gate,
+            p.x_norm,
+            p.scalar_buf,
+        )?;
+        moe_gemv_plain(ctx, gpu, gemv, &p.shared_gate_w, p.x_norm, &shared_gate)?;
+        moe_gemv_plain(ctx, gpu, gemv, &p.shared_up_w, p.x_norm, &shared_up)?;
+    }
+
+    // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
+    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
+    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
+    // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
+    // layers outside the {k=8, MQ4G256|MQ6G256|ParoQ4G128-routed} fast path
+    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
+    // dispatch migration behavior-preserving.
+    //
+    // The fallback is self-contained: it does softmax → CPU top-K + renorm →
+    // shared-expert down → generic per-expert routed loop, then returns. It
+    // does NOT fall through to the indexed GPU-top-K path below (which assumes
+    // k=8 + an indexable routed dtype).
+    moe_step!(__step, "after gate-side GEMV");
+    if !res.use_gpu_topk {
+        return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
+    }
+    // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
+    if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
+        if gpu.hip.device_synchronize().is_ok() {
+            if let Ok(all) = gpu.download_f32(p.router_logits) {
+                use std::io::Write;
+                let path = format!("{dump_path}.router_raw_p");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(&(0u32).to_le_bytes());
+                    for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
+                        let _ = f.write_all(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    hip!(gpu.softmax_f32(p.router_logits))?;
+    moe_step!(__step, "after softmax_f32");
+    hip!(gpu.moe_topk_renorm_k8(
+        p.router_logits,
+        p.topk_indices,
+        p.topk_weights,
+        p.n_exp,
+        p.norm_topk_prob
+    ))?;
+    // Paged residency (option A): make the selected experts resident before the
+    run_moe_decode_routed(ctx, gpu, p, &res, __step)
 }
 
 /// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393
