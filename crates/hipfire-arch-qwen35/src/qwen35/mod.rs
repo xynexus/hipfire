@@ -86,6 +86,7 @@ use decode_layers::*;
 mod prefill_chunk;
 use prefill_chunk::*;
 
+pub mod feature_report;
 mod prefill_lowered;
 use prefill_lowered::*;
 
@@ -2040,7 +2041,8 @@ fn moe_ffn_batched_admissible_for_dtypes(
     let shared_matches_routed = dtypes.shared_expert_gate == dtypes.expert_gate_up
         && dtypes.shared_expert_down == dtypes.expert_down;
 
-    shared_matches_routed || moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch)
+    shared_matches_routed
+        || moe_routed_dispatch_supported_for_dtype(dtypes.expert_gate_up, arch)
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
@@ -2189,7 +2191,7 @@ pub fn prefill_batch_pbs_eligible(
             dn_state.quant, config.num_experts_per_tok, config.num_experts
         );
     }
-    !force_fallback
+    let verdict = !force_fallback
         && n >= MIN_BATCH
         && matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16)
         // NOTE: there used to be an `all(DeltaNet | FullAttn)` term here, which
@@ -2240,7 +2242,24 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.wv.gpu_dtype, arch, allow_compact)
                     && is_batchable_la(l.wo.gpu_dtype, arch, allow_compact)
                     && moe_ffn_batched_admissible(&l.ffn, arch),
-        })
+        });
+    // Report the DECISION plus the first condition that would explain a false,
+    // so a "per-token" line never needs a kernel trace to interpret.
+    feature_report::note(
+        "prefill",
+        if verdict {
+            format!("batched (n={n}, dn_quant={:?})", dn_state.quant)
+        } else if force_fallback {
+            "per-token (caller forced fallback)".to_string()
+        } else if n < MIN_BATCH {
+            format!("per-token (n={n} < MIN_BATCH={MIN_BATCH})")
+        } else if !matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16) {
+            format!("per-token (dn_state.quant={:?}, needs FP32|FP16)", dn_state.quant)
+        } else {
+            "per-token (a per-layer dtype/MoE condition declined — HIPFIRE_KERNEL_TRACE=1 names the layer)".to_string()
+        },
+    );
+    verdict
 }
 
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, arch: &str) -> bool {
@@ -2289,9 +2308,29 @@ fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool
         // (RDNA-generic, like MQ4/MQ6); the dense shared expert uses the OQ
         // grouped-WMMA path + gemv_oq*_residual_sigmoid_scaled down. Admit on RDNA
         // (exclude CDNA/gfx9, unvalidated).
-        DType::Oq4G256 | DType::Oq8G256 => !arch.starts_with("gfx9"),
+        // OqCompactG256 joins its Opus siblings now that the MoE body can run it:
+        // both attention arms rotate for it (the `is_mq`/`qkv_is_mq` predicates)
+        // and the shared expert has gate_up + down arms. Admitting it WITHOUT
+        // those would feed an unrotated activation to an Opus GEMM.
+        DType::Oq4G256 | DType::Oq8G256 | DType::OqCompactG256 => !arch.starts_with("gfx9"),
         _ => false,
     }
+}
+
+/// Can this routed-expert dtype be dispatched INDEPENDENTLY of the shared-expert
+/// dtype? That is what the `shared_matches_routed || ...` admission fallback is
+/// asking, and it is a weaker question than "has a grouped-WMMA kernel".
+///
+/// The path-1 indexed GEMV route handles these per (token, expert), so a layer
+/// whose shared and routed experts differ is still dispatchable. Kept separate
+/// from `moe_grouped_gemm_supported_for_dtype` because that one also gates
+/// path-2 selection, whose fallthrough is a panic.
+fn moe_routed_dispatch_supported_for_dtype(dtype: DType, arch: &str) -> bool {
+    if moe_grouped_gemm_supported_for_dtype(dtype, arch) {
+        return true;
+    }
+    // Path-1 indexed GEMV arms that exist for routed experts.
+    matches!(dtype, DType::Oq8G256) && !arch.starts_with("gfx9")
 }
 
 fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
@@ -2307,7 +2346,19 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
         // OQ4 mixed-precision routing uses the indexed-block W4A16 grouped kernel
         // on gfx11. Uniform OQ can still use the existing indexed Path 1 kernels.
-        DType::Oq4G256 => arch.starts_with("gfx11"),
+        //
+        // Do NOT add a dtype here just to satisfy an admission check. This
+        // predicate ALSO gates path-2 eligibility, and path 2's dtype match ends
+        // in `other => panic!`. A dtype declared here without a grouped-WMMA arm
+        // is a latent panic. For "can the routed dtype dispatch independently of
+        // the shared dtype", use `moe_routed_dispatch_supported_for_dtype`.
+        // Oq8G256 is here legitimately as of the grouped-MoE wiring: path 2 has
+        // real `DType::Oq8G256` arms for gate_up and down backed by
+        // gemm_oq8g256_moe_grouped_wmma, so declaring it can no longer reach the
+        // `other => panic!` fallthrough. It was briefly added here to satisfy an
+        // ADMISSION check while no such arm existed -- that is what
+        // moe_routed_dispatch_supported_for_dtype is for; keep the two distinct.
+        DType::Oq4G256 | DType::Oq8G256 => arch.starts_with("gfx11"),
         _ => false,
     }
 }

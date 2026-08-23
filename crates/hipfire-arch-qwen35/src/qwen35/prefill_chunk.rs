@@ -462,6 +462,26 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 ffn.shared_expert.gate.k,
                 n,
             )?,
+            DType::OqCompactG256 => {
+                // Compact-resident Opus shared expert. There is no
+                // FusedGateUpOqCompact kernel key -- compact appears in dispatch
+                // only as decode-side GEMV entries -- so run gate and up as two
+                // compact GEMMs off ONE quantize of the shared rotated
+                // activation. Same shape as the dense compact arms.
+                gpu.quantize_act_oq8_batched_interleaved(
+                    &pbs.x_rot_batch,
+                    ffn.shared_expert.gate.m,
+                    ffn.shared_expert.gate.k,
+                    n,
+                )?;
+                for (w, y) in [
+                    (&ffn.shared_expert.gate, shared_gate),
+                    (&ffn.shared_expert.up, shared_up),
+                ] {
+                    let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                    gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                }
+            }
             other => panic!(
                 "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                              — admit predicate should have rejected this layer"
@@ -757,6 +777,36 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     n,
                 )?;
             }
+            DType::OqCompactG256 => {
+                // Compact shared-expert down. The Oq4/Oq8 arms above use a FUSED
+                // residual+sigmoid GEMV; compact has no such kernel, so decompose
+                // exactly as the F16/BF16 arms below already do: plain GEMM into
+                // the x_rot_batch scratch, then the shared
+                // `scaled_add_inplace_gpu_sigmoid_rows_f32`, which is
+                // y[row,col] += sigmoid(shared_scalar[row]) * x[row,col].
+                let dm = ffn.shared_expert.down.m;
+                let dk = ffn.shared_expert.down.k;
+                let shared_down_scratch = pbs.x_rot_batch.sub_offset(0, n * dm);
+                let bs =
+                    super::prefill_batch::oq_compact_block_stride(&ffn.shared_expert.down)?;
+                gpu.quantize_act_oq8_batched_interleaved(shared_rot, dm, dk, n)?;
+                gpu.gemm_oq_compact_grouped_prequant(
+                    &ffn.shared_expert.down.buf,
+                    &shared_down_scratch,
+                    dm,
+                    dk,
+                    n,
+                    bs,
+                )?;
+                let x_n = pbs.x_batch.sub_offset(0, n * dm);
+                gpu.scaled_add_inplace_gpu_sigmoid_rows_f32(
+                    &x_n,
+                    &shared_down_scratch,
+                    shared_scalar,
+                    dm,
+                    n,
+                )?;
+            }
             other => panic!(
                 "prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
                          — admit predicate should have rejected this layer"
@@ -767,6 +817,22 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // Paged experts retain page-in orchestration here. Mixed resident experts
     // use the same one-expert buckets so each launch interprets its weight
     // pointer with the correct low-bit or raw layout.
+    // The MoE routed decision, reported where it is MADE. Path 2 (scatter +
+    // grouped WMMA) lives entirely inside the bucketed branch below, so a
+    // resident-expert model never reaches it however eligible its dtype is --
+    // which is invisible from outside and cost several kernel traces to find.
+    super::feature_report::note(
+        "moe_routed",
+        if routed_expert_buckets.is_none() {
+            format!(
+                "indexed GEMV path-1 (resident experts: the grouped path-2 block is inside the \
+                 bucketed branch, so it is not reachable here) gate_up={:?}",
+                dtypes.expert_gate_up
+            )
+        } else {
+            format!("bucketed branch (grouped path-2 eligible per dtype {:?})", dtypes.expert_gate_up)
+        },
+    );
     if routed_expert_buckets.is_some() {
         // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
         //
@@ -956,6 +1022,26 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         path2_shape.gate_up_x_row_div,
                         m_total,
                         path2_shape.gate_up_source_rows,
+                    )?,
+                    // Opus OQ8 routed experts. The path-1 GEMV this replaces re-reads an
+                    // expert's weights once per (token, expert) pair -- ~16x redundant at
+                    // n=512 / k_top=8 / E=256, and 47.8% of MoE prefill in a kernel trace.
+                    // The grouped path reads each expert once per tile instead.
+                    // weight_byte_offset is 0: resident OQ8 experts point straight at
+                    // interleaved 260 B [f32 scale | 256 int8] blocks (OQ8_BLK), exactly
+                    // as the path-1 kernel addresses them.
+                    DType::Oq8G256 => gpu.gemm_oq8g256_moe_grouped_wmma(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_rot_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                        0,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_gate_up_ptrs,
@@ -1466,6 +1552,21 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         path2_shape.down_x_row_div,
                         m_total,
                         path2_shape.down_source_rows,
+                    )?,
+                    // Opus OQ8 routed down. See the gate_up arm for why the grouped
+                    // path matters here; offset 0 for the same reason.
+                    DType::Oq8G256 => gpu.gemm_oq8g256_moe_grouped_wmma(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                        0,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_down_ptrs,
@@ -2653,7 +2754,18 @@ pub(crate) fn forward_prefill_chunk(
                 // alongside the moe_ffn router/gate Q8 unlock (A3B's LA
                 // attention weights are Q8 — engine quantizer keeps q/k/v/o
                 // at Q8 alongside the Q8 router + shared_expert_gate).
-                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                // Opus (Oq4/Oq8/OqCompact) weights are FWHT(+AWQ)-rotated OFFLINE, so the
+                // activation must be rotated to match. Leaving them out of this
+                // predicate sends an UNROTATED x into an Opus GEMM -- the dense path
+                // records that outcome as "garbage: PPL 3.5e6".
+                let is_mq = matches!(
+                    layer.wqkv.gpu_dtype,
+                    DType::MQ4G256
+                        | DType::MQ6G256
+                        | DType::Oq4G256
+                        | DType::Oq8G256
+                        | DType::OqCompactG256
+                );
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
@@ -2880,6 +2992,34 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_alpha.k,
                         n,
                     )?;
+                } else if matches!(layer.wqkv.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: the SAME W8A8 math as the oq8 arm
+                    // above, decoding OqPlusCompact blocks in-kernel.
+                    //
+                    // Without this arm compact fell through to the final `else`,
+                    // which hard-codes `FusedQkvzaHfq4G256` — so a 136-byte
+                    // [f16 scale][128 nibbles][3x(u8 idx, i8 val)] block was read
+                    // as an HFQ4G256 block. Two layouts sharing no field, and no
+                    // error: just wrong numbers. That is what made compact's
+                    // BATCHED prefill unusable, which is why the batched
+                    // spec-decode verify had to exclude compact entirely and why
+                    // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
+                    // Measured: 48 fall-throughs in a 16-token spec run.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.wqkv.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.wqkv, &pbs.dn_qkv_batch),
+                        (&layer.wz, &pbs.dn_z_batch),
+                        (&layer.w_beta, &pbs.dn_beta_batch),
+                        (&layer.w_alpha, &pbs.dn_alpha_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else {
                     run_fused_qkvza_key(
                         gpu,
@@ -3374,6 +3514,19 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus o_proj: identical W8A8 math to the oq8
+                    // arm below, decoding the OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        dn_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
+                    )?;
                 } else {
                     run_residual_gemm_key(
                         gpu,
@@ -3460,7 +3613,18 @@ pub(crate) fn forward_prefill_chunk(
                 // the QKV dispatch is insufficient — the wo path below
                 // (line 5320) is hardcoded MQ4 too — so the all-or-nothing
                 // wiring lives in a separate PR (see followup issue).
-                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                // Opus (Oq4/Oq8/OqCompact) weights are FWHT(+AWQ)-rotated OFFLINE, so the
+                // activation must be rotated to match. Leaving them out of this
+                // predicate sends an UNROTATED x into an Opus GEMM -- the dense path
+                // records that outcome as "garbage: PPL 3.5e6".
+                let qkv_is_mq = matches!(
+                    layer.wq.gpu_dtype,
+                    DType::MQ4G256
+                        | DType::MQ6G256
+                        | DType::Oq4G256
+                        | DType::Oq8G256
+                        | DType::OqCompactG256
+                );
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
@@ -3660,6 +3824,23 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wv.k,
                         n,
                     )?;
+                } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
+                    // Compact-resident Opus: one quantize of the shared rotated
+                    // activation, then one compact GEMM per projection.
+                    gpu.quantize_act_oq8_batched_interleaved(
+                        &pbs.x_rot_batch,
+                        layer.wq.m,
+                        layer.wq.k,
+                        n,
+                    )?;
+                    for (w, y) in [
+                        (&layer.wq, &pbs.fa_q_full_batch),
+                        (&layer.wk, &pbs.fa_k_batch),
+                        (&layer.wv, &pbs.fa_v_batch),
+                    ] {
+                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+                    }
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
@@ -4234,57 +4415,65 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 }
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
-                let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-                let plan = KvTierPlan::derive(KvTierInputs {
-                    quant_asym4: kv_cache.quant_asym4,
-                    quant_asym3: kv_cache.quant_asym3,
-                    quant_asym2: kv_cache.quant_asym2,
-                    quant_q8: kv_cache.quant_q8,
-                    quant_fwht: kv_cache.quant_fwht,
-                    quant_hfq4: false,
-                    quant_q4: false,
-                    v_mode_bits: 0,
-                    pos: start_pos,
-                    flash_mode: s.flash_mode as usize,
-                    capture_mode: gpu.capture_mode,
-                    batch_size: n,
-                    is_tree,
-                    // TODO: boundary producer not yet populated. Matches the
-                    // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
-                    // `vec![]` at every KvCache constructor and never filled, so
-                    // `KvCache::is_boundary()` is always false. Threading it here
-                    // would be a no-op AND would imply boundary layers work.
-                    // Wire all three sites together when the producer lands.
-                    is_boundary: false,
-                })
-                .map_err(|e| HipError::new(0, &e.to_string()))?;
-                let io = AttnParams {
-                    q: &pbs.fa_q_batch,
-                    k: &pbs.fa_k_batch,
-                    v: &pbs.fa_v_batch,
-                    k_cache: &kv_cache.k_gpu[layer_idx],
-                    v_cache: &kv_cache.v_gpu[layer_idx],
-                    k_scales: None,
-                    v_scales: None,
-                    pos_buf: &s.pos_buf,
-                    pos: start_pos,
-                    positions: Some(&pbs.positions),
-                    n_heads: config.n_heads,
-                    n_kv_heads: config.n_kv_heads,
-                    head_dim: config.head_dim,
-                    physical_cap: kv_cache.physical_cap,
-                    batch_size: n,
-                    max_ctx_len,
-                    flash_partials: Some(&s.flash_partials),
-                    givens_cos: kv_cache.givens_cos.as_ref(),
-                    givens_sin: kv_cache.givens_sin.as_ref(),
-                    tree_bias,
-                    block_start,
-                    block_cols,
-                    output: &pbs.fa_attn_out_batch,
-                };
-                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                // KVarN already did the fused write + causal flash in kvarn_attend
+                // above, and KvTierPlan has no KVarN tier -- it falls through to an
+                // F32 write that has no batched form and resolves as
+                // `no implementation for KvWriteF32`. Pairs with admitting
+                // quant_kvarn into `fa_kv_ok`; the dense FullAttn path carries the
+                // same guard for the same reason.
+                if !kv_cache.quant_kvarn {
+                    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                    let plan = KvTierPlan::derive(KvTierInputs {
+                        quant_asym4: kv_cache.quant_asym4,
+                        quant_asym3: kv_cache.quant_asym3,
+                        quant_asym2: kv_cache.quant_asym2,
+                        quant_q8: kv_cache.quant_q8,
+                        quant_fwht: kv_cache.quant_fwht,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        v_mode_bits: 0,
+                        pos: start_pos,
+                        flash_mode: s.flash_mode as usize,
+                        capture_mode: gpu.capture_mode,
+                        batch_size: n,
+                        is_tree,
+                        // TODO: boundary producer not yet populated. Matches the
+                        // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
+                        // `vec![]` at every KvCache constructor and never filled, so
+                        // `KvCache::is_boundary()` is always false. Threading it here
+                        // would be a no-op AND would imply boundary layers work.
+                        // Wire all three sites together when the producer lands.
+                        is_boundary: false,
+                    })
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    let io = AttnParams {
+                        q: &pbs.fa_q_batch,
+                        k: &pbs.fa_k_batch,
+                        v: &pbs.fa_v_batch,
+                        k_cache: &kv_cache.k_gpu[layer_idx],
+                        v_cache: &kv_cache.v_gpu[layer_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &s.pos_buf,
+                        pos: start_pos,
+                        positions: Some(&pbs.positions),
+                        n_heads: config.n_heads,
+                        n_kv_heads: config.n_kv_heads,
+                        head_dim: config.head_dim,
+                        physical_cap: kv_cache.physical_cap,
+                        batch_size: n,
+                        max_ctx_len,
+                        flash_partials: Some(&s.flash_partials),
+                        givens_cos: kv_cache.givens_cos.as_ref(),
+                        givens_sin: kv_cache.givens_sin.as_ref(),
+                        tree_bias,
+                        block_start,
+                        block_cols,
+                        output: &pbs.fa_attn_out_batch,
+                    };
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Mirrors the dense FA wo dispatch at
                 // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
@@ -4390,6 +4579,19 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
+                    // decoding OqPlusCompact blocks in-kernel.
+                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+                    gpu.gemm_oq_compact_residual_act_batched(
+                        &layer.wo.buf,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                        bs,
+                    )?;
                 } else {
                     run_residual_gemm_key(
                         gpu,
@@ -4503,5 +4705,8 @@ pub(crate) fn forward_prefill_chunk(
         }
     }
 
+    // Flushed at the END of the first chunk: the MoE and dtype decisions are
+    // recorded during the body, so flushing on entry would print a half report.
+    super::feature_report::flush_once();
     Ok(())
 }

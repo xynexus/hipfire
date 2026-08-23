@@ -3751,12 +3751,30 @@ pub fn generate_start(
             //   unset -> batched prefill, drafter OFF   (new default)
             //   =1    -> batched prefill, drafter ON    (unchanged opt-in)
             //   =0    -> per-token prefill, drafter OFF (full rollback)
+            hipfire_arch_qwen35::qwen35::feature_report::note(
+                "kvarn_prefill",
+                if !kv.quant_kvarn {
+                    "n/a (KV mode is not kvarn)".to_string()
+                } else if std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL").ok().as_deref()
+                    == Some("0")
+                {
+                    "PER-TOKEN (HIPFIRE_KVARN_BATCHED_PREFILL=0 forced the rollback path)"
+                        .to_string()
+                } else {
+                    "batched (default since the 2026-08-23 coherence battery)".to_string()
+                },
+            );
             if kv.quant_kvarn
                 && std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
                     .ok()
                     .as_deref()
                     == Some("0")
             {
+                // The per-token path never enters forward_prefill_chunk, so its
+                // flush would never fire. Print here or this branch is silent --
+                // and this is precisely the branch worth explaining: it was 20x
+                // slower than batched and invisible from outside.
+                hipfire_arch_qwen35::qwen35::feature_report::flush_once();
                 // Historical reason for this path, kept because it explains the shape:
                 // KVarN was said to require the per-token attention dispatch, since the
                 // batched forward never populated the KVarN window/records and the

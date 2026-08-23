@@ -1506,6 +1506,11 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_OQ4G256_MOE_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4g256_moe_grouped_wmma.hip");
 
+/// OQ8G256 grouped MoE GEMM: the Oq4 sibling with a 260 B `[f32 scale | 256
+/// int8]` block instead of 132 B packed nibbles. Same scatter/tile contract.
+pub const GEMM_OQ8G256_MOE_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq8g256_moe_grouped_wmma.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
