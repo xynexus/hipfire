@@ -1,6 +1,7 @@
 # Raw F16/BF16 routed-MoE batched prefill diverges on every arch
 
-**Status:** open defect, reproducer in tree, root cause not yet found.
+**Status:** FIXED in `0bbbfd08f`. Kept as the write-up of the defect, the
+hunt, and the two traps it set. See "The fix" below.
 **Found:** 2026-08-24, while making batched MoE prefill reachable on gfx1103.
 
 ## What is wrong
@@ -88,19 +89,45 @@ the divergence is flat in prefill length and identical on both archs.
    per-row activations are expected and prove nothing. Any row-invariance test
    must use a prefill long enough to reach a distinct token id.
 
-## The fix, not yet made
+## The fix (landed `0bbbfd08f`)
 
-Give `DeltaNetMoe` the arms `DeltaNet` has — preferably by routing it through
-the same lowered binding (`bind.proj_qkvza`) rather than adding a fourth
-hand-rolled chain that the fifth dtype will fall out of.
+`DeltaNetMoe` and `FullAttnMoe` were folded onto the same lowered super-ops
+their dense siblings use, via borrowed attention-half views (`DnLaWeights` /
+`FaAttnWeights`) that both layer variants expose as `.la()` / `.fa()`. Net
+-1834 lines. One attention implementation now, so there is nothing left to
+drift.
 
-A partial port was attempted and REVERTED: adding full-precision arms to the
-QKVZA chain alone moved `max_kld` 0.88 -> 0.21 and made `dn_qkv_batch` rows
-distinct again, but adding the `wo` arm took it to 0.51 and it never approached
-the 1e-4 tolerance. The coupled sites are at least four (QKVZA GEMM, wo GEMM,
-wo input rotation, and the LA preamble's rmsnorm/FWHT choice); porting a subset
-leaves the activation basis inconsistent between them. Do it as one migration,
-not arm by arm.
+Result on gfx1103, `qwen3_5_moe_indexed` fp16, tolerance 1e-4:
+
+| prefill | max_kld | argmax |
+|---|---|---|
+| 6 | 3.1e-6 | 4/4 |
+| 16 | 2.2e-5 | 4/4 |
+| 64 | 5.4e-6 | 4/4 |
+| 128 | 2.3e-5 | 4/4 |
+
+from 0.88 / 0-of-4. Dense cells unchanged bit-for-bit. `--corrupt-kv-prefix`
+still moves it to 0.34, so the check can still fail.
+
+### An earlier arm-by-arm attempt, and why it failed
+
+Adding full-precision arms to the legacy chains one at a time went 0.88 -> 0.21
+(QKVZA) -> 0.51 (plus wo) and never approached tolerance. The coupled sites in
+the DeltaNetMoe body alone are four — QKVZA GEMM, wo GEMM, wo input rotation,
+and the LA preamble's rmsnorm/FWHT choice — and `FullAttnMoe` is a fifth
+through eighth. Patching a subset leaves the activation basis inconsistent
+between them. Consolidation was the only tractable shape.
+
+## Gate gap this exposed
+
+`tiny-prefill-gate.sh` reports these cells SKIP rather than OK. Its path check
+infers "the batched path never ran" from the batched and reference
+recurrent-state hashes being EQUAL, and they now legitimately are — both paths
+run the same per-token GDN kernels. That heuristic is evaluated BEFORE the KLD
+comparison, so during this hunt it also reported `max_kld 0.377, argmax 0/4` as
+INCONCLUSIVE rather than FAIL. It needs a positive probe that the batched path
+executed (the `moe_topk_ok` / `[features] moe_routed` trace already proves it)
+instead of inferring absence from equal state.
 
 ## Correction to the first commit message
 
