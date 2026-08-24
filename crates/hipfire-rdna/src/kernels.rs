@@ -4428,6 +4428,13 @@ pub const OQ_COMPACT_OVERLAY_CORRECT_T_SRC: &str =
 pub const GEMV_OQ_COMPACT_MULTICOL_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq_compact_multicol.hip");
 
+/// Wide-load twin of the multicol family: 8 lanes per group, `dwordx4` on BOTH
+/// the weight and activation streams, so a group-round moves 4x the weights for
+/// the same memory-instruction count. Requires `ng % 4 == 0`.
+/// `kernels/src/gemv_oq_compact_multicol_wide.hip`.
+pub const GEMV_OQ_COMPACT_MULTICOL_WIDE_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_compact_multicol_wide.hip");
+
 /// Wide-load twin of the compact decode GEMV: 8 lanes per group and a `dwordx4`
 /// weight load (32 weights/lane), so one wave covers four groups per round.
 /// Requires ng % 4 == 0. See `kernels/src/gemv_oq_compact_grouped_v3.hip`.

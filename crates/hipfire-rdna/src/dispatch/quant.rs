@@ -746,6 +746,53 @@ impl Gpu {
         // access (`m0` + `v_movrels`/`v_movreld` per column) plus one
         // `s_waitcnt lgkmcnt(0)` per column for its `Xs` load. One entry point
         // per reachable B, so that path no longer exists.
+        // WIDE variant: 8 lanes per group and dwordx4 on both streams, so a
+        // group-round moves 4x the weights for the same instruction count. Needs
+        // ng % 4 == 0 (K % 1024 == 0); the narrow kernel has no such constraint
+        // and stays the fallback. HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1 to enable
+        // while it is being proven against the narrow one.
+        let ng_ok = (k / 256) % 4 == 0;
+        let wide = ng_ok && std::env::var("HIPFIRE_OQ_COMPACT_MULTICOL_WIDE").as_deref() == Ok("1");
+        if wide {
+            let entry: &str = match batch_size {
+                1 => "gemv_oq_compact_multicol_w1",
+                2 => "gemv_oq_compact_multicol_w2",
+                3 => "gemv_oq_compact_multicol_w3",
+                4 => "gemv_oq_compact_multicol_w4",
+                5 => "gemv_oq_compact_multicol_w5",
+                6 => "gemv_oq_compact_multicol_w6",
+                7 => "gemv_oq_compact_multicol_w7",
+                8 => "gemv_oq_compact_multicol_w8",
+                9 => "gemv_oq_compact_multicol_w9",
+                10 => "gemv_oq_compact_multicol_w10",
+                11 => "gemv_oq_compact_multicol_w11",
+                12 => "gemv_oq_compact_multicol_w12",
+                13 => "gemv_oq_compact_multicol_w13",
+                14 => "gemv_oq_compact_multicol_w14",
+                15 => "gemv_oq_compact_multicol_w15",
+                _ => "gemv_oq_compact_multicol_w16",
+            };
+            self.ensure_kernel(
+                "gemv_oq_compact_multicol_wide",
+                kernels::GEMV_OQ_COMPACT_MULTICOL_WIDE_SRC,
+                entry,
+            )?;
+            let (wp, xp, xsp, yp) = (
+                w_blocks.buf.as_ptr(),
+                x_i8.buf.as_ptr(),
+                x_scales.buf.as_ptr(),
+                y_f32.buf.as_ptr(),
+            );
+            let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
+            let grid = ((m as u32).div_ceil(2 * 8)).clamp(1, 2048);
+            return self.launch_kernargs(
+                entry,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xp, ptr xsp, ptr yp, i32 mi, i32 ki, i32 bi, i32 bs],
+            );
+        }
         let entry: &str = match batch_size {
             1 => "gemv_oq_compact_multicol_b1",
             2 => "gemv_oq_compact_multicol_b2",
