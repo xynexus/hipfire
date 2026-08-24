@@ -1274,9 +1274,131 @@ For a MID-run snapshot, `--listen` works where stdin cannot: the frame loop
 services one pending frame per iteration and marches only when none remain
 (`main.rs`), so a socket client's request is handled between march rounds.
 
-Still outstanding for M3d: measurement 1 (p99/max module duration and which
-`SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
-dimension.
+**M3d measurement 2 — INSTRUMENTED AND MEASURED 2026-08-23. The 200 ms contract
+is NOT met.** Two stream-scoped `TraceEvent` variants were added: `Admitted`
+(recorded where `admit_generate` inserts the stream, `aux` = priority) and
+`QuantumBegin` (recorded in both march paths, round-robin and batched).
+`QuantumBegin` is the `Yielded`-shaped variant the enum reserved in a comment and
+declined to define because "today nothing can construct it" — M3's march loop
+constructs it. Both key on `request_id`, which is what `events::emit_text_bytes`
+already uses, so admission, quanta and tokens form one correlatable series.
+`exec_trace::admission_to_first_quantum_ns` derives the measurement and
+`snapshot_json` reports it under `admission`.
+
+Measured, bulk (priority 0) admitted FIRST and realtime (priority 9) second,
+three reps:
+
+| rep | realtime (p9) | bulk (p0) |
+|---|---|---|
+| 1 | **659.44 ms** | 1474.20 ms |
+| 2 | **652.94 ms** | 1463.86 ms |
+| 3 | **652.97 ms** | 1462.27 ms |
+
+**Read the gap correctly: it contains the stream's OWN prefill.** `admit_generate`
+records `Admitted`, and the same frame handler then calls `generate_start`, which
+"frames and prefills" (`handlers/generate.rs`) before the march ever runs. So
+`Admitted -> first QuantumBegin` necessarily spans that stream's own prefill, and
+the raw gap is not a scheduling latency. Subtracting each stream's `prefill_ms`
+from its own `done` frame:
+
+| stream | gap | own prefill | scheduling delay |
+|---|---|---|---|
+| realtime (p9) | 659.4 ms | 647.0 ms | **12.4 ms** |
+| bulk (p0) | 1474.2 ms | 762.1 ms | 712.1 ms |
+
+**So the 200 ms contract is met, at 12.4 ms** — priority admission puts the
+realtime stream on the GPU one quantum after its own prefill finishes, ahead of a
+bulk stream admitted before it. The bulk stream absorbs the interference (712 ms),
+which is the trade the priority lever exists to make.
+
+An earlier revision of this section claimed the 659 ms was the realtime stream
+queueing behind the bulk stream's prefill and concluded the contract failed by
+3.3x. That was wrong: the two streams' prefills are 647 ms and 762 ms, and each
+gap matches its OWN prefill to within ~13 ms. The lesson is that this metric is
+only a scheduling number after its prefill term is removed, so
+`admission_to_first_quantum_ns` should be read alongside `prefill_ms`, never
+alone.
+
+The residual hazard is narrower than "the contract fails", and it is still §M2a:
+a prefill is indivisible and runs in the frame handler, so a realtime request
+that arrives while ANOTHER stream is mid-prefill waits out that prefill — up to
+~762 ms here. Pausing or migrating low-priority streams does not help in that
+window, because there is no quantum boundary to pause at. Prefill lowering is
+what shrinks it.
+
+**The mid-prefill arrival case, measured over `--listen` (2026-08-23).** Every
+earlier number here was taken over the stdin protocol, which drains every frame
+before the march runs — so a realtime request could never arrive *while* a bulk
+prefill was in flight, and that is the case the 200 ms contract is actually
+about. `--listen` can express it: a second connection injects the request 2 s
+into a bulk prefill.
+
+Client-observed send -> first token for the priority-9 request, two reps:
+
+| config | client TTFT | trace admission -> first token |
+|---|---|---|
+| today (both flags off) | **8516.7 / 8505.5 ms** | 454.0 / 451.5 ms |
+| `MARCH_PREFILL` + `STRICT_PRIORITY`, band 16 | **575.2 / 571.0 ms** | 489.1 / 487.1 ms |
+
+**14.8x**, and the contract goes from missed by 42x to missed by ~2.9x.
+
+The two columns are the finding. With the flags off they disagree by ~8 seconds:
+the trace says 454 ms because ADMISSION ITSELF was delayed — the realtime frame
+sat unread in the channel while the bulk prefill occupied the frame handler, and
+`Admitted` is only recorded once the daemon gets to it. A metric anchored at
+admission cannot see a queue it never entered. With the flags on the two columns
+close to within ~86 ms, because prefill runs in the march and the frame loop
+regains control between bands.
+
+So `admission_to_first_quantum_ns` is the right instrument for scheduling INSIDE
+the executor and the wrong one for end-to-end latency; the client stopwatch is
+the honest number for the contract. Both are reported above deliberately.
+
+**M3d measurement 1 — MEASURED 2026-08-24. M3d is complete.** §M0's module
+dimension is built: `TraceEvent::ModuleEnd` carries the `SuperOpKind`
+discriminant in `module` and the duration in `aux`, and
+`exec_trace::module_duration_stats` reports per-module percentiles under
+`modules` in the trace reply.
+
+It could not be the passive field §M0 described. `dispatch_super_op` only
+ENQUEUES, so wall-clock around it measures launch cost and every module reads as
+a few microseconds; the number this exit wants is how long a module OWNS the
+device, because that is the floor on how long a yield must wait for it. Getting
+it honestly means bracketing each super-op with a device sync, so this is a
+measurement MODE (`HIPFIRE_TRACE_MODULES`, off by default) rather than
+always-on instrumentation, and its durations are per-module GPU time rather than
+a throughput figure.
+
+Qwen3.6-35B-A3B--oq4, kvarn, 12 tokens, `dropped=0` so the window is whole:
+
+| module | count | p50 | p99 | max |
+|---|---|---|---|---|
+| **moe** | 1000 | 0.326 ms | **0.526 ms** | **5.476 ms** |
+| attend | 1000 | 0.027 | 0.090 | 3.353 |
+| proj | 1000 | 0.406 | 0.666 | 2.841 |
+| recurrent | 750 | 0.104 | 0.148 | 0.745 |
+| residual_gemv | 1000 | 0.122 | 0.141 | 0.404 |
+| norm | 750 | 0.017 | 0.032 | 0.340 |
+
+**`Moe` owns the max, and the suspension floor is ~5 ms.** Read p99 and max
+differently: across three runs the p99s are stable to the third decimal (moe
+0.526 / 0.527 / 0.529) while the maxima wander 4.8-5.5 ms, as a single-sample
+statistic should. The drain budget should be sized on p99 plus a margin, not on a
+max that moves 14% run to run.
+
+So the tightest drain budget this design can hold is **sub-millisecond at p99**
+(0.67 ms, owned by `proj`) with a multi-millisecond tail owned by `Moe`. That is
+the achievable suspension floor, and it is three orders of magnitude below the
+200 ms contract — the contract is not limited by module granularity, which is
+what §M2a's prefill work already implied and this now confirms from the other
+direction.
+
+The observer is installed rather than called: `hipfire-runtime` owns the trace
+and DEPENDS on `hipfire-dispatch`, so the super-op loop measures and
+`exec_trace::install_dispatch_module_observer` says where the numbers land.
+Escapes collapse to one bucket deliberately — they are the coarse model-owned
+blocks that must stay coarse, so their payload does not subdivide into
+separately yieldable units.
 
 *Breaks:* everything that assumed a forward runs to completion. `hipGraph` capture is one
 indivisible quantum by construction — **off on the v2 path** until its WCET is declared,
@@ -1373,7 +1495,22 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    `expert_gate_up_blob`, which paging deliberately does not upload, so every
    paged layer fell into a fallback that no longer exists. Fixed by gating on the
    ptr tables the dispatch actually reads.
-2. **Expert admission is incompatible with HIP graph capture.** The residency
+2. **Expert admission is incompatible with HIP graph capture — RESOLVED as a
+   mutual exclusion, 2026-08-24.** Not a bug that could be reordered away: a
+   captured graph is a fixed sequence of device work containing no host
+   decisions, and paged experts need exactly such a decision per MoE layer (read
+   the router's top-k back, admit, patch the pointer table). The decision depends
+   on device work computed inside the region it would have to precede, so no
+   ordering satisfies both. `decode_step_with_graph` now detects the combination,
+   skips capture in favour of paging, and says why — where it previously died
+   mid-decode with `hipMemcpy D2H: operation would make the legacy stream depend
+   on a capturing blocking stream`, a HIP rule rather than the actual conflict.
+   Verified: the previously-fatal combination now runs to a natural EOS with the
+   same output as the graph-disabled path (7 tokens, `finish_reason: stop`).
+   Capturing only the non-MoE spans was rejected — many tiny graphs, most of the
+   benefit gone, on a model whose MoE layers dominate.
+
+   *(original wording)* **Expert admission is incompatible with HIP graph capture.** The residency
    hook does a blocking D2H inside the captured region and dispatch fails with
    "would make the legacy stream depend on a capturing blocking stream".
    Admission is a host decision; it has to be resolved *before* capture, not

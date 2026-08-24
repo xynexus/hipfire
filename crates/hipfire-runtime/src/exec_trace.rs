@@ -92,10 +92,32 @@ pub enum TraceEvent {
     /// before it reads as OOM, and that is only diagnosable if the memory slope
     /// and the latency series share a timeline.
     VramSample = 4,
-    // A `Yielded` variant belongs here when M3 gives the executor something to
-    // yield *between*. Left out deliberately: today nothing can construct it, and
-    // a variant that only ever appears in a `match` arm is API that looks
-    // supported without being reachable.
+    /// A stream was admitted to the executor and became eligible to run. `aux`
+    /// is its priority, so the ordering lever's input sits on the same timeline
+    /// as its effect.
+    ///
+    /// Distinct from [`TraceEvent::DispatchBegin`], which is FRAME-scoped and
+    /// carries no stream: the frame that admits a stream cannot otherwise be
+    /// told apart from the frame that unloads a model.
+    Admitted = 5,
+    /// The march loop granted this stream a quantum. The FIRST one per stream is
+    /// "first dispatch"; the gap from its [`TraceEvent::Admitted`] is §M3d
+    /// measurement 2, the number the 200 ms contract is about.
+    ///
+    /// This is the `Yielded`-shaped variant the enum previously reserved in a
+    /// comment and deliberately did not define, on the grounds that "today
+    /// nothing can construct it". M3's march loop constructs it.
+    QuantumBegin = 6,
+    /// One super-op completed. `module` is the [`SuperOpKind`] discriminant and
+    /// `aux` is its duration in nanoseconds.
+    ///
+    /// This is the module dimension §M0 declared and did not build. It could not
+    /// be a passive field: `dispatch_super_op` only ENQUEUES, so wall-clock
+    /// around it measures launch cost, not how long the module owns the GPU —
+    /// and the number §M3d wants is the latter, because it is the floor on how
+    /// long a yield has to wait. Producing it honestly means serializing, so it
+    /// is a measurement MODE rather than always-on instrumentation.
+    ModuleEnd = 7,
 }
 
 /// One trace entry. 32 bytes, `Copy`, no indirection.
@@ -283,6 +305,65 @@ pub fn snapshot() -> Option<TraceSnapshot> {
 /// alternation rather than any one stream's latency. Pass [`NO_STREAM`] to take
 /// every token event regardless of stream, which is what a single-stream
 /// baseline run wants.
+/// Per-stream nanoseconds from [`TraceEvent::Admitted`] to that stream's FIRST
+/// [`TraceEvent::QuantumBegin`] — §M3d measurement 2.
+///
+/// Returns `(stream, priority, delay_ns)` per admitted stream that went on to
+/// run, sorted by admission order. A stream admitted but never granted a quantum
+/// is omitted rather than reported as zero: "never ran" and "ran instantly" are
+/// opposite answers and must not share an encoding.
+///
+/// Derived here rather than left to the reader because the raw records only
+/// support it if you know that `Admitted` and `QuantumBegin` share the request-id
+/// key — which is exactly the kind of implicit contract that goes stale.
+pub fn admission_to_first_quantum_ns(snapshot: &TraceSnapshot) -> Vec<(u32, u64, u64)> {
+    let mut admitted: Vec<(u32, u64, u64)> = Vec::new(); // stream, priority, t_ns
+    for record in &snapshot.records {
+        if record.event == TraceEvent::Admitted
+            && !admitted.iter().any(|(s, _, _)| *s == record.stream)
+        {
+            admitted.push((record.stream, record.aux, record.t_ns));
+        }
+    }
+    let mut out = Vec::new();
+    for (stream, priority, t_admit) in admitted {
+        let first = snapshot
+            .records
+            .iter()
+            .find(|r| {
+                r.event == TraceEvent::QuantumBegin && r.stream == stream && r.t_ns >= t_admit
+            })
+            .map(|r| r.t_ns);
+        if let Some(t_first) = first {
+            out.push((stream, priority, t_first.saturating_sub(t_admit)));
+        }
+    }
+    out
+}
+
+/// Per-module duration percentiles, keyed by [`TraceEvent::ModuleEnd`]'s
+/// `module` discriminant — §M3d measurement 1.
+///
+/// Returns `(module, count, p50, p99, max)` sorted by max descending, so the
+/// module that owns the worst case — the question the exit actually asks — is
+/// the first row.
+pub fn module_duration_stats(snapshot: &TraceSnapshot) -> Vec<(u32, usize, u64, u64, u64)> {
+    let mut by: std::collections::BTreeMap<u32, Vec<u64>> = std::collections::BTreeMap::new();
+    for record in &snapshot.records {
+        if record.event == TraceEvent::ModuleEnd {
+            by.entry(record.module).or_default().push(record.aux);
+        }
+    }
+    let mut out: Vec<(u32, usize, u64, u64, u64)> = by
+        .into_iter()
+        .filter_map(|(module, durations)| {
+            percentiles(&durations).map(|(p50, p99, max)| (module, durations.len(), p50, p99, max))
+        })
+        .collect();
+    out.sort_by_key(|(_, _, _, _, max)| std::cmp::Reverse(*max));
+    out
+}
+
 pub fn inter_token_gaps_ns(snapshot: &TraceSnapshot, stream: u32) -> Vec<u64> {
     let mut previous: Option<u64> = None;
     let mut gaps = Vec::new();
@@ -337,6 +418,33 @@ pub fn snapshot_json() -> serde_json::Value {
     let gap_stats = percentiles(&gaps)
         .map(|(p50, p99, max)| serde_json::json!({ "p50_ns": p50, "p99_ns": p99, "max_ns": max }));
 
+    // §M3d measurement 2, one row per stream that was admitted and then ran.
+    let admission: Vec<serde_json::Value> = admission_to_first_quantum_ns(&snapshot)
+        .into_iter()
+        .map(|(stream, priority, delay_ns)| {
+            serde_json::json!({
+                "stream": stream,
+                "priority": priority,
+                "admission_to_first_quantum_ns": delay_ns,
+            })
+        })
+        .collect();
+
+    // §M3d measurement 1, present only when the module trace mode ran.
+    let modules: Vec<serde_json::Value> = module_duration_stats(&snapshot)
+        .into_iter()
+        .map(|(module, count, p50, p99, max)| {
+            serde_json::json!({
+                "module": module,
+                "name": module_name(module),
+                "count": count,
+                "p50_ns": p50,
+                "p99_ns": p99,
+                "max_ns": max,
+            })
+        })
+        .collect();
+
     let span_ns = match (snapshot.records.first(), snapshot.records.last()) {
         (Some(first), Some(last)) => last.t_ns.saturating_sub(first.t_ns),
         _ => 0,
@@ -365,8 +473,46 @@ pub fn snapshot_json() -> serde_json::Value {
         "span_ns": span_ns,
         "token_count": gaps.len() + usize::from(!gaps.is_empty()),
         "inter_token_gap": gap_stats,
+        "admission": admission,
+        "modules": modules,
         "records": records,
     })
+}
+
+/// Point `hipfire-dispatch`'s per-module timing at this trace.
+///
+/// Call once at startup. The indirection exists because `hipfire-dispatch`
+/// cannot depend on this crate — the dependency runs the other way — so the
+/// super-op loop measures and this installs where the numbers land.
+pub fn install_dispatch_module_observer() {
+    hipfire_dispatch::pipeline::superop::set_module_observer(|module, duration_ns| {
+        record(TraceEvent::ModuleEnd, NO_STREAM, module, duration_ns);
+    });
+}
+
+/// Name for a [`TraceEvent::ModuleEnd`] `module` discriminant.
+///
+/// Mirrors `SuperOpKind`'s declaration order. Kept here rather than imported
+/// because `hipfire-runtime` does not depend on `hipfire-dispatch`; the trace
+/// records a number and this is the only place that names it, so a reordering of
+/// `SuperOpKind` must be mirrored here — the doc comment on `ModuleEnd` says so.
+fn module_name(module: u32) -> &'static str {
+    match module {
+        0 => "proj",
+        1 => "residual_gemv",
+        2 => "norm",
+        3 => "attend",
+        4 => "moe",
+        5 => "recurrent",
+        6 => "conv",
+        7 => "act",
+        8 => "residual",
+        9 => "scale",
+        10 => "softcap",
+        11 => "ple",
+        12 => "escape",
+        _ => "unknown",
+    }
 }
 
 fn event_name(event: TraceEvent) -> &'static str {
@@ -376,12 +522,72 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::TokenEmitted => "token_emitted",
         TraceEvent::Completed => "completed",
         TraceEvent::VramSample => "vram_sample",
+        TraceEvent::Admitted => "admitted",
+        TraceEvent::QuantumBegin => "quantum_begin",
+        TraceEvent::ModuleEnd => "module_end",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `admission_to_first_quantum_ns` is §M3d measurement 2. The cases that
+    /// matter are the ones where "no answer" and "zero" must not be confused.
+    #[test]
+    fn admission_to_first_quantum_pairs_by_stream() {
+        let mk = |t_ns, event, stream, aux| TraceRecord {
+            t_ns,
+            event,
+            stream,
+            module: 0,
+            aux,
+        };
+        let snapshot = TraceSnapshot {
+            records: vec![
+                mk(1_000, TraceEvent::Admitted, 7, 0),     // bulk, priority 0
+                mk(2_000, TraceEvent::Admitted, 9, 9),     // realtime, priority 9
+                mk(5_000, TraceEvent::QuantumBegin, 9, 0), // realtime runs first
+                mk(6_000, TraceEvent::QuantumBegin, 7, 0),
+                mk(7_000, TraceEvent::QuantumBegin, 9, 0), // later quanta ignored
+                mk(8_000, TraceEvent::Admitted, 11, 3),    // admitted, never runs
+            ],
+            dropped: 0,
+            capacity: 64,
+        };
+        let got = admission_to_first_quantum_ns(&snapshot);
+        assert_eq!(got, vec![(7, 0, 5_000), (9, 9, 3_000)]);
+        // A stream that never got a quantum is OMITTED, not reported as 0 —
+        // "never ran" and "ran instantly" are opposite answers.
+        assert!(!got.iter().any(|(s, _, _)| *s == 11));
+    }
+
+    /// A quantum recorded BEFORE the admission it would pair with belongs to an
+    /// earlier stream that hashed to the same id, or to a re-admitted session.
+    /// Either way it must not produce a negative-shaped (saturated) delay.
+    #[test]
+    fn admission_to_first_quantum_ignores_earlier_quanta() {
+        let mk = |t_ns, event, stream, aux| TraceRecord {
+            t_ns,
+            event,
+            stream,
+            module: 0,
+            aux,
+        };
+        let snapshot = TraceSnapshot {
+            records: vec![
+                mk(1_000, TraceEvent::QuantumBegin, 4, 0),
+                mk(3_000, TraceEvent::Admitted, 4, 0),
+                mk(4_500, TraceEvent::QuantumBegin, 4, 0),
+            ],
+            dropped: 0,
+            capacity: 64,
+        };
+        assert_eq!(
+            admission_to_first_quantum_ns(&snapshot),
+            vec![(4, 0, 1_500)]
+        );
+    }
 
     /// The ring is tested directly rather than through the global, because the
     /// global resolves its enabled-ness exactly once per process and tests share

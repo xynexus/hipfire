@@ -578,10 +578,80 @@ pub fn run_layer_program_from<B: ForwardBindings>(
     budget: usize,
 ) -> Result<usize, DispatchError> {
     let (begin, end) = quantum_range(program.len(), start, budget);
+    if module_trace_enabled() {
+        // §M3d measurement 1. `dispatch_super_op` only ENQUEUES, so timing it
+        // without a sync measures launch cost — the CPU races ahead of the GPU
+        // and every module looks like a few microseconds. The number the exit
+        // wants is how long a module OWNS the device, because that is the floor
+        // on how long a yield must wait for it, so each op is bracketed by a
+        // device sync.
+        //
+        // That serializes the pipeline and makes the run slower than production.
+        // It is a measurement mode, off by default, and the durations it reports
+        // are per-module GPU time rather than a throughput figure.
+        let _ = gpu.device_synchronize();
+        for op in &program[begin..end] {
+            let t0 = std::time::Instant::now();
+            dispatch_super_op(gpu, ctx, op, bindings)?;
+            let _ = gpu.device_synchronize();
+            if let Some(observe) = MODULE_OBSERVER.get() {
+                observe(super_op_kind_index(op.kind), t0.elapsed().as_nanos() as u64);
+            }
+        }
+        return Ok(end);
+    }
     for op in &program[begin..end] {
         dispatch_super_op(gpu, ctx, op, bindings)?;
     }
     Ok(end)
+}
+
+/// Where per-module durations go, as `(module_index, duration_ns)`.
+///
+/// A hook rather than a direct call because `hipfire-runtime` — which owns the
+/// executor trace — DEPENDS on this crate, so calling its `exec_trace` from here
+/// would be a dependency cycle. The consumer installs itself at startup; with
+/// nothing installed the timing loop still runs but reports nowhere, which is
+/// the right behaviour for a library that must not assume a daemon.
+static MODULE_OBSERVER: std::sync::OnceLock<fn(u32, u64)> = std::sync::OnceLock::new();
+
+/// Install the sink for [`MODULE_OBSERVER`]. First caller wins; later calls are
+/// ignored rather than racing.
+pub fn set_module_observer(observer: fn(u32, u64)) {
+    let _ = MODULE_OBSERVER.set(observer);
+}
+
+/// Record per-module durations (`HIPFIRE_TRACE_MODULES`). Off by default: it
+/// syncs the device around every super-op, which is what makes the number
+/// meaningful and also what makes it slow.
+fn module_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HIPFIRE_TRACE_MODULES").is_ok())
+}
+
+/// Discriminant for the trace's `module` field. Written out rather than derived
+/// so that adding a `SuperOpKind` is a compile error here, and so the mapping
+/// stays pinned to `exec_trace::module_name`, which cannot import this type.
+fn super_op_kind_index(kind: SuperOpKind) -> u32 {
+    match kind {
+        SuperOpKind::Proj => 0,
+        SuperOpKind::ResidualGemv => 1,
+        SuperOpKind::Norm => 2,
+        SuperOpKind::Attend => 3,
+        SuperOpKind::Moe => 4,
+        SuperOpKind::Recurrent => 5,
+        SuperOpKind::Conv => 6,
+        SuperOpKind::Act => 7,
+        SuperOpKind::Residual => 8,
+        SuperOpKind::Scale => 9,
+        SuperOpKind::Softcap => 10,
+        SuperOpKind::Ple => 11,
+        // Every escape collapses to one bucket. Escapes are the coarse,
+        // model-owned blocks the plan says must stay coarse (deepseek4 fuses
+        // top-k into dispatch), so their payload does not subdivide into
+        // separately yieldable units and would only fragment the histogram.
+        SuperOpKind::Escape(_) => 12,
+    }
 }
 
 #[cfg(test)]

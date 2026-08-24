@@ -61,6 +61,56 @@ pub(crate) fn executor_v2_enabled() -> bool {
 /// in N (24.0 -> 22.4 -> 18.4 tok/s at N=1/16/32) because every stream pays its
 /// own full forward. The batched decode path reaches 50.7 tok/s at N=16 on the
 /// same model, which is what this is for.
+/// Pause lower-priority streams entirely while a higher-priority one is
+/// runnable (`HIPFIRE_EXECUTOR_STRICT_PRIORITY`).
+///
+/// Off by default: it deliberately starves bulk work for as long as a
+/// latency-class stream is live, which is the right trade only when the operator
+/// has asked for it.
+/// Mirror of serving-core's `march_driven_prefill`, for the warning below.
+fn march_prefill_on() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_MARCH_PREFILL").ok().as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+pub(crate) fn warn_if_banding_without_priority() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if march_prefill_on() && !strict_priority_enabled() {
+            tracing::warn!(
+                "HIPFIRE_MARCH_PREFILL without HIPFIRE_EXECUTOR_STRICT_PRIORITY: banding \
+                 prefill into the march makes streams SHARE it, which measured 2x WORSE \
+                 time-to-first-token for a priority-9 stream (1125 ms vs 546 ms unbanded). \
+                 Bands are the mechanism; strict priority is the policy that uses them."
+            );
+        }
+    });
+}
+
+/// Pause lower-priority streams entirely while a higher-priority one is
+/// runnable. ON by default; `HIPFIRE_EXECUTOR_STRICT_PRIORITY=0` restores
+/// fair-share ordering.
+///
+/// It starves bulk work while a latency-class stream is live, which is the
+/// point — and it costs nothing in the common case, because admission defaults
+/// `priority` to 0, so with no explicit priority every stream is in the top tier
+/// and the filter keeps all of them. It only bites once a client asks for it.
+///
+/// Defaulted on together with march-driven prefill, and it must stay paired with
+/// it: banding without this measured 2x WORSE time to first token for a
+/// priority-9 stream, because bands make streams share rather than yield.
+pub(crate) fn strict_priority_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_EXECUTOR_STRICT_PRIORITY")
+            .ok()
+            .as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 pub(crate) fn executor_batched_enabled() -> bool {
     executor_v2_enabled()
         && matches!(
@@ -145,6 +195,18 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
             .unwrap_or("0")
             .to_string();
         stream.run();
+        // §M3d measurement 2 needs an admission instant that can be attributed to
+        // a stream. `DispatchBegin` cannot serve: it is frame-scoped and carries
+        // `stream: NO_STREAM`, so the frame that admits is indistinguishable from
+        // the frame that unloads a model. Keyed on `request_id` because that is
+        // what `events::emit_text_bytes` uses, so admission, quanta and tokens
+        // land on one correlatable series.
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::Admitted,
+            hipfire_runtime::exec_trace::stream_id_of(&stream.request_id),
+            0,
+            priority as u64,
+        );
     }
     Some(id)
 }
@@ -322,6 +384,25 @@ impl StreamTable {
             .map(|(id, s)| (s.spec.priority, *id))
             .collect();
         ids.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+        // Strict priority: while a higher-priority stream can run, the lower
+        // ones do not get a quantum at all — they are PAUSED, not merely
+        // ordered behind.
+        //
+        // Ordering alone is not preemption, and measurement says so. With
+        // prefill banded into the march but every runnable stream still taking
+        // a band per round, a priority-9 stream's time to first token got WORSE
+        // than the unbanded path (1128 ms vs 456 ms): its own prefill went from
+        // running alone to sharing the GPU with a bulk prefill. Fairness is the
+        // opposite of what a latency class wants.
+        //
+        // Paused streams stay runnable and resume the moment the high-priority
+        // work retires; a band boundary is a committed KV state, so nothing is
+        // lost by not scheduling them.
+        if strict_priority_enabled() {
+            if let Some(&(top, _)) = ids.first() {
+                ids.retain(|(p, _)| *p == top);
+            }
+        }
         ids.into_iter().map(|(_, id)| id).collect()
     }
 

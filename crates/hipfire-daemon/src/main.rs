@@ -1171,6 +1171,14 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
     )> = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(s) = daemon_state.streams.get_mut(id) {
+            // A prefilling stream has no decodable token yet. Leaving it in the
+            // table hands it to the round-robin pass, which advances it one
+            // prefill band per quantum. Taking it here would be worse than
+            // useless: the caller skips whatever this batch claims, so the
+            // stream's prefill would never advance at all.
+            if s.generation.as_ref().is_some_and(|g| g.is_prefilling()) {
+                continue;
+            }
             if let Some(g) = s.generation.take() {
                 taken.push((
                     id,
@@ -1243,6 +1251,16 @@ fn march_streams_batched(daemon_state: &mut state::DaemonState) -> Vec<stream::S
                 }
             }
         }
+    }
+    // Same quantum event as the round-robin path: a batched round hands every
+    // row in it a slice, so each row gets one record.
+    for (_, req_id, _, _) in taken.iter() {
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::QuantumBegin,
+            hipfire_runtime::exec_trace::stream_id_of(req_id),
+            0,
+            0,
+        );
     }
     for (_, _, sid, g) in taken.iter_mut() {
         if let Err(e) = g.acquire_from_registry(m, sid) {
@@ -1359,6 +1377,7 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
     if !stream::executor_v2_enabled() {
         return;
     }
+    stream::warn_if_banding_without_priority();
     let batched: Vec<stream::StreamId> = if stream::executor_batched_enabled() {
         march_streams_batched(daemon_state)
     } else {
@@ -1378,6 +1397,14 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
         }) else {
             continue;
         };
+        // The march is handing this stream a slice. First one per stream is
+        // "first dispatch" for §M3d measurement 2.
+        hipfire_runtime::exec_trace::record(
+            hipfire_runtime::exec_trace::TraceEvent::QuantumBegin,
+            hipfire_runtime::exec_trace::stream_id_of(&req_id),
+            0,
+            0,
+        );
         // `fail` and `finish` both consume the handle, and only one of them runs.
         // An Option makes that move trackable instead of fighting the borrow
         // checker across match arms.
@@ -1576,6 +1603,10 @@ fn main() {
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
     hipfire_runtime::logging::init_stderr_logging("daemon");
+    // Per-module durations (§M3d measurement 1) land in the executor trace only
+    // if something wires the two crates together; dispatch cannot reach the
+    // trace on its own.
+    hipfire_runtime::exec_trace::install_dispatch_module_observer();
     let llm_registry = build_local_llm_registry();
     eprintln!(
         "[hipfire-daemon] model registry: {} model(s), {} sidecar/template artifact(s) (models={}, triattn={}, drafts={}, templates={})",
