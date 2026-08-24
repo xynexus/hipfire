@@ -630,3 +630,58 @@ B<=32 is now one weight sweep.
 `--ngram` and `--pld` do NOT substitute: they augment the DFlash drafter rather
 than replacing it, so the 1.18 GiB sweep still happens. Measured identical
 (25.59/25.54/25.76 friendly, 16.98/16.97/17.00 hard).
+
+
+## The verify lm_head is ~10 GiB/cycle and never two-staged
+
+Instrumenting the single-column compact GEMV (temporary probe, reverted) to
+report every distinct `(m,k)` that reaches it, over a 32-token run (~7.5 cycles):
+
+```
+gate_up  m=17408  k=5120   1750 calls   ~80 GiB     (mostly the n=23 seed prefill)
+down     m=5120   k=17408   850 calls   ~39 GiB
+qkv      m=12288  k=5120    850 calls   ~27 GiB
+lm_head  m=248320 k=5120     50 calls   ~33 GiB   <- ~8 per CYCLE, 1.27 GB each
+wo / wz / alpha                          ~18 GiB
+```
+
+The lm_head line is the actionable one. ~8 full-vocab single-column GEMVs per
+cycle is **~10 GiB per cycle** — comparable to the entire 14.4 GiB model sweep
+the verify is supposed to cost — and it is neither batched across the B verify
+positions nor routed through the two-stage shortlist.
+
+This is NOT a batched-prefill fallback: `HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1`
+reports `final=true base=true` at n=8 on every cycle. The layer stack batches;
+the lm_head does not.
+
+### Two-stage q2 already exists and is already proven ON THIS HEAD
+
+`lmhead_twostage_cfg` carries a sweep over 323 REAL decode states from
+Qwen3.8-27B's own [248320, 5120] compact head
+(`examples/verify_lmhead_twostage_compact.rs`):
+
+```
+bits   K      tier+fine MB   vs full   recall@1
+   2   32          318.9      2.12x    323/323
+   2   512         320.2      2.11x    323/323
+   4   512         638.1      1.06x    323/323
+```
+
+q2 is 2.11x with the exact full-vocab argmax reproduced on every probe, and q4
+"cannot pay for itself" (a q4 tier is 637 MB against the head's own 675 MB).
+`lmhead_twostage_applies` accepts `OqCompactG256`, and `lowered.rs:803` — the
+live single-token decode site — already calls it.
+
+So the two-stage path is built, correct, tuned for this head, and live for
+DECODE. The spec-decode VERIFY simply does not use it.
+
+### The fix
+
+Route the verify's lm_head through the same compact two-stage path, batched
+across the B positions. `dflash_enqueue_verify_lm_head` already has an
+`OqCompactG256` arm using `gemm_oq_compact_grouped_wmma`, so the batching half
+has an existing home; the coarse shortlist would then apply per position.
+
+Rough size of the prize: ~10 GiB/cycle -> ~2.4 GiB at the measured 2.11x, against
+a cycle that currently moves ~26 GiB in single-column GEMVs alone. This is the
+largest single addressable term found so far.
