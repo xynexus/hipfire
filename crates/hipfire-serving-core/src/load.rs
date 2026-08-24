@@ -776,7 +776,10 @@ mod load_headroom_tests {
         let err = load_headroom_verdict(68 * GIB, 40 * GIB, 4 * GIB).unwrap_err();
         assert!(err.contains("68.0 GiB"), "names the artifact size: {err}");
         assert!(err.contains("40.0 GiB"), "names what is available: {err}");
-        assert!(err.contains("HIPFIRE_LOAD_MEM_CHECK=0"), "names the override: {err}");
+        assert!(
+            err.contains("HIPFIRE_LOAD_MEM_CHECK=0"),
+            "names the override: {err}"
+        );
     }
 
     #[test]
@@ -4718,9 +4721,7 @@ mod admission_tests {
     /// test rather than as dead code nobody noticed.
     #[test]
     fn every_evictable_kv_mode_is_deprecated() {
-        let evictable = [
-            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4",
-        ];
+        let evictable = ["q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4"];
         for m in evictable {
             assert!(
                 triattn_can_evict_kv_mode(m),
@@ -4736,7 +4737,10 @@ mod admission_tests {
         }
         // The two supported families reach no eviction arm.
         for m in ["fp32", "kvarn", "kvarn2", "kvarn4", "kvarn8"] {
-            assert!(!triattn_can_evict_kv_mode(m), "{m} must decline the sidecar");
+            assert!(
+                !triattn_can_evict_kv_mode(m),
+                "{m} must decline the sidecar"
+            );
         }
     }
 

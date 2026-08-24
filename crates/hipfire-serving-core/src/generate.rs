@@ -2075,7 +2075,10 @@ fn qwen35_sample_next_from(
 ///   =1    -> batched prefill, drafter ON    (opt-in)
 ///   =0    -> per-token prefill, drafter OFF (full rollback)
 fn kvarn_forced_per_token() -> bool {
-    std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL").ok().as_deref() == Some("0")
+    std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("0")
 }
 
 fn qwen35_prefill_tokens(

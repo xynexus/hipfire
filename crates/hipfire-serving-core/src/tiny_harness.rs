@@ -1283,11 +1283,19 @@ pub struct PrefillHashOut {
     /// Largest absolute logit difference seen, any position.
     pub max_abs_diff: f32,
     /// Byte hash of the DeltaNet recurrent state after each path's prefill.
-    /// Never compared for EQUALITY as a correctness signal — the two paths
-    /// reassociate differently, so they are expected to differ. They are
-    /// compared for INEQUALITY instead: see [`PrefillHashOut::distinct_paths`].
+    /// DIAGNOSTIC ONLY. Not a correctness signal in either direction: a correct
+    /// implementation may leave them equal (both paths run the same per-token
+    /// GDN kernels) or different (GEMM vs GEMV reassociation), depending on the
+    /// layer mix. Execution is proved by
+    /// [`PrefillHashOut::batched_path_ran`] instead.
     pub batched_state_hash: u64,
     pub ref_state_hash: u64,
+    /// Rows `forward_prefill_chunk` processed during the BATCHED run. The
+    /// positive execution probe — see [`PrefillHashOut::batched_path_ran`].
+    pub batched_rows: u64,
+    /// Same counter across the REFERENCE run. Must be 0: the per-token
+    /// `forward_scratch` path never enters `forward_prefill_chunk`.
+    pub ref_rows: u64,
     pub n_prefill: usize,
     pub n_decode: usize,
 }
@@ -1300,21 +1308,31 @@ impl PrefillHashOut {
         self.max_kld <= max_kld_tol && self.argmax_agree == self.n_decode
     }
 
-    /// True when the two runs actually took different code paths.
+    /// True when the batched prefill actually executed, measured POSITIVELY.
     ///
-    /// **A false here invalidates the cell — it is not a pass.** The batched and
-    /// per-token paths write bit-different recurrent state (GEMM vs GEMV
-    /// reassociation), so equal state hashes mean the "batched" run silently
-    /// fell back to the reference and the probe compared it against itself.
+    /// **A false here invalidates the cell — it is not a pass.** Without it a
+    /// fixture that never reaches `forward_prefill_batch` reports a clean pass
+    /// for a path it never ran, which is the false-coverage failure this probe
+    /// exists to end.
     ///
-    /// Measured, not assumed: `HIPFIRE_PREFILL_BATCHED=0` collapses the qwen3_5
-    /// cell's hashes to equal and its max KLD to exactly 0.0, which is the
-    /// fallback's signature. Both tiny MoE fixtures show that signature with the
-    /// flag UNSET — they never reach `forward_prefill_batch` at all — so without
-    /// this check they would report a clean pass for a path they never ran,
-    /// which is the exact false-coverage failure this milestone exists to end.
-    pub fn distinct_paths(&self) -> bool {
-        self.batched_state_hash != self.ref_state_hash
+    /// The signal is `qwen35::batched_prefill_rows()`, bumped inside
+    /// `forward_prefill_chunk` — reachable only from `forward_prefill_batch*`,
+    /// never from the per-token reference. So the batched run must move it and
+    /// the reference run must not.
+    ///
+    /// This REPLACES inferring execution from the two runs' recurrent-state
+    /// hashes differing. That inference held only while the two paths ran
+    /// different kernels for the recurrent update; once the duplicated MoE
+    /// attention bodies were folded onto the shared lowered super-ops
+    /// (`0bbbfd08f`) both run the same per-token GDN kernels and the hashes are
+    /// EQUAL for a correct implementation. The old check read that as "never
+    /// ran", and because it was evaluated before the KLD comparison it also
+    /// reported a genuine `max_kld 0.377, argmax 0/4` failure as INCONCLUSIVE.
+    ///
+    /// The state hashes are still reported, as diagnostics. They are no longer
+    /// a correctness signal in either direction.
+    pub fn batched_path_ran(&self) -> bool {
+        self.batched_rows > 0 && self.ref_rows == 0
     }
 }
 
@@ -1535,6 +1553,9 @@ pub fn run_prefill_hash(
     }
     let tokens = synthetic_tokens(n_prefill + n_decode, seed);
 
+    // Positive execution probe, sampled around each run — see
+    // `PrefillHashOut::batched_path_ran`.
+    let rows_0 = hipfire_arch_qwen35::qwen35::batched_prefill_rows();
     let (batched_state_hash, batched) = qwen35_prefill_then_decode(
         arch,
         model_path,
@@ -1545,9 +1566,11 @@ pub fn run_prefill_hash(
         corrupt_kv_prefix,
         kv_mode,
     )?;
+    let rows_1 = hipfire_arch_qwen35::qwen35::batched_prefill_rows();
     let (ref_state_hash, reference) = qwen35_prefill_then_decode(
         arch, model_path, gpu, &tokens, n_prefill, false, false, kv_mode,
     )?;
+    let rows_2 = hipfire_arch_qwen35::qwen35::batched_prefill_rows();
 
     if batched.len() != reference.len() {
         return Err(format!(
@@ -1592,6 +1615,8 @@ pub fn run_prefill_hash(
         max_abs_diff,
         batched_state_hash,
         ref_state_hash,
+        batched_rows: rows_1 - rows_0,
+        ref_rows: rows_2 - rows_1,
         n_prefill,
         n_decode,
     })

@@ -173,14 +173,22 @@ fn main() {
             println!("batched_state_hash: 0x{:016x}", out.batched_state_hash);
             println!("ref_state_hash:     0x{:016x}", out.ref_state_hash);
             println!("tol: {tol:.8}");
-            println!("distinct_paths: {}", out.distinct_paths());
+            println!("batched_rows: {}", out.batched_rows);
+            println!("ref_rows: {}", out.ref_rows);
+            println!("batched_path_ran: {}", out.batched_path_ran());
             println!("agrees: {}", out.agrees(tol));
-            if !out.distinct_paths() {
-                // Exit 3 = inconclusive, NOT a pass: the two runs landed in the
-                // same code path, so this cell compared the reference against
-                // itself and proves nothing about the batched prefill.
+            if !out.batched_path_ran() {
+                // Exit 3 = inconclusive, NOT a pass: the batched prefill never
+                // executed, so this cell proves nothing about it. Measured
+                // positively (rows through `forward_prefill_chunk`), not
+                // inferred from the two runs' recurrent state differing — that
+                // inference reported correct implementations as INCONCLUSIVE
+                // and, being checked first, masked real divergences too.
                 eprintln!(
-                    "tiny_quant_probe prefill-hash: INCONCLUSIVE — batched and reference                      left identical recurrent state, so the batched prefill path was                      never reached for this fixture"
+                    "tiny_quant_probe prefill-hash: INCONCLUSIVE — the batched prefill did \
+                     not execute (batched_rows={}, ref_rows={}); this fixture never reached \
+                     forward_prefill_batch",
+                    out.batched_rows, out.ref_rows
                 );
                 std::process::exit(3);
             }

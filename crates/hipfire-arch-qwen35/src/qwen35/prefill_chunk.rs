@@ -2197,6 +2197,32 @@ pub(crate) fn dump_hidden_localize(
     }
 }
 
+/// Rows processed by the BATCHED prefill, process-wide and monotonic.
+///
+/// The tiny prefill gate's POSITIVE probe that the batched path executed.
+/// `forward_prefill_chunk` is reachable only from `forward_prefill_batch*`,
+/// never from the per-token `forward_scratch` reference, so a non-zero delta
+/// across a batched run — and a zero delta across a reference run — proves
+/// which path each one took.
+///
+/// This replaces inferring execution from the two paths' recurrent-state
+/// hashes DIFFERING. That inference held only while the batched and per-token
+/// paths ran different kernels for the recurrent update; once the duplicated
+/// MoE attention bodies were folded onto the shared lowered super-ops
+/// (`0bbbfd08f`) both run the same per-token GDN kernels and the hashes match
+/// exactly — a correct outcome that the old check read as "never ran". Worse,
+/// it was evaluated BEFORE the KLD comparison, so it also reported a genuine
+/// `max_kld 0.377, argmax 0/4` failure as INCONCLUSIVE. A check that can turn a
+/// real failure into a shrug is the more dangerous half of that bug.
+pub static BATCHED_PREFILL_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current value of [`BATCHED_PREFILL_ROWS`]. Sample either side of a run and
+/// compare; never compare the absolute value, which is process-wide.
+pub fn batched_prefill_rows() -> u64 {
+    BATCHED_PREFILL_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2227,6 +2253,7 @@ pub(crate) fn forward_prefill_chunk(
     routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let n = tokens.len();
+    BATCHED_PREFILL_ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
     debug_assert!(
