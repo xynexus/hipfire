@@ -302,3 +302,57 @@ What is left is a shape change, not a knob: either widen the weight load to
 to reach ~239 GB/s, against multicol's 4-byte dword), or stage the activation
 tile in LDS so the 8 waves of a workgroup stop each re-loading it from global.
 Both are real kernel rewrites.
+
+## The binding constraint is the DRAFTER'S SIZE, not the kernels
+
+Context: 55 tok/s is not a roofline guess — a closed-source engine reaches 60
+tok/s on this exact GPU. So the question is what they do differently, and the
+byte budget answers it.
+
+Per spec-decode cycle we stream the drafter B times and the target once:
+
+```
+B=8, tau 5.333
+  draft    9.4 GiB   39.6% of cycle bytes
+  verify  14.4 GiB   60.4%
+  total   23.8 GiB / 5.333 tokens = 4.47 GiB per token
+  at the 233 GB/s ceiling -> 50.9 tok/s MAXIMUM
+```
+
+**50.9 is the ceiling with this drafter at 100% memory efficiency.** Not 55.
+Every kernel in the path could hit peak bandwidth and the target would still be
+out of reach, because the drafter is 1.18 GiB — 8.2% of the 14.4 GiB target —
+and it is swept B times for every one target sweep.
+
+Shrink the drafter and the ceiling moves immediately:
+
+```
+0.60 GiB drafter, B=8, tau 5.333 -> 63.2 tok/s max
+0.30 GiB                          -> 72.2
+0.12 GiB                          -> 79.0
+```
+
+A DFlash2 head of 5 layers at hidden 5120 is very large for a speculative
+drafter; EAGLE-class heads are typically well under 1% of the target. At 8.2%
+and B sweeps per cycle, ours spends 40% of the memory budget guessing.
+
+### What this means for the remaining GPU work
+
+The kernel work is close to done, and the isolated bench says so —
+`gemv_oq_compact_multicol` (wide) at real 27B shapes:
+
+```
+gate/up B=8   224.4 GB/s   96.3% of the 233 ceiling
+down    B=8   206.1        88.4%
+gate/up B=1   231.4        99.3%
+wo      B=8   173.4        74.4%
+```
+
+Against 64.2 GB/s (27.6%) for the narrow kernel it replaced. The verify GEMVs
+are at peak; what is left in verify's 80ms is the non-weight tail (transposes,
+DeltaNet state, overlay correction, norms, quantize, copies) which the profile
+puts at ~11% of GPU time combined.
+
+So the remaining GPU-side headroom is roughly 36.9 -> 45-51 tok/s. Reaching
+55-60 needs a smaller drafter, and that is a training/checkpoint decision rather
+than a kernel one.
