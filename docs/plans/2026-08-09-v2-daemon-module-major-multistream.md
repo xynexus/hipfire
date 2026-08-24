@@ -1495,7 +1495,22 @@ oq4 with the w1/w3/w2 role ranks, attention re-encoded Q8_F16 from the FP8 .hfa.
    `expert_gate_up_blob`, which paging deliberately does not upload, so every
    paged layer fell into a fallback that no longer exists. Fixed by gating on the
    ptr tables the dispatch actually reads.
-2. **Expert admission is incompatible with HIP graph capture.** The residency
+2. **Expert admission is incompatible with HIP graph capture — RESOLVED as a
+   mutual exclusion, 2026-08-24.** Not a bug that could be reordered away: a
+   captured graph is a fixed sequence of device work containing no host
+   decisions, and paged experts need exactly such a decision per MoE layer (read
+   the router's top-k back, admit, patch the pointer table). The decision depends
+   on device work computed inside the region it would have to precede, so no
+   ordering satisfies both. `decode_step_with_graph` now detects the combination,
+   skips capture in favour of paging, and says why — where it previously died
+   mid-decode with `hipMemcpy D2H: operation would make the legacy stream depend
+   on a capturing blocking stream`, a HIP rule rather than the actual conflict.
+   Verified: the previously-fatal combination now runs to a natural EOS with the
+   same output as the graph-disabled path (7 tokens, `finish_reason: stop`).
+   Capturing only the non-MoE spans was rejected — many tiny graphs, most of the
+   benefit gone, on a model whose MoE layers dominate.
+
+   *(original wording)* **Expert admission is incompatible with HIP graph capture.** The residency
    hook does a blocking D2H inside the captured region and dispatch fails with
    "would make the legacy stream depend on a capturing blocking stream".
    Admission is a host decision; it has to be resolved *before* capture, not
