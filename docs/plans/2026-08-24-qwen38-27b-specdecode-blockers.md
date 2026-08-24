@@ -252,3 +252,53 @@ kernel-shape fix plus a draft-cost win away, on the prompts that matter.
 Benchmark spec decode on a PROMPT MIX, never one prompt. Acceptance is a property
 of the text, and a single prose prompt understates this drafter by 2.4x — enough
 to have closed the goal as impossible.
+
+
+## Where 55 tok/s comes from: it is the roofline
+
+With the multicol routing and batched rollback in, the code prompt measures
+18.87 tok/s at tau 5.333, and the budget model now predicts it to within 1%:
+
+```
+now:             draft 52 + verify 229 = 281ms ->  18.9 tok/s   (measured 18.87)
+perfect verify:  draft 52 + verify  58 = 110ms ->  48.5 tok/s
++ draft floor:   draft 38 + verify  58 =  96ms ->  55.3 tok/s
+```
+
+58ms is ONE weight sweep of the 14.4 GiB target at the measured ~250 GB/s.
+38ms is the drafter's own floor: 1.18 GiB is 4.8ms a sweep and drafting is
+sequential, so B=8 cannot go below 8 x 4.8.
+
+**55 tok/s is what perfect execution yields at tau 5.333.** Not an arbitrary
+target — it is the roofline, and hitting it requires verify at ~100% of memory
+bandwidth AND the drafter at its floor simultaneously. That is almost certainly
+where the number came from.
+
+Current standing against it:
+
+| term | now | floor | gap |
+|---|---|---|---|
+| verify | 229ms (63 GB/s) | 58ms (250 GB/s) | **4.0x** |
+| draft | 52ms | 38ms | 1.4x |
+
+### The verify gap is instruction issue, not bandwidth
+
+`gemv_oq_compact_multicol`'s own comment already diagnosed it: "bound by memory-
+instruction ISSUE on activations that are already cache hits, not by weight
+bandwidth". Per group-round only ~4 of ~32 memory instructions move weights, so
+~12% of issue slots carry weight traffic — which lands almost exactly on the
+measured 63 GB/s of a 250 GB/s part.
+
+RW (rows per wave) is the knob the kernel already uses to amortize that, and it
+is ALREADY at its optimum. Swept:
+
+    RW=4  code 18.84   RW=6  code 16.90   RW=8  code 15.11
+
+Higher RW regresses — `facc[RW][BC]` is RW*BC floats of accumulator, so RW=8 at
+BC=8 is 64 VGPRs of accumulator alone and spills. Recorded so nobody re-runs it.
+
+What is left is a shape change, not a knob: either widen the weight load to
+`dwordx4` so each lane covers 32 weights (what `gemv_oq_compact_grouped_v3` does
+to reach ~239 GB/s, against multicol's 4-byte dword), or stage the activation
+tile in LDS so the 8 waves of a workgroup stop each re-loading it from global.
+Both are real kernel rewrites.
