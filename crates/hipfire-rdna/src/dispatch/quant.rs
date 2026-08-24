@@ -551,6 +551,27 @@ impl Gpu {
         group: usize,
         block_stride: usize,
     ) -> HipResult<()> {
+        // SMALL BATCH -> multi-column GEMV, the same routing
+        // `gemm_oq_compact_grouped_wmma` already makes and for the same reason.
+        // The tiled GEMMs below are N-heavy by design (the wave64 recipe is
+        // tuned at B=128..512); at spec-decode's verify width they read every
+        // weight byte to produce a handful of output columns. Measured on
+        // Qwen3.8-27B/DFlash2: verify was 310ms at B=2 and 322ms at B=8 --
+        // CONSTANT in B, ~4.5 weight sweeps where one batched pass should cost
+        // one. `gemv_oq_compact_multicol` reads each weight row once and
+        // accumulates B columns.
+        //
+        // `xq`/`xs` are already the int8 activation and its scales, which is
+        // exactly multicol's contract -- the int4 path below derives its own
+        // nibbles from them, so nothing upstream has to change.
+        //
+        // HIPFIRE_OQ_COMPACT_SMALL_N=0 restores the GEMM for A/B.
+        if n <= 16
+            && group == 256
+            && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
+        {
+            return self.gemv_oq_compact_multicol(w_blocks, xq, xs, y, m, k, n, block_stride);
+        }
         if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
             // Wave64 twin, where it actually wins. Benched at the 27B shapes vs
             // the wave32 two-pass: gate/up 1.26x, B=512 1.26x, B=128 1.47x,
