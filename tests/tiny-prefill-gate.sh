@@ -44,12 +44,27 @@
 # against itself. Such a cell reports SKIP, never OK — without it those cells
 # would report a clean pass for a path they never ran.
 #
-# The MoE cells SKIP on gfx1103, and it is NOT a fixture gap: `arch_has_wmma`
-# (prefill_batch.rs:5782) lists gfx1100/1101/1102/1150/1151/1200/1201 and gfx1103
-# is absent, so the batched MoE prefill is not admitted on this arch at all. A
-# real Qwen3.6-35B-A3B--oq4 reports the same `distinct_paths: false`, which
-# settles it. On gfx1151/gfx12 these cells should run; if they still SKIP there,
-# the admission gate — not the gate script — is what to look at.
+# THE MoE CELLS, corrected 2026-08-24 by measurement. The previous note here
+# blamed `arch_has_wmma` (prefill_batch.rs:5782) for gfx1103 and was wrong twice
+# over: that predicate gates MQ3 *dense* weights, not MoE admission, and the
+# canonical `gfx_has_wmma` (hipfire-rdna/src/arch_caps.rs) has always listed
+# gfx1103. What actually happens on gfx1103:
+#
+#   * `qwen3_5_moe` SKIPs on EVERY arch, not just this one. `moe_preset` is
+#     top-2-of-8 and `moe_prefill_topk_shape_supported` requires k_top in {8,10},
+#     so the refusal is `moe_topk_ok=false (K=2, E=8)` — a fixture shape, with no
+#     arch term in it. Running this cell on gfx1151 would SKIP identically.
+#   * `qwen3_5_moe_indexed` is top-8-of-16, clears admission on gfx1103, and does
+#     reach grouped path-2. It then FAILS, and so does gfx1151: max_kld 0.8797 /
+#     max_abs_diff 5.33 on nix1 through the portable scalar grouped kernel, and
+#     0.8797 / 5.34 on halo through `gemm_f16_moe_grouped_wmma_gfx1151`. Two
+#     different GEMM kernels agreeing to four digits is evidence that both compute
+#     the grouped GEMM correctly and that the defect is in the raw-F16/BF16 path-2
+#     wiring around them. Raw F16/BF16 routed-MoE batched prefill is wrong on
+#     every arch; gfx1103 merely used to panic instead of returning garbage.
+#
+# So a red MoE cell here is NOT an arch gap to route around. See
+# docs/plans/2026-08-24-raw-f16-moe-prefill-divergence.md.
 #
 # SELF-CHECK. Every cell also runs with `--corrupt-kv-prefix`, which zeroes each
 # layer's K buffer at every position EXCEPT the last — position 0 included. That
