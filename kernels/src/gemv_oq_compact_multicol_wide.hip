@@ -77,12 +77,34 @@ static __device__ __forceinline__ void oqcmw_body(
     const int lig = lane & 7;    // 0..7 — which 32-weight chunk of that group
     const int elt = lig * 32;    // weight/activation offset inside the group
 
-    for (int row0 = wid * RW; row0 < M; row0 += nw * RW) {
+    // ACTIVATION TILE IN LDS. Every wave was re-loading the same activations
+    // from global: at RW=3 a wave-round moves ~8 KB of activations against
+    // ~1.5 KB of weights, and all 8 waves of a workgroup load the SAME bytes.
+    // They are L2 hits, so this is not DRAM bandwidth -- it is that weight
+    // traffic is a minority of the instruction stream. Staging the tile once per
+    // workgroup divides the activation side by the wave count and lets weights
+    // dominate, which is the only thing that can move a kernel already at
+    // ~140 GB/s toward the ~250 GB/s ceiling.
+    //
+    // 4 groups in flight x BC columns x 256 bytes = 8 KB at BC=8, well inside
+    // the 64 KB LDS.
+    __shared__ int8_t lds_x[4 * BC * 256];
+
+    // The barriers below must be reached by every wave the same number of times,
+    // so the row-block loop runs a UNIFORM trip count with bounds checks rather
+    // than a grid-stride `row0 < M` test that different waves exit at different
+    // times. A divergent __syncthreads() hangs the workgroup.
+    const int total_blocks = (M + RW - 1) / RW;
+    const int trips = (total_blocks + nw - 1) / nw;
+
+    for (int t = 0; t < trips; ++t) {
+        const int row0 = (wid + t * nw) * RW;
+        const bool row_active = row0 < M;
         const uint8_t* n_row[RW];
         const uint8_t* s_row[RW];
         #pragma unroll
         for (int r = 0; r < RW; ++r) {
-            const int row = (row0 + r < M) ? (row0 + r) : (M - 1);
+            const int row = (row_active && row0 + r < M) ? (row0 + r) : (M - 1);
             n_row[r] = W + (long long)row * ng * 128LL;
             s_row[r] = W + side_base + (long long)row * ng * (long long)side_stride;
         }
@@ -94,6 +116,26 @@ static __device__ __forceinline__ void oqcmw_body(
             for (int b = 0; b < BC; ++b) facc[r][b] = 0.0f;
 
         for (int g0 = 0; g0 < ng; g0 += 4) {
+            // Stage this round's four groups for all BC columns. 16 bytes per
+            // thread per step keeps the copy on dwordx4 like the compute path.
+            __syncthreads();
+            {
+                const int tid = threadIdx.x;
+                const int nthr = blockDim.x;
+                const int bytes = 4 * BC * 256;
+                for (int off = tid * 16; off < bytes; off += nthr * 16) {
+                    const int gl = off / (BC * 256);
+                    const int rem = off - gl * (BC * 256);
+                    const int b = rem >> 8;
+                    const int byte = rem & 255;
+                    const int gsrc = g0 + gl;
+                    const int8_t* src = (gsrc < ng)
+                        ? Xq + (long long)b * K + (long long)gsrc * 256 + byte
+                        : Xq;
+                    __builtin_memcpy(&lds_x[off], src, 16);
+                }
+            }
+            __syncthreads();
             const int gi = g0 + gir;
 
             // 16 bytes = this lane's 32 weights, 16-byte aligned inside a
@@ -136,7 +178,7 @@ static __device__ __forceinline__ void oqcmw_body(
 
             #pragma unroll
             for (int b = 0; b < BC; ++b) {
-                const int8_t* xq = Xq + (long long)b * K + (long long)gi * 256;
+                const int8_t* xq = &lds_x[((gir * BC) + b) * 256];
                 // 32 activations for this lane's 32 weights: two dwordx4.
                 uint32_t xv[8];
                 __builtin_memcpy(&xv[0], xq + elt, 16);
@@ -164,7 +206,7 @@ static __device__ __forceinline__ void oqcmw_body(
                 for (int off = 16; off > 0; off >>= 1)
                     facc[r][b] += __shfl_xor(facc[r][b], off);
             }
-        if (lane == 0) {
+        if (lane == 0 && row_active) {
             #pragma unroll
             for (int r = 0; r < RW; ++r) {
                 if (row0 + r >= M) break;
