@@ -118,6 +118,23 @@ and the LA preamble's rmsnorm/FWHT choice — and `FullAttnMoe` is a fifth
 through eighth. Patching a subset leaves the activation basis inconsistent
 between them. Consolidation was the only tractable shape.
 
+### Real-model check (not just the fixture)
+
+The tiny fixture is F16, so it exercises only the full-precision arms. The
+consolidation replaced legacy chains that also served Q8 / MQ4 / MQ6 / OQ4 /
+PARO, so a real quantized MoE model is the regression that matters. On
+`Qwen3.6-35B-A3B--oq4`, gfx1103, greedy:
+
+    [kernel-trace] pbs_eligible inputs: force_fallback=false n=57
+      moe_topk_ok=true (K=8, E=256) router_logits=true arch=gfx1103
+
+— admitted and executing the batched path, and the generation is coherent and
+correct. A `HIPFIRE_PREFILL_BATCHED=0` run produced byte-identical greedy text,
+but that comparison is NOT counted as evidence here: nothing in either run's
+output proves the flag changed the path, and decode dominates a short
+generation, so the two are indistinguishable on timing. The trace line above is
+the evidence; the identical text is a consistency check.
+
 ## Gate gap this exposed
 
 `tiny-prefill-gate.sh` reports these cells SKIP rather than OK. Its path check
