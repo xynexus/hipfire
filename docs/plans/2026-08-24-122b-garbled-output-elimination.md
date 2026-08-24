@@ -19,7 +19,12 @@ them.
 |---|---|---|
 | lm_head (its known historical defect) | `122b-lmbf16.hfq`, Bf16Lut3 head | garbles identically |
 | leftover Q8F16 tensors (the other known defect) | quant histogram | none present in either artifact |
-| dense compact residency | narrow compact to routed shapes only, dense expanded | garbles identically |
+| ~~dense compact residency~~ | ~~narrow compact to routed shapes, dense expanded~~ | **THAT TEST WAS INVALID — see below** |
+| dense compact residency (properly) | real-weight parity on DeltaNet in_proj/out_proj, shared expert, lm_head | 10/10 PASS at ~1e-7 |
+| routed compact, every layer | real-weight sweep, 48 layers x 2 projections x 16 experts | 96/96 PASS at ~1e-7 |
+| router weights | quant histogram | BF16 — compact residency never touches them |
+| KVarN batched prefill (known 57x-less-faithful path) | `HIPFIRE_KVARN_BATCHED_PREFILL=0` | byte-identical output |
+| lowered vs hand forward executor | `HIPFIRE_FORWARD_LOWERED=0` | byte-identical output |
 | compact kernel at this model's shapes | parity at gate_up [2048,3072] (ng=12) and down [3072,1024] | 21/21 PASS, all layouts |
 | stride table contents | `HIPFIRE_MOE_FEED_DEBUG=1` dumps them in situ | exactly right: 226x136 + 30x0, matches the loader |
 | representative dtype (expert 0 vs layer) | fixed decode AND prefill | output unchanged -- expert 0 was already compact |
@@ -33,6 +38,29 @@ a genuinely mixed layer (32 Oq8 + 224 compact, expert 0 among the Oq8) on a mode
 that has none, and the 35B-A3B stayed byte-identical to its expanded reference.
 Mixed handling -- kernel, stride table, representative, dispatch -- is correct
 end to end on a real model against a real reference.
+
+## CORRECTION: the first "dense exonerated" result was invalid
+
+The narrowing used `ONLY_M=2048,3072` with `ONLY_K=3072,1024`, and those lists are
+**ANDed per tensor**. Every `[3072, 3072]` attention tensor matches both, so it
+stayed compact. Dense was never actually expanded, and the conclusion drawn from
+that run -- "garbles with dense expanded, therefore dense is exonerated" -- did
+not follow. Dense is now exonerated properly, by direct real-weight parity
+against an f64 oracle rather than by inference from a config I misread.
+
+The lesson generalises: `ONLY_M`/`ONLY_K` cannot separate routed from dense on
+this model at all. Routed `down` is `[3072, 1024]` and the shared expert's
+`down_proj` is also `[3072, 1024]`. Shape is not an identity.
+
+## The corruption is upstream of every dispatch choice
+
+The 122B produces BYTE-IDENTICAL garbage across all of: lowered vs hand forward
+executor, batched vs per-token prefill, indexed vs generic MoE dispatch, grouped
+path-2 on and off, KVarN batched prefill on and off, and both lm_head variants.
+
+Whatever is wrong is therefore not a dispatch selection, and not any of the
+kernels those levers switch between. Combined with 106 real-weight parity checks
+passing, it is not the compact weight decode either.
 
 ## Compact decode verified on the 122B's REAL weights
 

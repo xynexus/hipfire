@@ -401,7 +401,7 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layou
 /// it against weights a quantizer actually emitted, including whatever overlay
 /// index distribution, duplicate pattern and scale range that artifact happens
 /// to carry. It needs no model load, so it works for a model too large to serve.
-fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
+fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize, proj: &str) -> bool {
     let hfq = match HfqFile::open(std::path::Path::new(path)) {
         Ok(f) => f,
         Err(e) => {
@@ -414,7 +414,7 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
     let (mut m, mut k) = (0usize, 0usize);
     for e in 0..n_exp {
         let name =
-            format!("model.language_model.layers.{layer}.mlp.experts.{e}.gate_up_proj.weight");
+            format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}.weight");
         let Some((info, buf)) = hfq.tensor_data_pread(&name) else {
             println!("  tensor not found: {name}");
             return false;
@@ -427,10 +427,6 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
         raw.push(buf.to_vec());
     }
     let n_compact = compact_flags.iter().filter(|c| **c).count();
-    println!(
-        "  layer {layer}: M={m} K={k}  {n_compact} compact / {} promoted of {n_exp}",
-        n_exp - n_compact
-    );
 
     // Oracle from the on-disk bytes, independent of either kernel.
     let logical: Vec<Vec<f32>> = raw
@@ -512,26 +508,30 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
         .unwrap();
     let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
     let mi = m / 2;
-    let g = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
-    let u = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
-
-    gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptr_t, &idx_t, &st_t, &x_t, &g, &u, m, k, true)
+    let is_down = proj.starts_with("down");
+    let y = if is_down {
+        // `down` writes [K_TOP x M] directly, no gate|up split.
+        let o = gpu.alloc_tensor(&[K_TOP * m], DType::F32).unwrap();
+        gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
+            &ptr_t, &idx_t, &st_t, &x_t, &o, m, k, K_TOP, 1,
+        )
         .unwrap();
-    gpu.device_synchronize().unwrap();
-
-    let (gv, uv) = (gpu.download_f32(&g).unwrap(), gpu.download_f32(&u).unwrap());
-    let mut y = vec![0f32; K_TOP * m];
-    for s in 0..K_TOP {
-        y[s * m..s * m + mi].copy_from_slice(&gv[s * mi..s * mi + mi]);
-        y[s * m + mi..s * m + m].copy_from_slice(&uv[s * mi..s * mi + mi]);
-    }
-    let err = max_rel(&oracle, &y);
-    let ok = err < 1e-5;
-    println!(
-        "  {:<34} kernel-vs-oracle {err:.3e}  {}",
-        "REAL WEIGHTS",
-        if ok { "PASS" } else { "FAIL" }
-    );
+        gpu.device_synchronize().unwrap();
+        gpu.download_f32(&o).unwrap()
+    } else {
+        let g = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+        let u = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+        gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptr_t, &idx_t, &st_t, &x_t, &g, &u, m, k, true)
+            .unwrap();
+        gpu.device_synchronize().unwrap();
+        let (gv, uv) = (gpu.download_f32(&g).unwrap(), gpu.download_f32(&u).unwrap());
+        let mut y = vec![0f32; K_TOP * m];
+        for s in 0..K_TOP {
+            y[s * m..s * m + mi].copy_from_slice(&gv[s * mi..s * mi + mi]);
+            y[s * m + mi..s * m + m].copy_from_slice(&uv[s * mi..s * mi + mi]);
+        }
+        y
+    };
     // THIRD OPINION: the production expansion path on the same real bytes, run
     // through the shipping Oq8 kernel. If the compact kernel matches THIS but
     // not the oracle, the oracle is what is wrong.
@@ -558,29 +558,43 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize) -> bool {
         })
         .collect();
     let ptr8_t = gpu.upload_f32(&ptrs8, &[2 * ts8.len()]).unwrap();
-    let g8 = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
-    let u8_ = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
-    gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8_t, &idx_t, &x_t, &g8, &u8_, m, k, true)
+    let y8 = if is_down {
+        let o = gpu.alloc_tensor(&[K_TOP * m], DType::F32).unwrap();
+        gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+            &ptr8_t, &idx_t, &x_t, &o, m, k, K_TOP, 1,
+        )
         .unwrap();
-    gpu.device_synchronize().unwrap();
-    let (gv8, uv8) = (
-        gpu.download_f32(&g8).unwrap(),
-        gpu.download_f32(&u8_).unwrap(),
-    );
-    let mut y8 = vec![0f32; K_TOP * m];
-    for s in 0..K_TOP {
-        y8[s * m..s * m + mi].copy_from_slice(&gv8[s * mi..s * mi + mi]);
-        y8[s * m + mi..s * m + m].copy_from_slice(&uv8[s * mi..s * mi + mi]);
-    }
+        gpu.device_synchronize().unwrap();
+        gpu.download_f32(&o).unwrap()
+    } else {
+        let g8 = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+        let u8_ = gpu.alloc_tensor(&[K_TOP * mi], DType::F32).unwrap();
+        gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8_t, &idx_t, &x_t, &g8, &u8_, m, k, true)
+            .unwrap();
+        gpu.device_synchronize().unwrap();
+        let (gv8, uv8) = (
+            gpu.download_f32(&g8).unwrap(),
+            gpu.download_f32(&u8_).unwrap(),
+        );
+        let mut y8 = vec![0f32; K_TOP * m];
+        for s in 0..K_TOP {
+            y8[s * m..s * m + mi].copy_from_slice(&gv8[s * mi..s * mi + mi]);
+            y8[s * m + mi..s * m + m].copy_from_slice(&uv8[s * mi..s * mi + mi]);
+        }
+        y8
+    };
+    let (e_oracle, e_cross) = (max_rel(&oracle, &y8), max_rel(&y8, &y));
+    let err = max_rel(&oracle, &y);
+    let ok = err < 1e-5 && e_cross < 1e-5;
     println!(
-        "  {:<34} expanded-vs-oracle {:.3e}   compact-vs-expanded {:.3e}",
-        "cross-checks",
-        max_rel(&oracle, &y8),
-        max_rel(&y8, &y)
+        "  L{layer:<3} {proj:<14} {n_compact:>3}c/{:>2}p  kernel-vs-oracle {err:.3e}  \
+         expanded-vs-oracle {e_oracle:.3e}  compact-vs-expanded {e_cross:.3e}  {}",
+        n_exp - n_compact,
+        if ok { "PASS" } else { "FAIL" }
     );
 
     // Per-slot, so a failure names the expert rather than the layer.
-    for t in 0..K_TOP {
+    for t in (0..K_TOP).filter(|_| !ok || std::env::var("PARITY_VERBOSE").is_ok()) {
         let e = topk[t] as usize;
         let se = max_rel(&oracle[t * m..(t + 1) * m], &y[t * m..(t + 1) * m]);
         let stride = raw[e].len() / (m * (k / GROUP));
@@ -613,6 +627,94 @@ fn decode_logical_oq8_canonical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
 
 const OQPLUS_COMPACT_QT: u8 = hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT;
 
+/// Check a DENSE compact tensor from a real artifact against the f64 oracle.
+///
+/// The routed sweep covers experts; attention, the shared expert, the router and
+/// lm_head all go through `gemv_oq_compact_grouped` instead, and nothing had
+/// checked those on real bytes. `split_compact_planes` is the same transform, so
+/// a defect here would be invisible to the MoE harness while corrupting every
+/// layer -- which matches an output that is byte-identical across every dispatch
+/// and executor choice.
+fn run_real_dense(gpu: &mut Gpu, path: &str, name: &str) -> Option<bool> {
+    let hfq = HfqFile::open(std::path::Path::new(path)).ok()?;
+    let (info, buf) = hfq.tensor_data_pread(name)?;
+    if info.quant_type != OQPLUS_COMPACT_QT || info.shape.len() != 2 {
+        return None;
+    }
+    let (m, k) = (info.shape[0] as usize, info.shape[1] as usize);
+    if k % GROUP != 0 {
+        return None;
+    }
+    let raw = buf.to_vec();
+    let stride = raw.len() / (m * (k / GROUP));
+    // Cap the rows so a 248320-row lm_head does not turn into an hour of f64.
+    let rows = m.min(256);
+
+    let logical = decode_logical_stride(&raw, m, k, stride, rows);
+    let mut rng = lcg(0xDE45E);
+    let x: Vec<f32> = (0..k)
+        .map(|_| ((rng() % 2001) as f32 - 1000.0) / 1000.0)
+        .collect();
+    let mut oracle = vec![0f32; rows];
+    for row in 0..rows {
+        let mut acc = 0f64;
+        for j in 0..k {
+            acc += logical[row * k + j] as f64 * x[j] as f64;
+        }
+        oracle[row] = acc as f32;
+    }
+
+    let mut owned = raw.clone();
+    normalize_compact_overlays(&mut owned, m, k, GROUP);
+    let split = split_compact_planes(&owned, m, k, GROUP);
+    // Rows are independent and the split layout is tensor-wide, so feed the
+    // whole tensor and read back the first `rows` outputs.
+    let w = gpu.upload_raw(&split, &[split.len()]).unwrap();
+    let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
+    let y = gpu.alloc_tensor(&[m], DType::F32).unwrap();
+    gpu.gemv_oq_compact_grouped(&w, &x_t, &y, m, k, GROUP, stride)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let got = gpu.download_f32(&y).unwrap();
+
+    let err = max_rel(&oracle, &got[..rows]);
+    let ok = err < 1e-5;
+    println!(
+        "  {:<52} M={m:<7} K={k:<5} stride={stride}  err {err:.3e}  {}",
+        name.rsplit('.').take(3).collect::<Vec<_>>().join("."),
+        if ok { "PASS" } else { "FAIL" }
+    );
+    Some(ok)
+}
+
+/// `decode_logical` with the stride taken from the tensor rather than assumed,
+/// and limited to the first `rows` rows.
+fn decode_logical_stride(blob: &[u8], _m: usize, k: usize, stride: usize, rows: usize) -> Vec<f32> {
+    let ng = k / GROUP;
+    let n_out = (stride - 130) / 2;
+    let mut w = vec![0f32; rows * k];
+    for row in 0..rows {
+        for g in 0..ng {
+            let base = (row * ng + g) * stride;
+            let scale = f16_bits_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let mut code = [0i32; GROUP];
+            for i in 0..128 {
+                let byte = blob[base + 2 + i];
+                code[2 * i] = sext4(byte & 0x0f);
+                code[2 * i + 1] = sext4(byte >> 4);
+            }
+            for e in 0..n_out {
+                let idx = blob[base + 130 + 2 * e] as usize;
+                code[idx] = blob[base + 130 + 2 * e + 1] as i8 as i32;
+            }
+            for i in 0..GROUP {
+                w[row * k + g * GROUP + i] = scale * code[i] as f32;
+            }
+        }
+    }
+    w
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
@@ -623,15 +725,54 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     // `--hfq <path> <layer> <n_exp>`: check real artifact bytes instead.
+    if std::env::args().nth(1).as_deref() == Some("--dense") {
+        let a: Vec<String> = std::env::args().skip(2).collect();
+        let path = a.first().cloned().unwrap_or_default();
+        println!("REAL-WEIGHT dense parity: {path}");
+        let mut all = true;
+        let mut ran = 0;
+        for name in a.iter().skip(1) {
+            match run_real_dense(&mut gpu, &path, name) {
+                Some(ok) => {
+                    all &= ok;
+                    ran += 1;
+                }
+                None => println!("  {name}: not compact / not found / unusable K"),
+            }
+        }
+        println!("{} ({ran} checks)", if all { "ALL PASS" } else { "FAILURES PRESENT" });
+        std::process::exit(if all { 0 } else { 1 });
+    }
     if std::env::args().nth(1).as_deref() == Some("--hfq") {
         let a: Vec<String> = std::env::args().skip(2).collect();
         let path = a.first().cloned().unwrap_or_default();
         let layer: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let n: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
         println!("REAL-WEIGHT parity: {path}");
-        let ok = run_real(&mut gpu, &path, layer, n);
-        println!("{}", if ok { "PASS" } else { "FAIL" });
-        std::process::exit(if ok { 0 } else { 1 });
+        // layer < 0 sweeps every layer; otherwise just the one named.
+        let layers: Vec<usize> = if a.get(1).map(|s| s == "all").unwrap_or(false) {
+            (0..64).collect()
+        } else {
+            vec![layer]
+        };
+        let mut all = true;
+        let mut ran = 0usize;
+        for l in layers {
+            for proj in ["gate_up_proj", "down_proj"] {
+                let name = format!("model.language_model.layers.{l}.mlp.experts.0.{proj}.weight");
+                let exists = HfqFile::open(std::path::Path::new(&path))
+                    .ok()
+                    .map(|f| f.find_tensor_info(&name).is_some())
+                    .unwrap_or(false);
+                if !exists {
+                    continue;
+                }
+                all &= run_real(&mut gpu, &path, l, n, proj);
+                ran += 1;
+            }
+        }
+        println!("{} ({ran} checks)", if all { "ALL PASS" } else { "FAILURES PRESENT" });
+        std::process::exit(if all { 0 } else { 1 });
     }
     println!("compact-resident indexed MoE GEMV parity (M={m} K={k} experts={n_exp})");
     let mut all = true;
