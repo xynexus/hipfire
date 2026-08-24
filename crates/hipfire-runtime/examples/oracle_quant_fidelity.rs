@@ -196,7 +196,10 @@ fn main() {
             _ => false,
         };
         if !shape_ok {
-            println!("  {} SHAPE MISMATCH hfq {m}x{k} vs source {sshape:?}", info.name);
+            println!(
+                "  {} SHAPE MISMATCH hfq {m}x{k} vs source {sshape:?}",
+                info.name
+            );
             continue;
         }
         let cos = cosine(&decoded[..rows * k], &src[..rows * k]);
@@ -228,6 +231,10 @@ fn main() {
     println!(
         "\nchecked {checked}; worst UNROTATED cosine {:.6} on {}",
         worst.0,
-        if worst.1.is_empty() { "(none)" } else { &worst.1 }
+        if worst.1.is_empty() {
+            "(none)"
+        } else {
+            &worst.1
+        }
     );
 }

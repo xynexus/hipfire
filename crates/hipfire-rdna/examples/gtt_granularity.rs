@@ -20,13 +20,21 @@ fn gtt_used() -> u64 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let size: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_064_960);
+    let size: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1_064_960);
     let count: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2000);
 
-    assert!(size % 4 == 0, "size must be a multiple of 4 (allocated as F32)");
+    assert!(
+        size % 4 == 0,
+        "size must be a multiple of 4 (allocated as F32)"
+    );
     let mut gpu = hipfire_rdna::Gpu::init().expect("gpu");
     // Warm the context so its own allocations are not attributed to the test.
-    let _warm = gpu.alloc_tensor(&[1024], hipfire_rdna::DType::F32).expect("warm");
+    let _warm = gpu
+        .alloc_tensor(&[1024], hipfire_rdna::DType::F32)
+        .expect("warm");
 
     let before = gtt_used();
     let mut keep = Vec::with_capacity(count);

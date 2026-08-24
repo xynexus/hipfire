@@ -1712,8 +1712,7 @@ impl MoePrefillDtypes {
                     expert_down: ffn.expert_down_dtype?,
                     expert_gate_up_uniform: true,
                     expert_down_uniform: true,
-                    routed_oq_mixed_compact: ffn.expert_gate_up_dtype?
-                        == DType::OqCompactG256,
+                    routed_oq_mixed_compact: ffn.expert_gate_up_dtype? == DType::OqCompactG256,
                     routed_profile: RoutedExpertDtypeProfile::Uniform(ffn.expert_gate_up_dtype?),
                 });
             } else {
@@ -2092,8 +2091,7 @@ fn moe_ffn_batched_admissible_for_dtypes(
     let shared_matches_routed = dtypes.shared_expert_gate == dtypes.expert_gate_up
         && dtypes.shared_expert_down == dtypes.expert_down;
 
-    shared_matches_routed
-        || moe_routed_dispatch_supported_for_dtype(dtypes.expert_gate_up, arch)
+    shared_matches_routed || moe_routed_dispatch_supported_for_dtype(dtypes.expert_gate_up, arch)
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
@@ -2305,7 +2303,10 @@ pub fn prefill_batch_pbs_eligible(
         } else if n < MIN_BATCH {
             format!("per-token (n={n} < MIN_BATCH={MIN_BATCH})")
         } else if !matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16) {
-            format!("per-token (dn_state.quant={:?}, needs FP32|FP16)", dn_state.quant)
+            format!(
+                "per-token (dn_state.quant={:?}, needs FP32|FP16)",
+                dn_state.quant
+            )
         } else {
             "per-token (a per-layer dtype/MoE condition declined — HIPFIRE_KERNEL_TRACE=1 names the layer)".to_string()
         },

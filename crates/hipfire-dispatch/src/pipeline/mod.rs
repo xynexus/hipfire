@@ -510,8 +510,7 @@ fn run_moe_decode_routed(
             1,
         ))?;
         if std::env::var("HIPFIRE_MOE_FEED_DEBUG").as_deref() == Ok("1") {
-            static ONCE: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let x = gpu.download_f32(p.x_rot_expanded).unwrap_or_default();
                 let sums: f64 = x.iter().map(|v| *v as f64 * *v as f64).sum();
@@ -553,9 +552,8 @@ fn run_moe_decode_routed(
             hip!(gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
-                p.expert_gate_up_strides.expect(
-                    "compact routed gate_up needs the per-expert stride table",
-                ),
+                p.expert_gate_up_strides
+                    .expect("compact routed gate_up needs the per-expert stride table",),
                 p.x_rot_expanded,
                 p.gate_batch,
                 p.up_batch,
@@ -2180,21 +2178,23 @@ pub fn run_moe_prefill(
                         // Compact-resident, possibly mixed with promoted Oq8
                         // experts in this layer -- the stride table disambiguates
                         // per expert.
-                        hip!(gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
-                            p.expert_gate_up_ptrs,
-                            p.topk_indices,
-                            p.expert_gate_up_strides.expect(
-                                "compact routed gate_up needs the per-expert stride table",
-                            ),
-                            p.x_rot_expanded,
-                            p.gate_batch,
-                            p.up_batch,
-                            2 * mi,
-                            gate_up_k,
-                            k_top,
-                            n,
-                            true,
-                        ))
+                        hip!(
+                            gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                                p.expert_gate_up_ptrs,
+                                p.topk_indices,
+                                p.expert_gate_up_strides.expect(
+                                    "compact routed gate_up needs the per-expert stride table",
+                                ),
+                                p.x_rot_expanded,
+                                p.gate_batch,
+                                p.up_batch,
+                                2 * mi,
+                                gate_up_k,
+                                k_top,
+                                n,
+                                true,
+                            )
+                        )
                     } else if dt == DType::Oq4G256 {
                         hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                             p.expert_gate_up_ptrs,

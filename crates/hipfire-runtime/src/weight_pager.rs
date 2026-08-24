@@ -926,9 +926,7 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
             // the byte count exactly. Asking the pager's question here would
             // over-estimate a compact artifact by 1.80x and refuse a load that
             // now fits -- which is precisely the 122B.
-            let len = if compact_resident
-                && tensor.quant_type == QuantType::OqPlusCompact.code()
-            {
+            let len = if compact_resident && tensor.quant_type == QuantType::OqPlusCompact.code() {
                 tensor.data_size
             } else {
                 module_tensor_resident_len(tensor).unwrap_or(tensor.data_size)
@@ -1463,9 +1461,7 @@ impl WeightPager {
             .module_catalog
             .iter()
             .filter(|(key, _)| key.layer == layer)
-            .map(|(_, module)| {
-                module_resident_len(module).map(|size| gtt_alloc_cost(size) as u64)
-            })
+            .map(|(_, module)| module_resident_len(module).map(|size| gtt_alloc_cost(size) as u64))
             .collect::<Result<Vec<_>, _>>()?;
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let need: u64 = sizes.iter().take(k).sum();

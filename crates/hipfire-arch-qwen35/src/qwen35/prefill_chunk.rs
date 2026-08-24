@@ -787,8 +787,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 let dm = ffn.shared_expert.down.m;
                 let dk = ffn.shared_expert.down.k;
                 let shared_down_scratch = pbs.x_rot_batch.sub_offset(0, n * dm);
-                let bs =
-                    super::prefill_batch::oq_compact_block_stride(&ffn.shared_expert.down)?;
+                let bs = super::prefill_batch::oq_compact_block_stride(&ffn.shared_expert.down)?;
                 gpu.quantize_act_oq8_batched_interleaved(shared_rot, dm, dk, n)?;
                 gpu.gemm_oq_compact_grouped_prequant(
                     &ffn.shared_expert.down.buf,
@@ -1377,9 +1376,10 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         // the kernel which each is. This arm's absence is what
                         // faulted the 122B: compact bytes reached the Oq8 branch
                         // below and were read at a 260-byte stride.
-                        let strides = ffn.expert_gate_up_strides.as_ref().expect(
-                            "compact routed gate_up needs the per-expert stride table",
-                        );
+                        let strides = ffn
+                            .expert_gate_up_strides
+                            .as_ref()
+                            .expect("compact routed gate_up needs the per-expert stride table");
                         gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
                             &ffn.expert_gate_up_ptrs,
                             topk_indices,
@@ -1983,7 +1983,10 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         !gu.is_empty()
             && gu.iter().all(servable)
             && dn.iter().all(servable)
-            && gu.iter().chain(dn.iter()).any(|d| *d == DType::OqCompactG256)
+            && gu
+                .iter()
+                .chain(dn.iter())
+                .any(|d| *d == DType::OqCompactG256)
     };
     let (routed_gate_up_dtype, routed_down_dtype) = if routed_representative_compact {
         (DType::OqCompactG256, DType::OqCompactG256)
@@ -2555,7 +2558,8 @@ pub(crate) fn forward_prefill_chunk(
     if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
         let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none())).then(|| format!("{:?}", l.wq.gpu_dtype))
+                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none()))
+                    .then(|| format!("{:?}", l.wq.gpu_dtype))
             }
             _ => None,
         });

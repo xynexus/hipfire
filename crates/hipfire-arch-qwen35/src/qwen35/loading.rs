@@ -827,7 +827,7 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 // layout version: a future layout change takes a NEW code, so a stale artifact
 // refuses via the loader's catch-all rather than reading as garbage.
 pub use hipfire_runtime::hfq::{
-    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, oq8_arch_load,
+    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, oq8_arch_load_allow_compact,
     OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 
@@ -1130,7 +1130,7 @@ fn load_weight_tensor_raw(
             // OQ) all resolve through the shared runtime helper to the combined
             // Oq8G256 device layout consumed by the iu8 GEMV/GEMM kernels. Routed
             // MoE experts keep their indexed block layout in `load_moe_expert`.
-            let (bytes, gpu_dtype) = oq8_arch_load(quant_type, data, m, k)
+            let (bytes, gpu_dtype) = oq8_arch_load_allow_compact(quant_type, data, m, k)
                 .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {

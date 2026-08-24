@@ -63,7 +63,7 @@ fn split_planes(blocks: &[u8], nblk: usize, stride: usize, group: usize) -> Vec<
 }
 
 /// Launch geometry for the CURRENT rung. Update together with the kernel.
-const BM: usize = 16;   // rung 0
+const BM: usize = 16; // rung 0
 const BN: usize = 128;
 const THREADS: usize = 256;
 
@@ -207,7 +207,9 @@ fn main() {
                 }
             }
         }
-        let xs: Vec<f32> = (0..b * ng).map(|i| (i % 997) as f32 * 1e-5 + 1e-4).collect();
+        let xs: Vec<f32> = (0..b * ng)
+            .map(|i| (i % 997) as f32 * 1e-5 + 1e-4)
+            .collect();
         let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
         let x8b = gpu.upload_raw(&x8u, &[x8u.len()]).expect("x");
         let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");

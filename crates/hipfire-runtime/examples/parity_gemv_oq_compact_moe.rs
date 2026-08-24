@@ -162,7 +162,11 @@ impl Layout {
 fn stride_table(gpu: &mut Gpu, layout: Layout, n_exp: usize) -> hipfire_rdna::GpuTensor {
     let v: Vec<f32> = (0..n_exp)
         .map(|e| {
-            let st: i32 = if layout.compact(e) { BLOCK_STRIDE as i32 } else { 0 };
+            let st: i32 = if layout.compact(e) {
+                BLOCK_STRIDE as i32
+            } else {
+                0
+            };
             f32::from_bits(st as u32)
         })
         .collect();
@@ -194,10 +198,13 @@ fn f32b(v: &[f32]) -> Vec<u8> {
 /// Largest relative difference between two vectors, scaled by the reference's
 /// own magnitude so a near-zero output cannot manufacture a huge ratio.
 fn max_rel(a: &[f32], b: &[f32]) -> f64 {
-    let scale = a.iter().fold(0f64, |m, v| m.max((*v as f64).abs())).max(1e-30);
-    a.iter()
-        .zip(b)
-        .fold(0f64, |m, (x, y)| m.max(((*x as f64) - (*y as f64)).abs() / scale))
+    let scale = a
+        .iter()
+        .fold(0f64, |m, v| m.max((*v as f64).abs()))
+        .max(1e-30);
+    a.iter().zip(b).fold(0f64, |m, (x, y)| {
+        m.max(((*x as f64) - (*y as f64)).abs() / scale)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -213,14 +220,14 @@ fn run_case(
     let ng = k / GROUP;
     let mi = m / 2;
 
-    let raw: Vec<Vec<u8>> = (0..n_exp).map(|e| build_expert(11 + e as u32, m, k)).collect();
+    let raw: Vec<Vec<u8>> = (0..n_exp)
+        .map(|e| build_expert(11 + e as u32, m, k))
+        .collect();
     let logical: Vec<Vec<f32>> = raw.iter().map(|b| decode_logical(b, m, k)).collect();
 
     // Every expert must actually be selected, or an addressing bug in an
     // unvisited slot passes silently.
-    let topk: Vec<i32> = (0..batch * K_TOP)
-        .map(|j| (j % n_exp) as i32)
-        .collect();
+    let topk: Vec<i32> = (0..batch * K_TOP).map(|j| (j % n_exp) as i32).collect();
 
     // x is PER-SLOT ([N x K_TOP x K]): routed experts carry different AWQ
     // scales, so a shared-x kernel cannot pass this.
@@ -257,7 +264,9 @@ fn run_case(
     let saving = bytes_oq8 as f64 / bytes_now as f64;
     let _ = ng;
 
-    let up = |g: &mut Gpu, blobs: &[Vec<u8>]| -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
+    let up = |g: &mut Gpu,
+              blobs: &[Vec<u8>]|
+     -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
         let ts: Vec<_> = blobs
             .iter()
             .map(|b| g.upload_raw(b, &[b.len()]).unwrap())
@@ -277,7 +286,13 @@ fn run_case(
     let strides = stride_table(gpu, layout, n_exp);
 
     let idx_t = gpu
-        .upload_raw(&topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[topk.len()])
+        .upload_raw(
+            &topk
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[topk.len()],
+        )
         .unwrap();
     let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
 
@@ -286,11 +301,21 @@ fn run_case(
     let (gc, uc) = (mk(gpu, batch * K_TOP * mi), mk(gpu, batch * K_TOP * mi));
 
     if batch == 1 {
-        gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8, &idx_t, &x_t, &g8, &u8_, m, k, true).unwrap();
-        gpu.gemv_oq_compact_moe_gate_up_k8_indexed(&ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, true).unwrap();
+        gpu.gemv_oq8g256_moe_gate_up_k8_indexed(&ptr8, &idx_t, &x_t, &g8, &u8_, m, k, true)
+            .unwrap();
+        gpu.gemv_oq_compact_moe_gate_up_k8_indexed(
+            &ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, true,
+        )
+        .unwrap();
     } else {
-        gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(&ptr8, &idx_t, &x_t, &g8, &u8_, m, k, K_TOP, batch, true).unwrap();
-        gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(&ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, K_TOP, batch, true).unwrap();
+        gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+            &ptr8, &idx_t, &x_t, &g8, &u8_, m, k, K_TOP, batch, true,
+        )
+        .unwrap();
+        gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+            &ptrc, &idx_t, &strides, &x_t, &gc, &uc, m, k, K_TOP, batch, true,
+        )
+        .unwrap();
     }
     gpu.device_synchronize().unwrap();
 
@@ -323,7 +348,9 @@ fn run_case(
 /// `down` writes `expert_outputs[N x K_TOP x M]` with no gate|up split, so it
 /// needs its own comparison rather than a flag on `run_case`.
 fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layout: Layout) -> bool {
-    let raw: Vec<Vec<u8>> = (0..n_exp).map(|e| build_expert(71 + e as u32, m, k)).collect();
+    let raw: Vec<Vec<u8>> = (0..n_exp)
+        .map(|e| build_expert(71 + e as u32, m, k))
+        .collect();
     let logical: Vec<Vec<f32>> = raw.iter().map(|b| decode_logical(b, m, k)).collect();
     let topk: Vec<i32> = (0..batch * K_TOP).map(|j| (j % n_exp) as i32).collect();
 
@@ -351,8 +378,13 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layou
         .collect();
     let cmp_blobs: Vec<Vec<u8>> = layout_blobs(&raw, layout, m, k);
 
-    let up = |g: &mut Gpu, blobs: &[Vec<u8>]| -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
-        let ts: Vec<_> = blobs.iter().map(|b| g.upload_raw(b, &[b.len()]).unwrap()).collect();
+    let up = |g: &mut Gpu,
+              blobs: &[Vec<u8>]|
+     -> (Vec<hipfire_rdna::GpuTensor>, hipfire_rdna::GpuTensor) {
+        let ts: Vec<_> = blobs
+            .iter()
+            .map(|b| g.upload_raw(b, &[b.len()]).unwrap())
+            .collect();
         let ptrs: Vec<f32> = ts
             .iter()
             .flat_map(|t| {
@@ -367,14 +399,22 @@ fn run_down(gpu: &mut Gpu, m: usize, k: usize, n_exp: usize, batch: usize, layou
     let (_kc, ptrc) = up(gpu, &cmp_blobs);
     let strides = stride_table(gpu, layout, n_exp);
     let idx_t = gpu
-        .upload_raw(&topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &[topk.len()])
+        .upload_raw(
+            &topk
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[topk.len()],
+        )
         .unwrap();
     let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
     let o8 = gpu.alloc_tensor(&[batch * K_TOP * m], DType::F32).unwrap();
     let oc = gpu.alloc_tensor(&[batch * K_TOP * m], DType::F32).unwrap();
 
-    gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(&ptr8, &idx_t, &x_t, &o8, m, k, K_TOP, batch)
-        .unwrap();
+    gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+        &ptr8, &idx_t, &x_t, &o8, m, k, K_TOP, batch,
+    )
+    .unwrap();
     gpu.gemv_oq_compact_moe_down_k8_indexed_batched_expanded(
         &ptrc, &idx_t, &strides, &x_t, &oc, m, k, K_TOP, batch,
     )
@@ -413,8 +453,7 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize, proj: &str) -
     let mut compact_flags = Vec::new();
     let (mut m, mut k) = (0usize, 0usize);
     for e in 0..n_exp {
-        let name =
-            format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}.weight");
+        let name = format!("model.language_model.layers.{layer}.mlp.experts.{e}.{proj}.weight");
         let Some((info, buf)) = hfq.tensor_data_pread(&name) else {
             println!("  tensor not found: {name}");
             return false;
@@ -470,7 +509,8 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize, proj: &str) -
                 normalize_compact_overlays(&mut owned, m, k, GROUP);
                 split_compact_planes(&owned, m, k, GROUP)
             } else {
-                hipfire_runtime::oq_moe::oq8_canonical_to_moe_blocks(b, m, k).expect("oq8 canonical")
+                hipfire_runtime::oq_moe::oq8_canonical_to_moe_blocks(b, m, k)
+                    .expect("oq8 canonical")
             }
         })
         .collect();
@@ -502,7 +542,10 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize, proj: &str) -
     let st_t = gpu.upload_f32(&strides, &[strides.len()]).unwrap();
     let idx_t = gpu
         .upload_raw(
-            &topk.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &topk
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
             &[topk.len()],
         )
         .unwrap();
@@ -600,7 +643,11 @@ fn run_real(gpu: &mut Gpu, path: &str, layer: usize, n_exp: usize, proj: &str) -
         let stride = raw[e].len() / (m * (k / GROUP));
         println!(
             "      slot {t} expert {e}: err {se:.3e}  {}  bytes={} stride={stride} n_ov={}",
-            if compact_flags[e] { "compact" } else { "promoted" },
+            if compact_flags[e] {
+                "compact"
+            } else {
+                "promoted"
+            },
             raw[e].len(),
             (stride as i64 - 130) / 2,
         );
@@ -720,7 +767,11 @@ fn main() {
     let m: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
     let k: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
     let n_exp: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(4);
-    assert_eq!(m % 2, 0, "M must be even -- the kernel splits rows into gate|up");
+    assert_eq!(
+        m % 2,
+        0,
+        "M must be even -- the kernel splits rows into gate|up"
+    );
     assert_eq!(k % GROUP, 0, "K must be a multiple of {GROUP}");
 
     let mut gpu = Gpu::init().unwrap();
@@ -740,7 +791,10 @@ fn main() {
                 None => println!("  {name}: not compact / not found / unusable K"),
             }
         }
-        println!("{} ({ran} checks)", if all { "ALL PASS" } else { "FAILURES PRESENT" });
+        println!(
+            "{} ({ran} checks)",
+            if all { "ALL PASS" } else { "FAILURES PRESENT" }
+        );
         std::process::exit(if all { 0 } else { 1 });
     }
     if std::env::args().nth(1).as_deref() == Some("--hfq") {
@@ -771,7 +825,10 @@ fn main() {
                 ran += 1;
             }
         }
-        println!("{} ({ran} checks)", if all { "ALL PASS" } else { "FAILURES PRESENT" });
+        println!(
+            "{} ({ran} checks)",
+            if all { "ALL PASS" } else { "FAILURES PRESENT" }
+        );
         std::process::exit(if all { 0 } else { 1 });
     }
     println!("compact-resident indexed MoE GEMV parity (M={m} K={k} experts={n_exp})");
@@ -782,7 +839,15 @@ fn main() {
         // A second K exercising a different group count, and a shape closer to a
         // real `down` projection.
         all &= run_case(&mut gpu, "gate_up K=512", m, 512, n_exp, 2, layout);
-        all &= run_case(&mut gpu, "gate_up M=256 K=2048", 256, 2048, n_exp, 2, layout);
+        all &= run_case(
+            &mut gpu,
+            "gate_up M=256 K=2048",
+            256,
+            2048,
+            n_exp,
+            2,
+            layout,
+        );
         // `down` is the other shape in a real layer: K is the moe_intermediate,
         // so it is smaller and the group count much lower than gate_up's.
         all &= run_down(&mut gpu, 512, 512, n_exp, 1, layout);

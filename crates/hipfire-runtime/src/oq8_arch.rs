@@ -448,7 +448,44 @@ fn compact_shape_selected(m: usize, k: usize) -> bool {
         && dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_M, m)
 }
 
+/// Load an OQ8-family tensor, EXPANDING `OqPlusCompact` to `Oq8G256`.
+///
+/// This is the entry every arch gets by default, and it must stay the expanding
+/// one. Compact residency was briefly wired into the shared loader behind a
+/// global env flag, which silently changed the on-device LAYOUT for every caller
+/// -- including `deepseek4`, `minimax`, `nemotron`, `qwen2` and `zaya`, none of
+/// which have an `OqCompactG256` arm anywhere. Their kernels would have read
+/// split nibble planes as combined int8. Caught by a zaya unit test asserting
+/// the dtype; the other four had no such test and would have failed at runtime.
+///
+/// Compact residency is a per-ARCH capability, not a global mode. An arch that
+/// can decode the split planes calls [`oq8_arch_load_allow_compact`] to opt in.
 pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    oq8_arch_load_inner(qt, data, m, k, false)
+}
+
+/// [`oq8_arch_load`] for callers that CAN decode compact planes: honours
+/// `HIPFIRE_OQ_COMPACT_RESIDENT` and keeps `OqPlusCompact` at ~4.25 bits/weight
+/// instead of unpacking it to one int8 per weight.
+///
+/// Only `qwen35` decodes this today (`gemv_oq_compact_*`,
+/// `gemm_oq_compact_*`). Do not call it from an arch without those kernels.
+pub fn oq8_arch_load_allow_compact(
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Option<(Vec<u8>, DType)> {
+    oq8_arch_load_inner(qt, data, m, k, true)
+}
+
+fn oq8_arch_load_inner(
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    allow_compact: bool,
+) -> Option<(Vec<u8>, DType)> {
     // Compact residency: hand the OqPlusCompact blocks to the device untouched
     // so oq4.25++ stays ~4.25 bits/weight instead of being unpacked to one int8
     // per weight here. `gemm_oq_compact_grouped_wmma` decodes the nibbles and
@@ -464,7 +501,7 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
     // a single (M, K) projection class. Purely diagnostic: unset (the normal
     // case) keeps every OqPlusCompact tensor compact, exactly as before. The
     // shape is the handle because this hook never sees the tensor name.
-    if compact_resident_enabled() && compact_shape_selected(m, k) {
+    if allow_compact && compact_resident_enabled() && compact_shape_selected(m, k) {
         if qt == QuantType::OqPlusCompact.code() {
             let mut owned = data.to_vec();
             normalize_compact_overlays(&mut owned, m, k, 256);

@@ -28,7 +28,8 @@ pub use crate::oq4_arch::{
     OQ4_CANONICAL_QT,
 };
 pub use crate::oq8_arch::{
-    oq4_to_oq8_combined, oq8_arch_load, oq8_combined, oqplus_compact_to_oq8_combined,
+    oq4_to_oq8_combined, oq8_arch_load, oq8_arch_load_allow_compact, oq8_combined,
+    oqplus_compact_to_oq8_combined,
 };
 
 pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
