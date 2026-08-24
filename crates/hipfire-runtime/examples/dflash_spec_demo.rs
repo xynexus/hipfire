@@ -79,8 +79,85 @@
 use hipfire_runtime::kv::KvCache;
 
 #[cfg(not(feature = "deltanet"))]
+
 fn main() {
     eprintln!("build with --features deltanet");
+}
+
+/// A trained low-rank Markov (bigram) head — DSpark's `markov_w1`/`markov_w2`
+/// `[vocab, rank]` shape, scoring `w1[prev] . w2[next]`.
+///
+/// Only tokens seen in training carry a row, so the argmax is over `n_obs`
+/// (hundreds) rather than the 248320-row vocabulary. That is what makes a
+/// host-side draft cheap enough to be worth doing: without it, one drafted
+/// token is 248320*rank multiply-adds on the CPU and the "free drafting"
+/// premise collapses immediately.
+struct MarkovHead {
+    rank: usize,
+    obs: Vec<u32>,
+    index: std::collections::HashMap<u32, usize>,
+    w1: Vec<f32>, // [n_obs * rank], row per PREV token
+    w2: Vec<f32>, // [n_obs * rank], row per NEXT token
+}
+
+impl MarkovHead {
+    fn load(path: &str) -> std::io::Result<Self> {
+        let b = std::fs::read(path)?;
+        assert_eq!(&b[0..4], b"MKV1", "markov head: bad magic");
+        let rank = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+        let mut o = 12usize;
+        let obs: Vec<u32> = (0..n)
+            .map(|i| u32::from_le_bytes(b[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        o += 4 * n;
+        let take = |o: usize| -> Vec<f32> {
+            (0..n * rank)
+                .map(|i| f32::from_le_bytes(b[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+                .collect()
+        };
+        let w1 = take(o);
+        let w2 = take(o + 4 * n * rank);
+        let index = obs.iter().copied().enumerate().map(|(i, t)| (t, i)).collect();
+        Ok(Self { rank, obs, index, w1, w2 })
+    }
+
+    /// argmax_next of `w1[prev] . w2[*]`. `None` when `prev` was never seen —
+    /// no evidence, so the caller must fall back rather than guess.
+    fn next(&self, prev: u32) -> Option<u32> {
+        let i = *self.index.get(&prev)?;
+        let a = &self.w1[i * self.rank..(i + 1) * self.rank];
+        let mut best = f32::NEG_INFINITY;
+        let mut arg = 0usize;
+        for j in 0..self.obs.len() {
+            let bvec = &self.w2[j * self.rank..(j + 1) * self.rank];
+            let mut dot = 0f32;
+            for k in 0..self.rank {
+                dot += a[k] * bvec[k];
+            }
+            if dot > best {
+                best = dot;
+                arg = j;
+            }
+        }
+        Some(self.obs[arg])
+    }
+
+    /// Chain `n` tokens by feeding each prediction back in — the drafting shape.
+    fn spine(&self, seed: u32, n: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(n);
+        let mut cur = seed;
+        for _ in 0..n {
+            match self.next(cur) {
+                Some(t) => {
+                    out.push(t);
+                    cur = t;
+                }
+                None => break,
+            }
+        }
+        out
+    }
 }
 
 #[cfg(feature = "deltanet")]
@@ -495,6 +572,9 @@ fn main() {
     //            structurally-acceptable candidate (Steps 2+3).
     // Implies --ddtree (and uses --ddtree-budget / --ddtree-topk).
     let mut ddtree_path_c_phase: Option<String> = None;
+    // --markov-head <file.mkv>: draft the spine from a trained low-rank bigram
+    // head instead of the DFlash model, i.e. the 'near-free drafting' shape.
+    let mut markov_head_path: Option<String> = None;
     // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
     // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
     // Default ON (2026-04-17): bare prompts send the model off-distribution.
@@ -762,6 +842,10 @@ fn main() {
                 }
                 ddtree_path_c_phase = Some(phase);
                 ddtree_enabled = true; // implies --ddtree
+                i += 2;
+            }
+            "--markov-head" => {
+                markov_head_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--chatml" => {
@@ -1701,6 +1785,18 @@ fn main() {
         // PLD stats: hits = cycles where a spine was substituted for DFlash;
         // accepted_from_pld = accepted count on those cycles (for τ_pld).
         let mut pld_hits: usize = 0;
+    let markov_head: Option<MarkovHead> = markov_head_path
+        .as_deref()
+        .map(|p| MarkovHead::load(p).expect("failed to load --markov-head"));
+    if let Some(h) = markov_head.as_ref() {
+        eprintln!(
+            "markov head: rank={} n_obs={} (drafts the spine when PLD misses)",
+            h.rank,
+            h.obs.len()
+        );
+    }
+    let mut markov_hits = 0usize;
+    let mut markov_miss = 0usize;
         let mut pld_accepted: usize = 0;
 
         if ddtree_enabled {
@@ -2108,13 +2204,31 @@ fn main() {
             // chain length clear their thresholds. Weaker matches are a net loss
             // when DFlash is strong (repetition-heavy content where literal
             // 3-gram matches predict the wrong number/variable in a list).
-            let pld_spine: Option<&[u32]> = pld_match.as_ref().and_then(|m| {
+            let pld_spine_owned: Option<Vec<u32>> = pld_match.as_ref().and_then(|m| {
                 if m.consensus >= pld_min_consensus && m.tokens.len() >= pld_min_chain {
-                    Some(m.tokens.as_slice())
+                    Some(m.tokens.clone())
                 } else {
                     None
                 }
             });
+            // Markov head drafts the spine when PLD has no match. Same slot, so
+            // the model draft is skipped entirely — this IS the "drafting goes
+            // near-free" shape the plan wanted priced.
+            let pld_spine_owned = match (pld_spine_owned, markov_head.as_ref()) {
+                (Some(v), _) => Some(v),
+                (None, Some(h)) => {
+                    let sp = h.spine(seed_token, current_adaptive_b.saturating_sub(1));
+                    if sp.is_empty() {
+                        markov_miss += 1;
+                        None
+                    } else {
+                        markov_hits += 1;
+                        Some(sp)
+                    }
+                }
+                (None, None) => None,
+            };
+            let pld_spine: Option<&[u32]> = pld_spine_owned.as_deref();
             let used_pld = pld_spine.is_some();
             if used_pld {
                 pld_hits += 1;
@@ -2781,6 +2895,13 @@ fn main() {
                 hit_rate * 100.0,
                 tau_pld,
                 tau_dflash,
+            );
+        }
+        if markov_hits + markov_miss > 0 {
+            eprintln!(
+                "markov-head: spine_hits={} no_evidence={} (a miss means the head \
+                 never saw that token; the DFlash model draft runs instead)",
+                markov_hits, markov_miss
             );
         }
         // ── End of per-row loop body ──────────────────────────────

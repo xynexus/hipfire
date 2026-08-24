@@ -410,3 +410,50 @@ be a cheap FIRST-STAGE that a real drafter falls back on, or a component of a
 full DSpark drafter (main projection + markov + confidence) rather than a
 replacement for DFlash2. Neither is what the plan asked for, and neither is
 worth building until the tail work above lands.
+
+
+## Phase 2b COMPLETE: head trained, wired, and measured — it loses 2.6-2.9x
+
+The plan said train + wire a Markov head. Done, end to end, rather than argued
+about. Three artifacts:
+
+* `scripts/train_markov_head.py` — fits a rank-r factorization of the bigram
+  matrix (DSpark's `markov_w1`/`markov_w2` `[vocab, rank]` shape) and writes an
+  MKV1 file. Only observed tokens get a row, which keeps the argmax O(n_obs*r);
+  without that a single drafted token is 248320*rank host multiply-adds and the
+  "free drafting" premise dies before it is measured.
+* `dflash_spec_demo --markov-head <file.mkv>` — loads it and drafts the SPINE
+  from it, filling the same slot PLD uses, so the DFlash model draft is skipped
+  entirely. That is exactly the shape the plan wanted priced.
+* `scripts/markov_head_tau_ceiling.py` — the ceiling harness.
+
+Trained on 2560 tokens the target itself generated (10 prompts). rank=32,
+n_obs=798. Its argmax agrees with the FULL bigram table only **45.2%** of the
+time — a low-rank approximation is strictly worse than the table it approximates,
+which is what the ceiling argument said and this quantifies.
+
+Measured, 96 tokens, same binary, only the drafter differing:
+
+```
+                tau      decode tok/s
+hd  DFlash2    3.571     35.42
+hd  Markov     0.397     13.67      -61%
+fr  DFlash2    5.733     57.82
+fr  Markov     1.159     20.23      -65%
+```
+
+Output stays coherent under the Markov head — the target verifies every token,
+so this costs speed, never correctness.
+
+Measured tau is BELOW the 2.028 full-bigram ceiling, as it must be: the rank-32
+approximation loses 55% of the table's argmaxes, and the spine chains 7
+predictions so per-token error compounds.
+
+This closes the question the plan opened. The arithmetic was: at best +5.10% from
+free drafting (the drafter's whole GPU share) against a tau collapse. Measured:
+-61 to -65%. The head is real, trained, wired, opt-in behind `--markov-head`, and
+should not be turned on for this model.
+
+Where it could still earn its place: as a cheap FIRST STAGE behind a real
+drafter, or as one component of a full DSpark drafter (main projection + markov +
+confidence) — not as a replacement for DFlash2.
