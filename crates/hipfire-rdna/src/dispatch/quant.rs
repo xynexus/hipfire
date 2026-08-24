@@ -784,7 +784,7 @@ impl Gpu {
                 y_f32.buf.as_ptr(),
             );
             let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
-            let grid = ((m as u32).div_ceil(2 * 8)).clamp(1, 2048);
+            let grid = ((m as u32).div_ceil(3 * 8)).clamp(1, 2048);
             return self.launch_kernargs(
                 entry,
                 [grid, 1, 1],

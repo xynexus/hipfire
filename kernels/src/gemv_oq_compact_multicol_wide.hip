@@ -182,7 +182,7 @@ static __device__ __forceinline__ void oqcmw_body(
         const uint8_t* __restrict__ W, const int8_t* __restrict__ Xq,          \
         const float* __restrict__ Xs, float* __restrict__ Y,                   \
         int M, int K, int B, int block_stride                                  \
-    ) { (void)B; oqcmw_body<N, 2>(W, Xq, Xs, Y, M, K, block_stride); }
+    ) { (void)B; oqcmw_body<N, 3>(W, Xq, Xs, Y, M, K, block_stride); }
 
 OQCMW_ENTRY(1)  OQCMW_ENTRY(2)  OQCMW_ENTRY(3)  OQCMW_ENTRY(4)
 OQCMW_ENTRY(5)  OQCMW_ENTRY(6)  OQCMW_ENTRY(7)  OQCMW_ENTRY(8)
