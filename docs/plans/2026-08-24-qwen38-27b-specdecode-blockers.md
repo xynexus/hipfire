@@ -140,3 +140,63 @@ printf '%s\n' '{"type":"load","model":".../Qwen3.8-27B--oq4.25++.hfq","params":{
   '{"type":"unload"}' | hipfire-daemon
 # HIPFIRE_DEBUG_PREFILL_ELIGIBLE=1 prints the verdict and kv_f32 directly.
 ```
+
+
+## The ceiling, computed — 55 tok/s is not reachable with this drafter
+
+`HIPFIRE_DFLASH_BLOCK` (added here) sweeps the draft block size. Decode is nearly
+FLAT in B, which is itself the finding:
+
+| B | tau | accept_rate | decode tok/s |
+|---|---|---|---|
+| 2 | 0.853 | 0.426 | 5.59 |
+| 3 | 1.37 | 0.457 | 6.18 |
+| 4 | 1.75 | 0.438 | **6.23** |
+| 6 | 2.25 | 0.375 | 6.19 |
+| 8 | 2.421 | 0.303 | 6.13 |
+
+Flat in B means a fixed per-cycle cost dominates, and the phase timings say which:
+
+```
+B=2   draft= 13.8ms   verify=310ms   replay=67ms
+B=8   draft= 51.5ms   verify=322ms   replay=67ms
+```
+
+**Verify is constant in B.** It is not per-token (that would be 8x69=552ms at
+B=8); it is a fixed ~4.5 weight sweeps per cycle where a batched forward should
+cost ~1. Draft scales cleanly at ~6.5 ms/token.
+
+### What a perfect verify would buy, and what it would not
+
+At 1 sweep (69ms) and ignoring replay:
+
+```
+B=2  10.4    B=3  15.5    B=4  18.4    B=6  20.8    B=8  20.0   tok/s
+```
+
+Best ~20.8 at B=6 — a 43% win over plain decode's 14.5, and enough to unpark
+both drafters. But 55 tok/s needs:
+
+```
+B=4: tau 5.22 (131% acceptance — impossible)
+B=6: tau 5.94  (99%)
+B=8: tau 6.65  (83%)
+```
+
+against a measured 30%. **55 tok/s is a drafter-quality bound, not an
+implementation one.** No amount of verify or block-size work reaches it; it needs
+a drafter that accepts ~5-6x more, or a target cheap enough per sweep that the
+whole budget shrinks.
+
+### The verify defect is still worth fixing
+
+Verify IS batch-eligible (`final=true n=8`, confirmed 19/19 cycles), so it takes
+the batched path and is still 4.5x off. The likely cause is kernel SHAPE:
+`gemm_oq_compact_iu4x2_w64` is tuned for large-n prefill (N-heavy 2x8 tiling,
+~50% of peak at prefill widths) and at n=8 it wastes most of its lanes while
+still reading every weight byte. A multi-column GEMV in exactly this shape
+already exists and appears in the profile —`gemv_oq_compact_multicol_b8`— so the
+fix is likely routing small-n verify to it rather than writing a new kernel.
+
+Expected: verify 310 -> ~70ms, spec decode 6.2 -> ~20 tok/s, beating plain decode
+for the first time on this model.
