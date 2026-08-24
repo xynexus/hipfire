@@ -1079,12 +1079,31 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
 /// serial": the branch below it replays through `forward_prefill_batch`, which
 /// needs no tape. Each serial step is a whole weight sweep, so at tau 2.6 the
 /// rollback costs ~2.6 sweeps where the batched replay costs one.
+///
+/// DEFAULT-ON since 2026-08-24, and the reason is correctness before speed. The
+/// serial path was the "conservative default while proving rollback parity";
+/// measured against plain AR decode on Qwen3.8-27B/DFlash2 over a five-prompt
+/// mix, greedy, it is the serial path that DIVERGES and the batched one that is
+/// exact:
+///
+///     serial  (this off)  -> differs from plain AR
+///     batched (this on)   -> BYTE-IDENTICAL to plain AR
+///
+/// Deterministic across repeated runs both ways. Spec decode's whole guarantee
+/// is that it cannot change the output, so a rollback that diverges from AR is
+/// not the conservative choice — it is the incorrect one, and it had been the
+/// default the entire time.
+///
+/// It is also faster, which is the smaller point: replay 470ms -> ~one sweep on
+/// a partially-accepted cycle, decode 16.4 -> 18.8 tok/s on the code prompt.
+///
+/// `HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL=0` restores the serial replay.
 fn dflash_rollback_batched_prefill_from_env() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL")
             .ok()
             .as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
 
