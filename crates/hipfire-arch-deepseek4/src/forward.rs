@@ -1592,6 +1592,38 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // Paged experts and whole-forward graph capture are mutually exclusive BY
+    // CONSTRUCTION, not by a bug worth fixing.
+    //
+    // A captured graph is a fixed sequence of device work with no host decisions
+    // in it. Paged experts require exactly such a decision, per MoE layer: read
+    // the router's top-k back, admit those experts, patch the pointer table.
+    // Attempting both makes the residency read a blocking D2H inside a capturing
+    // stream, which HIP refuses with
+    //
+    //     hipMemcpy D2H: operation would make the legacy stream depend on a
+    //     capturing blocking stream
+    //
+    // — a mid-decode hard error naming a HIP rule rather than the actual
+    // conflict. Nothing can be reordered to satisfy both: the decision depends on
+    // device work computed inside the region it would have to precede.
+    //
+    // So the combination resolves here, once, in favour of correctness: paging
+    // wins and capture is skipped. The alternative — capturing only the
+    // non-MoE spans — would leave many tiny graphs and give up most of the
+    // benefit for a model whose MoE layers dominate.
+    if weights.pager.is_some() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "[DeepSeek V4] HIP graph capture disabled: paged experts are active. \
+Expert admission is a host decision per MoE layer and a captured graph admits none. \
+Unset HIPFIRE_DEEPSEEK4_PAGED_EXPERTS to capture."
+            );
+        });
+        return decode_step(cfg, weights, state, gpu, token_id, position);
+    }
     use std::sync::OnceLock;
     // State-dependent kernargs (SWA slot/n_valid, indexer n_compressed/k_active,
     // compressor ring/commit slots) all live in `state.attn_state_buf` and
