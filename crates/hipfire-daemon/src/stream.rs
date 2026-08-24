@@ -67,11 +67,19 @@ pub(crate) fn executor_v2_enabled() -> bool {
 /// Off by default: it deliberately starves bulk work for as long as a
 /// latency-class stream is live, which is the right trade only when the operator
 /// has asked for it.
+/// Mirror of serving-core's `march_driven_prefill`, for the warning below.
+fn march_prefill_on() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_MARCH_PREFILL").ok().as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 pub(crate) fn warn_if_banding_without_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        if std::env::var("HIPFIRE_MARCH_PREFILL").is_ok() && !strict_priority_enabled() {
+        if march_prefill_on() && !strict_priority_enabled() {
             tracing::warn!(
                 "HIPFIRE_MARCH_PREFILL without HIPFIRE_EXECUTOR_STRICT_PRIORITY: banding \
                  prefill into the march makes streams SHARE it, which measured 2x WORSE \
@@ -82,12 +90,24 @@ pub(crate) fn warn_if_banding_without_priority() {
     });
 }
 
+/// Pause lower-priority streams entirely while a higher-priority one is
+/// runnable. ON by default; `HIPFIRE_EXECUTOR_STRICT_PRIORITY=0` restores
+/// fair-share ordering.
+///
+/// It starves bulk work while a latency-class stream is live, which is the
+/// point — and it costs nothing in the common case, because admission defaults
+/// `priority` to 0, so with no explicit priority every stream is in the top tier
+/// and the filter keeps all of them. It only bites once a client asks for it.
+///
+/// Defaulted on together with march-driven prefill, and it must stay paired with
+/// it: banding without this measured 2x WORSE time to first token for a
+/// priority-9 stream, because bands make streams share rather than yield.
 pub(crate) fn strict_priority_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HIPFIRE_EXECUTOR_STRICT_PRIORITY")
             .ok()
             .as_deref(),
-        Some("1" | "true" | "on" | "yes")
+        Some("0" | "false" | "off" | "no")
     )
 }
 
