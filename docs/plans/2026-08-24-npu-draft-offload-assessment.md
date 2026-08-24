@@ -69,8 +69,47 @@ whole approach is dead regardless of how good the kernels are, because 30
 dispatches cannot hide inside 80ms. If a drafter-shaped dispatch is ~1ms, the
 budget closes and the rest is worth building.
 
+## MEASURED: the NPU streams weights at ~3 GB/s, and that settles it
+
+Compiled artifacts DO exist (`~/.hipfire/npu/embgemma_aie2p_*` carry
+`final.xclbin` + `insts.bin`), so `npu_decode_bench` runs. Across every geometry
+that tiles:
+
+    K=2048 N=8192  8 dispatches   2.730 ms/token-linear  ->  3.1 GB/s W stream
+    K=2048 N=8192  8 dispatches   2.793 ms                   3.0 GB/s
+    K=2048 N=8192  8 dispatches   9.757 ms                   0.9 GB/s
+    K=2048 N=2048 16 dispatches   5.028 ms                   0.4 GB/s
+    (weight upload itself: 8 MB in 15.2 ms = 0.5 GB/s)
+
+The dispatch floor is FINE — 8 dispatches in 2.73 ms is 0.34 ms each, far better
+than the ~4 ms this tree had recorded. That was not the problem. The problem is
+streaming bandwidth: ~3 GB/s against the GPU's measured 250.
+
+    drafter sweep, 1.18 GiB
+      GPU    6.5 ms/token   (181 GB/s, 72% of peak)
+      NPU    390 ms/token   (at 3.1 GB/s)
+      ratio  60x slower
+
+A B=6 draft on the NPU is ~2.3 SECONDS per cycle against an 80 ms verify window.
+Fully overlapped it would still be the critical path by a factor of 29. The NPU
+would need 81x more streaming bandwidth just to MATCH the GPU, which is not a
+tuning gap.
+
+Caveat, stated plainly: these runs report MISMATCHES because the configs are
+guesses against harness kernels built for embedding-gemma, not for a drafter. The
+NUMERICS are wrong. But the timing is the throughput of dispatch + weight
+streaming on this hardware path, it is ~3 GB/s on every variant that ran, and no
+amount of kernel tuning closes 81x.
+
+Why this is consistent with "NPU ~55 TOPS ~= GPU ~56 TOPS": that is COMPUTE
+parity. Drafting at B=1 is bandwidth-bound, not compute-bound, and it is the
+memory path that differs by ~80x here. The NPU remains interesting for
+compute-dense batched work; sequential single-token drafting is the worst
+possible shape for it.
+
 ## Recommendation
 
-Do not start the DFlash2 NPU kernel yet. Measure the dispatch floor at the
-drafter's shape first — it is a single number that decides whether any of the
-remaining four items pay off.
+Do NOT build the DFlash2 NPU kernel. The dispatch floor was never the blocker and
+the bandwidth gap is not closeable by kernel work. The remaining GPU-side path to
+55 — verify 80ms against its 58ms floor, draft 39ms against 29ms — is a far
+better use of the same effort.
