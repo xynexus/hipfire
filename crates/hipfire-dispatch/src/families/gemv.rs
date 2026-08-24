@@ -540,6 +540,19 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             // A real GEMV, not the grouped WMMA GEMM at n=1: no activation
             // quantization (W4A16 at decode, as the other Opus decode GEMVs do)
             // and no wasted matrix tile.
+            {
+                // n=1 by construction here: this is the single-column GEMV.
+                // Recording bytes (not just calls) is what makes a [248320,
+                // 5120] lm_head at ~8 calls/cycle visible against thousands of
+                // small projections.
+                hipfire_rdna::kernel_trace::record_shape(
+                    "gemv_oq_compact_grouped(1col)",
+                    m,
+                    k,
+                    1,
+                    (m as u128) * (k as u128) * (block_stride as u128) / 256,
+                );
+            }
             hip!(gpu.gemv_oq_compact_grouped_auto(w.buf, x, y, m, k, GROUP, block_stride))
         }
         K::GemvOqCompactG128Prerotated => {
@@ -553,6 +566,19 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             // A real GEMV, not the grouped WMMA GEMM at n=1: no activation
             // quantization (W4A16 at decode, as the other Opus decode GEMVs do)
             // and no wasted matrix tile.
+            {
+                // n=1 by construction here: this is the single-column GEMV.
+                // Recording bytes (not just calls) is what makes a [248320,
+                // 5120] lm_head at ~8 calls/cycle visible against thousands of
+                // small projections.
+                hipfire_rdna::kernel_trace::record_shape(
+                    "gemv_oq_compact_grouped(1col)",
+                    m,
+                    k,
+                    1,
+                    (m as u128) * (k as u128) * (block_stride as u128) / 256,
+                );
+            }
             hip!(gpu.gemv_oq_compact_grouped_auto(w.buf, x, y, m, k, GROUP, block_stride))
         }
         K::GemvOq4G256Prerotated => {

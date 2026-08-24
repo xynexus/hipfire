@@ -2098,6 +2098,23 @@ fn moe_ffn_batched_admissible_for_dtypes(
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
 
+/// Whether compact-resident Opus may batch a forward that has a GdnTape in play.
+///
+/// This is consulted from TWO places — `prefill_batch_pbs_eligible` (does the
+/// batched path run at all) and `prefill_chunk`'s FA admission (do FullAttn
+/// layers batch inside it). They must agree: opening only the first lets the
+/// forward take the batched path while every FA layer still runs per-token,
+/// which is a full weight sweep per token with no outward sign except a
+/// GEMV-dominated histogram.
+///
+/// The guard existed because the lowered qkvza ladder tested `gdn_tape.is_some()`
+/// ABOVE its compact arm and so read compact blocks as HFQ4G256 (fixed in
+/// 61c300992). The tape WRITE itself is a dtype-independent memcpy, so with the
+/// ladder fixed the capture is valid. `HIPFIRE_COMPACT_GDN_TAPE=0` opts out.
+pub fn compact_tape_batching_allowed() -> bool {
+    std::env::var("HIPFIRE_COMPACT_GDN_TAPE").as_deref() != Ok("0")
+}
+
 /// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
 /// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
 /// handed to that forward will actually be populated. When this is false the
@@ -2199,8 +2216,7 @@ pub fn prefill_batch_pbs_eligible(
     // different hidden states than per-token and a drafter is sensitive to which
     // it gets, which is the same +-22% effect documented for
     // HIPFIRE_COMPACT_BATCHED_CAPTURE. Throughput wins well past that drift.
-    let allow_compact =
-        !tape_in_play || std::env::var("HIPFIRE_COMPACT_GDN_TAPE").as_deref() != Ok("0");
+    let allow_compact = !tape_in_play || compact_tape_batching_allowed();
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
@@ -2319,6 +2335,38 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.wo.gpu_dtype, arch, allow_compact)
                     && moe_ffn_batched_admissible(&l.ffn, arch),
         });
+    // Per-TERM verdict. The aggregate `verdict` is a conjunction of eight
+    // conditions and a false says nothing about which one — that ambiguity cost
+    // real time this session (the tree-verify assert blames "kv quant + FA
+    // weight dtypes" when the declining term is actually `gdn_tape.is_some()`
+    // via `allow_compact`). Name every term.
+    if hipfire_rdna::kernel_trace::enabled() {
+        let dn_ok = matches!(dn_state.quant, StateQuant::FP32 | StateQuant::FP16);
+        let any_dn = weights
+            .layers
+            .iter()
+            .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)));
+        let per_layer = weights.layers.iter().all(|lw| match lw {
+            LayerWeights::DeltaNet(l) => is_batchable_la(l.wqkv.gpu_dtype, arch, allow_compact),
+            LayerWeights::FullAttn(_) => true,
+            LayerWeights::DeltaNetMoe(l) => is_batchable_la(l.wqkv.gpu_dtype, arch, allow_compact),
+            LayerWeights::FullAttnMoe(l) => is_batchable_la(l.wq.gpu_dtype, arch, allow_compact),
+        });
+        eprintln!(
+            "[pbs-gate] verdict={verdict} | !force_fallback={} n>=MIN_BATCH={} dn_quant_ok={dn_ok} \
+             any_deltanet={any_dn} moe_topk_ok={moe_topk_ok} \
+             router_logits={moe_router_logits_present} per_layer_dtypes~={per_layer} \
+             || tape_in_play={tape_in_play} allow_compact={allow_compact} n={n} arch={arch}",
+            !force_fallback,
+            n >= MIN_BATCH,
+        );
+        if !verdict {
+            eprintln!(
+                "[pbs-gate] DECLINED -> the forward will drop to the PER-TOKEN loop \
+                 (one full weight sweep per token, and any passed GdnTape stays stale)"
+            );
+        }
+    }
     // Report the DECISION plus the first condition that would explain a false,
     // so a "per-token" line never needs a kernel trace to interpret.
     feature_report::note(

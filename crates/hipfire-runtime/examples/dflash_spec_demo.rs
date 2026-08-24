@@ -1848,6 +1848,10 @@ fn main() {
                     eprintln!("warning: failed to write --evidence-dir {dir}: {err}");
                 }
             }
+            // Kernel histogram + shaped traffic + SLOW PATHS, when HIPFIRE_KERNEL_TRACE=1.
+            // Printed next to the metrics deliberately: a tok/s number and the list of
+            // fast paths that did not apply belong in the same output.
+            hipfire_rdna::kernel_trace::dump("dflash_spec_demo");
             eprintln!("=== BENCH METRICS ===");
             eprintln!("prompt_tokens: {}", prompt_tokens.len());
             eprintln!("prefill_secs: {:.4}", prefill_secs);

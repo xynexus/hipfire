@@ -193,11 +193,7 @@ impl Gpu {
                 None => (kernel_name, n as u32),
             };
             if !std::ptr::eq(gemm_name, kernel_name) {
-                self.ensure_kernel(
-                    gemm_name,
-                    kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
-                    gemm_name,
-                )?;
+                self.ensure_kernel(gemm_name, kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC, gemm_name)?;
             }
             let gemm_func = &self.functions[gemm_name];
             unsafe {

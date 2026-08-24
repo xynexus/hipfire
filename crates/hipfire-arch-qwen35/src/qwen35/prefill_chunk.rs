@@ -2534,21 +2534,56 @@ pub(crate) fn forward_prefill_chunk(
     let fa_batched_ok = fa_kv_ok
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.w_gate.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.w_up.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.w_down.gpu_dtype, fa_arch, gdn_tape.is_none())
+                is_batchable_la(
+                    l.wq.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wk.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wv.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wo.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.w_gate.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.w_up.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.w_down.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                )
             }
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_batched_admissible in the eligibility gate).
             LayerWeights::FullAttnMoe(l) => {
-                is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wk.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wv.gpu_dtype, fa_arch, gdn_tape.is_none())
-                    && is_batchable_la(l.wo.gpu_dtype, fa_arch, gdn_tape.is_none())
+                is_batchable_la(
+                    l.wq.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wk.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wv.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                ) && is_batchable_la(
+                    l.wo.gpu_dtype,
+                    fa_arch,
+                    gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+                )
             }
             _ => true, // LA layers don't gate this check
         });
@@ -2557,10 +2592,12 @@ pub(crate) fn forward_prefill_chunk(
     // motivates the question, and costs nothing otherwise.
     if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
         let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
-            LayerWeights::FullAttn(l) => {
-                (!is_batchable_la(l.wq.gpu_dtype, fa_arch, gdn_tape.is_none()))
-                    .then(|| format!("{:?}", l.wq.gpu_dtype))
-            }
+            LayerWeights::FullAttn(l) => (!is_batchable_la(
+                l.wq.gpu_dtype,
+                fa_arch,
+                gdn_tape.is_none() || super::compact_tape_batching_allowed(),
+            ))
+            .then(|| format!("{:?}", l.wq.gpu_dtype)),
             _ => None,
         });
         eprintln!(

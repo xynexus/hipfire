@@ -199,21 +199,11 @@ fn dflash_gemm_opus_lmhead(
         gpu.quantize_act_oq8(&rot, &xq, &xs, n, w_out.k, group)?;
         match block_stride {
             Some(stride) => gpu.gemm_oq_compact_grouped_wmma(
-                &w_out.buf,
-                &xq,
-                &xs,
-                y,
-                w_out.m,
-                w_out.k,
-                n,
-                group,
-                stride,
+                &w_out.buf, &xq, &xs, y, w_out.m, w_out.k, n, group, stride,
             ),
             None => {
                 let ws = w_out.buf.sub_offset(w_out.m * w_out.k, w_out.m * ng * 4);
-                gpu.gemm_oq8_grouped_wmma(
-                    &w_out.buf, &ws, &xq, &xs, y, w_out.m, w_out.k, n, group,
-                )
+                gpu.gemm_oq8_grouped_wmma(&w_out.buf, &ws, &xq, &xs, y, w_out.m, w_out.k, n, group)
             }
         }
     };
@@ -6865,6 +6855,10 @@ fn verify_dflash_block_inner(
         // download or sample on-GPU.
     } else {
         // Fallback: B sequential GEMVs.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "dflash verify lm_head: per-row weight_gemv",
+            &format!("{:?}, B={b} full-vocab GEMVs/cycle", w_out.gpu_dtype),
+        );
         for i in 0..b {
             let hidden_row = final_hidden.sub_offset(i * dim, dim);
             weights::weight_gemv(
@@ -7513,13 +7507,7 @@ pub fn spec_step_dflash(
                 hipfire_rdna::DType::Oq8G256
                 | hipfire_rdna::DType::OqCompactG256
                 | hipfire_rdna::DType::OqCompactG128 => {
-                    dflash_gemm_opus_lmhead(
-                        gpu,
-                        w_out,
-                        &hidden_rows,
-                        &logits_batch,
-                        batch,
-                    )?;
+                    dflash_gemm_opus_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)?;
                 }
                 _ => unreachable!(),
             }
@@ -7610,6 +7598,14 @@ pub fn spec_step_dflash(
             }
         } else {
             // Fallback: per-row weight_gemv loop.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "dflash draft lm_head: per-row weight_gemv",
+                &format!(
+                    "{:?}, B-1={} full-vocab GEMVs/cycle",
+                    w_out.gpu_dtype,
+                    b - 1
+                ),
+            );
             for i in 1..b {
                 let hidden_row = draft_scratch.x.sub_offset(i * h, h);
                 weights::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
@@ -10625,19 +10621,17 @@ fn run_dflash_draft_for_logits(
         hipfire_rdna::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
-        hipfire_rdna::DType::HFQ4G256 => {
-            run_spec_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq4G256,
-                &w_out.buf,
-                w_out.gpu_dtype,
-                &hidden_rows,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                batch,
-            )
-        }
+        hipfire_rdna::DType::HFQ4G256 => run_spec_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+            &w_out.buf,
+            w_out.gpu_dtype,
+            &hidden_rows,
+            &logits_batch,
+            w_out.m,
+            w_out.k,
+            batch,
+        ),
         hipfire_rdna::DType::MQ4G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             // AWQ-aware rotation; see the target-verify dispatch above for the
@@ -10836,19 +10830,17 @@ fn run_dflash_draft_for_topk_gpu(
         hipfire_rdna::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
-        hipfire_rdna::DType::HFQ4G256 => {
-            run_spec_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq4G256,
-                &w_out.buf,
-                w_out.gpu_dtype,
-                &hidden_rows,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                batch,
-            )
-        }
+        hipfire_rdna::DType::HFQ4G256 => run_spec_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+            &w_out.buf,
+            w_out.gpu_dtype,
+            &hidden_rows,
+            &logits_batch,
+            w_out.m,
+            w_out.k,
+            batch,
+        ),
         hipfire_rdna::DType::MQ4G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             // AWQ-aware rotation for the target lm_head when an AWQ
