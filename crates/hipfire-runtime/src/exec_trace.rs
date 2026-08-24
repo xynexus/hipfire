@@ -108,6 +108,16 @@ pub enum TraceEvent {
     /// comment and deliberately did not define, on the grounds that "today
     /// nothing can construct it". M3's march loop constructs it.
     QuantumBegin = 6,
+    /// One super-op completed. `module` is the [`SuperOpKind`] discriminant and
+    /// `aux` is its duration in nanoseconds.
+    ///
+    /// This is the module dimension §M0 declared and did not build. It could not
+    /// be a passive field: `dispatch_super_op` only ENQUEUES, so wall-clock
+    /// around it measures launch cost, not how long the module owns the GPU —
+    /// and the number §M3d wants is the latter, because it is the floor on how
+    /// long a yield has to wait. Producing it honestly means serializing, so it
+    /// is a measurement MODE rather than always-on instrumentation.
+    ModuleEnd = 7,
 }
 
 /// One trace entry. 32 bytes, `Copy`, no indirection.
@@ -331,6 +341,29 @@ pub fn admission_to_first_quantum_ns(snapshot: &TraceSnapshot) -> Vec<(u32, u64,
     out
 }
 
+/// Per-module duration percentiles, keyed by [`TraceEvent::ModuleEnd`]'s
+/// `module` discriminant — §M3d measurement 1.
+///
+/// Returns `(module, count, p50, p99, max)` sorted by max descending, so the
+/// module that owns the worst case — the question the exit actually asks — is
+/// the first row.
+pub fn module_duration_stats(snapshot: &TraceSnapshot) -> Vec<(u32, usize, u64, u64, u64)> {
+    let mut by: std::collections::BTreeMap<u32, Vec<u64>> = std::collections::BTreeMap::new();
+    for record in &snapshot.records {
+        if record.event == TraceEvent::ModuleEnd {
+            by.entry(record.module).or_default().push(record.aux);
+        }
+    }
+    let mut out: Vec<(u32, usize, u64, u64, u64)> = by
+        .into_iter()
+        .filter_map(|(module, durations)| {
+            percentiles(&durations).map(|(p50, p99, max)| (module, durations.len(), p50, p99, max))
+        })
+        .collect();
+    out.sort_by_key(|(_, _, _, _, max)| std::cmp::Reverse(*max));
+    out
+}
+
 pub fn inter_token_gaps_ns(snapshot: &TraceSnapshot, stream: u32) -> Vec<u64> {
     let mut previous: Option<u64> = None;
     let mut gaps = Vec::new();
@@ -397,6 +430,21 @@ pub fn snapshot_json() -> serde_json::Value {
         })
         .collect();
 
+    // §M3d measurement 1, present only when the module trace mode ran.
+    let modules: Vec<serde_json::Value> = module_duration_stats(&snapshot)
+        .into_iter()
+        .map(|(module, count, p50, p99, max)| {
+            serde_json::json!({
+                "module": module,
+                "name": module_name(module),
+                "count": count,
+                "p50_ns": p50,
+                "p99_ns": p99,
+                "max_ns": max,
+            })
+        })
+        .collect();
+
     let span_ns = match (snapshot.records.first(), snapshot.records.last()) {
         (Some(first), Some(last)) => last.t_ns.saturating_sub(first.t_ns),
         _ => 0,
@@ -426,8 +474,45 @@ pub fn snapshot_json() -> serde_json::Value {
         "token_count": gaps.len() + usize::from(!gaps.is_empty()),
         "inter_token_gap": gap_stats,
         "admission": admission,
+        "modules": modules,
         "records": records,
     })
+}
+
+/// Point `hipfire-dispatch`'s per-module timing at this trace.
+///
+/// Call once at startup. The indirection exists because `hipfire-dispatch`
+/// cannot depend on this crate — the dependency runs the other way — so the
+/// super-op loop measures and this installs where the numbers land.
+pub fn install_dispatch_module_observer() {
+    hipfire_dispatch::pipeline::superop::set_module_observer(|module, duration_ns| {
+        record(TraceEvent::ModuleEnd, NO_STREAM, module, duration_ns);
+    });
+}
+
+/// Name for a [`TraceEvent::ModuleEnd`] `module` discriminant.
+///
+/// Mirrors `SuperOpKind`'s declaration order. Kept here rather than imported
+/// because `hipfire-runtime` does not depend on `hipfire-dispatch`; the trace
+/// records a number and this is the only place that names it, so a reordering of
+/// `SuperOpKind` must be mirrored here — the doc comment on `ModuleEnd` says so.
+fn module_name(module: u32) -> &'static str {
+    match module {
+        0 => "proj",
+        1 => "residual_gemv",
+        2 => "norm",
+        3 => "attend",
+        4 => "moe",
+        5 => "recurrent",
+        6 => "conv",
+        7 => "act",
+        8 => "residual",
+        9 => "scale",
+        10 => "softcap",
+        11 => "ple",
+        12 => "escape",
+        _ => "unknown",
+    }
 }
 
 fn event_name(event: TraceEvent) -> &'static str {
@@ -439,6 +524,7 @@ fn event_name(event: TraceEvent) -> &'static str {
         TraceEvent::VramSample => "vram_sample",
         TraceEvent::Admitted => "admitted",
         TraceEvent::QuantumBegin => "quantum_begin",
+        TraceEvent::ModuleEnd => "module_end",
     }
 }
 
