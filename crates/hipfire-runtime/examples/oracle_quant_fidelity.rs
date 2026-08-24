@@ -18,7 +18,6 @@
 
 use hipfire_quant_format::hfa::HfaArchive;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::oq8_arch::{normalize_compact_overlays, split_compact_planes};
 
 const GROUP: usize = 256;
 
