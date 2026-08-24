@@ -2671,7 +2671,27 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wqkv.k,
                 n,
             )?;
-        } else if gdn_tape.is_some() {
+        } else if gdn_tape.is_some()
+            && !matches!(
+                layer.wqkv.gpu_dtype,
+                DType::OqCompactG256 | DType::OqCompactG128
+            )
+        {
+            // NB the compact exclusion. This arm hard-codes the HFQ4G256
+            // "exact" qkvza, and it sits ABOVE the compact arm below, so
+            // before the exclusion a compact model that asked for a tape read
+            // its 136-byte [f16 scale][128 nibbles][N x (u8 idx, i8 val)]
+            // blocks as HFQ4G256 blocks — the very layout confusion the
+            // compact arm was added to fix, reintroduced by ladder ORDER for
+            // exactly the tape-capturing forwards.
+            //
+            // That is what "compact has no GDN-tape writer" actually was.
+            // There is no missing writer: the `if let Some(tape)` block below
+            // is plain memcpy_dtod out of x_rot_batch / dn_alpha_batch /
+            // dn_beta_batch and is dtype-independent, so it captures a correct
+            // tape for whichever projection arm ran. Only the projection was
+            // wrong. With compact routed to its own arm the tape it leaves is
+            // as valid as any other dtype's.
             gpu.gemm_qkvza_hfq4g256_exact(
                 &layer.wqkv.buf,
                 &layer.wz.buf,

@@ -2173,7 +2173,21 @@ pub fn prefill_batch_pbs_eligible(
     // and the cheap `SpecRollbackReplayKind::GdnTape` replay can never engage
     // (`replay_gdn_tape=0` in every run). Batching the FullPrefill replay is the
     // available lever; a compact tape writer would be the other one.
-    let allow_compact = !tape_in_play;
+    // HIPFIRE_COMPACT_GDN_TAPE=1 lets compact batch a tape-capturing forward.
+    //
+    // `!tape_in_play` was the right guard while the lowered qkvza ladder tested
+    // `gdn_tape.is_some()` ABOVE its compact arm: a compact model that asked for
+    // a tape was routed into the hard-coded HFQ4G256 "exact" qkvza and read its
+    // blocks under the wrong layout. The tape it produced was garbage, so the
+    // eligibility gate had to keep compact out of tape-capturing forwards
+    // entirely — and that is what blocked DDTree on every oq4.25++ target,
+    // since both tree paths require a tape.
+    //
+    // The tape WRITE was never the problem: it is a dtype-independent memcpy out
+    // of x_rot_batch / dn_alpha_batch / dn_beta_batch. With compact routed to its
+    // own projection arm the capture is valid, so the gate can open.
+    let allow_compact = !tape_in_play
+        || std::env::var("HIPFIRE_COMPACT_GDN_TAPE").as_deref() == Ok("1");
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
