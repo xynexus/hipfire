@@ -674,6 +674,17 @@ impl Gpu {
                 && self.oq_xt_n == n
                 && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
             if !hoisted {
+                // The hoisted quantize is supposed to have built XT for this
+                // activation already; a miss means we redo the transpose, which
+                // the trace prices at 3.50% of GPU time (3072 calls) — 10x the
+                // per-call cost of the interleave beside it. Name the reason.
+                crate::kernel_trace::record_fallback(
+                    "oq compact: XT hoist MISS -> redundant x8 transpose",
+                    &format!(
+                        "xt_gen={} act_gen={} xt_ng={} ng={} xt_n={} n={}",
+                        self.oq_xt_gen, self.oq_act_gen, self.oq_xt_ng, ng, self.oq_xt_n, n
+                    ),
+                );
                 self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
             }
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.

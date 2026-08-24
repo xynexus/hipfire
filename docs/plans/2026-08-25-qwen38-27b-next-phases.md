@@ -315,3 +315,56 @@ overhead; this verify is GPU-bandwidth-bound. Left opt-in.
   minor speedup. Needs a HIP kernel + parity test; `bf16_lut3::decode_block`
   is the host-side model to mirror.
 - The Phase 3 tail above.
+
+
+## Phase 3, worked: the tail is genuinely tail
+
+Chased the three tail items to call sites. None is a bug; all are intrinsic.
+
+**`oq_compact_x8_transpose` 3.50% (3072 calls) — NOT redundant.** It sits in the
+iu4x2 GEMM path behind a reuse check ("skip when the hoisted quantize already
+built XT"). Instrumented that miss: **it never fires**. The real callers are
+`quant.rs:2283/2322`, inside the hoisted quantize itself — so the transpose IS
+the hoist, done once per activation, and reuse works. 3072 calls is ~279/cycle,
+one per projection-group activation, which is the floor. Removing it means
+changing what layout the compact GEMV reads, i.e. a kernel redesign.
+
+**`__amd_rocclr_copyBuffer` 4.02% (18226 calls) — per-call overhead, spread
+thin.** Attributed by size (dim 5120, v_dim 6144, ffn 17408, n_v_heads 48, B=8):
+
+```
+557056 B = 8x17408x4   1584 calls  27.1%   FFN-sized
+196608 B = 8x6144x4    3663 calls  22.1%   v_dim (attn_out / qkv tape)
+163840 B = 8x5120x4    3993 calls  20.1%   hidden (x_in tape)
+  1536 B = 8x48x4      2112 calls   0.1%   alpha+beta tape (exactly 48x11x2)
+```
+
+Total d2d traffic is ~3.0 GiB against the verify's 14.4 GiB/cycle — about 2% of
+bytes. So it is ~2.7us of launch overhead per call, not bandwidth, and no single
+site dominates. Merging the adjacent alpha/beta pair would remove 1056 of 18226
+calls (~0.23% of GPU time). Not worth it individually; a batched-copy API would
+be the real fix.
+
+**`gated_delta_net_f32` 7.65%** is the core DeltaNet recurrence — the largest
+single tail item and a kernel project, not a dispatch fix.
+
+Conclusion: after the verify GEMV (57.86%, already 87-90% of ceiling), there is
+no quick win left in this trace. The remaining levers are a DeltaNet kernel and
+a batched-copy API.
+
+## CORRECTION: the bf16 embedding fix was a PREFILL win too
+
+Reported earlier as "tok/s flat". That was true of DECODE (an embed lookup reads
+one row per token) and wrong overall — batched PREFILL gathers the whole table,
+so halving it from F32 to bf16 nearly doubled prefill. Measured across the mix:
+
+```
+                  decode           prefill        VRAM
+numbers  tau 5.733  57.87    106.69 tok/s   19784 MB
+hard     tau 3.571  35.26    105.50         19786
+MIT      tau 2.000  24.03    105.23         19784
+```
+
+prefill 63.4 -> ~106 tok/s (+65%), consistent on all three prompts. Prefill
+should be in the baseline table above; it was not tracked and the win was nearly
+missed.
