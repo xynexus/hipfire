@@ -438,3 +438,68 @@ Also still unused on this model, worth checking after the tape lands:
 - **DFlash2's carried candidate selector** — measured worse in chain mode
   (tau 2.421 -> 2.25), but that was a chain measurement; a tree consumes top-K
   per position, which is what the selector actually produces.
+
+
+## RESULT: the compact GDN tape is worth +28-34%, and it was a rollback cost
+
+The "no compact GDN-tape writer" story was wrong twice over. There is no missing
+writer — the tape write is a dtype-independent `memcpy_dtod` out of
+`x_rot_batch` / `dn_alpha_batch` / `dn_beta_batch` — and the cost it was hiding
+was not in the forward at all. It was in the ROLLBACK.
+
+Phase breakdown of the chain path, compact locked out of tape capture:
+
+```
+draft=52.9ms  verify=83.1ms  replay=79.3ms  total=218.8ms
+replay_gdn_tape=0  replay_batched_prefill=0  replay_full_prefill=11
+```
+
+**Replay was 36% of the cycle**, and every rejection replayed a whole prefill
+because the cheap tape replay was unreachable. Earlier notes on this path quoted
+`draft 39 + verify 80` and did not count replay at all, which is why the budget
+looked like it closed and did not.
+
+With the ladder fixed and the gate open, `replay_gdn_tape=17`,
+`replay_full_prefill=0`, replay ~40ms:
+
+| prompt | tape off | tape on | delta |
+|---|---|---|---|
+| merge two sorted lists | 11.67 / 11.72 | 15.68 / 15.69 | **+34%** |
+| B-tree index | 9.41 | 12.05 | **+28%** |
+| `def quicksort(arr):` | 8.87 | 11.46 | **+29%** |
+
+Repeats are tight (11.67/11.72, 15.68/15.69). Default ON, opt out with
+`HIPFIRE_COMPACT_GDN_TAPE=0`.
+
+### Tree verify LOSES here, and the reason is a kernel width
+
+Now that DDTree runs, it can be measured, and on this target it does not pay:
+
+| config | tau | decode tok/s |
+|---|---|---|
+| chain (tape on) | 3.571 | **15.69** |
+| ddtree budget 8, k2 | 3.571 | 13.70 |
+| ddtree budget 12, k4 | 3.800 | 11.10 |
+| ddtree budget 16, k4 | 3.800 | 6.95 |
+| ddtree budget 24, k4 | 3.800 | 5.63 |
+
+tau moves only 3.571 -> 3.800 (+6%), nowhere near the ~6.6 the byte budget wants,
+and per-cycle cost swamps it. Note the cliff between budget 12 (n=13) and budget
+16 (n=17): that is `gemv_oq_compact_multicol` running out of columns. It is
+instantiated `_w1.._w16`, so a tree wider than 16 nodes falls off the
+multi-column GEMV — which reads each weight row once for all columns — onto a
+path that does not. **Compact tree verify is capped at 16 nodes by kernel width.**
+
+So tree verify is not dead, but it needs two things it does not have: a
+multicol GEMV wider than 16 columns, and a drafter whose per-position top-K is
+worth branching on (+6% tau at k4 says this drafter's second choice is rarely
+right). The selector this drafter carries is the obvious thing to try there,
+since a tree consumes exactly the per-position top-K it produces.
+
+### On the 38.97 figure
+
+It does not reproduce. Same harness, same model and drafter, best measured here
+is 15.69 tok/s. The gap is mostly tau and prompt: 38.97 was recorded at tau
+5.333 and B=6, while these prompts give tau 2.3-3.6 at B=8. Treat 38.97 as a
+best-prompt number, not a baseline — and note it omitted the 79ms replay term
+that dominated the cycle.

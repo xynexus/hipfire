@@ -2186,8 +2186,21 @@ pub fn prefill_batch_pbs_eligible(
     // The tape WRITE was never the problem: it is a dtype-independent memcpy out
     // of x_rot_batch / dn_alpha_batch / dn_beta_batch. With compact routed to its
     // own projection arm the capture is valid, so the gate can open.
-    let allow_compact = !tape_in_play
-        || std::env::var("HIPFIRE_COMPACT_GDN_TAPE").as_deref() == Ok("1");
+    // DEFAULT ON since the ladder fix; HIPFIRE_COMPACT_GDN_TAPE=0 opts out.
+    // Measured on Qwen3.8-27B oq4.25++ / DFlash2 over three prompts at 80-96
+    // tokens, decode tok/s: 11.67 -> 15.69, 9.41 -> 12.05, 8.87 -> 11.46
+    // (+34/28/29%). The win is not in the forward at all — it is the ROLLBACK:
+    // with compact locked out of tape capture, every rejection replayed a whole
+    // prefill (replay_full_prefill=11, ~79ms of a 219ms cycle). With the tape it
+    // is replay_gdn_tape=17 and ~40ms.
+    //
+    // Acceptance is NOT bit-identical prompt to prompt (tau 2.636 -> 2.478 on
+    // one, 2.333 -> 2.417 on another): the batched forward exports measurably
+    // different hidden states than per-token and a drafter is sensitive to which
+    // it gets, which is the same +-22% effect documented for
+    // HIPFIRE_COMPACT_BATCHED_CAPTURE. Throughput wins well past that drift.
+    let allow_compact =
+        !tape_in_play || std::env::var("HIPFIRE_COMPACT_GDN_TAPE").as_deref() != Ok("0");
     // Why the batched prefill was declined. Without this the only outward sign
     // is a per-token kernel histogram — measured 1279 dispatches/token on
     // Qwen3.6-35B-A3B against the 1B's 128 — and the gate is a conjunction of
