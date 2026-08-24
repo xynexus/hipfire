@@ -503,3 +503,55 @@ is 15.69 tok/s. The gap is mostly tau and prompt: 38.97 was recorded at tau
 5.333 and B=6, while these prompts give tau 2.3-3.6 at B=8. Treat 38.97 as a
 best-prompt number, not a baseline — and note it omitted the 79ms replay term
 that dominated the cycle.
+
+
+## Where the cycle actually goes (kernel trace, all fixes in)
+
+Phase timers are NOT usable for attribution on this path — they insert syncs, and
+they report cycle TOTAL rising 218 -> 306 ms across a change that raised
+end-to-end throughput 11.67 -> 15.68 tok/s. Use `rocprofv3 --kernel-trace`.
+
+Trace of a 64-token run on a high-tau prompt, tape + drafter multicol on:
+
+```
+gemv_oq_compact_grouped_v3        9934 calls   51.73%   SINGLE-column GEMV
+gemv_oq_compact_multicol_w8       4235 calls   20.79%   batched verify
+gemm_oq_compact_iu4x2_w64          496 calls    8.55%
+gated_delta_net_f32               1200 calls    3.47%
+attention_flash_q8_0_tile         1408 calls    2.61%
+gemm_dflash_oq4_plain_multicol_w8  451 calls    1.84%   drafter (was ~14%)
+```
+
+**The single-column GEMV is 52% of GPU time.** A full model sweep is ~500 GEMV
+calls (64 layers x 7-8 projections), and this run is ~11 cycles, so 9934 calls is
+roughly **2 extra single-token full-model sweeps per cycle** — each re-reading
+all 14.4 GiB — on top of the batched verify that costs one. That is the largest
+remaining term, worth more than verify itself.
+
+Finding their source is the next lever, and it is worth more than anything else
+on the list: if a cycle currently moves ~3 target sweeps where it needs 1, the
+available win is close to 2x, which is the difference between 25.65 and the
+target.
+
+The drafter fix worked as intended and is now down at 1.84%, so the draft side
+is done for the moment.
+
+## Honest position against 55 tok/s
+
+Best measured, all fixes in, across a prompt mix:
+
+| prompt | tau | decode tok/s |
+|---|---|---|
+| numbers 1..30 as a list | 5.733 | **25.65** |
+| first 20 primes | 5.400 | 25.55 |
+| count 1..40 | 5.125 | 23.88 |
+| JSON months | 4.500 | 21.09 |
+| merge two sorted lists | 3.571 | 16.98 |
+| MIT license header | 2.000 | 11.28 |
+
+Cycle time is ~220 ms almost independently of prompt, so tau is what moves
+throughput. 55 tok/s at tau 5.733 needs a 104 ms cycle; the bandwidth floor is
+~67 ms (verify 14.4 GiB + one drafter sweep at 233 GB/s), so 55 is NOT ruled out
+by bandwidth — it is ruled out by the ~2 redundant target sweeps above plus
+per-cycle overhead. On a hard prompt (tau 3.571) the ceiling is ~53 tok/s, so 55
+is a best-prompt target, not an every-prompt one.
