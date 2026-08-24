@@ -200,3 +200,55 @@ fix is likely routing small-n verify to it rather than writing a new kernel.
 
 Expected: verify 310 -> ~70ms, spec decode 6.2 -> ~20 tok/s, beating plain decode
 for the first time on this model.
+
+
+## CORRECTION: I measured tau on one prompt, and it was the worst one
+
+Everything above computes the ceiling from tau = 2.42. That number came from a
+single prose prompt, and tau is strongly prompt-dependent:
+
+| prompt | tau | accept_rate | decode tok/s |
+|---|---|---|---|
+| prose (all analysis above) | 2.20 | 0.275 | 5.75 |
+| **code** | **5.333** | 0.667 | **13.29** |
+| list | 5.125 | 0.641 | 13.23 |
+| repeat | 4.765 | 0.596 | 11.73 |
+| json | 3.174 | 0.397 | 7.42 |
+
+So the drafter is not weak — it is 2.4x better on code-like text than on the one
+prompt I benchmarked, and 5.333 matches the tau 4.875 the multicol routing
+comment in `quant.rs` recorded. The "55 tok/s is a drafter-quality bound"
+conclusion was drawn from the worst case and is WITHDRAWN.
+
+Spec decode already beats plain decode (14.5) on nothing yet — 13.29 is close —
+but the projection changes completely with a representative tau. Fixing verify
+from 322ms to one sweep (69ms):
+
+| prompt | now | with verify fixed |
+|---|---|---|
+| prose | 5.75 | 17.0 |
+| code | 13.29 | **36.0** |
+| list | 13.23 | **38.1** |
+| repeat | 11.73 | 31.1 |
+| json | 7.42 | 18.2 |
+
+That is 2.5-2.9x, and every prompt then beats plain decode.
+
+### What 55 actually needs now
+
+On a code-like prompt (tau 5.333) the cycle must fall to 97ms. Draft at B=8 is
+52ms, leaving 45ms for verify+replay — under one weight sweep (69ms). At B=6
+draft is 39ms, leaving 58ms. So 55 tok/s needs BOTH:
+
+1. verify at roughly one sweep (the 4.5x defect), and
+2. the draft phase cheaper than 6.5 ms/token, or a B/tau point that beats
+   B=8's 5.333.
+
+It is not out of reach the way the prose-only analysis implied — it is one
+kernel-shape fix plus a draft-cost win away, on the prompts that matter.
+
+### Method note
+
+Benchmark spec decode on a PROMPT MIX, never one prompt. Acceptance is a property
+of the text, and a single prose prompt understates this drafter by 2.4x — enough
+to have closed the goal as impossible.
