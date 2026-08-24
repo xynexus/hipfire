@@ -34,21 +34,85 @@ top-2-of-8 and is refused by `moe_prefill_topk_shape_supported` on every arch.
 | accumulation over tokens | **No** | flat across prefill 2..64 |
 | path-2 vs path-1 selection | **N/A** | `moe_grouped_gemm_path2_required_for_dtype` makes F16/BF16 path-2-only; `HIPFIRE_MOE_GROUPED_GEMM=0` does not move it |
 
-## Where to look next
+## ROOT CAUSE (found 2026-08-24)
 
-The raw-F16 arm differs from every MQ arm in exactly three places, all in
-`prefill_chunk.rs`:
+**`LayerWeights::DeltaNetMoe` never got the full-precision dispatch arms that
+`LayerWeights::DeltaNet` has.** It is not a MoE bug at all — the MoE body is
+innocent. The defect is in the linear-attention layer that precedes it.
 
-1. routed gate_up reads `pbs.x_norm_batch`, while MQ arms read
-   `pbs.x_rot_batch` (correct in principle — raw weights need no rotation);
-2. the down pre-activation is a plain `silu_mul_f32(gate, up, rot_batch)`
-   instead of one of the fused silu+rotate variants;
-3. the grouped GEMM call itself (ruled out above).
+The dense LA branch was migrated to the lowered program, whose matcher
+(`prefill_lowered.rs:2327-2328`) carries explicit arms:
 
-Note the shared expert also parks its down output in
-`pbs.x_rot_batch.sub_offset(..)` before the routed section, but it accumulates
-into `x_batch` immediately, so it is consumed before the routed path rebinds
-that buffer.
+```rust
+let is_f32 = matches!(layer.wqkv.gpu_dtype, DType::F32);
+let is_f16 = matches!(layer.wqkv.gpu_dtype, DType::F16 | DType::BF16);
+```
+
+The MoE LA branch still runs the legacy hand-rolled chain in
+`prefill_chunk.rs`, which enumerates PARO / 6-bit / Q8 / Q8-wmma /
+OqCompactG256 and sends **everything else** — F16 and BF16 included — to
+`FusedQkvzaHfq4G256`. Raw halves are then decoded as `[f16 scale][128 nibbles]`
+HFQ4 blocks. No error; just wrong numbers. The `wo` chain a few hundred lines
+below has the identical shape, defaulting to `GemmHfq4G256Residual`.
+
+This is the third recorded instance of one failure mode. The comment above the
+`OqCompactG256` qkv arm documents the second, in the same words: "Two layouts
+sharing no field, and no error: just wrong numbers."
+
+### The measurement chain
+
+Dumped via the in-tree `HIPFIRE_DUMP_HIDDEN` instrument (`"*_b"` tags in the
+batched path, `"pertoken"` in the reference), fp16 `qwen3_5_moe_indexed`,
+prefill 6, tokens `[87,87,87,82,8,14]`:
+
+| tensor | rows across DIFFERENT tokens | verdict |
+|---|---|---|
+| `x_batch` (layer input) | differ | correct |
+| rmsnorm output (`x_rot_batch`) | differ | correct |
+| `dn_qkv_batch` (wqkv projection) | **BIT-IDENTICAL** | **broken here** |
+| `dn_q/k/v`, `alpha`, `beta` | bit-identical | downstream of the above |
+| router logits | bit-identical | downstream |
+
+Every token's prefill therefore produced token 0's activations, which is why
+the divergence is flat in prefill length and identical on both archs.
+
+### Two traps this hunt fell into, recorded so the next one does not
+
+1. **`dn_quant=FP32` in the `kernel-trace` line is the DeltaNet STATE quant,
+   not the weight dtype.** Reading it as the weight dtype sent this
+   investigation after `gemm_f32_register_tiled` (which is correct). The
+   fixture has NO F32 tensors — `hipfire inspect` reports F16/BF16/Bf16Lut3
+   only. Read dtypes from the artifact, not from that field.
+2. **`synthetic_tokens(seed=42)` begins `[87, 87, 87, 82, ...]`.** At
+   `--prefill 2` or `3` the prefill tokens are all the SAME id, so identical
+   per-row activations are expected and prove nothing. Any row-invariance test
+   must use a prefill long enough to reach a distinct token id.
+
+## The fix, not yet made
+
+Give `DeltaNetMoe` the arms `DeltaNet` has — preferably by routing it through
+the same lowered binding (`bind.proj_qkvza`) rather than adding a fourth
+hand-rolled chain that the fifth dtype will fall out of.
+
+A partial port was attempted and REVERTED: adding full-precision arms to the
+QKVZA chain alone moved `max_kld` 0.88 -> 0.21 and made `dn_qkv_batch` rows
+distinct again, but adding the `wo` arm took it to 0.51 and it never approached
+the 1e-4 tolerance. The coupled sites are at least four (QKVZA GEMM, wo GEMM,
+wo input rotation, and the LA preamble's rmsnorm/FWHT choice); porting a subset
+leaves the activation basis inconsistent between them. Do it as one migration,
+not arm by arm.
+
+## Correction to the first commit message
+
+`75b718181` says `gemm_raw_moe_grouped_portable` "had no callers". That is
+wrong: `hipfire_dispatch::pipeline::run_grouped_moe_gemm` already dispatched it
+(with the same `F16 if arch == "gfx1151"` / else-portable split), and that is
+the path the per-token DECODE reference takes. The grep that produced the claim
+was scoped to `hipfire-arch-qwen35` and `hipfire-runtime` and missed it. The fix
+itself stands — the batched PREFILL call sites bypassed that shared dispatcher
+and called the gfx1151 entry point directly — but the right long-term shape is
+for prefill to delegate to `run_grouped_moe_gemm` too, rather than keep a second
+dispatcher (`gemm_raw_moe_grouped`) beside it.
 
 ## Blast radius
 
