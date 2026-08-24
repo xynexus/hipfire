@@ -185,11 +185,25 @@ impl Gpu {
                 &mut ni as *mut _ as *mut c_void,
                 &mut stride as *mut _ as *mut c_void,
             ];
-            let gemm_func = &self.functions[kernel_name];
+            // Multi-column when an exact-NB instantiation exists: one grid
+            // column instead of `n`, because the kernel loops the columns
+            // internally and reads each weight row once for all of them.
+            let (gemm_name, grid_y) = match dflash_plain_multicol_kernel(dtype, n) {
+                Some(name) => (name, 1u32),
+                None => (kernel_name, n as u32),
+            };
+            if !std::ptr::eq(gemm_name, kernel_name) {
+                self.ensure_kernel(
+                    gemm_name,
+                    kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+                    gemm_name,
+                )?;
+            }
+            let gemm_func = &self.functions[gemm_name];
             unsafe {
                 self.hip.launch_kernel(
                     gemm_func,
-                    [m.div_ceil(8) as u32, n as u32, 1],
+                    [m.div_ceil(8) as u32, grid_y, 1],
                     [256, 1, 1],
                     0,
                     self.stream_ref(),
@@ -2562,6 +2576,49 @@ fn dflash_plain_kernel(dtype: DType, aligned: bool) -> (&'static str, Option<usi
         (DType::DflashOq4MixedPlain, false) => ("gemm_dflash_oq4_mixed_plain_8w", None),
         other => panic!("gemm_dflash_oq_plain: unsupported dtype {other:?}"),
     }
+}
+
+/// Multi-column drafter GEMV name for an exact column count, when one exists.
+///
+/// The per-column kernels put the batch on `blockIdx.y`, so the drafter's whole
+/// weight set is re-read B times — at B=8 that is 9.4 GiB per spec cycle for a
+/// 1.18 GiB drafter, ~40% of the cycle's bytes, and it is what makes the draft
+/// phase scale linearly with B (~6.3 ms per position = one weight sweep each).
+/// These read the row ONCE and accumulate all B columns.
+///
+/// NB is compile-time in the kernel so the accumulators stay in registers, so
+/// only exact matches route here; everything else keeps the per-column kernel.
+fn dflash_plain_multicol_kernel(dtype: DType, batch: usize) -> Option<&'static str> {
+    if !(2..=8).contains(&batch) {
+        return None;
+    }
+    if std::env::var("HIPFIRE_DFLASH_MULTICOL").as_deref() == Ok("0") {
+        return None;
+    }
+    Some(match (dtype, batch) {
+        (DType::DflashOq8Plain, 2) => "gemm_dflash_oq8_plain_multicol_w2",
+        (DType::DflashOq8Plain, 3) => "gemm_dflash_oq8_plain_multicol_w3",
+        (DType::DflashOq8Plain, 4) => "gemm_dflash_oq8_plain_multicol_w4",
+        (DType::DflashOq8Plain, 5) => "gemm_dflash_oq8_plain_multicol_w5",
+        (DType::DflashOq8Plain, 6) => "gemm_dflash_oq8_plain_multicol_w6",
+        (DType::DflashOq8Plain, 7) => "gemm_dflash_oq8_plain_multicol_w7",
+        (DType::DflashOq8Plain, 8) => "gemm_dflash_oq8_plain_multicol_w8",
+        (DType::DflashOq4Plain, 2) => "gemm_dflash_oq4_plain_multicol_w2",
+        (DType::DflashOq4Plain, 3) => "gemm_dflash_oq4_plain_multicol_w3",
+        (DType::DflashOq4Plain, 4) => "gemm_dflash_oq4_plain_multicol_w4",
+        (DType::DflashOq4Plain, 5) => "gemm_dflash_oq4_plain_multicol_w5",
+        (DType::DflashOq4Plain, 6) => "gemm_dflash_oq4_plain_multicol_w6",
+        (DType::DflashOq4Plain, 7) => "gemm_dflash_oq4_plain_multicol_w7",
+        (DType::DflashOq4Plain, 8) => "gemm_dflash_oq4_plain_multicol_w8",
+        (DType::DflashOq4MixedPlain, 2) => "gemm_dflash_oq4_mixed_plain_multicol_w2",
+        (DType::DflashOq4MixedPlain, 3) => "gemm_dflash_oq4_mixed_plain_multicol_w3",
+        (DType::DflashOq4MixedPlain, 4) => "gemm_dflash_oq4_mixed_plain_multicol_w4",
+        (DType::DflashOq4MixedPlain, 5) => "gemm_dflash_oq4_mixed_plain_multicol_w5",
+        (DType::DflashOq4MixedPlain, 6) => "gemm_dflash_oq4_mixed_plain_multicol_w6",
+        (DType::DflashOq4MixedPlain, 7) => "gemm_dflash_oq4_mixed_plain_multicol_w7",
+        (DType::DflashOq4MixedPlain, 8) => "gemm_dflash_oq4_mixed_plain_multicol_w8",
+        _ => return None,
+    })
 }
 
 fn validate_dflash_plain_stride(

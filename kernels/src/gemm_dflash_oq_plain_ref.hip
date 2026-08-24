@@ -349,3 +349,94 @@ extern "C" __global__ void NAME(                                              \
 DFLASH_OQ_GEMM_DP4A_STAGED_8W(gemm_dflash_oq8_plain_dp4a_staged_8w, 8)
 DFLASH_OQ_GEMM_DP4A_STAGED_8W(gemm_dflash_oq4_plain_dp4a_staged_8w, 4)
 DFLASH_OQ_GEMM_DP4A_STAGED_8W(gemm_dflash_oq4_mixed_plain_dp4a_staged_8w, 5)
+
+// ── Multi-column: read each weight row ONCE for ALL B columns ───────────────
+//
+// Every kernel above puts the batch column on `blockIdx.y`, so a block computes
+// rows for ONE column and the drafter's whole weight set is re-read B times.
+// That is the dominant term in a spec-decode cycle: at B=8 a 1.18 GiB drafter
+// moves 9.4 GiB, ~40% of the cycle's bytes, and the measured draft phase (53 ms,
+// ~6.3 ms per position) is exactly one full weight sweep per position at ~187
+// GB/s. The weights do not depend on the column.
+//
+// This is the same fix `gemv_oq_compact_multicol` made on the TARGET side. The
+// activations re-read per column are negligible by comparison: B*K int8 is ~40
+// KB against 1.18 GiB of weights.
+//
+// NB is compile-time so `acc[]` stays in registers — a runtime bound would make
+// it dynamically indexed and spill to scratch, which costs more than it saves.
+// The dispatcher picks the exact-NB instantiation and falls back to the
+// per-column kernels above for any other B.
+#define DFLASH_OQ_GEMM_MULTICOL(NAME, MODE, NB)                                \
+__launch_bounds__(256)                                                         \
+extern "C" __global__ void NAME(                                               \
+    const uint8_t* __restrict__ W,                                             \
+    const int8_t*  __restrict__ XQ,                                            \
+    const float*   __restrict__ XS,                                            \
+    float*         __restrict__ Y,                                             \
+    int M, int K, int B, int block_stride                                      \
+) {                                                                            \
+    const int lane = (int)threadIdx.x & 31;                                    \
+    const int wave = (int)threadIdx.x >> 5;                                    \
+    const int row = (int)blockIdx.x * 8 + wave;                                \
+    if (row >= M || B != (NB)) return;                                         \
+    const int groups = K >> 8;                                                 \
+    float acc[NB];                                                             \
+    _Pragma("unroll") for (int c = 0; c < (NB); ++c) acc[c] = 0.0f;            \
+    for (int group = 0; group < groups; ++group) {                             \
+        const uint8_t* block = W +                                             \
+            ((long long)row * groups + group) * block_stride;                  \
+        const int pos = lane * 8;                                              \
+        /* Loaded ONCE and reused by every column below. */                    \
+        int w_a, w_b;                                                          \
+        if ((MODE) == 8) {                                                     \
+            w_a = *(const int*)(block + 2 + pos);                              \
+            w_b = *(const int*)(block + 2 + pos + 4);                          \
+        } else {                                                               \
+            w_a = dflash_pack_i4_4(block, pos);                                \
+            w_b = dflash_pack_i4_4(block, pos + 4);                            \
+        }                                                                      \
+        const float w_scale = dflash_f16_scale(block);                         \
+        _Pragma("unroll") for (int c = 0; c < (NB); ++c) {                     \
+            const int8_t* xq = XQ + (long long)c * K + group * 256;            \
+            const int x_a = *(const int*)(xq + pos);                           \
+            const int x_b = *(const int*)(xq + pos + 4);                       \
+            int isum = dflash_dot4_i8(w_a, x_a, 0);                            \
+            isum = dflash_dot4_i8(w_b, x_b, isum);                             \
+            if ((MODE) == 5) {                                                 \
+                const int overlays = (block_stride - 130) >> 1;                \
+                const uint8_t* table = block + 130;                            \
+                for (int entry = lane; entry < overlays; entry += 32) {        \
+                    const int overlay_pos = (int)table[2 * entry];             \
+                    bool shadowed = false;                                     \
+                    for (int later = entry + 1; later < overlays; ++later)     \
+                        shadowed |= table[2 * later] == overlay_pos;           \
+                    if (!shadowed) {                                           \
+                        const int base_q = dflash_i4(block, overlay_pos);      \
+                        const int rep = (int)(int8_t)table[2 * entry + 1];     \
+                        isum += (rep - base_q) * (int)xq[overlay_pos];         \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+            acc[c] += (float)isum * w_scale                                    \
+                    * XS[(long long)c * groups + group];                       \
+        }                                                                      \
+    }                                                                          \
+    _Pragma("unroll") for (int c = 0; c < (NB); ++c) {                         \
+        const float s = dflash_wave_sum(acc[c]);                               \
+        if (lane == 0) Y[(long long)c * M + row] = s;                          \
+    }                                                                          \
+}
+
+#define DFLASH_OQ_MULTICOL_SET(NB)                                             \
+    DFLASH_OQ_GEMM_MULTICOL(gemm_dflash_oq8_plain_multicol_w##NB, 8, NB)       \
+    DFLASH_OQ_GEMM_MULTICOL(gemm_dflash_oq4_plain_multicol_w##NB, 4, NB)       \
+    DFLASH_OQ_GEMM_MULTICOL(gemm_dflash_oq4_mixed_plain_multicol_w##NB, 5, NB)
+
+DFLASH_OQ_MULTICOL_SET(2)
+DFLASH_OQ_MULTICOL_SET(3)
+DFLASH_OQ_MULTICOL_SET(4)
+DFLASH_OQ_MULTICOL_SET(5)
+DFLASH_OQ_MULTICOL_SET(6)
+DFLASH_OQ_MULTICOL_SET(7)
+DFLASH_OQ_MULTICOL_SET(8)
