@@ -2412,7 +2412,24 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::Oq4G256 => arch.starts_with("gfx11"),
         // Compact routed experts: gemm_oq_compact_moe_grouped_wmma backs both
         // path-2 arms, so this cannot reach the `other => panic!` fallthrough.
-        DType::OqCompactG256 => arch.starts_with("gfx11"),
+        //
+        // ⚠️ OPT-IN, like the Oq8 sibling below and for the same reason: the
+        // kernel has never been checked against a reference. It was committed
+        // that way deliberately (see its own commit message) and enabling it by
+        // default was an oversight -- compiling and routing is not evidence, and
+        // the Oq8 grouped kernel proved exactly that by running 1.8x faster and
+        // emitting garbage.
+        //
+        // The decode GEMVs it sits beside ARE verified (parity_gemv_oq_compact_moe,
+        // 24 synthetic cases plus 106 real-weight checks), so compact residency
+        // and its 2.83x memory win do not depend on this flag. Validate the
+        // grouped GEMM against gemm_oq8_grouped_wmma on expanded blocks -- the
+        // shape `parity_gemm_oq_compact` already uses for the dense twin -- before
+        // flipping it on.
+        DType::OqCompactG256 => {
+            arch.starts_with("gfx11")
+                && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() == Ok("1")
+        }
         // ⚠️ Oq8G256 grouped is OPT-IN and OFF by default: the kernel is FAST and
         // WRONG. gemm_oq8g256_moe_grouped_wmma + its path-2 arms exist and route
         // (Qwen3.6-35B-A3B 215.0 -> 391.0 tok/s, 1.8x), but the output degenerates
