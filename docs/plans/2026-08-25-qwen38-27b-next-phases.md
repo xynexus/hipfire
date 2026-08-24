@@ -368,3 +368,45 @@ MIT      tau 2.000  24.03    105.23         19784
 prefill 63.4 -> ~106 tok/s (+65%), consistent on all three prompts. Prefill
 should be in the baseline table above; it was not tracked and the win was nearly
 missed.
+
+
+## Phase 2b, MEASURED: a Markov head's tau ceiling is 2.077 — below what it must beat
+
+Earlier I argued against building this from the drafter's 5.10% GPU share. That
+was a prediction ("tau would fall toward 2-3"), so it has now been measured
+instead. Harness: `scripts/markov_head_tau_ceiling.py`.
+
+Corpus: 1280 tokens the TARGET itself generated across five prompts (that is
+what a drafter has to predict). Method deliberately OPTIMISTIC — the n-gram
+table is fit on the SAME stream it is scored on. That is train-on-test and
+invalid for estimating accuracy; it is used only as a CEILING. Every eval
+context is therefore in the table, so a miss is never sparsity — it is the
+genuine limit that one context recurs with different successors and argmax can
+only serve the majority.
+
+```
+order-1: tau=2.077  <- the Markov head's shape (bigram)
+order-2: tau=4.206
+order-3: tau=5.277
+DFlash2, measured on these same prompts: 5.733 / 3.571 / 2.000  (mix mean ~3.77)
+```
+
+The DSpark head is `markov_w1`/`markov_w2` `[vocab, rank]` — a rank-r
+factorization of the BIGRAM matrix, i.e. order-1. Its ceiling is 2.077, and a
+low-rank approximation can only be WORSE than the full table measured here. The
+order-2/3 rows are inflated by memorization (order-3 over 1280 tokens is close to
+a lookup table of the eval set) and are not this head.
+
+So the trade is: at best +5.10% from free drafting, against tau ~3.77 -> <=2.077,
+about -45%. Net strongly negative, now on evidence rather than argument.
+
+CAVEAT, stated because it cuts the other way: 1280 greedy-decoded tokens is a
+small and repetitive corpus, which FLATTERS the n-gram (repetition is exactly
+what it exploits). A larger or more diverse corpus would lower these numbers,
+not raise them.
+
+What would change the answer: a Markov head is not a drafter here, but it could
+be a cheap FIRST-STAGE that a real drafter falls back on, or a component of a
+full DSpark drafter (main projection + markov + confidence) rather than a
+replacement for DFlash2. Neither is what the plan asked for, and neither is
+worth building until the tail work above lands.
