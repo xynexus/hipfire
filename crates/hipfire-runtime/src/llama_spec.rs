@@ -345,6 +345,23 @@ fn verify_block_logits_or_argmax(
     };
 
     let eligible = batched_verify_eligible(gpu, weights, kv_cache, n, pbs);
+    if !eligible {
+        // Spec-decode verify without the batched forward = K weight sweeps for a
+        // K-token block, which caps the achievable tau at 1 and makes speculation
+        // strictly a loss. Silent otherwise: tok/s just looks flat.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "spec verify: block not batchable -> per-token decode loop (K weight sweeps)",
+            &format!(
+                "arch={} n={n} max_batch={} enabled={} kv_ok={} weights_ok={} wq0={:?}",
+                gpu.arch,
+                pbs.max_batch,
+                crate::config::get().prefill_batched,
+                crate::transformer::kv_quant_batchable(kv_cache),
+                crate::transformer::llama_weights_batchable(weights, gpu.arch.as_str()),
+                weights.layers.first().map(|l| l.wq.gpu_dtype),
+            ),
+        );
+    }
 
     // Hidden capture only flows through the batched path; the per-token fallback
     // does not run the capturing per-layer loop. Clearing the sink for an

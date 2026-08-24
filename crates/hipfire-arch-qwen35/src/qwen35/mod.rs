@@ -1150,6 +1150,15 @@ pub fn forward_scratch_capture_gdn_tape(
 // and gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd remains
 // unwired — MQ2-Lloyd lands separately.
 fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
+    // A false here sends a whole layer class down a per-token path with no
+    // outward sign but a GEMV-heavy histogram. Name the dtype that declined.
+    fn decline(dt: DType, allow_compact: bool) -> bool {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "is_batchable_la DECLINED -> per-token layer path",
+            &format!("{dt:?} (allow_compact={allow_compact})"),
+        );
+        false
+    }
     let always_ok = matches!(
         dt,
         DType::MQ4G256 | DType::HFQ4G256
@@ -1199,7 +1208,11 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
     // letting compact batch the verify took accept_rate 0.468 -> 0.000 and
     // decode 5.10 -> 1.39 tok/s with the draft emitting random vocab ids.
     if dt == DType::OqCompactG256 {
-        return allow_compact;
+        return if allow_compact {
+            true
+        } else {
+            decline(dt, allow_compact)
+        };
     }
     // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
     // family ported. As of this commit:
@@ -1365,7 +1378,7 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
-    mq3_uniform_with_wmma
+    let batchable = mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_gfx11_wmma
         || lloyd_mq3_with_gfx12_wmma
@@ -1373,7 +1386,18 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || oq4_with_wmma
-        || oq8_with_wmma
+        || oq8_with_wmma;
+    // Instrumentation only. The `always_ok` and compact arms above returned
+    // already, so reaching here with a false means NO batched arm exists for
+    // this (dtype, arch) pair — the exact shape of defect that hid four ~2x
+    // wins: a ladder that stopped at the MQ/HFQ families.
+    if !batchable {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 is_batchable_la NO dtype/arch arm -> per-token layer path",
+            &format!("{dt:?} arch={arch} allow_compact={allow_compact}"),
+        );
+    }
+    batchable
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -1874,6 +1898,18 @@ fn moe_decode_dispatch_flags_for_dtypes(
     } else if routed_dtype_indexable_oq_compact {
         MoeDecodeIndexedRoutedPath::OqCompact
     } else {
+        // Instrumentation only. No indexed routed arm => the layer decodes its
+        // experts one at a time instead of through a single indexed GEMV.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe decode NO indexed routed path -> per-expert MoE decode",
+            &format!(
+                "gate_up={:?} down={:?} gu_uniform={} down_uniform={} oq_indexed={oq_indexed_decode} k_top={k_top}",
+                dtypes.expert_gate_up,
+                dtypes.expert_down,
+                dtypes.expert_gate_up_uniform,
+                dtypes.expert_down_uniform,
+            ),
+        );
         MoeDecodeIndexedRoutedPath::None
     };
     let routed_dtype_indexable = routed_path != MoeDecodeIndexedRoutedPath::None;
@@ -2012,6 +2048,12 @@ fn moe_ffn_batched_admissible_for_dtypes(
     admit_paro: bool,
     arch: &str,
 ) -> bool {
+    // Instrumentation only: a false here sends the whole MoE FFN down the
+    // per-token path, and the conjunction below cannot say which term declined.
+    fn decline(site: &str, detail: String) -> bool {
+        hipfire_rdna::kernel_trace::record_fallback(site, &detail);
+        false
+    }
     let router_ok = moe_prefill_side_gate_dtype_supported(dtypes.router);
     let shared_gate_ok = moe_prefill_side_gate_dtype_supported(dtypes.shared_expert_scalar_gate);
     // Unit-level callers historically construct a uniform profile and then
@@ -2028,7 +2070,13 @@ fn moe_ffn_batched_admissible_for_dtypes(
         dtypes.routed_profile
     };
     if !(router_ok && shared_gate_ok) || routed_profile == RoutedExpertDtypeProfile::Invalid {
-        return false;
+        return decline(
+            "qwen35 moe_ffn_batched DECLINED (router/shared-gate dtype or routed profile) -> per-token MoE FFN",
+            format!(
+                "router={:?} shared_scalar_gate={:?} profile={routed_profile:?} arch={arch}",
+                dtypes.router, dtypes.shared_expert_scalar_gate
+            ),
+        );
     }
     let profile_metadata_consistent = match routed_profile {
         RoutedExpertDtypeProfile::Uniform(_) => true,
@@ -2041,7 +2089,16 @@ fn moe_ffn_batched_admissible_for_dtypes(
         RoutedExpertDtypeProfile::Invalid => false,
     };
     if !profile_metadata_consistent {
-        return false;
+        return decline(
+            "qwen35 moe_ffn_batched DECLINED (routed profile metadata inconsistent) -> per-token MoE FFN",
+            format!(
+                "profile={routed_profile:?} gate_up={:?} down={:?} gu_uniform={} down_uniform={} arch={arch}",
+                dtypes.expert_gate_up,
+                dtypes.expert_down,
+                dtypes.expert_gate_up_uniform,
+                dtypes.expert_down_uniform
+            ),
+        );
     }
 
     if admit_paro
@@ -2056,7 +2113,13 @@ fn moe_ffn_batched_admissible_for_dtypes(
 
     let shared_gu_one_dtype = dtypes.shared_expert_up == dtypes.shared_expert_gate;
     if !shared_gu_one_dtype {
-        return false;
+        return decline(
+            "qwen35 moe_ffn_batched DECLINED (shared gate/up dtypes differ) -> per-token MoE FFN",
+            format!(
+                "shared_gate={:?} shared_up={:?} arch={arch}",
+                dtypes.shared_expert_gate, dtypes.shared_expert_up
+            ),
+        );
     }
 
     let shared_gate_up_supported =
@@ -2081,17 +2144,38 @@ fn moe_ffn_batched_admissible_for_dtypes(
         RoutedExpertDtypeProfile::Invalid => false,
     };
     if !shared_gate_up_supported || !shared_down_supported || !routed_supported {
-        return false;
+        return decline(
+            "qwen35 moe_ffn_batched DECLINED (dtype unsupported on this arch) -> per-token MoE FFN",
+            format!(
+                "shared_gate_up={:?}/{shared_gate_up_supported} shared_down={:?}/{shared_down_supported} routed={routed_profile:?}/{routed_supported} arch={arch}",
+                dtypes.shared_expert_gate, dtypes.shared_expert_down
+            ),
+        );
     }
 
     if routed_profile.is_mixed() {
-        return moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch);
+        return moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch)
+            || decline(
+                "qwen35 moe_ffn_batched DECLINED (mixed routed profile has no grouped GEMM) -> per-token MoE FFN",
+                format!("{:?} arch={arch}", dtypes.expert_gate_up),
+            );
     }
 
     let shared_matches_routed = dtypes.shared_expert_gate == dtypes.expert_gate_up
         && dtypes.shared_expert_down == dtypes.expert_down;
 
-    shared_matches_routed || moe_routed_dispatch_supported_for_dtype(dtypes.expert_gate_up, arch)
+    shared_matches_routed
+        || moe_routed_dispatch_supported_for_dtype(dtypes.expert_gate_up, arch)
+        || decline(
+            "qwen35 moe_ffn_batched DECLINED (routed dtype not independently dispatchable) -> per-token MoE FFN",
+            format!(
+                "routed_gate_up={:?} shared_gate={:?} routed_down={:?} shared_down={:?} arch={arch}",
+                dtypes.expert_gate_up,
+                dtypes.shared_expert_gate,
+                dtypes.expert_down,
+                dtypes.shared_expert_down
+            ),
+        )
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
@@ -2386,11 +2470,35 @@ pub fn prefill_batch_pbs_eligible(
             "per-token (a per-layer dtype/MoE condition declined — HIPFIRE_KERNEL_TRACE=1 names the layer)".to_string()
         },
     );
+    // Instrumentation only. A false here is one full weight sweep PER TOKEN for
+    // the whole prefill; the eprintln above only fires with the trace on, this
+    // lands in the fallback histogram.
+    if !verdict {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 prefill_batch_pbs_eligible DECLINED -> per-token prefill loop",
+            &format!(
+                "n={n} arch={arch} force_fallback={force_fallback} tape_in_play={tape_in_play} \
+                 allow_compact={allow_compact} moe_topk_ok={moe_topk_ok} \
+                 router_logits={moe_router_logits_present} dn_quant={:?}",
+                dn_state.quant
+            ),
+        );
+    }
     verdict
 }
 
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, arch: &str) -> bool {
     let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
+        // Instrumentation only.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_ffn_batched DECLINED (MoePrefillDtypes::from_ffn = None) -> per-token MoE FFN",
+            &format!(
+                "n_experts={} gate_up_dtypes={} down_dtypes={} arch={arch}",
+                ffn.experts.len(),
+                ffn.expert_gate_up_dtypes.len(),
+                ffn.expert_down_dtypes.len()
+            ),
+        );
         return false;
     };
 
@@ -2414,7 +2522,19 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, arch: &str) -> bool {
     // a second time using an actual routed gate_up tensor as representative.
     // Paged expert mode has dtype metadata only here, so keep it on the
     // established fallback until page-level AWQ representatives are exposed.
-    !(ffn.experts.is_empty() && moe_prefill_needs_routed_gate_up_reprojection(&dtypes))
+    let paged_needs_reprojection =
+        ffn.experts.is_empty() && moe_prefill_needs_routed_gate_up_reprojection(&dtypes);
+    if paged_needs_reprojection {
+        // Instrumentation only.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_ffn_batched DECLINED (paged experts need routed gate_up reprojection) -> per-token MoE FFN",
+            &format!(
+                "routed_gate_up={:?} shared_gate={:?} arch={arch}",
+                dtypes.expert_gate_up, dtypes.shared_expert_gate
+            ),
+        );
+    }
+    !paged_needs_reprojection
 }
 
 fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool {
@@ -2440,7 +2560,14 @@ fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool
         // and the shared expert has gate_up + down arms. Admitting it WITHOUT
         // those would feed an unrotated activation to an Opus GEMM.
         DType::Oq4G256 | DType::Oq8G256 | DType::OqCompactG256 => !arch.starts_with("gfx9"),
-        _ => false,
+        // Instrumentation only. This is the classic ladder-stops-at-MQ/HFQ arm.
+        other => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 moe_prefill_quant_family ladder `_` arm -> dtype not batched-admissible",
+                &format!("{other:?} arch={arch}"),
+            );
+            false
+        }
     }
 }
 
@@ -2519,7 +2646,15 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
             arch.starts_with("gfx11")
                 && std::env::var("HIPFIRE_MOE_OQ8_GROUPED").as_deref() == Ok("1")
         }
-        _ => false,
+        // Instrumentation only. No grouped-GEMM arm for this dtype/arch, so the
+        // caller falls back to path-1 indexed GEMVs or declines batching outright.
+        other => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 moe_grouped_gemm ladder `_` arm -> no grouped GEMM for dtype",
+                &format!("{other:?} arch={arch}"),
+            );
+            false
+        }
     }
 }
 
@@ -3658,6 +3793,17 @@ fn moe_ffn_dispatch(
         )?;
         moe_ffn_decode_with_scratch_prerotated(gpu, pager, ffn, x, x, config, s, layer_idx)
     } else {
+        // Instrumentation only: not all-MQ4 => separate rmsnorm + the
+        // non-prerotated MoE decode instead of the fused rmsnorm+rotate.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_ffn_dispatch not all-MQ4 -> unfused rmsnorm + non-prerotated MoE decode",
+            &format!(
+                "layer={layer_idx} router={:?} expert_gate_up={:?} shared_gate={:?}",
+                ffn.router.gpu_dtype,
+                moe_expert_gate_up_dtype(ffn, 0),
+                ffn.shared_expert.gate.gpu_dtype
+            ),
+        );
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         moe_ffn_decode_with_scratch(gpu, pager, ffn, &s.tmp, x, config, s, layer_idx)
     };
@@ -3706,6 +3852,16 @@ fn moe_ffn_dispatch_ep(
             skip_shared,
         )
     } else {
+        // Instrumentation only — same fork as `moe_ffn_dispatch`, EP variant.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_ffn_dispatch_ep not all-MQ4 -> unfused rmsnorm + non-prerotated MoE decode",
+            &format!(
+                "layer={layer_idx} router={:?} expert_gate_up={:?} shared_gate={:?}",
+                ffn.router.gpu_dtype,
+                moe_expert_gate_up_dtype(ffn, 0),
+                ffn.shared_expert.gate.gpu_dtype
+            ),
+        );
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         moe_ffn_decode_impl(
             gpu,
@@ -3877,6 +4033,12 @@ fn triattn_tap(
         config.head_dim,
     )?;
     if !gpu_handled {
+        // Instrumentation only: the GPU tap declined, so this layer pays a
+        // synchronous D2H download of fa_q (and fa_k) every token.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 triattn_tap GPU tap declined -> per-layer D2H download",
+            &format!("layer={layer_idx} needs_k={}", hipfire_runtime::triattn::tap_needs_k()),
+        );
         let n_q = config.n_heads * config.head_dim;
         let q_cpu = gpu.download_f32(&s.fa_q)?;
         if hipfire_runtime::triattn::tap_needs_k() {

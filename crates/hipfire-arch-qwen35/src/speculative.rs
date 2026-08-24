@@ -5332,6 +5332,10 @@ impl GdnTape {
                     // FP32 above can stay batched because it has no narrowing at
                     // all, so batched and per-token are identical there. f16 is
                     // the case where the distinction reappears.
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "dflash rollback GDN: per-token f16 recurrence",
+                        &format!("StateQuant::FP16, {n_steps} single-step launches"),
+                    );
                     for step in 0..n_steps {
                         let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
                         let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
@@ -6632,6 +6636,23 @@ fn verify_dflash_block_inner(
                 | hipfire_runtime::weights::EmbeddingFormat::Q8_0,
         )
         && verify_scratch.prefill_batch.is_some();
+    if !verify_graph_ok {
+        // Direct (uncaptured) verify forward: every kernel re-dispatched per
+        // cycle. The embedding-format clause is the ladder that stops at the
+        // HFQ4/Q8 families — an Opus or BF16 embedding silently loses graph
+        // replay for the whole session.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "dflash verify: no captured graph, direct dispatch",
+            &format!(
+                "embd={:?}, policy={:?}, tree={}, pbs={}, env={:?}",
+                target.weights.embd_format,
+                graph_policy,
+                tree_verify_present,
+                verify_scratch.prefill_batch.is_some(),
+                verify_graph_env.as_deref(),
+            ),
+        );
+    }
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
@@ -6818,6 +6839,12 @@ fn verify_dflash_block_inner(
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
 
     let try_batched = dflash_batched_lm_head_supported(w_out.gpu_dtype);
+    if !try_batched {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "dflash verify lm_head: no batched arm for dtype",
+            &format!("{:?}", w_out.gpu_dtype),
+        );
+    }
 
     if graph_includes_lmhead_argmax {
         debug_assert!(!want_full_logits);
@@ -7397,6 +7424,12 @@ pub fn spec_step_dflash(
                 | hipfire_rdna::DType::OqCompactG128,
         );
         let use_q8_staged = matches!(w_out.gpu_dtype, hipfire_rdna::DType::Q8_0);
+        if !use_batched_gemm && !use_q8_staged {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "dflash draft lm_head: no batched arm for dtype",
+                &format!("{:?}", w_out.gpu_dtype),
+            );
+        }
         if use_batched_gemm || use_q8_staged {
             // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
             // download just (B-1) × 4 bytes of indices.
@@ -10454,6 +10487,17 @@ pub fn spec_step_dflash(
         }
         SpecRollbackReplayKind::GdnTape
     } else {
+        // No usable GDN tape: re-run the whole target over the committed
+        // prefix instead of replaying the recorded innovations. The usual
+        // cause is `verify_populates_tape == false`, i.e. the verify forward
+        // itself dropped to the tape-less per-token loop.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "dflash rollback: full-prefill re-run, no GDN tape",
+            &format!(
+                "verify_populates_tape={verify_populates_tape}, kv_batched_capable={kv_batched_capable}, replay_steps={}",
+                accept_len + 1
+            ),
+        );
         let replay_tokens = &committed[..accept_len + 1];
         qwen35::forward_prefill_batch(
             gpu,
@@ -11875,6 +11919,13 @@ pub fn spec_step_ddtree_batched(
         // linear-order tape AND correctly RoPE'd K written to committed
         // slots. ~40-50 ms cost on 27B. Path B kill is opt-in via
         // HIPFIRE_DDTREE_PATH_B_CAPTURE=1.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "ddtree: 2nd verify forward for committed-order tape",
+            &format!(
+                "spine_accept={spine_accept}, force_slow={force_slow}, replay_steps={}",
+                accept_len + 1
+            ),
+        );
         let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(

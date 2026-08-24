@@ -398,6 +398,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 n,
             )?;
         } else if qkv_is_q8 && qkv_same_dtype {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered FA proj_qkv: -> 3 plain Q8 GEMMs (no WMMA)",
+                &format!("{:?} arch={} has_wmma=false", layer.wq.gpu_dtype, gpu.arch),
+            );
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
@@ -467,6 +471,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered FA proj_qkv: F16 -> fused_qkvza_f16_xf32 (no WMMA GEMM)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.fused_qkvza_f16_xf32_batched(
                     &layer.wq.buf,
                     &layer.wk.buf,
@@ -518,6 +526,13 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 )?;
             }
         } else {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered FA proj_qkv: -> per-weight GEMM (mixed dtypes)",
+                &format!(
+                    "q={:?} k={:?} v={:?}",
+                    layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype
+                ),
+            );
             // Mixed-format fallback (issue #249): wq/wk/wv don't all
             // share a dtype. Dispatch each weight to its own
             // single-weight batched GEMM, dropping the fused-kernel
@@ -1137,6 +1152,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 )?;
             }
         } else if kv_cache.quant_q8 && q8_fa_attention_serial_kv_loop_enabled() {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered attend_full: -> serial per-row Q8 KV write+attend",
+                &format!("HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP n={n}"),
+            );
             assert!(
                 tree_verify.is_none(),
                 "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP is a causal Q8 FA diagnostic; tree-verify masking is not supported",
@@ -1185,6 +1204,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
             let _ = gpu.hip.free(pos_buf_tmp);
             pos_buf_result?;
         } else if kv_cache.quant_q8 && max_ctx_len > LDS_CTX_LIMIT {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered attend_full: -> per-position Q8 flash loop (LDS ctx limit)",
+                &format!("max_ctx_len={max_ctx_len} > {LDS_CTX_LIMIT} n={n}"),
+            );
             assert!(
                 tree_verify.is_none(),
                 "tree-verify mode hits the long-context Q8 fallback \
@@ -1229,6 +1252,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
             let _ = gpu.hip.free(pos_buf_tmp);
             pos_buf_result?;
         } else if kv_cache.quant_q8 && q8_fa_attention_scalar_loop_enabled() {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered attend_full: -> per-row scalar Q8 attention loop",
+                &format!("HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP n={n}"),
+            );
             let q_dim = config.n_heads * config.head_dim;
             let pos_buf_tmp = gpu.hip.malloc(4)?;
             let pos_buf_result = (|| -> HipResult<()> {
@@ -1256,6 +1283,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
             let _ = gpu.hip.free(pos_buf_tmp);
             pos_buf_result?;
         } else if kv_cache.quant_q8 && q8_fa_attention_row_loop_enabled() {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered attend_full: -> per-row masked Q8 attention loop",
+                &format!("HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP n={n}"),
+            );
             let q8_tree_bias = if q8_fa_attention_ignore_tree_bias_enabled() {
                 None
             } else {
@@ -1524,6 +1555,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 n,
             )?;
         } else if fa_wo_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered FA resid_wo: -> plain Q8 GEMM + add (no WMMA)",
+                &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+            );
             let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
             run_plain_gemm_key(
                 gpu,
@@ -1562,6 +1597,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered FA resid_wo: F16 -> GEMV residual (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.gemv_f16_xf32_residual_batched(
                     &layer.wo.buf,
                     fa_wo_input,
@@ -1776,6 +1815,13 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 n,
             )?;
         } else if fa_ffn_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered FA proj_gate_up: -> 2 plain Q8 GEMMs (no WMMA)",
+                &format!(
+                    "{:?} arch={} has_wmma=false",
+                    layer.w_gate.gpu_dtype, gpu.arch
+                ),
+            );
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
@@ -1844,6 +1890,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered FA proj_gate_up: F16 -> GEMV (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.fused_gate_up_f16_xf32_batched(
                     &layer.w_gate.buf,
                     &layer.w_up.buf,
@@ -2021,6 +2071,13 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 n,
             )?;
         } else if fa_w_down_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered FA resid_down: -> plain Q8 GEMM + add (no WMMA)",
+                &format!(
+                    "{:?} arch={} has_wmma=false",
+                    layer.w_down.gpu_dtype, gpu.arch
+                ),
+            );
             let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
             run_plain_gemm_key(
                 gpu,
@@ -2059,6 +2116,10 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered FA resid_down: F16 -> GEMV residual (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.gemv_f16_xf32_residual_batched(
                     &layer.w_down.buf,
                     &pbs.ffn_hidden_batch,
@@ -2406,6 +2467,13 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else if is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered DN proj_qkvza: -> 4 plain Q8 GEMMs (no WMMA)",
+                &format!(
+                    "{:?} arch={} has_wmma=false",
+                    layer.wqkv.gpu_dtype, gpu.arch
+                ),
+            );
             // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
             // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
             // GemmQ8_0BatchedChunked dispatcher-entry key → identical
@@ -2538,6 +2606,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered DN proj_qkvza: F16 -> non-WMMA fused path",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.fused_qkvza_f16_xf32_batched(
                     &layer.wqkv.buf,
                     &layer.wz.buf,
@@ -3326,6 +3398,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else if wo_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered DN resid_wo: -> tier-2 plain Q8 GEMM + add (no WMMA)",
+                &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+            );
             // Tier 2 fallback (non-WMMA archs): GEMM into x_rot_batch as
             // scratch (safe — next consumer is the FFN rmsnorm), then
             // add into residual.
@@ -3367,6 +3443,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered DN resid_wo: F16 -> GEMV residual (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.gemv_f16_xf32_residual_batched(
                     &layer.wo.buf,
                     wo_input,
@@ -3562,6 +3642,13 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else if ffn_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered DN proj_gate_up: -> 2 plain Q8 GEMMs (no WMMA)",
+                &format!(
+                    "{:?} arch={} has_wmma=false",
+                    layer.w_gate.gpu_dtype, gpu.arch
+                ),
+            );
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
@@ -3630,6 +3717,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered DN proj_gate_up: F16 -> GEMV (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.fused_gate_up_f16_xf32_batched(
                     &layer.w_gate.buf,
                     &layer.w_up.buf,
@@ -4010,6 +4101,13 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else if w_down_is_q8 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_lowered DN resid_down: -> plain Q8 GEMM + add (no WMMA)",
+                &format!(
+                    "{:?} arch={} has_wmma=false",
+                    layer.w_down.gpu_dtype, gpu.arch
+                ),
+            );
             let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
             run_plain_gemm_key(
                 gpu,
@@ -4048,6 +4146,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_lowered DN resid_down: F16 -> GEMV residual (no WMMA)",
+                    &format!("F16 arch={} f16_prefill_wmma=false", gpu.arch),
+                );
                 gpu.gemv_f16_xf32_residual_batched(
                     &layer.w_down.buf,
                     &pbs.ffn_hidden_batch,

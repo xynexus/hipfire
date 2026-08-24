@@ -156,6 +156,10 @@ impl KvTierPlan {
             (KernelKey::KvWriteQ4, KernelKey::AttnQ4Kv, false)
         } else {
             // F32 fallback
+            hipfire_rdna::kernel_trace::record_fallback(
+                "kv tier: no quantized KV tier matched -> full-f32 KV write + attend",
+                &format!("batch_size={batch_size} is_tree={is_tree} pos={pos}"),
+            );
             (KernelKey::KvWriteF32, KernelKey::AttnF32, false)
         };
 

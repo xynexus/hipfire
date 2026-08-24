@@ -317,12 +317,18 @@ impl GemvFamily {
                 launch(gpu, key, params)
             }
             GemvVariant::Prerotated => {
-                if params.w.dtype == DType::MFP4G32
+                let mfp4_fused_ok = params.w.dtype == DType::MFP4G32
                     && self
                         .registry
                         .resolve(KernelKey::GemvMfp4G32Fused, ctx, None)
-                        .is_ok()
-                {
+                        .is_ok();
+                if params.w.dtype == DType::MFP4G32 && !mfp4_fused_ok {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "gemv mfp4g32: fused rotate+gemv not admitted -> split rotate + gemv",
+                        &format!("m={} k={}", params.w.m, params.w.k),
+                    );
+                }
+                if mfp4_fused_ok {
                     let pipe_params = PipelineParams::Linear(LinearParams {
                         x: params.x,
                         y: params.y,
@@ -511,6 +517,14 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // int8 weight. Weight buffer layout: [int8 M*K | f32 scales M*ng].
         K::GemvOq8G256Prerotated => {
             const GROUP: usize = 256;
+            // Not a real GEMV: this quantizes the activation into a freshly
+            // allocated pair of scratch tensors and runs the batched grouped
+            // WMMA GEMM at n=1, wasting 15/16 of its matrix tile. The compact
+            // Opus arm below has a true single-column kernel; Oq8G256 does not.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "gemv oq8g256: no 1-column kernel -> grouped WMMA GEMM at n=1 (+ per-call alloc)",
+                &format!("m={m} k={k}"),
+            );
             let ng = k / GROUP;
             let xq = hip!(gpu.alloc_tensor(&[k], DType::Raw))?;
             let xs = hip!(gpu.alloc_tensor(&[ng], DType::F32))?;

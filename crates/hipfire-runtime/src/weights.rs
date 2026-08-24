@@ -452,6 +452,18 @@ fn trace_rotation(gpu: &mut Gpu, tag: &str, w: &WeightTensor, x: &GpuTensor, xr:
 }
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    // Every call here is ONE column. A caller looping this over B rows re-reads
+    // the whole weight once per row, which is the defect shape behind three of
+    // the four ~2x wins on this model. Recording BYTES (not calls) is what makes
+    // a [248320, 5120] lm_head at B calls/cycle outrank thousands of small
+    // projections. Costs one relaxed atomic load when tracing is off.
+    hipfire_rdna::kernel_trace::record_shape(
+        "weight_gemv(1col)",
+        w.m,
+        w.k,
+        1,
+        w.buf.byte_size() as u128,
+    );
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::{
@@ -650,6 +662,10 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         // W8A8 reference (decode = B=1): reuse the weight_gemm path. buf =
         // [M*K int8 | M f32]. Per-vector int8 act-quant, iu8 WMMA (B=1), rowcol dequant.
         DType::W8A8Ref => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemv: W8A8 reference path (per-call scratch alloc/free)",
+                &format!("{:?}", w.gpu_dtype),
+            );
             warn_generic_once(
                 "weight_gemv",
                 "W8A8",
@@ -722,6 +738,10 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             debug_assert!(
                 w.gpu_dtype != DType::Oq4G256,
                 "Oq4G256 reached weight_gemv generic arm — should hit the dedicated arm"
+            );
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemv: no dedicated arm -> generic FWHT-G256 prerotated GEMV",
+                &format!("{:?}", w.gpu_dtype),
             );
             if std::env::var_os("HIPFIRE_OQ4_TRACE").is_some() {
                 eprintln!(
@@ -1193,7 +1213,13 @@ pub fn weight_gemv_prerotated(
             }
         }
         DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
-        _ => weight_gemv(gpu, w, x, y),
+        _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemv_prerotated: no prerotated GEMV for dtype -> re-rotating weight_gemv",
+                &format!("{:?}", w.gpu_dtype),
+            );
+            weight_gemv(gpu, w, x, y)
+        }
     }
 }
 
@@ -1308,6 +1334,10 @@ pub fn weight_gemv_residual(
             gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemv_residual: no fused residual GEMV -> gemv + alloc + add_inplace + free",
+                &format!("{:?}", w.gpu_dtype),
+            );
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
             let result: HipResult<()> = (|| {
                 weight_gemv(gpu, w, x, &tmp)?;
@@ -1426,6 +1456,10 @@ pub fn weight_gemv_swiglu_residual(
             )
         }
         _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemv_swiglu_residual: no fused SwiGLU epilogue -> silu_mul + gemv_residual",
+                &format!("{:?}", w_down.gpu_dtype),
+            );
             // Non-MQ fallback: plain two-step.
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
             // HIPFIRE_DOWN_TRACE=1: the down_proj call site, which is the only
@@ -1569,6 +1603,10 @@ pub fn weight_gemm(
             // Quantize activations per-token to int8, iu8 WMMA, dequant by w·x scale.
             // Per-call scratch (alloc/free, mirrors the fallback) — correctness over
             // perf for the reference floor; warn so the slow path is visible.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemm: W8A8 reference path (per-call scratch alloc/free)",
+                &format!("{:?} batch={}", w.gpu_dtype, batch_size),
+            );
             warn_generic_once(
                 "weight_gemm",
                 "W8A8",
@@ -1594,6 +1632,10 @@ pub fn weight_gemm(
             result
         }
         _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "weight_gemm: no batched kernel for dtype -> per-token GEMV loop",
+                &format!("{:?} batch={}", w.gpu_dtype, batch_size),
+            );
             // Generic fallback: no batched kernel for this weight dtype, so loop a
             // per-token GEMV. Correct but slow — warn once per (dtype, mode, arch) so
             // the missing batched-kernel coverage shows up in logs (reference layer).

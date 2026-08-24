@@ -3848,6 +3848,13 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count,
                     )?;
                 } else if attn_is_q8 {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_batch DN qkvza: -> 4 plain Q8 GEMMs (no WMMA)",
+                        &format!(
+                            "{:?} arch={} has_wmma=false",
+                            layer.wqkv.gpu_dtype, gpu.arch
+                        ),
+                    );
                     gpu.gemm_q8_0_batched_chunked(
                         &layer.wqkv.buf,
                         &pbs.x_rot_batch,
@@ -4065,6 +4072,10 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count,
                     )?;
                 } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_batch DN wo: -> plain Q8 GEMM + add (no WMMA)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+                    );
                     let scratch = pbs
                         .dn_normed_rot_batch
                         .sub_offset(0, row_count * layer.wo.m);
@@ -4229,6 +4240,10 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count,
                     )?;
                 } else if attn_is_q8 {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_batch FA qkv: -> 3 plain Q8 GEMMs (no WMMA)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wq.gpu_dtype, gpu.arch),
+                    );
                     gpu.gemm_q8_0_batched_chunked(
                         &layer.wq.buf,
                         &pbs.x_rot_batch,
@@ -4512,6 +4527,10 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count,
                     )?;
                 } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_batch FA wo: -> plain Q8 GEMM + add (no WMMA)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+                    );
                     let scratch = pbs
                         .fa_attn_out_rot_batch
                         .sub_offset(0, row_count * layer.wo.m);
@@ -5135,6 +5154,18 @@ pub(crate) fn kld_direct_f16kv_attention_eligible(
         && config.head_dim <= 256
         && gpu.arch_caps.has_wmma();
     if enabled && !eligible {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 prefill_batch: direct f16-KV WMMA attention ineligible -> standard attention",
+            &format!(
+                "start_pos={start_pos} q8={} asym={}/{}/{} head_dim={} has_wmma={}",
+                kv_cache.quant_q8,
+                kv_cache.quant_asym2,
+                kv_cache.quant_asym3,
+                kv_cache.quant_asym4,
+                config.head_dim,
+                gpu.arch_caps.has_wmma()
+            ),
+        );
         static LOGGED: OnceLock<()> = OnceLock::new();
         LOGGED.get_or_init(|| {
             eprintln!(
@@ -6202,6 +6233,10 @@ pub fn forward_prefill_batch_with_pbs_opts(
     }
 
     if !eligible {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 forward_prefill_batch: -> per-token forward_scratch loop (batched prefill declined)",
+            &format!("base={pbs_eligible_base} kv_f32={kv_f32} kv_asym2_tree={kv_asym2_tree} n={n} arch={arch} dn_quant={:?}", dn_state.quant),
+        );
         assert!(
             tree_verify.is_none(),
             "tree-verify mode requires the batched-FA-eligible prefill path; \

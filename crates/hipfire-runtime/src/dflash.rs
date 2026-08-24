@@ -1902,7 +1902,16 @@ fn gemm_dispatch(
         None
     };
     let result = match w.gpu_dtype {
-        DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F32 => {
+            // Naive non-WMMA kernel (~100 GB/s, ~10% of peak) — every other arm
+            // here is a WMMA path. An F32 drafter weight means the F16 lift or a
+            // quant arm did not apply upstream.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "dflash gemm: F32 weight -> naive gemm_f32_batched (no WMMA)",
+                &format!("m={} k={} batch={batch}", w.m, w.k),
+            );
+            gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m)
+        }
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),

@@ -4403,7 +4403,41 @@ pub fn load_weights(
                 6 => (tensor, EmbeddingFormat::HFQ4G256),
                 7 => (tensor, EmbeddingFormat::HFQ4G128),
                 3 => (tensor, EmbeddingFormat::Q8_0),
+                // Lossless BF16 recodings (Bf16Lut3=49 / Bf16Huff=50). These decode
+                // to plain bf16, so expanding them to F32 doubles the resident
+                // table for nothing: on Qwen3.8-27B's [248320, 5120] embedding
+                // that is 4.74 GiB instead of 2.37 GiB, 12% of the model's
+                // resident footprint. The gather cannot read the packed form —
+                // a lookup reads one arbitrary row and the escape plane is only
+                // addressable by walking a block — so decode to plain bf16 and
+                // take the native-bf16 gather path, exactly as
+                // `hipfire-arch-qwen2`'s `load_embed_tokens` already does.
+                //
+                // Found by the record_fallback sweep: this fired as
+                // "qwen35 embedding: expanded to F32 [quant_type=49]".
+                49 | 50 => {
+                    let (_, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                        .expect("embed_tokens not found");
+                    loaded_bytes += embd_data.len();
+                    let n = config.vocab_size * config.dim;
+                    let logical = hipfire_runtime::hfq::decode_bf16_packed(qt, &embd_data, n)
+                        .unwrap_or_else(|| {
+                            panic!("qwen35: failed to decode recoded embedding (qt={qt})")
+                        });
+                    eprintln!(
+                        "    (bf16 recoding qt={qt} -> native bf16, {} MB resident)",
+                        logical.len() / 1_000_000
+                    );
+                    (
+                        gpu.upload_raw(&logical, &[logical.len()])?,
+                        EmbeddingFormat::BF16,
+                    )
+                }
                 _ => {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 embedding: expanded to F32",
+                        &format!("slab quant_type={qt} (fast formats: 6/7/3/49/50)"),
+                    );
                     let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
                         .expect("embed_tokens not found");
                     loaded_bytes += embd_data.len();
@@ -4442,7 +4476,33 @@ pub fn load_weights(
                 gpu.upload_raw(&embd_data, &[embd_data.len()])?,
                 EmbeddingFormat::Q8_0,
             )
+        } else if embd_qt == 49 || embd_qt == 50 {
+            // Lossless BF16 recodings — see the slab arm above for the full
+            // reasoning. Decoding these to F32 doubles the resident table for
+            // nothing (4.74 GiB vs 2.37 GiB on this model's [248320, 5120]).
+            let (_, embd_data) =
+                qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+            loaded_bytes += embd_data.len();
+            let n = config.vocab_size * config.dim;
+            let logical = hipfire_runtime::hfq::decode_bf16_packed(embd_qt as u8, &embd_data, n)
+                .unwrap_or_else(|| {
+                    panic!("qwen35: failed to decode recoded embedding (qt={embd_qt})")
+                });
+            eprintln!(
+                "    (bf16 recoding qt={embd_qt} -> native bf16, {} MB resident)",
+                logical.len() / 1_000_000
+            );
+            (
+                gpu.upload_raw(&logical, &[logical.len()])?,
+                EmbeddingFormat::BF16,
+            )
         } else {
+            // F32 embedding is 8x the HFQ4 bytes AND disables the DFlash
+            // verify graph, whose eligibility gate lists only HFQ4G256/Q8_0.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 embedding: expanded to F32",
+                &format!("quant_type={embd_qt} (fast formats: 6/7/3/49/50)"),
+            );
             let (embd_meta, embd_data) =
                 qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
             loaded_bytes += embd_data.len();
@@ -4662,6 +4722,12 @@ pub fn load_weights(
             } else if embd_qt == 16 {
                 load_bf16_matrix_weight(gpu, &tied_data, config.vocab_size, config.dim)?
             } else {
+                // The 1017 MB f32 head the comment block above measured at
+                // 24.8% of all GPU time. Every other arm keeps it packed.
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 tied lm_head: expanded to F32",
+                    &format!("quant_type={embd_qt}, force_bf16_head={force_bf16_head}"),
+                );
                 let f32_data =
                     hfq_plain_tensor_as_f32(tied_info, &tied_data, "embed_tokens.weight");
                 let bytes: &[u8] = unsafe {
@@ -5864,6 +5930,13 @@ fn load_token_embd_into(
             EmbeddingFormat::Q8_0,
         )
     } else {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 embedding: expanded to F32",
+            &format!(
+                "quant_type={} (fast formats: 6/7/3)",
+                embd_info.0.quant_type
+            ),
+        );
         let f32_data = hfq_plain_tensor_as_f32(embd_info.0, embd_info.1, "embed_tokens.weight");
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
@@ -6485,6 +6558,13 @@ fn load_moe_expert(
                 | Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
         )
     {
+        // OQ routed expert that the `*_k8_indexed*` kernels cannot be admitted
+        // for (shape or k_top != 8): stays in the dense combined layout and
+        // dispatches through the non-indexed per-expert MoE path.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 MoE expert: non-indexed decode path",
+            &format!("qt={qt:?}, m={m}, k={k}"),
+        );
         return load_weight_tensor(hfq, gpu, slabs, name, m, k);
     }
     // COMPACT-RESIDENT ROUTED EXPERTS. `load_weight_tensor` routes OqPlusCompact
@@ -6567,6 +6647,14 @@ fn load_moe_expert(
             )
         }
         Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT) => {
+            // Compact planes unpacked to one int8 per weight: 1.80x the bytes,
+            // on the tensor class that dominates a MoE model.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 MoE expert: compact expanded to Oq8 (1.80x bytes)",
+                &format!(
+                    "layer_compact_dispatchable={layer_compact_dispatchable}, force_expand={force_expand}, m={m}, k={k}"
+                ),
+            );
             let (_info, data) = qwen35_tensor_data_vec(hfq, name)
                 .ok_or_else(|| HipError::new(0, &format!("MoE expert not found: {name}")))?;
             (

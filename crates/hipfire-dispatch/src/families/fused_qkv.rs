@@ -205,6 +205,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             if gpu.arch_caps.has_wmma() {
                 hip!(gpu.gemm_qkv_hfq3g256_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "fused qkv hfq3g256: arch has no WMMA -> base cross-arch GEMM",
+                    &format!("arch={} k={k} n={n}", gpu.arch),
+                );
                 hip!(gpu.gemm_qkv_hfq3g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
             }
         }
@@ -352,6 +356,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     n
                 ))
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "fused qkvza hfq3g256: arch has no WMMA -> base cross-arch GEMM",
+                    &format!("arch={} k={k} n={n}", gpu.arch),
+                );
                 hip!(gpu.gemm_qkvza_hfq3g256(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
                     n
@@ -413,6 +421,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     n
                 ))?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "fused qkvza oq4g256: n < 64 -> per-projection f16-WMMA (no fused int8 MMQ)",
+                    &format!("n={n} k={k}"),
+                );
                 for (w, y, mm) in [
                     (wqkv, qkv, mqkv),
                     (wz, z, mz),
@@ -534,6 +546,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             if gpu.arch_caps.has_wmma() {
                 hip!(gpu.gemm_gate_up_hfq3g256_wmma(w_gate, w_up, x, gate, up, mg, mu, k, n))
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "fused gate_up hfq3g256: arch has no WMMA -> base cross-arch GEMM",
+                    &format!("arch={} k={k} n={n}", gpu.arch),
+                );
                 hip!(gpu.gemm_gate_up_hfq3g256(w_gate, w_up, x, gate, up, mg, mu, k, n))
             }
         }
@@ -577,6 +593,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             if n >= 64 {
                 hip!(gpu.gemm_oq4_gate_up_mmq(w_gate, w_up, x, gate, up, mg, mu, k, n))?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "fused gate_up oq4g256: n < 64 -> per-projection f16-WMMA (no fused int8 MMQ)",
+                    &format!("n={n} k={k}"),
+                );
                 for (w, y, mm) in [(w_gate, gate, mg), (w_up, up, mu)] {
                     hip!(gpu.gemm_oq4_grouped_f16_wmma(w, x, y, mm, k, n, GROUP))?;
                 }

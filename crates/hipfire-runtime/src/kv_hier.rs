@@ -557,6 +557,13 @@ impl HierKvState {
         if self.hot_count[layer] >= self.hot_budget {
             // Overflow fallback (on the critical path): evict the oldest batch. The
             // idle/between-turns path (idle_compact) keeps this from firing often.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "kv_hier: hot ring full -> migrate_n on the CRITICAL path (idle_compact missed)",
+                &format!(
+                    "layer={layer} hot_budget={} migrate_batch={}",
+                    self.hot_budget, self.migrate_batch
+                ),
+            );
             self.migrate_n(gpu, layer, self.migrate_batch)?;
         }
         let slot = self.hot_count[layer];

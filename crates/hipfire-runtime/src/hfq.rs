@@ -2707,6 +2707,13 @@ fn load_weight_tensor(
                     awq_scale: None,
                 })
             } else {
+                // F32 upcast: no batched WMMA GEMM for F32, so every prefill of
+                // this linear degrades to the per-token GEMV loop in weight_gemm,
+                // at 2x the resident bytes.
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "hfq load: F16 -> F32 upcast (no batched GEMM; per-token GEMV prefill)",
+                    &format!("m={m} k={k} k%16={} force_f32={force_f32}", k % 16),
+                );
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -2749,6 +2756,12 @@ fn load_weight_tensor(
                     awq_scale: None,
                 })
             } else {
+                // Same trap as the F16 arm: F32 has no batched GEMM, so the
+                // whole prefill for this linear becomes a per-token GEMV loop.
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "hfq load: BF16 -> F32 upcast (no batched GEMM; per-token GEMV prefill)",
+                    &format!("m={m} k={k} k%16={} force_f32={force_f32}", k % 16),
+                );
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
                     .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))

@@ -1607,6 +1607,10 @@ pub fn spec_step_mtp(
         }
         _ => {
             // Fallback: per-row weight_gemv. Same path verify_dflash_block uses.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "mtp verify lm_head: per-row weight_gemv",
+                &format!("{:?}, {n_verify} full-vocab GEMVs/cycle", w_out.gpu_dtype),
+            );
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
@@ -2050,6 +2054,10 @@ pub fn spec_step_mtp_compressed(
             )?;
         }
         _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "mtp compressed verify lm_head: per-row weight_gemv",
+                &format!("{:?}, {n_verify} full-vocab GEMVs/cycle", w_out.gpu_dtype),
+            );
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
@@ -2731,6 +2739,16 @@ pub fn spec_step_mtp_compressed_serial(
         state.trunk_gdn_tape.set_base_position(cur_pos);
         Some(&mut state.trunk_gdn_tape)
     } else {
+        // The forward's own PBS predicate declined: it will run the tape-less
+        // per-token loop instead of one batched prefill over n_verify tokens,
+        // and the rollback below pays a full-trunk replay on top.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "mtp verify: pbs ineligible, tape-less per-token forward",
+            &format!(
+                "{:?}, kv_quant={:?}, n_verify={n_verify}",
+                trunk_weights.output.gpu_dtype, target.dn_state.quant,
+            ),
+        );
         None
     };
 
@@ -2856,6 +2874,10 @@ pub fn spec_step_mtp_compressed_serial(
             )?;
         }
         _ => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "mtp serial verify lm_head: per-row weight_gemv",
+                &format!("{:?}, {n_verify} full-vocab GEMVs/cycle", w_out.gpu_dtype),
+            );
             for i in 0..n_verify {
                 let row = state.verify_hidden.sub_offset(i * dim, dim);
                 let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
@@ -3083,6 +3105,13 @@ pub fn spec_step_mtp_compressed_serial(
             // so the persistent tape is stale. Do the original always-correct
             // full-trunk replay of the committed prefix — one batched forward,
             // or a single forward_scratch for advance==1.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "mtp rollback: full-trunk replay, no GDN tape",
+                &format!(
+                    "{:?}, kv_quant={:?}, replay_steps={advance}",
+                    trunk_weights.output.gpu_dtype, target.dn_state.quant,
+                ),
+            );
             if advance >= 2 {
                 let replay = &verify_tokens[..advance];
                 qwen35::forward_prefill_batch(
@@ -3709,6 +3738,10 @@ pub fn spec_step_mtp_compressed_serial_multi(
                 )?;
             }
             _ => {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "mtp multi-gpu verify lm_head: per-row weight_gemv",
+                    &format!("{:?}, {n_verify} full-vocab GEMVs/cycle", w_out.gpu_dtype),
+                );
                 for i in 0..n_verify {
                     let row = state.verify_hidden.sub_offset(i * dim, dim);
                     let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);

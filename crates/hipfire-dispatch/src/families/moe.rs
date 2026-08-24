@@ -262,6 +262,15 @@ impl MoeResolution {
             || routed_indexable_oq_compact;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
+        if !use_gpu_topk {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "moe decode: routed dtype not indexable (or k != 8) -> CPU top-K per-expert loop",
+                &format!(
+                    "gate_up={:?} down={:?} k={} indexable={}",
+                    d.routed_gate_up, d.routed_down, k, routed_dtype_indexable
+                ),
+            );
+        }
         // OQ routed experts are FWHT-rotated (same signs as MQ, gen_fwht_signs
         // 42/1042 uploaded by ensure_mq_signs) → they need x_rot_local too.
         let needs_x_rot_local = gate_side_mq4
@@ -754,6 +763,15 @@ impl MoePrefillResolution {
         // opt-out route them into a nonexistent path.
         let grouped_required = matches!(routed_dtype, DType::MQ3G256 | DType::F16 | DType::BF16);
         let use_path2 = grouped_supported && (flags.moe_grouped_gemm || grouped_required);
+        if !use_path2 {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "moe prefill: no grouped MoE GEMM for this dtype/arch -> per-token indexed GEMV",
+                &format!(
+                    "{routed_dtype:?} arch_grouped_supported={grouped_supported} flag={}",
+                    flags.moe_grouped_gemm
+                ),
+            );
+        }
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();

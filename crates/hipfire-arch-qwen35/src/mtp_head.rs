@@ -1936,6 +1936,12 @@ fn mtp_moe_ffn_decode(
             ffn.shared_expert.down.k,
         )?;
     } else {
+        // No fused silu-mul-rotate + residual-sigmoid-scaled GEMV for this
+        // dtype: four separate launches plus an extra scaled_add pass.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "mtp moe shared-expert down: unfused 4-launch path",
+            &format!("{:?}", ffn.shared_expert.down.gpu_dtype),
+        );
         gpu.sigmoid_f32(scalar_buf)?;
         let shared_hid = ffn_hidden.sub_offset(0, smi);
         gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
@@ -2077,6 +2083,14 @@ pub fn mtp_head_apply_lm_head_batched(
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "mtp head lm_head: Q8 scalar GEMM, no WMMA",
+                    &format!(
+                        "has_wmma={}, k={} (needs %32==0)",
+                        gpu.arch_caps.has_wmma(),
+                        lm_head_weights.k,
+                    ),
+                );
                 gpu.gemm_q8_0_batched(
                     &lm_head_weights.buf,
                     tmp_batched,
@@ -2168,6 +2182,10 @@ pub fn mtp_head_apply_lm_head_batched(
             // Fallback: per-row weight_gemv. Same path mtp_probe uses for
             // unrecognized dtypes. Defeats the K-amortization but keeps
             // correctness for less-common lm_head formats.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "mtp head lm_head batched: per-row weight_gemv",
+                &format!("{:?}, {n} full-vocab GEMVs/call", lm_head_weights.gpu_dtype),
+            );
             for i in 0..n {
                 let row = tmp_batched.sub_offset(i * n_embd, n_embd);
                 let logits_row = logits_view.sub_offset(i * vocab, vocab);

@@ -864,6 +864,17 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             },
         );
     }
+    if !path2_eligible {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 prefill_chunk: MoE routed -> path-1 indexed GEMV (grouped WMMA declined)",
+            &format!(
+                "gate_up={:?} arch={} use_path2={use_path2} mixed={}",
+                dtypes.expert_gate_up,
+                gpu.arch,
+                dtypes.routed_profile.is_mixed()
+            ),
+        );
+    }
     if routed_expert_buckets.is_some() || path2_eligible {
         // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
         //
@@ -1787,6 +1798,10 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 )?;
             }
         } else {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 prefill_chunk: MoE routed down -> path-1 expanded GEMV",
+                &format!("down={:?} arch={}", dtypes.expert_down, gpu.arch),
+            );
             let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
             if use_atomic_free_down {
                 // Path 1 expanded-down: per-token-per-rank GEMV writes to a
@@ -1923,6 +1938,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     n,
                 )?;
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_chunk: MoE routed down -> path-0 atomic residual GEMV",
+                    &format!(
+                        "down={:?} arch={} (wave64/CDNA)",
+                        dtypes.expert_down, gpu.arch
+                    ),
+                );
                 gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
                     &ffn.expert_down_ptrs,
                     topk_indices,
@@ -2398,6 +2420,10 @@ pub(crate) fn forward_prefill_chunk(
             _ => unreachable!(),
         }
     } else if do_embed {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 prefill_chunk: embedding -> per-token lookup loop",
+            &format!("embd_format={:?} n={n}", weights.embd_format),
+        );
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G256 => unreachable!(),
@@ -2590,6 +2616,19 @@ pub(crate) fn forward_prefill_chunk(
 
     // Reported under HIPFIRE_KERNEL_TRACE so it lands beside the histogram that
     // motivates the question, and costs nothing otherwise.
+    if !fa_batched_ok {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 prefill_chunk: FA layers -> per-token run_layer_program",
+            &format!(
+                "fa_kv_ok={fa_kv_ok} arch={fa_arch} kv(q8={} asym4={} asym3={} asym2={} quantized={})",
+                kv_cache.quant_q8,
+                kv_cache.quant_asym4,
+                kv_cache.quant_asym3,
+                kv_cache.quant_asym2,
+                kv_cache.quantized
+            ),
+        );
+    }
     if !fa_batched_ok && hipfire_rdna::kernel_trace::enabled() {
         let bad_dtype = weights.layers.iter().find_map(|lw| match lw {
             LayerWeights::FullAttn(l) => (!is_batchable_la(
@@ -2822,6 +2861,10 @@ pub(crate) fn forward_prefill_chunk(
             }
 
             (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "qwen35 prefill_chunk: FA layer body -> per-token gather/scatter loop",
+                    &format!("layer={layer_idx} n={n} arch={}", gpu.arch),
+                );
                 // Per-token gather/scatter fallback for FA layers that don't
                 // qualify for batched FA (non-MQ4 weights, non-Q8_0 KV, etc).
                 //
@@ -3098,6 +3141,13 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if is_q8 {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: DN qkvza -> 4 plain Q8 GEMMs (no WMMA)",
+                        &format!(
+                            "{:?} arch={} has_wmma=false",
+                            layer.wqkv.gpu_dtype, gpu.arch
+                        ),
+                    );
                     // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
                     // (wqkv/wz/w_beta/w_alpha), sibling DeltaNet QKVZA path.
                     run_plain_gemm_key(
@@ -3630,6 +3680,10 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if dn_wo_is_q8 {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: DN wo -> plain Q8 GEMM + add (no WMMA residual)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+                    );
                     // Non-WMMA Q8: gemm into a scratch then add into x_batch.
                     // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
                     // path didn't run here) as the GEMM scratch.
@@ -3943,6 +3997,10 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_q8 && qkv_same_dtype {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: FA qkv -> 3 plain Q8 GEMMs (no fused WMMA)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wq.gpu_dtype, gpu.arch),
+                    );
                     run_plain_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
@@ -4011,6 +4069,10 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                     )?;
                 } else {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: FA qkv -> per-weight GEMM (mixed dtypes, fused qkv declined)",
+                        &format!("q={:?} k={:?} v={:?}", layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype),
+                    );
                     // Mixed-format fallback (issue #249). batched_gemm_single_weight
                     // covers MQ4/HFQ4 + MQ6/HFQ6 + Q8_0; mixed-Q8/MQ4 within FAMoe
                     // routes here.
@@ -4491,6 +4553,10 @@ pub(crate) fn forward_prefill_chunk(
                         )?;
                     }
                 } else if kv_cache.quant_q8 && max_ctx_len > LDS_CTX_LIMIT {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: FA attention -> per-position Q8 flash loop (LDS ctx limit)",
+                        &format!("max_ctx_len={max_ctx_len} > {LDS_CTX_LIMIT} n={n}"),
+                    );
                     assert!(
                         tree_verify.is_none(),
                         "tree-verify mode hits the long-context Q8 fallback \
@@ -4695,6 +4761,10 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_wo_is_q8 {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "qwen35 prefill_chunk: FA wo -> plain Q8 GEMM + add (no WMMA residual)",
+                        &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+                    );
                     // Non-WMMA Q8: GEMM into a scratch then add into x_batch.
                     // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
                     // didn't run here) as scratch.

@@ -242,6 +242,21 @@ pub fn lmhead_project(
             });
         }
     }
+    // The coarse-shortlist tier did not apply: either the env cfg is unset, or
+    // the head dtype is not one the two-stage path knows (BF16 / OqCompactG256),
+    // or the compact block stride did not divide. Consequence is an EXACT
+    // full-vocab GEMV — the whole [V, K] head read per token. This is exactly the
+    // silent-slow-path shape that cost hours by hand.
+    hipfire_rdna::kernel_trace::record_fallback(
+        "lmhead: two-stage not applicable -> exact full-vocab GEMV",
+        &format!(
+            "dtype={:?} m={} k={} twostage_cfg={:?}",
+            w.gpu_dtype,
+            w.m,
+            w.k,
+            lmhead_twostage_cfg(w.gpu_dtype == DType::OqCompactG256)
+        ),
+    );
     weight_gemv(gpu, w, x, y)
 }
 
@@ -808,6 +823,19 @@ pub fn forward_prefill_batch(
         crate::transformer::llama_prefill_batchable(weights, kv_cache, arch, n, batched_enabled);
 
     if !eligible {
+        // Batched prefill declined -> one full weight sweep PER TOKEN. Name which
+        // of the four conjuncts said no, and (for the weight conjunct, the one
+        // that silently excludes new quant families) the first offending dtype.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "llama prefill: not batchable -> per-token forward_scratch loop",
+            &format!(
+                "arch={arch} n={n} enabled={batched_enabled} kv_ok={} weights_ok={} lm_head={:?} wq0={:?}",
+                crate::transformer::kv_quant_batchable(kv_cache),
+                crate::transformer::llama_weights_batchable(weights, arch),
+                weights.output.gpu_dtype,
+                weights.layers.first().map(|l| l.wq.gpu_dtype),
+            ),
+        );
         for (i, &tok) in tokens.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
             forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
@@ -1657,6 +1685,10 @@ fn forward_prefill_chunk(
                  per-position fallback; keep the tree within the LDS context limit"
             );
             // Long-context Q8 fallback: per-position flash.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "llama prefill attn: ctx > LDS limit -> per-position flash_q8_0 loop",
+                &format!("max_ctx_len={max_ctx_len} limit={LDS_CTX_LIMIT} n={n}"),
+            );
             //
             // `pbs.positions` was uploaded as raw i32 bits but the dtype is
             // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`

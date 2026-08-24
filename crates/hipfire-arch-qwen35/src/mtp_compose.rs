@@ -363,6 +363,14 @@ pub fn spec_step_dflash_mtp(
             }
             _ => {
                 // Fallback per-row gemv.
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "dflash_mtp draft lm_head: per-row weight_gemv",
+                    &format!(
+                        "{:?}, {} full-vocab GEMVs + D2H/cycle",
+                        w_out.gpu_dtype,
+                        b - 1
+                    ),
+                );
                 for i in 1..b {
                     let hidden_row = draft_scratch.x.sub_offset(i * h, h);
                     weights::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;

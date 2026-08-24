@@ -22,6 +22,31 @@ fail qwen3_5/kld:q8f16      drift 0.000538 vs baseline 0.000843
 Five of the eight moved DOWN — the quantized model now tracks the reference
 better than the recorded baseline says it should. Only `qwen3_5_moe` moved up.
 
+## AMENDMENT 2026-08-25: the qwen3_5_moe rows moved again
+
+Re-measured on gfx1151. Six of the eight cells still reproduce this document
+exactly. The three `qwen3_5_moe` rows do NOT:
+
+| cell | this doc | measured 2026-08-25 |
+|---|---|---|
+| `qwen3_5_moe mq4` | 0.215099 | **0.223334** |
+| `qwen3_5_moe mq6` | 0.215099 | **0.223334** |
+| `qwen3_5_moe q8f16` | 0.179210 | **0.179465** |
+
+So the "measured gfx1151 now equals the gfx1103 baseline to six digits"
+argument below no longer holds for mq4/mq6 — that agreement was the evidence
+for the stale-baseline diagnosis, and it has decayed. The diagnosis may still
+be right, but this pair is no longer proof of it.
+
+NOT a regression from the 2026-08-24/25 spec-decode work: the same three values
+were measured at `88ae2b8f3` (before that work) and at `890d350c0` (after) in a
+scratch worktree, and they agree to every digit printed. Whatever moved them
+landed in the ~1000 commits between this document and `88ae2b8f3` — several MoE
+residency changes are in that range (`92e81f22d` routed experts stay compact
+resident, `928d0f8cb` indexed-compact feed, `cc532499d` per-expert stride
+table). Bisecting that range is the open work; until then do not re-record
+these three rows, because recording an unexplained number enshrines it.
+
 ## Why this is a stale baseline
 
 The measured gfx1151 numbers now equal the **gfx1103** baselines exactly:

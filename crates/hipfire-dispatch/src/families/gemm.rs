@@ -64,6 +64,10 @@ impl GemmFamily {
                 if self.registry.resolve(preferred, ctx, shape).is_ok() {
                     preferred
                 } else {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "gemm q8_0: WMMA variant not admitted -> batched-chunked GEMM",
+                        &format!("arch={} shape={shape:?}", ctx.arch.arch()),
+                    );
                     KernelKey::GemmQ8_0BatchedChunked
                 }
             }
@@ -72,6 +76,10 @@ impl GemmFamily {
                 if self.registry.resolve(preferred, ctx, shape).is_ok() {
                     preferred
                 } else {
+                    hipfire_rdna::kernel_trace::record_fallback(
+                        "gemm hfq4g256: WMMA variant not admitted -> non-WMMA GEMM",
+                        &format!("arch={} shape={shape:?}", ctx.arch.arch()),
+                    );
                     KernelKey::GemmHfq4G256
                 }
             }

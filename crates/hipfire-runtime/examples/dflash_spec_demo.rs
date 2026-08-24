@@ -2596,6 +2596,11 @@ fn main() {
             0.0
         };
 
+        // Kernel histogram + shaped traffic + SLOW PATHS, when
+        // HIPFIRE_KERNEL_TRACE=1. This is the DFlash path's block — the earlier
+        // copy sits in the --ar-baseline mirror, which a spec-decode run never
+        // reaches, so the dump silently never fired.
+        hipfire_rdna::kernel_trace::dump("dflash_spec_demo");
         // ── BENCH METRICS (machine-parseable) ─────────────────────────────────
         // Single source of truth for downstream submission scripts (LMX,
         // benchmarks/results/*.py). Keep flat key=value lines so a simple regex

@@ -571,6 +571,19 @@ pub fn execute_steps(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {
+            // A fusable window (RmsnormAutomatic + GEMVs) that the FUSED_TABLE
+            // did not match means "no fused kernel for this dtype/arch" — the
+            // exact silent-slow-path this trace exists to surface.
+            if matches!(steps[i], Step::RmsnormAutomatic { .. }) {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "pipeline: no fused kernel for this rmsnorm+gemv window -> unfused per-op",
+                    &format!(
+                        "window_len={} first_gemv_dtype={:?}",
+                        steps.len() - i,
+                        window_gemv_dtype(&steps[i..])
+                    ),
+                );
+            }
             launch_op(gpu, ctx, &steps[i])?;
             i += 1;
         }

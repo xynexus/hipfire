@@ -515,6 +515,20 @@ fn oq8_arch_load_inner(
             return Some((split, DType::OqCompactG128));
         }
     }
+    // A COMPACT tensor reaching here is expanded to one int8 per weight — ~2x
+    // the resident bytes and the ordinary Oq8 kernels instead of the compact
+    // ones. That is a bandwidth regression with no correctness signal, so name
+    // which of the three conditions declined.
+    if qt == QuantType::OqPlusCompact.code() || qt == QuantType::OqPlusCompactG128.code() {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "oq load: compact NOT resident -> expanded to Oq8G256 (2x weight bytes)",
+            &format!(
+                "qt={qt} m={m} k={k} allow_compact={allow_compact}                  resident_enabled={} shape_selected={}",
+                compact_resident_enabled(),
+                compact_shape_selected(m, k)
+            ),
+        );
+    }
     let bytes = match qt {
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),

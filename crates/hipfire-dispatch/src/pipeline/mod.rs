@@ -846,6 +846,10 @@ pub fn run_moe_decode(
             p.router.k,
         ))?;
     } else {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "moe decode gate side: not all-MQ4 -> 4 separate GEMVs instead of fused_qkvza",
+            &format!("router={:?} shared_gate={:?}", p.router.dtype, p.shared_gate_w.dtype),
+        );
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
         moe_gemv_plain(ctx, gpu, gemv, &p.router, p.x_norm, p.router_logits)?;
@@ -875,6 +879,13 @@ pub fn run_moe_decode(
     // k=8 + an indexable routed dtype).
     moe_step!(__step, "after gate-side GEMV");
     if !res.use_gpu_topk {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "moe decode: CPU top-K per-expert loop (no indexed GPU top-K path)",
+            &format!(
+                "gate_up={:?} down={:?} k={} n_exp={}",
+                p.dtypes.routed_gate_up, p.dtypes.routed_down, p.k, p.n_exp
+            ),
+        );
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
@@ -1277,6 +1288,10 @@ fn select_grouped_lloyd_variant(
     } else if use_lloyd_4w {
         GroupedLloydVariant::Lloyd4w
     } else {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "moe grouped lloyd: no 4w/mmq variant admitted -> base grouped GEMM",
+            &format!("use_lloyd_4w={use_lloyd_4w} use_mmqload={use_mmqload}"),
+        );
         GroupedLloydVariant::Base
     }
 }
@@ -1633,6 +1648,10 @@ pub fn run_moe_prefill_bias_aware(
         ))?;
     } else {
         // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
+        hipfire_rdna::kernel_trace::record_fallback(
+            "moe prefill (bias-aware): grouped GEMM not used -> scalar K4 indexed GEMV",
+            &format!("batch_size={batch_size} gate_threshold={gate_threshold}"),
+        );
         hip!(
             gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
                 p.expert_gate_up_ptrs,
@@ -1837,7 +1856,12 @@ pub fn run_grouped_moe_gemm(
                 rows,
             ))
         }
-        DType::F16 | DType::BF16 => hip!(gpu.gemm_raw_moe_grouped_portable(
+        DType::F16 | DType::BF16 => {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "moe grouped GEMM: no arch WMMA kernel for raw dtype -> portable active-route",
+                &format!("{dtype:?} arch={} m={m} k={k}", gpu.arch),
+            );
+            hip!(gpu.gemm_raw_moe_grouped_portable(
             dtype,
             ptrs,
             tile_ids,
@@ -1848,7 +1872,8 @@ pub fn run_grouped_moe_gemm(
             k,
             x_row_div,
             m_total,
-        )),
+            ))
+        }
         DType::ParoQ4G128 => {
             if paro_i8_k8 {
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
@@ -1877,6 +1902,10 @@ pub fn run_grouped_moe_gemm(
                     rows,
                 ))
             } else {
+                hipfire_rdna::kernel_trace::record_fallback(
+                    "moe grouped GEMM (paro): i8 MMQ off -> wmma_k2 grouped",
+                    &format!("m={m} k={k} rows={rows} arch={}", gpu.arch),
+                );
                 hip!(gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
                     ptrs,
                     tile_ids,
@@ -2027,6 +2056,10 @@ pub fn run_moe_prefill(
         ))?;
     } else {
         // Path 1 fallback: per-token indexed GEMV, batched over N tokens.
+        hipfire_rdna::kernel_trace::record_fallback(
+            "moe prefill gate_up: grouped GEMM (path 2) not admitted -> path 1 indexed GEMV",
+            &format!("{:?} n={n} mi={mi}", p.dtypes.routed_gate_up),
+        );
         if res.paro_mode {
             let paro = p
                 .paro_gate_up

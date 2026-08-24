@@ -1196,6 +1196,13 @@ pub(crate) fn moe_ffn_decode_impl(
             ffn.router.k,
         )?;
     } else {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_decode: gate side -> 4 separate weight_gemv (fused-4 declined)",
+            &format!(
+                "router={:?} shared_gate={:?}",
+                ffn.router.gpu_dtype, ffn.shared_expert_gate.gpu_dtype
+            ),
+        );
         // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
         // weight_gemv handles its own rotation for MQ4 weights internally
         // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
@@ -1289,6 +1296,10 @@ pub(crate) fn moe_ffn_decode_impl(
             }
             (None, None)
         } else {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 moe_decode: top-K -> CPU download + CPU top-K (D2H sync)",
+                &format!("use_gpu_topk=false k={k} n_exp={n_exp}"),
+            );
             // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
             gpu.softmax_f32(router_logits)?;
             let probs = gpu.download_f32(router_logits)?;
@@ -1372,6 +1383,10 @@ pub(crate) fn moe_ffn_decode_impl(
                 ffn.shared_expert.down.k,
             )?;
         } else {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 moe_decode: shared-expert down -> unfused sigmoid + gemv + scaled_add",
+                &format!("{:?}", ffn.shared_expert.down.gpu_dtype),
+            );
             // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
             gpu.sigmoid_f32(scalar_buf)?;
             // Non-MQ fallback: pre-2a-ii path.
@@ -1788,6 +1803,10 @@ pub(crate) fn moe_ffn_decode_impl(
             paged_moe_debug_sync(gpu, "after paged routed combine")?;
         }
     } else {
+        hipfire_rdna::kernel_trace::record_fallback(
+            "qwen35 moe_decode: routed experts -> CPU-top-K path (indexed GPU path declined)",
+            &format!("gate_up={routed_gate_up_dtype:?} down={routed_down_dtype:?} k={k}"),
+        );
         // CPU-top-K fallback path. Two sub-paths from here:
         //   (a) k==8 && all-MQ4 but gate_side wasn't all-MQ4 (e.g. router
         //       not MQ4): use the kernarg-pointer fused kernels with the
@@ -1866,6 +1885,10 @@ pub(crate) fn moe_ffn_decode_impl(
                 e0.down.k,
             )?;
         } else {
+            hipfire_rdna::kernel_trace::record_fallback(
+                "qwen35 moe_decode: routed experts -> per-expert weight_gemv loop",
+                &format!("gate_up={routed_gate_up_dtype:?} down={routed_down_dtype:?} k={k}"),
+            );
             // Per-expert fallback for layers that aren't all-MQ4 or have k != 8.
             for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
                 let expert = &ffn.experts[expert_idx];

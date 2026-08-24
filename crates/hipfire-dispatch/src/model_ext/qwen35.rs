@@ -199,6 +199,15 @@ impl Qwen35ModelExt for () {
                 params.head_dim,
             );
         }
+        hipfire_rdna::kernel_trace::record_fallback(
+            "deltanet batch: chunkwise-parallel not taken -> sequential per-token recurrence",
+            &format!(
+                "{:?} n_tokens={} chunk_enabled={}",
+                params.quant,
+                params.n_tokens,
+                hipfire_rdna::gdn_chunk::chunk_enabled()
+            ),
+        );
         match params.quant {
             StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
                 params.q_batch,
