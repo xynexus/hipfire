@@ -39,7 +39,57 @@ what KVarN is.
 So: the surviving supported KV modes are fp32 (ineligible) and kvarn (eligible by
 accident). That is worth making explicit before it regresses.
 
-## Blocker 2 — the GDN tape forces per-token verify, which is why spec-decode loses
+## CORRECTION to blocker 2, and the measured budget
+
+The 7th argument to `prefill_batch_pbs_eligible` is **`tape_in_play`**, not
+`force_fallback` (which is computed inside from env). I read it wrong first time.
+It sets `allow_compact = !tape_in_play`, and only `tree_verify || gdn_tape` sets
+it -- `hidden_rb` does not, by default.
+
+And for a compact target the tape is ALREADY dropped before verify:
+
+```rust
+let verify_populates_tape = pbs_eligible(.., /* tape_in_play */ true) && kv_batched_capable;
+let use_tape_replay = gdn_tape.is_some() && verify_populates_tape;
+let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
+```
+
+`pbs_eligible(.., true)` is false for compact, so `gdn_tape_opt` is None and
+verify's own `tape_in_play` is false. Verify is therefore NOT simply per-token,
+and "write a compact tape writer" is not the fix I claimed it was.
+
+**Measured budget** (`HIPFIRE_SPEC_PHASES=1`, B=8, dflash2, kvarn):
+
+```
+draft=52ms  verify=322ms  replay=67-336ms  total=376-712ms   (tau 2.28)
+```
+
+Plain decode is 69 ms/token. A fully batched verify of 8 tokens should cost ~1
+sweep (~69ms); it costs 322ms, about 4.7 sweeps. So verify is partially batched
+and there is ~4.7x still on the table there -- but that is not where the target
+lives.
+
+### Why tau, not verify, is the lever
+
+Even with a PERFECT one-sweep verify: 52 + 69 + 67 = 188ms per cycle for ~2.3
+accepted tokens = 82 ms/token = **12 tok/s, still below plain decode's 14.5**.
+The fixed draft (52ms) and replay (67ms) terms dominate at low tau.
+
+55 tok/s = 18 ms/token. At B=8 with near-full acceptance: (52 draft + 69 verify)
+/ 8 = 15 ms/token = **66 tok/s**. That is the only shape of the budget that
+reaches the target: acceptance close to B, so the fixed costs amortise.
+
+And the daemon says acceptance is being left on the table, unprompted:
+
+> DFlash2 candidate_selector (rank=256, top_k=16) is carried by this drafter but
+> NOT applied — the draft path still takes a per-position argmax. Output stays
+> correct (the target verifies every token); acceptance rate is below what this
+> checkpoint can do.
+
+So the order is: **apply the DFlash2 candidate selector** (tau 2.28 -> ?), then
+the 4.7x verify, then the replay. Not the tape.
+
+## Blocker 2 (as first written, superseded above) — the GDN tape
 
 The eligibility call passes
 
