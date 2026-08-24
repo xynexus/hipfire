@@ -9,6 +9,75 @@ use crate::kernels;
 use hip_bridge::HipResult;
 
 impl Gpu {
+    /// Raw F16/BF16 routed-MoE grouped GEMM, arch-dispatched. gfx1151 has tuned
+    /// WMMA kernels; every other arch takes the portable scalar fallback, which
+    /// shares the `expert_tile_ids` / `sorted_slot_index` / `x_row_div` contract
+    /// and the `[m_total, M]` fp32 output layout exactly.
+    ///
+    /// Without this, `moe_grouped_gemm_supported_for_dtype` admitting
+    /// `F16 | BF16 => arch.starts_with("gfx")` reached a gfx1151-only entry point
+    /// and panicked on every other RDNA part — batched MoE prefill was
+    /// unreachable on gfx1103 for exactly that reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_raw_moe_grouped(
+        &mut self,
+        dtype: DType,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if self.arch == "gfx1151" {
+            return match dtype {
+                DType::F16 => self.gemm_f16_moe_grouped_wmma_gfx1151(
+                    expert_weight_ptrs,
+                    expert_tile_ids,
+                    sorted_slot_index,
+                    x_src,
+                    y_grouped,
+                    m,
+                    k,
+                    x_row_div,
+                    m_total,
+                    x_src_rows,
+                ),
+                DType::BF16 => self.gemm_bf16_moe_grouped_wmma_gfx1151(
+                    expert_weight_ptrs,
+                    expert_tile_ids,
+                    sorted_slot_index,
+                    x_src,
+                    y_grouped,
+                    m,
+                    k,
+                    x_row_div,
+                    m_total,
+                    x_src_rows,
+                ),
+                _ => unreachable!("gemm_raw_moe_grouped: {dtype:?} is not a raw F16/BF16 dtype"),
+            };
+        }
+        // The portable kernel reads X as f32 directly, so `x_src_rows` (the
+        // fp16 staging extent) has no analogue here.
+        self.gemm_raw_moe_grouped_portable(
+            dtype,
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+        )
+    }
+
     /// Portable active-route grouped fallback for raw F16/BF16 expert weights.
     /// The fast gfx1151 path uses WMMA; this scalar kernel keeps streamed source
     /// calibration correct on RDNA2, other RDNA3 cards, RDNA4, and CDNA.

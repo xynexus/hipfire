@@ -1135,19 +1135,8 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             )?
                         }
                     }
-                    DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
-                        &ffn.expert_gate_up_ptrs,
-                        tile_ids,
-                        sorted,
-                        &pbs.x_norm_batch,
-                        y_gu_grouped,
-                        2 * mi,
-                        gate_up_k,
-                        path2_shape.gate_up_x_row_div,
-                        m_total,
-                        path2_shape.gate_up_source_rows,
-                    )?,
-                    DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                    raw @ (DType::F16 | DType::BF16) => gpu.gemm_raw_moe_grouped(
+                        raw,
                         &ffn.expert_gate_up_ptrs,
                         tile_ids,
                         sorted,
@@ -1697,19 +1686,8 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             )?
                         }
                     }
-                    DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
-                        &ffn.expert_down_ptrs,
-                        tile_ids,
-                        sorted,
-                        rot_batch,
-                        y_down_grouped,
-                        down_m,
-                        down_k,
-                        path2_shape.down_x_row_div,
-                        m_total,
-                        path2_shape.down_source_rows,
-                    )?,
-                    DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                    raw @ (DType::F16 | DType::BF16) => gpu.gemm_raw_moe_grouped(
+                        raw,
                         &ffn.expert_down_ptrs,
                         tile_ids,
                         sorted,
