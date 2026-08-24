@@ -580,7 +580,12 @@ impl Gpu {
         // nibbles from them, so nothing upstream has to change.
         //
         // HIPFIRE_OQ_COMPACT_SMALL_N=0 restores the GEMM for A/B.
-        if n <= 16
+        // 32, not 16: a DDTree of budget B linearizes to B+1 tokens, so every
+        // tree worth building exceeded the old bound and fell through to the
+        // N-heavy tiled GEMM below — which is why tree verify measured slower
+        // than chain here. multicol reads each weight row once for ALL columns,
+        // so it is the right kernel for a tree the same way it is for a block.
+        if n <= 32
             && group == 256
             && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
         {
@@ -752,8 +757,8 @@ impl Gpu {
             return Ok(());
         }
         assert!(
-            (1..=16).contains(&batch_size),
-            "gemv_oq_compact_multicol: B must be in 1..=16"
+            (1..=32).contains(&batch_size),
+            "gemv_oq_compact_multicol: B must be in 1..=32"
         );
         // B is a COMPILE-TIME parameter of the kernel: with a runtime B the
         // column loop cannot unroll and `facc[b]` degrades to indexed-register
@@ -784,7 +789,23 @@ impl Gpu {
                 13 => "gemv_oq_compact_multicol_w13",
                 14 => "gemv_oq_compact_multicol_w14",
                 15 => "gemv_oq_compact_multicol_w15",
-                _ => "gemv_oq_compact_multicol_w16",
+                16 => "gemv_oq_compact_multicol_w16",
+                17 => "gemv_oq_compact_multicol_w17",
+                18 => "gemv_oq_compact_multicol_w18",
+                19 => "gemv_oq_compact_multicol_w19",
+                20 => "gemv_oq_compact_multicol_w20",
+                21 => "gemv_oq_compact_multicol_w21",
+                22 => "gemv_oq_compact_multicol_w22",
+                23 => "gemv_oq_compact_multicol_w23",
+                24 => "gemv_oq_compact_multicol_w24",
+                25 => "gemv_oq_compact_multicol_w25",
+                26 => "gemv_oq_compact_multicol_w26",
+                27 => "gemv_oq_compact_multicol_w27",
+                28 => "gemv_oq_compact_multicol_w28",
+                29 => "gemv_oq_compact_multicol_w29",
+                30 => "gemv_oq_compact_multicol_w30",
+                31 => "gemv_oq_compact_multicol_w31",
+                _ => "gemv_oq_compact_multicol_w32",
             };
             self.ensure_kernel(
                 "gemv_oq_compact_multicol_wide",
@@ -798,7 +819,11 @@ impl Gpu {
                 y_f32.buf.as_ptr(),
             );
             let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
-            let grid = ((m as u32).div_ceil(3 * 8)).clamp(1, 2048);
+            // Mirrors OQCMW_ENTRY's RW (3 up to 16, then 1). Hardcoding 3 here
+            // would launch a third of the needed waves past B=16 and silently
+            // drop rows.
+            let rw_w: u32 = if batch_size <= 16 { 3 } else { 1 };
+            let grid = ((m as u32).div_ceil(rw_w * 8)).clamp(1, 2048);
             return self.launch_kernargs(
                 entry,
                 [grid, 1, 1],
@@ -823,7 +848,23 @@ impl Gpu {
             13 => "gemv_oq_compact_multicol_b13",
             14 => "gemv_oq_compact_multicol_b14",
             15 => "gemv_oq_compact_multicol_b15",
-            _ => "gemv_oq_compact_multicol_b16",
+            16 => "gemv_oq_compact_multicol_b16",
+            17 => "gemv_oq_compact_multicol_b17",
+            18 => "gemv_oq_compact_multicol_b18",
+            19 => "gemv_oq_compact_multicol_b19",
+            20 => "gemv_oq_compact_multicol_b20",
+            21 => "gemv_oq_compact_multicol_b21",
+            22 => "gemv_oq_compact_multicol_b22",
+            23 => "gemv_oq_compact_multicol_b23",
+            24 => "gemv_oq_compact_multicol_b24",
+            25 => "gemv_oq_compact_multicol_b25",
+            26 => "gemv_oq_compact_multicol_b26",
+            27 => "gemv_oq_compact_multicol_b27",
+            28 => "gemv_oq_compact_multicol_b28",
+            29 => "gemv_oq_compact_multicol_b29",
+            30 => "gemv_oq_compact_multicol_b30",
+            31 => "gemv_oq_compact_multicol_b31",
+            _ => "gemv_oq_compact_multicol_b32",
         };
         self.ensure_kernel(
             "gemv_oq_compact_multicol",
@@ -839,7 +880,15 @@ impl Gpu {
         let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
         // Each wave carries RW rows (mirrors the RW choice in the .hip entry
         // macro), so the grid shrinks by RW or most waves launch with no rows.
-        let rw: u32 = if batch_size <= 8 { 4 } else { 2 };
+        // Mirrors OQCM_ENTRY's RW: 4 up to 8, 2 up to 16, then 1 — past 16 the
+        // N*RW accumulators would not fit without spilling.
+        let rw: u32 = if batch_size <= 8 {
+            4
+        } else if batch_size <= 16 {
+            2
+        } else {
+            1
+        };
         let grid = ((m as u32).div_ceil(8 * rw)).clamp(1, 2048);
         self.launch_kernargs(
             entry,

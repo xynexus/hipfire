@@ -23,7 +23,7 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
-#define OQCM_MAX_B 16
+#define OQCM_MAX_B 32
 
 // V_DOT4 with the same arch guard `gemm_dflash_oq_plain_ref.hip` uses: gfx11xx /
 // gfx12xx expose it as sudot4 with explicit per-operand signedness, older parts
@@ -203,9 +203,22 @@ static __device__ __forceinline__ void oqcm_body(
         const uint8_t* __restrict__ W, const int8_t* __restrict__ Xq,          \
         const float* __restrict__ Xs, float* __restrict__ Y,                   \
         int M, int K, int B, int block_stride                                  \
-    ) { (void)B; oqcm_body<N, (N <= 8 ? 4 : 2)>(W, Xq, Xs, Y, M, K, block_stride); }
+    ) { (void)B; oqcm_body<N, (N <= 8 ? 4 : (N <= 16 ? 2 : 1))>(W, Xq, Xs, Y, M, K, block_stride); }
 
 OQCM_ENTRY(1)  OQCM_ENTRY(2)  OQCM_ENTRY(3)  OQCM_ENTRY(4)
 OQCM_ENTRY(5)  OQCM_ENTRY(6)  OQCM_ENTRY(7)  OQCM_ENTRY(8)
 OQCM_ENTRY(9)  OQCM_ENTRY(10) OQCM_ENTRY(11) OQCM_ENTRY(12)
 OQCM_ENTRY(13) OQCM_ENTRY(14) OQCM_ENTRY(15) OQCM_ENTRY(16)
+// 17..32 exist for TREE verify. A DDTree of budget B linearizes to B+1 tokens,
+// so any tree worth building lands past 16 — and the routing below sent those
+// to the N-heavy tiled GEMM, which reads every weight byte to produce a handful
+// of columns. That cliff is what made DDTree measure SLOWER than chain on this
+// target (b12/n=13 11.10 tok/s -> b16/n=17 6.95), which reads as "trees do not
+// help here" when it is really "the verify kernel stopped at 16".
+//
+// RW drops to 1 past 16: accumulators are N*RW VGPRs per lane, and RW=2 at
+// N=32 would want 64 before any working registers.
+OQCM_ENTRY(17) OQCM_ENTRY(18) OQCM_ENTRY(19) OQCM_ENTRY(20)
+OQCM_ENTRY(21) OQCM_ENTRY(22) OQCM_ENTRY(23) OQCM_ENTRY(24)
+OQCM_ENTRY(25) OQCM_ENTRY(26) OQCM_ENTRY(27) OQCM_ENTRY(28)
+OQCM_ENTRY(29) OQCM_ENTRY(30) OQCM_ENTRY(31) OQCM_ENTRY(32)

@@ -29,7 +29,7 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
-#define OQCMW_MAX_B 16
+#define OQCMW_MAX_B 32
 
 static __device__ __forceinline__ int oqcmw_dot4_i8(int a, int b, int acc) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
@@ -230,9 +230,15 @@ static __device__ __forceinline__ void oqcmw_body(
         const uint8_t* __restrict__ W, const int8_t* __restrict__ Xq,          \
         const float* __restrict__ Xs, float* __restrict__ Y,                   \
         int M, int K, int B, int block_stride                                  \
-    ) { (void)B; oqcmw_body<N, 3>(W, Xq, Xs, Y, M, K, block_stride); }
+    ) { (void)B; oqcmw_body<N, (N <= 16 ? 3 : 1)>(W, Xq, Xs, Y, M, K, block_stride); }
 
 OQCMW_ENTRY(1)  OQCMW_ENTRY(2)  OQCMW_ENTRY(3)  OQCMW_ENTRY(4)
 OQCMW_ENTRY(5)  OQCMW_ENTRY(6)  OQCMW_ENTRY(7)  OQCMW_ENTRY(8)
 OQCMW_ENTRY(9)  OQCMW_ENTRY(10) OQCMW_ENTRY(11) OQCMW_ENTRY(12)
 OQCMW_ENTRY(13) OQCMW_ENTRY(14) OQCMW_ENTRY(15) OQCMW_ENTRY(16)
+// 17..32 for tree verify; see the narrow kernel's note. RW drops to 1 past 16
+// on register pressure (N*RW accumulators per lane).
+OQCMW_ENTRY(17) OQCMW_ENTRY(18) OQCMW_ENTRY(19) OQCMW_ENTRY(20)
+OQCMW_ENTRY(21) OQCMW_ENTRY(22) OQCMW_ENTRY(23) OQCMW_ENTRY(24)
+OQCMW_ENTRY(25) OQCMW_ENTRY(26) OQCMW_ENTRY(27) OQCMW_ENTRY(28)
+OQCMW_ENTRY(29) OQCMW_ENTRY(30) OQCMW_ENTRY(31) OQCMW_ENTRY(32)
