@@ -555,3 +555,78 @@ throughput. 55 tok/s at tau 5.733 needs a 104 ms cycle; the bandwidth floor is
 by bandwidth — it is ruled out by the ~2 redundant target sweeps above plus
 per-cycle overhead. On a hard prompt (tau 3.571) the ceiling is ~53 tok/s, so 55
 is a best-prompt target, not an every-prompt one.
+
+
+## DDTree IS faster — at topk=1. The chain path is the slow one.
+
+Correcting the previous section. "Tree verify loses here" was measured at
+topk>=2 only. At **topk=1** DDTree beats the chain path outright, at IDENTICAL
+tau:
+
+| prompt | chain | ddtree topk=1 budget=7 | delta |
+|---|---|---|---|
+| numbers 1..30 | 25.64 | **28.08 / 28.09** | +9.5% |
+| merge two sorted lists | 17.00 | **19.97** | +17.5% |
+
+tau is unchanged (5.733 and 3.571 respectively), so this is not an acceptance
+effect — the tree path simply does less work per cycle than `spec_step_dflash`.
+That is consistent with the kernel trace, which found ~2 redundant single-token
+full-model sweeps per chain cycle (single-column GEMV at 52% of GPU time). The
+DDTree path does not carry them.
+
+### The bug that makes topk>1 lose
+
+`spec_step_ddtree_batched` step 8 runs a SECOND `verify_dflash_block` after the
+tree verify, unconditionally, to capture the GDN tape:
+
+- topk=1: `topk1_is_committed_prefix` holds, so the tape block is the full-B
+  top-1 chain and the result is byte-exact with the DFlash baseline.
+- topk>1: when the tree accepts a rank>0 branch, that branch is not in the top-1
+  block, so it re-verifies over the committed path at a different batch size.
+
+So every cycle pays two target verifies, and the second one gets *more*
+expensive exactly when the tree does its job. Measured:
+
+| config | tau | tok/s |
+|---|---|---|
+| chain | 5.733 | 25.64 |
+| topk=1 budget 7 | 5.733 | 28.08 |
+| topk=2 budget 10 | 5.667 | 20.57 |
+| topk=4 budget 16 | 5.857 | 12.81 |
+
+topk=4/budget16 at 12.81 is almost exactly half of 25.61 — two verifies where
+chain does one.
+
+The redundancy looks removable: the tree verify already receives `gdn_tape` and
+captures rows for every tree node, and `gather_accepted` exists a few lines
+below. Capturing the committed path's tape rows FROM the tree verify instead of
+re-running it should let topk>1 keep its tau gain (+6.4% on the hard prompt)
+without paying a second sweep.
+
+### Use topk=1 today
+
+`--ddtree-batched --ddtree-budget 7 --ddtree-topk 1` is a free win over the chain
+path on both prompt classes and is byte-exact with the DFlash baseline by
+construction.
+
+## The Markov head (DSpark) — exists, not reachable from this model
+
+The cheap-drafting lever is real but not wired for this target:
+
+- `DsparkWeights` carries `markov_w1`/`markov_w2` `[vocab, rank]` F16 with
+  `cfg.markov_rank`, plus GPU-vs-CPU parity examples asserting token-identical
+  greedy output. At rank r the head costs ~`r * vocab * 2` bytes — tens of MB
+  against the DFlash2 drafter's 1.18 GiB, i.e. drafting becomes ~free.
+- But the loader (`hipfire-arch-llama/src/dspark_body.rs`) is written for the
+  **Qwen3-8B** sidecar and the serving hook keys off `m.dspark` for **arch 0/1**.
+  Qwen3.8-27B is a qwen35-family hybrid (arch 5/6), and there is **no
+  `.dspark.hfq` sidecar for it on disk** — only gemma3-4b / medgemma-27b datasets.
+
+So using it here needs a trained sidecar plus qwen35 wiring. It is the right
+lever for the draft term (30ms and 1.18 GiB per cycle) and it composes with the
+widened multicol: a near-free drafter makes large B affordable, and verify at
+B<=32 is now one weight sweep.
+
+`--ngram` and `--pld` do NOT substitute: they augment the DFlash drafter rather
+than replacing it, so the 1.18 GiB sweep still happens. Measured identical
+(25.59/25.54/25.76 friendly, 16.98/16.97/17.00 hard).
