@@ -42,7 +42,12 @@ use hipfire_dispatch::pipeline::superop::EscapeKind;
 /// `Qwen35Bindings` (decode, n=1) field-for-field in spirit, but carries the row
 /// count and the batched scratch instead of a single-token cursor.
 pub(crate) struct Qwen35PrefillBindings<'a> {
-    pub(crate) layer: &'a FullAttnLayerWeights,
+    /// Attention half only — see [`FaAttnWeights`]. Both `FullAttn` and
+    /// `FullAttnMoe` drive these super-ops through it.
+    pub(crate) layer: FaAttnWeights<'a>,
+    /// Dense FFN weights, for `proj_gate_up` / `resid_down_swiglu` only. `None`
+    /// on a `FullAttnMoe` layer.
+    pub(crate) dense_ffn: Option<&'a FullAttnLayerWeights>,
     pub(crate) s: &'a Qwen35Scratch,
     pub(crate) pbs: &'a PrefillBatchScratch,
     pub(crate) config: &'a Qwen35Config,
@@ -258,23 +263,18 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.wq.k,
                 n,
             )?;
-                } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
-                    // Compact-resident Opus: one quantize of the shared rotated
-                    // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched_interleaved(
-                        &pbs.x_rot_batch,
-                        layer.wq.m,
-                        layer.wq.k,
-                        n,
-                    )?;
-                    for (w, y) in [
-                        (&layer.wq, &pbs.fa_q_full_batch),
-                        (&layer.wk, &pbs.fa_k_batch),
-                        (&layer.wv, &pbs.fa_v_batch),
-                    ] {
-                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
-                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
-                    }
+        } else if matches!(layer.wq.gpu_dtype, DType::OqCompactG256) && qkv_same_dtype {
+            // Compact-resident Opus: one quantize of the shared rotated
+            // activation, then one compact GEMM per projection.
+            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+            for (w, y) in [
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ] {
+                let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+            }
         } else if qkv_is_oq8 && qkv_same_dtype {
             // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
             // off the shared FWHT-rotated activation.
@@ -1482,19 +1482,19 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.wo.k,
                 n,
             )?;
-                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
-                    // decoding OqPlusCompact blocks in-kernel.
-                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
-                    gpu.gemm_oq_compact_residual_act_batched(
-                        &layer.wo.buf,
-                        fa_wo_input,
-                        &pbs.x_batch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        n,
-                        bs,
-                    )?;
+        } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: same W8A8 math as the oq8 arm,
+            // decoding OqPlusCompact blocks in-kernel.
+            let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+            gpu.gemm_oq_compact_residual_act_batched(
+                &layer.wo.buf,
+                fa_wo_input,
+                &pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+                bs,
+            )?;
         } else if fa_wo_is_oq8 {
             // Opus W8A8: fa_wo_input is FWHT-rotated above.
             gpu.gemm_oq8_grouped_residual_act_batched(
@@ -1644,7 +1644,9 @@ impl<'a> Qwen35PrefillBindings<'a> {
     }
 
     pub(crate) fn proj_gate_up(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -1717,25 +1719,30 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.w_gate.k,
                 n,
             )?;
-                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: one quantize of the shared rotated
-                    // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched_interleaved(
-                        &pbs.x_rot_batch,
-                        layer.w_gate.m,
-                        layer.w_gate.k,
-                        n,
-                    )?;
-                    for (w, y) in [
-                        (&layer.w_gate, &pbs.gate_ffn_batch),
-                        (&layer.w_up, &pbs.up_batch),
-                    ] {
-                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
-                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
-                    }
+        } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: one quantize of the shared rotated
+            // activation, then one compact GEMM per projection.
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
+            for (w, y) in [
+                (&layer.w_gate, &pbs.gate_ffn_batch),
+                (&layer.w_up, &pbs.up_batch),
+            ] {
+                let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+            }
         } else if fa_ffn_is_oq8 {
             // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
-            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -1917,7 +1924,9 @@ impl<'a> Qwen35PrefillBindings<'a> {
     }
 
     pub(crate) fn resid_down_swiglu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -1974,19 +1983,19 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 layer.w_down.k,
                 n,
             )?;
-                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
-                    // decoding OqPlusCompact blocks in-kernel.
-                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
-                    gpu.gemm_oq_compact_residual_act_batched(
-                        &layer.w_down.buf,
-                        &pbs.ffn_hidden_batch,
-                        &pbs.x_batch,
-                        layer.w_down.m,
-                        layer.w_down.k,
-                        n,
-                        bs,
-                    )?;
+        } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: same W8A8 math as the oq8 arm,
+            // decoding OqPlusCompact blocks in-kernel.
+            let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+            gpu.gemm_oq_compact_residual_act_batched(
+                &layer.w_down.buf,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+                bs,
+            )?;
         } else if fa_w_down_is_oq8 {
             // Opus W8A8: ffn_hidden_batch is FWHT-rotated above.
             gpu.gemm_oq8_grouped_residual_act_batched(
@@ -2257,7 +2266,13 @@ impl<'a> ForwardBindings for Qwen35PrefillBindings<'a> {
 /// matrices: they are `GpuTensor` device buffers, written by kernels, exactly as
 /// the decode `Qwen35Bindings` documents at `lowered.rs:139`.
 pub(crate) struct Qwen35PrefillDnBindings<'a> {
-    pub(crate) layer: &'a DeltaNetLayerWeights,
+    /// LA half only — see [`DnLaWeights`]. Both `DeltaNet` and `DeltaNetMoe`
+    /// drive these five super-ops through it, so there is ONE linear-attention
+    /// implementation instead of two that drift apart.
+    pub(crate) layer: DnLaWeights<'a>,
+    /// Dense FFN weights, for `proj_gate_up` / `resid_down_swiglu` only. `None`
+    /// on a `DeltaNetMoe` layer, whose FFN is `prefill_moe_ffn_body_batched`.
+    pub(crate) dense_ffn: Option<&'a DeltaNetLayerWeights>,
     pub(crate) tree_verify: Option<TreeVerifyCtx<'a>>,
     /// Chunk-level decision (`prefill_chunk.rs`), not a per-layer one.
     pub(crate) use_gdn_per_token: bool,
@@ -2634,7 +2649,12 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
             // projection. Each shares the same int8 activation quantize
             // via the batched scratch, so the redundancy is the quantize
             // launch, not a re-read of x.
-            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.wqkv.m,
+                layer.wqkv.k,
+                n,
+            )?;
             for (w, y) in [
                 (&layer.wqkv, &pbs.dn_qkv_batch),
                 (&layer.wz, &pbs.dn_z_batch),
@@ -2684,34 +2704,34 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wqkv.k,
                 n,
             )?;
-                } else if matches!(layer.wqkv.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: the SAME W8A8 math as the oq8 arm
-                    // above, decoding OqPlusCompact blocks in-kernel.
-                    //
-                    // Without this arm compact fell through to the final `else`,
-                    // which hard-codes `FusedQkvzaHfq4G256` — so a 136-byte
-                    // [f16 scale][128 nibbles][3x(u8 idx, i8 val)] block was read
-                    // as an HFQ4G256 block. Two layouts sharing no field, and no
-                    // error: just wrong numbers. That is what made compact's
-                    // BATCHED prefill unusable, which is why the batched
-                    // spec-decode verify had to exclude compact entirely and why
-                    // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
-                    // Measured: 48 fall-throughs in a 16-token spec run.
-                    gpu.quantize_act_oq8_batched_interleaved(
-                        &pbs.x_rot_batch,
-                        layer.wqkv.m,
-                        layer.wqkv.k,
-                        n,
-                    )?;
-                    for (w, y) in [
-                        (&layer.wqkv, &pbs.dn_qkv_batch),
-                        (&layer.wz, &pbs.dn_z_batch),
-                        (&layer.w_beta, &pbs.dn_beta_batch),
-                        (&layer.w_alpha, &pbs.dn_alpha_batch),
-                    ] {
-                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
-                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
-                    }
+        } else if matches!(layer.wqkv.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: the SAME W8A8 math as the oq8 arm
+            // above, decoding OqPlusCompact blocks in-kernel.
+            //
+            // Without this arm compact fell through to the final `else`,
+            // which hard-codes `FusedQkvzaHfq4G256` — so a 136-byte
+            // [f16 scale][128 nibbles][3x(u8 idx, i8 val)] block was read
+            // as an HFQ4G256 block. Two layouts sharing no field, and no
+            // error: just wrong numbers. That is what made compact's
+            // BATCHED prefill unusable, which is why the batched
+            // spec-decode verify had to exclude compact entirely and why
+            // the tape-free rollback replay collapsed tau 3.00 -> 0.63.
+            // Measured: 48 fall-throughs in a 16-token spec run.
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.wqkv.m,
+                layer.wqkv.k,
+                n,
+            )?;
+            for (w, y) in [
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ] {
+                let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+            }
         } else {
             run_fused_qkvza_key(
                 gpu,
@@ -3222,19 +3242,19 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wo.k,
                 n,
             )?;
-                } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus o_proj: identical W8A8 math to the oq8
-                    // arm below, decoding the OqPlusCompact blocks in-kernel.
-                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
-                    gpu.gemm_oq_compact_residual_act_batched(
-                        &layer.wo.buf,
-                        wo_input,
-                        &pbs.x_batch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        n,
-                        bs,
-                    )?;
+        } else if matches!(layer.wo.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus o_proj: identical W8A8 math to the oq8
+            // arm below, decoding the OqPlusCompact blocks in-kernel.
+            let bs = super::prefill_batch::oq_compact_block_stride(&layer.wo)?;
+            gpu.gemm_oq_compact_residual_act_batched(
+                &layer.wo.buf,
+                wo_input,
+                &pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+                bs,
+            )?;
         } else if wo_is_oq8 {
             // Opus W8A8 o_proj: grouped int8-WMMA GEMM into scratch +
             // residual add (no fused oq8 residual kernel), mirroring the
@@ -3426,7 +3446,9 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
     }
 
     pub(crate) fn proj_gate_up(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -3659,27 +3681,32 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.w_gate.k,
                 n,
             )?;
-                } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: one quantize of the shared rotated
-                    // activation, then one compact GEMM per projection.
-                    gpu.quantize_act_oq8_batched_interleaved(
-                        &pbs.x_rot_batch,
-                        layer.w_gate.m,
-                        layer.w_gate.k,
-                        n,
-                    )?;
-                    for (w, y) in [
-                        (&layer.w_gate, &pbs.gate_ffn_batch),
-                        (&layer.w_up, &pbs.up_batch),
-                    ] {
-                        let bs = super::prefill_batch::oq_compact_block_stride(w)?;
-                        gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
-                    }
+        } else if matches!(layer.w_gate.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: one quantize of the shared rotated
+            // activation, then one compact GEMM per projection.
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
+            for (w, y) in [
+                (&layer.w_gate, &pbs.gate_ffn_batch),
+                (&layer.w_up, &pbs.up_batch),
+            ] {
+                let bs = super::prefill_batch::oq_compact_block_stride(w)?;
+                gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+            }
         } else if ffn_is_oq8 {
             // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
             // same buffers the fused kernel writes; downstream silu_mul
             // is unchanged.
-            gpu.quantize_act_oq8_batched_interleaved(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+            gpu.quantize_act_oq8_batched_interleaved(
+                &pbs.x_rot_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
             for (w, y) in [
                 (&layer.w_gate, &pbs.gate_ffn_batch),
                 (&layer.w_up, &pbs.up_batch),
@@ -3815,7 +3842,9 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
     }
 
     pub(crate) fn resid_down_swiglu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -3905,19 +3934,19 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.w_down.k,
                 n,
             )?;
-                } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
-                    // Compact-resident Opus: same W8A8 math as the oq8 arm,
-                    // decoding OqPlusCompact blocks in-kernel.
-                    let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
-                    gpu.gemm_oq_compact_residual_act_batched(
-                        &layer.w_down.buf,
-                        &pbs.ffn_hidden_batch,
-                        &pbs.x_batch,
-                        layer.w_down.m,
-                        layer.w_down.k,
-                        n,
-                        bs,
-                    )?;
+        } else if matches!(layer.w_down.gpu_dtype, DType::OqCompactG256) {
+            // Compact-resident Opus: same W8A8 math as the oq8 arm,
+            // decoding OqPlusCompact blocks in-kernel.
+            let bs = super::prefill_batch::oq_compact_block_stride(&layer.w_down)?;
+            gpu.gemm_oq_compact_residual_act_batched(
+                &layer.w_down.buf,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+                bs,
+            )?;
         } else if w_down_is_oq8 {
             // Opus W8A8 down: grouped int8-WMMA GEMM + residual add.
             gpu.gemm_oq8_grouped_residual_act_batched(

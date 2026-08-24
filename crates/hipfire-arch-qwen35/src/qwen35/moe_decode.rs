@@ -80,12 +80,11 @@ pub(crate) struct MoeScratchRef<'a> {
     bucket_y_down: &'a GpuTensor,
 }
 
-
 impl<'a> MoeScratchRef<'a> {
     /// View into a Qwen35Scratch's MoE fields. Panics if the caller didn't
     /// allocate MoE scratch (config.num_experts == 0).
-    
-pub(crate) fn from_scratch(s: &'a Qwen35Scratch) -> Self {
+
+    pub(crate) fn from_scratch(s: &'a Qwen35Scratch) -> Self {
         Self {
             router_logits: s
                 .moe_router_logits
@@ -997,7 +996,10 @@ pub(crate) fn moe_ffn_decode_impl(
         !gu.is_empty()
             && gu.iter().all(servable)
             && dn.iter().all(servable)
-            && gu.iter().chain(dn.iter()).any(|d| *d == DType::OqCompactG256)
+            && gu
+                .iter()
+                .chain(dn.iter())
+                .any(|d| *d == DType::OqCompactG256)
     };
     let routed_gate_up_dtype = if routed_representative_compact {
         DType::OqCompactG256
@@ -1566,52 +1568,52 @@ pub(crate) fn moe_ffn_decode_impl(
                     )?;
                 }
             } else {
-            match (routed_dtype_indexable_oq4, ffn.experts.is_empty()) {
-                (true, true) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xs,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k,
-                    1,
-                    true,
-                )?,
-                (true, false) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xs,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    true,
-                )?,
-                (false, true) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xs,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    k,
-                    1,
-                    true,
-                )?,
-                (false, false) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
-                    &ffn.expert_gate_up_ptrs,
-                    s.topk_indices,
-                    xs,
-                    s.gate_batch,
-                    s.up_batch,
-                    2 * mi,
-                    gate_up_k,
-                    true,
-                )?,
-            }
+                match (routed_dtype_indexable_oq4, ffn.experts.is_empty()) {
+                    (true, true) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        k,
+                        1,
+                        true,
+                    )?,
+                    (true, false) => gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        true,
+                    )?,
+                    (false, true) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        k,
+                        1,
+                        true,
+                    )?,
+                    (false, false) => gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
+                        &ffn.expert_gate_up_ptrs,
+                        s.topk_indices,
+                        xs,
+                        s.gate_batch,
+                        s.up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        true,
+                    )?,
+                }
             }
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed

@@ -221,6 +221,70 @@ pub struct MoeParoSidecars {
     pub group_size: u32,
 }
 
+/// Borrowed view of the linear-attention half of a DeltaNet layer.
+///
+/// `DeltaNetLayerWeights` and `DeltaNetMoeLayerWeights` carry an IDENTICAL LA
+/// half and differ only in the FFN that follows it (dense `w_gate/w_up/w_down`
+/// vs `ffn: MoeFfnWeights`). Before this existed the two had separate LA
+/// implementations — the dense one lowered into `prefill_lowered.rs`, the MoE
+/// one left behind as a hand-rolled dtype chain in `prefill_chunk.rs` — and
+/// they drifted: the lowered one gained `is_f32` / `is_f16` arms, the copy did
+/// not, so an F16/BF16 MoE checkpoint had its `wqkv` decoded as HFQ4 nibble
+/// blocks. See docs/plans/2026-08-24-raw-f16-moe-prefill-divergence.md.
+///
+/// One LA implementation, driven through this view, is what keeps them from
+/// drifting again.
+#[derive(Clone, Copy)]
+pub struct DnLaWeights<'a> {
+    pub attn_norm: &'a GpuTensor,
+    pub wqkv: &'a WeightTensor,
+    pub wz: &'a WeightTensor,
+    pub w_alpha: &'a WeightTensor,
+    pub w_beta: &'a WeightTensor,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+    pub conv_weight: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub wo: &'a WeightTensor,
+    pub ffn_norm: &'a GpuTensor,
+}
+
+impl DeltaNetLayerWeights {
+    pub fn la(&self) -> DnLaWeights<'_> {
+        DnLaWeights {
+            attn_norm: &self.attn_norm,
+            wqkv: &self.wqkv,
+            wz: &self.wz,
+            w_alpha: &self.w_alpha,
+            w_beta: &self.w_beta,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            conv_weight: &self.conv_weight,
+            norm_weight: &self.norm_weight,
+            wo: &self.wo,
+            ffn_norm: &self.ffn_norm,
+        }
+    }
+}
+
+impl DeltaNetMoeLayerWeights {
+    pub fn la(&self) -> DnLaWeights<'_> {
+        DnLaWeights {
+            attn_norm: &self.attn_norm,
+            wqkv: &self.wqkv,
+            wz: &self.wz,
+            w_alpha: &self.w_alpha,
+            w_beta: &self.w_beta,
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            conv_weight: &self.conv_weight,
+            norm_weight: &self.norm_weight,
+            wo: &self.wo,
+            ffn_norm: &self.ffn_norm,
+        }
+    }
+}
+
 pub struct DeltaNetMoeLayerWeights {
     pub attn_norm: GpuTensor,
     pub wqkv: WeightTensor,
@@ -234,6 +298,52 @@ pub struct DeltaNetMoeLayerWeights {
     pub wo: WeightTensor,
     pub ffn_norm: GpuTensor,
     pub ffn: MoeFfnWeights,
+}
+
+/// Borrowed view of the attention half of a full-attention layer — the FA
+/// sister of [`DnLaWeights`], for the same reason. `FullAttnLayerWeights` and
+/// `FullAttnMoeLayerWeights` share an identical attention half and differ only
+/// in the FFN that follows.
+#[derive(Clone, Copy)]
+pub struct FaAttnWeights<'a> {
+    pub attn_norm: &'a GpuTensor,
+    pub wq: &'a WeightTensor,
+    pub wk: &'a WeightTensor,
+    pub wv: &'a WeightTensor,
+    pub wo: &'a WeightTensor,
+    pub q_norm: &'a GpuTensor,
+    pub k_norm: &'a GpuTensor,
+    pub ffn_norm: &'a GpuTensor,
+}
+
+impl FullAttnLayerWeights {
+    pub fn fa(&self) -> FaAttnWeights<'_> {
+        FaAttnWeights {
+            attn_norm: &self.attn_norm,
+            wq: &self.wq,
+            wk: &self.wk,
+            wv: &self.wv,
+            wo: &self.wo,
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            ffn_norm: &self.ffn_norm,
+        }
+    }
+}
+
+impl FullAttnMoeLayerWeights {
+    pub fn fa(&self) -> FaAttnWeights<'_> {
+        FaAttnWeights {
+            attn_norm: &self.attn_norm,
+            wq: &self.wq,
+            wk: &self.wk,
+            wv: &self.wv,
+            wo: &self.wo,
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            ffn_norm: &self.ffn_norm,
+        }
+    }
 }
 
 pub struct FullAttnMoeLayerWeights {
