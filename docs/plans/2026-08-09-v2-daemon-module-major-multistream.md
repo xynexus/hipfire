@@ -1354,9 +1354,51 @@ So `admission_to_first_quantum_ns` is the right instrument for scheduling INSIDE
 the executor and the wrong one for end-to-end latency; the client stopwatch is
 the honest number for the contract. Both are reported above deliberately.
 
-Still outstanding for M3d: measurement 1 (p99/max module duration and which
-`SuperOpKind` owns the max) remains unobtainable until §M0 grows its module
-dimension.
+**M3d measurement 1 — MEASURED 2026-08-24. M3d is complete.** §M0's module
+dimension is built: `TraceEvent::ModuleEnd` carries the `SuperOpKind`
+discriminant in `module` and the duration in `aux`, and
+`exec_trace::module_duration_stats` reports per-module percentiles under
+`modules` in the trace reply.
+
+It could not be the passive field §M0 described. `dispatch_super_op` only
+ENQUEUES, so wall-clock around it measures launch cost and every module reads as
+a few microseconds; the number this exit wants is how long a module OWNS the
+device, because that is the floor on how long a yield must wait for it. Getting
+it honestly means bracketing each super-op with a device sync, so this is a
+measurement MODE (`HIPFIRE_TRACE_MODULES`, off by default) rather than
+always-on instrumentation, and its durations are per-module GPU time rather than
+a throughput figure.
+
+Qwen3.6-35B-A3B--oq4, kvarn, 12 tokens, `dropped=0` so the window is whole:
+
+| module | count | p50 | p99 | max |
+|---|---|---|---|---|
+| **moe** | 1000 | 0.326 ms | **0.526 ms** | **5.476 ms** |
+| attend | 1000 | 0.027 | 0.090 | 3.353 |
+| proj | 1000 | 0.406 | 0.666 | 2.841 |
+| recurrent | 750 | 0.104 | 0.148 | 0.745 |
+| residual_gemv | 1000 | 0.122 | 0.141 | 0.404 |
+| norm | 750 | 0.017 | 0.032 | 0.340 |
+
+**`Moe` owns the max, and the suspension floor is ~5 ms.** Read p99 and max
+differently: across three runs the p99s are stable to the third decimal (moe
+0.526 / 0.527 / 0.529) while the maxima wander 4.8-5.5 ms, as a single-sample
+statistic should. The drain budget should be sized on p99 plus a margin, not on a
+max that moves 14% run to run.
+
+So the tightest drain budget this design can hold is **sub-millisecond at p99**
+(0.67 ms, owned by `proj`) with a multi-millisecond tail owned by `Moe`. That is
+the achievable suspension floor, and it is three orders of magnitude below the
+200 ms contract — the contract is not limited by module granularity, which is
+what §M2a's prefill work already implied and this now confirms from the other
+direction.
+
+The observer is installed rather than called: `hipfire-runtime` owns the trace
+and DEPENDS on `hipfire-dispatch`, so the super-op loop measures and
+`exec_trace::install_dispatch_module_observer` says where the numbers land.
+Escapes collapse to one bucket deliberately — they are the coarse model-owned
+blocks that must stay coarse, so their payload does not subdivide into
+separately yieldable units.
 
 *Breaks:* everything that assumed a forward runs to completion. `hipGraph` capture is one
 indivisible quantum by construction — **off on the v2 path** until its WCET is declared,

@@ -1603,6 +1603,10 @@ fn main() {
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
     hipfire_runtime::logging::init_stderr_logging("daemon");
+    // Per-module durations (§M3d measurement 1) land in the executor trace only
+    // if something wires the two crates together; dispatch cannot reach the
+    // trace on its own.
+    hipfire_runtime::exec_trace::install_dispatch_module_observer();
     let llm_registry = build_local_llm_registry();
     eprintln!(
         "[hipfire-daemon] model registry: {} model(s), {} sidecar/template artifact(s) (models={}, triattn={}, drafts={}, templates={})",
