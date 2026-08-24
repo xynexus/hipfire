@@ -379,6 +379,28 @@ pub struct Dflash2Conv {
     pub proj_finish: WeightTensor,
 }
 
+/// DFlash2 candidate selector: a rank-`r` triple product that rescores the
+/// drafter's top-`k` candidates using the PREVIOUS pick, instead of taking a
+/// plain per-position argmax.
+///
+///   `score[k] = unary[k] + Σ_r predecessor[prev][r] · hidden_proj[r] · successor[cand_k][r]`
+///
+/// Semantics pinned by [`crate::dflash2::selector_scores`]; the GPU kernel is
+/// `dflash2_candidate_selector` and is parity-checked against it.
+///
+/// Loaded ONLY when the selector is enabled: the two codebooks are
+/// `[vocab, rank]` each, which is ~254 MB apiece as f32 on a 248320-token
+/// vocab, and paying half a gigabyte for weights nothing reads would be worse
+/// than the acceptance they buy.
+pub struct Dflash2Selector {
+    /// `[rank, hidden]` — projects the drafter hidden state to the codebook rank.
+    pub hidden_projection: WeightTensor,
+    /// `[vocab, rank]` F32 — indexed by the PREVIOUS accepted/drafted token.
+    pub predecessor: GpuTensor,
+    /// `[vocab, rank]` F32 — indexed by each candidate token.
+    pub successor: GpuTensor,
+}
+
 pub struct DflashLayerWeights {
     pub attn_norm: GpuTensor, // [hidden] — F32, RMSNorm weight
     pub wq: WeightTensor,     // [q_dim, hidden]
@@ -409,6 +431,9 @@ pub struct DflashWeights {
     /// True when at least one matrix weight is MQ4G256 or MQ3G256 — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
     pub has_mq: bool,
+    /// DFlash2 candidate selector. `None` on DFlash1, on a checkpoint that does
+    /// not carry one, or when it is not enabled.
+    pub selector: Option<Dflash2Selector>,
 }
 
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
@@ -704,6 +729,67 @@ fn hfq_weight_rows(
 /// Load one `GroupedDynamicCausalConv`, splitting both of its tables into the
 /// `prepare` and `finish` halves. Returns `None` when the layer carries no conv
 /// (a DFlash1 drafter).
+/// Whether to load and apply the DFlash2 candidate selector.
+///
+/// Off by default while its acceptance effect is unmeasured on this family. The
+/// drafter's plain argmax is CORRECT either way -- spec decode is lossless by
+/// construction because the target verifies every token -- so this trades only
+/// acceptance rate, and the codebooks cost ~508 MB.
+pub fn dflash2_selector_enabled() -> bool {
+    std::env::var("HIPFIRE_DFLASH2_SELECTOR").as_deref() == Ok("1")
+}
+
+fn load_dflash2_selector(
+    source: &(impl DflashSource + ?Sized),
+    gpu: &mut Gpu,
+    cfg: &DflashConfig,
+    use_f16_weights: bool,
+) -> HipResult<Option<Dflash2Selector>> {
+    if !dflash2_selector_enabled() || cfg.selector_rank == 0 || cfg.selector_top_k == 0 {
+        return Ok(None);
+    }
+    let hp_name = "candidate_selector.hidden_projection.weight";
+    if source.tensor(hp_name).is_none() {
+        return Ok(None);
+    }
+    let (rank, vocab) = (cfg.selector_rank, cfg.vocab_size);
+    let codebook = |gpu: &mut Gpu, name: &str| -> HipResult<GpuTensor> {
+        let t = source
+            .tensor(name)
+            .unwrap_or_else(|| panic!("dflash2 selector: {name} missing"));
+        let v = dflash_dense_to_f32(name, t.quant_type, t.data.as_ref());
+        assert_eq!(
+            v.len(),
+            vocab * rank,
+            "dflash2 selector {name}: expected [{vocab}, {rank}]"
+        );
+        gpu.upload_f32(&v, &[vocab * rank])
+    };
+    let predecessor = codebook(gpu, "candidate_selector.predecessor_codebook")?;
+    let successor = codebook(gpu, "candidate_selector.successor_codebook")?;
+    let hidden_projection = hfq_weight_rows(
+        source,
+        gpu,
+        hp_name,
+        rank,
+        cfg.hidden,
+        0,
+        rank,
+        use_f16_weights,
+    )?;
+    eprintln!(
+        "  DFlash2 candidate selector ENABLED: rank={rank} top_k={} \
+         (codebooks {:.0} MB)",
+        cfg.selector_top_k,
+        2.0 * (vocab * rank * 4) as f64 / (1024.0 * 1024.0),
+    );
+    Ok(Some(Dflash2Selector {
+        hidden_projection,
+        predecessor,
+        successor,
+    }))
+}
+
 fn load_dflash2_conv(
     source: &(impl DflashSource + ?Sized),
     gpu: &mut Gpu,
@@ -1215,6 +1301,7 @@ impl DflashWeights {
             logit_bias,
             layers,
             has_mq,
+            selector: load_dflash2_selector(hfq, gpu, cfg, use_f16_weights)?,
         })
     }
 
