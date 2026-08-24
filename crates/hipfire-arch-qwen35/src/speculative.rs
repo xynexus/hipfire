@@ -7435,6 +7435,37 @@ pub fn spec_step_dflash(
                     }
                     drafted.push(argmax_u32(&row));
                 }
+            } else if let Some(sel) = draft_weights.selector.as_ref() {
+                // DFlash2 candidate selector. Rescores each position's top-k
+                // against the PREVIOUS pick instead of taking a raw argmax —
+                // the drafter carries trained codebooks for exactly this, and
+                // ignoring them was costing acceptance (the load-time WARNING
+                // this replaces said so at every load).
+                //
+                // Sequential by construction: each pick seeds the next
+                // predecessor, so this cannot use the batched GPU argmax. It
+                // pays one (B-1) x vocab D2H the argmax path avoids — 8 MB at
+                // B=8, ~0.8 ms — against a 52 ms draft phase.
+                //
+                // Placed AFTER `host_path_active` so repeat-penalty / n-gram
+                // blocking still win when they are on: those reshape the
+                // distribution the TARGET also sees, and diverging from it
+                // collapses acceptance outright, which is a worse failure than
+                // leaving the selector unapplied.
+                let host_logits = gpu.download_f32(&logits_batch)?;
+                debug_assert_eq!(host_logits.len(), batch * vocab);
+                let proj = gpu.alloc_tensor(&[sel.rank], hipfire_rdna::DType::F32)?;
+                for i in 0..batch {
+                    let hidden_row = draft_scratch.x.sub_offset((i + 1) * h, h);
+                    weights::weight_gemv(gpu, &sel.hidden_projection, &hidden_row, &proj)?;
+                    let hp = gpu.download_f32(&proj)?;
+                    // `drafted` currently ends at position i, which is exactly
+                    // the token position i+1 follows.
+                    let prev = drafted.last().copied().unwrap_or(0);
+                    let row = &host_logits[i * vocab..(i + 1) * vocab];
+                    drafted.push(sel.pick(row, &hp, prev));
+                }
+                let _ = gpu.free_tensor(proj);
             } else {
                 // GPU argmax over (B-1) rows — one kernel, small D2H.
                 let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);
@@ -7479,6 +7510,19 @@ pub fn spec_step_dflash(
                         sampler::apply_ngram_block(&mut row, prev_committed);
                     }
                     drafted.push(argmax_u32(&row));
+                } else if let Some(sel) = draft_weights.selector.as_ref() {
+                    // Selector on the per-row fallback. This is the path a
+                    // COMPACT target takes: the batched lm_head has no qt=36
+                    // arm, so an oq4.25++ target lands here, which is exactly
+                    // the configuration being tuned. Wiring only the batched
+                    // path above left the selector dead for it — measured as
+                    // byte-identical tau with the flag on and off.
+                    let proj = gpu.alloc_tensor(&[sel.rank], hipfire_rdna::DType::F32)?;
+                    weights::weight_gemv(gpu, &sel.hidden_projection, &hidden_row, &proj)?;
+                    let hp = gpu.download_f32(&proj)?;
+                    let _ = gpu.free_tensor(proj);
+                    let prev = drafted.last().copied().unwrap_or(0);
+                    drafted.push(sel.pick(&logits, &hp, prev));
                 } else {
                     drafted.push(argmax_u32(&logits));
                 }

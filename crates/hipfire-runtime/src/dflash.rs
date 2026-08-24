@@ -315,13 +315,16 @@ impl DflashConfig {
                 .tensor("candidate_selector.hidden_projection.weight")
                 .is_some()
             {
-                eprintln!(
-                    "  WARNING: DFlash2 candidate_selector (rank={selector_rank}, \
-                     top_k={selector_top_k}) is carried by this drafter but NOT applied — \
-                     the draft path still takes a per-position argmax. Output stays correct \
-                     (the target verifies every token); acceptance rate is below what this \
-                     checkpoint can do."
-                );
+                if !dflash2_selector_enabled() {
+                    eprintln!(
+                        "  DFlash2 candidate_selector (rank={selector_rank}, \
+                         top_k={selector_top_k}) carried by this drafter, NOT applied — \
+                         the draft path takes a per-position argmax. Output is correct \
+                         either way (the target verifies every token). \
+                         HIPFIRE_DFLASH2_SELECTOR=1 applies it, but MEASURED WORSE on \
+                         Qwen3.8-27B/DFlash2: tau 2.421 -> 2.25, decode 6.14 -> 5.92."
+                    );
+                }
             }
         }
         let block_size = df.get("block_size").and_then(|v| v.as_u64())? as usize;
@@ -393,12 +396,23 @@ pub struct Dflash2Conv {
 /// vocab, and paying half a gigabyte for weights nothing reads would be worse
 /// than the acceptance they buy.
 pub struct Dflash2Selector {
-    /// `[rank, hidden]` — projects the drafter hidden state to the codebook rank.
+    /// `[rank, hidden]` — projects the drafter hidden state to the codebook
+    /// rank. Stays on the GPU: it is a real 256x5120 GEMV per position, and the
+    /// only thing that crosses back is `rank` floats.
     pub hidden_projection: WeightTensor,
-    /// `[vocab, rank]` F32 — indexed by the PREVIOUS accepted/drafted token.
-    pub predecessor: GpuTensor,
-    /// `[vocab, rank]` F32 — indexed by each candidate token.
-    pub successor: GpuTensor,
+    /// `[vocab, rank]` F32, HOST-resident — indexed by the PREVIOUS pick.
+    ///
+    /// Host rather than device on purpose. The selection is a greedy left-to-
+    /// right chain (each pick seeds the next predecessor), so it cannot batch
+    /// across positions, and the per-position work is 16x256 MACs -- far below
+    /// what a kernel launch costs. What the GPU would buy is nothing; what it
+    /// would cost is 485 MB of VRAM on a box where the weight pager already
+    /// fights for it, plus 17 scattered row copies per position.
+    pub predecessor: Vec<f32>,
+    /// `[vocab, rank]` F32, HOST-resident — indexed by each candidate token.
+    pub successor: Vec<f32>,
+    pub rank: usize,
+    pub top_k: usize,
 }
 
 pub struct DflashLayerWeights {
@@ -729,6 +743,31 @@ fn hfq_weight_rows(
 /// Load one `GroupedDynamicCausalConv`, splitting both of its tables into the
 /// `prepare` and `finish` halves. Returns `None` when the layer carries no conv
 /// (a DFlash1 drafter).
+impl Dflash2Selector {
+    /// Pick one draft token: rescore the logits' top-`top_k` candidates against
+    /// the PREVIOUS pick and take the best.
+    ///
+    /// `hidden_proj` is `[rank]`, already projected on the GPU. `prev` is the
+    /// token this position follows -- the accepted prefix's last token for
+    /// position 0, and the previous PICK thereafter, which is what makes the
+    /// chain greedy-sequential and unbatchable across positions.
+    ///
+    /// Falls back to a plain argmax when `prev` is out of vocab range, so a
+    /// bad/absent predecessor degrades to today's behaviour rather than
+    /// indexing out of bounds.
+    pub fn pick(&self, logits: &[f32], hidden_proj: &[f32], prev: u32) -> u32 {
+        crate::dflash2::selector_pick(
+            logits,
+            hidden_proj,
+            prev,
+            &self.predecessor,
+            &self.successor,
+            self.rank,
+            self.top_k,
+        )
+    }
+}
+
 /// Whether to load and apply the DFlash2 candidate selector.
 ///
 /// Off by default while its acceptance effect is unmeasured on this family. The
@@ -753,7 +792,7 @@ fn load_dflash2_selector(
         return Ok(None);
     }
     let (rank, vocab) = (cfg.selector_rank, cfg.vocab_size);
-    let codebook = |gpu: &mut Gpu, name: &str| -> HipResult<GpuTensor> {
+    let codebook = |name: &str| -> Vec<f32> {
         let t = source
             .tensor(name)
             .unwrap_or_else(|| panic!("dflash2 selector: {name} missing"));
@@ -763,10 +802,10 @@ fn load_dflash2_selector(
             vocab * rank,
             "dflash2 selector {name}: expected [{vocab}, {rank}]"
         );
-        gpu.upload_f32(&v, &[vocab * rank])
+        v
     };
-    let predecessor = codebook(gpu, "candidate_selector.predecessor_codebook")?;
-    let successor = codebook(gpu, "candidate_selector.successor_codebook")?;
+    let predecessor = codebook("candidate_selector.predecessor_codebook");
+    let successor = codebook("candidate_selector.successor_codebook");
     let hidden_projection = hfq_weight_rows(
         source,
         gpu,
@@ -779,7 +818,7 @@ fn load_dflash2_selector(
     )?;
     eprintln!(
         "  DFlash2 candidate selector ENABLED: rank={rank} top_k={} \
-         (codebooks {:.0} MB)",
+         (codebooks {:.0} MB, host)",
         cfg.selector_top_k,
         2.0 * (vocab * rank * 4) as f64 / (1024.0 * 1024.0),
     );
@@ -787,6 +826,8 @@ fn load_dflash2_selector(
         hidden_projection,
         predecessor,
         successor,
+        rank,
+        top_k: cfg.selector_top_k,
     }))
 }
 

@@ -89,3 +89,138 @@ pub fn selector_argmax(scores: &[f32]) -> usize {
     }
     best
 }
+
+/// Pick one draft token: rescore the logits' top-`top_k` candidates against the
+/// PREVIOUS pick and take the best. See [`selector_scores`].
+///
+/// `prev` is the token this position follows — the accepted prefix's last token
+/// at position 0, the previous PICK thereafter. That chain is what makes the
+/// selection greedy-sequential and unbatchable across positions.
+///
+/// Degrades to a plain argmax when the geometry does not line up (bad `prev`,
+/// wrong projection width), so a malformed selector behaves like today's path
+/// instead of indexing out of bounds.
+#[allow(clippy::too_many_arguments)]
+pub fn selector_pick(
+    logits: &[f32],
+    hidden_proj: &[f32],
+    prev: u32,
+    predecessor: &[f32],
+    successor: &[f32],
+    rank: usize,
+    top_k: usize,
+) -> u32 {
+    let vocab = logits.len();
+    let prev = prev as usize;
+    if rank == 0
+        || top_k == 0
+        || hidden_proj.len() != rank
+        || prev >= vocab
+        || predecessor.len() < (prev + 1) * rank
+    {
+        return selector_argmax(logits) as u32;
+    }
+    let k = top_k.min(vocab);
+    // Partial selection: top_k is 16 against a 248k vocab, so a bounded
+    // insertion beats sorting the row.
+    let mut cand: Vec<u32> = (0..k as u32).collect();
+    cand.sort_unstable_by(|a, b| {
+        logits[*b as usize]
+            .partial_cmp(&logits[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for i in k..vocab {
+        if logits[i] > logits[cand[k - 1] as usize] {
+            cand[k - 1] = i as u32;
+            let mut j = k - 1;
+            while j > 0 && logits[cand[j] as usize] > logits[cand[j - 1] as usize] {
+                cand.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+    if successor.len() < (*cand.iter().max().unwrap() as usize + 1) * rank {
+        return selector_argmax(logits) as u32;
+    }
+    let unary: Vec<f32> = cand.iter().map(|&c| logits[c as usize]).collect();
+    let pred = &predecessor[prev * rank..(prev + 1) * rank];
+    let mut succ = Vec::with_capacity(cand.len() * rank);
+    for &c in &cand {
+        succ.extend_from_slice(&successor[c as usize * rank..(c as usize + 1) * rank]);
+    }
+    let scores = selector_scores(&unary, pred, hidden_proj, &succ, cand.len(), rank);
+    cand[selector_argmax(&scores)]
+}
+
+#[cfg(test)]
+mod selector_pick_tests {
+    use super::*;
+
+    const RANK: usize = 2;
+    const VOCAB: usize = 6;
+
+    #[test]
+    fn zero_codebooks_reduce_to_plain_argmax() {
+        // Every transition term vanishes, so the pick must be the raw argmax.
+        let logits = vec![0.1, 0.9, 0.3, 0.2, 0.05, 0.4];
+        let zero = vec![0f32; VOCAB * RANK];
+        let got = selector_pick(&logits, &[1.0, 1.0], 0, &zero, &zero, RANK, 4);
+        assert_eq!(got, 1, "argmax of {logits:?} is index 1");
+    }
+
+    #[test]
+    fn a_transition_can_override_the_argmax() {
+        // Index 1 wins on logit alone; index 5 is inside the top-4 and gets a
+        // large positive transition from prev=0. The selector must prefer 5 --
+        // if it does not, the codebooks are not reaching the score.
+        let logits = vec![0.1, 0.9, 0.3, 0.2, 0.05, 0.8];
+        let mut pred = vec![0f32; VOCAB * RANK];
+        pred[0] = 1.0;
+        pred[1] = 1.0;
+        let mut succ = vec![0f32; VOCAB * RANK];
+        succ[5 * RANK] = 10.0;
+        let got = selector_pick(&logits, &[1.0, 1.0], 0, &pred, &succ, RANK, 4);
+        assert_eq!(got, 5, "transition should beat the 0.1 logit gap");
+    }
+
+    #[test]
+    fn the_previous_pick_changes_the_answer() {
+        // Same logits, same codebooks, different `prev` -> different pick. This
+        // is the property the whole greedy chain rests on.
+        let logits = vec![0.1, 0.9, 0.3, 0.2, 0.05, 0.8];
+        let mut pred = vec![0f32; VOCAB * RANK];
+        pred[0 * RANK] = 1.0; // prev=0 gates rank-0
+        pred[2 * RANK + 1] = 1.0; // prev=2 gates rank-1
+        let mut succ = vec![0f32; VOCAB * RANK];
+        succ[5 * RANK] = 10.0; // rank-0 favours token 5
+        succ[1 * RANK + 1] = 10.0; // rank-1 favours token 1
+        let from0 = selector_pick(&logits, &[1.0, 1.0], 0, &pred, &succ, RANK, 4);
+        let from2 = selector_pick(&logits, &[1.0, 1.0], 2, &pred, &succ, RANK, 4);
+        assert_eq!(from0, 5);
+        assert_eq!(from2, 1);
+        assert_ne!(from0, from2, "prev must steer the pick");
+    }
+
+    #[test]
+    fn out_of_range_prev_degrades_to_argmax() {
+        let logits = vec![0.1, 0.9, 0.3];
+        let zero = vec![0f32; 3 * RANK];
+        assert_eq!(
+            selector_pick(&logits, &[1.0, 1.0], 99, &zero, &zero, RANK, 2),
+            1
+        );
+    }
+
+    #[test]
+    fn top_k_bounds_which_candidates_can_win() {
+        // Token 5 carries a huge transition but sits OUTSIDE the top-2 by logit,
+        // so it must not be reachable. Guards the partial-selection bound.
+        let logits = vec![0.1, 0.9, 0.85, 0.2, 0.05, 0.3];
+        let mut pred = vec![0f32; VOCAB * RANK];
+        pred[0] = 1.0;
+        let mut succ = vec![0f32; VOCAB * RANK];
+        succ[5 * RANK] = 100.0;
+        let got = selector_pick(&logits, &[1.0, 1.0], 0, &pred, &succ, RANK, 2);
+        assert!(got == 1 || got == 2, "top-2 are tokens 1 and 2, got {got}");
+    }
+}
