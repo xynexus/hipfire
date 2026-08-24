@@ -88,6 +88,12 @@ static __device__ __forceinline__ void oqcmw_body(
     //
     // 4 groups in flight x BC columns x 256 bytes = 8 KB at BC=8, well inside
     // the 64 KB LDS.
+    // SINGLE-BUFFERED on purpose. Double-buffering this tile — fill round g0+4
+    // into a second half while computing g0, removing the fill/compute
+    // serialisation — measured WORSE: verify 82.0ms against 80.2ms. The extra
+    // 8 KB costs more in occupancy than the overlap recovers, so the barrier
+    // stall was not what the remaining gap was made of. Tried, measured,
+    // reverted; do not re-run it.
     __shared__ int8_t lds_x[4 * BC * 256];
 
     // The barriers below must be reached by every wave the same number of times,
