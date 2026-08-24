@@ -136,6 +136,90 @@ fn dflash_q8_lmhead_wmma_enabled_from_env() -> bool {
     })
 }
 
+/// Batched lm_head for the Opus family (Oq8G256 and the compact-resident
+/// OqCompactG256/128), for DDTree's draft top-K extraction.
+///
+/// WHY THIS EXISTS: `dflash_enqueue_verify_lm_head` has had these arms all
+/// along, but the two DDTree draft helpers carry their own dtype ladder and
+/// it stopped at the MQ/HFQ families. On an Opus target that made DDTree
+/// unreachable — `spec_step_ddtree_batched` died at the first cycle with
+/// "unsupported target.output dtype", so tree verification had never actually
+/// run on an `oq4.25++` model. Chain mode was not chosen over tree mode on
+/// this family; tree mode was never reachable to be measured.
+///
+/// The math is `dflash_enqueue_verify_lm_head`'s, term for term, so a token's
+/// draft logits agree with the verify pass that re-scores it. The difference
+/// is only where the staging buffers come from: verify has `VerifyScratch`,
+/// and the draft helpers allocate per call like the MQ arms beside them.
+fn dflash_gemm_opus_lmhead(
+    gpu: &mut Gpu,
+    w_out: &weights::WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    let group = match w_out.gpu_dtype {
+        hipfire_rdna::DType::OqCompactG128 => 128usize,
+        _ => 256usize,
+    };
+    if w_out.k % group != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "ddtree opus lm_head: K must be a whole number of groups",
+        ));
+    }
+    let ng = w_out.k / group;
+
+    // Compact carries its overlay records inline, so the per-block stride is a
+    // property of the buffer (130 + 2*N_out), not a constant. Derive it the
+    // way the GEMV dispatch arm does.
+    let block_stride = if matches!(
+        w_out.gpu_dtype,
+        hipfire_rdna::DType::OqCompactG256 | hipfire_rdna::DType::OqCompactG128
+    ) {
+        let blocks = w_out.m * ng;
+        if blocks == 0 || w_out.buf.byte_size() % blocks != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "ddtree opus lm_head: buffer length is not a whole number of blocks",
+            ));
+        }
+        Some(w_out.buf.byte_size() / blocks)
+    } else {
+        None
+    };
+
+    gpu.ensure_mq_signs()?;
+    let rot = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::F32)?;
+    let xq = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::Raw)?;
+    let xs = gpu.alloc_owned(&[n * ng], hipfire_rdna::DType::F32)?;
+
+    let run = |gpu: &mut Gpu| -> HipResult<()> {
+        weights::rotate_x_mq_batched_for(gpu, w_out, x, &rot, w_out.k, n)?;
+        gpu.quantize_act_oq8(&rot, &xq, &xs, n, w_out.k, group)?;
+        match block_stride {
+            Some(stride) => gpu.gemm_oq_compact_grouped_wmma(
+                &w_out.buf,
+                &xq,
+                &xs,
+                y,
+                w_out.m,
+                w_out.k,
+                n,
+                group,
+                stride,
+            ),
+            None => {
+                let ws = w_out.buf.sub_offset(w_out.m * w_out.k, w_out.m * ng * 4);
+                gpu.gemm_oq8_grouped_wmma(
+                    &w_out.buf, &ws, &xq, &xs, y, w_out.m, w_out.k, n, group,
+                )
+            }
+        }
+    };
+    run(gpu)
+}
+
 fn dflash_gemm_q8_lmhead(
     gpu: &mut Gpu,
     w_out: &weights::WeightTensor,
@@ -10615,9 +10699,17 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        // Opus, dense and compact-resident. See `dflash_gemm_opus_lmhead`:
+        // absent these, DDTree could not run at all on an oq4.25++ target.
+        hipfire_rdna::DType::Oq8G256
+        | hipfire_rdna::DType::OqCompactG256
+        | hipfire_rdna::DType::OqCompactG128 => {
+            dflash_gemm_opus_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/\
+             HFQ6G256/MQ6G256/Oq8G256/OqCompactG256/OqCompactG128)",
         )),
     };
     gemm_result?;
@@ -10812,9 +10904,17 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        // Opus, dense and compact-resident. See `dflash_gemm_opus_lmhead`:
+        // absent these, DDTree could not run at all on an oq4.25++ target.
+        hipfire_rdna::DType::Oq8G256
+        | hipfire_rdna::DType::OqCompactG256
+        | hipfire_rdna::DType::OqCompactG128 => {
+            dflash_gemm_opus_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/\
+             HFQ6G256/MQ6G256/Oq8G256/OqCompactG256/OqCompactG128)",
         )),
     };
     gemm_result?;

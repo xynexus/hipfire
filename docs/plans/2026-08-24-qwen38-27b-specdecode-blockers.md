@@ -356,3 +356,85 @@ puts at ~11% of GPU time combined.
 So the remaining GPU-side headroom is roughly 36.9 -> 45-51 tok/s. Reaching
 55-60 needs a smaller drafter, and that is a training/checkpoint decision rather
 than a kernel one.
+
+
+## CORRECTION: the drafter size is NOT the blocker — tree verify is
+
+The section above concluded that 55 tok/s needs a smaller drafter. That is
+**wrong**, and the fact that kills it is simple: the closed-source engine hits
+60 tok/s on this GPU **with this exact 1.18 GiB drafter**.
+
+The byte arithmetic was right; the reading of it was not. At 233 GB/s, 60 tok/s
+means ~3.62 GiB per token. Our cycle streams 23.8 GiB (drafter B times + target
+once). 23.8 / 3.62 = **tau ~6.6** — and a *chain* drafter at B=8 gives 5.333.
+So the missing factor is not fewer bytes per cycle, it is more accepted tokens
+per cycle. That is exactly what tree-structured verification buys: the tree
+keeps depth B (same drafter cost) and adds top-k branching, so one target sweep
+scores many candidate continuations instead of one chain.
+
+### We were never running it
+
+hipfire has a full DDTree implementation (`hipfire-runtime/src/ddtree.rs`,
+Ringel & Ro Algorithm 1/2, with `spec_step_ddtree`, `spec_step_ddtree_batched`
+and `spec_step_ddtree_path_c`). Every number in this document was measured on
+the **chain** path, `spec_step_dflash`. Tree mode was not evaluated and rejected
+on this family — it could not run at all. Two independent blockers:
+
+**1. No Opus arm in the DDTree lm_head ladder — FIXED here.**
+`run_dflash_draft_for_logits` and `run_dflash_draft_for_topk_gpu` each carry
+their own `w_out.gpu_dtype` match for the batched draft lm_head, and it stopped
+at the MQ/HFQ families:
+
+```
+ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)
+```
+
+Our target's lm_head is `OqCompactG256` (qt=36), so DDTree died on the first
+cycle. `dflash_enqueue_verify_lm_head` has had the Oq8 and compact arms all
+along; the draft ladders simply never gained them. Added
+`dflash_gemm_opus_lmhead`, whose math is the verify arm's term for term.
+
+**2. Compact has no GDN-tape writer — this is the real remaining blocker.**
+Both tree paths depend on the tape: the DFS `spec_step_ddtree` calls
+`gdn_tape.replay_gdn` / `gather_accepted`, and `spec_step_ddtree_batched` passes
+`Some(gdn_tape)` into the tree forward as its "key optimization". But
+`prefill_batch_pbs_eligible` sets `allow_compact = !tape_in_play`, so a compact
+model is refused the batched forward the moment a tape is requested — and the
+caller then asserts `tree_verify.is_none()`:
+
+```
+tree-verify mode requires the batched-FA-eligible prefill path;
+kv quant + FA weight dtypes do not match on this model
+```
+
+The assertion message misattributes it: KV tier and FA weight dtypes are both
+fine here (`kv_f32=false kv_asym2_tree=false`, asym3 carries the masked batched
+variants). The declining term is `gdn_tape.is_some()`. Confirmed by dropping
+tree-verify out of `tape_in_play` behind a flag — the verdict stayed false at
+n=17 while n=9 passed.
+
+Running the DFS path anyway shows the failure mode exactly as documented for a
+zero tape — `replay_gdn_tape=2`, target emits `<think>\n<|im_end|>` and stops:
+
+```
+chain      48 tok  cycles 13  accepted 37  tau 2.846
+dfs b16k4   3 tok  cycles  2  accepted  0  tau 0.000   <- zero-tape corruption
+dfs b24k8   4 tok  cycles  2  accepted  1  tau 0.500
+```
+
+So it is ONE root blocker, not two: **compact-resident Opus cannot capture a
+GDN tape**, and every tree path needs one.
+
+### What to build
+
+A compact GDN-tape writer. That single gap blocks tree verification on every
+`oq4.25++` target, and tree verification is the term the byte budget says is
+missing. It is also already named as the outstanding lever in
+`prefill_batch_pbs_eligible`'s own comment: "a compact tape writer would be the
+other one."
+
+Also still unused on this model, worth checking after the tape lands:
+- **DSpark** (`hipfire-specdecode-dspark`) — never wired for this target.
+- **DFlash2's carried candidate selector** — measured worse in chain mode
+  (tau 2.421 -> 2.25), but that was a chain measurement; a tree consumes top-K
+  per position, which is what the selector actually produces.
