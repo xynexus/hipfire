@@ -7387,7 +7387,20 @@ pub fn spec_step_dflash(
                 | hipfire_rdna::DType::MQ4G256
                 | hipfire_rdna::DType::MQ3G256
                 | hipfire_rdna::DType::HFQ6G256
-                | hipfire_rdna::DType::MQ6G256,
+                | hipfire_rdna::DType::MQ6G256
+                // Opus. Their absence here is why an oq4.25++ target paid the
+                // per-row loop this fast path exists to avoid: B-1 full-vocab
+                // GEMVs per cycle against a [248320, 5120] head, ~1.27 GB each,
+                // ~9 GiB/cycle — comparable to a whole 14.4 GiB model sweep.
+                // The comment above sizes it: ~40 ms serial vs ~8 ms batched.
+                //
+                // Same shape of gap as the DDTree draft ladder (910664f21) and
+                // the compact tape arm (61c300992): a dtype ladder that stopped
+                // at the MQ/HFQ families while an Opus artifact silently took
+                // the slow branch.
+                | hipfire_rdna::DType::Oq8G256
+                | hipfire_rdna::DType::OqCompactG256
+                | hipfire_rdna::DType::OqCompactG128,
         );
         let use_q8_staged = matches!(w_out.gpu_dtype, hipfire_rdna::DType::Q8_0);
         if use_batched_gemm || use_q8_staged {
@@ -7494,6 +7507,17 @@ pub fn spec_step_dflash(
                         &logits_batch,
                         w_out.m,
                         w_out.k,
+                        batch,
+                    )?;
+                }
+                hipfire_rdna::DType::Oq8G256
+                | hipfire_rdna::DType::OqCompactG256
+                | hipfire_rdna::DType::OqCompactG128 => {
+                    dflash_gemm_opus_lmhead(
+                        gpu,
+                        w_out,
+                        &hidden_rows,
+                        &logits_batch,
                         batch,
                     )?;
                 }
