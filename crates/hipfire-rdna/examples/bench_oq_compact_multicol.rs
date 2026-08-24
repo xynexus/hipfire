@@ -38,6 +38,14 @@ fn main() {
         ("wo", 5120, 4096, 8),
         ("gate/up B=1", 17408, 5120, 1),
         ("gate/up B=16", 17408, 5120, 16),
+        // Past 16 the entry macro drops RW (narrow 4/2/1, wide 3/1) because the
+        // N*RW accumulators stop fitting. Tree verify linearizes a budget-B tree
+        // to B+1 tokens, so these are the widths a DDTree actually asks for, and
+        // the cliff between 16 and 17 is what decides whether wide trees pay.
+        ("gate/up B=12", 17408, 5120, 12),
+        ("gate/up B=17", 17408, 5120, 17),
+        ("gate/up B=24", 17408, 5120, 24),
+        ("gate/up B=32", 17408, 5120, 32),
     ] {
         let ng = k / GROUP;
         let nblk = m * ng;

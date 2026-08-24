@@ -6633,7 +6633,26 @@ fn verify_dflash_block_inner(
         && matches!(
             target.weights.embd_format,
             hipfire_runtime::weights::EmbeddingFormat::HFQ4G256
-                | hipfire_runtime::weights::EmbeddingFormat::Q8_0,
+                | hipfire_runtime::weights::EmbeddingFormat::Q8_0
+                // BF16/F16/F32 are capture-equivalent to the two above: every
+                // arm of the batched embed dispatch
+                // (prefill_batch.rs:2529-2560) reads token ids from the SAME
+                // `pbs.tokens` device buffer and writes `pbs.x_batch`. The
+                // pointer is stable across cycles and only the CONTENTS change,
+                // which is exactly what the capture contract above requires.
+                // Listing only HFQ4G256/Q8_0 cost this model graph replay on
+                // 11/11 verify cycles once its bf16 embedding stopped being
+                // expanded to F32.
+                //
+                // Gated while it is proven: HIPFIRE_VERIFY_GRAPH_WIDE_EMBD=1.
+                // Capture bugs here are subtle and this file documents a tau
+                // collapse (code 7.08 -> 4.51) from enabling capture too eagerly
+                // on the tree path, so this does not go default-on untested.
+                | hipfire_runtime::weights::EmbeddingFormat::BF16
+                    if !matches!(
+                        target.weights.embd_format,
+                        hipfire_runtime::weights::EmbeddingFormat::BF16
+                    ) || std::env::var("HIPFIRE_VERIFY_GRAPH_WIDE_EMBD").as_deref() == Ok("1"),
         )
         && verify_scratch.prefill_batch.is_some();
     if !verify_graph_ok {

@@ -818,7 +818,7 @@ impl Gpu {
             // Mirrors OQCMW_ENTRY's RW (3 up to 16, then 1). Hardcoding 3 here
             // would launch a third of the needed waves past B=16 and silently
             // drop rows.
-            let rw_w: u32 = if batch_size <= 16 { 3 } else { 1 };
+            let rw_w: u32 = if batch_size <= 16 { 3 } else { 2 };
             let grid = ((m as u32).div_ceil(rw_w * 8)).clamp(1, 2048);
             return self.launch_kernargs(
                 entry,

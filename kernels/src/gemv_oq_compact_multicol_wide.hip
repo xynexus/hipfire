@@ -230,14 +230,23 @@ static __device__ __forceinline__ void oqcmw_body(
         const uint8_t* __restrict__ W, const int8_t* __restrict__ Xq,          \
         const float* __restrict__ Xs, float* __restrict__ Y,                   \
         int M, int K, int B, int block_stride                                  \
-    ) { (void)B; oqcmw_body<N, (N <= 16 ? 3 : 1)>(W, Xq, Xs, Y, M, K, block_stride); }
+    ) { (void)B; oqcmw_body<N, (N <= 16 ? 3 : 2)>(W, Xq, Xs, Y, M, K, block_stride); }
 
 OQCMW_ENTRY(1)  OQCMW_ENTRY(2)  OQCMW_ENTRY(3)  OQCMW_ENTRY(4)
 OQCMW_ENTRY(5)  OQCMW_ENTRY(6)  OQCMW_ENTRY(7)  OQCMW_ENTRY(8)
 OQCMW_ENTRY(9)  OQCMW_ENTRY(10) OQCMW_ENTRY(11) OQCMW_ENTRY(12)
 OQCMW_ENTRY(13) OQCMW_ENTRY(14) OQCMW_ENTRY(15) OQCMW_ENTRY(16)
-// 17..32 for tree verify; see the narrow kernel's note. RW drops to 1 past 16
-// on register pressure (N*RW accumulators per lane).
+// 17..32 for tree verify; see the narrow kernel's note. RW=2 past 16, chosen by
+// MEASUREMENT not by counting registers — the register argument said 1 and that
+// was 2.6x slower. gate/up [17408,5120], weight bytes constant at 45.2 MiB:
+//
+//     B      RW=1      RW=2      RW=3
+//     17    1.032ms   0.390ms   0.549ms
+//     24    1.458     0.533     0.958
+//     32    1.942     0.735     2.446
+//
+// RW=1 starves each wave of row-level reuse of the staged activation tile; RW=3
+// spills past B=24. 2 is the knee at every width above 16.
 OQCMW_ENTRY(17) OQCMW_ENTRY(18) OQCMW_ENTRY(19) OQCMW_ENTRY(20)
 OQCMW_ENTRY(21) OQCMW_ENTRY(22) OQCMW_ENTRY(23) OQCMW_ENTRY(24)
 OQCMW_ENTRY(25) OQCMW_ENTRY(26) OQCMW_ENTRY(27) OQCMW_ENTRY(28)
