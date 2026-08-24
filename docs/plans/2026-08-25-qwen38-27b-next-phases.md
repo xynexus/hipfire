@@ -190,3 +190,128 @@ not. Worth ~6% of cycle bytes.
 - `hipfire eval` caches on model+prompt+binary_hash, **not env** — env-only A/Bs
   replay arm 1. Use `--force`. Identical numbers are a cache hit, not a null
   result.
+
+
+---
+
+# MEASURED 2026-08-25 — two of the three phases were aimed wrong
+
+Phases executed against this document. Recording what the measurements said,
+because two of the targets it names are not where the time is.
+
+## Phase 1 — done, and it found a real bug
+
+117 `record_fallback` sites landed (five parallel agents, disjoint file sets).
+On the full workload exactly TWO fired, and they were causally linked:
+
+```
+11x  dflash verify: no captured graph, direct dispatch  [embd=F32 ...]
+ 1x  qwen35 embedding: expanded to F32  [quant_type=49 (fast formats: 6/7/3)]
+```
+
+`embed_tokens` is quant_type 49 (`Bf16Lut3`) — a LOSSLESS bf16 recoding — and
+both qwen35 load paths expanded it to F32: 4.74 GiB resident instead of 2.37,
+12% of the model's footprint. `hipfire-arch-qwen2` had solved this since it was
+written. Fixed (`f88863593`): VRAM 22207 -> 19783 MB, output identical, tok/s
+flat (an embed lookup reads one row per token — always a footprint bug).
+
+## Phase 2a — the named target is NOT the cost
+
+This document says DDTree's redundant second verify is the Phase 2 target. It
+is not. Instrumented and priced at topk=4: **2 firings in 12 cycles**, which
+cannot explain a 2.5x gap against chain.
+
+The actual cost was per-column scaling in `gemv_oq_compact_multicol`, and part
+of it was self-inflicted: widening it 16->32 (`10beb8964`) dropped RW from 3 to
+1 past B=16 on a REGISTER-PRESSURE ARGUMENT that was never benched. Measured,
+weight bytes constant at 45.2 MiB:
+
+```
+B      RW=1      RW=2      RW=3
+17    1.032ms   0.390ms   0.549ms
+24    1.458     0.533     0.958
+32    1.942     0.735     2.446
+```
+
+RW=1 was 2.6x slower. Fixed to RW=2 (`e1391d193`): tree verify 12.81 -> 33.35
+(budget 16), 9.12 -> 26.29 (budget 24).
+
+Trees STILL lose (chain 57.61) but now for an honest reason: tau moves only
+5.733 -> 5.929 (+3.4%) against ~1.7x per-cycle cost. That is a property of this
+drafter — its alternative branches rarely rescue a rejection — not a kernel
+artifact. The earlier "tree verify loses here" verdict was measured on a kernel
+I had crippled and should not be cited.
+
+## Phase 2b — the Markov head is NET NEGATIVE here, do not build it
+
+The premise in this document is "at rank r the head costs tens of MB vs the
+drafter's 1.18 GiB, so drafting goes near-free". That premise was written when
+the drafter was ~13.8% of GPU time and re-reading its weights B times. The
+multicol drafter fix (`bce8c84de`) already collected that win. Measured now:
+
+```
+>>> all dflash (drafter) kernels combined: 5.10% of GPU time
+```
+
+So a Markov head that makes drafting ENTIRELY FREE wins at most 5.10%, and only
+if tau holds — which it will not. A low-rank Markov head is a far weaker
+predictor than a 5-layer DFlash2 head; tau falling from 5.733 toward 2-3 costs
+40-50%. The "large B becomes affordable" half does not hold either: verify at
+B=32 is 27.5% of ceiling even after the RW=2 fix.
+
+The training stack is real and mostly arch-agnostic if someone wants it later:
+`train_dspark_loop` touches the target for exactly `embed_tokens` and `lm_head`,
+so `LlamaWeightsF32` is just a container; only LABEL GENERATION
+(`examples/dspark_labels.rs`, "DENSE Qwen3 (LLaMA-family)") is arch-bound, and
+qwen35 already captures the hidden states it needs via `hidden_rb`. But the
+throughput case does not support doing it on this model.
+
+## Phase 3 — the verify GEMV is nearly done; the tail is 16.65%
+
+Post-fix trace, 64 tokens:
+
+```
+gemv_oq_compact_multicol_w8   57.86%   the verify — 87-90% of ceiling in isolation
+gemv_oq_compact_multicol_w23  11.36%   23-token seed prefill, amortizes
+gated_delta_net_f32            7.65%
+__amd_rocclr_copyBuffer        4.02%   18226 calls, sub-us each = per-call overhead
+gemm_dflash_oq4_plain_...w8    3.93%   drafter
+oq_compact_x8_transpose        3.50%   ~280/cycle, one per projection
+fused_rmsnorm_mq_rotate_awq    1.48%
+```
+
+The dominant kernel is the irreducible weight sweep and it is already at 87-90%
+of the 233 GB/s ceiling (`bench_oq_compact_multicol`), so there is little left
+there. The decode-time tail is **16.65%**; halving it is worth ~8%.
+
+Ranked by size, with what is known:
+1. `gated_delta_net_f32` 7.65% — core DeltaNet recurrence, a kernel project.
+2. `copyBuffer` 4.02% — 1657 copies/cycle. The GDN tape writes are part of this
+   and they BOUGHT +28-34%, so they are paid for; the rest is unattributed and
+   worth tracing to a call site before optimizing.
+3. `oq_compact_x8_transpose` 3.50% — feeds the compact GEMV. If multicol could
+   read the untransposed layout this disappears.
+
+NOT worth doing, checked: gating the tape's `x_in_bufs` writes. They are
+genuinely diagnostic-only (every reader is a compare/repair/log behind
+`dflash_serial_tape_rollback_replay_from_env`, and runs show
+`replay_serial_tape=0`), but it is 48 of ~1657 copies/cycle, ~0.12% of GPU time.
+
+## Also measured: verify-graph capture works with a bf16 embedding, and is worth ~0
+
+`verify_graph_ok` admitted only HFQ4G256|Q8_0, but every arm of the batched embed
+dispatch reads token ids from the same `pbs.tokens` device buffer — the list was
+incomplete, not principled. `HIPFIRE_VERIFY_GRAPH_WIDE_EMBD=1` captures and
+replays cleanly (`direct=0 replay=13`) with byte-identical output, and changes
+throughput by nothing (57.72 -> 57.36). Graph capture removes CPU launch
+overhead; this verify is GPU-bandwidth-bound. Left opt-in.
+
+## Open, genuinely
+
+- `embedding_lookup_bf16l3`: in-kernel decode exists for GEMM (`bf16l3_gemm_to_f32`,
+  `bf16l3_wmma_coop`) which is how the lm_head stays packed, but the GATHER
+  variant was never written — that is why qwen2's comment says the gather cannot
+  read the packed form. Worth ~850 MB more (1.50x on the 2542 MB table) and a
+  minor speedup. Needs a HIP kernel + parity test; `bf16_lut3::decode_block`
+  is the host-side model to mirror.
+- The Phase 3 tail above.
