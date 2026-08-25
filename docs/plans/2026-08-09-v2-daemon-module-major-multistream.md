@@ -1408,6 +1408,35 @@ pick step — one site instead of three-and-counting, and finer.
 
 *Revertible:* yes, behind `HIPFIRE_DAEMON_EXECUTOR=v2`.
 
+### M4 — measured 2026-08-25: on this box the unfused path will not even LOAD
+
+The decision §M4 poses — "is module granularity worth unfusing the default MoE
+decode path?" — was framed as a throughput trade: unfusing costs "a D2H plus a
+kernel launch per expert per token". On gfx1103 with `Qwen3.6-35B-A3B--oq4` it is
+not a throughput trade, because the unfused configuration does not load.
+
+    HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 (default, fused)   pp512 20.80  tg128 20.70 tok/s
+    HIPFIRE_QWEN35_MOE_OQ_INDEXED=0 (unfused)          OOM at layer 26/40:
+        hipMalloc(1.03 MiB), free=13.9 MiB of total=43008 MiB
+
+Reproduced twice, the second time on a verified-idle GPU (no daemon, 82 MB VRAM
+in use) so it is the configuration and not contention from the previous run.
+
+**Read this with its caveat.** `HIPFIRE_QWEN35_MOE_OQ_INDEXED` gates two things at
+once: whether routing and expert compute are one kernel, AND the resident expert
+layout — indexed implies `oq_moe`-repacked experts, while off falls back to the
+`oq4_arch` combined layout (`moe_decode.rs:639`). So this measures the flag, not
+"unfusing" in isolation, and the OOM is most likely the layout half. It still
+answers the practical question: there is no way to *try* the unfused path at this
+model size on this hardware, so any M4 work that depends on it cannot be verified
+here — the same stop-line §3.4 of the prefill-lowering plan invoked, and the same
+one that turned out to be misdiagnosed there, so it is worth someone checking on
+gfx1151 before treating it as settled.
+
+What that leaves for M4, unchanged from the 2026-08-22 scoping: qwen35 joins
+deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
+and `MoeExpert(e)` exists only for arches whose MoE is not fused.
+
 ### M4 — scoped 2026-08-22. qwen35 has deepseek4's problem too.
 
 **Measured before starting.** This section already concedes that deepseek4 fuses
