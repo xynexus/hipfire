@@ -211,9 +211,16 @@ __device__ __forceinline__ void kvarn_tile_body(
         const int TPW = 32 / bits;                    // codes per dword: 8 at bits=4
         for (int t_base = wv * TPW; t_base < tile_len; t_base += NW * TPW) {
             const int nt = min(TPW, tile_len - t_base);
-            float part[8];                            // TPW <= 8 for bits >= 4
+            // WORST-CASE sized: TPW = 32/bits is 16 at bits=2, and `nt` below can
+            // reach it, so `part[8]` overran by 8 floats on every 2-bit tile.
+            // The old comment ("TPW <= 8 for bits >= 4") stated the precondition
+            // correctly but nothing enforced it, while the kernel signature
+            // accepts bits in {2,4,8} — so KVarN-2 batched prefill faulted:
+            // "Memory access fault ... kernel: attention_flash_kvarn_tile_batched"
+            // at 609 and 2408 tokens (69 happened to fit and passed).
+            float part[16];                           // TPW = 32/bits, 16 at bits=2
             #pragma unroll
-            for (int tt = 0; tt < 8; tt++) part[tt] = c_local;
+            for (int tt = 0; tt < 16; tt++) part[tt] = c_local;
             for (int i = 0; i < dpt; i++) {
                 const int idx = (d0 + i) * group + t_base;
                 const uint32_t w4 = *(const uint32_t*)(rec + (idx >> cpb_shift));

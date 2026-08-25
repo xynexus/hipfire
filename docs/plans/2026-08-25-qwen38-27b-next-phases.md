@@ -644,3 +644,56 @@ receives.
 No fallback bugs remain in prefill: a 2408-token run under
 `HIPFIRE_KERNEL_TRACE=1` takes the batched path (`verdict=true ... n=2408`) and
 fires only the decode-side verify-graph site.
+
+
+## KVarN bit widths: 4 is available and IS the default; 2 was a GPU memory fault
+
+`KvMode::Kvarn` reads `KvCache::kvarn_bits_from_env()` — `HIPFIRE_KVARN_BITS` in
+{2,4,8}, **defaulting to 4**, invalid values warned and coerced. So the KVarN
+runs in this document are KVarN-**4**.
+
+Note `compare_prefill_hidden_paths` hardcodes `new_gpu_kvarn(..., 8)`, so the
+fidelity tool tests KVarN-8 while serving defaults to 4 — which is why its kvarn
+and q8 rows came out byte-identical (both 8-bit).
+
+At short context the width is immaterial — tau 3.571 and ~35.4 tok/s for 2/4/8
+and deprecated q8 alike, VRAM within 10 MB, because `--ctx 512` makes the KV
+cache tiny.
+
+### The bug: KVarN-2 faulted on any real prompt
+
+```
+kvarn2   69 tokens  ok
+kvarn2  609 tokens  Memory access fault ... kernel: attention_flash_kvarn_tile_batched
+kvarn2 2408 tokens  Memory access fault (same kernel)
+kvarn4/8 at 2408    fine
+```
+
+Root cause in `attention_flash_kvarn_tile_batched.hip`:
+
+```c
+const int TPW = 32 / bits;                    // 16 at bits=2
+const int nt  = min(TPW, tile_len - t_base);  // can reach 16
+float part[8];                                // <-- only 8
+for (int tt = 0; tt < nt; tt++) part[tt] += ...;   // writes part[8..15]
+```
+
+A stack overflow of 8 floats on every 2-bit tile. The old comment
+("TPW <= 8 for bits >= 4") stated the precondition correctly, but nothing
+enforced it while the kernel signature accepts bits in {2,4,8}. 69 tokens
+happened to fit; 609 did not.
+
+Fixed by sizing `part[16]` for the worst case. After:
+
+```
+kvarn2   609 / 2408   rc=0   13.44 / 6.40 tok/s
+kvarn4   609 / 2408   rc=0   13.25 / 5.82   (unchanged)
+kvarn8   609 / 2408   rc=0   13.20 / 5.80   (unchanged)
+```
+
+KVarN-2 is now slightly the fastest of the three, as less KV bandwidth predicts.
+Short-prompt baseline unmoved: 57.49 / 35.04 against 57.53 / 35.32.
+
+Worth doing next: point `compare_prefill_hidden_paths` at
+`kvarn_bits_from_env()` instead of a hardcoded 8, so the fidelity tool measures
+the tier that actually ships.
