@@ -38,18 +38,35 @@
 # The default 1e-4 sits ~8x above the worst observed noise and ~530x below the
 # weakest corruption signal. Raise it only with a measurement, not a hunch.
 #
-# PATH CHECK, before anything else. The batched and per-token paths write
-# bit-different recurrent state, so if their state hashes come out EQUAL the
-# "batched" run silently fell back to the reference and the cell compared it
-# against itself. Such a cell reports SKIP, never OK — without it those cells
-# would report a clean pass for a path they never ran.
+# PATH CHECK, before anything else, and measured POSITIVELY: the probe counts
+# rows through `forward_prefill_chunk` (reachable only from
+# `forward_prefill_batch*`, never from the per-token reference) and requires the
+# batched run to move that counter while the reference run leaves it alone. A
+# cell that fails it reports SKIP, never OK — without it a fixture that never
+# reaches the batched path would report a clean pass for a path it never ran.
 #
-# The MoE cells SKIP on gfx1103, and it is NOT a fixture gap: `arch_has_wmma`
-# (prefill_batch.rs:5782) lists gfx1100/1101/1102/1150/1151/1200/1201 and gfx1103
-# is absent, so the batched MoE prefill is not admitted on this arch at all. A
-# real Qwen3.6-35B-A3B--oq4 reports the same `distinct_paths: false`, which
-# settles it. On gfx1151/gfx12 these cells should run; if they still SKIP there,
-# the admission gate — not the gate script — is what to look at.
+# It used to infer this from the two runs' recurrent-state hashes DIFFERING.
+# That inference died with `0bbbfd08f`: once the duplicated MoE attention bodies
+# were folded onto the shared lowered super-ops, both paths run the same
+# per-token GDN kernels and a CORRECT implementation leaves the hashes equal.
+# The old check called that "never ran", and because it was evaluated before the
+# KLD comparison it also reported a real `max_kld 0.377, argmax 0/4` failure as
+# INCONCLUSIVE. The state hashes are still printed, as diagnostics only.
+#
+# THE MoE CELLS. `qwen3_5_moe` SKIPs on EVERY arch, and that is correct, not an
+# arch gap: `moe_preset` is top-2-of-8 and `moe_prefill_topk_shape_supported`
+# requires k_top in {8,10}, so the refusal is `moe_topk_ok=false (K=2, E=8)` —
+# a fixture shape, with no arch term in it. It is deliberately kept that way as
+# the regression cover for the ADMISSION guard (see `moe_indexed_preset`'s
+# docstring in hipfire-arch-qwen35-spec).
+#
+# `qwen3_5_moe_indexed` is top-8-of-16, reaches grouped path-2, and PASSES.
+# Getting there took two fixes, both in `0bbbfd08f` and `75b718181`: raw
+# F16/BF16 grouped MoE was dispatched to a gfx1151-only entry point, and — the
+# real one — `DeltaNetMoe`/`FullAttnMoe` carried stale COPIES of the dense
+# attention bodies that decoded F16 weights as HFQ4 nibble blocks on every arch.
+# A red MoE cell here is not an arch gap to route around.
+# See docs/plans/2026-08-24-raw-f16-moe-prefill-divergence.md.
 #
 # SELF-CHECK. Every cell also runs with `--corrupt-kv-prefix`, which zeroes each
 # layer's K buffer at every position EXCEPT the last — position 0 included. That
@@ -158,7 +175,7 @@ for raw_family in "${families[@]}"; do
             # Both runs landed in the same code path, so this cell compared the
             # reference against itself. Inconclusive, and explicitly NOT a pass —
             # counting it would recreate the false-coverage bug in a new place.
-            echo "  SKIP no batched prefill path reached (compared reference to itself)"
+            echo "  SKIP batched prefill did not execute for this fixture"
             skip=$((skip + 1))
             continue
         fi

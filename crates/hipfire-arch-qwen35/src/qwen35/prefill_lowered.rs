@@ -42,7 +42,12 @@ use hipfire_dispatch::pipeline::superop::EscapeKind;
 /// `Qwen35Bindings` (decode, n=1) field-for-field in spirit, but carries the row
 /// count and the batched scratch instead of a single-token cursor.
 pub(crate) struct Qwen35PrefillBindings<'a> {
-    pub(crate) layer: &'a FullAttnLayerWeights,
+    /// Attention half only — see [`FaAttnWeights`]. Both `FullAttn` and
+    /// `FullAttnMoe` drive these super-ops through it.
+    pub(crate) layer: FaAttnWeights<'a>,
+    /// Dense FFN weights, for `proj_gate_up` / `resid_down_swiglu` only. `None`
+    /// on a `FullAttnMoe` layer.
+    pub(crate) dense_ffn: Option<&'a FullAttnLayerWeights>,
     pub(crate) s: &'a Qwen35Scratch,
     pub(crate) pbs: &'a PrefillBatchScratch,
     pub(crate) config: &'a Qwen35Config,
@@ -1678,7 +1683,9 @@ impl<'a> Qwen35PrefillBindings<'a> {
     }
 
     pub(crate) fn proj_gate_up(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -1967,7 +1974,9 @@ impl<'a> Qwen35PrefillBindings<'a> {
     }
 
     pub(crate) fn resid_down_swiglu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -2318,7 +2327,13 @@ impl<'a> ForwardBindings for Qwen35PrefillBindings<'a> {
 /// matrices: they are `GpuTensor` device buffers, written by kernels, exactly as
 /// the decode `Qwen35Bindings` documents at `lowered.rs:139`.
 pub(crate) struct Qwen35PrefillDnBindings<'a> {
-    pub(crate) layer: &'a DeltaNetLayerWeights,
+    /// LA half only — see [`DnLaWeights`]. Both `DeltaNet` and `DeltaNetMoe`
+    /// drive these five super-ops through it, so there is ONE linear-attention
+    /// implementation instead of two that drift apart.
+    pub(crate) layer: DnLaWeights<'a>,
+    /// Dense FFN weights, for `proj_gate_up` / `resid_down_swiglu` only. `None`
+    /// on a `DeltaNetMoe` layer, whose FFN is `prefill_moe_ffn_body_batched`.
+    pub(crate) dense_ffn: Option<&'a DeltaNetLayerWeights>,
     pub(crate) tree_verify: Option<TreeVerifyCtx<'a>>,
     /// Chunk-level decision (`prefill_chunk.rs`), not a per-layer one.
     pub(crate) use_gdn_per_token: bool,
@@ -3531,7 +3546,9 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
     }
 
     pub(crate) fn proj_gate_up(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;
@@ -3936,7 +3953,9 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
     }
 
     pub(crate) fn resid_down_swiglu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let layer = self.layer;
+        let layer = self
+            .dense_ffn
+            .expect("dense FFN super-op invoked on a layer with no dense FFN weights");
         let pbs = self.pbs;
         let config = self.config;
         let n = self.n;

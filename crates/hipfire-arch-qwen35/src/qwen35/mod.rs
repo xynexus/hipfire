@@ -85,6 +85,9 @@ use decode_layers::*;
 
 mod prefill_chunk;
 use prefill_chunk::*;
+// The batched-prefill execution counter is the tiny prefill gate's positive
+// probe; it has to reach `hipfire-serving-core`'s harness.
+pub use prefill_chunk::{batched_prefill_rows, BATCHED_PREFILL_ROWS};
 
 pub mod feature_report;
 mod prefill_lowered;
