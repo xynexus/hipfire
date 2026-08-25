@@ -1124,6 +1124,32 @@
     "env": []
   },
   {
+    "key": "sampler_rng",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "fixed",
+        "random"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "fixed",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Sampler RNG seeding. 'fixed' reproduces today's behaviour (every temperature>0 request starts from the same constant, so identical prompts give identical output); 'random' seeds each stream from entropy so concurrent requests are independent. Greedy decode never consults the RNG and is unaffected either way.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "scheduler_system_memory_budget_bytes",
     "type": {
       "kind": "u64"

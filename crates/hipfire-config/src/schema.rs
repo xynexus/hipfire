@@ -405,6 +405,17 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "VRAM headroom preserved by residency admission. 0 disables the headroom guard."
     ),
     field!(
+        "sampler_rng",
+        ConfigType::Enum {
+            values: &["fixed", "random"]
+        },
+        Requirement::Optional,
+        Some("fixed"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Sampler RNG seeding. 'fixed' reproduces today's behaviour (every temperature>0 request starts from the same constant, so identical prompts give identical output); 'random' seeds each stream from entropy so concurrent requests are independent. Greedy decode never consults the RNG and is unaffected either way."
+    ),
+    field!(
         "model_residency_mode",
         ConfigType::Enum {
             values: &["auto", "full", "qwen_moe_modules"]

@@ -1153,7 +1153,7 @@ fn decode_loop_inner(
         frequency_penalty: ctx.frequency_penalty,
         blocked_tokens: Vec::new(),
     };
-    let mut rng_state: u32 = 0x13579BDF;
+    let mut rng_state: u32 = crate::sampler::initial_rng_state();
 
     let mut pos = start_pos;
     let mut committed: Vec<u32> = Vec::new();

@@ -98,6 +98,14 @@ fn default_resource_lock_wait_ms() -> u32 {
 fn default_scheduler_memory_budget_bytes() -> u64 {
     0
 }
+/// `"fixed"` — today's behaviour, kept as the default deliberately. Every
+/// `temperature>0` request has always started from the same constant, so
+/// flipping this to `"random"` by default would silently change sampled output
+/// for every existing deployment. Opt in instead.
+fn default_sampler_rng() -> String {
+    "fixed".to_string()
+}
+
 fn default_model_residency_mode() -> String {
     "auto".to_string()
 }
@@ -307,6 +315,9 @@ pub struct HipfireConfig {
     pub scheduler_vram_headroom_bytes: u64,
     #[serde(default = "default_model_residency_mode")]
     pub model_residency_mode: String,
+    /// Sampler RNG seeding: `"fixed"` (reproducible) or `"random"` (per stream).
+    #[serde(default = "default_sampler_rng")]
+    pub sampler_rng: String,
     #[serde(default = "default_kv_cache")]
     pub kv_cache: String,
     #[serde(default = "default_kv_adaptive")]
@@ -477,6 +488,7 @@ impl Default for HipfireConfig {
             models_dir: None,
             models_network_dir: None,
             default_model: None,
+            sampler_rng: default_sampler_rng(),
             prewarm_priority: default_prewarm_priority(),
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
