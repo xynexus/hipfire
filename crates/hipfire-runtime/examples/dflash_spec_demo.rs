@@ -701,6 +701,7 @@ fn main() {
     //    exactly at --block-size 4 but not at 2 or the default). That is
     //    batched-verify vs serial-decode parity, a separate question from
     //    #17. Cross-drafter identity holds regardless.
+    let mut no_speculate: bool = false;
     let mut no_tape: bool = false;
     let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 
@@ -936,6 +937,10 @@ fn main() {
             "--debug-cycle" => {
                 debug_cycles = args[i + 1].parse().unwrap();
                 i += 2;
+            }
+            "--no-speculate" => {
+                no_speculate = true;
+                i += 1;
             }
             "--no-tape" => {
                 no_tape = true;
@@ -2435,8 +2440,17 @@ fn main() {
                 }
                 (None, None) => None,
             };
-            let pld_spine: Option<&[u32]> = pld_spine_owned.as_deref();
-            let used_pld = pld_spine.is_some();
+            let used_pld = pld_spine_owned.is_some();
+            // Debug harness only. An EMPTY spine is the engine's no-speculate
+            // signal: b=1, no drafter forward, no rollback. `--block-size 1`
+            // does NOT reach it -- the drafter still launches with b-1 = 0 rows
+            // and dies in mq_rotate_x with grid=8x0x1. This flag is how you
+            // measure what a spec cycle costs with the speculation removed.
+            let pld_spine: Option<&[u32]> = if no_speculate {
+                Some(&[])
+            } else {
+                pld_spine_owned.as_deref()
+            };
             if used_pld {
                 pld_hits += 1;
             }

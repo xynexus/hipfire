@@ -8954,7 +8954,13 @@ pub fn spec_step_dflash(
     } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
-            qwen35::forward_scratch(
+            // `_no_logits`: replay exists only to walk dn_state + kv_cache
+            // forward over tokens that are ALREADY committed. Nothing reads
+            // `scratch.logits` afterwards -- the compare diagnostic below runs
+            // its own logits-producing forward. The lm_head is vocab-wide and
+            // costs ~1.2 ms/token on Qwen3.5-35B-A3B (rocprofv3), so the
+            // logits-producing variant burned that per replayed token.
+            qwen35::forward_scratch_no_logits(
                 gpu,
                 &target.weights,
                 &target.config,
