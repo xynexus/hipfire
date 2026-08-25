@@ -2304,7 +2304,8 @@ pub fn run_moe_prefill(
             | DType::MQ2G256Lloyd
             | DType::MQ3G256Lloyd
             | DType::Oq4G256
-            | DType::Oq8G256 => {
+            | DType::Oq8G256
+            | DType::OqCompactG256 => {
                 if let Some(down_awq) = p.expert_down_awq_ptrs {
                     // Per-expert AWQ: `down_awq_scale` below is ONE
                     // representative's, which routed experts do not share
