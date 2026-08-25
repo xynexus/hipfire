@@ -6364,6 +6364,20 @@ pub fn forward_prefill_batch_with_pbs_opts(
         // precision effect — and on a 14-token prompt the K values still sit in
         // KVarN's f32 window, where no K quantization has happened at all.
         //
+        // The strongest evidence is per-LAYER, not the tokens:
+        // `examples/compare_prefill_hidden_paths` reports batched == per-token
+        // EXACTLY (0.00e0, every layer) at fp32 KV, and a split from LAYER 3
+        // reaching 1.23e-1 relative at kvarn. A greedy token flip alone would
+        // not justify this warning — several unrelated perturbations of this
+        // model land on the same degenerate loop for this prompt while scoring
+        // IDENTICAL perplexity, so token divergence on its own is weak evidence.
+        // A 1.2e-1 hidden-state split from layer 3 is not that.
+        //
+        // NOT measured: the quality (ppl/KLD) cost. `hipfire-eval --battery
+        // perplexity` cannot measure it — that battery does not route through
+        // this function at all (verified by hardcoding `force_fallback = true`:
+        // elapsed time unchanged and this very warning never fires).
+        //
         // It matters here because KVarN is the DEFAULT KV mode and this fallback
         // is silent, so a model that declines the batched path for any unrelated
         // reason (an unwired dtype, a MoE term) starts emitting different tokens
