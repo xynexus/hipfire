@@ -46,7 +46,9 @@ pub fn generate_vl(
     // makes each request's tokens depend on whatever else sampled beside it, and
     // both callers reset it to the *same* constant, so concurrent requests did
     // not merely share a stream — they repeatedly reset each other onto one.
-    let mut sampler_rng = hipfire_runtime::sampler::SamplerRng::from_seed(0x13579BDF);
+    let mut sampler_rng = hipfire_runtime::sampler::SamplerRng::from_seed(
+        hipfire_runtime::sampler::initial_rng_state(),
+    );
 
     let GenerateVLParams {
         id,

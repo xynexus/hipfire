@@ -1444,7 +1444,7 @@ pub fn build_dspark_speculator(
         temp: 0.0,
         top_p: 1.0,
         top_k: 0,
-        rng_state: 0x13579BDF,
+        rng_state: hipfire_runtime::sampler::initial_rng_state() as u64,
         block,
         ctx_capacity,
         main_hidden_dev: None,
