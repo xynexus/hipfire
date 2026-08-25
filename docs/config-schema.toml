@@ -248,7 +248,7 @@ default = "\"\""
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
-description = "Two-stage lm_head decode: a coarse shortlist pass then a full-precision rescore. `q2` (2-bit tier) or `q4`; append `:<K>` to set the shortlist width. Empty disables it and the exact full-vocab GEMV runs. Measured INERT on Qwen3.8-27B decode (24.27 vs 24.31 tok/s with the wide multicol GEMV off), so it is not the lever on that model — it is exposed because it carries real wins on heads where the lm_head actually dominates."
+description = "Two-stage lm_head decode: a coarse shortlist pass then a full-precision rescore. `q2` (2-bit tier) or `q4`; append `:<K>` to set the shortlist width. Empty disables it and the exact full-vocab GEMV runs. On Qwen3.8-27B it is a NET LOSS, for two reasons worth knowing before enabling it. (1) Under spec decode it never runs at all: the two-stage site is the batch-1 lowered decode forward, and verify scores B tokens through the batched path. (2) Under plain decode it does run and decode gets 2.7% faster (14.7 -> 15.1 tok/s) — exactly the predicted saving, since the coarse tier cuts a 675 MB head to 318 MB and that head is only 4.4% of a 15.46 GB model — but the tier is BUILT AT RUNTIME because the artifact carries none, costing ~4.2 s charged to TTFT. Breakeven is ~2350 tokens in one generation; at 160 tokens it is 25% worse end-to-end. Quantize with a coarse tier (or cache the built one) and this becomes a free 2.7%."
 secret = false
 restart_impact = "none"
 

@@ -1203,13 +1203,27 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
     if always_ok {
         return true;
     }
-    // Compact-resident Opus: the dense prefill chain has compact arms, the GDN
-    // tape and the small-B spec-decode VERIFY do not. Admit it only for a real
-    // seed prefill — no tape, and n past the same n<=32 boundary this file
-    // already uses to separate "small-B MTP verify (n = K+1)" from "large seed
-    // prefill". Measured on Qwen3.8-27B oq4.25++ with the DFlash2 drafter,
-    // letting compact batch the verify took accept_rate 0.468 -> 0.000 and
-    // decode 5.10 -> 1.39 tok/s with the draft emitting random vocab ids.
+    // Compact-resident Opus. The caller decides via `allow_compact`; this arm
+    // only honours it.
+    //
+    // HISTORY, because the superseded version of this comment is still quoted:
+    // until 2026-08-25 this said the GDN tape and the small-B spec-decode VERIFY
+    // had no compact arms, so compact had to be refused for anything but a
+    // tape-less seed prefill, citing accept_rate 0.468 -> 0.000 and decode
+    // 5.10 -> 1.39 tok/s "with the draft emitting random vocab ids" on
+    // Qwen3.8-27B oq4.25++ / DFlash2.
+    //
+    // That is NO LONGER TRUE and the number does not reproduce. `890d350c0`
+    // made `allow_compact = !tape_in_play || compact_tape_batching_allowed()`,
+    // and `compact_tape_batching_allowed()` is default ON, so compact batches
+    // the verify under a tape on the DEFAULT path — 27.7 -> 57.9 tok/s. Measured
+    // on that path today: tape_in_play=true, allow_compact=true, n=17,
+    // accept_rate 0.819-0.837. Not 0.000.
+    //
+    // Left as history rather than deleted because the old text points AWAY from
+    // what is now the main remaining lever: verify is batched and still costs
+    // ~8ms per token at n=8..32, which is arithmetic intensity, not a
+    // correctness wall.
     if dt == DType::OqCompactG256 {
         return if allow_compact {
             true
@@ -4040,7 +4054,10 @@ fn triattn_tap(
         // synchronous D2H download of fa_q (and fa_k) every token.
         hipfire_rdna::kernel_trace::record_fallback(
             "qwen35 triattn_tap GPU tap declined -> per-layer D2H download",
-            &format!("layer={layer_idx} needs_k={}", hipfire_runtime::triattn::tap_needs_k()),
+            &format!(
+                "layer={layer_idx} needs_k={}",
+                hipfire_runtime::triattn::tap_needs_k()
+            ),
         );
         let n_q = config.n_heads * config.head_dim;
         let q_cpu = gpu.download_f32(&s.fa_q)?;

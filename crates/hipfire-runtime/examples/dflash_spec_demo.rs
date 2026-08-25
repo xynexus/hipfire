@@ -2796,8 +2796,23 @@ fn main() {
                 target.kv_cache.compact_offset,
             );
         }
-        let accept_rate = if stats.cycles > 0 {
-            stats.accepted_tokens as f32 / (stats.cycles * (draft_cfg.block_size - 1)) as f32
+        // Acceptance is accepted / PROPOSED, and a tree does not propose B-1.
+        // DDTree expands `tree.num_nodes()` per cycle (16 at the default budget
+        // against B-1 = 7), so the linear denominator overstated its efficiency
+        // by ~2.3x: it read 0.837 where the true node acceptance was 0.366, i.e.
+        // it reported a tree accepting 84% of what it proposed when it accepted
+        // 37%. That is the number the tree-vs-linear tradeoff turns on.
+        let ddtree_meta = hipfire_arch_qwen35::speculative::read_ddtree_meta_stats();
+        let (proposed, rate_basis) = if ddtree_meta.total_nodes > 0 {
+            (ddtree_meta.total_nodes as f32, "ddtree nodes proposed")
+        } else {
+            (
+                (stats.cycles * (draft_cfg.block_size - 1)) as f32,
+                "cycles x (B-1)",
+            )
+        };
+        let accept_rate = if proposed > 0.0 {
+            stats.accepted_tokens as f32 / proposed
         } else {
             0.0
         };
@@ -2861,7 +2876,10 @@ fn main() {
         eprintln!("vram_used_mb: {}", vram_used_mb);
         eprintln!("vram_total_mb: {}", vram_total_mb);
         eprintln!("=====================");
-        eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
+        eprintln!(
+            "accept_rate (accepted {} / proposed {proposed:.0} [{rate_basis}]): {accept_rate:.3}",
+            stats.accepted_tokens
+        );
         eprintln!(
             "histogram: {:?}",
             stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
