@@ -6425,8 +6425,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
             // lm_head for all non-final tokens via the no-logits forward; the
             // last token still gets full logits in scratch.logits.
             let skip_logits = needs_last_token_logits && i != last_idx;
+            // Same rule for both branches. It used to apply only to the
+            // hidden_rb == None arm, so a caller asking for BOTH the ring
+            // buffer and per-token hidden -- i.e. DFlash verify -- always got a
+            // vocab-wide lm_head it never read, then computed the lm_head again
+            // itself from `per_token_hidden_out`. ~1.2 ms/token on
+            // Qwen3.5-35B-A3B, on every verified token.
+            let no_logits =
+                (per_token_hidden_out.is_some() && !needs_last_token_logits) || skip_logits;
             if let Some(rb) = hidden_rb.as_mut() {
-                forward_scratch_with_hidden(
+                forward_scratch_with_hidden_opts(
                     gpu,
                     weights,
                     config,
@@ -6436,8 +6444,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
                     dn_state,
                     scratch,
                     rb,
+                    !no_logits,
                 )?;
-            } else if (per_token_hidden_out.is_some() && !needs_last_token_logits) || skip_logits {
+            } else if no_logits {
                 forward_scratch_no_logits(
                     gpu,
                     weights,

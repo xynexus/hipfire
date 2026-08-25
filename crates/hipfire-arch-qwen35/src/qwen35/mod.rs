@@ -3136,6 +3136,31 @@ pub fn forward_scratch_with_hidden(
     scratch: &Qwen35Scratch,
     hidden_rb: &mut HiddenStateRingBuffer,
 ) -> HipResult<()> {
+    forward_scratch_with_hidden_opts(
+        gpu, weights, config, token, pos, kv_cache, dn_state, scratch, hidden_rb, true,
+    )
+}
+
+/// `forward_scratch_with_hidden`, but the caller says whether it wants logits.
+///
+/// The lm_head is vocab-wide and costs ~1.2 ms/token on Qwen3.5-35B-A3B
+/// (`gemv_oq_compact_grouped_v3`, grid 524288 — measured with rocprofv3). A
+/// caller that only wants the hidden states, and computes its own logits from
+/// them afterwards, was paying for it and throwing the result away: DFlash
+/// verify did exactly that, computing the lm_head twice per verified token.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_with_hidden_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut kv::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    want_logits: bool,
+) -> HipResult<()> {
     let dim = config.dim;
     let pos_i32 = pos as i32;
     gpu.hip
@@ -3172,7 +3197,7 @@ pub fn forward_scratch_with_hidden(
         dn_state,
         scratch,
         Some(hidden_rb),
-        true,
+        want_logits,
         None,
     )?;
     hidden_rb.advance_head();
