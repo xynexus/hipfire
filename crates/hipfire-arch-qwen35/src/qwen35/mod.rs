@@ -2696,7 +2696,7 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // So this is worth chasing -- but not worth shipping wrong.
         DType::OqCompactG256 => {
             arch.starts_with("gfx11")
-                && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() == Ok("1")
+                && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() != Ok("0")
         }
         // ⚠️ Oq8G256 grouped is OPT-IN and OFF by default: the kernel is FAST and
         // WRONG. gemm_oq8g256_moe_grouped_wmma + its path-2 arms exist and route
