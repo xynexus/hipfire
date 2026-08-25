@@ -866,6 +866,14 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 .and_then(|req| req.evidence_dir.as_deref())
                 .or_else(|| msg.get("evidence_dir").and_then(|v| v.as_str())),
             raw_override,
+            // §M1b: derived, not transmitted. Stable for a given
+            // (session, request), and independent of what else is admitted —
+            // which is the property that makes a solo-vs-interleaved comparison
+            // meaningful.
+            Some(hipfire_runtime::sampler::derive_stream_seed(
+                session_id.unwrap_or(id),
+                id,
+            )),
         );
         let Qwen35Start::Ready(mut generation) = started else {
             // Served by another route (spec-decode, VL, llama) or already

@@ -3437,6 +3437,13 @@ pub fn generate_start(
     // has no chat_template). Threaded rather than read from a global — see
     // `effective_raw` for the cross-request leak that motivated it.
     raw_override: Option<bool>,
+    // Per-stream sampler seed, derived at admission
+    // (`sampler::derive_stream_seed`). `None` = no stream identity to derive
+    // from (CLI, eval, tests), which falls back to `initial_rng_state()`.
+    // Threaded rather than read from a global, for the same reason
+    // `raw_override` is: a stream's sampling must not depend on what else is
+    // running beside it.
+    sampler_seed: Option<u32>,
 ) -> Qwen35Start {
     // No RNG reset here any more. This used to seed a process-global CPU sampler
     // state so a request would not inherit RNG from its predecessor; the global
@@ -4497,7 +4504,8 @@ pub fn generate_start(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = hipfire_runtime::sampler::initial_rng_state();
+        let mut rng_state: u32 =
+            sampler_seed.unwrap_or_else(hipfire_runtime::sampler::initial_rng_state);
         let repeat_buf_cap = (scratch.repeat_buf.buf.size() / 4).min(repeat_window);
 
         // Build the list of paired (open, close) attractor pairs once;
@@ -4886,6 +4894,9 @@ pub fn generate(
         request_stop_sequences,
         evidence_dir,
         raw_override,
+        // Legacy in-crate driver: no stream identity to derive a seed from, so
+        // it keeps the process-level behaviour `initial_rng_state()` selects.
+        None,
     ) {
         Qwen35Start::Handled => {}
         Qwen35Start::Ready(mut generation) => {
