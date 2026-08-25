@@ -1118,6 +1118,9 @@ fn main() {
     }
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "kvarn" => hipfire_arch_qwen35::speculative::KvMode::Kvarn,
+        // Unquantized gold path: the oracle arm for isolating a KV-quant
+        // effect from a logic bug. Slow and large; verification only.
+        "f32" | "fp32" => hipfire_arch_qwen35::speculative::KvMode::Fp32,
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
         "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
         "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
@@ -1128,6 +1131,7 @@ fn main() {
         other => {
             eprintln!(
                 "unknown --kv-mode: {other}. Valid: kvarn (default) / kvarn2 / kvarn4 / kvarn8, \
+                 f32 (unquantized oracle), \
                  q8/asym4/asym3/asym2/fwht4/fwht3/fwht2 (all DEPRECATED)"
             );
             std::process::exit(1);
