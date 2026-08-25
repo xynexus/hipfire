@@ -294,7 +294,135 @@ __device__ __forceinline__ float oqc_moe_row_dot_wide(
     return facc;
 }
 
-// ROWS/BLOCK: one wave per output row, OQCM_ROWS_PER_BLOCK waves per workgroup.
+// K-SLICED variant of `oqc_moe_row_dot_wide`: this wave handles only groups
+// [g0, g0+gpw), so SPLIT waves can share one output row.
+//
+// Why: routed gate_up has ng = 8, and the wide path eats 4 groups per round, so
+// each wave walks TWO dependent rounds. The dense split-K shape reaching 195
+// GB/s has the same 8192 waves but only ONE round. Measured here: gate_up 63.5
+// us vs the dense 8192-wave shape at 48.3 us for comparable bytes (8.6 vs 9.4
+// MB) -- the extra round is the difference, not bandwidth.
+//
+// Ruled out first, so nobody re-runs them: occupancy (1-wave workgroups -> 8
+// waves/workgroup changed nothing), load width (dwordx2 on down_proj bought
+// 0.3%), and expert SCATTER -- forcing the 8 routed experts to be consecutive
+// allocations, same byte volume, moved 63.5 -> 59.2 us, only 6.8%. So a
+// per-layer expert-buffer consolidation is NOT worth its blast radius.
+__device__ __forceinline__ float oqc_moe_row_dot_wide_slice(
+    const uint8_t* __restrict__ A,
+    const float* __restrict__ x,
+    int row, int M, int K, int block_stride, int lane, int g0, int gpw
+) {
+    const int ng = K / 256;
+    const int side_stride = block_stride - 128;
+    const int n_ov = (block_stride - 130) >> 1;
+    const int gir = lane >> 3;
+    const int lig = lane & 7;
+    const int elt = lig * 32;
+
+    const uint8_t* __restrict__ n_row = A + (long long)row * ng * 128LL;
+    const uint8_t* __restrict__ s_row = A + (long long)M * ng * 128LL
+                                          + (long long)row * ng * (long long)side_stride;
+
+    float facc = 0.0f;
+    for (int r = 0; r < gpw; r += 4) {
+        const int gi = g0 + r + gir;
+        const uint8_t* sb = s_row + (long long)gi * side_stride;
+        const float sw = (float)(*(const _Float16*)sb);
+
+        uint32_t wv[4];
+        __builtin_memcpy(wv, n_row + (long long)gi * 128 + lig * 16, 16);
+
+        const int xoff = gi * 256 + elt;
+        const float4 x0 = *(const float4*)(x + xoff);
+        const float4 x1 = *(const float4*)(x + xoff + 4);
+        const float4 x2 = *(const float4*)(x + xoff + 8);
+        const float4 x3 = *(const float4*)(x + xoff + 12);
+        const float4 x4 = *(const float4*)(x + xoff + 16);
+        const float4 x5 = *(const float4*)(x + xoff + 20);
+        const float4 x6 = *(const float4*)(x + xoff + 24);
+        const float4 x7 = *(const float4*)(x + xoff + 28);
+
+        float sd = OQCM_WORD(wv[0], x0, x1) + OQCM_WORD(wv[1], x2, x3)
+                 + OQCM_WORD(wv[2], x4, x5) + OQCM_WORD(wv[3], x6, x7);
+
+        const uint8_t* table = sb + 2;
+        {
+            const int e   = (lig < n_ov) ? lig : 0;
+            const int idx = (int)table[2 * e];
+            const int val = (lig < n_ov) ? (int)(int8_t)table[2 * e + 1] : 0;
+            sd += (float)val * x[gi * 256 + idx];
+        }
+        for (int e = lig + 8; e < n_ov; e += 8) {
+            const int idx = (int)table[2 * e];
+            const int val = (int)(int8_t)table[2 * e + 1];
+            sd += (float)val * x[gi * 256 + idx];
+        }
+
+        facc += sd * sw;
+    }
+
+    for (int off = 16; off > 0; off >>= 1) facc += __shfl_down(facc, off);
+    return facc;
+}
+
+// SPLIT-K gate_up: OQCM_GU_SPLIT waves share one output row, 8/SPLIT rows per
+// 256-thread workgroup. Grid (ceil(M/rows_per_block), K_TOP, N).
+#define OQCM_GU_SPLIT 2
+#define OQCM_GU_ROWS  (8 / OQCM_GU_SPLIT)
+
+__launch_bounds__(256)
+extern "C" __global__ void gemv_oq_compact_moe_gate_up_k8_indexed_batched_splitk(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int* __restrict__ topk_indices,
+    const int* __restrict__ expert_strides,
+    const float* __restrict__ x,
+    float* __restrict__ y_gate,
+    float* __restrict__ y_up,
+    int M, int K, int K_TOP, int x_per_slot
+) {
+    const int wig = (int)(threadIdx.x >> 5);
+    const int rib = wig / OQCM_GU_SPLIT;
+    const int sub = wig % OQCM_GU_SPLIT;
+    const int lane = (int)(threadIdx.x & 31);
+    const int row = blockIdx.x * OQCM_GU_ROWS + rib;
+    const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
+
+    __shared__ float part[8];
+
+    if (row < M) {
+        const int expert_id = topk_indices[bid * K_TOP + krank];
+        const uint8_t* __restrict__ A =
+            reinterpret_cast<const uint8_t*>(expert_ptrs[expert_id]);
+        const float* __restrict__ x_row =
+            x + (x_per_slot ? ((long long)bid * K_TOP + krank) : (long long)bid) * K;
+        const int e_stride = expert_strides[expert_id];
+        const int gpw = (K / 256) / OQCM_GU_SPLIT;
+        // MIXED PRECISION: 0 means this expert was promoted to Oq8G256 while its
+        // neighbours stayed compact, and one launch has to serve both. The
+        // compact slice helper cannot read that layout, so for a promoted expert
+        // ONE wave computes the whole row the narrow way and the other waves
+        // contribute zero. Workgroup-uniform (one expert per workgroup), so it
+        // costs a scalar compare and no divergence.
+        const float acc = (e_stride == 0)
+            ? ((sub == 0) ? oqc_moe_row_dot(A, x_row, row, M, K, 0, lane) : 0.0f)
+            : oqc_moe_row_dot_wide_slice(A, x_row, row, M, K, e_stride, lane,
+                                         sub * gpw, gpw);
+        if (lane == 0) part[wig] = acc;
+    }
+    __syncthreads();
+    if (row < M && sub == 0 && lane == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < OQCM_GU_SPLIT; ++i) t += part[rib * OQCM_GU_SPLIT + i];
+        const int mi = M >> 1;
+        const long long slot = (long long)bid * K_TOP + krank;
+        if (row < mi) y_gate[slot * mi + row] = t;
+        else          y_up[slot * mi + (row - mi)] = t;
+    }
+}
+
+// ROWS/BLOCK: one wave per output row// ROWS/BLOCK: one wave per output row, OQCM_ROWS_PER_BLOCK waves per workgroup.
 //
 // These launched as block=32 -- a SINGLE wave per workgroup, no LDS -- with
 // __launch_bounds__(32, 16). On RDNA the per-CU WORKGROUP-slot limit then binds

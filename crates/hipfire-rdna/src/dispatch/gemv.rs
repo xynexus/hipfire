@@ -4128,10 +4128,21 @@ impl Gpu {
         x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // SPLIT-K when every wave would otherwise walk more than one round.
+        // The wide path eats 4 groups per round, so ng=8 (routed gate_up, K=2048)
+        // means two dependent rounds; the dense split-K shape hits 195 GB/s with
+        // the same 8192 waves and ONE round. Needs (ng/2) % 4 == 0 and M % 4 == 0.
+        let ng_gu = k / 256;
+        let gu_split = ng_gu % 8 == 0 && m % 4 == 0;
+        let gu_name = if gu_split {
+            "gemv_oq_compact_moe_gate_up_k8_indexed_batched_splitk"
+        } else {
+            "gemv_oq_compact_moe_gate_up_k8_indexed_batched"
+        };
         self.ensure_kernel(
             "gemv_oq_compact_moe_indexed",
             kernels::GEMV_OQ_COMPACT_MOE_INDEXED_SRC,
-            "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
+            gu_name,
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -4146,9 +4157,10 @@ impl Gpu {
         // kernels/src/gemv_oq_compact_moe_indexed.hip. Math is unchanged and
         // bit-identical; this only stops the per-CU workgroup-slot limit from
         // capping occupancy at 16 waves/CU on a memory-bound GEMV.
-        let gx = m.div_ceil(OQCM_ROWS_PER_BLOCK) as u32;
+        // splitk packs 8/SPLIT=4 rows per workgroup; the plain kernel packs 8.
+        let gx = m.div_ceil(if gu_split { 4 } else { OQCM_ROWS_PER_BLOCK }) as u32;
         self.launch_kernargs(
-            "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
+            gu_name,
             [gx, k_top as u32, batch_size as u32],
             [OQCM_BLOCK_THREADS, 1, 1],
             0,
