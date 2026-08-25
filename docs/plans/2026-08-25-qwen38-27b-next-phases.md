@@ -861,3 +861,78 @@ exist here.
 Kept: `hadamard_channels` / `hadamard_rows` / `quantize_tile_rotated` in the
 oracle, with tests. They are correct, they cost nothing when unused, and they are
 what a decode-accumulation study would need. Nothing is wired into serving.
+
+
+# Pseudo-decode proxy: built, and the rotation accumulates WORSE
+
+`crates/hipfire-kvquant/examples/kvarn_pseudo_decode.rs` implements the setting
+the paper defines (Fig. "pseudo-decode"):
+
+> "We split the sequence into blocks of size b. After every block, the freshly
+> produced K, V are quantized before being written back to the KV-cache.
+> Subsequent blocks access a quantized cache, so quantization error accumulates
+> over time."
+
+The feedback is the point, and it is what the earlier single-shot test could not
+see: the quantised run's FUTURE keys are generated from its OWN dequantised
+history, so error compounds. Both runs share one driving process; only the cache
+differs.
+
+Two frame bugs had to be fixed before the numbers meant anything, and both
+pinned drift at exactly 1.0 (a collapse, not a measurement):
+  * a rotated cache must be queried with a ROTATED query — H orthonormal gives
+    `q.k == (qH).(kH)`, which is the entire reason the rotation is free at
+    attention time. Querying it raw produces meaningless scores.
+  * only the CACHE lives in the rotated frame. A real implementation un-rotates
+    the attention output (`acc_rot @ H.t()`) before the network sees it, so the
+    model STATE stays in the natural basis. Feeding a rotated state forward makes
+    the two runs different processes rather than one process plus quant error.
+
+## Result (128 channels, b=32, 24 blocks, ~1/8 outlier channels)
+
+Relative drift of the attention readout vs the unquantised run:
+
+```
+2-bit    step 1:  plain 0.0696   rotated 0.0729   1.05x
+         step 24: plain 0.5556   rotated 1.2901   2.32x
+4-bit    step 1:  plain 0.0179   rotated 0.0141   0.79x   <- rotation better
+         step 24: plain 0.1491   rotated 0.4770   3.20x
+```
+
+The rotation starts neutral-to-better at step 1 and accumulates WORSE, with the
+gap widening as steps go on — the opposite of the paper's claim.
+
+The paper's own decomposition explains the shape without rescuing the outcome:
+
+```
+E_M/E_T (magnitude share of total error)
+  2-bit   plain 0.239   rotated 0.017
+  4-bit   plain 0.029   rotated 0.000
+```
+
+The rotation DOES do what the paper says — it nearly eliminates magnitude error,
+which the paper identifies as the dominant outlier failure. But in this proxy the
+residual DIRECTIONAL error accumulates worse than the magnitude error it removed.
+
+A coherent reading: hipfire's Sinkhorn already normalises per-row = per-channel,
+so magnitude error is ALREADY small on the plain path (E_M/E_T 0.029 at 4-bit).
+The rotation's magnitude fix is therefore largely redundant here, while its
+directional cost is not. The paper pairs rotation WITH dual-scaling and reports
+SOTA, so either real K statistics differ from this synthetic process, or the
+benefit lives somewhere this proxy does not reach.
+
+## Honest limits
+
+The driving process (`make_block`) is synthetic — my construction, not a model
+forward. Accumulation dynamics depend on it, so this bounds what can be claimed:
+it is evidence that the rotation is not obviously beneficial for OUR quantiser,
+NOT a refutation of the paper. The decisive version replaces `make_block` with a
+real qwen35 forward and measures drift in the actual residual stream.
+
+## Where that leaves the port
+
+Both instruments now agree the rotation costs us: single-shot reconstruction
+~1.3x worse (0/200 tiles), accumulated drift 2.3-3.2x worse over 24 blocks.
+Porting it into the default KV path is not justified on this evidence. The oracle
+functions stay (correct, tested, free when unused) for whoever runs the
+real-forward version.
