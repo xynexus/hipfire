@@ -226,9 +226,50 @@ pub fn hadamard_rows(x: &mut [f32], n: usize) {
 /// The caller MUST apply the same rotation to Q (see `hadamard_rows`) — this
 /// returns codes in the rotated frame, and `dequantize_tile` returns rotated
 /// values. Nothing inverts it, by design.
+/// Hadamard-rotate along the CHANNEL axis of a `[channel(row) x token(col)]`
+/// tile — i.e. down each column, across `r_dim` channels.
+///
+/// The axis matters and is easy to get backwards. `kvarn_gather_k_tiles` builds
+/// tiles as `[head_dim x GROUP]`, so a ROW is one channel across all tokens and a
+/// COLUMN is one token across all channels. The reference rotates `q @ H` with
+/// `q` shaped `[heads, R]` where R is the channel/latent dim, so the transform
+/// runs across CHANNELS. Rotating across tokens instead would mix independent
+/// timesteps and is simply a different (wrong) operator.
+pub fn hadamard_channels(tile: &mut [f32], r_dim: usize, c_dim: usize) {
+    assert!(
+        r_dim.is_power_of_two(),
+        "hadamard_channels: r_dim (channels) must be a power of two, got {r_dim}"
+    );
+    assert_eq!(tile.len(), r_dim * c_dim, "hadamard_channels: tile shape mismatch");
+    let scale = 1.0f32 / (r_dim as f32).sqrt();
+    let mut col = vec![0f32; r_dim];
+    for t in 0..c_dim {
+        for ch in 0..r_dim {
+            col[ch] = tile[ch * c_dim + t];
+        }
+        let mut len = 1;
+        while len < r_dim {
+            let mut i = 0;
+            while i < r_dim {
+                for j in i..i + len {
+                    let a = col[j];
+                    let b = col[j + len];
+                    col[j] = a + b;
+                    col[j + len] = a - b;
+                }
+                i += len << 1;
+            }
+            len <<= 1;
+        }
+        for ch in 0..r_dim {
+            tile[ch * c_dim + t] = col[ch] * scale;
+        }
+    }
+}
+
 pub fn quantize_tile_rotated(tile: &[f32], r_dim: usize, c_dim: usize, qmax: f32) -> QuantTile {
     let mut rot = tile.to_vec();
-    hadamard_rows(&mut rot, c_dim);
+    hadamard_channels(&mut rot, r_dim, c_dim);
     quantize_tile_qmax(&rot, r_dim, c_dim, qmax)
 }
 
@@ -563,12 +604,18 @@ mod tests {
     fn hadamard_rotation_improves_2bit_reconstruction_on_outlier_channels() {
         // One dominant channel per row is the case the paper calls out: a coarse
         // grid spends its whole range on the outlier and flattens everything else.
-        let (r, c) = (8usize, 128usize);
+        // [channel(row) x token(col)]. An OUTLIER CHANNEL is a whole ROW that is
+        // large across all tokens — that is what the paper means, and it is the
+        // axis the rotation acts on. (An earlier version of this test put a
+        // spike at one token per row and "passed" while rotating across tokens,
+        // i.e. it validated the wrong operator.)
+        let (r, c) = (128usize, 32usize);
         let mut tile = vec![0f32; r * c];
-        for i in 0..r {
-            for j in 0..c {
-                let base = (((i * 31 + j * 17) % 13) as f32 - 6.0) * 0.05;
-                tile[i * c + j] = if j == (i * 7) % c { 12.0 } else { base };
+        for ch in 0..r {
+            let outlier = ch % 37 == 0;
+            for t in 0..c {
+                let base = (((ch * 31 + t * 17) % 13) as f32 - 6.0) * 0.05;
+                tile[ch * c + t] = if outlier { 12.0 + base } else { base };
             }
         }
         let err = |q: &QuantTile, reference: &[f32]| -> f32 {
@@ -583,7 +630,7 @@ mod tests {
         // The rotated tile is quantised in the rotated frame, so compare against
         // the rotated reference — that is what attention consumes.
         let mut rotated_ref = tile.clone();
-        hadamard_rows(&mut rotated_ref, c);
+        hadamard_channels(&mut rotated_ref, r, c);
         let rotated = err(
             &quantize_tile_rotated(&tile, r, c, QMAX_2BIT),
             &rotated_ref,
