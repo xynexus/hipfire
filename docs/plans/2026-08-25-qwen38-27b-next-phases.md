@@ -1212,3 +1212,47 @@ diversity buys almost nothing on this drafter. Tree build itself is free
 Conclusion: the lever is NOT tree topology. It is either the drafter (raise tau
 at B<=8, where verify is free) or the kernel's occupancy past B=8 (which would
 let B=12 spend its tau=7.1 at B=8 prices).
+
+## Prefill throughput: measured curve and a fitted cost model
+
+Qwen3.8-27B oq4.25++ on gfx1151, `dflash_spec_demo --max 4`, 20 prompt lengths
+from n=37 to n=4489. **Prefill is not a single number** — it ranges from 95 to
+306 tok/s over that span, so quoting one figure without its n is meaningless.
+
+    t(n) = 0.174 + 2.854e-3 n + 0.275e-6 n^2      seconds     (fit on n >= 250)
+
+worst error 8.5%, mean 3.3%. Equivalently, per-token cost is
+
+    2.85 ms + 0.275 us * n
+
+which is the more useful form: a flat compute term plus an attention term
+linear in context. Reading the coefficients:
+
+- `0.174 s` fixed setup, which is why short prompts look slow (n=37 measures
+  95 tok/s and is ~all overhead).
+- `2.85 ms/token` -> a **350 tok/s ceiling** from the linear term alone.
+- `0.275 us * n` attention. Negligible under n~1000; it **doubles** the
+  per-token cost at n = 10379.
+
+Measured, and predicted past the data:
+
+| n | tok/s |
+|---|---|
+| 37 | 95 (measured, overhead-dominated) |
+| 121 | 247 (measured) |
+| 849 | 302 (measured) |
+| 1269 | **306 (measured peak)** |
+| 4489 | 242 (measured) |
+| 8192 | 195 (predicted) |
+| 16384 | 136 (predicted) |
+| 32768 | 84 (predicted) |
+
+⚠️ **A better-fitting model was WRONG.** `a*ceil(n/256) + b n + c n^2` scored
+better (worst 10.0% / mean 2.8% vs 18.8% / 5.0%) and 256 is exactly
+`PREFILL_MAX_BATCH`, so it looked physically motivated — cost per chunk. But
+its distinctive prediction is a ~285 ms sawtooth at each chunk boundary, and
+that does not exist: crossing n=256 measures 249 -> 0.79 s, 259 -> 0.88 s
+(+0.09 s for 10 tokens, not +0.285 s), and crossing 512 is equally smooth. The
+chunk term was fitting noise in the small-n scatter. Prefill cost is SMOOTH in
+n. Fit quality alone did not distinguish the true model from the false one —
+only testing the prediction did.
