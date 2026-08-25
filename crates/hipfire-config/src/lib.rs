@@ -855,14 +855,73 @@ fn materialize_config(
         );
     }
 
-    match serde_json::from_value::<HipfireConfig>(Value::Object(object)) {
+    match serde_json::from_value::<HipfireConfig>(Value::Object(object.clone())) {
         Ok(config) => config,
+        // ONE unparseable field must not discard the other ninety.
+        //
+        // This arm used to return `HipfireConfig::default()`, which meant a
+        // single type mismatch anywhere silently reset EVERY setting —
+        // `models_dir`, `kv_cache`, scheduler budgets, `model_overrides`, all of
+        // it. Silently, because the diagnostic below is dropped on the floor by
+        // `HipfireConfig::resolve_for_model`, which returns only `.config`.
+        //
+        // That was not hypothetical. `hipfire-server`'s `apply_resource_list_env`
+        // writes `HIPFIRE_RESOURCE_LOCK_NPUS=1` for `resource_lock_npus:
+        // ["auto"]` — correct for its consumer, which documents `1` as "lease
+        // every detected NPU" — but this crate's env layer claims the same name
+        // for a `Vec<String>` field and reads `1` as a JSON number. A server with
+        // NPU auto-leasing therefore ran on default config for everything, with
+        // no error and no log. Two `hipfire-server` prewarm tests were the only
+        // thing that ever noticed.
+        //
+        // Recovery is field-by-field: start from the defaults and accept each
+        // resolved key only if the document still deserializes with it. The bad
+        // key alone falls back, and is NAMED in a diagnostic and on stderr so it
+        // stops being invisible. O(keys) deserializations, on the error path
+        // only — the happy path above is untouched.
         Err(err) => {
             diagnostics.push(ConfigDiagnostic {
                 severity: ConfigDiagnosticSeverity::Error,
                 message: format!("failed to materialize typed config: {err}"),
             });
-            HipfireConfig::default()
+            let mut accepted = match serde_json::to_value(HipfireConfig::default()) {
+                Ok(Value::Object(map)) => map,
+                // Defaults themselves do not serialize: nothing to recover onto.
+                _ => return HipfireConfig::default(),
+            };
+            let mut rejected: Vec<String> = Vec::new();
+            for (key, value) in object {
+                let mut trial = accepted.clone();
+                trial.insert(key.clone(), value);
+                if serde_json::from_value::<HipfireConfig>(Value::Object(trial.clone())).is_ok() {
+                    accepted = trial;
+                } else {
+                    rejected.push(key);
+                }
+            }
+            for key in &rejected {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    message: format!(
+                        "config key `{key}` has a value of the wrong type; it fell back to its \
+                         default. Every OTHER key was kept."
+                    ),
+                });
+            }
+            if !rejected.is_empty() {
+                // Deliberately stderr, not just a diagnostic: the caller that
+                // hits this most (`resolve_for_model`) discards diagnostics, and
+                // a config that silently reverts to defaults is the failure this
+                // whole arm exists to stop being silent.
+                eprintln!(
+                    "hipfire-config: ignoring {} malformed config key(s): {}. \
+                     They fell back to defaults; all other keys were kept.",
+                    rejected.len(),
+                    rejected.join(", ")
+                );
+            }
+            serde_json::from_value::<HipfireConfig>(Value::Object(accepted))
+                .unwrap_or_else(|_| HipfireConfig::default())
         }
     }
 }
@@ -1166,5 +1225,47 @@ mod tests {
         assert_eq!(resolved.prefill_compression, "auto");
         assert_eq!(resolved.prefill_drafter_device, 1);
         assert_eq!(cfg.resolve_for_model("other").temperature, 0.3);
+    }
+    /// One malformed key must not discard the rest of the config.
+    ///
+    /// Before this, `materialize_config` returned `HipfireConfig::default()` on
+    /// any deserialization failure, so a single wrong-typed value silently reset
+    /// EVERY setting. The live trigger was `HIPFIRE_RESOURCE_LOCK_NPUS=1`, which
+    /// `hipfire-server` sets on itself for `resource_lock_npus: ["auto"]` — valid
+    /// for the daemon adapter that reads it, wrong type for the `Vec<String>`
+    /// config field of the same name. A server with NPU auto-leasing ran on
+    /// defaults for everything, silently.
+    #[test]
+    fn a_malformed_key_does_not_discard_the_others() {
+        let raw = serde_json::json!({
+            "prewarm_priority": 7,
+            "kv_cache": "kvarn",
+            // Wrong type on purpose: this field is a Vec<String>.
+            "resource_lock_npus": 1,
+        });
+
+        let resolved = resolve_typed_config_document(&raw, None);
+
+        assert_eq!(
+            resolved.config.prewarm_priority, 7,
+            "a good key was discarded because a different key was malformed"
+        );
+        assert_eq!(
+            resolved.config.kv_cache, "kvarn",
+            "a good key was discarded because a different key was malformed"
+        );
+        assert_eq!(
+            resolved.config.resource_lock_npus,
+            default_resource_lock_npus(),
+            "the malformed key should fall back to its own default"
+        );
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("resource_lock_npus")),
+            "the malformed key must be NAMED — being unnamed is what made this \
+             invisible for so long"
+        );
     }
 }
