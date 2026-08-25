@@ -48,8 +48,16 @@
 // The speedup grows with batch because that is what deepens the reuse: more
 // slots per tile means the same weight read serves more tokens.
 //
-// Requires ng % 4 == 0 (K % 1024 == 0), the same constraint the wide GEMV path
-// carries; callers keep the indexed GEMV otherwise.
+// TWO LANE SHAPES, because the reference has two. Routed gate_up is K=2048
+// (ng=8) and takes the WIDE path (8 lanes/group, dwordx4) like
+// `oqc_moe_row_dot_wide`; routed down_proj is K=512 (ng=2), fails ng % 4, and
+// the reference falls back to the NARROW path (32 lanes/group, one dword, 8
+// weights per lane) in `oqc_moe_row_dot`. Both are mirrored here, selected by a
+// workgroup-uniform branch, because a grouped kernel that only covered gate_up
+// would be useless: enabling path-2 routes BOTH projections through it.
+//
+// The narrow arm also uses a SINGLE accumulator, matching its reference —
+// splitk applies to gate_up only.
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -130,6 +138,54 @@ extern "C" __global__ void gemm_oq_compact_moe_grouped_f32(
     for (int s = 0; s < OQCF_TILE; s++) {
         facc[s][0] = 0.0f;
         facc[s][1] = 0.0f;
+    }
+
+    if ((ng & 3) != 0) {
+        // ── NARROW arm: mirrors `oqc_moe_row_dot` (32 lanes own one group) ──
+        const int nlane = lane;            // 0..31
+        const int nbase_off = nlane * 8;   // 8 weights per lane
+        for (int g = 0; g < ng; g++) {
+            const uint8_t* sb = s_row + (long long)g * side_stride;
+            const float sw = (float)(*(const _Float16*)sb);
+            uint32_t wv;
+            __builtin_memcpy(&wv, n_row + (long long)g * 128 + nlane * 4, 4);
+            const uint8_t* table = sb + 2;
+            const int e0 = (nlane < n_ov) ? nlane : 0;
+            const int i0 = (int)table[2 * e0];
+            const int v0 = (nlane < n_ov) ? (int)(int8_t)table[2 * e0 + 1] : 0;
+            const int base = g * 256 + nbase_off;
+
+            #pragma unroll
+            for (int s2 = 0; s2 < OQCF_TILE; s2++) {
+                const float* xp = xb[s2];
+                if (xp == nullptr) continue;
+                float sd = (float)OQCF_LO(wv, 0) * xp[base + 0]
+                         + (float)OQCF_HI(wv, 0) * xp[base + 1]
+                         + (float)OQCF_LO(wv, 1) * xp[base + 2]
+                         + (float)OQCF_HI(wv, 1) * xp[base + 3]
+                         + (float)OQCF_LO(wv, 2) * xp[base + 4]
+                         + (float)OQCF_HI(wv, 2) * xp[base + 5]
+                         + (float)OQCF_LO(wv, 3) * xp[base + 6]
+                         + (float)OQCF_HI(wv, 3) * xp[base + 7];
+                sd += (float)v0 * xp[g * 256 + i0];
+                for (int e = nlane + 32; e < n_ov; e += 32) {
+                    const int idx = (int)table[2 * e];
+                    const int val = (int)(int8_t)table[2 * e + 1];
+                    sd += (float)val * xp[g * 256 + idx];
+                }
+                facc[s2][0] += sd * sw;
+            }
+        }
+        #pragma unroll
+        for (int s2 = 0; s2 < OQCF_TILE; s2++) {
+            float v = facc[s2][0];
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+            const int slot = slot_start + s2;
+            if (lane == 0 && slot < m_total && xb[s2] != nullptr) {
+                Y_grouped[(long long)slot * M + row] = v;
+            }
+        }
+        return;
     }
 
     for (int r = 0; r < ng; r += 4) {
