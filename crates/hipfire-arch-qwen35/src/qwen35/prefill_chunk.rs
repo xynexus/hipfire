@@ -835,12 +835,34 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
         )
     });
-    let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
-        dtypes.expert_gate_up,
-        &gpu.arch,
-        (use_path2 || dtypes.routed_profile.is_mixed())
-            && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
-    );
+    // BATCH THRESHOLD. Grouped MoE amortizes an expert's weight read across the
+    // tokens routed to it, but for Opus dtypes it first has to expand
+    // activations into [N x K_TOP x dim] so each slot gets its OWN expert's AWQ
+    // scale (see the OqCompact arm below and b86eb4397). That expansion is
+    // O(N x K_TOP), so it only pays once N is large enough for the weight reuse
+    // to outrun it. Measured end-to-end on Qwen3.5-35B-A3B--oq4.25++, prefill
+    // tok/s, indexed vs grouped:
+    //
+    //     N=31    193.29 -> 179.89   -7%   grouped LOSES
+    //     N=115   249.71 -> 288.93  +16%
+    //     N=459   250.75 -> 327.92  +31%
+    //     N=1720  248.20 -> 325.47  +31%
+    //     N=3445  238.78 -> 309.48  +30%
+    //
+    // Crossover is between 31 and 115. 64 sits above it with margin and well
+    // clear of DFlash verify, which runs B <= 16 -- and verify must stay on the
+    // indexed path anyway: at B=8 the grouped path measured 56.20 -> 45.95
+    // tok/s. Both paths are bit-exact to each other (MoE path-2 gate reads
+    // 0.000e0 on every layer), so this threshold is purely a speed choice and
+    // cannot change output.
+    const MOE_GROUPED_MIN_BATCH: usize = 64;
+    let path2_eligible = n >= MOE_GROUPED_MIN_BATCH
+        && moe_grouped_gemm_path2_eligible_for_dtype(
+            dtypes.expert_gate_up,
+            &gpu.arch,
+            (use_path2 || dtypes.routed_profile.is_mixed())
+                && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
+        );
     // Report the DECISION, not one of its inputs. An earlier version of this
     // line keyed on `routed_expert_buckets` and kept printing "not reachable
     // here" after the hoist had made it reachable -- the exact failure the rule
