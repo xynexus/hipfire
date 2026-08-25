@@ -1312,3 +1312,56 @@ cost lives. Attention is inherently O(N) here, so that is the first suspect.
 Context for the ceiling: prefill peaks at 306 tok/s = 14.9 TOPS effective over
 24.35 B matmul params, which is 26.6% of the 56 TOPS int8 peak (3.8x headroom)
 or 13.4% of the 110.9 TOPS iu4 ceiling.
+
+## The drafter's width ladder stopped at 8 — 57.8 -> 63.9 tok/s
+
+rocprofv3 on the demo (B=8 vs B=24, per cycle, kernel time in ms) finally named
+where the marginal cost of raising B goes. **Attention is not it** — 1.14 ->
+1.77 ms/cycle, ~1% of the cycle, essentially flat. My "attention is the first
+suspect" guess was wrong.
+
+| phase | B=8 | B=24 | delta |
+|---|---|---|---|
+| multicol GEMV (verify weights) | 81.96 | 149.67 | +67.7 |
+| **draft GEMM** | **5.44** | **73.04** | **+67.6** |
+| DeltaNet/GDN | 7.99 | 50.43 | +42.4 |
+| other GEMM | 1.24 | 41.19 | +40.0 |
+| attention | 1.14 | 1.77 | +0.6 |
+| TOTAL GPU | 113.07 | 341.42 | +228.4 |
+
+`gemm_dflash_oq4_plain_dp4a_staged_8w` went from 2 calls / 0.6 ms to **41 calls
+/ 72.8 ms** — the call count, not just the work, so the draft path changed
+SHAPE. Root cause in `dflash_plain_multicol_kernel`:
+
+    if !(2..=8).contains(&batch) { return None; }   // 9+ -> per-column fallback
+
+The drafter's multi-column ladder stopped at 8 while the TARGET's
+`gemv_oq_compact_multicol` goes to w32. So every B>8 fell back to the
+per-column kernel and paid one weight sweep per drafted position. Same defect
+shape as the four dtype ladders in Phase 1 — a ladder that stops short while
+the artifact silently takes a slow branch — except the axis is WIDTH.
+
+The macro body is fully parametric in NB (`acc[NB]` in registers, no LDS), so
+extending it is additive. Added sets 9..16 plus the dispatch arms.
+
+Warm results, tau IDENTICAL at every B (behaviour unchanged, just faster):
+
+| B | tau | before | after |
+|---|---|---|---|
+| 8 | 5.733 | 57.8 | 57.4 |
+| 9 | 6.000 | — | 58.2 |
+| **10** | **6.917** | — | **63.9** |
+| 11 | 7.500 | — | 63.0 |
+| 12 | 7.818 | 50.1 | 62.1 |
+| 13 | 8.273 | — | 55.8 |
+| 16 | 8.500 | 40.2 | 49.4 |
+
+**New optimum B=10 at 63.9 tok/s, up from 57.8 at B=8 (+10.6%).** B=12 gains
++24% against its own baseline. Past ~12 the verify GEMV occupancy cliff
+reasserts itself and throughput falls again, so this does not remove that
+ceiling — it removes a second, independent one that was hiding underneath it.
+
+⚠️ **Cold-cache trap, third instance this session.** Adding 24 kernel
+instantiations makes the first run of each width pay JIT inside the measured
+window: B=8 first read 8.33 tok/s and B=10 read 28.50, against warm 57.4 and
+63.9. Always warm every width before believing a sweep.

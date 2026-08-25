@@ -2648,7 +2648,7 @@ fn dflash_plain_kernel(dtype: DType, aligned: bool) -> (&'static str, Option<usi
 /// NB is compile-time in the kernel so the accumulators stay in registers, so
 /// only exact matches route here; everything else keeps the per-column kernel.
 fn dflash_plain_multicol_kernel(dtype: DType, batch: usize) -> Option<&'static str> {
-    if !(2..=8).contains(&batch) {
+    if !(2..=16).contains(&batch) {
         return None;
     }
     if std::env::var("HIPFIRE_DFLASH_MULTICOL").as_deref() == Ok("0") {
@@ -2676,6 +2676,30 @@ fn dflash_plain_multicol_kernel(dtype: DType, batch: usize) -> Option<&'static s
         (DType::DflashOq4MixedPlain, 6) => "gemm_dflash_oq4_mixed_plain_multicol_w6",
         (DType::DflashOq4MixedPlain, 7) => "gemm_dflash_oq4_mixed_plain_multicol_w7",
         (DType::DflashOq4MixedPlain, 8) => "gemm_dflash_oq4_mixed_plain_multicol_w8",
+        (DType::DflashOq8Plain, 9) => "gemm_dflash_oq8_plain_multicol_w9",
+        (DType::DflashOq8Plain, 10) => "gemm_dflash_oq8_plain_multicol_w10",
+        (DType::DflashOq8Plain, 11) => "gemm_dflash_oq8_plain_multicol_w11",
+        (DType::DflashOq8Plain, 12) => "gemm_dflash_oq8_plain_multicol_w12",
+        (DType::DflashOq8Plain, 13) => "gemm_dflash_oq8_plain_multicol_w13",
+        (DType::DflashOq8Plain, 14) => "gemm_dflash_oq8_plain_multicol_w14",
+        (DType::DflashOq8Plain, 15) => "gemm_dflash_oq8_plain_multicol_w15",
+        (DType::DflashOq8Plain, 16) => "gemm_dflash_oq8_plain_multicol_w16",
+        (DType::DflashOq4Plain, 9) => "gemm_dflash_oq4_plain_multicol_w9",
+        (DType::DflashOq4Plain, 10) => "gemm_dflash_oq4_plain_multicol_w10",
+        (DType::DflashOq4Plain, 11) => "gemm_dflash_oq4_plain_multicol_w11",
+        (DType::DflashOq4Plain, 12) => "gemm_dflash_oq4_plain_multicol_w12",
+        (DType::DflashOq4Plain, 13) => "gemm_dflash_oq4_plain_multicol_w13",
+        (DType::DflashOq4Plain, 14) => "gemm_dflash_oq4_plain_multicol_w14",
+        (DType::DflashOq4Plain, 15) => "gemm_dflash_oq4_plain_multicol_w15",
+        (DType::DflashOq4Plain, 16) => "gemm_dflash_oq4_plain_multicol_w16",
+        (DType::DflashOq4MixedPlain, 9) => "gemm_dflash_oq4_mixed_plain_multicol_w9",
+        (DType::DflashOq4MixedPlain, 10) => "gemm_dflash_oq4_mixed_plain_multicol_w10",
+        (DType::DflashOq4MixedPlain, 11) => "gemm_dflash_oq4_mixed_plain_multicol_w11",
+        (DType::DflashOq4MixedPlain, 12) => "gemm_dflash_oq4_mixed_plain_multicol_w12",
+        (DType::DflashOq4MixedPlain, 13) => "gemm_dflash_oq4_mixed_plain_multicol_w13",
+        (DType::DflashOq4MixedPlain, 14) => "gemm_dflash_oq4_mixed_plain_multicol_w14",
+        (DType::DflashOq4MixedPlain, 15) => "gemm_dflash_oq4_mixed_plain_multicol_w15",
+        (DType::DflashOq4MixedPlain, 16) => "gemm_dflash_oq4_mixed_plain_multicol_w16",
         _ => return None,
     })
 }

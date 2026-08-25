@@ -440,3 +440,17 @@ DFLASH_OQ_MULTICOL_SET(5)
 DFLASH_OQ_MULTICOL_SET(6)
 DFLASH_OQ_MULTICOL_SET(7)
 DFLASH_OQ_MULTICOL_SET(8)
+DFLASH_OQ_MULTICOL_SET(9)
+DFLASH_OQ_MULTICOL_SET(10)
+DFLASH_OQ_MULTICOL_SET(11)
+DFLASH_OQ_MULTICOL_SET(12)
+DFLASH_OQ_MULTICOL_SET(13)
+DFLASH_OQ_MULTICOL_SET(14)
+DFLASH_OQ_MULTICOL_SET(15)
+DFLASH_OQ_MULTICOL_SET(16)
+// 9..16: the drafter's ladder used to stop at 8 while the TARGET's
+// gemv_oq_compact_multicol goes to w32. Any spec-decode B>8 therefore fell back
+// to the per-column kernel and paid one weight sweep per position: measured 41
+// calls / 72.8 ms per cycle at B=24 against 2 calls / 0.6 ms at B=8, which was
+// 32% of the whole marginal cost of raising B. The macro body is fully
+// parametric in NB (acc[NB] in registers, no LDS), so this is additive.
