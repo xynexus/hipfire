@@ -630,10 +630,17 @@ fn main() {
     // tok/s goes 48.82 -> 55.36). Another reminder that tau is the wrong
     // objective; the controller optimises ms/committed-token for this reason.
     //
-    // ⚠️ Do NOT compare these against the older table above: absolute tok/s on
-    // this box is not stable across sessions (same commit measured 65.06 and
-    // 35.90 on dflash_resident_smoke hours apart). Only compare arms measured
-    // back-to-back in one run.
+    // ⚠️ Do NOT compare these against the older table above -- those numbers do
+    // not reproduce, and the cause is NOT machine drift. Six hypotheses were
+    // tested and refuted: (1) machine state -- AR on the same prompt is 64.17
+    // today vs 64.27 there, and AR is deterministic; (2) the lm_head commit --
+    // parent == HEAD; (3) controller nondeterminism -- 3 repeats land within
+    // 0.03 with identical tau; (4) changed inputs -- prompt files untouched
+    // since 2026-05-25, model/drafter mtimes unchanged; (5) resident vs cold
+    // harness -- `--prompts-file` reproduces the cold numbers to ~1% with
+    // identical tau; (6) the rollback default flip in 4b3cdcffd -- the older
+    // table POSTDATES it. Most likely those figures were carried forward rather
+    // than re-measured. Trust only arms measured back-to-back in one run.
     let mut adaptive_b_min: usize = 2;
     let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
