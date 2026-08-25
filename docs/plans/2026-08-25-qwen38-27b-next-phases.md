@@ -811,3 +811,53 @@ published until the rotation is in.
 `dump_logits_qwen35` could not measure this at all before — it handled only
 q8/asym{4,3,2} and panicked otherwise, so neither the shipping tier (kvarn) nor
 the only fixed point to compare against (fp32) were reachable. Both added here.
+
+
+## STOP: do not port the Hadamard rotation on current evidence
+
+Measured properly, the rotation makes single-shot reconstruction WORSE, and the
+earlier "1.17-1.41x gain" numbers were noise I should not have reported.
+
+200 random [128 x 32] tiles with ~1/8 outlier channels, gain = plain/rotated:
+
+```
+ bits      mean       std       min       max     n>1
+    2    0.7721    0.0126    0.7385    0.8084    0/200
+    4    0.7755    0.0122    0.7486    0.8186    0/200
+    8    0.7776    0.0130    0.7482    0.8236    0/200
+```
+
+Rotated error is ~1.3x plain, 0 wins out of 200 at every width, tight variance.
+
+The mechanism is clear once stated: **hipfire's Sinkhorn already normalises
+per-row = per-channel.** The Hadamard rotation deliberately DESTROYS per-channel
+structure — that is its purpose, spreading outlier energy across all channels —
+which is exactly the structure the per-row scales exploit. Applied together they
+are antagonistic on this data.
+
+### Why this does NOT refute the paper
+
+The paper's claim is about ERROR ACCUMULATION over autoregressive decoding
+("error accumulation" appears 21 times), and it says explicitly that prior work
+is "evaluated under prefill-like settings and errors behave differently under
+autoregressive decoding". A single-shot tile reconstruction is a prefill-like
+measurement — the exact regime it says the benefit does not appear in. My test
+cannot see the claimed advantage by construction, while it can and does see a
+cost.
+
+### What that means for us
+
+The earlier framing in this document — "the Hadamard rotation is missing, that is
+the fidelity gap, port it" — was too confident. It is a fidelity DIFFERENCE whose
+value cannot be judged by anything measured here. Porting it into the default KV
+path on the strength of "the paper says so", against local evidence that it costs
+~1.3x reconstruction error, would be unjustified.
+
+To decide it properly one needs the paper's own instrument: a decode-accumulation
+proxy (it calls this "pseudo-decode"), measuring drift over many autoregressive
+steps rather than one tile. That is the prerequisite for any port, and it does not
+exist here.
+
+Kept: `hadamard_channels` / `hadamard_rows` / `quantize_tile_rotated` in the
+oracle, with tests. They are correct, they cost nothing when unused, and they are
+what a decode-accumulation study would need. Nothing is wired into serving.
