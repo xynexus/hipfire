@@ -1069,7 +1069,12 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     // for routed MoE. block_stride comes from the expert's own blocks;
                     // the kernel derives side_stride and n_ov from it and applies the
                     // overlay inline, so no expert-indexed correction pass is needed.
-                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
+                    // f32-activation grouped GEMM, NOT the WMMA sibling: this one
+                    // is bit-exact against the decode GEMV, which is what lets
+                    // DFlash verify keep committing what AR decode would. The
+                    // WMMA one rounds activations to f16 (~3e-4) and is slower
+                    // here besides. See gemm_oq_compact_moe_grouped_f32.hip.
+                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_f32(
                         &ffn.expert_gate_up_ptrs,
                         tile_ids,
                         sorted,
@@ -1079,7 +1084,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         gate_up_k,
                         path2_shape.gate_up_x_row_div,
                         m_total,
-                        path2_shape.gate_up_source_rows,
                         super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
@@ -1620,7 +1624,10 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         0,
                     )?,
                     // Compact routed down. See the gate_up arm.
-                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
+                    // See the gate_up arm. down_k = 512 -> ng = 2, so this takes
+                    // the kernel's NARROW lane arm, mirroring the narrow GEMV the
+                    // reference uses at that shape.
+                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_f32(
                         &ffn.expert_down_ptrs,
                         tile_ids,
                         sorted,
@@ -1630,7 +1637,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         down_k,
                         path2_shape.down_x_row_div,
                         m_total,
-                        path2_shape.down_source_rows,
                         super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].down)?,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(

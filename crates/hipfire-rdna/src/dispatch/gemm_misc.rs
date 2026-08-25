@@ -561,8 +561,9 @@ impl Gpu {
     /// f32-activation twin of `gemm_oq_compact_moe_grouped_wmma`.
     ///
     /// Same arguments minus `x_src_rows` (no f16 staging buffer is needed), and
-    /// `x_src` is consumed as f32 directly. Requires `(k / 256) % 4 == 0`, the
-    /// wide GEMV path's constraint; callers keep the indexed GEMV otherwise.
+    /// `x_src` is consumed as f32 directly. Handles both reference lane shapes:
+    /// the wide dwordx4 path when `(k / 256) % 4 == 0` (routed gate_up, K=2048)
+    /// and the narrow 32-lane path otherwise (routed down_proj, K=512).
     ///
     /// Bit-exact against `gemv_oq_compact_moe_*` by construction — see the
     /// kernel's preamble — so `parity_gemm_oq_compact_moe_grouped` checks it as
@@ -583,8 +584,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            (k / 256) % 4 == 0,
-            "gemm_oq_compact_moe_grouped_f32: needs ng % 4 == 0 (K % 1024 == 0), got K={k}"
+            k % 256 == 0,
+            "gemm_oq_compact_moe_grouped_f32: needs K % 256 == 0, got K={k}"
         );
         let kernel_name = "gemm_oq_compact_moe_grouped_f32";
         self.ensure_kernel(

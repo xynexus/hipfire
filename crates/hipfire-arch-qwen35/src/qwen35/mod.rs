@@ -2646,6 +2646,35 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // grouped GEMM against gemm_oq8_grouped_wmma on expanded blocks -- the
         // shape `parity_gemm_oq_compact` already uses for the dense twin -- before
         // flipping it on.
+        // ⚠️ STILL OPT-IN, and NOT because of the GEMM. See the note below.
+        //
+        // Path 2 was moved onto
+        // `gemm_oq_compact_moe_grouped_f32`, which is BIT-EXACT against the
+        // decode GEMV -- 0 mismatches of up to 2,097,152 values across every
+        // shape in `parity_gemm_oq_compact_moe_grouped`, both lane arms -- and
+        // 1.4-3.3x faster than the indexed GEMV it replaces.
+        //
+        // The opt-in gate here was for the WMMA sibling, which had never been
+        // checked against a reference. It has been now (0624cbc50): it is
+        // numerically fine but only to the f16-activation floor (~3e-4), and it
+        // is SLOWER in practice. f16 is why it can never back DFlash verify --
+        // verify has to commit what AR decode would, and AR decode runs the
+        // f32 GEMV.
+        //
+        // ⚠️ BUT PATH 2 STILL DIVERGES FROM PATH 1 for this dtype, and the GEMM
+        // is NOT the cause: measured on Qwen3.5-35B-A3B--oq4.25++, AR greedy on
+        // the humaneval_0 prompt splits from path 1 at token 1 with the grouped
+        // path on -- and did so IDENTICALLY when the WMMA GEMM backed it. Two
+        // different GEMMs, one of them bit-exact, same divergence => the defect
+        // is in the grouped PIPELINE (scatter / inverse_perm / the between-proj
+        // silu+rotate, where per-expert AWQ scales are a known trap: routed
+        // experts do not share one), not in either kernel.
+        //
+        // The prize for fixing it is large and measured, with the flag forced on:
+        //     prefill        248.76 -> 342.28 tok/s  (+37.6%)
+        //     DFlash decode   56.16 ->  73.60 tok/s  (+31%), tau 3.47 -> 5.19
+        // which puts spec-decode AHEAD of AR decode (64.15) for the first time.
+        // So this is worth chasing -- but not worth shipping wrong.
         DType::OqCompactG256 => {
             arch.starts_with("gfx11")
                 && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() == Ok("1")
