@@ -62,6 +62,61 @@ pub use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerCo
 /// `llama::ForwardScratch`; the caller owns them. This matches the
 /// existing pre-PR3 daemon signature exactly — we do not redesign the
 /// argument shape.
+/// The value a decode path should start its sampler RNG from.
+///
+/// Reads the `sampler_rng` config option once per process:
+///
+/// * `"fixed"` (default) — the constant `0x13579BDF` every call site used to
+///   hardcode. Reproducible, and what every existing deployment already gets.
+/// * `"random"` — a fresh entropy-derived value per call, so two concurrent
+///   streams at `temperature>0` are independent rather than identical.
+///
+/// **Why this exists.** The constant was inlined at seven-plus sites
+/// (`generate.rs`, `qwen35_prefill.rs`, …), which meant every `temperature>0`
+/// request sampled the same stream of randomness: identical prompts produced
+/// identical tokens by construction, and no request could be made independent of
+/// another because nothing on the wire carries a seed. Routing every site
+/// through one accessor is also what stops the two modes drifting apart, the way
+/// the f16-state dither drifted from its tree kernel.
+///
+/// **Greedy decode never consults the RNG**, so `temperature == 0` output — and
+/// every greedy baseline in the tiny gates — is identical under both modes. That
+/// is the property to check first if this is ever suspected of moving numbers.
+pub fn initial_rng_state() -> u32 {
+    /// The historical constant. Kept as the `"fixed"` value rather than being
+    /// re-derived, so `"fixed"` is bit-identical to the old inlined literal.
+    const FIXED_SEED: u32 = 0x13579BDF;
+
+    static MODE_IS_RANDOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let random = *MODE_IS_RANDOM.get_or_init(|| {
+        hipfire_config::load_config()
+            .sampler_rng
+            .eq_ignore_ascii_case("random")
+    });
+    if !random {
+        return FIXED_SEED;
+    }
+    // Entropy per CALL, not per process: two streams admitted in the same
+    // process must not share a stream of randomness, which is the whole point.
+    // A OnceLock here would reintroduce exactly the sharing this replaces.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(FIXED_SEED);
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Mix the counter in: two calls inside the same nanosecond tick would
+    // otherwise collide, and `subsec_nanos` is coarser than a nanosecond on
+    // plenty of hosts.
+    let mixed = nanos.wrapping_mul(2654435761).rotate_left(13) ^ n.wrapping_mul(2246822519);
+    // 0 is a degenerate state for the xorshift the sampler advances.
+    if mixed == 0 {
+        FIXED_SEED
+    } else {
+        mixed
+    }
+}
+
 pub fn sample(
     gpu: &mut Gpu,
     logits: &GpuTensor,
@@ -995,5 +1050,33 @@ mod tests {
             logits[5].is_finite(),
             "older unclosed opens must not count once they leave the window"
         );
+    }
+}
+
+#[cfg(test)]
+mod initial_rng_state_tests {
+    use super::*;
+
+    /// `"fixed"` must be bit-identical to the constant the call sites used to
+    /// inline. If this moves, every reproducible deployment moved with it.
+    #[test]
+    fn fixed_mode_is_the_historical_constant() {
+        // Default config is "fixed"; no env or file needed.
+        assert_eq!(initial_rng_state(), 0x13579BDF);
+    }
+
+    /// The whole point of `"random"`: two draws differ. Asserted here as a pure
+    /// unit property of the mixing, independent of config loading — the mode
+    /// switch itself is covered by the config schema test.
+    #[test]
+    fn the_mix_separates_successive_draws() {
+        // Same nanos, successive counter values: the counter must be enough on
+        // its own, because `subsec_nanos` is coarser than a nanosecond on many
+        // hosts and two admissions can land in one tick.
+        let mix = |nanos: u32, n: u32| {
+            nanos.wrapping_mul(2654435761).rotate_left(13) ^ n.wrapping_mul(2246822519)
+        };
+        assert_ne!(mix(1234, 0), mix(1234, 1), "same tick collided");
+        assert_ne!(mix(1234, 1), mix(1234, 2), "same tick collided");
     }
 }
