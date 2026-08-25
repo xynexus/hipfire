@@ -24,6 +24,34 @@ on its own terms: M2a0 fixed a gate that lied about coverage, M2a1 fixed a
 production divergence, and M2a3/M2a4a removed ~3,600 lines of inline kernel
 sequencing from `prefill_chunk.rs` with bit-identical output.
 
+## 0.0 Measured 2026-08-25: layer banding does NOT bound drain-to-suspend
+
+Added after exposing `forward_prefill_batch_banded` (§M2a). Recording it here
+because it is easy to read the band work as solving §M6's admission budget, and
+it does not.
+
+Timing every layer band on `qwen3_5_moe_indexed`, kvarn KV, gfx1103 — worst gap
+between suspension points:
+
+| prefill tokens | worst band |
+|---|---|
+| 32 | 31.7 ms |
+| 128 | 63.4 ms |
+| 512 | 160.6 ms |
+
+**It scales with chunk length**, because a layer band still processes every token
+in the chunk. Drain-to-suspend is therefore `one layer x chunk_tokens`, not a
+constant, and at 512 tokens a single band already eats 160 ms of §1.1's 200 ms
+budget on a TWO-layer fixture.
+
+So the two levers compose and neither replaces the other: `HIPFIRE_PREFILL_BAND_TOKENS`
+bounds how much work a band contains, and layer banding decides how finely that
+work can be interrupted. §0.1's conclusion — chunk size is the latency lever —
+survives this, and the band work does not overturn it.
+
+These are tiny-fixture absolute numbers and carry fixed per-dispatch overhead;
+the SCALING is the transferable part, not the milliseconds.
+
 ## 0. Read this before costing anything: the premise is false
 
 The parent plan justifies M2a with "an unlowered prefill is by definition one

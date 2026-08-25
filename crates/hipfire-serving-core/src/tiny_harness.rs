@@ -1421,6 +1421,11 @@ fn qwen35_prefill_then_decode(
             // it counts, so the comparison can assert the drive actually happened
             // per layer rather than falling back to a whole-stack call.
             let mut layers_seen = 0usize;
+            // §M6: the drain-to-suspend bound is the LONGEST gap between
+            // suspension points, not the mean — an executor that must wait for
+            // the worst band is what the admission inequality has to budget for.
+            let mut last = std::time::Instant::now();
+            let mut worst_ms = 0.0f64;
             let r = qwen35::forward_prefill_batch_banded(
                 gpu,
                 weights,
@@ -1431,8 +1436,21 @@ fn qwen35_prefill_then_decode(
                 dn,
                 scratch,
                 true,
-                |_| layers_seen += 1,
+                |_| {
+                    layers_seen += 1;
+                    let ms = last.elapsed().as_secs_f64() * 1000.0;
+                    if ms > worst_ms {
+                        worst_ms = ms;
+                    }
+                    last = std::time::Instant::now();
+                },
             );
+            if std::env::var("HIPFIRE_BAND_TIMING").is_ok() {
+                eprintln!(
+                    "[band-timing] layers={layers_seen} worst_band={worst_ms:.3} ms \
+                     (this is the drain-to-suspend bound §M6's inequality needs)"
+                );
+            }
             if layers_seen != config.layer_types.len() {
                 return Err(format!(
                     "prefill probe: banded drive visited {layers_seen} layers, expected {}",
