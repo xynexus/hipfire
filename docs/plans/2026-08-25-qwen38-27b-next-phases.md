@@ -1013,3 +1013,70 @@ because none of them exercised the quantised path:
 
 All three now warn. The general shape is worth remembering: a KV diagnostic that
 does not cross the quantiser's own block boundary is measuring f32.
+
+
+# Does the KVarN f32 window need to be f32? No — but the win is small
+
+## How much math actually touches the window
+
+All of it, in `attention_flash_kvarn_tile_batched.hip`:
+
+```c
+partial += mq[i] * kt[d0 + i];      // Q.K, one MAC per element
+partial = wave32_sum_dpp(partial);  // wave reduction
+s = partial * scale_attn;           // one scale
+```
+
+That is the entire lifetime of a window value: read once per decode step, dotted
+with Q, done. No in-place transform, no iterative refinement, nothing that
+compounds precision error across steps. The accumulator is f32 regardless of how
+the value is STORED. V is not in the window at all (it is Q8 separately), so this
+is K-only.
+
+The window is also read by the block flush (gather -> quantise), which turns
+these very values into 4-bit KVarN codes.
+
+## So the storage precision only has to beat 4 bits
+
+Measured on K-like vectors with the outlier-channel structure KVarN targets
+(20k vectors, head_dim 128, every 8th channel x9), relative error of Q.K:
+
+```
+    window storage      rel err of Q.K
+    f32 (today)         0
+    f16                 2.07e-4
+    bf16                1.67e-3
+    4-bit (post-flush)  1.88e-1     <- what these same values BECOME
+```
+
+f16 is ~900x more accurate than the quantisation these values receive 128 tokens
+later; bf16 ~113x. Holding a 24-bit mantissa for data whose destiny is 4 bits is
+not buying anything. **f16 over bf16** here: K is bounded and roughly normalised,
+so f16's larger mantissa beats bf16's larger exponent range by ~8x.
+
+## What it would actually save
+
+window = GROUP(128) x kv_dim x 4 B per KV layer. On this model (16 of 64 layers
+carry KV — the rest are LinearAttention with no cache):
+
+```
+    n_kv_heads=8  ->  512 KiB/layer  ->  8.0 MiB f32  ->  4.0 MiB f16
+```
+
+Footprint saving ~4 MiB against a ~20 GB resident model: 0.02%. The window is
+re-read every decode step but only `tile_len` of it (0..128, ~64 average), so
+per-step traffic is ~2-4 MiB — roughly 0.1-0.2% of the 233 GB/s budget at 57
+tok/s. Halving it is not measurable.
+
+## Recommendation: correct, safe, and not worth doing here
+
+f32 is unnecessary and f16 is provably sufficient, but the payoff on THIS model
+is ~4 MiB and ~0.1% bandwidth, against touching three places (allocation, the
+window writer, and the attention kernel's window read) on the default KV path.
+That trade is not worth it on the evidence.
+
+It becomes worth revisiting if the window grows: a FULL-ATTENTION model where all
+64 layers carry KV puts it at 32 MiB f32 and ~0.5-0.9% of per-step bandwidth, and
+a larger GROUP scales it linearly. The measurement above is the justification
+whenever someone wants to make that change — the precision question is settled,
+only the size question is open.
