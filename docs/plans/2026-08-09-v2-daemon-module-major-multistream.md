@@ -1433,6 +1433,22 @@ here — the same stop-line §3.4 of the prefill-lowering plan invoked, and the 
 one that turned out to be misdiagnosed there, so it is worth someone checking on
 gfx1151 before treating it as settled.
 
+**The gfx1151 cross-check was attempted and is blocked on halo's configuration,
+not on hardware.** Two runs, both arms failing identically at LOAD with "DFlash
+draft requested but target lm_head quant_type=36 is not supported" — before
+either MoE path executes, so neither run is a datapoint. Cause: halo's global
+`dflash_mode` is `on`, its per-model `off` overrides name artifacts that are not
+on that box (`Qwen3.6-35B-A3B--mq4`, `--oq4++`), and the only 35B MoE artifacts
+present are `bf16` and `oq4.25++` — whose lm_head quant the paired drafter
+(`Qwen3.5-35B-A3B--dflash.oq4+.hfq`) cannot serve. `HIPFIRE_DFLASH_MODE=off` did
+not override it, so the per-model config layer appears to win over env here.
+
+Finishing it needs one of: a per-model `dflash_mode: off` override added to
+halo's config (a shared box, actively in use — ask first), a 35B MoE artifact
+copied there that has one, or a run on a third machine. Recorded rather than
+retried because two attempts already failed the same way for a reason unrelated
+to the question, and a third would too.
+
 What that leaves for M4, unchanged from the 2026-08-22 scoping: qwen35 joins
 deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
 and `MoeExpert(e)` exists only for arches whose MoE is not fused.
