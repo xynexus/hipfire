@@ -1440,8 +1440,32 @@ either MoE path executes, so neither run is a datapoint. Cause: halo's global
 `dflash_mode` is `on`, its per-model `off` overrides name artifacts that are not
 on that box (`Qwen3.6-35B-A3B--mq4`, `--oq4++`), and the only 35B MoE artifacts
 present are `bf16` and `oq4.25++` — whose lm_head quant the paired drafter
-(`Qwen3.5-35B-A3B--dflash.oq4+.hfq`) cannot serve. `HIPFIRE_DFLASH_MODE=off` did
-not override it, so the per-model config layer appears to win over env here.
+(`Qwen3.5-35B-A3B--dflash.oq4+.hfq`) cannot serve.
+
+**Correction (2026-08-25).** The sentence that stood here — "`HIPFIRE_DFLASH_MODE=off`
+did not override it, so the per-model config layer appears to win over env here"
+— was wrong, and was a guess published as a finding. There is no config-layer-beats-env
+precedence involved. What the code actually says:
+
+- The env layer is fine. `env_var_name_for_key` maps `dflash_mode` to
+  `HIPFIRE_DFLASH_MODE`, and `off` is a valid `ConfigType::Enum` value, so it
+  parses and lands in `HipfireConfig::dflash_mode`.
+- **The daemon never reads that env var.** `dflash_mode` reaches it only inside the
+  load request params (`hipfire-daemon/src/handlers/lifecycle.rs:225`), and
+  `.unwrap_or("auto")` when the field is absent.
+- Only clients that call `load_params_from_config` forward it — `hipfire-cli`'s
+  chat path and `hipfire-server` (which correctly omits `auto` and sends `off`).
+  **`hipfire-eval` does not**: it builds params from its own `DflashMode`
+  (`--dflash`, default `Off`, `hipfire-eval/src/config.rs:43`), which never
+  consults `HipfireConfig` and so cannot see the env var at all.
+- Anything other than `off` then lets `load.rs:857` auto-pair a sibling drafter by
+  filename — which is how the drafter got requested without anyone naming it.
+
+So the env var did not lose a precedence fight; depending on which client drove
+that load it either never reached the request or was never consulted. Which of the
+two it was on halo is still unverified — settling it means capturing the actual
+load request, not re-reasoning about layering. The blocked-on-halo conclusion below
+is unaffected: it rests on the artifacts present on that box, not on this mechanism.
 
 Finishing it needs one of: a per-model `dflash_mode: off` override added to
 halo's config (a shared box, actively in use — ask first), a 35B MoE artifact
