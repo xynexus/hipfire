@@ -37,6 +37,20 @@
 // Semantics are otherwise identical to the f32 tree kernel: DFS order, read the
 // parent's slot (or `s_init` at a root), persist-write the post-update tile so
 // children see the parent rather than the previous sibling.
+// Deterministic dithered narrowing — the SAME function, and below the same
+// index derivation, as `gated_delta_net_f16.hip`. That identity is the point:
+// tree replay must reproduce, bit for bit, the state sequential decode would
+// have produced, or accepting a drafted token commits a state the non-spec path
+// would never have reached and spec-decode stops being lossless. A different
+// seed here would be worse than no dither at all.
+__device__ __forceinline__ _Float16 f32_to_f16_dither(float x, unsigned int idx) {
+    unsigned int u = __float_as_uint(x);
+    unsigned int r = u ^ (idx * 2654435761u);
+    r ^= r >> 15; r *= 2246822519u; r ^= r >> 13; r *= 3266489917u; r ^= r >> 16;
+    unsigned int dithered = (u + (r & 0x1FFFu)) & 0xFFFFE000u;
+    return (_Float16)__uint_as_float(dithered);
+}
+
 extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_f16_tree(
     const float* __restrict__ q,
@@ -50,7 +64,8 @@ __global__ void gated_delta_net_f16_tree(
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
-    int head_dim
+    int head_dim,
+    int stochastic_round
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -109,9 +124,15 @@ __global__ void gated_delta_net_f16_tree(
                 output[t * stride + h * HD + row] = out_v;
         }
 
-        // Persist-write, narrowing to f16 exactly once per token.
+        // Persist-write, narrowing to f16 exactly once per token. The dither
+        // index is `(row_start * HD + i) ^ (h << 19)` — byte-for-byte the live
+        // kernel's derivation, and deliberately independent of `t`, so the tape
+        // slot for a token holds exactly what the live path would have stored.
         _Float16* dst = s_tape + (size_t)t * token_stride + head_tile_offset;
         for (int i = tid; i < TILE_ROWS * HD; i += 32)
-            dst[i] = (_Float16)S_tile[i];
+            dst[i] = stochastic_round
+                ? f32_to_f16_dither(S_tile[i],
+                                    (unsigned int)(row_start * HD + i) ^ ((unsigned int)h << 19))
+                : (_Float16)S_tile[i];
     }
 }
