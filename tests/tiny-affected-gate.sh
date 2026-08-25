@@ -130,6 +130,10 @@ select_all_tiny() {
     select_state
 }
 
+select_deltanet() {
+    RUN_DELTANET=1
+}
+
 select_spec() {
     RUN_SPEC=1
 }
@@ -149,6 +153,7 @@ RUN_QUANT=0
 RUN_STATE=0
 RUN_SPEC=0
 RUN_PREFILL=0
+RUN_DELTANET=0
 PATHS="$(changed_paths)" || exit 2
 
 if [ -z "$PATHS" ]; then
@@ -181,6 +186,19 @@ while IFS= read -r path; do
         crates/hipfire-model/*)
             add_all_supported
             select_all_tiny
+            ;;
+
+        # Gated-DeltaNet kernels and their dispatch. The f32 trio (linear /
+        # tree / routed) must agree BIT-FOR-BIT, and so must the f16 trio;
+        # when they do not, spec-decode replay commits a state sequential
+        # decode never reaches. Nothing gated these until 2026-08-26, which is
+        # how an -ffp-contract=fast difference between two character-identical
+        # kernels reached master.
+        kernels/src/gated_delta_net*.hip|\
+        crates/hipfire-rdna/src/dispatch/gated.rs|\
+        crates/hipfire-rdna/src/gdn_chunk.rs|\
+        crates/hipfire-arch-qwen35/src/qwen35/state.rs)
+            select_deltanet
             ;;
 
         crates/hipfire-runtime/src/ddtree.rs|crates/hipfire-runtime/src/dflash.rs|\
@@ -297,7 +315,7 @@ if [ -z "$FAMILIES" ]; then
 fi
 
 echo "tiny-affected-gate: selected families: $FAMILIES"
-echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC prefill=$RUN_PREFILL"
+echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC prefill=$RUN_PREFILL deltanet=$RUN_DELTANET"
 if [ "$UNCOVERED" -eq 1 ]; then
     echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
     echo "  $UNCOVERED_REASONS"
@@ -351,6 +369,11 @@ fi
 if [ "$RUN_STATE" -eq 1 ]; then
     HIPFIRE_TINYQUANT_FAMILIES="$FAMILIES" ./tests/tiny-state-gate.sh
     classify_gate tiny-state $?
+fi
+
+if [ "$RUN_DELTANET" -eq 1 ]; then
+    ./tests/tiny-deltanet-gate.sh
+    classify_gate tiny-deltanet $?
 fi
 if [ "$RUN_SPEC" -eq 1 ]; then
     ./tests/tiny-spec-gate.sh

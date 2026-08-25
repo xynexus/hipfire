@@ -41,3 +41,7 @@ required-features = ["deltanet"]
 [[example]]
 name = "bench_gated_delta_net"
 required-features = ["deltanet"]
+
+[[example]]
+name = "test_gated_delta_net_routed_f32"
+required-features = ["deltanet"]
