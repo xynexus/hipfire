@@ -163,6 +163,43 @@ fn main() {
         ref_host.len(),
         max_abs
     );
+    if exact != ref_host.len() {
+        // WORK BACKWARDS: localise the mismatch instead of reading the kernels.
+        // Which rows/heads/columns differ says immediately whether it is
+        // accumulation, routing, or (as it was) a per-kernel compile difference.
+        let mut per_row = vec![0usize; ROWS];
+        let mut per_head = vec![0usize; N_HEADS];
+        let mut per_col = vec![0usize; HD];
+        for b in 0..ROWS {
+            for h in 0..N_HEADS {
+                for c in 0..HD {
+                    let i = b * N_HEADS * HD + h * HD + c;
+                    if ref_host[i].to_bits() != routed_host[i].to_bits() {
+                        per_row[b] += 1;
+                        per_head[h] += 1;
+                        per_col[c] += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "mismatches by ROW (session): {:?}",
+            (0..ROWS)
+                .map(|b| (b, row_session[b], per_row[b]))
+                .collect::<Vec<_>>()
+        );
+        eprintln!("mismatches by HEAD: {per_head:?}");
+        let cols: Vec<usize> = (0..HD).filter(|&c| per_col[c] > 0).collect();
+        eprintln!(
+            "mismatching COLS ({} of {HD}): {:?}",
+            cols.len(),
+            &cols[..cols.len().min(40)]
+        );
+        let lanes16: Vec<usize> = (0..8)
+            .filter(|&l| (0..16).any(|j| per_col[l * 16 + j] > 0))
+            .collect();
+        eprintln!("affected 16-col lane groups: {lanes16:?}");
+    }
 
     // A leak between sessions, or flat-order application, shows up here — the
     // two sessions start from deliberately different states, so any crosstalk

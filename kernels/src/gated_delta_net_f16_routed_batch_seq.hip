@@ -4,6 +4,16 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
+// FP CONTRACTION IS PINNED. HIP defaults to -ffp-contract=fast, which lets the
+// compiler fuse `x += y*z` ACROSS statements wherever scheduling suits it. The
+// pairwise reduction below creates many such sites, and the choice came out
+// differently in the routed kernel than in the linear one running
+// character-identical source -- 1713/3072 byte-exact, diverging on the FIRST
+// token, uniformly across every row, head and column. These kernels are
+// required to agree bit-for-bit, so the contraction cannot be left to the
+// scheduler.
+#pragma clang fp contract(on)
+
 #define HD 128
 #define TILE_ROWS 4
 
@@ -71,7 +81,24 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
     if (h >= n_heads || head_dim != HD) return;
 
     const int tid = threadIdx.x;
-    const int col = tid * 4;
+    // 8-LANE ROW GROUPS. The wave is 4 groups of 8 lanes: group `g` owns row
+    // `row_start+g`, lane-in-group `l` owns columns [16l, 16l+16). The previous
+    // layout gave each lane 4 columns of ONE row and walked the 4 rows serially,
+    // so every row paid two 32-lane tree reductions (5 shuffle steps each plus a
+    // broadcast) back to back -- 40+ shuffles per token on the critical path.
+    // Ablating just those reductions cut t=24 by 45%, making them the single
+    // largest per-token term.
+    //
+    // ⚠️ THIS BLOCK IS REPLICATED VERBATIM in gated_delta_net_f16.hip,
+    // gated_delta_net_f16_tree.hip and gated_delta_net_f16_routed_batch_seq.hip.
+    // The three MUST agree bit-for-bit -- tree replay reproduces the linear path,
+    // and a mismatch commits a state sequential decode never reaches, collapsing
+    // spec-decode acceptance. Change all three together and re-run
+    // examples/test_gated_delta_net_tree_f32.
+    const int g = tid >> 3;
+    const int l = tid & 7;
+    const int col = l * 16;
+    const int row_in_tile = g;
     const int stride = n_heads * HD;
     const int row_start = tile * TILE_ROWS;
 
@@ -94,39 +121,52 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         float alpha = expf(gate[b * n_heads + h]);
         float beta_v = beta[b * n_heads + h];
 
-        float k0 = k_t[col], k1 = k_t[col + 1], k2 = k_t[col + 2], k3 = k_t[col + 3];
-        float q0 = q_t[col], q1 = q_t[col + 1], q2 = q_t[col + 2], q3 = q_t[col + 3];
 
-        for (int r = 0; r < TILE_ROWS; r++) {
-            int row = row_start + r;
-            float* sr = S_tile + r * HD + col;
-            float s0 = sr[0], s1 = sr[1], s2 = sr[2], s3 = sr[3];
+        // --- identical f16 GDN step: see the lane-group note above ---
+        float sreg[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) sreg[i] = S_tile[row_in_tile * HD + col + i];
 
-            float kv = s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3;
-            for (int o = 16; o > 0; o >>= 1) {
-                kv += __shfl_down(kv, o);
-            }
-            kv = __shfl(kv, 0);
+        float kk[16], qq[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) { kk[i] = k_t[col + i]; qq[i] = q_t[col + i]; }
 
-            float delta = (v_t[row] - alpha * kv) * beta_v;
+        float part[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) part[i] = sreg[i] * kk[i];
+        #pragma unroll
+        for (int w = 8; w > 0; w >>= 1)
+            #pragma unroll
+            for (int i = 0; i < w; i++) part[i] += part[i + w];
+        float kv = part[0];
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) kv += __shfl_down(kv, o, 8);
+        kv = __shfl(kv, 0, 8);
 
-            s0 = alpha * s0 + k0 * delta;
-            s1 = alpha * s1 + k1 * delta;
-            s2 = alpha * s2 + k2 * delta;
-            s3 = alpha * s3 + k3 * delta;
-            sr[0] = s0;
-            sr[1] = s1;
-            sr[2] = s2;
-            sr[3] = s3;
+        const int row = row_start + row_in_tile;
+        const float delta = (v_t[row] - alpha * kv) * beta_v;
 
-            float out_v = s0 * q0 + s1 * q1 + s2 * q2 + s3 * q3;
-            for (int o = 16; o > 0; o >>= 1) {
-                out_v += __shfl_down(out_v, o);
-            }
-            if (tid == 0) {
-                output[b * stride + h * HD + row] = out_v;
-            }
-        }
+        #pragma unroll
+        for (int i = 0; i < 16; i++) sreg[i] = alpha * sreg[i] + kk[i] * delta;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) part[i] = sreg[i] * qq[i];
+        #pragma unroll
+        for (int w = 8; w > 0; w >>= 1)
+            #pragma unroll
+            for (int i = 0; i < w; i++) part[i] += part[i + w];
+        float out_v = part[0];
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) out_v += __shfl_down(out_v, o, 8);
+
+        #pragma unroll
+        for (int i = 0; i < 16; i++) S_tile[row_in_tile * HD + col + i] = sreg[i];
+
+        // One lane per group stores its own row; the 4 rows are contiguous, so
+        // this is a single coalesced segment instead of four single-lane
+        // 4-byte scattered writes.
+        if (l == 0)
+            output[b * stride + h * HD + row] = out_v;
+        // --- end identical step ---
     }
 
     for (int i = tid; i < TILE_ROWS * HD; i += 32) {

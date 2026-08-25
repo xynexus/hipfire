@@ -5,6 +5,16 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
+// FP CONTRACTION IS PINNED. HIP defaults to -ffp-contract=fast, which lets the
+// compiler fuse `x += y*z` ACROSS statements wherever scheduling suits it. The
+// pairwise reduction below creates many such sites, and the choice came out
+// differently in the routed kernel than in the linear one running
+// character-identical source -- 1713/3072 byte-exact on the f16 trio, diverging
+// on the FIRST token, uniformly across every row, head and column. These
+// kernels are required to agree bit-for-bit, so the contraction cannot be left
+// to the scheduler.
+#pragma clang fp contract(on)
+
 #define HD 128
 #define TILE_ROWS 4
 

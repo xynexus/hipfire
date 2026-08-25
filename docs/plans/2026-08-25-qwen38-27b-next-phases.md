@@ -1630,3 +1630,56 @@ that DID land is verified only indirectly (its tree sibling, and the
 tolerance-based f64 oracle). If the routed transform has a defect, the f32 one
 has it too and nothing currently catches it. Writing that test is the next step
 and is worth more than the remaining 1-2%.
+
+## f16 family LANDED — and the routed failure was FP CONTRACTION
+
+The previous section said the f16 routed byte-exactness failure was
+unidentified. It is identified, and the method that found it is the point:
+**stop reading the kernels and localise the failure.**
+
+Instrumenting the test to report WHICH elements differ took one run:
+
+    mismatches by ROW: [(0,s0,216),(1,s1,189),(2,s0,261),(3,s1,208),(4,s0,253),(5,s1,232)]
+    mismatches by HEAD: [330, 355, 339, 335]
+    mismatching COLS: 128 of 128 — all 8 lane groups
+
+Uniform across every row, head and column, and **row 0 already differs**, so it
+is not accumulation, not routing, not the lane mapping. Identical inputs +
+character-identical source + different results = the two kernels are COMPILED
+differently.
+
+Cause: HIP defaults to `-ffp-contract=fast`, which fuses `x += y*z` ACROSS
+statements wherever scheduling suits. The pairwise reduction creates many such
+sites and the compiler resolved them differently in the routed kernel than in
+the linear one. `#pragma clang fp contract(on)` — contraction confined to a
+single expression, so identical source gives identical code — fixes it:
+
+    routed f16 vs per-session f16 linear: 3072/3072 byte-exact
+
+Pinned in ALL SIX kernels, f32 included. The f32 trio landed WITHOUT it and was
+carrying the same latent nondeterminism, invisible only because no routed-f32
+test exists. Contraction pinning costs nothing measurable (t=10 0.0367 ->
+0.0370, t=24 0.0563 -> 0.0560).
+
+⚠️ **Byte-exactness between kernels is not a property of the source alone.**
+Two kernels with character-identical bodies can disagree because the compiler
+contracts differently under scheduling pressure. Any kernel family required to
+agree bit-for-bit must pin contraction explicitly.
+
+### fp16 end-to-end, 6 prompts x 256 tokens, B=10
+
+| p | OLD tau / tok/s | NEW tau / tok/s | |
+|---|---|---|---|
+| 0 | 6.667 / 65.92 | 7.118 / 69.95 | +6.1% |
+| 1 | 7.323 / 69.07 | 7.323 / 69.01 | −0.1% |
+| 2 | 2.228 / 27.24 | 2.355 / 28.24 | +3.7% |
+| 3 | 3.962 / 39.45 | 3.796 / 39.81 | +0.9% |
+| 4 | 1.723 / 23.44 | 1.763 / 23.78 | +1.5% |
+| 5 | 2.507 / 28.52 | 2.012 / 25.51 | −10.6% |
+
+mix mean **42.27 -> 42.72 (+1.0%)**; on the three tau-stable prompts,
+39.92 -> 40.34 (+1.1%). p5's tau swing dominates its row, in the opposite
+direction from p0's — which is the tau-noise point again, now visible in both
+directions.
+
+Best single config measured: **fp16 state, B=10, 69.95 tok/s.**
