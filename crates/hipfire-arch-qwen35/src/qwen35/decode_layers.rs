@@ -8,6 +8,39 @@
 
 use super::*;
 
+/// The position to dual-run at, from `HIPFIRE_FORWARD_ORACLE`.
+///
+/// `1`/`on`/`true` means position 0; a number means that position. Unset or `0`
+/// disables it.
+///
+/// **SINGLE-SHOT, AND IT PERTURBS THE SESSION.** Running the forward twice writes
+/// the KV row for that position twice, and at least the KVarN recent-window ring
+/// does not treat the second write as idempotent — measured: with the dual-run
+/// firing at every position, greedy output degenerated to "ABrsteqeqeqtual" while
+/// the oracle itself reported `mismatched=0` at every step. An instrument that
+/// corrupts the run it is measuring, and reports agreement while doing it, is
+/// worse than no instrument. So it fires at exactly ONE position and says so.
+///
+/// What that costs: everything generated AFTER the probed position in the same
+/// session is invalid and must not be read as output. What it still buys, which
+/// is what §M2a needs: a real elementwise diff of the two paths on identical
+/// inputs at a position of your choosing.
+///
+/// Restoring KV as well would lift the restriction. `KvCacheRowsSnapshot` exists
+/// (private, in `speculative.rs`) but covers K/V rows and scales — not KVarN's
+/// window ring — so a rewind built on it alone would be silently partial, which
+/// is the same failure in a new place.
+fn forward_oracle_position() -> Option<usize> {
+    static POS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *POS.get_or_init(
+        || match std::env::var("HIPFIRE_FORWARD_ORACLE").ok().as_deref() {
+            None | Some("0") | Some("off") | Some("false") => None,
+            Some("1") | Some("on") | Some("true") | Some("yes") => Some(0),
+            Some(v) => v.parse::<usize>().ok(),
+        },
+    )
+}
+
 pub(crate) fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -91,7 +124,49 @@ pub(crate) fn forward_scratch_layers(
             }
         );
     }
-    if take_lowered {
+    // §M2's exit instrument. `HIPFIRE_FORWARD_ORACLE=1` runs BOTH paths on the
+    // same inputs and reports how far they diverge, instead of trusting that they
+    // agree. It was advertised in `superop.rs` and in this crate's own docs for
+    // months and implemented nowhere, so §M2a's exit — "dual-run reports 0
+    // mismatched values" — could not be evaluated at all, on the bug class the
+    // plan calls accept-and-miscompute and says the oracle is the only thing that
+    // catches.
+    //
+    // LOWERED runs first into a host copy, the recurrent state is rewound, and
+    // then this function FALLS THROUGH to the hand arms below, which run for real.
+    // So the hand path stays the authority in oracle mode and the oracle cannot
+    // change the answer — it only reports what lowered would have produced.
+    // Falling through also means the hand path needs no extraction: it is the
+    // rest of this function.
+    //
+    // Only the recurrent DeltaNet state is rewound. A decode step writes KV at
+    // `pos`, so the second run overwrites the same row from the same inputs; it is
+    // the accumulating S matrices that would otherwise advance twice.
+    let oracle_lowered_logits: Option<Vec<f32>> =
+        if take_lowered && forward_oracle_position() == Some(pos) {
+            let mut snap = crate::speculative::DeltaNetSnapshot::new_for(gpu, dn_state)?;
+            snap.save_from(dn_state, gpu)?;
+            let ran = forward_scratch_layers_lowered(
+                gpu,
+                weights,
+                config,
+                pos,
+                kv_cache,
+                dn_state,
+                s,
+                hidden_rb.as_deref(),
+                needs_last_token_logits,
+            );
+            let captured = ran.and_then(|()| gpu.download_f32(&s.logits));
+            let rewound = snap.restore_to(dn_state, gpu);
+            snap.free_gpu(gpu);
+            rewound?;
+            Some(captured?)
+        } else {
+            None
+        };
+
+    if take_lowered && oracle_lowered_logits.is_none() {
         return forward_scratch_layers_lowered(
             gpu,
             weights,
@@ -2861,6 +2936,49 @@ pub(crate) fn forward_scratch_layers(
             execute_steps(gpu, &ctx, &[step])
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         }
+    }
+
+    if let Some(lowered) = oracle_lowered_logits {
+        let hand = gpu.download_f32(&s.logits)?;
+        // Default tolerance 0.0 — BIT-exact. §M2a's exit is "0 mismatched
+        // values", and a tolerance that quietly absorbs a real mismatch is the
+        // failure this instrument exists to prevent. Raise it only with a
+        // measurement.
+        let tol: f32 = std::env::var("HIPFIRE_FORWARD_ORACLE_TOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        // A length mismatch is itself a failure; zipping past it would report
+        // "0 mismatched" for two paths that do not agree on shape.
+        if lowered.len() != hand.len() {
+            eprintln!(
+                "[forward-oracle] pos={pos} SHAPE MISMATCH lowered={} hand={}",
+                lowered.len(),
+                hand.len()
+            );
+        }
+        let mut mismatched = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut worst_at = 0usize;
+        for (i, (a, b)) in lowered.iter().zip(hand.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > tol {
+                mismatched += 1;
+            }
+            if d > max_abs {
+                max_abs = d;
+                worst_at = i;
+            }
+        }
+        eprintln!(
+            "[forward-oracle] pos={pos} mismatched={mismatched}/{} max_abs={max_abs:.9e} at={worst_at} tol={tol:.9e}",
+            hand.len()
+        );
+        eprintln!(
+            "[forward-oracle] this session's state is now PERTURBED — anything \
+             generated after pos={pos} is not valid output. See \
+             `forward_oracle_position`."
+        );
     }
 
     Ok(())
