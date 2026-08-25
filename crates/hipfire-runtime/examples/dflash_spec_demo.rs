@@ -576,18 +576,32 @@ fn main() {
     // Floor 3, not 8. The cap at 16 is real -- the draft is trained at
     // block_size=16 and larger B is out-of-distribution for its positional
     // encoding -- but nothing makes SMALLER B out-of-distribution, and the
-    // throughput optimum on Qwen3.5-35B-A3B--oq4.25++ is B=3, which a floor of 8
-    // made unreachable. Measured (3 runs each, +/-0.15 spread, so the shape is
-    // real and not noise):
+    // throughput optimum on Qwen3.5-35B-A3B--oq4.25++ is PROMPT-DEPENDENT, and
+    // ADAPTIVE_B_STEP=2 means this floor picks which residue class is ever
+    // sampled: 3 generates 3/5/7, 4 generates 4/6/8.
     //
-    //     B=3  69.32    B=4  65.52    B=5  68.50    B=6  68.32
+    // Chosen on SIX prompts, not one. decode tok/s, adaptive, kvarn:
     //
-    // ⚠️ NOT UNIMODAL -- B=4 is a genuine local dip between two better
-    // neighbours. With ADAPTIVE_B_STEP=2 the candidate set from this floor is
-    // 3/5/7, which steps over the dip entirely and lets the ascending
-    // early-stop settle on 3 after two probes. A floor of 4 would generate
-    // 4/6/8 and land on 6, giving up ~1.5%.
-    let mut adaptive_b_min: usize = 3;
+    //     prompt                    AR     floor 3   floor 4
+    //     dflash_resident_smoke   64.27     68.63     65.06
+    //     humaneval_0             63.64     99.90    112.23
+    //     humaneval_2_truncate    71.20     64.62     82.47
+    //     coherence_sheep_reason  64.05     78.22     74.32
+    //     lru_cache_pep8_strict   63.49    105.25    104.34
+    //     coherence_lloyd_long    63.51     40.10     38.30
+    //     mean                              76.12     79.45
+    //
+    // Floor 4 wins fewer prompts but by far larger margins, and it wins the
+    // predictable ones where spec-decode earns its keep at all. An earlier
+    // revision of this line used 3, tuned solely on dflash_resident_smoke --
+    // which is a LOOP ATTRACTOR for this model and about the least
+    // representative prompt available. That is how a 1.5% "win" on one prompt
+    // cost 12% on another.
+    //
+    // ⚠️ tau, and therefore the optimum, tracks how PREDICTABLE the
+    // continuation is: B=3 is best on the attractor prompt, B=6 on humaneval.
+    // Do not tune this on a single prompt.
+    let mut adaptive_b_min: usize = 4;
     let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
