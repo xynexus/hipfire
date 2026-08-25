@@ -35,7 +35,14 @@ use hipfire_runtime::kv::KvCache;
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model = None;
-    let mut n: usize = 48;
+    // Default must CROSS the prefill chunk boundary (PREFILL_MAX_BATCH = 256).
+    // Below it there is exactly one chunk, attention reads the in-flight f32 K/V
+    // and NEVER reads the quantised cache — so every KV tier returns bit-identical
+    // numbers and the tool silently reports "the KV tier does not matter". It was
+    // 48, and that made every KV comparison ever run with it vacuous: kvarn2,
+    // kvarn8 and q8 all read 2.766e-2 / 1.203e-2. At n=512 they separate properly
+    // (kvarn2 2.842e-1 vs kvarn8 3.443e-2 batched).
+    let mut n: usize = 512;
     let mut kv_mode = "kvarn".to_string();
     let mut i = 1;
     while i < argv.len() {
@@ -56,14 +63,32 @@ fn main() {
         }
     }
     let model = model.expect("--model required");
+    // PREFILL_MAX_BATCH, duplicated rather than imported: this example does not
+    // depend on hipfire-arch-qwen35's internals and the number is stable.
+    const PREFILL_CHUNK: usize = 256;
+    if n <= PREFILL_CHUNK {
+        eprintln!(
+            "WARNING: --n {n} <= the prefill chunk size ({PREFILL_CHUNK}), so prefill \
+             runs as ONE chunk, attention never reads the quantised KV cache, and \
+             every --kv-mode / HIPFIRE_KVARN_BITS will return IDENTICAL numbers. \
+             Use --n > {PREFILL_CHUNK} to compare KV tiers."
+        );
+    }
 
     let mut hfq = HfqFile::open(std::path::Path::new(&model)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
     eprintln!(
-        "arch={} dim={} n_layers={} n={n} kv={kv_mode}",
-        gpu.arch, config.dim, config.n_layers
+        "arch={} dim={} n_layers={} n={n} kv={kv_mode}{}",
+        gpu.arch,
+        config.dim,
+        config.n_layers,
+        if kv_mode == "kvarn" {
+            format!(" bits={}", KvCache::kvarn_bits_from_env())
+        } else {
+            String::new()
+        }
     );
 
     // Arbitrary but fixed token ids — this compares two execution paths on the
@@ -78,13 +103,19 @@ fn main() {
             std::env::set_var("HIPFIRE_PREFILL_BATCHED", "0");
         }
         let mut kv_cache = match kv_mode {
+            // Width from HIPFIRE_KVARN_BITS (2/4/8, default 4) — the SAME source
+            // serving uses via KvMode::Kvarn. This was hardcoded to 8, so the
+            // fidelity tool measured KVarN-8 while the shipping default is 4;
+            // its kvarn and q8 rows then came out byte-identical because both
+            // were 8-bit, which reads as "the KV tier does not matter" when what
+            // it actually meant was "you compared 8-bit against 8-bit".
             "kvarn" => KvCache::new_gpu_kvarn(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
-                8,
+                KvCache::kvarn_bits_from_env(),
             )
             .expect("kv kvarn"),
             "q8" => KvCache::new_gpu_q8(

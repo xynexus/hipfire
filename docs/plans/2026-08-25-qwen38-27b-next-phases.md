@@ -697,3 +697,50 @@ Short-prompt baseline unmoved: 57.49 / 35.04 against 57.53 / 35.32.
 Worth doing next: point `compare_prefill_hidden_paths` at
 `kvarn_bits_from_env()` instead of a hardcoded 8, so the fidelity tool measures
 the tier that actually ships.
+
+
+## compare_prefill_hidden_paths was measuring nothing about KV — fixed
+
+Two defects, and the second invalidated every KV comparison in this document.
+
+1. It hardcoded `new_gpu_kvarn(.., 8)`, so it tested KVarN-**8** while serving
+   defaults to **4**. Now reads `KvCache::kvarn_bits_from_env()` and PRINTS the
+   width (`kv=kvarn bits=4`).
+2. Its default `--n` was **48**, below the prefill chunk size
+   (`PREFILL_MAX_BATCH = 256`). With one chunk, attention reads the in-flight
+   f32 K/V and NEVER reads the quantised cache — so every tier returned
+   bit-identical numbers (2.766e-2 / 1.203e-2 for kvarn2, kvarn8 AND q8 alike).
+   That is what "the KV tier does not matter" earlier in this document actually
+   meant: the tool was not testing the KV tier at all.
+
+Default is now 512, and an `--n <= 256` warns that KV will not be exercised.
+
+### The real numbers (n=512, so later chunks read the quantised cache)
+
+```
+                  worst |rel|   vs fp32-KV: batched   per-token
+kvarn bits=2       9.83e-2         2.842e-1           2.591e-1
+kvarn bits=4       3.93e-2         1.317e-1           9.622e-2   <- SHIPPING DEFAULT
+kvarn bits=8       3.56e-2         3.443e-2           1.203e-2
+q8 (deprecated)    5.09e-2         6.392e-2           1.240e-2
+```
+
+**The default KVarN-4 is ~8x less faithful than KVarN-8, and ~8x worse than the
+deprecated q8 it supersedes.** KVarN-8 and q8 agree closely (1.203e-2 vs
+1.240e-2), which is what two 8-bit schemes should do and is a good check that the
+tool is now measuring the right thing.
+
+This matches the recorded finding in memory `project_light_qat_recovery` —
+"KVarN-4 loss NON-recoverable => deploy KVarN-8 not KV4" — so the shipping
+default contradicts the project's own conclusion.
+
+NOT changed here, because it is a product decision: at the lengths benchmarked
+in this document KVarN-4 buys nothing measurable (decode 35.40 vs 35.40 vs 35.34
+for 4/8/2; VRAM within 10 MB) while costing 8x fidelity. Its case is KV MEMORY at
+long context, which is not what these prompts test. Whoever owns that tradeoff
+should decide whether `HIPFIRE_KVARN_BITS` should default to 8.
+
+Also visible: batched prefill is worse than per-token at EVERY tier (2.842e-1 vs
+2.591e-1, 1.317e-1 vs 9.622e-2, 3.443e-2 vs 1.203e-2), so the batched-vs-per-token
+defect noted earlier is real and independent of the KV tier — but it is far
+smaller than the tier choice itself at 4 bits.
