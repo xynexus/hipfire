@@ -17,7 +17,9 @@ instrumentation).
 M=~/.hipfire/models/Qwen3.8-27B--oq4.25++.hfq
 D=~/.hipfire/drafts/Qwen3.8-27B--dflash2.oq4+.hfq.parked-slower-than-plain-decode
 export HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1 HIPFIRE_LMHEAD_TWOSTAGE=q2 \
-       HIPFIRE_GRAPH=1 HIPFIRE_KV_MODE=asym3
+       HIPFIRE_GRAPH=1
+# NB: do NOT set HIPFIRE_KV_MODE=asym3 here. The numbers below are Q8 KV, which
+# is this harness's default AND the faster tier (see the correction at the end).
 ./target/release/examples/dflash_spec_demo --target $M --draft $D \
    --prompt "Write the numbers 1 through 30 as a comma-separated list." --max 96
 ```
@@ -535,3 +537,81 @@ has the activation tile staged — exactly what the decode multicol kernel does.
 That is a kernel project and is the single largest prefill lever: ~20% of
 prefill, and it would delete the `oq_compact_x8_transpose` pass (1.44%) that
 exists only to feed it.
+
+
+# CORRECTION: every number in this document was Q8 KV, not asym3
+
+`dflash_spec_demo` never read `HIPFIRE_KV_MODE`. It hard-defaulted to
+`kv_mode_str = "q8"` and honoured only `--kv-mode`, so the
+`HIPFIRE_KV_MODE=asym3` in the baseline recipe above was a NO-OP for this
+binary — every run in this document used **Q8** KV and printed `kv_mode: Q8`
+where nobody was looking.
+
+It produced no error because there was nothing to error on: the demo validates
+`--kv-mode` strictly (unknown value exits 1) but had no notion the env var
+existed. Every other qwen35 example honours it — `infer_qwen35`,
+`bench_qwen35_speed`, `probe_argmax_agreement`, `speed_bench`. An env var that
+one binary honours and its sibling silently ignores is worse than one nothing
+reads, because it buys false confidence.
+
+Fixed: precedence is now `--kv-mode` > `HIPFIRE_KV_MODE` > `q8`, and the line
+reads `kv_mode: Q8 (from default)` / `(from HIPFIRE_KV_MODE)` so the source is
+never in doubt.
+
+**The accident was in our favour, and the baseline should stay Q8.** Measured
+now that the flag works:
+
+```
+                        tau     decode tok/s
+numbers   Q8           5.733       57.86
+numbers   Asym3        5.733       56.91     -1.6%
+hard      Q8           3.571       35.21
+hard      Asym3        2.840       29.25     -17%
+```
+
+Asym3 costs 20% of tau on the hard prompt — coarser KV degrades the hidden
+states the drafter reads, so acceptance falls. Committed text is identical
+either way (the target verifies every token); only speed moves.
+
+So the reported 57.9 / 35.2 are not inflated by the mix-up — they are the BETTER
+configuration. But the recipe at the top of this document was wrong, and after
+this fix it would have produced asym3 and an apparent failure to reproduce. It
+has been corrected.
+
+
+## SUPERSEDES the Q8 correction above: KVarN is the default, Q8/asym are DEPRECATED
+
+Q8 and the asym*/fwht* tiers are deprecated; new KV work goes to KVarN, which is
+meant to be the default path. Two things were wrong here, not one:
+
+1. `dflash_spec_demo` ignored `HIPFIRE_KV_MODE` and hard-defaulted to `q8`.
+2. Its `--kv-mode` match did not list `kvarn` AT ALL — only q8/asym4/asym3/asym2/
+   fwht4/fwht3/fwht2 — so the harness could not select the intended default path
+   even deliberately, despite `KvMode::Kvarn` existing and
+   `speculative.rs:881` constructing it via `KvCache::new_gpu_kvarn_filtered`.
+
+So every measurement in this document ran on a DEPRECATED KV tier, chosen by a
+default nobody stated, with no way to opt into the supported one.
+
+Fixed: `kvarn` is accepted and is now the default; precedence is `--kv-mode` >
+`HIPFIRE_KV_MODE` > `kvarn`; the source is printed (`kv_mode: Kvarn (from
+default)`); and selecting any deprecated tier prints a WARNING naming it.
+
+Re-baselined on KVarN — it costs nothing:
+
+```
+                     tau    prefill tok/s   decode tok/s
+numbers 1..30       5.733      109.64          57.53
+merge two lists     3.571      105.76          35.32
+MIT header          2.000      107.03          24.14
+```
+
+Identical to the Q8 numbers within noise (57.68 / 35.21 / 24.03), and tau is
+unchanged, so nothing in this document's conclusions moves. Asym3 remains the
+one that actually hurt (tau 3.571 -> 2.840 on the hard prompt).
+
+NOT warned about, deliberately: the daemon warns that KVarN without
+`HIPFIRE_KVARN_BATCHED_PREFILL=1` drops decode to plain AR. That is a
+serving-path condition and is FALSE here — measured, this harness reaches tau
+5.733 with the flag unset (57.39) and 57.54 with it set, so the drafter engages
+either way. A warning that is false where it prints is worse than none.

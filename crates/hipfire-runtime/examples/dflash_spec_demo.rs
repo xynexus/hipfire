@@ -502,7 +502,17 @@ fn main() {
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
-    let mut kv_mode_str = String::from("q8");
+    // HIPFIRE_KV_MODE is the documented knob and every OTHER qwen35 example
+    // honours it (infer_qwen35, bench_qwen35_speed, probe_argmax_agreement,
+    // speed_bench). This one did not: it hard-defaulted to q8 and read only
+    // --kv-mode, so `HIPFIRE_KV_MODE=asym3 dflash_spec_demo ...` silently ran
+    // Q8 and reported it nowhere anyone would look. An env var that one binary
+    // honours and its sibling ignores is worse than one nothing reads.
+    // Precedence: --kv-mode > HIPFIRE_KV_MODE > q8, and the source is logged.
+    let (mut kv_mode_str, mut kv_mode_src) = match std::env::var("HIPFIRE_KV_MODE") {
+        Ok(v) if !v.is_empty() => (v, "HIPFIRE_KV_MODE"),
+        _ => (String::from("kvarn"), "default"),
+    };
     let mut calib_out: Option<String> = None;
     let mut calib_imatrix_only: Vec<String> = Vec::new();
     let mut block_size_override: Option<usize> = None;
@@ -701,6 +711,7 @@ fn main() {
             }
             "--kv-mode" => {
                 kv_mode_str = args[i + 1].clone();
+                kv_mode_src = "--kv-mode";
                 i += 2;
             }
             // ── DFlash calibration collection ──────────────────────
@@ -1052,7 +1063,24 @@ fn main() {
             .max(if adaptive_b { adaptive_b_max } else { 0 });
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
+    // Q8 and the asym*/fwht* tiers are DEPRECATED — new KV work goes to KVarN,
+    // which is the intended default path. They stay selectable because existing
+    // artifacts and baselines still use them, but a run should say so out loud:
+    // this harness defaulted to q8 for its whole life and nothing ever mentioned
+    // it, so every measurement taken with it was quietly on a deprecated tier.
+    if matches!(
+        kv_mode_str.as_str(),
+        "q8" | "asym4" | "turbo4" | "asym3" | "turbo3" | "turbo" | "asym2" | "turbo2"
+            | "fwht4" | "fwht3" | "fwht2"
+    ) {
+        eprintln!(
+            "WARNING: --kv-mode {kv_mode_str} is DEPRECATED (from {kv_mode_src}). \
+             Q8 and the asym*/fwht* tiers are superseded by KVarN, which is the \
+             default path; use --kv-mode kvarn (or unset HIPFIRE_KV_MODE)."
+        );
+    }
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
+        "kvarn" => hipfire_arch_qwen35::speculative::KvMode::Kvarn,
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
         "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
         "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
@@ -1062,12 +1090,19 @@ fn main() {
         "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
             eprintln!(
-                "unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2"
+                "unknown --kv-mode: {other}. Valid: kvarn (default), \
+                 q8/asym4/asym3/asym2/fwht4/fwht3/fwht2 (all DEPRECATED)"
             );
             std::process::exit(1);
         }
     };
-    eprintln!("kv_mode: {:?}", slot_cfg.kv_mode);
+    eprintln!("kv_mode: {:?} (from {kv_mode_src})", slot_cfg.kv_mode);
+    // NB the daemon warns that KVarN without HIPFIRE_KVARN_BATCHED_PREFILL=1
+    // drops decode to plain AR. That is a SERVING-path condition and does NOT
+    // apply here: measured on this harness, kvarn reaches tau 5.733 with the
+    // flag unset and 57.39 vs 57.54 tok/s with it set, i.e. the drafter engages
+    // either way. No warning is emitted, because a warning that is false where
+    // it prints is worse than none.
     let t1 = Instant::now();
     let mut target = ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg)
         .expect("load target");
