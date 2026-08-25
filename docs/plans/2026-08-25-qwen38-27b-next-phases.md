@@ -1365,3 +1365,52 @@ ceiling — it removes a second, independent one that was hiding underneath it.
 instantiations makes the first run of each width pay JIT inside the measured
 window: B=8 first read 8.33 tok/s and B=10 read 28.50, against warm 57.4 and
 63.9. Always warm every width before believing a sweep.
+
+## DeltaNet perf pass — where the time actually is
+
+Real geometry from the artifact: `linear_num_value_heads=48`, `linear_key/value_head_dim=128`,
+48 of 64 layers DeltaNet. Bench at that shape (`bench_gated_delta_net`, GDN_HEADS=48):
+
+    t=1   23.6 us        t=10  51.7 us       => fixed 23.6 us + 3.12 us/token
+
+**The fixed half is already optimal and cannot be tuned.** State is
+48 x 128 x 128 x 4 = 3.15 MB, read AND written every call = 6.29 MB in 23.6 us
+= **267 GB/s, at the DRAM ceiling** (measured achievable 250-256). The only way
+down is fewer state BYTES, which is exactly what FP16 state does.
+
+**The marginal half runs at ~10% of f32 FMA peak** and resisted every structural
+lever tried:
+
+| lever | result |
+|---|---|
+| `#pragma unroll` the row loop | null — compiler already unrolls a constant bound |
+| ablate BOTH cross-lane reductions (wrong results, timing only) | only −4% — NOT shuffle-bound |
+| hoist state slice LDS -> registers | **−3.7%, kept** (lands on the ablated floor) |
+| TILE_ROWS 4 -> 8 -> 16 | null: 0.0517 / 0.0522 / 0.0518 ms, despite occupancy 16 -> 8 -> 4 |
+| chunkwise-parallel (`HIPFIRE_GDN_CHUNK=1`) | null at B=10: 63.87 vs 63.75 tok/s |
+
+TILE_ROWS being flat while occupancy drops 4x is the strongest single result
+here: this kernel is **not occupancy-limited**, so the usual RDNA levers
+(registers, LDS, waves) have nothing to give. That is why the LDS hoist bought
+3.7% and nothing else bought anything.
+
+The chunkwise kernel DOES run when enabled (`gdn_chunk_pairs` 336 calls/run
+under HIPFIRE_KERNEL_TRACE, alongside 720 sequential calls for the single-token
+steps) — it simply has nothing to amortize at 10 tokens. It is a long-prefill
+optimization, and it additionally requires `StateQuant::FP32`, so it is
+MUTUALLY EXCLUSIVE with the FP16 state that actually wins here.
+
+### The lever that works is FP16 state
+
+Measured end-to-end at B=10 on Qwen3.8-27B, tau identical (6.917) in all three:
+
+| config | tok/s |
+|---|---|
+| fp32 sequential (DEFAULT) | 63.75 |
+| fp32 chunkwise | 63.87 |
+| **fp16 sequential** | **68.02** |
+
+FP16 halves the DRAM-bound term that dominates the call, and halves the
+spec-decode state snapshot alongside it. It is the only thing that moved the
+number, it is opt-in, and the env doc claimed for months that it was already
+the default. See the `HIPFIRE_DN_STATE_FP16` entry.
