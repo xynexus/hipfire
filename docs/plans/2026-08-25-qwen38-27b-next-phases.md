@@ -1148,3 +1148,67 @@ default waiting to be flipped.
 `B=2 cmd` does NOT unset A. Every "A off" row was really "both on". Use
 `env -u A -u B` per run. The first instance was cold-cache; both produced
 confident wrong numbers that survived until something looked impossible.
+
+## Verify is nearly free — up to B=8, then it falls off a cliff
+
+`bench_oq_compact_multicol`, gate/up [17408, 5120], weight bytes CONSTANT at
+45.2 MiB across every B, so GB/s *is* the amortisation efficiency:
+
+| B | LDS | VGPRs | occupancy (min of VGPR/LDS) | GB/s | % of 233 | GB/s per wave |
+|---|---|---|---|---|---|---|
+| 1 | — | 79 | 16 | 235 | 96.6% | — |
+| **8** | 8 KB | 135 | **10** | **216** | **95.2%** | 21.6 |
+| 12 | 12 KB | 163 | 9 | 184 | 79.2% | 20.4 |
+| 16 | 16 KB | 191 | 8 | 148 | 63.9% | 18.5 |
+| 17 | 17 KB | 148 | 6 | 124 | 51.1% | 20.6 |
+| 24 | 24 KB | — | 4 | 91 | 38.4% | 22.7 |
+| 32 | 32 KB | 223 | 4 | 64 | 27.5% | 16.0 |
+
+At B=8 eight tokens cost 0.213 ms against one token's 0.210 ms — the weight
+sweep is amortised essentially perfectly. **That is why B=8 is the sweet spot:
+it is the largest B where occupancy still sits at 10.**
+
+ROOT CAUSE: the kernel is LATENCY-bound, and throughput is ~20 GB/s per
+wave/SIMD across B=8..24. Occupancy is capped by `facc[RW][BC]` registers for
+B=9..16 and by `lds_x[4 * BC * 256]` above 16 — both linear in batch width.
+
+The decisive evidence is B=17: it has FEWER VGPRs (148 vs 191) and higher
+compiler-reported occupancy (9 vs 8) than B=16, yet is SLOWER (124 vs 148
+GB/s). Only the LDS-limited occupancy (6 vs 8) explains that ordering, which is
+why the compiler's VGPR-only "Occupancy" line must not be read as the answer.
+
+Two hypotheses TESTED AND KILLED, so nobody re-runs them:
+
+- **LDS read traffic.** The activation tile is re-read per column, so LDS
+  traffic scales with BC while global traffic stays flat. Raising RW 3 -> 4 for
+  B=9..16 (more row reuse per LDS read) changed nothing: B=12 0.258 vs 0.257 ms,
+  B=16 0.321 vs 0.325 ms, three runs each.
+- **The overlay's scattered per-(row,column) LDS gather.** `BENCH_NOUT=0`
+  removes it entirely and the cliff is untouched: B=16 147.5 vs 147.7 GB/s. It
+  costs ~4%, flat in B, which is just its extra bytes.
+
+Also note the wide kernel is what makes verify viable at all: at B=8 it is
+**3.5x** the narrow kernel (0.213 vs 0.748 ms). Narrow never amortises — 27% of
+ceiling at B=8, falling to 16% at B=16.
+
+## DDTree does not pay here, and a smaller budget does not rescue it
+
+Matched-proposal comparison, 96 tokens:
+
+| mode | proposals | tau | node acceptance | tok/s |
+|---|---|---|---|---|
+| linear DFlash2 | 7 | **5.733** | 81.9% | **57.55** |
+| tree budget=6 | 6 | 5.125 | 85.4% | 51.87 |
+| tree budget=8 | 8 | 5.667 | 70.8% | 47.43 |
+| tree budget=12 | 12 | 5.786 | 48.2% | 43.16 |
+| tree budget=16 | 16 | 5.857 | 36.6% | 33.19 |
+
+The verify cliff is real but it is NOT the whole story: at equal proposal count
+the tree has LOWER tau than the linear chain, and tau rises only 5.125 -> 5.857
+for 2.7x the nodes. DFlash2's sequential chain already accepts 82%, so tree
+diversity buys almost nothing on this drafter. Tree build itself is free
+(0.01 ms); verify is 90% of the cycle.
+
+Conclusion: the lever is NOT tree topology. It is either the drafter (raise tau
+at B<=8, where verify is free) or the kernel's occupancy past B=8 (which would
+let B=12 spend its tau=7.1 at B=8 prices).

@@ -23,7 +23,12 @@ fn main() {
         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
         (seed >> 16) as u32
     };
-    let n_out = 3usize;
+    // BENCH_NOUT=0 removes the sparse overlay entirely, isolating its scattered
+    // per-(row,column) LDS gather from the dense dot4 path.
+    let n_out = std::env::var("BENCH_NOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3usize);
     let stride = 2 + GROUP / 2 + 2 * n_out; // 136 at n_out=3 => 4.25 bits
     let iters = 30usize;
 
