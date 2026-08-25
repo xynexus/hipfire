@@ -1168,6 +1168,17 @@ does); and `None` disables reclaiming entirely. 41/41 scheduler tests pass.
 
 **M1d — the remaining process globals become per-stream:** `RAW_OVERRIDE`,
 `hipfire_steer::{SESSION, ACTIVE, EPOCH}`, `load_progress::SINK`.
+`RAW_OVERRIDE` is retired as of 2026-08-25; the other two remain.
+
+**Scoped 2026-08-25 — see `docs/plans/2026-08-25-m1-scope.md`.** Headline: M1b
+is NOT as landed as this section reads. The `static SAMPLER_STATE` is gone, but
+nothing samples through the per-stream `SamplerRng` (`daemon/stream.rs:181` says
+so), no request seed reaches it (`SamplerRng::from_seed` has zero production
+call sites), and the RNG state is still shared per MODEL — it round-trips
+through `Qwen35Scratch::sample_buf`, a single `[2]` tensor on the one
+`LoadedModel::q35_scratch`. The global was removed; the sharing was relocated,
+so M1b's own failure mode is still live and its exit criterion is unmeetable
+today.
 
 *Breaks:* M1b changes sampled output for every `temperature>0` request — deliberately;
 today's output is not reproducible under batching anyway. Greedy tiny-quant baselines must
