@@ -15,7 +15,7 @@ times in one session, so nothing here is asserted from intuition.
 | M2a2 flag | **landed** (§3.2) — `HIPFIRE_PREFILL_LOWERED`, default on, plus a decision trace |
 | M2a3 batched bindings, dense FullAttn | **landed** (§3.2) — bit-identical, verified |
 | M2a4a DeltaNet | **landed** (§3.3) — bit-identical, verified on a 3/4-LinearAttention fixture |
-| M2a4b the two MoE arms | **blocked on hardware, measured** (§3.4) — the batched MoE prefill is not admitted on gfx1103, so the change is unverifiable on this box |
+| M2a4b the two MoE arms | **LANDED 2026-08-25** (§3.4) — the hardware blocker was misdiagnosed and is gone; both arms are on the shared lowered super-ops and the gate now runs them |
 | M2a5 session-batch loops | separate milestone, unchanged (§3 says so itself) |
 
 §0.1's decision was about ORDERING — that M2a is not the cheapest way to buy the
@@ -323,7 +323,49 @@ flag off.
 
 `prefill_chunk.rs` is 6,106 → 4,504 lines across M2a3 + M2a4a.
 
-### 3.4 M2a4b — the MoE arms are blocked on hardware, and that is measured
+### 3.4 M2a4b — LANDED 2026-08-25. The hardware blocker was misdiagnosed.
+
+**Corrected in place. Every claim in the original §3.4 below the line was checked
+on 2026-08-25 and three of them are false.** Keeping the original text because the
+*reasoning* — refuse a change no oracle can check — was right, and only its
+premise was wrong.
+
+**1. `arch_has_wmma` was never the reason.** That predicate
+(`prefill_batch.rs:5782`) gates MQ3 **dense** weights, not MoE admission, and the
+canonical `gfx_has_wmma` (`hipfire-rdna/src/arch_caps.rs`) has always listed
+gfx1103. The real refusal was `moe_topk_ok=false (K=2, E=8)`:
+`moe_prefill_topk_shape_supported` requires `k_top ∈ {8,10}` and `moe_preset` is
+top-2-of-8. That is a **fixture shape with no arch term in it**.
+
+**2. "Do it on gfx1151 or gfx12" would not have worked.** The tiny `qwen3_5_moe`
+cell SKIPs identically on every arch, for the reason above. What *does* reach the
+path is `qwen3_5_moe_indexed` (top-8-of-16), which existed all along.
+
+**3. The cells no longer report `distinct_paths: false`.** They run and pass —
+`tiny-prefill-gate: ran=4 fail=0`, indexed MoE at 5.4e-6 / 2.8e-6 against a 1e-4
+tolerance, with `--corrupt-kv-prefix` still caught at 0.34. The real
+`Qwen3.6-35B-A3B--oq4` is admitted too (`force_fallback=false n=57 K=8/E=256`).
+Two fixes got there: the raw F16/BF16 grouped MoE was dispatched to a
+gfx1151-only entry point (`75b718181`), and the gate's path check inferred
+"never ran" from equal recurrent-state hashes, which masked a real failure
+(`a97d60d93` → PR #342).
+
+**M2a4b itself landed as a side effect of fixing a production bug.** `0bbbfd08f`
+(PR #340) folded `DeltaNetMoe` and `FullAttnMoe` onto the shared lowered
+super-ops — which is exactly what "extract the two MoE arms" asked for — because
+those hand-rolled copies had drifted and were decoding F16 weights as HFQ4 nibble
+blocks on every arch. Net −1834 lines, and the gate that now covers it is the
+oracle §3.4 said did not exist.
+
+**§6's second stop-line was honoured, not bypassed.** The rule is "refuse a change
+no available oracle can check". The change was made only once the gate genuinely
+ran the MoE cells, and it was verified against them plus a real 35B.
+
+---
+
+_Original §3.4, preserved:_
+
+### 3.4 M2a4b — the MoE arms are blocked on hardware, and that is measured (SUPERSEDED)
 
 **Not deferred by §0.1, and not a fixture gap. The batched MoE prefill cannot
 run on gfx1103 at all.**
