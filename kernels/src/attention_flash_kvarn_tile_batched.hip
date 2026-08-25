@@ -102,7 +102,8 @@ __device__ __forceinline__ void kvarn_tile_body(
     int block_cols,                            // ignored when tree_bias == nullptr
     int n_full_blocks,                         // record tiles before the window tile
     int rec_bytes,                             // kvarn_record_bytes_bits(head_dim, GROUP, bits)
-    int bits                                   // K code bits in {2,4,8}; 8/bits codes/byte
+    int bits,                                  // K code bits in {2,4,8}; 8/bits codes/byte
+    int window_f16                             // 1 = window holds f16, 0 = f32
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -245,10 +246,22 @@ __device__ __forceinline__ void kvarn_tile_body(
         const int win_base = n_full_blocks * group;            // == tile_start
         for (int t_local = wv; t_local < tile_len; t_local += NW) {
             const int t = tile_start + t_local;
-            const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
             float partial = 0.0f;
-            for (int i = 0; i < dpt; i++) {
-                partial += mq[i] * kt[d0 + i];
+            if (window_f16) {
+                // f16 window. The branch is on a kernel argument, so it is
+                // workgroup-uniform and costs a scalar compare, not divergence.
+                // The accumulator stays f32 either way — only STORAGE narrows.
+                const _Float16* ktb =
+                    reinterpret_cast<const _Float16*>(window)
+                    + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+                for (int i = 0; i < dpt; i++) {
+                    partial += mq[i] * (float)ktb[d0 + i];
+                }
+            } else {
+                const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+                for (int i = 0; i < dpt; i++) {
+                    partial += mq[i] * kt[d0 + i];
+                }
             }
             partial = wave32_sum_dpp(partial);
             if (lane == 0) {
@@ -363,11 +376,12 @@ extern "C" __launch_bounds__(32 * KVARN_NW, 1) __global__ void attention_flash_k
     float* __restrict__ partials, const int* __restrict__ positions,
     const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
-    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits,
+    int window_f16) {
     kvarn_tile_body<8, KVARN_NW>(q, records, window, v_cache, partials, positions, tree_bias,
                        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
                        max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
-                       rec_bytes, bits);
+                       rec_bytes, bits, window_f16);
 }
 
 // head_dim == 512 (dpt == 16): gemma4 global layers. Lower min-blocks hint since
@@ -378,9 +392,10 @@ extern "C" __launch_bounds__(32 * KVARN_NW, 1) __global__ void attention_flash_k
     float* __restrict__ partials, const int* __restrict__ positions,
     const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
-    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits,
+    int window_f16) {
     kvarn_tile_body<16, KVARN_NW>(q, records, window, v_cache, partials, positions, tree_bias,
                         n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
                         max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
-                        rec_bytes, bits);
+                        rec_bytes, bits, window_f16);
 }

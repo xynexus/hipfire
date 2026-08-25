@@ -75,3 +75,38 @@ extern "C" __global__ void kv_cache_write_kvarn_window_routed_batched(
 
     window[(size_t)slot * kv_dim + i] = src[(size_t)b * kv_dim + i];
 }
+
+// ── f16 window variant ──────────────────────────────────────────────────────
+// The window holds the trailing partial block and every value in it is read by
+// exactly ONE dot product per decode step before being quantised to 4-bit KVarN
+// codes on flush. Measured relative error of Q.K on K-like data with outlier
+// channels: f32 0, f16 2.07e-4, bf16 1.67e-3, and the 4-bit these same values
+// BECOME 1.88e-1. So f16 is ~900x tighter than the fate of the data it holds,
+// and f32 was carrying a 24-bit mantissa for values destined for 4 bits.
+//
+// f16 over bf16 here because K is bounded and roughly normalised: the extra
+// mantissa bits are worth more than bf16's extra exponent range, measured at ~8x.
+extern "C" __global__ void kv_cache_write_kvarn_window_routed_batched_f16(
+    unsigned long long* __restrict__ win_ptrs,
+    const int* __restrict__ row_session_indices,
+    const float* __restrict__ src,
+    const int* __restrict__ positions,
+    int row_offset,
+    int row_count,
+    int n_kv_heads,
+    int head_dim,
+    int group,
+    int layer_index,
+    int ptr_layer_stride
+) {
+    if ((int)blockIdx.y >= row_count) return;
+    const int b = row_offset + (int)blockIdx.y;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) return;
+    const int session_idx = row_session_indices[b];
+    _Float16* window = reinterpret_cast<_Float16*>(
+        win_ptrs[(size_t)session_idx * ptr_layer_stride + layer_index]);
+    const int slot = positions[b] % group;
+    window[(size_t)slot * kv_dim + i] = (_Float16)src[(size_t)b * kv_dim + i];
+}

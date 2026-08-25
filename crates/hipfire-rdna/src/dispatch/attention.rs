@@ -1602,6 +1602,10 @@ impl Gpu {
                     unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
                 let rec_ptr = records.buf.as_ptr();
                 let win_ptr = window.buf.as_ptr();
+                // Must match the window's ALLOCATED dtype (KvCache::kvarn_window_dtype).
+                // The kernel branches on this; passing the wrong value reinterprets
+                // the window and produces silent garbage.
+                let win_f16 = i32::from(window.dtype == crate::DType::F16);
                 let v_ptr = v_cache.buf.as_ptr();
                 let p_ptr = partials.buf.as_ptr();
                 let pos_ptr = positions.buf.as_ptr();
@@ -1637,7 +1641,8 @@ impl Gpu {
                         ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr,
                         ptr pos_ptr, ptr bias_ptr,
                         i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc,
-                        i32 ts, i32 mt, i32 bo, i32 bs, i32 bc, i32 nfb, i32 rb, i32 bt
+                        i32 ts, i32 mt, i32 bo, i32 bs, i32 bc, i32 nfb, i32 rb, i32 bt,
+                        i32 win_f16
                     ],
                 )?;
             }

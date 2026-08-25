@@ -1191,6 +1191,62 @@ impl KvCache {
     /// KVarN K bits from `HIPFIRE_KVARN_BITS` (default 4). Valid: 2, 4, 8. 4-bit
     /// is lossy vs f16 (~0.085 KLD, precision-limited); 8-bit is ~165× lower KLD
     /// at 2× the K storage — see `docs/todo/kvarn-hot-bitwidth.md`.
+
+    /// Why the KVarN recent-window cannot be f16 yet, or `Ok(())` when it can.
+    ///
+    /// The window holds the trailing partial block and every value in it is read by
+    /// exactly ONE dot product per decode step before being quantised to 4-bit KVarN
+    /// codes on flush. Measured relative error of Q.K on K-like data with outlier
+    /// channels: f32 0, f16 2.07e-4, bf16 1.67e-3, and the 4-bit these same values BECOME
+    /// 1.88e-1. f16 is therefore ~900x tighter than the fate of the data it holds,
+    /// and f32 was carrying a 24-bit mantissa for values destined for 4 bits.
+    /// f16 is preferred over bf16 here because K is bounded and roughly normalised,
+    /// so the extra mantissa bits beat bf16's extra exponent range by ~8x.
+    ///
+    /// What DOES gate it is consumer coverage. The window is read from seven-plus
+    /// sites across qwen35, gemma3, zaya, serving-core and layered_kv, and one of
+    /// them — `qwen35_decode.rs`'s `gpu.download_f32(&kv.k_window[layer])` — would
+    /// silently reinterpret f16 as f32 and return garbage with no compile error.
+    /// Flipping the dtype before those are converted trades 4 MiB for a silent
+    /// corruption, so this probe reports the honest state and the caller falls back
+    /// loudly.
+    ///
+    /// `HIPFIRE_KVARN_WINDOW_F16=1` forces it on for developing the remaining
+    /// consumers; `=0` pins f32.
+    pub fn kvarn_window_f16_status() -> Result<(), &'static str> {
+    match std::env::var("HIPFIRE_KVARN_WINDOW_F16").ok().as_deref() {
+        Some("1") => return Ok(()),
+        Some("0") => return Err("pinned off by HIPFIRE_KVARN_WINDOW_F16=0"),
+        _ => {}
+    }
+    // Converted: kv_cache_write_kvarn_window_routed_batched_bf16 (writer) and
+    // attention_flash_kvarn_tile_batched (reader, `window_bf16` arg).
+    // NOT converted, and each would misread bf16 as f32:
+    Err("qwen35_decode.rs download_f32(k_window) + gemma3/zaya window readers \
+         still assume f32; convert them, then this flips to f16 automatically")
+}
+
+    /// Element dtype for the KVarN recent window, announcing any fallback.
+    fn kvarn_window_dtype() -> (DType, bool) {
+    match Self::kvarn_window_f16_status() {
+        Ok(()) => (DType::F16, true),
+        Err(why) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[kvarn] WINDOW FALLBACK: recent window allocated F32, not f16 — {why}. \
+                     Cost of the fallback: 2x window bytes (GROUP x kv_dim x 4B per KV layer, \
+                     ~8 MiB on a 16-KV-layer 27B) and 2x its per-step read traffic. f16 is \
+                     measured safe here (Q.K rel err 2.07e-4 vs 1.88e-1 for the 4-bit these \
+                     values become on flush) — this is a wiring gap, not a precision one."
+                );
+            }
+            (DType::F32, false)
+        }
+    }
+}
+
     pub fn kvarn_bits_from_env() -> usize {
         match std::env::var("HIPFIRE_KVARN_BITS").ok().as_deref() {
             Some("2") => 2,
@@ -1259,20 +1315,21 @@ impl KvCache {
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         let mut k_window = Vec::with_capacity(n_layers);
+        let (win_dtype, win_is_f16) = Self::kvarn_window_dtype();
         for _ in 0..n_layers {
             k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-            // Recent-window staging ring: GROUP tokens × kv_dim, stored F32 so
-            // the existing `kv_cache_write_f32_batched` can append rows and the
-            // gather/quantize kernels share one input dtype. It holds at most one
-            // 128-token block, so the f32-vs-f16 size cost is negligible.
-            k_window.push(gpu.zeros(&[group * kv_dim], DType::F32)?);
+            // Recent-window staging ring: GROUP tokens × kv_dim. bf16 when every
+            // consumer supports it, F32 otherwise — see `kvarn_window_dtype`,
+            // which announces the fallback and why.
+            k_window.push(gpu.zeros(&[group * kv_dim], win_dtype)?);
         }
         let k_bph = rec_bytes / n_kv_heads.max(1); // informational; record is per-head already
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + f32 window + V Q8 {v_bph}B/head)",
+            "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + {} window + V Q8 {v_bph}B/head)",
             group,
+            if win_is_f16 { "f16" } else { "f32" },
         );
         let _ = k_bph;
         Ok(Self {
@@ -1366,17 +1423,19 @@ impl KvCache {
         // Recent-window ring (GROUP tokens × kv_dim, F32) per KV layer; placeholder
         // for non-KV layers so `k_window[layer_idx]` stays valid.
         let mut k_window = Vec::with_capacity(is_kv_layer.len());
+        let (win_dtype, win_is_f16) = Self::kvarn_window_dtype();
         for &is_kv in is_kv_layer {
             k_window.push(if is_kv {
-                gpu.zeros(&[group * kv_dim], DType::F32)?
+                gpu.zeros(&[group * kv_dim], win_dtype)?
             } else {
-                gpu.zeros(&[1], DType::F32)?
+                gpu.zeros(&[1], win_dtype)?
             });
         }
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + f32 window + V Q8)",
-            is_kv_layer.len()
+            "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + {} window + V Q8)",
+            is_kv_layer.len(),
+            if win_is_f16 { "f16" } else { "f32" }
         );
         Ok(Self {
             k_gpu,
