@@ -266,6 +266,74 @@ fn main() {
         y_grp[flat * m..flat * m + m].copy_from_slice(&yg_raw[s * m..s * m + m]);
     }
 
+    // ── arm 3: f32-activation grouped GEMM (must be BIT-EXACT vs the GEMV) ──
+    let y_f = gpu.alloc_tensor(&[m_total * m], DType::F32).unwrap();
+    gpu.gemm_oq_compact_moe_grouped_f32(
+        &ptr_t,
+        &tiles_t,
+        &sorted_t,
+        &x_t,
+        &y_f,
+        m,
+        k,
+        1,
+        m_total,
+        BLOCK_STRIDE,
+    )
+    .unwrap();
+    gpu.device_synchronize().unwrap();
+    let yf_raw = gpu.download_f32(&y_f).unwrap();
+    let mut y_f32 = vec![0f32; batch * K_TOP * m];
+    for flat in 0..batch * K_TOP {
+        let s = slot_of_flat[flat];
+        y_f32[flat * m..flat * m + m].copy_from_slice(&yf_raw[s * m..s * m + m]);
+    }
+    let exact = y_f32
+        .iter()
+        .zip(&y_gemv)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+
+    // ── timing: does hoisting the weight read out of the slot loop pay? ─────
+    let iters = 50;
+    let t_gemv = {
+        gpu.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gpu.gemv_oq_compact_moe_gate_up_k8_indexed_batched(
+                &ptr_t, &idx_t, &strides, &x_t, &gt, &ut, m, k, K_TOP, batch, true,
+            )
+            .unwrap();
+        }
+        gpu.device_synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    };
+    let t_f32 = {
+        gpu.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_oq_compact_moe_grouped_f32(
+                &ptr_t,
+                &tiles_t,
+                &sorted_t,
+                &x_t,
+                &y_f,
+                m,
+                k,
+                1,
+                m_total,
+                BLOCK_STRIDE,
+            )
+            .unwrap();
+        }
+        gpu.device_synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    };
+    println!(
+        "  timing: gemv {t_gemv:.3} ms   f32-grouped {t_f32:.3} ms   speedup {:.2}x",
+        t_gemv / t_f32.max(1e-9)
+    );
+
     // ── verdict ─────────────────────────────────────────────────────────────
     let e_gemv = max_rel(&oracle, &y_gemv);
     let e_grp = max_rel(&oracle, &y_grp);
@@ -273,15 +341,28 @@ fn main() {
     println!("  gemv   vs oracle : {e_gemv:.3e}   (shipping decode path)");
     println!("  grouped vs oracle: {e_grp:.3e}   (kernel under test)");
     println!("  grouped vs gemv  : {cross:.3e}   (what spec-decode verify needs small)");
+    let e_f32 = max_rel(&oracle, &y_f32);
+    let cross_f32 = max_rel(&y_gemv, &y_f32);
+    println!("  f32grp vs oracle : {e_f32:.3e}   (f32-activation kernel)");
+    println!(
+        "  f32grp vs gemv   : {cross_f32:.3e}   bit-mismatches {exact}/{}  {}",
+        y_gemv.len(),
+        if exact == 0 {
+            "BIT-EXACT"
+        } else {
+            "NOT bit-exact"
+        }
+    );
     // f16 activations put the floor near 1e-3; a layout/addressing defect is
     // orders above that, which is how the Oq8 sibling failed.
-    let ok = e_grp < 5e-3 && cross < 5e-3;
+    // The f32 arm's bar is strict equality; the WMMA arm's is the f16 floor.
+    let ok = e_grp < 5e-3 && cross < 5e-3 && exact == 0;
     println!(
         "{}",
         if ok {
-            "PASS — consistent with f16-activation rounding, no addressing defect"
+            "PASS — wmma arm at the f16 floor, f32 arm BIT-EXACT vs the decode GEMV"
         } else {
-            "FAIL — error far above the f16 floor: addressing/layout defect"
+            "FAIL — see which arm: wmma above the f16 floor, or f32 arm not bit-exact"
         }
     );
     if !ok {
