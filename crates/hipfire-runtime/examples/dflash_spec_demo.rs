@@ -2116,7 +2116,19 @@ fn main() {
 
         // Adaptive-B state: tracks current B between cycles, plus a cooldown
         // counter and a histogram for end-of-run reporting.
-        let mut current_adaptive_b: usize = draft_cfg.block_size;
+        // CLAMPED INTO THE REQUESTED RANGE. Seeding from the drafter's trained
+        // block_size alone is a bug when the range does not contain it: the
+        // controller then STARTS out of range and can only walk back in one
+        // ADAPTIVE_B_STEP at a time, gated by ADAPTIVE_B_COOLDOWN, so a short
+        // run never arrives. `--adaptive-b-range 6:6` — a pin, with no decision
+        // left to make — ran the whole session at B=16 (verified in the
+        // HIPFIRE_SPEC_PHASES trace: every line read `B=16`).
+        //
+        // That silently invalidated every adaptive measurement on this model:
+        // ranges 8..16, 4..8 and 6:6 all effectively ran near B=16, which is the
+        // WORST block size here (48.95 tok/s at B=12 vs 68.36 at B=6).
+        let mut current_adaptive_b: usize =
+            draft_cfg.block_size.clamp(adaptive_b_min, adaptive_b_max);
         let mut adaptive_b_cycles_since_change: usize = 0;
         let mut adaptive_b_histogram: std::collections::HashMap<usize, u32> =
             std::collections::HashMap::new();
