@@ -552,6 +552,26 @@ fn main() {
     // larger max raises VRAM cost. Default 16 preserves the pre-Task-#93
     // behaviour (draft trained at block_size=16; larger B is OOD for the
     // draft's positional encoding and may degrade τ).
+    //
+    // ⚠️ THESE DEFAULTS LEAVE ~31% ON THE TABLE on Qwen3.5-35B-A3B--oq4.25++ +
+    // its oq4+ DFlash drafter. Measured, 128 tokens, kvarn, AR baseline 64.25:
+    //
+    //     adaptive 8..16 (this default)   52.27 tok/s   τ 3.43
+    //     adaptive 4..8                   55.12         τ 3.13
+    //     fixed B=6                       68.36         τ 3.00   <-- BEATS AR
+    //     fixed B=4                       65.53         τ 2.15
+    //     fixed B=8                       60.05         τ 3.23
+    //
+    // τ rises monotonically with B; THROUGHPUT peaks at 6 and falls, because a
+    // bigger block costs more verify than the extra acceptance returns. Picking
+    // B to maximise τ — which is what the adaptive controller does — therefore
+    // maximises the wrong quantity on this model.
+    //
+    // Left as-is rather than retuned: this is one model + one drafter, and the
+    // right fix is for the controller to optimise tok/s rather than τ, not for
+    // the default range to be moved on a single data point. Use
+    // `--no-adaptive-b --block-size 6` to reproduce the 68.36 figure; output is
+    // byte-identical to `--ar-baseline` on both the prose and code prompts.
     let mut adaptive_b: bool = true;
     let mut adaptive_b_min: usize = 8;
     let mut adaptive_b_max: usize = 16;
