@@ -1074,18 +1074,43 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     // DFlash verify keep committing what AR decode would. The
                     // WMMA one rounds activations to f16 (~3e-4) and is slower
                     // here besides. See gemm_oq_compact_moe_grouped_f32.hip.
-                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_f32(
-                        &ffn.expert_gate_up_ptrs,
-                        tile_ids,
-                        sorted,
-                        &pbs.x_rot_batch,
-                        y_gu_grouped,
-                        2 * mi,
-                        gate_up_k,
-                        path2_shape.gate_up_x_row_div,
-                        m_total,
-                        super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
-                    )?,
+                    //
+                    // PER-SLOT x, exactly as path 1 does for this dtype. Routed
+                    // Opus experts carry DIFFERENT AWQ scales -- each sees a
+                    // different token subset, hence a different imatrix -- and
+                    // the divide precedes the FWHT, so one rotation cannot serve
+                    // them all. `x_rot_batch` is a REPRESENTATIVE expert's
+                    // rotation, [N x dim]; feeding it here with x_row_div=K_TOP
+                    // gave every slot the wrong scale and put the grouped path
+                    // ~40% off from LAYER 0 (measured by the MoE path-2 gate in
+                    // compare_prefill_hidden_paths). Expand into
+                    // [N x K_TOP x dim] first, then index slots directly.
+                    DType::OqCompactG256 => {
+                        let x_rot_slots =
+                            pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
+                        gpu.rotate_x_mq_awq_indexed_batched(
+                            &pbs.x_norm_batch,
+                            ffn.expert_gate_up_awq_ptrs.as_ref(),
+                            topk_indices,
+                            x_rot_slots,
+                            gate_up_k,
+                            k_top,
+                            n,
+                        )?;
+                        gpu.gemm_oq_compact_moe_grouped_f32(
+                            &ffn.expert_gate_up_ptrs,
+                            tile_ids,
+                            sorted,
+                            x_rot_slots,
+                            y_gu_grouped,
+                            2 * mi,
+                            gate_up_k,
+                            // rows ARE flat slots now, so no division
+                            1,
+                            m_total,
+                            super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
+                        )?;
+                    }
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_gate_up_ptrs,
                         tile_ids,
