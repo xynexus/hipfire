@@ -7,6 +7,14 @@
 use super::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
+
+/// Output rows per workgroup for the indexed compact-MoE GEMVs. MUST match
+/// `OQCM_ROWS_PER_BLOCK` / `OQCM_BLOCK_THREADS` in
+/// `kernels/src/gemv_oq_compact_moe_indexed.hip` — the kernel derives its row
+/// from `blockIdx.x * OQCM_ROWS_PER_BLOCK + threadIdx.x/32`, so a mismatch
+/// silently computes the wrong rows rather than failing to launch.
+const OQCM_ROWS_PER_BLOCK: usize = 8;
+const OQCM_BLOCK_THREADS: u32 = (OQCM_ROWS_PER_BLOCK * 32) as u32;
 use std::ffi::c_void;
 
 impl Gpu {
@@ -4133,10 +4141,16 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
         let xps = i32::from(x_per_slot);
+        // 8 rows per workgroup (256 threads = 8 waves of 32), not one row per
+        // single-wave workgroup — see the note on OQCM_ROWS_PER_BLOCK in
+        // kernels/src/gemv_oq_compact_moe_indexed.hip. Math is unchanged and
+        // bit-identical; this only stops the per-CU workgroup-slot limit from
+        // capping occupancy at 16 waves/CU on a memory-bound GEMV.
+        let gx = m.div_ceil(OQCM_ROWS_PER_BLOCK) as u32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
+            [gx, k_top as u32, batch_size as u32],
+            [OQCM_BLOCK_THREADS, 1, 1],
             0,
             &kernargs![ptr pp, ptr ip, ptr sp, ptr xp, ptr ygp, ptr yup,
                        i32 m_val, i32 k_val, i32 kt, i32 xps],
@@ -4169,10 +4183,12 @@ impl Gpu {
         let rp = rot_batch.buf.as_ptr();
         let op = expert_outputs.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
+        // Same 8-rows-per-workgroup geometry as gate_up above.
+        let gx = m.div_ceil(OQCM_ROWS_PER_BLOCK) as u32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
+            [gx, k_top as u32, batch_size as u32],
+            [OQCM_BLOCK_THREADS, 1, 1],
             0,
             &kernargs![ptr pp, ptr ip, ptr sp, ptr rp, ptr op,
                        i32 m_val, i32 k_val, i32 kt],
