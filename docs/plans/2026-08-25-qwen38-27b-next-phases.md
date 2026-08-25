@@ -1538,3 +1538,60 @@ change** (`gated_delta_net.hip`, `_f32_tree`, `_f32_routed_batch_seq`, the
 batch-seq variant), with byte-exactness re-verified across all of them. The
 8-lane-group experiment is worth −27%/−41% on the kernel and is kept in
 `docs/experiments/`; it is blocked on exactly that, not on the idea.
+
+## LANDED: the 8-lane rewrite, family-wide
+
+All three f32 GDN kernels now carry the IDENTICAL step block —
+`gated_delta_net.hip`, `gated_delta_net_f32_tree.hip`,
+`gated_delta_net_f32_routed_batch_seq.hip`. (`gated_delta_net_f32_batch_seq` is
+not a fourth kernel; it launches `gated_delta_net_f32` with a batch grid. The
+f64acc oracle and the chunk kernel are compared on tolerance, not bytes, and
+are deliberately excluded.)
+
+The wave is 4 groups of 8 lanes: group `g` owns row `row_start+g`, lane `l`
+owns columns [16l, 16l+16). The 4 rows resolve CONCURRENTLY and each reduction
+spans 8 lanes, so a token costs 2x3 shuffle steps instead of 4x(5+5). The `r`
+loop disappears entirely.
+
+    kernel (48 heads)  t=10 0.0509 -> 0.0367 (−28%)   t=24 0.0949 -> 0.0563 (−41%)
+    f32 tree vs f32 linear: 2560/2560 byte-exact
+    all four parity tests PASS
+
+### The accuracy trap that cost two rounds
+
+The first version summed the 16 per-lane products SEQUENTIALLY. That is less
+accurate than the layout it replaced — which summed 4 per lane and then reduced
+across 32 lanes as a tree — and the f64 reference caught it:
+**state rel L2 err 2.997e-7 -> 3.412e-7**. Small, but spec-decode acceptance is
+sensitive to it: tau moved 6.917 -> 6.308 on one prompt and 2.414 -> 1.857 on
+another, and the mix went 3.5% SLOWER despite a 38% faster kernel.
+
+Tree-summing the 16 (`part[i] += part[i+w]`, w = 8,4,2,1) restores the depth and
+is **more accurate than the original**: 2.9927e-7 vs 2.9973e-7. It is also
+FASTER than the sequential version (0.0367 vs 0.0396 at t=10) because the tree
+carries more ILP. Accuracy and speed moved together, not against each other.
+
+### End-to-end: small, and smaller than the kernel win
+
+6 prompts, 256 tokens each (17-94 cycles), fp32, B=10:
+
+| | OLD | NEW |
+|---|---|---|
+| mix mean tok/s | 39.32 | 39.20 (−0.3%) |
+| excluding p0 | 33.91 | **34.41 (+1.5%)** |
+
+p0 is the shortest run (17 cycles) and the only one with a material tau shift
+(7.118 -> 6.667). Five of six prompts favour the new kernel.
+
+⚠️ **tau is noisy at short generation lengths and it swamps kernel wins.** At 96
+tokens (~13 cycles) the same comparison read 3.5% SLOWER and looked like a
+systematic regression; at 256 tokens it is +1.5% on 5 of 6 prompts. Any
+rounding change reshuffles which drafted tokens are accepted, and that is worth
+several percent either way on a short run. Do not judge a numerics-touching
+change on <30 cycles.
+
+The honest ceiling: DeltaNet is ~7% of the cycle, so even a 41% kernel win is
+~2.5% end-to-end at best. The f16 state family (`gated_delta_net_f16.hip`,
+`_f16_tree`, `_f16_routed_batch_seq`) is a SEPARATE byte-exact group and still
+has the old layout — the same rewrite there would give the fp16 path (the
+fastest config, 67.8 tok/s) the same treatment.
