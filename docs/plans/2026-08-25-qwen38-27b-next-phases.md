@@ -1595,3 +1595,38 @@ The honest ceiling: DeltaNet is ~7% of the cycle, so even a 41% kernel win is
 `_f16_tree`, `_f16_routed_batch_seq`) is a SEPARATE byte-exact group and still
 has the old layout — the same rewrite there would give the fp16 path (the
 fastest config, 67.8 tok/s) the same treatment.
+
+## f16 family: NOT landed — routed byte-exactness fails and I cannot explain it
+
+Applied the identical 8-lane + pairwise transform to `gated_delta_net_f16.hip`,
+`_f16_tree` and `_f16_routed_batch_seq`. Two of the three are fine:
+
+    f16 tree vs f16 linear: 2560/2560 byte-exact   (dither ON *and* OFF)
+    f32 tree vs f32 linear: 2560/2560 byte-exact
+
+but `test_gated_delta_net_routed_f16` fails:
+
+    routed f16 vs per-session f16 linear: 1713/3072 byte-exact, max|diff|=1.863e-9
+
+REVERTED. What was ruled out, so nobody repeats it:
+
+- **Not the step block.** A comment-stripped diff of the routed and linear
+  kernels shows the two step blocks are character-identical; the only
+  differences are the routing scaffolding and the dither index.
+- **Not the dither.** Same 1713/3072 with `HIPFIRE_DN_STATE_FP16_DITHER=0`.
+- **Not FP contraction.** `alpha*sreg[i] + kk[i]*delta` is contractible and the
+  compiler may fuse it in one kernel and not another, which would give exactly
+  this size of divergence. Pinning it with `__builtin_fmaf` in all six kernels
+  changed nothing — the count stayed 1713 exactly.
+- **Not geometry.** All nine GDN kernels are `#define HD 128`, `TILE_ROWS 4`,
+  `__launch_bounds__(32, 8)`, launched `[32,1,1]`.
+
+The count being bit-stable at 1713 across all of those says it is structural,
+not a rounding lottery. Unresolved.
+
+⚠️ **There is no `test_gated_delta_net_routed_f32`.** The f16 routed test is the
+ONLY byte-exact cover for a routed kernel, which means the f32 routed kernel
+that DID land is verified only indirectly (its tree sibling, and the
+tolerance-based f64 oracle). If the routed transform has a defect, the f32 one
+has it too and nothing currently catches it. Writing that test is the next step
+and is worth more than the remaining 1-2%.
