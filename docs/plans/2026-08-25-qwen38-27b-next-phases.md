@@ -1683,3 +1683,30 @@ direction from p0's — which is the tau-noise point again, now visible in both
 directions.
 
 Best single config measured: **fp16 state, B=10, 69.95 tok/s.**
+
+## The missing cover, closed: `test_gated_delta_net_routed_f32` + a gate
+
+Two gaps, both of which let the contraction defect reach master:
+
+1. **No routed-f32 byte-exactness test.** The f16 one was the ONLY routed cover,
+   so the f32 routed kernel was verified only through its tree sibling and a
+   tolerance-based f64 oracle. Written now, mirroring the f16 fixture
+   (interleaved sessions, per-session linear replay, byte-exact comparison).
+
+   Proven to have teeth rather than merely passing: with
+   `#pragma clang fp contract(on)` stripped from the f32 trio it fails at
+   **exactly 1713/3072 byte-exact, max|diff| 1.863e-9** — the identical
+   signature to the f16 failure. So the f32 trio *did* carry the same latent
+   defect, and this test is what would have caught it.
+
+2. **No gate ran ANY of them.** `parity_gated_delta_net_f64acc{,_routed}`,
+   `test_gated_delta_net_tree_f32` and the two routed tests were manual
+   examples. `tests/tiny-deltanet-gate.sh` now runs all five, and
+   `tiny-affected-gate.sh` selects it on `kernels/src/gated_delta_net*.hip`,
+   `dispatch/gated.rs`, `gdn_chunk.rs` and `qwen35/state.rs`. Verified:
+   `--base HEAD~1 --dry-run` on the commit that touched all six kernels reports
+   `deltanet=1`, and the gate itself passes 5/5 in ~8s with no model artifacts.
+
+A byte-exactness invariant that nothing runs is not an invariant. Both f16 and
+f32 routed kernels had the same defect; only the half with a test — a test
+nobody ran automatically — showed it.
