@@ -9,6 +9,44 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+/// Whether FP16 DeltaNet state narrows through the deterministic dither.
+///
+/// **DEFAULT ON** as of 2026-08-25. Opt out with `HIPFIRE_DN_STATE_FP16_DITHER=0`.
+///
+/// Round-to-nearest on a recurrent accumulator is biased — the same value always
+/// rounds the same way, so the error does not cancel and the state drifts. The
+/// kernel comment in `gated_delta_net_f16.hip` records the measurement that
+/// motivated the dither: on a 35B-A3B, FP16-vs-FP32 state divergence grew 13x
+/// over 2.5x the tokens, i.e. compounding rather than a fixed storage cost. The
+/// dither existed but shipped OFF, so every FP16 user got the mode that
+/// compounds and the mitigation was reachable only through an undocumented
+/// second flag.
+///
+/// Turning it on is safe for spec-decode ONLY because all three f16 state
+/// kernels now dither, and the tree kernel uses the live kernel's exact index
+/// derivation — see the comment on its persist-write. Before that fix, enabling
+/// this would have made tree replay round differently from the live path it is
+/// meant to reproduce, breaking losslessness. Do not re-enable per-kernel.
+///
+/// The dither is a pure function of the value's bits and the element index — no
+/// RNG, no carried state — so a snapshot still restores exactly what it saved.
+#[cfg(feature = "deltanet")]
+fn fp16_state_dither() -> bool {
+    static SR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // NOT `parse_or::<bool>`: that accepts only "true"/"false", so `=0` would
+    // parse as Err and silently fall back to the default — the exact trap that
+    // cost a 24-minute KLD run reporting FP16 numbers identical to FP32
+    // (see `qwen35/state.rs`). Match the strings explicitly, both ways.
+    *SR.get_or_init(|| {
+        !matches!(
+            std::env::var("HIPFIRE_DN_STATE_FP16_DITHER")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        )
+    })
+}
+
 impl Gpu {
     /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
     #[cfg(feature = "deltanet")]
@@ -508,6 +546,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
+        // Same accessor as the live and routed kernels — tree replay must round
+        // identically to the path it reproduces, or spec-decode is not lossless.
+        let sr = fp16_state_dither() as i32;
         self.ensure_kernel(
             "gated_delta_net_f16_tree",
             kernels::GATED_DELTA_NET_F16_TREE_SRC,
@@ -543,7 +584,7 @@ impl Gpu {
             0,
             &kernargs![
                 ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr stp,
-                ptr pp, ptr op, i32 nt, i32 nh, i32 hd
+                ptr pp, ptr op, i32 nt, i32 nh, i32 hd, i32 sr
             ],
         );
         if let Some(t) = timer {
@@ -604,15 +645,7 @@ impl Gpu {
         let nh = n_heads as i32;
         let hd = head_dim as i32;
         // Same env as the single-session f16 path; read here so no caller changes.
-        static SR_ROUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sr = *SR_ROUTED.get_or_init(|| {
-            matches!(
-                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER")
-                    .ok()
-                    .as_deref(),
-                Some("1") | Some("on") | Some("true") | Some("yes")
-            )
-        }) as i32;
+        let sr = fp16_state_dither() as i32;
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -692,17 +725,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        // Read here rather than threading a flag through four call sites in
-        // three modules. Cached: this is on the per-layer decode path.
-        static SR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let sr = *SR.get_or_init(|| {
-            matches!(
-                std::env::var("HIPFIRE_DN_STATE_FP16_DITHER")
-                    .ok()
-                    .as_deref(),
-                Some("1") | Some("on") | Some("true") | Some("yes")
-            )
-        }) as i32;
+        let sr = fp16_state_dither() as i32;
 
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
