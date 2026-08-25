@@ -1080,3 +1080,40 @@ It becomes worth revisiting if the window grows: a FULL-ATTENTION model where al
 a larger GROUP scales it linearly. The measurement above is the justification
 whenever someone wants to make that change — the precision question is settled,
 only the size question is open.
+
+## KVarN window precision — the knob is config, not env
+
+`kv_window_precision` (`auto` | `f16` | `f32`, load-time, global/model/runtime)
+is the user-facing control for the KVarN recent window's storage dtype. It is a
+real config field in `hipfire-config`, not an env var: **the env system here is
+for debugging.** `HIPFIRE_KVARN_WINDOW_F16` still exists and still outranks the
+config, but only as a documented debug override for developing the remaining
+consumers.
+
+`auto` resolves to **f32 today** and says so loudly, naming what blocks it.
+Precision is not what blocks it — f16 is ~900x tighter than the 4-bit these
+values become on flush (Q·K rel err 2.07e-4 vs 1.88e-1). What blocks it is
+consumer coverage, and both survivors are inside `Gpu::kvarn_attend`:
+
+1. it stages K into the window with a raw dtod blit hardcoding 4 bytes/element,
+   so flipping the dtype under it overruns the buffer (measured: `assert!` at
+   hip-bridge `ffi.rs:1619`, first decode step);
+2. `kvarn_gather_k_tiles` reads the window as f32 to build the quantiser's
+   tiles — and this one corrupts KV records silently rather than crashing.
+
+That second point is why an explicit `kv_window_precision=f16` is a **request,
+not a force**: it falls through to the same honest probe and the same loud
+fallback. Forcing is the debug override's job. `window_f16_precedence` is a pure
+function with a unit test pinning exactly this.
+
+Converted consumers derive the flag from `kvarn_window_is_f16()` or from the
+tensor's own dtype, so a kernel can never disagree with the memory it reads —
+that invariant is the whole reason the routed kernels take a `window_f16`
+kernarg instead of assuming.
+
+Regression after the change, warm, `--max 96`: **57.61 / 57.53 tok/s, τ=5.733**
+on "numbers 1 through 30", unchanged from baseline.
+
+⚠️ **Bench trap:** the FIRST run of a fresh binary reads 34.4 tok/s on that same
+prompt — cold page cache, not a regression. It cost a round of chasing. Discard
+run 1 of any newly built binary, or you will bisect a phantom.
