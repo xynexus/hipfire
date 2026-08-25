@@ -698,7 +698,10 @@ pub fn prefill_session_batch_write_kvarn_kv_layer(
             ),
         ));
     }
-    // K -> per-session f32 recent window at `pos % group`, for this segment only.
+    // K -> per-session recent window at `pos % group`, for this segment only.
+    // dtype comes from the same predicate the allocation uses, so the kernel
+    // selected here always matches the memory it writes.
+    let window_f16 = hipfire_runtime::kv::KvCache::kvarn_window_is_f16();
     gpu.kv_cache_write_kvarn_window_routed_batched(
         &device_tables.kv_win_ptrs,
         k_src,
@@ -711,6 +714,7 @@ pub fn prefill_session_batch_write_kvarn_kv_layer(
         group,
         row_offset,
         row_count,
+        window_f16,
     )?;
     // V -> plain Q8_0. Note this kernel has no row_offset: V is a flat
     // position-addressed store with no wrapping window, so it is safe to write
@@ -765,6 +769,7 @@ pub fn prefill_session_batch_attention_kvarn_layer(
         ));
     }
     gpu.attention_kvarn_routed_batched(
+        hipfire_runtime::kv::KvCache::kvarn_window_is_f16(),
         q_batch,
         &device_tables.kv_k_ptrs,
         &device_tables.kv_win_ptrs,

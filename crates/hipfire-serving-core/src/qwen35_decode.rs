@@ -334,11 +334,29 @@ pub fn maybe_dump_kvarn_state(
         );
         return;
     }
-    let window = match gpu.download_f32(&kv.k_window[layer]) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[kvarn-dump] window readback failed: {}", e.message);
-            return;
+    // The window is f16 or f32 depending on KvCache::kvarn_window_dtype; a bare
+    // download_f32 on an f16 window reinterprets the bytes and returns garbage
+    // with no error, so read it in its own dtype and widen.
+    let window_is_f16 = kv.k_window[layer].dtype == hipfire_rdna::DType::F16;
+    let window = if window_is_f16 {
+        let n = kv.k_window[layer].shape.iter().product::<usize>();
+        match gpu.download_raw(&kv.k_window[layer], n * 2) {
+            Ok(b) => b
+                .chunks_exact(2)
+                .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect::<Vec<f32>>(),
+            Err(e) => {
+                eprintln!("[kvarn-dump] window readback (f16) failed: {}", e.message);
+                return;
+            }
+        }
+    } else {
+        match gpu.download_f32(&kv.k_window[layer]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[kvarn-dump] window readback failed: {}", e.message);
+                return;
+            }
         }
     };
     let records = match gpu.download_f32(&kv.k_gpu[layer]) {

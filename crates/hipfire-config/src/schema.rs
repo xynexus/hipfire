@@ -431,6 +431,26 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          because TriAttention/CASK eviction scoring reads the asym format."
     ),
     field!(
+        "kv_window_precision",
+        ConfigType::Enum {
+            values: &["auto", "f16", "f32"]
+        },
+        Requirement::Optional,
+        Some("auto"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Storage dtype for the KVarN recent window (the trailing partial block held \
+         unquantised before flush). `auto` picks the narrowest dtype every consumer \
+         supports. Each value in the window is read by exactly ONE dot product per \
+         decode step before being quantised to 4-bit on flush, so f16 is ~900x tighter \
+         than the fate of the data it holds (measured Q.K rel err: f16 2.07e-4, bf16 \
+         1.67e-3, the 4-bit it becomes 1.88e-1); f16 beats bf16 because K is bounded, so \
+         mantissa outweighs exponent range. `auto` still resolves to f32 while \
+         Gpu::kvarn_attend stages the window with a 4-bytes/element dtod blit and gathers \
+         tiles from it as f32 — the fallback is announced at load. Worth ~4 MiB and ~0.1% \
+         of bandwidth on a 16-KV-layer 27B, more on a full-attention model."
+    ),
+    field!(
         "kv_adaptive",
         ConfigType::Enum {
             values: &["off", "auto"]

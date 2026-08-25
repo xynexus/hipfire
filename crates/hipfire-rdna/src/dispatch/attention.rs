@@ -1175,6 +1175,8 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn attention_kvarn_routed_batched(
         &mut self,
+        // Must match the window's ALLOCATED dtype (KvCache::kvarn_window_dtype).
+        window_f16: bool,
         q: &GpuTensor,
         rec_ptrs: &GpuTensor,
         win_ptrs: &GpuTensor,
@@ -1220,6 +1222,7 @@ impl Gpu {
             .next_power_of_two()
             .min(256);
         let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let win_f16_i = i32::from(window_f16);
         self.launch_kernargs(
             "attention_kvarn_routed_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -1228,7 +1231,8 @@ impl Gpu {
             &kernargs![
                 ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
                 ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
-                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp
+                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
+                i32 win_f16_i
             ],
         )
     }

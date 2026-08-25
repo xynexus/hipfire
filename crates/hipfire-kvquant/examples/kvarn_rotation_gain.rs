@@ -11,7 +11,9 @@
 use hipfire_kvquant::kvarn::*;
 
 fn lcg(state: &mut u64) -> f32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (((*state >> 33) as f32) / (u32::MAX as f32 / 2.0)) - 1.0
 }
 
@@ -22,13 +24,24 @@ fn main() {
 
     let err = |q: &QuantTile, rf: &[f32]| -> f64 {
         let d = dequantize_tile(q);
-        let num: f64 = d.iter().zip(rf).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-        let den: f64 = rf.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().max(1e-12);
+        let num: f64 = d
+            .iter()
+            .zip(rf)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
+        let den: f64 = rf
+            .iter()
+            .map(|v| (*v as f64).powi(2))
+            .sum::<f64>()
+            .max(1e-12);
         (num / den).sqrt()
     };
 
     println!("{r}x{c} tiles, n={n_tiles}, outlier channels ~1/8, gain = plain/rotated");
-    println!("{:>5} {:>9} {:>9} {:>9} {:>9} {:>7}", "bits", "mean", "std", "min", "max", "n>1");
+    println!(
+        "{:>5} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        "bits", "mean", "std", "min", "max", "n>1"
+    );
     for (bits, qmax) in [(2usize, 3.0f32), (4, 15.0), (8, 255.0)] {
         let mut gains = Vec::with_capacity(n_tiles);
         let mut s = seed;
@@ -36,7 +49,11 @@ fn main() {
             let mut tile = vec![0f32; r * c];
             for ch in 0..r {
                 let outlier = lcg(&mut s) > 0.75; // ~1 in 8 channels
-                let mag = if outlier { 8.0 + 8.0 * lcg(&mut s).abs() } else { 1.0 };
+                let mag = if outlier {
+                    8.0 + 8.0 * lcg(&mut s).abs()
+                } else {
+                    1.0
+                };
                 for t in 0..c {
                     tile[ch * c + t] = lcg(&mut s) * mag;
                 }

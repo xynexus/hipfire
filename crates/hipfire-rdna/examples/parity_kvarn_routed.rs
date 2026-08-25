@@ -289,6 +289,7 @@ fn main() {
         .unwrap();
     let max_ctx = pos_batch.iter().map(|&p| p as usize + 1).max().unwrap();
     gpu.attention_kvarn_routed_batched(
+        false, // window_f16: this fixture allocates an f32 window
         &qd, &recp, &winp, &vp, &out_b, &rsid, &posd, 1, 0, N_HEADS, N_KV_HEADS, HEAD_DIM, MAX_SEQ,
         max_ctx, n_rows,
     )

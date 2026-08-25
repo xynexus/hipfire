@@ -123,6 +123,7 @@ fn main() {
     for (off, cnt) in segments {
         gpu.kv_cache_write_kvarn_window_routed_batched(
             &winp, &kd, &rsid, &posd, 1, 0, N_KV_HEADS, HEAD_DIM, GROUP, off, cnt,
+            false, // window_f16: this fixture allocates an f32 window
         )
         .unwrap();
     }

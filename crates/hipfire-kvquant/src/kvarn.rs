@@ -195,7 +195,10 @@ pub struct QuantTile {
 ///
 /// `n` must be a power of two.
 pub fn hadamard_rows(x: &mut [f32], n: usize) {
-    assert!(n.is_power_of_two(), "hadamard_rows: n must be a power of two");
+    assert!(
+        n.is_power_of_two(),
+        "hadamard_rows: n must be a power of two"
+    );
     assert_eq!(x.len() % n, 0, "hadamard_rows: len must be a multiple of n");
     let scale = 1.0f32 / (n as f32).sqrt();
     for row in x.chunks_mut(n) {
@@ -240,7 +243,11 @@ pub fn hadamard_channels(tile: &mut [f32], r_dim: usize, c_dim: usize) {
         r_dim.is_power_of_two(),
         "hadamard_channels: r_dim (channels) must be a power of two, got {r_dim}"
     );
-    assert_eq!(tile.len(), r_dim * c_dim, "hadamard_channels: tile shape mismatch");
+    assert_eq!(
+        tile.len(),
+        r_dim * c_dim,
+        "hadamard_channels: tile shape mismatch"
+    );
     let scale = 1.0f32 / (r_dim as f32).sqrt();
     let mut col = vec![0f32; r_dim];
     for t in 0..c_dim {
@@ -620,7 +627,11 @@ mod tests {
         }
         let err = |q: &QuantTile, reference: &[f32]| -> f32 {
             let d = dequantize_tile(q);
-            let num: f32 = d.iter().zip(reference).map(|(a, b)| (a - b) * (a - b)).sum();
+            let num: f32 = d
+                .iter()
+                .zip(reference)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
             let den: f32 = reference.iter().map(|v| v * v).sum::<f32>().max(1e-12);
             (num / den).sqrt()
         };
@@ -631,10 +642,7 @@ mod tests {
         // the rotated reference — that is what attention consumes.
         let mut rotated_ref = tile.clone();
         hadamard_channels(&mut rotated_ref, r, c);
-        let rotated = err(
-            &quantize_tile_rotated(&tile, r, c, QMAX_2BIT),
-            &rotated_ref,
-        );
+        let rotated = err(&quantize_tile_rotated(&tile, r, c, QMAX_2BIT), &rotated_ref);
 
         assert!(
             rotated < plain,

@@ -118,8 +118,19 @@ impl MarkovHead {
         };
         let w1 = take(o);
         let w2 = take(o + 4 * n * rank);
-        let index = obs.iter().copied().enumerate().map(|(i, t)| (t, i)).collect();
-        Ok(Self { rank, obs, index, w1, w2 })
+        let index = obs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, t)| (t, i))
+            .collect();
+        Ok(Self {
+            rank,
+            obs,
+            index,
+            w1,
+            w2,
+        })
     }
 
     /// argmax_next of `w1[prev] . w2[*]`. `None` when `prev` was never seen —
@@ -1070,8 +1081,16 @@ fn main() {
     // it, so every measurement taken with it was quietly on a deprecated tier.
     if matches!(
         kv_mode_str.as_str(),
-        "q8" | "asym4" | "turbo4" | "asym3" | "turbo3" | "turbo" | "asym2" | "turbo2"
-            | "fwht4" | "fwht3" | "fwht2"
+        "q8" | "asym4"
+            | "turbo4"
+            | "asym3"
+            | "turbo3"
+            | "turbo"
+            | "asym2"
+            | "turbo2"
+            | "fwht4"
+            | "fwht3"
+            | "fwht2"
     ) {
         eprintln!(
             "WARNING: --kv-mode {kv_mode_str} is DEPRECATED (from {kv_mode_src}). \
@@ -1840,18 +1859,18 @@ fn main() {
         // PLD stats: hits = cycles where a spine was substituted for DFlash;
         // accepted_from_pld = accepted count on those cycles (for τ_pld).
         let mut pld_hits: usize = 0;
-    let markov_head: Option<MarkovHead> = markov_head_path
-        .as_deref()
-        .map(|p| MarkovHead::load(p).expect("failed to load --markov-head"));
-    if let Some(h) = markov_head.as_ref() {
-        eprintln!(
-            "markov head: rank={} n_obs={} (drafts the spine when PLD misses)",
-            h.rank,
-            h.obs.len()
-        );
-    }
-    let mut markov_hits = 0usize;
-    let mut markov_miss = 0usize;
+        let markov_head: Option<MarkovHead> = markov_head_path
+            .as_deref()
+            .map(|p| MarkovHead::load(p).expect("failed to load --markov-head"));
+        if let Some(h) = markov_head.as_ref() {
+            eprintln!(
+                "markov head: rank={} n_obs={} (drafts the spine when PLD misses)",
+                h.rank,
+                h.obs.len()
+            );
+        }
+        let mut markov_hits = 0usize;
+        let mut markov_miss = 0usize;
         let mut pld_accepted: usize = 0;
 
         if ddtree_enabled {

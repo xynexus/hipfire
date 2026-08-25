@@ -107,6 +107,9 @@ fn default_kv_cache() -> String {
 fn default_kv_adaptive() -> String {
     "off".to_string()
 }
+fn default_kv_window_precision() -> String {
+    "auto".to_string()
+}
 fn default_flash_mode() -> String {
     "auto".to_string()
 }
@@ -311,6 +314,8 @@ pub struct HipfireConfig {
     pub kv_cache: String,
     #[serde(default = "default_kv_adaptive")]
     pub kv_adaptive: String,
+    #[serde(default = "default_kv_window_precision")]
+    pub kv_window_precision: String,
     #[serde(default = "default_flash_mode")]
     pub flash_mode: String,
     #[serde(default = "default_dflash_mode")]
@@ -494,6 +499,7 @@ impl Default for HipfireConfig {
             model_residency_mode: default_model_residency_mode(),
             kv_cache: default_kv_cache(),
             kv_adaptive: default_kv_adaptive(),
+            kv_window_precision: default_kv_window_precision(),
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),
             dflash_adaptive_b: default_dflash_adaptive_b(),

@@ -48,9 +48,11 @@ pub fn run(args: GenConfigSchemaArgs) -> anyhow::Result<()> {
                 .unwrap_or(false);
             if !matches {
                 anyhow::bail!(
-                    "config schema is stale: {}\nregenerate with `cargo run -p hipfire-cli -- gen-config-schema --format {:?} --output {}`",
+                    // `{:?}` here printed `Json`, which clap's value_enum rejects --
+                    // the hint has to be a command that actually runs.
+                    "config schema is stale: {}\nregenerate with `cargo run -p hipfire-cli -- gen-config-schema --format {} --output {}`",
                     path.display(),
-                    args.format,
+                    args.format.to_possible_value().expect("no skipped variants").get_name(),
                     path.display(),
                 );
             }

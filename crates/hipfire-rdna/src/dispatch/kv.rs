@@ -1414,12 +1414,20 @@ impl Gpu {
         group: usize,
         row_offset: usize,
         row_count: usize,
+        window_f16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Must match the window's ALLOCATED dtype (KvCache::kvarn_window_dtype).
+        // The two kernels differ only in the store: `(_Float16)v` vs `v`.
+        let kname = if window_f16 {
+            "kv_cache_write_kvarn_window_routed_batched_f16"
+        } else {
+            "kv_cache_write_kvarn_window_routed_batched"
+        };
         self.ensure_kernel(
-            "kv_cache_write_kvarn_window_routed_batched",
+            kname,
             kernels::KV_CACHE_WRITE_KVARN_WINDOW_ROUTED_BATCHED_SRC,
-            "kv_cache_write_kvarn_window_routed_batched",
+            kname,
         )?;
 
         let win_ptrs_ptr = win_ptrs.buf.as_ptr();
@@ -1438,7 +1446,7 @@ impl Gpu {
         let kv_dim = n_kv_heads * head_dim;
         let grid_x = kv_dim.div_ceil(BLOCK) as u32;
         self.launch_kernargs(
-            "kv_cache_write_kvarn_window_routed_batched",
+            kname,
             [grid_x, row_count as u32, 1],
             [BLOCK as u32, 1, 1],
             0,

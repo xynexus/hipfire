@@ -848,7 +848,10 @@ pub fn run_moe_decode(
     } else {
         hipfire_rdna::kernel_trace::record_fallback(
             "moe decode gate side: not all-MQ4 -> 4 separate GEMVs instead of fused_qkvza",
-            &format!("router={:?} shared_gate={:?}", p.router.dtype, p.shared_gate_w.dtype),
+            &format!(
+                "router={:?} shared_gate={:?}",
+                p.router.dtype, p.shared_gate_w.dtype
+            ),
         );
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
@@ -1862,16 +1865,16 @@ pub fn run_grouped_moe_gemm(
                 &format!("{dtype:?} arch={} m={m} k={k}", gpu.arch),
             );
             hip!(gpu.gemm_raw_moe_grouped_portable(
-            dtype,
-            ptrs,
-            tile_ids,
-            sorted_slot_index,
-            x,
-            y,
-            m,
-            k,
-            x_row_div,
-            m_total,
+                dtype,
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
             ))
         }
         DType::ParoQ4G128 => {

@@ -41,7 +41,8 @@ extern "C" __global__ void attention_kvarn_routed_batched(
     float scale_attn,
     int rec_bytes,
     int group
-) {
+,
+    int window_f16                                  // 1 = window holds f16, 0 = f32) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
     if (h >= n_heads) return;
@@ -99,8 +100,17 @@ extern "C" __global__ void attention_kvarn_routed_batched(
                 dot += q_shared[d] * k;
             }
         } else {
-            const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
-            for (int d = 0; d < head_dim; d++) dot += q_shared[d] * kt[d];
+            // f16 or f32 window — the branch is on a kernel argument, so it is
+            // workgroup-uniform. The accumulator stays f32 either way; only the
+            // STORAGE narrows. See KvCache::kvarn_window_dtype.
+            if (window_f16) {
+                const _Float16* kt = reinterpret_cast<const _Float16*>(window)
+                    + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+                for (int d = 0; d < head_dim; d++) dot += q_shared[d] * (float)kt[d];
+            } else {
+                const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+                for (int d = 0; d < head_dim; d++) dot += q_shared[d] * kt[d];
+            }
         }
         float s = dot * scale_attn;
         scores[t] = s;

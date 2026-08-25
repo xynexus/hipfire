@@ -205,6 +205,21 @@ env_vars! {
          default on capacity grounds: FP32 state bounds concurrency (60 MiB per \
          session on a 35B-A3B, ~9x its KV) and OOMs at width 64.";
 
+    KVARN_WINDOW_F16 = "HIPFIRE_KVARN_WINDOW_F16", Developer,
+        "DEBUG OVERRIDE ONLY — the user-facing option is the `kv_window_precision` \
+         config field (docs/config-schema.toml); this exists to develop the \
+         remaining consumers. `1` forces f16, `0` pins f32, unset \
+         lets `KvCache::kvarn_window_f16_status` decide. The window holds the \
+         trailing partial block and each value is read by exactly ONE dot \
+         product before being quantised to 4-bit on flush, so f16 is ~900x \
+         tighter than the fate of the data it holds (measured Q.K rel err: f16 \
+         2.07e-4, bf16 1.67e-3, the 4-bit it becomes 1.88e-1). f16 beats bf16 \
+         here because K is bounded, so mantissa outweighs exponent range. \
+         Default is still f32 because `Gpu::kvarn_attend` stages the window with \
+         a 4-bytes/element dtod blit and gathers tiles from it as f32; forcing \
+         `1` before those are converted overruns the buffer. Worth ~4 MiB and \
+         ~0.1% of bandwidth on a 16-KV-layer 27B, more on a full-attention model.";
+
     // ── lm_head (hipfire-runtime, hipfire-quantize) ─────────────────────────
     LMHEAD_TWOSTAGE = "HIPFIRE_LMHEAD_TWOSTAGE", Developer,
         "Two-stage lm_head decode: coarse Q4 shortlist then bf16 rescore. \

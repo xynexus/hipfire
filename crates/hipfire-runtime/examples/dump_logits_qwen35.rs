@@ -137,9 +137,9 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        other => panic!(
-            "unknown HIPFIRE_KV_MODE: {other} (have: fp32, q8, kvarn, asym4, asym3, asym2)"
-        ),
+        other => {
+            panic!("unknown HIPFIRE_KV_MODE: {other} (have: fp32, q8, kvarn, asym4, asym3, asym2)")
+        }
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();

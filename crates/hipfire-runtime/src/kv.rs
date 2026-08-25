@@ -1211,41 +1211,98 @@ impl KvCache {
     /// corruption, so this probe reports the honest state and the caller falls back
     /// loudly.
     ///
-    /// `HIPFIRE_KVARN_WINDOW_F16=1` forces it on for developing the remaining
-    /// consumers; `=0` pins f32.
+    /// The user-facing knob is the `kv_window_precision` config field
+    /// (`auto` | `f16` | `f32`, load-time). `auto` takes whatever the consumers
+    /// can honestly support — f32 today, f16 once the two blockers below are
+    /// converted — and `f16`/`f32` pin it. `HIPFIRE_KVARN_WINDOW_F16` is a DEBUG
+    /// override for developing those consumers and outranks the config.
     pub fn kvarn_window_f16_status() -> Result<(), &'static str> {
-    match std::env::var("HIPFIRE_KVARN_WINDOW_F16").ok().as_deref() {
-        Some("1") => return Ok(()),
-        Some("0") => return Err("pinned off by HIPFIRE_KVARN_WINDOW_F16=0"),
-        _ => {}
+        if let Some(pinned) = window_f16_precedence(
+            hipfire_env::KVARN_WINDOW_F16.get().as_deref(),
+            Self::kv_window_precision(),
+        ) {
+            return pinned;
+        }
+        // CONVERTED (each derives the flag from `kvarn_window_is_f16()` or from the
+        // tensor's own dtype, so the kernel can never disagree with the memory):
+        //   writer   kv_cache_write_kvarn_window_routed_batched{,_f16}
+        //   readers  attention_flash_kvarn_tile_batched (tile path)
+        //            attention_kvarn_routed_batched     (routed path, gemma3 + zaya)
+        //   diag     qwen35_decode.rs kvarn-dump (reads f16 in its own dtype rather
+        //            than download_f32-ing it into garbage)
+        //
+        // REMAINING, and both are inside `Gpu::kvarn_attend` — the decode/verify
+        // path that qwen35, gemma3 and zaya all funnel through:
+        //   1. it stages K into the window with a RAW dtod blit that hardcodes 4
+        //      bytes/element (`slot * kv_dim * 4`, `take * kv_dim * 4`). fa_k is
+        //      f32, so this is an f32->f32 memcpy and cannot narrow without a
+        //      convert-and-scatter kernel. Flipping the dtype under it overruns the
+        //      buffer — measured: `assert!(dst_offset + size <= dst.size)` at
+        //      hip-bridge ffi.rs:1619 on the first decode step.
+        //   2. `kvarn_gather_k_tiles(window, ..)` then reads the window to build the
+        //      tiles the quantiser consumes, also assuming f32. This one is
+        //      correctness-critical: a mistake here corrupts the KV records
+        //      silently rather than crashing.
+        //
+        // Both are mechanical, but they are on the default KV path for three archs
+        // and the measured prize is ~4 MiB and ~0.1% of bandwidth, so they want their
+        // own change with the parity examples run, not a tail-end flip.
+        Err(
+            "Gpu::kvarn_attend still stages the window with a 4-bytes/element dtod \
+         blit and gathers tiles from it as f32; convert those two and this flips \
+         to f16 automatically",
+        )
     }
-    // Converted: kv_cache_write_kvarn_window_routed_batched_bf16 (writer) and
-    // attention_flash_kvarn_tile_batched (reader, `window_bf16` arg).
-    // NOT converted, and each would misread bf16 as f32:
-    Err("qwen35_decode.rs download_f32(k_window) + gemma3/zaya window readers \
-         still assume f32; convert them, then this flips to f16 automatically")
-}
+
+    /// Resolved `kv_window_precision`. Load-time mutability, so resolving the
+    /// bundle once per process is the contract, not a shortcut.
+    fn kv_window_precision() -> &'static str {
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                let v = hipfire_config::load_config_bundle().config.kv_window_precision;
+                match v.as_str() {
+                    "auto" | "f16" | "f32" => v,
+                    other => {
+                        eprintln!(
+                            "[kvarn] kv_window_precision={other} invalid (want auto|f16|f32); using auto"
+                        );
+                        "auto".to_string()
+                    }
+                }
+            })
+            .as_str()
+    }
+
+    /// Single source of truth for the window's dtype, for consumers that cannot
+    /// see the tensor (the routed write/attend paths take device pointer tables,
+    /// not a `KvCache`). Allocation uses the same predicate, so the flag passed
+    /// to a kernel can never disagree with the memory it reads.
+    pub fn kvarn_window_is_f16() -> bool {
+        Self::kvarn_window_f16_status().is_ok()
+    }
 
     /// Element dtype for the KVarN recent window, announcing any fallback.
     fn kvarn_window_dtype() -> (DType, bool) {
-    match Self::kvarn_window_f16_status() {
-        Ok(()) => (DType::F16, true),
-        Err(why) => {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[kvarn] WINDOW FALLBACK: recent window allocated F32, not f16 — {why}. \
+        match Self::kvarn_window_f16_status() {
+            Ok(()) => (DType::F16, true),
+            Err(why) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[kvarn] WINDOW FALLBACK: recent window allocated F32, not f16 — {why}. \
                      Cost of the fallback: 2x window bytes (GROUP x kv_dim x 4B per KV layer, \
                      ~8 MiB on a 16-KV-layer 27B) and 2x its per-step read traffic. f16 is \
                      measured safe here (Q.K rel err 2.07e-4 vs 1.88e-1 for the 4-bit these \
-                     values become on flush) — this is a wiring gap, not a precision one."
-                );
+                     values become on flush) — this is a wiring gap, not a precision one. \
+                     Knob: config `kv_window_precision` (auto|f16|f32)."
+                    );
+                }
+                (DType::F32, false)
             }
-            (DType::F32, false)
         }
     }
-}
 
     pub fn kvarn_bits_from_env() -> usize {
         match std::env::var("HIPFIRE_KVARN_BITS").ok().as_deref() {
@@ -3076,5 +3133,39 @@ mod index_math_tests {
             kv_quant_mode_from_flags(true, true, false, false, false, false, false, true, false),
             Q8
         );
+    }
+}
+
+/// Debug env override beats config; `f32` pins off. `auto` and `f16` both fall
+/// through (`None`) to the consumer-coverage probe: an explicit `f16` ask is a
+/// REQUEST, not a force, because what blocks it is silent corruption rather
+/// than a slow path — see `KvCache::kvarn_window_f16_status`.
+fn window_f16_precedence(env: Option<&str>, cfg: &str) -> Option<Result<(), &'static str>> {
+    match env {
+        Some("1") => Some(Ok(())),
+        Some("0") => Some(Err(
+            "pinned off by debug override HIPFIRE_KVARN_WINDOW_F16=0",
+        )),
+        _ => match cfg {
+            "f32" => Some(Err("pinned off by config kv_window_precision=f32")),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod kvarn_window_precision_tests {
+    use super::window_f16_precedence;
+
+    #[test]
+    fn env_outranks_config_and_f16_is_a_request_not_a_force() {
+        // Debug override wins in both directions, even against an opposite config.
+        assert_eq!(window_f16_precedence(Some("1"), "f32"), Some(Ok(())));
+        assert!(window_f16_precedence(Some("0"), "f16").unwrap().is_err());
+        // Config pins off.
+        assert!(window_f16_precedence(None, "f32").unwrap().is_err());
+        // auto and f16 defer to the consumer-coverage probe.
+        assert_eq!(window_f16_precedence(None, "auto"), None);
+        assert_eq!(window_f16_precedence(None, "f16"), None);
     }
 }

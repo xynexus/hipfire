@@ -30,7 +30,9 @@ const CH: usize = 128; // channels (head_dim) — the rotation axis
 const BLK: usize = 32; // block size b
 
 fn lcg(s: &mut u64) -> f32 {
-    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (((*s >> 33) as f32) / (u32::MAX as f32 / 2.0)) - 1.0
 }
 
@@ -131,8 +133,16 @@ fn run(steps: usize, qmax: f32, rotate: bool, outlier_every: usize) -> (Vec<f32>
         for (k, kq) in bq_raw.iter().zip(&bq) {
             let nk: f64 = (k.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
             let nq: f64 = (kq.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
-            let dot: f64 = k.iter().zip(kq).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
-            let _cos = if nk * nq > 1e-30 { dot / (nk * nq) } else { 1.0 };
+            let dot: f64 = k
+                .iter()
+                .zip(kq)
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum();
+            let _cos = if nk * nq > 1e-30 {
+                dot / (nk * nq)
+            } else {
+                1.0
+            };
             let e_t: f64 = k
                 .iter()
                 .zip(kq)
