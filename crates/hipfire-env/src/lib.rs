@@ -199,11 +199,24 @@ env_vars! {
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
         "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
-         Storage only; arithmetic stays FP32; no scales, no stochastic rounding, \
-         so spec-decode rollback stays lossless. DEFAULT since 2026-08-12; set \
-         `0` to opt out back to FP32, which remains the numerical oracle. Made \
-         default on capacity grounds: FP32 state bounds concurrency (60 MiB per \
-         session on a 35B-A3B, ~9x its KV) and OOMs at width 64.";
+         Storage only; arithmetic stays FP32. OPT-IN: unset means FP32, which \
+         remains the numerical oracle. \
+         \
+         This line previously read `DEFAULT since 2026-08-12; set 0 to opt out`, \
+         which was never true of the code: `default_state_quant` gates on \
+         `DN_STATE_FP16.flag()`, and `flag()` is false when unset. Its own \
+         comment says the opposite of the old doc — `Opt in per-deployment; do \
+         not move the default on the capacity number alone, which one branch \
+         briefly did`. A doc claiming a default the code does not have is worse \
+         than no doc: it tells you to set `0` to change behaviour that is \
+         already off, and it is why FP16 state was believed live when it was not. \
+         \
+         The capacity argument for moving the default is real (FP32 state is \
+         60 MiB per session on a 35B-A3B, ~9x its KV, and OOMs at width 64) and \
+         so is the throughput: measured +5.5% on Qwen3.8-27B spec decode, \
+         63.90 -> 67.42 tok/s at B=10 with a byte-identical token stream. What \
+         `default_state_quant` asks for before flipping is a teacher-forced \
+         FP32-vs-FP16 KLD sweep on more than one model.";
 
     KVARN_WINDOW_F16 = "HIPFIRE_KVARN_WINDOW_F16", Developer,
         "DEBUG OVERRIDE ONLY — the user-facing option is the `kv_window_precision` \
