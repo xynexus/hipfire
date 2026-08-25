@@ -1414,3 +1414,72 @@ FP16 halves the DRAM-bound term that dominates the call, and halves the
 spec-decode state snapshot alongside it. It is the only thing that moved the
 number, it is opt-in, and the env doc claimed for months that it was already
 the default. See the `HIPFIRE_DN_STATE_FP16` entry.
+
+## ⚠️ RETRACTION: most of the DeltaNet ablation section above is INVALID
+
+`kernels.rs` does `include_str!` on the .hip files, so **kernel source is
+embedded in the Rust binary at build time**. Editing a .hip and deleting
+`~/.hipfire/kernels/gfx1151/*` does NOT change what runs — the cache is
+recompiled from the same stale embedded string. Every ablation run without a
+`cargo build` in between measured the unmodified kernel.
+
+Caught by an impossible result: with the ENTIRE token loop ablated, runtime
+still scaled with n_tokens (0.0238 / 0.0516 / 0.0971 ms at t=1/10/24). A kernel
+doing no per-token work cannot do that.
+
+Corrected, with a rebuild between every edit:
+
+| claim (as published above) | corrected |
+|---|---|
+| reductions cost only 4% — "NOT shuffle-bound" | **WRONG. They are 57% of the marginal**: ablating them takes t=24 from 0.0965 to 0.0533 ms (−45%) |
+| LDS -> register hoist worth −3.7% | **null** (0.0523 vs 0.0524) |
+| TILE_ROWS 4/8/16 null | untested; that sweep never changed the binary |
+| output store / q-k loads null | untested |
+
+Only the env-var-driven results (FP16 state, chunkwise) were valid, because
+those needed no kernel edit.
+
+Ablation with a correct build, 48 heads:
+
+    baseline            t=1 0.0239  t=10 0.0518  t=24 0.0979
+    no token loop       t=1 0.0180  t=10 0.0201  t=24 0.0212   <- flat, as it must be
+    loop, no row work   t=1 0.0181  t=10 0.0193  t=24 0.0212
+    no reductions       t=1   -     t=10 0.0368  t=24 0.0533
+    no out dot          t=1   -     t=10 0.0516  t=24 0.0985   <- null
+
+So: fixed ~18-21 us (state I/O, at the DRAM ceiling), and the per-token cost is
+**dominated by the two 32-lane shuffle reductions**, 40+ shuffle steps per token
+on the critical path.
+
+## The fix works in isolation and LOSES end-to-end — deferred, not abandoned
+
+Restructured the wave as 4 groups of 8 lanes: group `g` owns row `row_start+g`,
+lane `l` owns columns [16l, 16l+16), so the 4 rows resolve CONCURRENTLY and each
+reduction spans 8 lanes (`__shfl_down(v, o, 8)`) instead of 32. Per token:
+2x3 shuffle steps instead of 4x(5+5). Same FMA work, 4x the ILP.
+Kept at `docs/experiments/gated_delta_net_8lane_groups.hip.txt`.
+
+    kernel   t=10 0.0513 -> 0.0377 (−27%)   t=24 0.0965 -> 0.0574 (−41%)
+    VGPRs 46 -> 72, no spills, occupancy still 16
+    parity vs f64 CPU reference: PASS (3.4e-7)
+
+But `test_gated_delta_net_tree_f32` went **FAIL: f32 tree vs f32 linear 782/2560
+byte-exact, max|diff| 2.794e-9**, and end-to-end **tau fell 6.917 -> 6.308 and
+throughput 63.75 -> 59.73 tok/s**.
+
+Changing the summation order changes the rounding, and the f32 GDN kernels are
+required to agree BIT-FOR-BIT: `gated_delta_net_f32_tree.hip` says so in its own
+header ("Lane mapping is `col = tid * 4` (contiguous), matching the FP32 LINEAR
+kernel"). When they disagree, replay commits a state sequential decode never
+reaches and acceptance collapses — the exact failure the f16 dither commit
+(074e28503) fixed the tree kernel to avoid.
+
+REVERTED. To land it, the identical layout has to go into every f32 GDN kernel
+at once — `gated_delta_net_f32_tree.hip`,
+`gated_delta_net_f32_routed_batch_seq.hip`, and the batch-seq variant — then
+re-verify byte-exactness across all of them. Worth ~2-3% end-to-end (DeltaNet is
+~7% of the cycle and this halves its marginal), which is why it is recorded
+rather than dropped.
+
+Note the FP16 state path is untouched by all of this and still wins outright at
+67.5 tok/s, because it attacks the DRAM-bound fixed half instead.
