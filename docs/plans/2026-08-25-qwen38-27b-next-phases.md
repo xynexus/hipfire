@@ -615,3 +615,32 @@ NOT warned about, deliberately: the daemon warns that KVarN without
 serving-path condition and is FALSE here — measured, this harness reaches tau
 5.733 with the flag unset (57.39) and 57.54 with it set, so the drafter engages
 either way. A warning that is false where it prints is worse than none.
+
+
+## Prefill fidelity, re-measured: batched is 2.3x worse than per-token (not 57x)
+
+With KVarN now the default it was worth re-checking the recorded claim that
+"batched prefill + KVarN is 57x less faithful than per-token". It does not hold.
+`compare_prefill_hidden_paths --n 48` on this model:
+
+```
+batched vs per-token:   worst |rel| 1.58e-2, first diverging layer 0
+against the fp32-KV reference (lower is more faithful):
+  batched    2.766e-2
+  per-token  1.203e-2        -> 2.3x, not 57x
+```
+
+And it is **not KV-tier-specific**: `kvarn` and `q8` return byte-identical
+numbers. Both are 8-bit KV, and with only 16 FA layers over 48 tokens the tier
+barely moves the residual stream — the divergence is dominated by the
+BATCHED-vs-PER-TOKEN difference itself, which is the real defect and applies to
+every dtype. (`asym3` is unsupported by that tool and panics cleanly, which is
+the correct behaviour and worth contrasting with the demo's silent q8 default.)
+
+This is the mechanism behind the ~±22% acceptance swing already documented for
+`HIPFIRE_COMPACT_BATCHED_CAPTURE`: the drafter is sensitive to which capture it
+receives.
+
+No fallback bugs remain in prefill: a 2408-token run under
+`HIPFIRE_KERNEL_TRACE=1` takes the batched path (`verdict=true ... n=2408`) and
+fires only the decode-side verify-graph site.
