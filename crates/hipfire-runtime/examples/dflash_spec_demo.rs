@@ -2126,7 +2126,7 @@ fn main() {
         // CLAMPED INTO THE REQUESTED RANGE. Seeding from the drafter's trained
         // block_size alone is a bug when the range does not contain it: the
         // controller then STARTS out of range and can only walk back in one
-        // ADAPTIVE_B_STEP at a time, gated by ADAPTIVE_B_COOLDOWN, so a short
+        // ADAPTIVE_B_STEP at a time, gated by a cooldown, so a short
         // run never arrives. `--adaptive-b-range 6:6` — a pin, with no decision
         // left to make — ran the whole session at B=16 (verified in the
         // HIPFIRE_SPEC_PHASES trace: every line read `B=16`).
@@ -2139,12 +2139,10 @@ fn main() {
             std::collections::HashMap::new();
         let mut current_adaptive_b: usize =
             draft_cfg.block_size.clamp(adaptive_b_min, adaptive_b_max);
-        let mut adaptive_b_cycles_since_change: usize = 0;
         let mut adaptive_b_histogram: std::collections::HashMap<usize, u32> =
             std::collections::HashMap::new();
         let mut adaptive_b_changes: u32 = 0;
         const ADAPTIVE_B_STEP: usize = 2;
-        const ADAPTIVE_B_COOLDOWN: usize = 3;
         // Hysteresis thresholds on util = EWMA(accept_len) / (current_B - 1):
         //   util > UP   → draft keeps up, stretch B further.
         //   util < DOWN → draft lags, shrink B to cut verify cost.
@@ -2355,7 +2353,6 @@ fn main() {
                         best
                     }
                 };
-                adaptive_b_cycles_since_change += 1;
                 *adaptive_b_histogram.entry(current_adaptive_b).or_insert(0) += 1;
                 Some(current_adaptive_b)
             } else {
