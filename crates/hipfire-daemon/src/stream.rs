@@ -178,22 +178,29 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
         0,
         WorkloadResources::default(),
     );
-    // The rng is a slot: the daemon's decode path does not sample through
-    // `SamplerRng` yet, and greedy decode never consults it — which is why
-    // greedy baselines must not move when this lands.
+    // Seeded by DERIVATION, not entropy (§M1b). `from_entropy()` made every
+    // admission unreproducible and, worse, made a stream's output depend on
+    // nothing it owns; the derived seed is a pure function of (session,
+    // request), so a stream samples the same whether it runs alone or beside
+    // others. Greedy decode never consults it either way.
+    // Hoisted above `admit` because the seed derives from it; it is assigned to
+    // the stream below exactly as before.
+    let request_id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .to_string();
+    let sampler_seed =
+        hipfire_runtime::sampler::derive_stream_seed(session.as_str(), &request_id);
     let id = match state
         .streams
-        .admit(session, spec, SamplerRng::from_entropy())
+        .admit(session, spec, SamplerRng::from_seed(sampler_seed))
     {
         Ok(id) => id,
         Err(AdmitError::SessionAlreadyLive(_)) => return None,
     };
     if let Some(stream) = state.streams.get_mut(id) {
-        stream.request_id = msg
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0")
-            .to_string();
+        stream.request_id = request_id;
         stream.run();
         // §M3d measurement 2 needs an admission instant that can be attributed to
         // a stream. `DispatchBegin` cannot serve: it is frame-scoped and carries
