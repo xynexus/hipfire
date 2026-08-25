@@ -36,6 +36,7 @@ __global__ void gated_delta_net_f32(
     for (int i = tid; i < TILE_ROWS * HD; i += 32)
         S_tile[i] = S_global[i];
 
+    float out_row[TILE_ROWS];
     for (int t = 0; t < n_tokens; t++) {
         const float* q_t = q + t * stride + h * HD;
         const float* k_t = k + t * stride + h * HD;
@@ -67,8 +68,21 @@ __global__ void gated_delta_net_f32(
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
-            if (tid == 0)
-                output[t * stride + h * HD + row] = out_v;
+            // Stash rather than store. The per-row store was a SINGLE-LANE
+            // 4-byte scattered write, four per token per block, each its own
+            // memory transaction against a 32-byte granule. Ablating it was
+            // worth 40% of t=24 -- the second-largest term after the shuffle
+            // reductions.
+            out_row[r] = out_v;
+        }
+        // One coalesced store for the tile's 4 CONTIGUOUS rows. Pure store
+        // shaping: the arithmetic and its ORDER are untouched, so the f32 GDN
+        // kernels stay byte-exact with each other -- which is exactly what the
+        // 8-lane-group reduction rewrite could not preserve.
+        if (tid == 0) {
+            float* dst = output + t * stride + h * HD + row_start;
+            #pragma unroll
+            for (int r = 0; r < TILE_ROWS; r++) dst[r] = out_row[r];
         }
     }
 

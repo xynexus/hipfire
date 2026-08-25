@@ -1483,3 +1483,58 @@ rather than dropped.
 
 Note the FP16 state path is untouched by all of this and still wins outright at
 67.5 tok/s, because it attacks the DRAM-bound fixed half instead.
+
+## DeltaNet, corrected: where the per-token cost really is
+
+With a rebuild between every edit (48 heads, ms at t=10 / t=24):
+
+| ablation | t=10 | t=24 | reading |
+|---|---|---|---|
+| baseline | 0.0519 | 0.0970 | — |
+| no token loop | 0.0201 | 0.0212 | fixed cost ~20 us, flat — state I/O at the DRAM ceiling |
+| **no reductions** | **0.0368** | **0.0533** | **the dominant per-token term** |
+| no output store | 0.0365 | 0.0584 | ⚠️ CONFOUNDED — see below |
+| no q/k global loads | 0.0487 | 0.0943 | 3-6%, minor |
+| no out dot | 0.0516 | 0.0985 | null |
+
+⚠️ **"no output store" is not a store measurement.** Removing the store makes
+`out_v` dead, so the compiler also eliminates the out-dot AND the second
+reduction. That is why it reads 40% — it is measuring the reduction a second
+time. Coalescing the store for real (below) is worth 2%, not 40%. An ablation
+that deletes a *consumer* deletes everything upstream of it; only ablations that
+keep the value live measure what they name.
+
+So the per-token cost is dominated by the two 32-lane shuffle reductions, and
+essentially nothing else is worth attacking.
+
+### Landed: coalesced output store (byte-exact, ~2%)
+
+The per-row store was a single-lane 4-byte scattered write, four per token per
+block. Now the four contiguous rows are stashed and written together. Pure store
+shaping — arithmetic and its ORDER untouched — so all four parity tests stay
+green and tau is unchanged.
+
+    kernel  t=10 0.0519 -> 0.0509   t=24 0.0970 -> 0.0949
+    e2e     64.18 -> 64.3 tok/s at B=10, tau 6.917
+
+### On "drop the whole kernel to f16"
+
+Worth separating what is already f16 from what is not. `HIPFIRE_DN_STATE_FP16`
+narrows the GLOBAL STATE only: `gated_delta_net_f16.hip` still stages an
+**FP32 working copy in LDS** and does every operation — q/k/v, both dots, both
+reductions, the update — in `float`. That is deliberate, and the dither exists
+because f16 *storage alone* is already biased on a recurrent accumulator.
+
+Narrowing the arithmetic would attack the FMA term, which the table above shows
+is the MINORITY. The dominant term is the reductions, and those are 32-bit
+shuffles whose count does not fall just because the values are narrower. Packing
+two rows' partials into one 32-bit shuffle WOULD halve them — but that changes
+the reduction's precision and order, which is the byte-exactness constraint
+again.
+
+Which is the real conclusion: **every remaining DeltaNet lever changes summation
+order, and therefore has to be applied to the whole f32 GDN kernel family in one
+change** (`gated_delta_net.hip`, `_f32_tree`, `_f32_routed_batch_seq`, the
+batch-seq variant), with byte-exactness re-verified across all of them. The
+8-lane-group experiment is worth −27%/−41% on the kernel and is kept in
+`docs/experiments/`; it is blocked on exactly that, not on the idea.
