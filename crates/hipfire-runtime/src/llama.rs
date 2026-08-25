@@ -81,8 +81,24 @@ thread_local! {
 /// vectors do not look like decode states, and on real ones the same K is
 /// lossless. Corrected here rather than kept as a free-looking margin, because
 /// 8192 costs 22 MB/token for nothing.
+/// Resolved `lmhead_twostage` config value, or `None` when unset/empty.
+/// Load-time mutability, so one resolve per process is the contract.
+fn lmhead_twostage_config() -> Option<&'static String> {
+    static RESOLVED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let v = hipfire_config::load_config_bundle().config.lmhead_twostage;
+            (!v.trim().is_empty()).then_some(v)
+        })
+        .as_ref()
+}
+
 fn lmhead_twostage_cfg(compact: bool) -> Option<(usize, usize)> {
-    let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
+    // Env is the debug override; the user-facing setting is the `lmhead_twostage`
+    // config field. Same precedence as everywhere else in the project.
+    let v = hipfire_env::LMHEAD_TWOSTAGE
+        .get()
+        .or_else(|| lmhead_twostage_config().cloned())?;
     let q2_k = if compact { 512usize } else { 128usize };
     let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
         (2usize, q2_k, r)

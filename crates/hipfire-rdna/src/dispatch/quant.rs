@@ -778,7 +778,10 @@ impl Gpu {
         // and stays the fallback. HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1 to enable
         // while it is being proven against the narrow one.
         let ng_ok = (k / 256) % 4 == 0;
-        let wide = ng_ok && std::env::var("HIPFIRE_OQ_COMPACT_MULTICOL_WIDE").as_deref() == Ok("1");
+        // Was a raw `env::var` on EVERY dispatch -- the exact per-call global-lock
+        // hit `FeatureFlags` exists to prevent (see its module docs). Read once at
+        // Gpu::init now, and settable from config rather than env-only.
+        let wide = ng_ok && self.flags.oq_compact_multicol_wide;
         if wide {
             let entry: &str = match batch_size {
                 1 => "gemv_oq_compact_multicol_w1",

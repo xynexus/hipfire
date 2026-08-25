@@ -8,6 +8,48 @@
 //! `FeatureFlags::from_env()`. Dispatching hot paths access `self.flags.*`
 //! instead of hitting `std::env::var`'s global lock on every call.
 
+/// Config values for flags a user may set in the config file, installed by a
+/// config-capable crate at startup.
+///
+/// `hipfire-rdna` has ZERO dependencies and must keep it that way — it cannot
+/// read `hipfire-config` without dragging serde into every crate that dispatches
+/// a kernel. So the value is PUSHED down here instead of pulled up there, and
+/// the dependency arrow stays pointing the right way.
+///
+/// Precedence, matching the rest of the project: a real env var is a debug
+/// override and wins; config is the user-facing setting; then the compiled
+/// default. Install before `Gpu::init()` — `FeatureFlags::from_env` reads these
+/// once and hot paths use the cached struct.
+static CONFIG_OVERRIDES: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+    std::sync::OnceLock::new();
+
+pub fn install_config_overrides(values: std::collections::BTreeMap<String, String>) {
+    let _ = CONFIG_OVERRIDES.set(values);
+}
+
+/// Whether [`install_config_overrides`] has run. A binary that resolves config
+/// but never installs it silently gets env-only behaviour, so callers that care
+/// can assert rather than wonder.
+pub fn config_overrides_installed() -> bool {
+    CONFIG_OVERRIDES.get().is_some()
+}
+
+fn truthy(v: &str) -> bool {
+    matches!(v.trim(), "1" | "true" | "yes" | "on")
+}
+
+fn config_or_env_bool(key: &str, env_name: &str, default: bool) -> bool {
+    #[allow(clippy::disallowed_methods)]
+    if let Ok(raw) = std::env::var(env_name) {
+        return truthy(&raw);
+    }
+    CONFIG_OVERRIDES
+        .get()
+        .and_then(|m| m.get(key))
+        .map(|v| truthy(v))
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mb4Mode {
     Pack1,
@@ -49,6 +91,12 @@ pub struct FeatureFlags {
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
     pub lm_head_overwrite: bool,
+
+    /// Wide (8-lane, dwordx4) compact multicol GEMV. Needs `ng % 4 == 0`
+    /// (K % 1024 == 0); the narrow kernel is the fallback and has no such
+    /// constraint. Measured 24.3 -> 55.5 tok/s on Qwen3.8-27B/gfx1151 — the
+    /// single largest decode lever on that model, and it defaults OFF.
+    pub oq_compact_multicol_wide: bool,
 
     // ── MMQ screening ─────────────────────────────────────────────
     pub mmq_screen: bool,
@@ -220,6 +268,12 @@ impl FeatureFlags {
             lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA")
                 .map_or(false, |v| v == "0"),
             lm_head_overwrite: std::env::var("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
+
+            oq_compact_multicol_wide: config_or_env_bool(
+                "oq_compact_multicol_wide",
+                "HIPFIRE_OQ_COMPACT_MULTICOL_WIDE",
+                false,
+            ),
 
             // MMQ screening
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN")
@@ -424,6 +478,7 @@ impl FeatureFlags {
             wo_mmq: false,
             lm_head_wmma_disabled: false,
             lm_head_overwrite: false,
+            oq_compact_multicol_wide: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
             mmq_diag_quantize_only: false,

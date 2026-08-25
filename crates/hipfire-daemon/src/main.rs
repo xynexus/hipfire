@@ -1511,6 +1511,10 @@ fn main() {
     // `hipfire_runtime::GENERATION_CANCEL`.
     hipfire_runtime::install_generation_cancel_handler();
 
+    // Before ANY Gpu::init: FeatureFlags snapshots once at init and hot paths
+    // read the cached struct, so config values installed later would be ignored.
+    hipfire_runtime::config::install_rdna_overrides();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {

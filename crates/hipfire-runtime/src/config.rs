@@ -43,6 +43,26 @@ pub struct RuntimeConfig {
     pub mtp_k: usize,
 }
 
+/// Push config-file values down into `hipfire-rdna`'s `FeatureFlags` seam.
+///
+/// `hipfire-rdna` is dependency-free by design and cannot read `hipfire-config`,
+/// so the values travel down instead of the dependency travelling up. Call this
+/// BEFORE `Gpu::init()`: `FeatureFlags::from_env` snapshots once and every hot
+/// path then reads the cached struct.
+///
+/// A binary that skips this still works — it just gets env-and-default behaviour
+/// and silently ignores the config file, which is why
+/// `feature_flags::config_overrides_installed()` exists to assert against.
+pub fn install_rdna_overrides() {
+    let cfg = hipfire_config::load_config_bundle().config;
+    let mut values = std::collections::BTreeMap::new();
+    values.insert(
+        "oq_compact_multicol_wide".to_string(),
+        cfg.oq_compact_multicol_wide.to_string(),
+    );
+    hipfire_rdna::feature_flags::install_config_overrides(values);
+}
+
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
 pub fn get() -> &'static RuntimeConfig {

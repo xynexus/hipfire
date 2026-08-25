@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::{ConfigField, Requirement};
+use crate::schema::{ConfigField, ConfigType, Requirement};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +103,95 @@ pub struct UnknownConfigKey {
 pub struct ConfigResolution {
     pub values: Vec<ResolvedConfigValue>,
     pub unknown_keys: Vec<UnknownConfigKey>,
+}
+
+/// Environment variable name for a config key: `HIPFIRE_` + the key upper-cased.
+/// One mechanical rule, no per-field table — a new schema field gets its env
+/// override for free, and nobody has to remember to register it.
+pub fn env_var_name_for_key(key: &str) -> String {
+    format!("HIPFIRE_{}", key.to_uppercase())
+}
+
+/// Build the `Environment` layer from `HIPFIRE_*` variables.
+///
+/// This exists so env is a RESOLUTION SOURCE rather than a bypass. Before it,
+/// subsystems read `env::var` directly and overwrote the already-resolved config
+/// value in place: env silently outranked config, nothing announced it, and one
+/// setting had two independent sources. Routed through here instead, an override
+/// lands in the normal precedence chain (files < environment < cli/request) and
+/// `hipfire config show` reports `environment` as the source.
+///
+/// Values are parsed AGAINST THE FIELD'S TYPE and a bad one is rejected, not
+/// coerced. That matters more than it looks: every resolved value is fed to one
+/// `serde_json::from_value::<HipfireConfig>`, so a single unparseable env var
+/// would fail the whole struct and silently fall back to `Default` — one typo
+/// would reset every other setting. Rejects are returned for the caller to
+/// surface as diagnostics.
+pub fn config_layer_from_env(fields: &[ConfigField]) -> (Option<ConfigLayer>, Vec<String>) {
+    config_layer_from_env_with(fields, |name| std::env::var(name).ok())
+}
+
+/// Testable core of [`config_layer_from_env`].
+pub fn config_layer_from_env_with(
+    fields: &[ConfigField],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Option<ConfigLayer>, Vec<String>) {
+    let mut layer = ConfigLayer::new(ConfigLayerKind::Environment);
+    let mut rejected = Vec::new();
+
+    for field in fields {
+        let name = env_var_name_for_key(field.key);
+        let Some(raw) = lookup(&name) else { continue };
+        match parse_env_value(&raw, &field.ty) {
+            Ok(value) => {
+                layer.values.insert(field.key.to_string(), value);
+            }
+            Err(why) => rejected.push(format!("{name}={raw} ignored: {why}")),
+        }
+    }
+
+    if layer.values.is_empty() {
+        (None, rejected)
+    } else {
+        (Some(layer), rejected)
+    }
+}
+
+fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    match ty {
+        // `1`/`0` as well as `true`/`false`: the env vars this layer replaces
+        // overwhelmingly used `=1`, and rejecting that would break every habit
+        // and doc line that already exists.
+        ConfigType::Bool => match trimmed {
+            "1" | "true" | "yes" | "on" => Ok(Value::Bool(true)),
+            "0" | "false" | "no" | "off" => Ok(Value::Bool(false)),
+            _ => Err("want a boolean (1/0, true/false, yes/no, on/off)".to_string()),
+        },
+        ConfigType::U8 | ConfigType::U16 | ConfigType::U32 | ConfigType::U64 => trimmed
+            .parse::<u64>()
+            .map(|n| Value::from(n))
+            .map_err(|_| "want a non-negative integer".to_string()),
+        ConfigType::I32 => trimmed
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| "want an integer".to_string()),
+        ConfigType::F64 => trimmed
+            .parse::<f64>()
+            .map(|n| Value::from(n))
+            .map_err(|_| "want a number".to_string()),
+        ConfigType::Enum { values } => {
+            if values.contains(&trimmed) {
+                Ok(Value::String(trimmed.to_string()))
+            } else {
+                Err(format!("want one of {}", values.join("|")))
+            }
+        }
+        ConfigType::String | ConfigType::Path => Ok(Value::String(raw.to_string())),
+        ConfigType::Json => {
+            serde_json::from_str::<Value>(raw).map_err(|err| format!("want valid JSON ({err})"))
+        }
+    }
 }
 
 pub fn resolve_config_layers(fields: &[ConfigField], layers: &[ConfigLayer]) -> ConfigResolution {
@@ -399,5 +488,72 @@ mod tests {
             model_overrides.source.as_ref().map(|source| source.kind),
             Some(ConfigLayerKind::CompiledDefault)
         );
+    }
+}
+
+#[cfg(test)]
+mod env_layer_tests {
+    use super::{config_layer_from_env_with, env_var_name_for_key, ConfigLayerKind};
+    use crate::schema::config_schema;
+    use std::collections::HashMap;
+
+    fn layer_from(pairs: &[(&str, &str)]) -> (Option<super::ConfigLayer>, Vec<String>) {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        config_layer_from_env_with(config_schema(), |name| map.get(name).cloned())
+    }
+
+    #[test]
+    fn name_rule_is_mechanical() {
+        assert_eq!(
+            env_var_name_for_key("prefill_block"),
+            "HIPFIRE_PREFILL_BLOCK"
+        );
+    }
+
+    #[test]
+    fn typed_values_land_in_an_environment_layer() {
+        let (layer, rejected) = layer_from(&[
+            ("HIPFIRE_PORT", "18080"),
+            ("HIPFIRE_KV_CACHE", "kvarn8"),
+            ("HIPFIRE_PREFILL_PROFILE", "1"),
+        ]);
+        let layer = layer.expect("env layer");
+        assert_eq!(layer.kind, ConfigLayerKind::Environment);
+        assert_eq!(layer.values["port"], 18080);
+        assert_eq!(layer.values["kv_cache"], "kvarn8");
+        // `=1` for a bool: the env vars this layer replaces used that spelling.
+        assert_eq!(layer.values["prefill_profile"], true);
+        assert!(rejected.is_empty(), "{rejected:?}");
+    }
+
+    #[test]
+    fn a_bad_value_is_rejected_alone_and_never_poisons_the_rest() {
+        // The whole resolved map goes through ONE from_value::<HipfireConfig>, so
+        // an unparseable value that got through would fail the entire struct and
+        // fall back to Default -- one typo silently resetting every setting.
+        let (layer, rejected) = layer_from(&[
+            ("HIPFIRE_PORT", "not-a-port"),
+            ("HIPFIRE_KV_CACHE", "kvarn9"),
+            ("HIPFIRE_HOST", "0.0.0.0"),
+        ]);
+        let layer = layer.expect("env layer");
+        assert!(!layer.values.contains_key("port"));
+        assert!(!layer.values.contains_key("kv_cache"));
+        assert_eq!(layer.values["host"], "0.0.0.0");
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        // The message names the legal values, so a typo tells you the fix.
+        assert!(rejected
+            .iter()
+            .any(|m| m.contains("HIPFIRE_KV_CACHE") && m.contains("kvarn8")));
+    }
+
+    #[test]
+    fn no_env_means_no_layer() {
+        let (layer, rejected) = layer_from(&[]);
+        assert!(layer.is_none());
+        assert!(rejected.is_empty());
     }
 }

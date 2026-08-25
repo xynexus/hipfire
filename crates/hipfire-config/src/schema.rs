@@ -431,6 +431,35 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          because TriAttention/CASK eviction scoring reads the asym format."
     ),
     field!(
+        "lmhead_twostage",
+        ConfigType::String,
+        Requirement::Optional,
+        Some("\"\""),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Two-stage lm_head decode: a coarse shortlist pass then a full-precision \
+         rescore. `q2` (2-bit tier) or `q4`; append `:<K>` to set the shortlist \
+         width. Empty disables it and the exact full-vocab GEMV runs. Measured \
+         INERT on Qwen3.8-27B decode (24.27 vs 24.31 tok/s with the wide multicol \
+         GEMV off), so it is not the lever on that model — it is exposed because \
+         it carries real wins on heads where the lm_head actually dominates."
+    ),
+    field!(
+        "oq_compact_multicol_wide",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Wide (8-lane, dwordx4) compact multicol decode GEMV. Needs K % 1024 == 0; \
+         the narrow kernel is the fallback where that does not hold. Measured \
+         24.3 -> 55.5 tok/s on Qwen3.8-27B (gfx1151), which makes it the single \
+         largest decode lever on that model — and it defaults OFF while it is \
+         proven against the narrow kernel on more shapes. Was reachable only as \
+         HIPFIRE_OQ_COMPACT_MULTICOL_WIDE, so the engine's headline throughput \
+         depended on knowing an env var."
+    ),
+    field!(
         "kv_window_precision",
         ConfigType::Enum {
             values: &["auto", "f16", "f32"]

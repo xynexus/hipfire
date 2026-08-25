@@ -1117,3 +1117,34 @@ on "numbers 1 through 30", unchanged from baseline.
 ⚠️ **Bench trap:** the FIRST run of a fresh binary reads 34.4 tok/s on that same
 prompt — cold page cache, not a regression. It cost a round of chasing. Discard
 run 1 of any newly built binary, or you will bisect a phantom.
+
+## The headline number depended on knowing an env var
+
+Measured properly (each knob isolated with `env -u`; the three were previously
+exported together, which made every partial run look like "both on"):
+
+| knob | tok/s alone | verdict |
+|---|---|---|
+| `HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1` | **55.53** | the entire 2.3x |
+| `HIPFIRE_LMHEAD_TWOSTAGE=q2` | 24.27 | inert on this model |
+| `HIPFIRE_GRAPH=1` | 57.07 vs 57.57 unset | no-op — AR-forward hipGraph is hard-disabled |
+| all off | 24.31 | baseline |
+
+Two of the three incantations in the bench recipe above do nothing here. The
+whole gap between 24 and 56 tok/s was ONE opt-in env var that defaults off, read
+by a raw `env::var` on every dispatch — in the crate whose `FeatureFlags` module
+exists precisely to stop that ("read exactly once at `Gpu::init()`... instead of
+hitting `std::env::var`'s global lock on every call").
+
+It is now `oq_compact_multicol_wide` in the config file, verified end to end:
+**55.98 tok/s from config alone with no env set**, and `HIPFIRE_...=0` still pins
+it off at 24.36 as the debug override.
+
+Default stays OFF pending cross-shape proof against the narrow kernel — it needs
+`K % 1024 == 0` and falls back where that fails. On this model it is a 2.3x
+default waiting to be flipped.
+
+⚠️ **Measurement trap, second instance this session:** `export A=1 B=2` then
+`B=2 cmd` does NOT unset A. Every "A off" row was really "both on". Use
+`env -u A -u B` per run. The first instance was cold-cache; both produced
+confident wrong numbers that survived until something looked impossible.

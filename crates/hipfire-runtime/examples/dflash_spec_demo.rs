@@ -173,6 +173,9 @@ impl MarkovHead {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    // Same ordering rule as the daemon: install before any Gpu::init --
+    // FeatureFlags snapshots once there and hot paths read the cached struct.
+    hipfire_runtime::config::install_rdna_overrides();
     use hipfire_arch_qwen35::qwen35::LayerType;
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,

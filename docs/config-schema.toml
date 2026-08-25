@@ -241,6 +241,18 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "lmhead_twostage"
+type = "string"
+requirement = "optional"
+default = "\"\""
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Two-stage lm_head decode: a coarse shortlist pass then a full-precision rescore. `q2` (2-bit tier) or `q4`; append `:<K>` to set the shortlist width. Empty disables it and the exact full-vocab GEMV runs. Measured INERT on Qwen3.8-27B decode (24.27 vs 24.31 tok/s with the wide multicol GEMV off), so it is not the lever on that model — it is exposed because it carries real wins on heads where the lm_head actually dominates."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "max_seq"
 type = "u32"
 requirement = "optional"
@@ -357,6 +369,18 @@ scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
 description = "Multi-token prediction sidecar mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "oq_compact_multicol_wide"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Wide (8-lane, dwordx4) compact multicol decode GEMV. Needs K % 1024 == 0; the narrow kernel is the fallback where that does not hold. Measured 24.3 -> 55.5 tok/s on Qwen3.8-27B (gfx1151), which makes it the single largest decode lever on that model — and it defaults OFF while it is proven against the narrow kernel on more shapes. Was reachable only as HIPFIRE_OQ_COMPACT_MULTICOL_WIDE, so the engine's headline throughput depended on knowing an env var."
 secret = false
 restart_impact = "none"
 

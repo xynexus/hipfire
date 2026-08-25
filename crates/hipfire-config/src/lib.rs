@@ -19,7 +19,8 @@ pub use editor::{
     ConfigEditTarget, ConfigEditorPaths, ConfigEditorRow, ConfigEditorSnapshot,
 };
 pub use resolve::{
-    config_layers_from_document, config_layers_from_documents, resolve_config_layers, ConfigLayer,
+    config_layer_from_env, config_layer_from_env_with, config_layers_from_document,
+    config_layers_from_documents, env_var_name_for_key, resolve_config_layers, ConfigLayer,
     ConfigLayerKind, ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
@@ -106,6 +107,12 @@ fn default_kv_cache() -> String {
 }
 fn default_kv_adaptive() -> String {
     "off".to_string()
+}
+fn default_lmhead_twostage() -> String {
+    String::new()
+}
+fn default_oq_compact_multicol_wide() -> bool {
+    false
 }
 fn default_kv_window_precision() -> String {
     "auto".to_string()
@@ -316,6 +323,10 @@ pub struct HipfireConfig {
     pub kv_adaptive: String,
     #[serde(default = "default_kv_window_precision")]
     pub kv_window_precision: String,
+    #[serde(default = "default_oq_compact_multicol_wide")]
+    pub oq_compact_multicol_wide: bool,
+    #[serde(default = "default_lmhead_twostage")]
+    pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
     pub flash_mode: String,
     #[serde(default = "default_dflash_mode")]
@@ -500,6 +511,8 @@ impl Default for HipfireConfig {
             kv_cache: default_kv_cache(),
             kv_adaptive: default_kv_adaptive(),
             kv_window_precision: default_kv_window_precision(),
+            oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
+            lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
@@ -722,8 +735,23 @@ pub fn resolve_typed_config_documents_with_layers(
     additional_layers: &[ConfigLayer],
 ) -> ResolvedTypedConfig {
     let mut layers = config_layers_from_documents(raw, Some(host_local), model_tag);
+    // Environment sits between the files and the caller's CLI/request layers:
+    // an env override beats what is written on disk, and an explicit request
+    // still beats the environment.
+    let (env_layer, env_rejected) = config_layer_from_env(config_schema());
+    if let Some(env_layer) = env_layer {
+        layers.push(env_layer);
+    }
     layers.extend(additional_layers.iter().cloned());
-    resolve_typed_config_layers(&layers, model_overrides_from_documents(raw, host_local))
+    let mut resolved =
+        resolve_typed_config_layers(&layers, model_overrides_from_documents(raw, host_local));
+    resolved
+        .diagnostics
+        .extend(env_rejected.into_iter().map(|message| ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            message,
+        }));
+    resolved
 }
 
 pub fn resolve_typed_config_layers(
