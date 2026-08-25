@@ -558,6 +558,73 @@ impl Gpu {
         result
     }
 
+    /// f32-activation twin of `gemm_oq_compact_moe_grouped_wmma`.
+    ///
+    /// Same arguments minus `x_src_rows` (no f16 staging buffer is needed), and
+    /// `x_src` is consumed as f32 directly. Requires `(k / 256) % 4 == 0`, the
+    /// wide GEMV path's constraint; callers keep the indexed GEMV otherwise.
+    ///
+    /// Bit-exact against `gemv_oq_compact_moe_*` by construction — see the
+    /// kernel's preamble — so `parity_gemm_oq_compact_moe_grouped` checks it as
+    /// strict equality rather than a tolerance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_moe_grouped_f32(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            (k / 256) % 4 == 0,
+            "gemm_oq_compact_moe_grouped_f32: needs ng % 4 == 0 (K % 1024 == 0), got K={k}"
+        );
+        let kernel_name = "gemm_oq_compact_moe_grouped_f32";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_OQ_COMPACT_MOE_GROUPED_F32_SRC,
+            kernel_name,
+        )?;
+        let expert_ptr = expert_weight_ptrs.buf.as_ptr();
+        let tile_ptr = expert_tile_ids.buf.as_ptr();
+        let sorted_ptr = sorted_slot_index.buf.as_ptr();
+        let x_ptr = x_src.buf.as_ptr();
+        let y_ptr = y_grouped.buf.as_ptr();
+        let m_value = m as i32;
+        let k_value = k as i32;
+        let row_div_value = x_row_div as i32;
+        let total_value = m_total as i32;
+        let stride_value = block_stride as i32;
+        // 8 waves per workgroup, one output row each; grid.y is the slot tile.
+        let row_groups = m.div_ceil(8) as u32;
+        let slot_tiles = m_total.div_ceil(16) as u32;
+        self.launch_kernargs(
+            kernel_name,
+            [row_groups, slot_tiles, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![
+                ptr expert_ptr,
+                ptr tile_ptr,
+                ptr sorted_ptr,
+                ptr x_ptr,
+                ptr y_ptr,
+                i32 m_value,
+                i32 k_value,
+                i32 row_div_value,
+                i32 total_value,
+                i32 stride_value
+            ],
+        )
+    }
+
     pub fn gemm_oq_compact_moe_grouped_wmma(
         &mut self,
         expert_weight_ptrs: &GpuTensor,

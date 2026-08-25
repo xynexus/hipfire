@@ -1526,6 +1526,14 @@ pub const GEMM_OQ8G256_MOE_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_MOE_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_moe_grouped_wmma.hip");
 
+/// f32-activation grouped compact-MoE GEMM. Same grouped dispatch contract as
+/// the WMMA sibling above, but consumes f32 activations and accumulates with
+/// FMA, so it is BIT-EXACT against `gemv_oq_compact_moe_*` — which the WMMA one
+/// cannot be, since it rounds activations to f16 for the tensor cores.
+/// See `kernels/src/gemm_oq_compact_moe_grouped_f32.hip`.
+pub const GEMM_OQ_COMPACT_MOE_GROUPED_F32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_moe_grouped_f32.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
