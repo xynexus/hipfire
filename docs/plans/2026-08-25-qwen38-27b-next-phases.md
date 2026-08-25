@@ -936,3 +936,80 @@ Both instruments now agree the rotation costs us: single-shot reconstruction
 Porting it into the default KV path is not justified on this evidence. The oracle
 functions stay (correct, tested, free when unused) for whoever runs the
 real-forward version.
+
+
+# Real-forward decode accumulation: the error PLATEAUS, it does not accumulate
+
+`crates/hipfire-runtime/examples/kvarn_decode_accumulation.rs` runs the
+pseudo-decode experiment on an actual qwen35 forward: two identical decode runs
+over one model differing ONLY in the KV tier, measuring logit KLD against an
+fp32-KV reference as steps accumulate. Both runs are TEACHER FORCED on the same
+token stream — left to sample their own they diverge in token space and the drift
+stops being attributable to the KV tier.
+
+Qwen3.8-27B, prompt 64 + 384 decode steps, KLD(fp32-KV ref || tier):
+
+```
+             steps 1-64     after the first block flush (step 128+)
+bits=8        ~8e-6          ~5e-6        flat
+bits=4        ~8e-6          ~6-9e-5      flat
+bits=2        ~8e-6          ~2-9e-3      oscillating, no trend
+```
+
+Two things to read off this.
+
+**The step-128 jump is the first flush, not accumulation.** KVarN keeps the
+trailing GROUP=128 tokens in an f32 window; below that nothing is quantised at
+all. Prompt 64 + 64 steps = 128 is exactly where the first block leaves the
+window. Before it, all three bit widths are bit-identical.
+
+**After the flush the error PLATEAUS.** The 2-bit series across the plateau is
+2.4, 2.0, 2.0, 4.5, 3.6, 8.8, 2.9, 6.3, 3.7 (x1e-3) — high step-to-step variance,
+no monotonic growth over 256 further steps. Same for 4-bit and 8-bit. There is no
+compounding here to fix.
+
+That CONTRADICTS the synthetic proxy, which showed drift growing to 0.55/1.29
+relative. The synthetic driving process had far stronger state feedback than the
+real model does, which is exactly the limitation flagged when it was committed —
+and the reason the real-forward version was worth building.
+
+**Why this model probably does not accumulate: it is a HYBRID.** 16 of 64 layers
+are FullAttention and carry KV; the other 48 are LinearAttention (DeltaNet) with
+no KV cache at all. Only a quarter of the depth is exposed to KV error, and
+attention is a weighted average, which averages perturbations rather than
+compounding them. The paper targets standard full-attention models where every
+layer reads the quantised cache; accumulation may well be real there and simply
+absent here.
+
+## So: is there anything to do about the accumulating error?
+
+On this model, no — because there is not any. Concretely:
+
+* Accumulation-targeted mitigations have nothing to fix here. That covers the
+  Hadamard rotation (measured 1.3x worse single-shot, 2.3-3.2x worse on the
+  synthetic proxy), and also the usual suspects — error feedback across blocks,
+  periodic f32 re-anchoring, attention-sink preservation. They all buy reduced
+  COMPOUNDING, and compounding is not what is happening.
+* The real cost is a ONE-TIME step at flush, sized by bit width: 8-bit 5e-6,
+  4-bit 8e-5, 2-bit 3e-3. If KV error matters to you, the lever is bit width, and
+  the shipping default (4) sits three orders of magnitude below 2-bit for KLD.
+* The f32 window already does the one thing that clearly helps: it keeps the
+  most recent GROUP tokens exact, so the freshest context — the part attention
+  weights most heavily — never carries quantisation error at all.
+* If accumulation ever does appear (a full-attention model, or much longer
+  horizons than 384 steps), this harness is the instrument to catch it, and the
+  GROUP guard in it stops the "everything is identical" failure mode.
+
+## A recurring trap, now guarded in three places
+
+Three separate diagnostics silently reported "the KV tier does not matter"
+because none of them exercised the quantised path:
+
+| tool | threshold | symptom |
+|---|---|---|
+| `compare_prefill_hidden_paths` | prefill chunk = 256 | every tier bit-identical at n=48 |
+| same | hardcoded `bits=8` | kvarn read as q8 |
+| `kvarn_decode_accumulation` | KVarN GROUP = 128 | every `--bits` identical at 96 positions |
+
+All three now warn. The general shape is worth remembering: a KV diagnostic that
+does not cross the quantiser's own block boundary is measuring f32.
