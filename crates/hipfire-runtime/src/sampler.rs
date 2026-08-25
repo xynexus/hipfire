@@ -82,18 +82,116 @@ pub use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerCo
 /// **Greedy decode never consults the RNG**, so `temperature == 0` output — and
 /// every greedy baseline in the tiny gates — is identical under both modes. That
 /// is the property to check first if this is ever suspected of moving numbers.
+/// Process-wide base the per-stream seeds are derived from.
+///
+/// Constant under `sampler_rng = "fixed"`; ONE entropy draw per process under
+/// `"random"`. Per-process, not per-call, on purpose: a stream's seed must stay
+/// the same across its whole life and across a solo-vs-interleaved comparison,
+/// or the property §M1b exists to prove — that interleaving does not change a
+/// stream's output — becomes untestable.
+fn process_seed_base() -> u32 {
+    const FIXED_SEED: u32 = 0x13579BDF;
+    static BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        if !sampler_rng_is_random() {
+            return FIXED_SEED;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+            .unwrap_or(FIXED_SEED);
+        let mixed = nanos.wrapping_mul(2654435761).rotate_left(13);
+        if mixed == 0 {
+            FIXED_SEED
+        } else {
+            mixed
+        }
+    })
+}
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Seed for one stream, DERIVED rather than transmitted.
+///
+/// `mix(process base, session id, request id, admission ordinal)`. Deriving
+/// rather than adding a wire `seed` parameter buys the property v2 actually
+/// needs — a stream's sampling is independent of how many other streams sampled
+/// first, and is stable for a given (session, request) — without a protocol
+/// change. A wire override can be added later; it would layer on top of this,
+/// not replace it.
+///
+/// Each input earns its place:
+/// * **session id** — distinguishes concurrent sessions.
+/// * **request id** — without it every request in a long-lived session replays
+///   the same randomness, which is worse than the constant it replaces.
+///
+/// **An admission ordinal is deliberately NOT mixed in**, though it was in a
+/// first draft as a tiebreak for client-supplied session ids colliding. It
+/// cannot be: admission order differs between a stream running solo and the
+/// same stream interleaved with others, so mixing it in would make the seed —
+/// and therefore the output — depend on what else was admitted. That is exactly
+/// the property §M1b exists to guarantee against, and it would have made the
+/// solo-vs-interleaved test unpassable by construction.
+///
+/// The collision it would have guarded is cosmetic by comparison: two streams
+/// sharing a (session, request) pair are the same request by the system's own
+/// identity model, and sampling them identically is defensible. Determinism
+/// under interleaving is not negotiable; the tiebreak is.
+pub fn derive_stream_seed(session_id: &str, request_id: &str) -> u32 {
+    // `"fixed"` returns the historical constant for EVERY stream, deliberately.
+    //
+    // Deriving in this mode was tried and reverted the same hour: callers mint a
+    // fresh request id per invocation, so a derived seed varies run to run and
+    // `hipfire chat --temperature 0.8` stopped reproducing — which is the entire
+    // contract of the mode. Reproducibility beats per-stream independence here;
+    // a user who wants independence picks `"random"`.
+    //
+    // This does NOT weaken §M1b's property in either mode. Each stream holds its
+    // own `rng_state` and advances it alone, so its output is a function of its
+    // own draws regardless of how many streams share a starting value or in what
+    // order they were admitted. What `"fixed"` gives up is that two concurrent
+    // streams sample the SAME sequence — historical behaviour, and the reason
+    // this is not the multi-tenant default.
+    if !sampler_rng_is_random() {
+        return 0x13579BDF;
+    }
+    mix_stream_seed(process_seed_base(), session_id, request_id)
+}
+
+/// The derivation itself, split out so it is testable without the mode gate.
+fn mix_stream_seed(base: u32, session_id: &str, request_id: &str) -> u32 {
+    let h = fnv1a(session_id.as_bytes()) ^ fnv1a(request_id.as_bytes()).rotate_left(11);
+    let mixed = base ^ h.wrapping_mul(2654435761).rotate_left(7);
+    // 0 is a degenerate state for the xorshift the sampler advances.
+    if mixed == 0 {
+        0x13579BDF
+    } else {
+        mixed
+    }
+}
+
+fn sampler_rng_is_random() -> bool {
+    static MODE_IS_RANDOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE_IS_RANDOM.get_or_init(|| {
+        hipfire_config::load_config()
+            .sampler_rng
+            .eq_ignore_ascii_case("random")
+    })
+}
+
 pub fn initial_rng_state() -> u32 {
     /// The historical constant. Kept as the `"fixed"` value rather than being
     /// re-derived, so `"fixed"` is bit-identical to the old inlined literal.
     const FIXED_SEED: u32 = 0x13579BDF;
 
-    static MODE_IS_RANDOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let random = *MODE_IS_RANDOM.get_or_init(|| {
-        hipfire_config::load_config()
-            .sampler_rng
-            .eq_ignore_ascii_case("random")
-    });
-    if !random {
+    if !sampler_rng_is_random() {
         return FIXED_SEED;
     }
     // Entropy per CALL, not per process: two streams admitted in the same
@@ -1078,5 +1176,68 @@ mod initial_rng_state_tests {
         };
         assert_ne!(mix(1234, 0), mix(1234, 1), "same tick collided");
         assert_ne!(mix(1234, 1), mix(1234, 2), "same tick collided");
+    }
+}
+
+#[cfg(test)]
+mod derive_stream_seed_tests {
+    use super::*;
+
+    /// Any non-zero base; these test the mix, not the mode gate.
+    const BASE: u32 = 0xA5A5_1234;
+
+    /// The property §M1b exists for, at the level this function can carry it:
+    /// a stream's seed depends only on what the stream owns. Nothing about the
+    /// order or number of other admissions can reach it.
+    #[test]
+    fn seed_depends_only_on_session_and_request() {
+        let solo = mix_stream_seed(BASE, "sess-a", "req-1");
+        // Same identity, derived again after unrelated admissions have happened
+        // (which the derivation cannot observe — that is the point).
+        let _ = mix_stream_seed(BASE, "sess-b", "req-9");
+        let _ = mix_stream_seed(BASE, "sess-c", "req-9");
+        let interleaved = mix_stream_seed(BASE, "sess-a", "req-1");
+        assert_eq!(
+            solo, interleaved,
+            "seed moved when other streams were derived beside it"
+        );
+    }
+
+    /// Two concurrent sessions must not share a stream of randomness — the
+    /// failure the old shared constant guaranteed.
+    #[test]
+    fn distinct_sessions_get_distinct_seeds() {
+        assert_ne!(
+            mix_stream_seed(BASE, "sess-a", "req-1"),
+            mix_stream_seed(BASE, "sess-b", "req-1")
+        );
+    }
+
+    /// Without this, every request in a long-lived session replays the same
+    /// randomness — worse than the constant it replaces.
+    #[test]
+    fn successive_requests_in_one_session_differ() {
+        assert_ne!(
+            mix_stream_seed(BASE, "sess-a", "req-1"),
+            mix_stream_seed(BASE, "sess-a", "req-2")
+        );
+    }
+
+    /// The contract of `"fixed"`: every stream starts from the historical
+    /// constant, so a repeated request reproduces. Regression guard — deriving
+    /// here broke `hipfire chat --temperature 0.8` reproducibility.
+    #[test]
+    fn fixed_mode_ignores_identity_and_returns_the_constant() {
+        // Default config is "fixed".
+        assert_eq!(derive_stream_seed("sess-a", "req-1"), 0x13579BDF);
+        assert_eq!(derive_stream_seed("sess-b", "req-2"), 0x13579BDF);
+    }
+
+    /// A degenerate xorshift state must never be handed out.
+    #[test]
+    fn never_returns_zero() {
+        for i in 0..2000 {
+            assert_ne!(mix_stream_seed(BASE, &format!("s{i}"), &format!("r{i}")), 0);
+        }
     }
 }
