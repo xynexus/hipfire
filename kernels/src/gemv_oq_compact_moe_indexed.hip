@@ -222,8 +222,18 @@ extern "C" __global__ void gemv_oq_compact_moe_gate_up_k8_indexed(
 //
 // Observed effect at greedy decode: output tracks the narrow path until a
 // near-tie and can then take the other branch. Evidence it is a tie-flip and not
-// corruption -- on humaneval_0 the wide path emits a textbook-correct
-// `has_close_elements`, fluent and on-topic, not degraded text.
+// corruption: AR decode of humaneval_0 is **60/60 tokens IDENTICAL** to the
+// narrow path, while the prose prompt splits at token 5 onto a loop attractor
+// that several unrelated perturbations of this model also land on.
+//
+// ⚠️ DO NOT try to validate this kernel with `hipfire-eval --battery
+// perplexity`. It does not exercise it. PROVEN by deliberately corrupting this
+// function to return `facc * 0.5f` and rebuilding the daemon: perplexity stayed
+// bit-identical at ppl 2.8994 / nll 1.0645. That battery is prefill/batch
+// shaped; these are the batch=1 DECODE gemv kernels. An earlier revision of this
+// comment, and the commit that introduced it, cited exactly that perplexity pair
+// as proof of equivalence -- it proved nothing. Compare DECODE TOKENS on a
+// confident prompt instead.
 __device__ __forceinline__ float oqc_moe_row_dot_wide(
     const uint8_t* __restrict__ A,
     const float* __restrict__ x,

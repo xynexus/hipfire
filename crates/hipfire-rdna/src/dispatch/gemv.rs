@@ -5737,7 +5737,40 @@ impl Gpu {
                 .ok()
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        let (kname, ksrc) = if v3 {
+        // SPLIT-K for small M. v3 gives each row one wave, so the wave count IS
+        // M — fine for lm_head (M=248320), starving for the per-layer
+        // projections. From one decode trace on Qwen3.5-35B-A3B--oq4.25++, where
+        // the middle two shapes move the SAME 4.7 MB:
+        //
+        //     M=8192 K=2048  8192 waves  49.9 us  189 GB/s
+        //     M=4096 K=2048  4096 waves  29.1 us  162 GB/s
+        //     M=2048 K=4096  2048 waves  44.6 us  106 GB/s   <-- same bytes
+        //     M=512  K=2048   512 waves   6.1 us   97 GB/s
+        //
+        // Same bytes at half the waves costs 1.53x the time, so the limit is
+        // parallelism, not bandwidth. Pick the smallest split that lifts M*split
+        // to ~8192 waves, subject to (ng/split) % 4 == 0 — a wave still eats 4
+        // groups per round — and split | 8 so rows-per-workgroup divides evenly.
+        let ng = k / 256;
+        let split = if v3 {
+            [8u32, 4, 2]
+                .into_iter()
+                .find(|&sp| {
+                    (m as u32) * sp <= 16384
+                        && (m as u32) * sp >= 4096
+                        && ng % (4 * sp as usize) == 0
+                        && (m as u32) % (8 / sp) == 0
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (kname, ksrc) = if v3 && split > 1 {
+            (
+                "gemv_oq_compact_grouped_v3_splitk",
+                kernels::GEMV_OQ_COMPACT_GROUPED_V3_SRC,
+            )
+        } else if v3 {
             (
                 "gemv_oq_compact_grouped_v3",
                 kernels::GEMV_OQ_COMPACT_GROUPED_V3_SRC,
@@ -5760,11 +5793,25 @@ impl Gpu {
         // x 256 measured 239.0 GB/s against 234.5 for one workgroup per row on
         // the synthetic sweep (examples/bench_oq_layout). Capped at the row count
         // so small M does not launch idle waves. v2 keeps one row per workgroup.
-        let (grid, tpb) = if v3 {
+        let (grid, tpb) = if v3 && split > 1 {
+            // rows-per-workgroup = 8/split, so grid covers M rows.
+            let rpb = 8 / split;
+            ((m as u32).div_ceil(rpb).clamp(1, 2048), 256u32)
+        } else if v3 {
             (((m as u32).div_ceil(8)).clamp(1, 2048), 256u32)
         } else {
             (m as u32, 32u32)
         };
+        if split > 1 {
+            let sp = split as i32;
+            return self.launch_kernargs(
+                kname,
+                [grid, 1, 1],
+                [tpb, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs, i32 sp],
+            );
+        }
         self.launch_kernargs(
             kname,
             [grid, 1, 1],
