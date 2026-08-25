@@ -175,6 +175,63 @@ pub struct QuantTile {
 /// Mirrors `pack_tile`: quantize the balanced tile per-row, then absorb the
 /// per-row Sinkhorn scale `s_row` into (scale, zp) so dequant only needs the
 /// per-column scale at runtime: `deq = (q*scale_abs + zp_abs) * s_col`.
+/// In-place Walsh–Hadamard transform over each length-`n` row segment, scaled by
+/// `1/sqrt(n)` so the transform is ORTHONORMAL.
+///
+/// This is the stage hipfire's KVarN was missing. The paper
+/// (2606.03458v1, `/srv/hipfire/references/Quant/2606.03458v1-KVarN`) specifies
+/// "a Hadamard rotation followed by a dual-scaling variance normalization across
+/// both axes" — we implemented the second half and not the first. The reference
+/// (`kvarn_mla_tilepack.py`) packs values already in the rotated frame:
+/// `qH = q @ H`, keys stored rotated.
+///
+/// Orthonormality is what makes it free at attention time: H^T H = I, so
+/// `q·k == (qH)·(kH)` and the scores are unchanged — the rotation only has to be
+/// applied consistently to Q and K, never inverted.
+///
+/// Why it matters most at low bit-width: the rotation spreads outlier channels
+/// across the whole vector, so a coarse grid no longer has to span one dominant
+/// coordinate. That is exactly the regime the paper targets (2-bit).
+///
+/// `n` must be a power of two.
+pub fn hadamard_rows(x: &mut [f32], n: usize) {
+    assert!(n.is_power_of_two(), "hadamard_rows: n must be a power of two");
+    assert_eq!(x.len() % n, 0, "hadamard_rows: len must be a multiple of n");
+    let scale = 1.0f32 / (n as f32).sqrt();
+    for row in x.chunks_mut(n) {
+        let mut len = 1;
+        while len < n {
+            let mut i = 0;
+            while i < n {
+                for j in i..i + len {
+                    let a = row[j];
+                    let b = row[j + len];
+                    row[j] = a + b;
+                    row[j + len] = a - b;
+                }
+                i += len << 1;
+            }
+            len <<= 1;
+        }
+        for v in row.iter_mut() {
+            *v *= scale;
+        }
+    }
+}
+
+/// `quantize_tile_qmax` preceded by the paper's Hadamard rotation along the
+/// channel axis (`c_dim`), i.e. the full published KVarN pipeline rather than
+/// just its second half.
+///
+/// The caller MUST apply the same rotation to Q (see `hadamard_rows`) — this
+/// returns codes in the rotated frame, and `dequantize_tile` returns rotated
+/// values. Nothing inverts it, by design.
+pub fn quantize_tile_rotated(tile: &[f32], r_dim: usize, c_dim: usize, qmax: f32) -> QuantTile {
+    let mut rot = tile.to_vec();
+    hadamard_rows(&mut rot, c_dim);
+    quantize_tile_qmax(&rot, r_dim, c_dim, qmax)
+}
+
 pub fn quantize_tile(tile: &[f32], r_dim: usize, c_dim: usize) -> QuantTile {
     quantize_tile_qmax(tile, r_dim, c_dim, QMAX)
 }
@@ -478,6 +535,64 @@ mod tests {
         assert!(
             e_kvarn < e_naive,
             "KVarN must beat naive per-row 4-bit on a skewed tile"
+        );
+    }
+
+    /// The paper's claim, reduced to something testable: on data with outlier
+    /// channels, the Hadamard rotation should improve low-bit reconstruction,
+    /// and it should be an exact orthonormal involution.
+    #[test]
+    fn hadamard_rows_is_orthonormal_and_self_inverse() {
+        let n = 128usize;
+        let mut x: Vec<f32> = (0..n).map(|i| ((i * 37 % 61) as f32) - 30.0).collect();
+        let orig = x.clone();
+        let n0: f32 = orig.iter().map(|v| v * v).sum();
+        hadamard_rows(&mut x, n);
+        let n1: f32 = x.iter().map(|v| v * v).sum();
+        assert!(
+            (n0 - n1).abs() / n0.max(1e-6) < 1e-4,
+            "orthonormal transform must preserve L2: {n0} vs {n1}"
+        );
+        hadamard_rows(&mut x, n); // H is its own inverse when orthonormal
+        for (a, b) in x.iter().zip(&orig) {
+            assert!((a - b).abs() < 1e-3, "H(H(x)) != x: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn hadamard_rotation_improves_2bit_reconstruction_on_outlier_channels() {
+        // One dominant channel per row is the case the paper calls out: a coarse
+        // grid spends its whole range on the outlier and flattens everything else.
+        let (r, c) = (8usize, 128usize);
+        let mut tile = vec![0f32; r * c];
+        for i in 0..r {
+            for j in 0..c {
+                let base = (((i * 31 + j * 17) % 13) as f32 - 6.0) * 0.05;
+                tile[i * c + j] = if j == (i * 7) % c { 12.0 } else { base };
+            }
+        }
+        let err = |q: &QuantTile, reference: &[f32]| -> f32 {
+            let d = dequantize_tile(q);
+            let num: f32 = d.iter().zip(reference).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = reference.iter().map(|v| v * v).sum::<f32>().max(1e-12);
+            (num / den).sqrt()
+        };
+        const QMAX_2BIT: f32 = 3.0;
+        let plain = err(&quantize_tile_qmax(&tile, r, c, QMAX_2BIT), &tile);
+
+        // The rotated tile is quantised in the rotated frame, so compare against
+        // the rotated reference — that is what attention consumes.
+        let mut rotated_ref = tile.clone();
+        hadamard_rows(&mut rotated_ref, c);
+        let rotated = err(
+            &quantize_tile_rotated(&tile, r, c, QMAX_2BIT),
+            &rotated_ref,
+        );
+
+        assert!(
+            rotated < plain,
+            "Hadamard rotation should reduce 2-bit error on outlier channels: \
+             rotated {rotated:.4} vs plain {plain:.4}"
         );
     }
 }
