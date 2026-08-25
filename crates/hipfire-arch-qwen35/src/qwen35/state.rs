@@ -23,8 +23,17 @@ use super::*;
 pub enum StateQuant {
     FP32,
     /// Half-precision storage, FP32 arithmetic. Halves per-sequence state; no
-    /// scales, no error-feedback buffer, no stochastic rounding, so it is
-    /// deterministic and spec-decode rollback is lossless.
+    /// scales and no error-feedback buffer.
+    ///
+    /// Narrowing goes through a DETERMINISTIC DITHER (on by default since
+    /// 2026-08-25; opt out with `HIPFIRE_DN_STATE_FP16_DITHER=0`). "Deterministic"
+    /// is load-bearing and is why rollback stays lossless: the dither is a pure
+    /// function of the value's own bits and the element index — no RNG, no seed,
+    /// no carried state — unlike the retired Q8 stochastic rounding whose seed
+    /// leaked execution history into target numerics (issue #17). All three f16
+    /// state kernels (live, routed-batch-seq, tree) dither, and the tree kernel
+    /// uses the live kernel's exact index derivation, so tree replay is byte-exact
+    /// against the linear path (`examples/test_gated_delta_net_tree_f32`).
     FP16,
 }
 
@@ -135,13 +144,29 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // wrong default. Opt in per-deployment; do not move the default on the
     // capacity number alone, which one branch briefly did.
     //
-    // Both accuracy points are one prompt on one or two models. Moving the
-    // default wants a teacher-forced FP32-vs-FP16 KLD sweep across more than
-    // that — and specifically ACROSS CONTEXT LENGTH, which is still unmeasured
-    // for this pair. The f32-vs-fp64 sweep that does exist came out flat
-    // (BUGS.md), but that is a different pair under teacher forcing and does
-    // not transfer: FP16 state is re-rounded every invocation with no error
-    // feedback, which is the mechanism that would compound.
+    // Both accuracy points are one prompt on one or two models.
+    //
+    // THE CONTEXT-LENGTH SWEEP THIS COMMENT ASKED FOR NOW EXISTS (2026-08-25),
+    // and it does NOT show compounding. Teacher-forced FP32-vs-FP16 on
+    // Qwen3.5-0.8B-Base--oq8, kvarn KV, calib-1m, mean KLD:
+    //
+    //     n_ctx      512      1024      2048      4096      8192
+    //     round-to-nearest  5.62e-4  5.24e-4  5.54e-4  6.23e-4  5.82e-4
+    //     + dither          5.46e-4  5.13e-4  6.00e-4  6.16e-4  5.76e-4
+    //
+    // Flat across a 16x context range. The FP32-vs-FP32 control on the same
+    // harness is 9.2e-10 (ctx 512) / 4.8e-10 (ctx 8192), so the numbers above
+    // sit ~600,000x above the measurement floor — the sweep can resolve the
+    // effect and simply finds no growth. It also finds no reliable dither
+    // benefit: the two rows differ by less than their own run-to-run spread.
+    //
+    // This CONTRADICTS the compounding claim in `gated_delta_net_f16.hip`
+    // ("divergence grew 13x over 2.5x the tokens, superlinear"), which is what
+    // the dither was built for. Both are kept because they are different
+    // models: that measurement is on a 35B-A3B, this sweep is on the dense
+    // 0.8B, and the accuracy numbers above already show FP16 costing ~45x more
+    // on the larger MoE. Sweeping the 35B is the open question; until then, do
+    // not cite either as settled for the other.
     //
     // History worth not repeating: FP16 was made the default and REVERTED the
     // same day (2026-08-09). The Q8 dispatch functions had never been deleted,

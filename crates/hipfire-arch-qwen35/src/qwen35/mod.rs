@@ -4040,7 +4040,10 @@ fn triattn_tap(
         // synchronous D2H download of fa_q (and fa_k) every token.
         hipfire_rdna::kernel_trace::record_fallback(
             "qwen35 triattn_tap GPU tap declined -> per-layer D2H download",
-            &format!("layer={layer_idx} needs_k={}", hipfire_runtime::triattn::tap_needs_k()),
+            &format!(
+                "layer={layer_idx} needs_k={}",
+                hipfire_runtime::triattn::tap_needs_k()
+            ),
         );
         let n_q = config.n_heads * config.head_dim;
         let q_cpu = gpu.download_f32(&s.fa_q)?;
