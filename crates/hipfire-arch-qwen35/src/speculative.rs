@@ -7225,8 +7225,17 @@ pub fn spec_step_dflash(
     // so we don't run off the end of the PLD continuation. PLD-supplied
     // spines are often shorter than the trained B; the paper caps at 8.
     let requested_b = block_size_override.unwrap_or(draft_cfg.block_size);
+    // `.max(1)`, not `.max(2)`: an EMPTY spine means "do not speculate at all".
+    // b=1 verifies only the seed and commits the bonus -- one target forward,
+    // which is exactly an AR step, with hidden/KV/DeltaNet left coherent because
+    // the engine owns them. It also needs NO rollback: verify advances exactly
+    // as far as the committed prefix, so there is nothing to undo.
+    //
+    // This is the "stop speculating" capability the engine previously lacked.
+    // Without it a caller cannot fall back on a prompt the drafter cannot
+    // predict, and DFlash measures 0.60x AR there while nothing notices.
     let b = match pld_spine {
-        Some(pld) => (1 + pld.len()).min(requested_b).max(2),
+        Some(pld) => (1 + pld.len()).min(requested_b).max(1),
         None => requested_b,
     };
     let h = draft_cfg.hidden;
@@ -7242,7 +7251,10 @@ pub fn spec_step_dflash(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
-    assert!(b >= 2, "dflash block size must be ≥ 2");
+    // b == 1 is the no-speculation step (empty pld_spine); it skips the drafter
+    // via the pld branch below, so the `b >= 2` asserts in the draft helpers are
+    // unreachable from here.
+    assert!(b >= 1, "dflash block size must be ≥ 1");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default
     // ctx_slice=None path the data lives on GPU in draft_scratch.target_hidden
