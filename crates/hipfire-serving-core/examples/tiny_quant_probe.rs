@@ -42,7 +42,8 @@ use std::path::Path;
 
 use hipfire_rdna::Gpu;
 use hipfire_serving_core::tiny_harness::{
-    run_ar_hash, run_collect, run_kld, run_prefill_hash, PrefillKvMode, TinyArch,
+    run_ar_hash, run_collect, run_kld, run_prefill_band_parity, run_prefill_hash, PrefillKvMode,
+    TinyArch,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -129,6 +130,53 @@ fn main() {
         // prefill and the in-tree per-token reference and requires them to
         // agree within tolerance, so there is no baseline to go stale.
         // `--corrupt-kv-prefix` proves it can still fail.
+        "prefill-band-parity" => {
+            let n_prefill: usize = flag(&args, "--prefill")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(64);
+            let n_decode: usize = flag(&args, "--decode")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(4);
+            let kv_mode = PrefillKvMode::parse(flag(&args, "--kv").as_deref().unwrap_or("kvarn"))
+                .unwrap_or_else(|e| {
+                    eprintln!("tiny_quant_probe: {e}");
+                    std::process::exit(2);
+                });
+            let model = req(&args, "--model");
+            let out = match run_prefill_band_parity(
+                arch,
+                Path::new(&model),
+                &mut gpu,
+                n_prefill,
+                n_decode,
+                seed,
+                kv_mode,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("tiny_quant_probe prefill-band-parity: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let (max_abs, whole_hash, band_hash) = out;
+            println!("max_abs_diff: {max_abs:.9e}");
+            println!("whole_state_hash: 0x{whole_hash:016x}");
+            println!("band_state_hash:  0x{band_hash:016x}");
+            // Exact, not tolerant — see `run_prefill_band_parity`.
+            if max_abs != 0.0 || whole_hash != band_hash {
+                eprintln!(
+                    "tiny_quant_probe prefill-band-parity: per-layer banding is NOT \
+                     transparent (max_abs={max_abs:.9e}, state {}) — an executor \
+                     suspending between layers would change the answer",
+                    if whole_hash == band_hash {
+                        "equal"
+                    } else {
+                        "DIFFERS"
+                    }
+                );
+                std::process::exit(1);
+            }
+        }
         "prefill-hash" | "prefill_hash" => {
             let n_prefill: usize = flag(&args, "--prefill")
                 .map(|s| s.parse().unwrap())
