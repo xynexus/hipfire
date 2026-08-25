@@ -2661,14 +2661,33 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // verify has to commit what AR decode would, and AR decode runs the
         // f32 GEMV.
         //
-        // ⚠️ BUT PATH 2 STILL DIVERGES FROM PATH 1 for this dtype, and the GEMM
-        // is NOT the cause: measured on Qwen3.5-35B-A3B--oq4.25++, AR greedy on
-        // the humaneval_0 prompt splits from path 1 at token 1 with the grouped
-        // path on -- and did so IDENTICALLY when the WMMA GEMM backed it. Two
-        // different GEMMs, one of them bit-exact, same divergence => the defect
-        // is in the grouped PIPELINE (scatter / inverse_perm / the between-proj
-        // silu+rotate, where per-expert AWQ scales are a known trap: routed
-        // experts do not share one), not in either kernel.
+        // ⚠️ Path 2 produces a DIFFERENT token stream than path 1, but there is
+        // no evidence it is WRONG, and an earlier revision of this comment
+        // asserting a pipeline "defect" was overstated. What is actually known:
+        //
+        //   * the GEMM is bit-exact vs the decode GEMV (0 mismatches, both lane
+        //     arms, every shape in parity_gemm_oq_compact_moe_grouped),
+        //   * `moe_scatter_offsets_k8` pads each expert's count up to block_m,
+        //     so a tile never spans two experts -- the layout both grouped
+        //     kernels assume is the layout produced,
+        //   * `moe_gate_up_unscatter_k8` restores FLAT (token, krank) order
+        //     before the shared AWQ silu+rotate, so per-expert AWQ is keyed on
+        //     topk_indices exactly as on path 1,
+        //   * output under path 2 is coherent: humaneval_0 yields a valid
+        //     docstring-then-body continuation, the prose prompt loops the same
+        //     way path 1 loops on it.
+        //
+        // The token split is at a genuine near-tie (docstring vs function body),
+        // and this model flips such ties under ANY small perturbation -- the
+        // remaining candidate is summation ORDER in the down combine, which is
+        // a legitimate difference, not a bug.
+        //
+        // It stays OPT-IN regardless, because "coherent and probably rounding"
+        // is not the bar for changing what every prefill computes, and no
+        // quantitative gate covers this path today: `hipfire-eval --battery
+        // perplexity` does not route through `forward_prefill_batch` at all
+        // (verified by hardcoding the fallback -- elapsed unchanged). Building
+        // one is the prerequisite for turning this on.
         //
         // The prize for fixing it is large and measured, with the flag forced on:
         //     prefill        248.76 -> 342.28 tok/s  (+37.6%)
