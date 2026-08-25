@@ -37,3 +37,7 @@ required-features = ["deltanet"]
 [[example]]
 name = "parity_gemv_oq_compact_w8a8"
 required-features = ["deltanet"]
+
+[[example]]
+name = "bench_gated_delta_net"
+required-features = ["deltanet"]
