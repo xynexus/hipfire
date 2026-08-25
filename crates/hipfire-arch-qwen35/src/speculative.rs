@@ -9914,6 +9914,64 @@ pub fn spec_step_dflash(
             let mut gdn_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
             gdn_result.save_from(&target.dn_state, gpu)?;
 
+            // REFERENCE ARM: the tape-free re-run of the committed prefix
+            // (`SpecRollbackReplayKind::FullPrefill`). This is the arm whose
+            // committed tokens match plain AR decode byte-for-byte, so it — not
+            // the serial replay — is what a rollback has to reproduce.
+            //
+            // Every other comparison in this block checks the GDN tape against
+            // the SERIAL replay, and a check between two paths cannot see a
+            // defect they SHARE. They do share one: both replay hidden states
+            // captured over the DRAFTED block, so committed output follows the
+            // drafter (that is bug #21, recorded on
+            // `dflash_serial_tape_rollback_replay_from_env` above, and it is why
+            // the serial-tape path is already default-off). Measured on
+            // Qwen3.5-35B-A3B--oq4.25++, gdn-vs-serial reported `match` on every
+            // cycle while the emitted tokens diverged from AR — this arm is what
+            // that green light was missing.
+            let full_prefill_frame_start = gpu.debug_gdn_requant_frame();
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                &committed[..accept_len + 1],
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-gdn-full-prefill-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} full_prefill_byte={} gdn_tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-gdn-full-prefill-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            gpu.debug_set_gdn_requant_frame(full_prefill_frame_start);
+
             let serial_frame_start = gpu.debug_gdn_requant_frame();
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
