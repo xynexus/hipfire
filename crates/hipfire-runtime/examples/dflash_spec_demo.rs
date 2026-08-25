@@ -573,14 +573,21 @@ fn main() {
     // `--no-adaptive-b --block-size 6` to reproduce the 68.36 figure; output is
     // byte-identical to `--ar-baseline` on both the prose and code prompts.
     let mut adaptive_b: bool = true;
-    // Floor 4, not 8. The cap at 16 is real -- the draft is trained at
+    // Floor 3, not 8. The cap at 16 is real -- the draft is trained at
     // block_size=16 and larger B is out-of-distribution for its positional
     // encoding -- but nothing makes SMALLER B out-of-distribution, and the
-    // throughput optimum on Qwen3.5-35B-A3B--oq4.25++ is B=6, which a floor of 8
-    // made unreachable. With the floor at 4 the controller finds it: the default
-    // range measures 65.17 tok/s against an AR baseline of 64.25, where the old
-    // 8..16 floor gave 52.22.
-    let mut adaptive_b_min: usize = 4;
+    // throughput optimum on Qwen3.5-35B-A3B--oq4.25++ is B=3, which a floor of 8
+    // made unreachable. Measured (3 runs each, +/-0.15 spread, so the shape is
+    // real and not noise):
+    //
+    //     B=3  69.32    B=4  65.52    B=5  68.50    B=6  68.32
+    //
+    // ⚠️ NOT UNIMODAL -- B=4 is a genuine local dip between two better
+    // neighbours. With ADAPTIVE_B_STEP=2 the candidate set from this floor is
+    // 3/5/7, which steps over the dip entirely and lets the ascending
+    // early-stop settle on 3 after two probes. A floor of 4 would generate
+    // 4/6/8 and land on 6, giving up ~1.5%.
+    let mut adaptive_b_min: usize = 3;
     let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
@@ -2321,12 +2328,20 @@ fn main() {
                         .map(|(ms, n)| ms / (*n).max(1) as f64)
                         .unwrap_or(f64::MAX)
                 };
-                // ASCENDING probe with EARLY STOP. Throughput over B is unimodal
-                // here -- it climbs to a peak and falls, because verify cost
-                // grows with B faster than acceptance does -- so once a
-                // candidate is worse than the one below it, everything above is
-                // worse too and does not need measuring. That turns a full sweep
-                // into (peak + 1) probes.
+                // ASCENDING probe with EARLY STOP: once a candidate is worse
+                // than the one below it, stop probing upward. Verify cost grows
+                // with B faster than acceptance returns, so the far end of a
+                // range is reliably bad and not worth measuring.
+                //
+                // ⚠️ This assumes the curve is well-behaved, and MEASURED IT IS
+                // NOT: on this model B=4 (65.52) is a local dip between B=3
+                // (69.32) and B=5 (68.50), all three reproducible to +/-0.15.
+                // A step of 2 from an odd floor steps over that dip, which is
+                // why ADAPTIVE_B_STEP and the default floor are chosen together.
+                // An even floor with the same step would sample the dip, stop
+                // early on it, and settle ~1.5% low. If this heuristic is ever
+                // ported to another model, re-measure the curve before trusting
+                // the early stop.
                 let mut unexplored = None;
                 for (i, b) in candidates.iter().enumerate() {
                     if adaptive_b_perf.get(b).map_or(0, |(_, n)| *n) < need {
