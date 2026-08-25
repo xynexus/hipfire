@@ -856,6 +856,11 @@ pub fn generate_dflash(
         || im_end_token == Some(first_token)
         || tokenizer.is_terminator(first_token);
 
+    // NOT routed through `sampler::initial_rng_state()`, deliberately: this is the
+    // u64 spec-decode state, and its only consumer below passes a hardcoded
+    // `0.0_f32` temperature, so it is never consulted. Left constant rather than
+    // randomized so the DFlash/DDTree path keeps a fixed, reproducible state; if
+    // that call site ever takes a real temperature, route it then.
     let mut rng_state: u64 = 0x13579BDFu64;
 
     // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
@@ -1502,7 +1507,7 @@ pub fn generate_multi(
     // ngram scope: generated tokens only (matches pp=1).
     let ngram_scope_start = m.active.cursor.conversation_tokens.len();
 
-    let mut rng_state: u32 = 0x13579BDFu32;
+    let mut rng_state: u32 = hipfire_runtime::sampler::initial_rng_state();
 
     let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
         .into_iter()
@@ -4492,7 +4497,7 @@ pub fn generate_start(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = hipfire_runtime::sampler::initial_rng_state();
         let repeat_buf_cap = (scratch.repeat_buf.buf.size() / 4).min(repeat_window);
 
         // Build the list of paired (open, close) attractor pairs once;
