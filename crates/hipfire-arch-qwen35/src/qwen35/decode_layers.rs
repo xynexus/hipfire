@@ -46,6 +46,15 @@ pub(crate) fn forward_scratch_layers(
     // lowered now agree — measured self-KLD 5.3e-10 across 2044 scored tokens, and
     // byte-identical greedy output over 204 tokens on dense and MoE artifacts.
     //
+    // ⚠️ THE "and MoE" HALF OF THAT NO LONGER HOLDS. Re-measured 2026-08-26 on
+    // Qwen3.5-35B-A3B, greedy AR decode, `HIPFIRE_FORWARD_LOWERED=0`: the hand
+    // path emits the correct FIRST token and then token 0 ("!") forever, on BOTH
+    // bf16 and oq4.25++. It is not slow or approximate, it runs clean at 68.9
+    // tok/s and returns garbage. Dense is unaffected. So the hand arms are dead
+    // on qwen3.5 MoE and anything that routes onto them there — the rq opt-in, a
+    // steer session, or a GDN tape capture — gets silent garbage. The one-shot
+    // warning below exists so that at least it is not silent.
+    //
     // The rq opt-in below is therefore NO LONGER about the hand path being broken.
     // It stays because the correction is still only wired HERE and not into the
     // lowered super-op executor, so routing rq models to the hand path by default
@@ -90,6 +99,30 @@ pub(crate) fn forward_scratch_layers(
                 _ => " (gdn tape or rq opt-in)",
             }
         );
+    }
+    // See the MoE note above: the hand arms below are measured-dead on qwen3.5
+    // MoE (token 0 forever after the first). Warn once rather than let a steer
+    // session or an rq opt-in quietly produce garbage.
+    if !take_lowered
+        && weights.layers.iter().any(|lw| {
+            matches!(
+                lw,
+                LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+            )
+        })
+    {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[decode] WARNING: hand decode arms on a MoE model — MEASURED to emit token 0 \
+                 forever after the first token on qwen3.5 MoE (bf16 and oq4.25++ alike). \
+                 Output is garbage. Cause of the routing: lowered={} gdn_tape={} rq_hand={} steer={}",
+                forward_lowered_enabled(),
+                gdn_tape_capture.is_some(),
+                rq_hand_optin,
+                steer_forces_hand,
+            );
+        }
     }
     if take_lowered {
         return forward_scratch_layers_lowered(
