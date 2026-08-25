@@ -573,7 +573,14 @@ fn main() {
     // `--no-adaptive-b --block-size 6` to reproduce the 68.36 figure; output is
     // byte-identical to `--ar-baseline` on both the prose and code prompts.
     let mut adaptive_b: bool = true;
-    let mut adaptive_b_min: usize = 8;
+    // Floor 4, not 8. The cap at 16 is real -- the draft is trained at
+    // block_size=16 and larger B is out-of-distribution for its positional
+    // encoding -- but nothing makes SMALLER B out-of-distribution, and the
+    // throughput optimum on Qwen3.5-35B-A3B--oq4.25++ is B=6, which a floor of 8
+    // made unreachable. With the floor at 4 the controller finds it: the default
+    // range measures 65.17 tok/s against an AR baseline of 64.25, where the old
+    // 8..16 floor gave 52.22.
+    let mut adaptive_b_min: usize = 4;
     let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
@@ -2127,6 +2134,9 @@ fn main() {
         // That silently invalidated every adaptive measurement on this model:
         // ranges 8..16, 4..8 and 6:6 all effectively ran near B=16, which is the
         // WORST block size here (48.95 tok/s at B=12 vs 68.36 at B=6).
+        // (B -> (summed ms/token, samples)) for the throughput controller.
+        let mut adaptive_b_perf: std::collections::HashMap<usize, (f64, usize)> =
+            std::collections::HashMap::new();
         let mut current_adaptive_b: usize =
             draft_cfg.block_size.clamp(adaptive_b_min, adaptive_b_max);
         let mut adaptive_b_cycles_since_change: usize = 0;
@@ -2148,14 +2158,6 @@ fn main() {
         // code's high-confidence stretches without firing on prose/instr, where
         // shrinking is the right move. Env override for tuning:
         //   HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
-        let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.45);
-        let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.25);
 
         let t_decode = Instant::now();
         // TTFT capture: production-realistic measure excluding DPM warmup
@@ -2181,6 +2183,11 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok());
         while emitted.len() < max_tokens {
+            // Always-on cycle timer for the adaptive-B controller. `wall_start`
+            // below exists only under --host-timing; the controller needs a
+            // measurement on every run, and Instant::now() is free next to a
+            // block of GPU work.
+            let ab_t0 = std::time::Instant::now();
             if position + draft_scratch_b >= ctx_capacity {
                 eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
                 break;
@@ -2281,27 +2288,73 @@ fn main() {
             // adaptive_b_min/max default to 8..=16 (pre-2026-04-24 behaviour
             // bounded by the draft's trained block_size). User can widen with
             // --adaptive-b-range MIN:MAX; scratches upstream pre-sized for MAX.
+            // OBJECTIVE: ms PER COMMITTED TOKEN, measured. Not utilisation.
+            //
+            // The old rule tracked EWMA(accept_len)/(B-1) and grew B when that
+            // ran high. That maximises ACCEPTANCE, which is not what anyone
+            // wants, and on this model the two objectives point opposite ways:
+            // tau rises monotonically with B (2.15 at B=4 -> 3.48 at B=12) while
+            // throughput PEAKS at B=6 and falls (65.53 / 68.36 / 60.05 / 48.95
+            // at B=4/6/8/12). A bigger block buys acceptance but costs more
+            // verify than the acceptance returns, so a utilisation-maximiser
+            // walks confidently to the worst end of the range -- the default
+            // 8..16 measured 52.22 tok/s against 68.30 at a fixed B=6.
+            //
+            // Instead: sweep every candidate in the range for a few cycles,
+            // then commit to the one with the lowest measured ms/token, and
+            // re-sweep occasionally so a drifting workload is not stuck with a
+            // stale winner. Exploration is bounded and cheap -- the candidates
+            // differ by ~30% in throughput, not orders of magnitude, so a handful
+            // of cycles at a bad B costs far less than a whole run at one.
             let block_override = if adaptive_b {
-                if accepts_window.len() >= 4
-                    && adaptive_b_cycles_since_change >= ADAPTIVE_B_COOLDOWN
-                {
-                    let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
-                        / accepts_window.len() as f64;
-                    let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
-                    if util > adaptive_b_up
-                        && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max
-                    {
-                        current_adaptive_b += ADAPTIVE_B_STEP;
-                        adaptive_b_cycles_since_change = 0;
-                        adaptive_b_changes += 1;
-                    } else if util < adaptive_b_down
-                        && current_adaptive_b >= adaptive_b_min + ADAPTIVE_B_STEP
-                    {
-                        current_adaptive_b -= ADAPTIVE_B_STEP;
-                        adaptive_b_cycles_since_change = 0;
-                        adaptive_b_changes += 1;
+                let candidates: Vec<usize> = (adaptive_b_min..=adaptive_b_max)
+                    .step_by(ADAPTIVE_B_STEP)
+                    .collect();
+                // 2 samples is enough to rank candidates that differ by ~30%,
+                // and exploration is charged against a run that may only be ~30
+                // cycles long. An exhaustive 3-sample sweep of a 5-candidate
+                // range spent HALF the run probing -- including at the worst B --
+                // and finished behind the rule it replaced (8:16 measured 40.21
+                // that way, against 52.22 for the old utilisation rule).
+                let need = 2usize;
+                let cost = |b: &usize| -> f64 {
+                    adaptive_b_perf
+                        .get(b)
+                        .map(|(ms, n)| ms / (*n).max(1) as f64)
+                        .unwrap_or(f64::MAX)
+                };
+                // ASCENDING probe with EARLY STOP. Throughput over B is unimodal
+                // here -- it climbs to a peak and falls, because verify cost
+                // grows with B faster than acceptance does -- so once a
+                // candidate is worse than the one below it, everything above is
+                // worse too and does not need measuring. That turns a full sweep
+                // into (peak + 1) probes.
+                let mut unexplored = None;
+                for (i, b) in candidates.iter().enumerate() {
+                    if adaptive_b_perf.get(b).map_or(0, |(_, n)| *n) < need {
+                        unexplored = Some(*b);
+                        break;
+                    }
+                    if i > 0 && cost(b) > cost(&candidates[i - 1]) {
+                        break; // past the peak; stop probing upward
                     }
                 }
+                current_adaptive_b = match unexplored {
+                    Some(b) => b,
+                    None => {
+                        // Exploit: argmin ms/token over what was actually measured.
+                        let best = candidates
+                            .iter()
+                            .copied()
+                            .filter(|b| adaptive_b_perf.contains_key(b))
+                            .min_by(|a, b| cost(a).partial_cmp(&cost(b)).unwrap())
+                            .unwrap_or(current_adaptive_b);
+                        if best != current_adaptive_b {
+                            adaptive_b_changes += 1;
+                        }
+                        best
+                    }
+                };
                 adaptive_b_cycles_since_change += 1;
                 *adaptive_b_histogram.entry(current_adaptive_b).or_insert(0) += 1;
                 Some(current_adaptive_b)
@@ -2554,6 +2607,22 @@ fn main() {
                     launch_us, htod_us, dtoh_us, dtod_us, memset_us, ssync_us, esync_us, dsync_us,
                     glaunch_us,
                 ));
+            }
+
+            // Feed the controller: ms per COMMITTED token for the B just used.
+            // `committed` includes the seed, which was already emitted, so the
+            // tokens this cycle actually bought is len()-1.
+            // Skip cycle 0: it carries one-off kernel compilation (measured
+            // draft 14.7 ms on the first cycle against 4.3 ms steady-state),
+            // which would libel whichever candidate happened to go first.
+            if adaptive_b && stats.cycles > 1 {
+                let gained = step.committed.len().saturating_sub(1).max(1);
+                let ms = ab_t0.elapsed().as_secs_f64() * 1e3 / gained as f64;
+                let e = adaptive_b_perf
+                    .entry(current_adaptive_b)
+                    .or_insert((0.0f64, 0usize));
+                e.0 += ms;
+                e.1 += 1;
             }
 
             // Rolling τ.
