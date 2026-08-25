@@ -795,6 +795,24 @@ pub fn prefill_session_batch_attention_kvarn_layer(
 /// quantizing a completed block needs the actual `records` / `window` tensors and
 /// a scratch buffer. This carries them alongside, so the flush stays where the
 /// write is instead of forcing the layer loop up into the caller.
+/// K code width for a batched KVarN flush, taken from the CACHE rather than the
+/// environment.
+///
+/// `bits` feeds `kvarn_k_record_bytes_bits`, so it sets the record STRIDE. Reading
+/// `HIPFIRE_KVARN_BITS` here wrote records at the env default (4) into a cache
+/// allocated for whatever `kv_cache` asked for — correct only by coincidence at
+/// `kvarn4`, and a stride mismatch at `kvarn2` / `kvarn8`. The cache is the single
+/// source of truth for its own geometry; the env var is a debug override that the
+/// cache has already consulted by the time it exists.
+fn kvarn_batch_bits(rows: &[DensePrefillSessionBatchRow<'_>]) -> usize {
+    let bits = rows[0].kv_cache.kvarn_bits;
+    debug_assert!(
+        rows.iter().all(|r| r.kv_cache.kvarn_bits == bits),
+        "mixed KVarN code widths in one prefill batch: the flush writes ONE stride"
+    );
+    bits
+}
+
 pub struct KvarnBatchFlushContext<'a> {
     /// Per-session routes, indexed by `session_index` — the same slice the
     /// pointer tables were built from, so the two cannot disagree about which
@@ -804,7 +822,7 @@ pub struct KvarnBatchFlushContext<'a> {
     pub tiles: &'a GpuTensor,
     /// Tokens per KVarN block (`KvCache::KVARN_GROUP`).
     pub group: usize,
-    /// K code width; 4 unless `HIPFIRE_KVARN_BITS` says otherwise.
+    /// K code width, from the cache's own geometry — see `kvarn_batch_bits`.
     pub bits: usize,
     /// Segment end offsets from
     /// [`grouped_moe_prefill_session_batch_kvarn_block_flushes`]. Segment `i`
@@ -3196,6 +3214,7 @@ fn forward_prefill_dense_session_batch_impl(
         validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
     }
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let kvarn_bits = kvarn_batch_bits(rows);
     for (idx, row) in rows.iter().enumerate() {
         let row_end = row.start_pos.checked_add(row.tokens.len()).ok_or_else(|| {
             hip_bridge::HipError::new(
@@ -3355,7 +3374,7 @@ fn forward_prefill_dense_session_batch_impl(
             routes: &routes,
             tiles,
             group,
-            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            bits: kvarn_bits,
             splits,
             flushes,
         });
@@ -4640,6 +4659,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
 ) -> HipResult<DensePrefillSessionBatchShape> {
     let shape = validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let kvarn_bits = kvarn_batch_bits(rows);
     let inputs: Vec<DensePrefillSessionBatchInput<'_>> = rows
         .iter()
         .map(|row| DensePrefillSessionBatchInput {
@@ -4791,7 +4811,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
             routes: &routes,
             tiles,
             group,
-            bits: hipfire_runtime::kv::KvCache::kvarn_bits_from_env(),
+            bits: kvarn_bits,
             splits,
             flushes,
         });

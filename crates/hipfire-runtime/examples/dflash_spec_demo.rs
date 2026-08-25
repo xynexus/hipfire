@@ -1098,6 +1098,21 @@ fn main() {
              default path; use --kv-mode kvarn (or unset HIPFIRE_KV_MODE)."
         );
     }
+    // Width aliases. KvMode::Kvarn carries no bit width -- the cache constructor
+    // reads it, which is the right place for it (a cache decides its own
+    // geometry). Setting the debug override here is the only channel this harness
+    // has to reach that constructor, and without it the KVarN widths were simply
+    // untestable from the demo: `--kv-mode kvarn8` was rejected outright.
+    if let Some(bits) = match kv_mode_str.as_str() {
+        "kvarn2" => Some("2"),
+        "kvarn4" => Some("4"),
+        "kvarn8" => Some("8"),
+        _ => None,
+    } {
+        eprintln!("--kv-mode {kv_mode_str}: KVarN with {bits}-bit K codes");
+        std::env::set_var("HIPFIRE_KVARN_BITS", bits);
+        kv_mode_str = "kvarn".to_string();
+    }
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "kvarn" => hipfire_arch_qwen35::speculative::KvMode::Kvarn,
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
@@ -1109,7 +1124,7 @@ fn main() {
         "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
             eprintln!(
-                "unknown --kv-mode: {other}. Valid: kvarn (default), \
+                "unknown --kv-mode: {other}. Valid: kvarn (default) / kvarn2 / kvarn4 / kvarn8, \
                  q8/asym4/asym3/asym2/fwht4/fwht3/fwht2 (all DEPRECATED)"
             );
             std::process::exit(1);
