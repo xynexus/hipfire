@@ -1256,3 +1256,59 @@ that does not exist: crossing n=256 measures 249 -> 0.79 s, 259 -> 0.88 s
 chunk term was fitting noise in the small-n scatter. Prefill cost is SMOOTH in
 n. Fit quality alone did not distinguish the true model from the false one —
 only testing the prediction did.
+
+## Why DDTree fails: tau SATURATES with width, and climbs with depth
+
+The verify cliff is real, but it is not the reason the tree loses. Measured on
+the same prompt, 96 tokens:
+
+| tree budget | proposals | tree tau | | linear B | proposals | linear tau | tok/s |
+|---|---|---|---|---|---|---|---|
+| 8  | 120 | 5.667 | | 8  | 105 | 5.733 | 57.76 |
+| 16 | 224 | 5.857 | | 12 | 121 | 7.818 | 50.08 |
+| 24 | 336 | 5.929 | | 16 | 150 | 8.500 | 40.22 |
+| 32 | 448 | 5.929 | | 24 | 253 | 8.818 | 23.92 |
+| 48 | 672 | **5.929** | | | | | |
+
+**Tree tau saturates at 5.929.** Tripling the nodes from 16 to 48 — 224 to 672
+proposals — buys +0.07 tau. Linear tau keeps climbing to 8.818.
+
+The reason is structural, and it means no amount of cheap verify rescues the
+tree: a tree built on a B=8 drafter explores ALTERNATIVES at 8 positions. Its
+tau ceiling is the draft DEPTH, and it saturates well below even that. Width
+cannot substitute for depth. Raising B raises depth directly, which is why
+linear tau goes to 8.8 while the tree sits at 5.9.
+
+## But the verify curve IS what caps spec decode — via linear B, not the tree
+
+From B=8 to B=24 tau rises 54% (5.733 -> 8.818) while throughput falls 59%
+(57.76 -> 23.92), because verify cost grows with proposals. The DDTree phase
+timer gives `verify(N) ~ 35 + 8*N ms`: a ~35 ms fixed sweep plus **8 ms per
+proposed token**. Plain decode is 68 ms/token, so verify is already 8.5x
+cheaper per token — that is the spec-decode win — but it is NOT flat, and flat
+is what the amortisation argument assumes.
+
+Projected throughput if the marginal per-token verify cost were reduced
+(draft ~1.6 ms/token + 35 ms + marginal*N):
+
+| B | tau | now (8 ms) | 4 ms | 1 ms |
+|---|---|---|---|---|
+| 8 | 5.733 | 52 | 73 | 106 |
+| 12 | 7.818 | 53 | 78 | **121** |
+| 16 | 8.500 | 46 | 69 | 113 |
+| 24 | 8.818 | 33 | 53 | 92 |
+
+(model tracks the measured 57.8 / 40.2 / 23.9 within ~15%)
+
+So the prize is ~2x — 57.8 -> ~110-120 tok/s — and it comes from letting B=12..16
+run at their tau of 7.8-8.5. **The lever is the 8 ms/token marginal verify
+cost, not tree topology and not the drafter.**
+
+Note this refines the microbench section above: `gemv_oq_compact_multicol`
+amortises 8 tokens for the price of 1, but WHOLE-MODEL verify does not inherit
+that — it still costs 8 ms per extra token. The GEMV is not where the marginal
+cost lives. Attention is inherently O(N) here, so that is the first suspect.
+
+Context for the ceiling: prefill peaks at 306 tok/s = 14.9 TOPS effective over
+24.35 B matmul params, which is 26.6% of the 56 TOPS int8 peak (3.8x headroom)
+or 13.4% of the 110.9 TOPS iu4 ceiling.
