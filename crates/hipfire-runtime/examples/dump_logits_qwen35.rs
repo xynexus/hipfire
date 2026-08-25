@@ -116,7 +116,30 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}"),
+        // kvarn and fp32 were missing, so this tool could not measure the tier
+        // that actually ships (kvarn, default 4-bit) NOR the only fixed point to
+        // measure it against (fp32 KV). Same incomplete-ladder shape as the
+        // demo's silent q8 default.
+        "kvarn" => KvCache::new_gpu_kvarn(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+            KvCache::kvarn_bits_from_env(),
+        )
+        .unwrap(),
+        "fp32" => KvCache::new_gpu(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        other => panic!(
+            "unknown HIPFIRE_KV_MODE: {other} (have: fp32, q8, kvarn, asym4, asym3, asym2)"
+        ),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();

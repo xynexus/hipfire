@@ -744,3 +744,70 @@ Also visible: batched prefill is worse than per-token at EVERY tier (2.842e-1 vs
 2.591e-1, 1.317e-1 vs 9.622e-2, 3.443e-2 vs 1.203e-2), so the batched-vs-per-token
 defect noted earlier is real and independent of the KV tier — but it is far
 smaller than the tier choice itself at 4 bits.
+
+
+# KVarN does NOT faithfully reproduce the paper — the Hadamard rotation is missing
+
+Paper: `/srv/hipfire/references/Quant/2606.03458v1-KVarN/` (2606.03458v1), with a
+vLLM reference implementation under `git/`.
+
+The method, stated four times in the paper and confirmed in the reference code, is
+**"a Hadamard rotation followed by a dual-scaling variance normalization across
+both axes of the K and V matrices"**, calibration-free, headline result at
+**2-bit**. Its thesis is that decode-time error accumulation is driven by
+*incorrect token scales*, which the rotation + dual scaling fix.
+
+| paper component | hipfire KVarN | |
+|---|---|---|
+| Hadamard rotation (decoherence) | **ABSENT** | zero mentions across all 5 kvarn kernels |
+| Sinkhorn dual-scaling, both axes | present | `KVARN_SINKHORN_ITERS 10`, per-row + per-col |
+| applied to K **and** V | **K only** | "V stays Q8_0 (reuses the asym4 V layout)" |
+
+The quantiser itself is faithful. `kvarn_mla_tilepack.py` dequants as
+`(q*scale_abs + zp_abs) * s_row`; hipfire's record is
+`(q*scale_abs[r] + zp_abs[r]) * s_col[c]` — the same form, same per-row/per-col
+scales, same affine codes. What differs is the FRAME: the reference packs values
+that are ALREADY Hadamard-rotated (`qH = q @ H`, keys stored rotated,
+`acc_rot @ H.t()` to un-rotate V's contribution), while hipfire quantises raw.
+
+That is the paper's actual contribution, and it is exactly what 2-bit needs:
+rotation spreads outliers so a 2-bit grid can represent them. Our 2-bit being
+catastrophic (KLD 9.6e-3 against fp32 KV, ~100x the 4-bit number) is the expected
+symptom of quantising raw at 2 bits.
+
+**The irony:** the DEPRECATED `Fwht4` tier DOES carry the Hadamard rotation
+("signed-FWHT-rotated 4-bit K ... matches MQ4's weight-quant trick"), and
+`attention_flash_asym4_tile.hip` already implements the required
+rotate-Q-at-attention pattern ("Load + rotate Q for each half" ... "Q·K dot
+products (K in rotated 4-bit space)"). So the machinery exists in-repo; the tier
+named after the paper is the one not using it.
+
+## What a faithful fix requires
+
+Because H is orthogonal, `q·k = (qH)·(kH)`, so scores are preserved and K needs
+no inverse:
+
+1. Rotate K into the Hadamard frame at the KVarN write path, BEFORE the Sinkhorn
+   normalise + affine quantise.
+2. Rotate Q identically on entry to `attention_flash_kvarn_tile_batched.hip`,
+   mirroring `attention_flash_asym4_tile.hip`. The f32 window must be rotated
+   too, since attention reads it for the trailing partial tile.
+3. For full fidelity, extend to V: store rotated V and un-rotate the attention
+   output (`acc_rot @ H.t()`). hipfire's V is Q8 today, so this is a second,
+   separate deviation.
+
+This changes the DEFAULT KV path for all serving, so it wants the KLD and
+coherence batteries behind it, not a spot check.
+
+## Note on measuring before fixing
+
+KLD numbers taken against the current implementation characterise
+hipfire's-KVarN-minus-the-rotation, not KVarN. For the record, measured against
+an fp32-KV reference at one position (prefill 512): kvarn8 4.5e-5, kvarn4 1.0e-4,
+kvarn2 9.6e-3, q8 4.7e-5, top-1 unchanged for all. Those say the 4-bit tier is
+cheap in output terms TODAY, but they cannot say anything about KVarN as
+published until the rotation is in.
+
+`dump_logits_qwen35` could not measure this at all before — it handled only
+q8/asym{4,3,2} and panicked otherwise, so neither the shipping tier (kvarn) nor
+the only fixed point to compare against (fp32) were reachable. Both added here.
