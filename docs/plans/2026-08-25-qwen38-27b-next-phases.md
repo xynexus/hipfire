@@ -457,3 +457,81 @@ should not be turned on for this model.
 Where it could still earn its place: as a cheap FIRST STAGE behind a real
 drafter, or as one component of a full DSpark drafter (main projection + markov +
 confidence) — not as a replacement for DFlash2.
+
+
+# PREFILL — two crashes and a 20% overlay pass
+
+Prefill was never exercised past ~500 tokens this session, because the bench
+harness aborts above that. Fixed, then measured.
+
+## Bug 1+2: prompt length is never checked against `--ctx` (harness only)
+
+`--ctx` defaults to **512**, and both the draft's `target_hidden`
+(`[ctx_capacity x num_extract x hidden]`) and the KV cache (`ctx_capacity +
+block + 16`) are sized from it. Nothing validated the prompt against either, so
+past 512 it failed two different ways:
+
+```
+  69 tokens   ok, 164 tok/s
+ 609 tokens   thread 'main' panicked: assertion failed: dst_offset + size <= dst.size
+              (hip-bridge ffi.rs:1027, via scatter_hidden_block_to_interleaved)
+2408 tokens   Memory access fault by GPU node-1 ... kernel: kv_cache_write_q8_0_batched
+              Reason: Page not present or supervisor privilege
+```
+
+The second is the serious shape: an UNCHECKED OUT-OF-BOUNDS GPU WRITE, not a
+caught assert.
+
+**The daemon is NOT affected** — it guards this properly at
+`generate.rs:223 / 679 / 698` and returns "request exceeds loaded KV budget".
+This was `dflash_spec_demo` only. But it silently capped every prefill
+measurement in this document at <=512 tokens.
+
+Fixed with an explicit guard naming the offending number and the flag to raise.
+
+## Prefill scaling, now measurable
+
+```
+  69 tokens   160.38 tok/s
+ 609 tokens   303.54 tok/s
+2408 tokens   274.50 tok/s   (--ctx 4096)
+```
+
+Roughly 32x off the bandwidth bound: a batched prefill reads the 14.4 GiB of
+weights ONCE for the whole prompt, which at 233 GB/s is 62 ms, i.e. ~9800 tok/s
+at n=609. So prefill is nowhere near memory-bound and the ceiling is elsewhere.
+
+## Where prefill time goes (2408 tokens, --max 1)
+
+```
+gemm_oq_compact_iu4x2_w64      4960 calls  46.77%
+attention_q8_0_kv_batched       320 calls  20.51%   O(n^2), inherent
+oq_compact_overlay_correct_tr  4960 calls  19.85%   <-- the anomaly
+gated_delta_net_f32             480 calls   5.03%
+quantize_act_oq8               2560 calls   1.56%
+oq_compact_x8_transpose        2560 calls   1.44%
+```
+
+**The sparse overlay is a separate 19.85% pass in prefill** — 42% of the GEMM's
+own cost, once per GEMM (identical 4960 call counts), for a correction that
+touches 3 entries per block. In DECODE the same overlay is folded inline and
+branchless into `gemv_oq_compact_multicol` and costs ~3%.
+
+The mechanism is activation traffic, not weight traffic. Per (row, group,
+overlay entry) the kernel gathers a B-wide contiguous slice of the TRANSPOSED
+activation:
+
+```c
+const uint32_t w4 = *(const uint32_t*)(XT + (long long)(kbase + idx) * B + b0);
+```
+
+At M=17408, n_groups=20, n_ov=3, B=256 that is ~267 MB of activation reads per
+projection against the GEMM's 44.6 MB of weights — the activation is re-read
+three times per group. The side plane it also reads is only ~2.8 MB, so this is
+not the weights.
+
+The fix is to fold the overlay into `gemm_oq_compact_iu4x2_w64`, which already
+has the activation tile staged — exactly what the decode multicol kernel does.
+That is a kernel project and is the single largest prefill lever: ~20% of
+prefill, and it would delete the `oq_compact_x8_transpose` pass (1.44%) that
+exists only to feed it.

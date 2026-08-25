@@ -1556,6 +1556,26 @@ fn main() {
         // draft_scratch.target_hidden on GPU. This primes the GPU-resident
         // path in spec_step_dflash (ctx_slice=None) so it doesn't need to
         // round-trip target_hidden through the CPU shadow each cycle.
+        // The draft's target_hidden is [ctx_capacity x num_extract x hidden] and
+        // the KV cache is sized ctx_capacity + block + 16, but nothing upstream
+        // checks the prompt against either. Past ctx_capacity this used to fail
+        // two different ways, both unhelpful: a 609-token prompt tripped
+        // `assert!(dst_offset + size <= dst.size)` deep in hip-bridge, and a
+        // 2408-token prompt walked off the KV cache into a GPU MEMORY FAULT in
+        // kv_cache_write_q8_0_batched (an unchecked out-of-bounds device write).
+        //
+        // The daemon guards this properly (generate.rs:223/679/698, "request
+        // exceeds loaded KV budget"); this harness did not, so long-prompt
+        // prefill could not be benchmarked at all.
+        assert!(
+            prompt_tokens.len() <= ctx_capacity,
+            "prompt is {} tokens but --ctx is {} — the draft target_hidden \
+             and the KV cache are both sized from it. Re-run with --ctx {} \
+             (or larger).",
+            prompt_tokens.len(),
+            ctx_capacity,
+            prompt_tokens.len().next_power_of_two()
+        );
         speculative::scatter_hidden_block_to_interleaved(
             &gpu,
             &hidden_rb,
