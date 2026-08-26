@@ -5944,6 +5944,94 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     )
 }
 
+/// Prefill one chunk **one layer at a time**, invoking `between_layers(layer_idx)`
+/// after each. The executor's suspension point for prefill.
+///
+/// §M2a's parent plan justifies lowering prefill with "an unlowered prefill is by
+/// definition one indivisible quantum". That premise is false — `forward_prefill_chunk`
+/// has taken a `band` for some time and the EP driver already drives it per layer
+/// (`ep.rs:315`). What was actually missing is this: `PrefillBandCtx` was
+/// `pub(crate)` with no external users, and the per-layer drive was exercised only
+/// on the expert-parallel path, never on the single-GPU `pp == 1` default that a
+/// daemon executor runs.
+///
+/// The offset bookkeeping stays in here on purpose. `delta_layer_offset` and
+/// `fa_layer_offset` index `dn_state.s_matrices` and `kv_cache.k_caches`, and they
+/// advance by LAYER KIND, not by layer index — get that wrong and a band reads
+/// another layer's recurrent state, which no type checks. Callers get a callback
+/// instead of a struct to fill in.
+///
+/// Equivalence to the unbanded call is a property this must keep, not an
+/// assumption: with a no-op callback the two produce byte-identical output. That
+/// is what makes the callback a place an executor can suspend rather than a place
+/// it can change the answer.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_banded(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut kv::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    needs_last_token_logits: bool,
+    mut between_layers: impl FnMut(usize),
+) -> HipResult<()> {
+    let pbs = PrefillBatchScratch::new(gpu, config, tokens.len())?;
+    let n_layers = config.layer_types.len();
+    let mut delta_off = 0usize;
+    let mut fa_off = 0usize;
+    let mut result = Ok(());
+    for layer_idx in 0..n_layers {
+        let band = super::prefill_chunk::PrefillBandCtx {
+            layer_start: layer_idx,
+            layer_end: layer_idx + 1,
+            delta_layer_offset: delta_off,
+            fa_layer_offset: fa_off,
+            is_first_band: layer_idx == 0,
+            is_last_band: layer_idx + 1 == n_layers,
+            givens_cos: None,
+            givens_sin: None,
+        };
+        result = forward_prefill_chunk(
+            gpu,
+            weights,
+            config,
+            tokens,
+            start_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            &pbs,
+            None,
+            None,
+            None,
+            0,
+            None,
+            false,
+            Some(&band),
+            None,
+            None,
+            needs_last_token_logits,
+            None,
+            false,
+            None,
+        );
+        if result.is_err() {
+            break;
+        }
+        // Advance by KIND, matching `ep.rs:384-385`.
+        match config.layer_types[layer_idx] {
+            LayerType::LinearAttention => delta_off += 1,
+            LayerType::FullAttention => fa_off += 1,
+        }
+        between_layers(layer_idx);
+    }
+    pbs.free_gpu(gpu);
+    result
+}
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,

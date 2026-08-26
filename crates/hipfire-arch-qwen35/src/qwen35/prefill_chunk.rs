@@ -2097,7 +2097,16 @@ pub(crate) fn prefill_moe_ffn_body_batched(
 /// Counter offsets seed the running per-LA / per-KV / per-FA counters so
 /// the band's first DeltaNet/FullAttn layer indexes the correct
 /// `dn_state.s_matrices[i]` / `kv_cache.k_caches[i]` slot.
-pub(crate) struct PrefillBandCtx<'a> {
+/// A contiguous slice of the layer stack, plus where that slice starts in the
+/// per-kind state arrays.
+///
+/// `pub` as of §M2a: an executor outside this crate could not construct one, so
+/// "prefill is suspendable at layer granularity" was true of the code and false
+/// of anything that wanted to use it. Prefer [`forward_prefill_batch_banded`] to
+/// building this by hand — `delta_layer_offset` / `fa_layer_offset` index
+/// `dn_state.s_matrices` / `kv_cache.k_caches` and are the easy thing to get
+/// wrong.
+pub struct PrefillBandCtx<'a> {
     pub layer_start: usize,
     pub layer_end: usize,
     pub delta_layer_offset: usize,

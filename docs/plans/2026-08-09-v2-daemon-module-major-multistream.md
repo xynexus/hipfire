@@ -1419,6 +1419,75 @@ pick step — one site instead of three-and-counting, and finer.
 
 *Revertible:* yes, behind `HIPFIRE_DAEMON_EXECUTOR=v2`.
 
+### M4 — measured 2026-08-25: on this box the unfused path will not even LOAD
+
+The decision §M4 poses — "is module granularity worth unfusing the default MoE
+decode path?" — was framed as a throughput trade: unfusing costs "a D2H plus a
+kernel launch per expert per token". On gfx1103 with `Qwen3.6-35B-A3B--oq4` it is
+not a throughput trade, because the unfused configuration does not load.
+
+    HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 (default, fused)   pp512 20.80  tg128 20.70 tok/s
+    HIPFIRE_QWEN35_MOE_OQ_INDEXED=0 (unfused)          OOM at layer 26/40:
+        hipMalloc(1.03 MiB), free=13.9 MiB of total=43008 MiB
+
+Reproduced twice, the second time on a verified-idle GPU (no daemon, 82 MB VRAM
+in use) so it is the configuration and not contention from the previous run.
+
+**Read this with its caveat.** `HIPFIRE_QWEN35_MOE_OQ_INDEXED` gates two things at
+once: whether routing and expert compute are one kernel, AND the resident expert
+layout — indexed implies `oq_moe`-repacked experts, while off falls back to the
+`oq4_arch` combined layout (`moe_decode.rs:639`). So this measures the flag, not
+"unfusing" in isolation, and the OOM is most likely the layout half. It still
+answers the practical question: there is no way to *try* the unfused path at this
+model size on this hardware, so any M4 work that depends on it cannot be verified
+here — the same stop-line §3.4 of the prefill-lowering plan invoked, and the same
+one that turned out to be misdiagnosed there, so it is worth someone checking on
+gfx1151 before treating it as settled.
+
+**The gfx1151 cross-check was attempted and is blocked on halo's configuration,
+not on hardware.** Two runs, both arms failing identically at LOAD with "DFlash
+draft requested but target lm_head quant_type=36 is not supported" — before
+either MoE path executes, so neither run is a datapoint. Cause: halo's global
+`dflash_mode` is `on`, its per-model `off` overrides name artifacts that are not
+on that box (`Qwen3.6-35B-A3B--mq4`, `--oq4++`), and the only 35B MoE artifacts
+present are `bf16` and `oq4.25++` — whose lm_head quant the paired drafter
+(`Qwen3.5-35B-A3B--dflash.oq4+.hfq`) cannot serve.
+
+**Correction (2026-08-25).** The sentence that stood here — "`HIPFIRE_DFLASH_MODE=off`
+did not override it, so the per-model config layer appears to win over env here"
+— was wrong, and was a guess published as a finding. There is no config-layer-beats-env
+precedence involved. What the code actually says:
+
+- The env layer is fine. `env_var_name_for_key` maps `dflash_mode` to
+  `HIPFIRE_DFLASH_MODE`, and `off` is a valid `ConfigType::Enum` value, so it
+  parses and lands in `HipfireConfig::dflash_mode`.
+- **The daemon never reads that env var.** `dflash_mode` reaches it only inside the
+  load request params (`hipfire-daemon/src/handlers/lifecycle.rs:225`), and
+  `.unwrap_or("auto")` when the field is absent.
+- Only clients that call `load_params_from_config` forward it — `hipfire-cli`'s
+  chat path and `hipfire-server` (which correctly omits `auto` and sends `off`).
+  **`hipfire-eval` does not**: it builds params from its own `DflashMode`
+  (`--dflash`, default `Off`, `hipfire-eval/src/config.rs:43`), which never
+  consults `HipfireConfig` and so cannot see the env var at all.
+- Anything other than `off` then lets `load.rs:857` auto-pair a sibling drafter by
+  filename — which is how the drafter got requested without anyone naming it.
+
+So the env var did not lose a precedence fight; depending on which client drove
+that load it either never reached the request or was never consulted. Which of the
+two it was on halo is still unverified — settling it means capturing the actual
+load request, not re-reasoning about layering. The blocked-on-halo conclusion below
+is unaffected: it rests on the artifacts present on that box, not on this mechanism.
+
+Finishing it needs one of: a per-model `dflash_mode: off` override added to
+halo's config (a shared box, actively in use — ask first), a 35B MoE artifact
+copied there that has one, or a run on a third machine. Recorded rather than
+retried because two attempts already failed the same way for a reason unrelated
+to the question, and a third would too.
+
+What that leaves for M4, unchanged from the 2026-08-22 scoping: qwen35 joins
+deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
+and `MoeExpert(e)` exists only for arches whose MoE is not fused.
+
 ### M4 — scoped 2026-08-22. qwen35 has deepseek4's problem too.
 
 **Measured before starting.** This section already concedes that deepseek4 fuses

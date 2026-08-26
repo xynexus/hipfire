@@ -1369,6 +1369,7 @@ fn qwen35_prefill_then_decode(
     tokens: &[u32],
     n_prefill: usize,
     batched: bool,
+    banded: bool,
     corrupt_kv_prefix: bool,
     kv_mode: PrefillKvMode,
 ) -> Result<(u64, Vec<Vec<f32>>), String> {
@@ -1414,7 +1415,50 @@ fn qwen35_prefill_then_decode(
         let vocab = config.vocab_size.max(1) as u32;
         let prompt: Vec<u32> = tokens[..n_prefill].iter().map(|t| t % vocab).collect();
 
-        if batched {
+        if banded {
+            // §M2a: the same prefill driven ONE LAYER AT A TIME through the public
+            // band driver. The callback is where an executor would suspend; here
+            // it counts, so the comparison can assert the drive actually happened
+            // per layer rather than falling back to a whole-stack call.
+            let mut layers_seen = 0usize;
+            // §M6: the drain-to-suspend bound is the LONGEST gap between
+            // suspension points, not the mean — an executor that must wait for
+            // the worst band is what the admission inequality has to budget for.
+            let mut last = std::time::Instant::now();
+            let mut worst_ms = 0.0f64;
+            let r = qwen35::forward_prefill_batch_banded(
+                gpu,
+                weights,
+                config,
+                &prompt,
+                0,
+                kv,
+                dn,
+                scratch,
+                true,
+                |_| {
+                    layers_seen += 1;
+                    let ms = last.elapsed().as_secs_f64() * 1000.0;
+                    if ms > worst_ms {
+                        worst_ms = ms;
+                    }
+                    last = std::time::Instant::now();
+                },
+            );
+            if std::env::var("HIPFIRE_BAND_TIMING").is_ok() {
+                eprintln!(
+                    "[band-timing] layers={layers_seen} worst_band={worst_ms:.3} ms \
+                     (this is the drain-to-suspend bound §M6's inequality needs)"
+                );
+            }
+            if layers_seen != config.layer_types.len() {
+                return Err(format!(
+                    "prefill probe: banded drive visited {layers_seen} layers, expected {}",
+                    config.layer_types.len()
+                ));
+            }
+            r.map_err(|e| format!("qwen35 forward_prefill_batch_banded: {e:?}"))?;
+        } else if batched {
             qwen35::forward_prefill_batch(
                 gpu, weights, config, &prompt, 0, kv, dn, scratch, None, None, None, None,
             )
@@ -1535,6 +1579,55 @@ fn qwen35_prefill_then_decode(
 /// milestone exists to catch, position 0 included — so the probe's own
 /// falsifiability can be demonstrated. With it set, `agrees()` MUST be false.
 /// That is the exit criterion for this stage.
+/// §M2a: is the public per-layer band driver equivalent to the whole-stack call?
+///
+/// Runs the SAME prompt through `forward_prefill_batch` and through
+/// `forward_prefill_batch_banded` (one layer per call), then compares the
+/// post-prefill decode logits and the recurrent-state hash.
+///
+/// Equivalence must be **exact**, not within a tolerance. Both runs execute the
+/// same kernels over the same rows in the same order; banding only changes where
+/// the loop is cut. Anything other than 0.0 means banding is not transparent, and
+/// an executor that suspends between layers would change the answer — which is
+/// the whole thing that has to be false for prefill to be suspendable.
+pub fn run_prefill_band_parity(
+    arch: TinyArch,
+    model_path: &Path,
+    gpu: &mut Gpu,
+    n_prefill: usize,
+    n_decode: usize,
+    seed: u64,
+    kv_mode: PrefillKvMode,
+) -> Result<(f32, u64, u64), String> {
+    if n_prefill < 2 {
+        return Err("band parity: --prefill must be >= 2".into());
+    }
+    let tokens = synthetic_tokens(n_prefill + n_decode, seed);
+    let (whole_hash, whole) = qwen35_prefill_then_decode(
+        arch, model_path, gpu, &tokens, n_prefill, true, false, false, kv_mode,
+    )?;
+    let (band_hash, banded) = qwen35_prefill_then_decode(
+        arch, model_path, gpu, &tokens, n_prefill, false, true, false, kv_mode,
+    )?;
+    if whole.len() != banded.len() {
+        return Err(format!(
+            "band parity: decoded {} positions whole vs {} banded",
+            whole.len(),
+            banded.len()
+        ));
+    }
+    let mut max_abs = 0.0f32;
+    for (a, b) in whole.iter().zip(banded.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (x - y).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+    }
+    Ok((max_abs, whole_hash, band_hash))
+}
+
 pub fn run_prefill_hash(
     arch: TinyArch,
     model_path: &Path,
@@ -1563,12 +1656,13 @@ pub fn run_prefill_hash(
         &tokens,
         n_prefill,
         true,
+        false,
         corrupt_kv_prefix,
         kv_mode,
     )?;
     let rows_1 = hipfire_arch_qwen35::qwen35::batched_prefill_rows();
     let (ref_state_hash, reference) = qwen35_prefill_then_decode(
-        arch, model_path, gpu, &tokens, n_prefill, false, false, kv_mode,
+        arch, model_path, gpu, &tokens, n_prefill, false, false, false, kv_mode,
     )?;
     let rows_2 = hipfire_arch_qwen35::qwen35::batched_prefill_rows();
 
