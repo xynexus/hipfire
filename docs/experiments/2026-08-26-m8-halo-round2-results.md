@@ -92,8 +92,15 @@ value if nothing were resident at all. The honest evidence that paging happened
 is behavioural: the 15× slowdown and the 42 `paged` log lines.
 
 **Neither `rocm-smi` (reports the 512 MB dedicated carveout, per round 1) nor
-`resource_status` currently measures GTT residency on this host.** Establishing
-real residency numbers needs a third instrument that does not exist yet.
+`resource_status` measures GTT residency.**
+
+⚠️ **Corrected 2026-08-26:** this paragraph originally ended "…needs a third
+instrument that does not exist yet." That was wrong. The instrument exists:
+`/sys/class/drm/card0/device/mem_info_gtt_used` reports actual GTT allocation
+(0.01 GB idle), alongside `mem_info_gtt_total` for the ceiling. Sampling it
+during a run is what finally measured residency — see
+`2026-08-26-three-model-coresidency-nix1.md`, where it showed the daemon's own
+ledger understating real GTT by ~8.5 GB.
 
 ## 4. The round-2 instruction about VRAM budgets was wrong
 
@@ -149,8 +156,10 @@ one).**
   no shape parameters. Adding them remains the cheapest route to a rerunnable
   pressure test.
 - **Eviction / downgrade / refuse** — needs the HTTP server path (§4).
-- **A real residency measurement** — needs an instrument that observes GTT,
-  since neither existing one does (§3).
+- ~~**A real residency measurement** — needs an instrument that observes GTT,
+  since neither existing one does~~ **DONE**: `mem_info_gtt_used` is that
+  instrument (§3 correction). Re-measuring these halo runs with it is still
+  worthwhile, since only nix1 has been sampled so far.
 - **Module sharing between workloads** — `handlers/train.rs` still trains its own
   un-fused `LlamaModel`, so this is one executor with two resident workloads, not
   two workloads sharing modules.
