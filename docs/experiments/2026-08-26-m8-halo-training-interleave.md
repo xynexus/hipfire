@@ -212,3 +212,104 @@ decides residency strategy from a **filename substring**, and one of its
 conditions is `lower.contains("a")` — very nearly a tautology for any real path.
 If you happen to observe a surprising residency mode on halo, that is a strong
 candidate for why. Worth a note either way.
+
+---
+
+# Round 2 — putting real pressure on it
+
+Round 1 (`docs/experiments/2026-08-26-m8-halo-training-interleave-results.md`)
+returned **PASS** on the strong form of the criterion and was honest about what
+it did not exercise. This section says what to change so the next run tests the
+part that matters. Ranked: do 1 and 2 even if you do nothing else.
+
+## 1. Set a real VRAM budget — round 1's was unlimited
+
+Round 1 ran with `vram_budget_bytes: 0` and `vram_headroom_bytes: 0`. That is
+not "the default budget", it is **no budget**:
+
+```rust
+fn effective_limit(budget: u64, headroom: u64) -> Option<u64> {
+    (budget > 0).then_some(budget.saturating_sub(headroom))   // 0 => None => unlimited
+}
+```
+
+`usage_fits` then passes unconditionally, so `plan_model_residency` never had a
+question it could answer "no" to. **Eviction, the `full` → `qwen_moe_modules`
+downgrade, and the refuse path were all structurally unreachable** — the run
+could not have exercised residency pressure no matter how large the models were.
+
+So: set `scheduler_vram_budget_bytes` **below** what the run needs (served model
++ trainer + cache), and report which of the three outcomes you got — fit,
+downgrade to module-granular, or eviction of a resident worker. A run where the
+planner never had to choose is not a residency test.
+
+Do this deliberately at two settings: one where everything fits, one where it
+provably does not. The second is the interesting one.
+
+## 2. Add a negative control — prove the comparison can fail
+
+Round 1's three curves were bit-identical. That is a strong result *only if the
+comparison could have detected a difference*, and nothing in round 1 shows that
+it could. Round 1 itself found a bug of exactly the shape that would hide here:
+`steps` silently falling back to the 200 default when it is not nested under
+`train`. A harness that compared the same file twice, or an interleave that
+never interleaved, produces the same bit-identical PASS.
+
+So before reporting a verdict, **deliberately break it and confirm the test goes
+red**: rerun with a changed `lr` (or LoRA `seed`) and show the curve differs.
+Report that as its own line — "perturbed run differs at step N" — next to the
+PASS. Without it the zero-width band is unfalsifiable.
+
+Same rule as §3a applies to the loss side, not just the decode side: equal
+output never proves the path ran.
+
+## 3. Make the residency actually module-granular
+
+M8's exit says *interleaved at module granularity*. Round 1 got
+`residency_mode: "full"`, which is one executor alternating whole-model quanta —
+the weaker reading the wording admits. Set `model_residency_mode:
+qwen_moe_modules` on the served side and confirm via `resource_status` that it
+held **during** a training quantum, not just at load.
+
+If it refuses or silently stays `full`, that refusal is itself the finding —
+report it rather than falling back quietly.
+
+## 4. Vary the decode prompts
+
+Round 1's 200 requests returned identical text, correctly attributed to greedy
+determinism. But it means the decode probe rests on `done`/`id` counts alone.
+Use a **different prompt per request** (index it) so identical output would be a
+*failure* signal rather than the expected one. Keep `temperature: 0.0` and
+`sampler_rng: fixed` — determinism per prompt, difference across prompts.
+
+## 5. Training-side pressure: get a real base, or scope it out honestly
+
+Round 1 could not apply training-side pressure and explained why. Note what is
+**not** an option: `emit_fixture(arch, out_dir, seed)` takes no shape
+parameters — fixtures come from each arch's declared `ToyModel`, so there is no
+flag that emits a 7B-shaped llama fixture. Do not spend time looking for one.
+
+That leaves:
+
+- **(a)** land a complete large llama base on halo (`hub fetch` stalled at
+  0.12/2.48 GB in round 1 — resumable? different mirror? copy from carbon's
+  `/srv`, then move it to local NVMe before measuring); or
+- **(b)** add shape parameters to the fixture emitter so a large fp32 base can
+  be synthesised. Random weights are fine here — M8 asks whether interleaving
+  changes the result, not whether the model learns — so this is a smaller job
+  than it sounds and it makes the pressure test repeatable on any host; or
+- **(c)** declare the training-side residency half out of scope for M8 and
+  amend the plan to say so, rather than leaving a limitation that reads as
+  pending forever.
+
+**(b) is the recommendation** — it is the only one that makes this experiment
+rerunnable without a 2.48 GB download and a specific host's disk contents.
+
+## 6. Assert the config you think you set
+
+Round 1 found `steps` must be nested under `train` or the run silently uses the
+default while reporting otherwise. Treat that as a class, not an incident: echo
+back the *actual* step count, LoRA rank, budget and residency mode the daemon
+used — read from `resource_status` / the run's own output, not from the request
+you sent — and put them in the writeup. A config that silently did not apply is
+the most likely way this experiment produces a confident wrong answer.
