@@ -6687,6 +6687,21 @@ fn verify_dflash_block_inner(
                 // Capture bugs here are subtle and this file documents a tau
                 // collapse (code 7.08 -> 4.51) from enabling capture too eagerly
                 // on the tree path, so this does not go default-on untested.
+                //
+                // ⚠️ TESTED 2026-08-26 ON Qwen3.5-35B-A3B--oq4.25++ (bf16 embed):
+                // THE CAPTURE-EQUIVALENCE ARGUMENT ABOVE IS WRONG IN PRACTICE.
+                // With HIPFIRE_VERIFY_GRAPH_WIDE_EMBD=1 the b=1 no-speculate path
+                // STOPS being byte-identical to --ar-baseline. That is a
+                // controlled case -- with the flag off it matches AR exactly, so
+                // the capture is what changes the output. It is also SLOWER
+                // there (48.47 -> 44.28 tok/s); normal spec-decode moves
+                // 48.39 -> 49.32, not worth an output change.
+                //
+                // So do NOT promote BF16 into this list on the reasoning above.
+                // The pointer-stability argument may well be right; something
+                // else in the bf16 embed capture is not. Fix that first, and use
+                // `--no-speculate` vs `--ar-baseline` byte-equality as the test
+                // -- it is the only arm here that is AR-exact by construction.
                 | hipfire_runtime::weights::EmbeddingFormat::BF16
                     if !matches!(
                         target.weights.embd_format,
