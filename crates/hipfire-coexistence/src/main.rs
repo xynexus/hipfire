@@ -662,19 +662,11 @@ fn hub_cli(op: &str, repo_arg: Option<&str>, args: &[String]) -> Result<(), Box<
                 // The archive is written under a `.part` marker and only
                 // renamed into place once complete and digest-verified, so the
                 // final name never holds a truncated file. A leftover marker is
-                // by definition from an interrupted run: restart it without
-                // ceremony.
-                // ponytail: restart re-downloads completed files too; per-file
-                // resume needs a sidecar manifest of finished entries (the
-                // index is only written at the end) — add if multi-shard
-                // interrupts get common.
+                // from an interrupted run: fetch_to_archive resumes it at the
+                // last completed file via the `.manifest` sidecar (rechecking
+                // the kept bytes first), or restarts if the manifest is
+                // missing, stale, or fails the recheck.
                 let part = PathBuf::from(format!("{}.part", archive.display()));
-                if part.exists() {
-                    eprintln!(
-                        "hub: {} is a partial archive from an interrupted run — restarting",
-                        part.display()
-                    );
-                }
                 if let Some(p) = archive.parent() {
                     std::fs::create_dir_all(p)?;
                 }
