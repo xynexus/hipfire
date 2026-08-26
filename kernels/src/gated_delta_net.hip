@@ -28,7 +28,19 @@ __global__ void gated_delta_net_f32(
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
-    int head_dim
+    int head_dim,
+    // Per-token S checkpoints for spec-decode rollback. When non-null, the
+    // state AFTER token t is written to `state_snapshots + t * n_heads*HD*HD`,
+    // so a rejected block can be rewound by RESTORING the accepted token's
+    // slot instead of re-forwarding the committed prefix through the whole
+    // model (~37% of a DFlash cycle). Exact by construction: these are the
+    // same bytes this kernel would have left in `state`.
+    //
+    // Null (the default for every non-spec caller) costs one predicated branch
+    // per token and writes nothing. The write sits OUTSIDE the replicated
+    // "identical f32 GDN step" block below, so the bit-for-bit contract with
+    // gated_delta_net_f32_tree.hip and _routed_batch_seq.hip is untouched.
+    float* __restrict__ state_snapshots
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;  // which row tile (0..HD/TILE_ROWS-1)
@@ -122,6 +134,18 @@ __global__ void gated_delta_net_f32(
         if (l == 0)
             output[t * stride + h * HD + row] = out_v;
         // --- end identical step ---
+
+        // Checkpoint this block's tile for token t. Each block owns
+        // TILE_ROWS x HD contiguous floats, so this is the same coalesced
+        // shape as the final writeback below.
+        if (state_snapshots != nullptr) {
+            float* snap = state_snapshots
+                        + (size_t)t * (size_t)n_heads * HD * HD
+                        + (size_t)h * HD * HD
+                        + (size_t)row_start * HD;
+            for (int i = tid; i < TILE_ROWS * HD; i += 32)
+                snap[i] = S_tile[i];
+        }
     }
 
     // Store tile back
