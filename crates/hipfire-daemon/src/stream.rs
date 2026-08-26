@@ -190,8 +190,7 @@ pub(crate) fn admit_generate(state: &mut DaemonState, msg: &serde_json::Value) -
         .and_then(|v| v.as_str())
         .unwrap_or("0")
         .to_string();
-    let sampler_seed =
-        hipfire_runtime::sampler::derive_stream_seed(session.as_str(), &request_id);
+    let sampler_seed = hipfire_runtime::sampler::derive_stream_seed(session.as_str(), &request_id);
     let id = match state
         .streams
         .admit(session, spec, SamplerRng::from_seed(sampler_seed))
