@@ -859,7 +859,18 @@ pub(crate) fn moe_ffn_decode_impl(
     // are now first-class for graph capture. Mixed-kmap A3B layers
     // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
     // of the HFQ4 ones — same control flow, different kernel binary.
-    let use_gpu_topk = dispatch_flags.use_gpu_topk;
+    // §M4 option-B measurement lever. The per-expert arm below is the EXISTING
+    // correctness fallback for non-all-MQ4 / k != 8 layers, so "unfuse MoE
+    // decode" is measurable today without writing a kernel — but only if the
+    // same artifact can be driven down both arms. This forces the fallback.
+    //
+    // NOT a correctness switch and NOT a perf option: the forced arm also drags
+    // in a CPU top-K D2H sync, so its cost is `per-expert GEMV + round trip`,
+    // not per-expert GEMV alone. Any A/B using this must attribute the sync
+    // separately or it will overstate what unfusing costs.
+    let force_per_expert =
+        std::env::var("HIPFIRE_QWEN35_MOE_FORCE_PER_EXPERT").as_deref() == Ok("1");
+    let use_gpu_topk = dispatch_flags.use_gpu_topk && !force_per_expert;
     let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
     // Why a routed decode was refused is otherwise invisible: the dispatch error
     // carries only `use_gpu_topk`/`routed_experts_resident`, not the dtypes that
@@ -1822,7 +1833,11 @@ pub(crate) fn moe_ffn_decode_impl(
         // for `routed_gate_up_mq4` alone, check `routed_mq4` explicitly.
         // With both checks the condition equals `use_gpu_topk`, so this
         // branch is effectively dead — kept for clarity until the cleanup.
-        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && routed_mq4 && x_rot_local.is_some();
+        let use_kernarg_fused = !force_per_expert
+            && k == 8
+            && routed_gate_up_mq4
+            && routed_mq4
+            && x_rot_local.is_some();
         if use_kernarg_fused {
             let xr = x_rot_local.unwrap();
             let e0 = &ffn.experts[topk_indices[0]];
