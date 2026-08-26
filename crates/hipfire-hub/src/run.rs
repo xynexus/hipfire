@@ -118,6 +118,7 @@ pub async fn fetch(
     repo: &str,
     revision: &str,
     include: Option<&str>,
+    jobs: usize,
 ) -> Result<usize> {
     let files = filtered(list_files(repo, revision).await?, repo, include)?;
     let store = Store::new(root, repo);
@@ -149,9 +150,24 @@ pub async fn fetch(
         held as f64 / 1e9
     );
 
+    // One whole file per connection: `.part` files are keyed by file path and
+    // the blob store is content-addressed, so concurrent files never share
+    // state. Ranged parallelism within a file is deliberately not attempted —
+    // the streamed hasher needs bytes in order.
+    let jobs = jobs.clamp(1, 16);
+    use futures_util::StreamExt;
+    let mut results = futures_util::stream::iter(files.iter().map(|f| {
+        let store = &store;
+        async move {
+            let blob = fetch_with_retry(repo, revision, f, store).await?;
+            Ok::<_, Error>((f, blob))
+        }
+    }))
+    .buffer_unordered(jobs);
+
     let mut fetched = 0usize;
-    for f in &files {
-        let blob = fetch_with_retry(repo, revision, f, &store).await?;
+    while let Some(r) = results.next().await {
+        let (f, blob) = r?;
         store.link(revision, &f.path, &blob)?;
         fetched += 1;
     }

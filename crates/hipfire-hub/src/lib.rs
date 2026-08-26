@@ -142,23 +142,57 @@ fn auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-/// List a revision's files via the tree API.
+/// Pull the `rel="next"` URL out of a `Link` header, if any.
+///
+/// The hub paginates the tree API (RFC 8288 style): `<url>; rel="next"`.
+/// Ignoring it silently truncates large repos, and a truncated listing means a
+/// fetch that reports success with files missing — so every page is followed.
+fn link_next(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in link.split(',') {
+        let (url, params) = part.split_once(';')?;
+        if params.contains("rel=\"next\"") {
+            return Some(
+                url.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// List a revision's files via the tree API, following pagination.
 ///
 /// `lfs.oid` is the SHA-256 this module verifies against; the top-level `oid`
 /// is a git blob sha1 and is *not* a content hash of the file.
 pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
-    let url = format!("{HUB}/api/models/{repo}/tree/{revision}?recursive=1");
-    let resp = auth(client()?.get(&url)).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(classify(status, &format!("listing {repo}@{revision}")));
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let arr = body
-        .as_array()
-        .ok_or_else(|| Error::Fatal(format!("{repo}: tree API did not return a list")))?;
-
+    let client = client()?;
+    let mut url = format!("{HUB}/api/models/{repo}/tree/{revision}?recursive=1");
     let mut out = Vec::new();
+    loop {
+        let resp = auth(client.get(&url)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(classify(status, &format!("listing {repo}@{revision}")));
+        }
+        let next = link_next(resp.headers());
+        let body: serde_json::Value = resp.json().await?;
+        let arr = body
+            .as_array()
+            .ok_or_else(|| Error::Fatal(format!("{repo}: tree API did not return a list")))?;
+        push_tree_page(arr, &mut out);
+        match next {
+            Some(n) => url = n,
+            None => break,
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn push_tree_page(arr: &[serde_json::Value], out: &mut Vec<RepoFile>) {
     for e in arr {
         if e.get("type").and_then(|v| v.as_str()) != Some("file") {
             continue;
@@ -184,8 +218,6 @@ pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
             git_oid,
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
 }
 
 fn classify(status: reqwest::StatusCode, what: &str) -> Error {
@@ -715,4 +747,29 @@ pub async fn fetch_file_from(
     // holds a correct blob, and verify falls back to the whole-file digest.
     let _ = store.write_chunks(&blob_name, &ch.finish());
     Ok(final_path)
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::link_next;
+    use reqwest::header::{HeaderMap, HeaderValue, LINK};
+
+    fn map(v: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(LINK, HeaderValue::from_str(v).unwrap());
+        m
+    }
+
+    #[test]
+    fn follows_next_and_ignores_other_rels() {
+        let m = map("<https://h.co/api/models/x/tree/main?cursor=abc>; rel=\"next\"");
+        assert_eq!(
+            link_next(&m).as_deref(),
+            Some("https://h.co/api/models/x/tree/main?cursor=abc")
+        );
+        let m = map("<https://h.co/p1>; rel=\"prev\", <https://h.co/p3>; rel=\"next\"");
+        assert_eq!(link_next(&m).as_deref(), Some("https://h.co/p3"));
+        assert_eq!(link_next(&map("<https://h.co/p1>; rel=\"prev\"")), None);
+        assert_eq!(link_next(&HeaderMap::new()), None);
+    }
 }
