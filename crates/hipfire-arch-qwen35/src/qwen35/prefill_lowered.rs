@@ -2973,7 +2973,12 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 k_dim,
                 v_dim,
                 n,
-                pbs.dn_conv_snapshots.get(delta_layer_idx),
+                // Same bounds rule as dn_s_snapshots above.
+                if n <= pbs.max_batch {
+                    pbs.dn_conv_snapshots.get(delta_layer_idx)
+                } else {
+                    None
+                },
             )?;
         }
 
@@ -3141,7 +3146,26 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
                 n_v_heads,
                 config.linear_value_head_dim,
-                pbs.dn_s_snapshots.get(delta_layer_idx),
+                // ⚠️ BOUNDS: the slots hold `max_batch` entries and the kernel
+                // writes slot `t` for every t in 0..n. A call with n >
+                // max_batch (a PREFILL, where n is the prompt length) would
+                // write far past the buffer — a GPU heap corruption that
+                // presents as an acceptance collapse, not as a crash. Verify
+                // always has n <= max_batch; prefill does not.
+                {
+                    let ok = n <= pbs.max_batch && !pbs.dn_s_snapshots.is_empty();
+                    if ok {
+                        // Record that THIS path wrote n slots; the restore in
+                        // speculative.rs refuses to read otherwise.
+                        pbs.dn_snapshots_written
+                            .store(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if ok {
+                        pbs.dn_s_snapshots.get(delta_layer_idx)
+                    } else {
+                        None
+                    }
+                },
             )?;
         } else if use_gdn_per_token {
             // FP16 only — the FP32 arm above is batched, and batched
