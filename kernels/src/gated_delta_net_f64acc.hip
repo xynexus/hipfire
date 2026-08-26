@@ -46,7 +46,12 @@ __global__ void gated_delta_net_f64acc(
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
-    int head_dim
+    int head_dim,
+    // Accepted and IGNORED. Present only so this oracle entry and
+    // gated_delta_net_f32 share one kernarg list in
+    // `gated_delta_net_f32_batch_seq`, which picks between them at runtime
+    // (HIPFIRE_DN_STATE_F64_ORACLE). Checkpointing the oracle is not needed.
+    float* __restrict__ state_snapshots_unused
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
