@@ -2963,7 +2963,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else {
-            gpu.conv1d_silu_split_f32_n(
+            gpu.conv1d_silu_split_f32_n_opts(
                 &pbs.dn_q_raw_batch,
                 &pbs.dn_k_raw_batch,
                 &pbs.dn_v_batch,
@@ -2973,6 +2973,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 k_dim,
                 v_dim,
                 n,
+                pbs.dn_conv_snapshots.get(delta_layer_idx),
             )?;
         }
 

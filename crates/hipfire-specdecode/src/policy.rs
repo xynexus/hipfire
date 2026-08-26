@@ -79,11 +79,15 @@ pub enum SpecRollbackReplayKind {
     PrefixVerify,
     SerialTape,
     VerifyComplete,
+    /// DeltaNet state restored from the per-token checkpoints the verify
+    /// forward wrote. No re-forward at all.
+    Checkpoint,
 }
 
 impl SpecRollbackReplayKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Checkpoint => "checkpoint",
             Self::GdnTape => "gdn_tape",
             Self::BatchedPrefill => "batched_prefill",
             Self::FullPrefill => "full_prefill",

@@ -2238,6 +2238,7 @@ fn main() {
         let mut rollback_replay_prefix_verify: usize = 0;
         let mut rollback_replay_serial_tape: usize = 0;
         let mut rollback_replay_verify_complete: usize = 0;
+        let mut rollback_replay_checkpoint: usize = 0;
         let mut verify_graph_direct: usize = 0;
         let mut verify_graph_warmup: usize = 0;
         let mut verify_graph_capture: usize = 0;
@@ -2618,6 +2619,7 @@ fn main() {
                 speculative::SpecRollbackReplayKind::VerifyComplete => {
                     rollback_replay_verify_complete += 1
                 }
+                speculative::SpecRollbackReplayKind::Checkpoint => rollback_replay_checkpoint += 1,
             }
             match step.verify_graph_mode {
                 speculative::SpecVerifyGraphMode::Direct => verify_graph_direct += 1,
@@ -2955,7 +2957,7 @@ fn main() {
             stats.mean_committed(),
         );
         eprintln!(
-            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_batched_prefill={} replay_full_prefill={} replay_prefix_verify={} replay_serial_tape={} replay_verify_complete={}",
+            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_batched_prefill={} replay_full_prefill={} replay_prefix_verify={} replay_serial_tape={} replay_verify_complete={} replay_checkpoint={}",
             rollback_checked_cycles,
             rollback_single_session_ok,
             rollback_multi_request_disabled,
@@ -2965,6 +2967,7 @@ fn main() {
             rollback_replay_prefix_verify,
             rollback_replay_serial_tape,
             rollback_replay_verify_complete,
+            rollback_replay_checkpoint,
         );
         eprintln!(
             "verify_graph: direct={} warmup={} capture={} replay={} not_applicable={}",
