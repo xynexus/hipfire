@@ -5712,7 +5712,14 @@ impl VerifyScratch {
         config: &qwen35::Qwen35Config,
     ) -> HipResult<Self> {
         let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
-        s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
+        let mut pbs = qwen35::PrefillBatchScratch::new(gpu, config, max_n)?;
+        if dflash_checkpoint_rollback_from_env() {
+            // Up front, not on demand: the verify forward can run inside a
+            // captured graph and hipMalloc is not permitted under stream
+            // capture.
+            pbs.alloc_dn_s_snapshots(gpu, config)?;
+        }
+        s.prefill_batch = Some(pbs);
         Ok(s)
     }
 
@@ -6449,6 +6456,26 @@ pub struct DflashVerifyOutput {
 /// NOTE `HIPFIRE_COMPACT_GDN_TAPE=0` is NOT a substitute: it gates only the
 /// COMPACT tape writer, so on a bf16 target the non-compact tape stays live and
 /// the broken path is still taken. This knob covers both.
+/// `HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1` — rewind DeltaNet by RESTORING the
+/// per-token state the verify forward already produced, instead of re-forwarding
+/// the committed prefix through the whole model.
+///
+/// Exact by construction (the restored bytes are the ones verify wrote), so
+/// unlike the GDN-tape fast path it has no parity question. Off by default
+/// while it is proven, and because the checkpoint slots cost ~832 MB on
+/// Qwen3.5-35B-A3B (2 MB/layer x 26 layers x 16 slots).
+fn dflash_checkpoint_rollback_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn dflash_rollback_gdn_tape_from_env() -> bool {
     matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_GDN_TAPE")
