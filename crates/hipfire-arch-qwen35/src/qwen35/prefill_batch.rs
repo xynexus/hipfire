@@ -45,6 +45,20 @@ pub struct PrefillBatchScratch {
     /// reconstructed once the forward has finished.
     pub dn_conv_snapshots: Vec<GpuTensor>,
 
+    /// How many per-token slots the LAST forward actually WROTE, or 0.
+    ///
+    /// Allocation is not proof of writing. There are two batched GDN paths —
+    /// `prefill_lowered.rs` (`gated_delta_net_f32_batch_seq_opts`, which writes
+    /// snapshots) and `prefill_batch.rs` (`gated_delta_net_f32_routed_batch_seq`,
+    /// which does not). DFlash verify in SERVING takes the routed one, so a
+    /// restore that trusted `!dn_s_snapshots.is_empty()` copied ZEROS over live
+    /// DeltaNet state: measured tau 1.595 -> 0.056 through the daemon, an
+    /// acceptance collapse that looks like a model bug rather than a crash.
+    ///
+    /// The reader must require this to equal the block size it is restoring
+    /// from. AtomicUsize so the writer needs only `&PrefillBatchScratch`.
+    pub dn_snapshots_written: std::sync::atomic::AtomicUsize,
+
     // Residual stream and rotation scratch — all [N × dim]
     pub x_batch: GpuTensor,
     pub x_rot_batch: GpuTensor,
@@ -4908,6 +4922,7 @@ impl PrefillBatchScratch {
             max_batch,
             dn_s_snapshots: Vec::new(),
             dn_conv_snapshots: Vec::new(),
+            dn_snapshots_written: std::sync::atomic::AtomicUsize::new(0),
             x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_norm_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
