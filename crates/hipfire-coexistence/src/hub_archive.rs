@@ -4,7 +4,7 @@
 
 //! Fetch a HuggingFace repo straight into an `.hfa` archive.
 //!
-//! `hub fetch` followed by `repack` produces the same archive, but it needs the
+//! `download --raw` followed by `repack` produces the same archive, but it needs the
 //! raw checkpoint on disk first — so converting a 400 GB model costs 400 GB of
 //! scratch you may not have, and the machine most likely to want the compressed
 //! form is the one least able to stage the uncompressed one. This removes that
