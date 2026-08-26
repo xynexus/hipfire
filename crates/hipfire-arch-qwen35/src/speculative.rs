@@ -6423,8 +6423,47 @@ pub struct DflashVerifyOutput {
     pub verify_graph_mode: SpecVerifyGraphMode,
 }
 
-fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape: bool) -> bool {
-    caller_supplied_tape && verify_populates_tape
+/// `HIPFIRE_DFLASH_ROLLBACK_GDN_TAPE=1` — opt back into replaying a rejected
+/// block from the recorded GDN tape instead of re-running the committed prefix
+/// through `forward_prefill_batch` (`SpecRollbackReplayKind::FullPrefill`).
+///
+/// DEFAULT-OFF since 2026-08-26, and the reason is correctness before speed —
+/// the same trade already recorded for the serial-vs-batched replay above.
+/// Measured on Qwen3.5-35B-A3B--oq4.25++ with its DFlash drafter, greedy, 24
+/// tokens, against plain AR decode of the same target:
+///
+///     gdn-tape replay  (this on)  -> `...561, 12386, 19825...`   DIVERGES
+///     full-prefill     (this off) -> `...561, 30315, 557...`     BYTE-IDENTICAL to AR
+///
+/// The tape replay restores the WRONG DeltaNet state. That state is recurrent
+/// and lives OUTSIDE the KV cache, which is why the divergence is invariant to
+/// `--kv-mode` (kvarn4/kvarn8/f32 all identical) and to the verify block size
+/// (B=2/4/8/16 all identical) — rolling it back after a partial accept is the
+/// one thing plain AR decode never does, so nothing else exercises it.
+///
+/// Spec decode's whole guarantee is that it cannot change the output, so a
+/// rollback that diverges from AR is not a performance knob — it is incorrect.
+/// Cost of the correct path here: 18.62 -> 15.27 tok/s. Turn this back on only
+/// to work ON the tape bug, not to buy that back.
+///
+/// NOTE `HIPFIRE_COMPACT_GDN_TAPE=0` is NOT a substitute: it gates only the
+/// COMPACT tape writer, so on a bf16 target the non-compact tape stays live and
+/// the broken path is still taken. This knob covers both.
+fn dflash_rollback_gdn_tape_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_GDN_TAPE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
+fn dflash_use_gdn_tape_replay(
+    caller_supplied_tape: bool,
+    verify_populates_tape: bool,
+    tape_replay_opt_in: bool,
+) -> bool {
+    caller_supplied_tape && verify_populates_tape && tape_replay_opt_in
 }
 
 /// Run the target on `draft_tokens` (length B) positions starting at
@@ -7790,7 +7829,11 @@ pub fn spec_step_dflash(
         moe_router_logits_present,
         /* tape_in_play */ true,
     ) && kv_batched_capable;
-    let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
+    let use_tape_replay = dflash_use_gdn_tape_replay(
+        gdn_tape.is_some(),
+        verify_populates_tape,
+        dflash_rollback_gdn_tape_from_env(),
+    );
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
     let trace_position = dflash_trace_position_from_env();
     let trace_this_position = trace_position == Some(position);
@@ -9870,6 +9913,64 @@ pub fn spec_step_dflash(
         {
             let mut gdn_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
             gdn_result.save_from(&target.dn_state, gpu)?;
+
+            // REFERENCE ARM: the tape-free re-run of the committed prefix
+            // (`SpecRollbackReplayKind::FullPrefill`). This is the arm whose
+            // committed tokens match plain AR decode byte-for-byte, so it — not
+            // the serial replay — is what a rollback has to reproduce.
+            //
+            // Every other comparison in this block checks the GDN tape against
+            // the SERIAL replay, and a check between two paths cannot see a
+            // defect they SHARE. They do share one: both replay hidden states
+            // captured over the DRAFTED block, so committed output follows the
+            // drafter (that is bug #21, recorded on
+            // `dflash_serial_tape_rollback_replay_from_env` above, and it is why
+            // the serial-tape path is already default-off). Measured on
+            // Qwen3.5-35B-A3B--oq4.25++, gdn-vs-serial reported `match` on every
+            // cycle while the emitted tokens diverged from AR — this arm is what
+            // that green light was missing.
+            let full_prefill_frame_start = gpu.debug_gdn_requant_frame();
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                &committed[..accept_len + 1],
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-gdn-full-prefill-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} full_prefill_byte={} gdn_tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-gdn-full-prefill-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            gpu.debug_set_gdn_requant_frame(full_prefill_frame_start);
 
             let serial_frame_start = gpu.debug_gdn_requant_frame();
             target_snap.restore_to(&mut target.dn_state, gpu)?;
@@ -12671,9 +12772,13 @@ mod tests {
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {
-        assert!(dflash_use_gdn_tape_replay(true, true));
-        assert!(!dflash_use_gdn_tape_replay(false, true));
-        assert!(!dflash_use_gdn_tape_replay(true, false));
+        // Opted in: still gated on BOTH eligibility terms.
+        assert!(dflash_use_gdn_tape_replay(true, true, true));
+        assert!(!dflash_use_gdn_tape_replay(false, true, true));
+        assert!(!dflash_use_gdn_tape_replay(true, false, true));
+        // Default (no opt-in) declines even when both terms say yes — the
+        // tape replay diverges from AR, so FullPrefill is the default.
+        assert!(!dflash_use_gdn_tape_replay(true, true, false));
     }
 
     #[test]

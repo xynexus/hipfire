@@ -96,7 +96,22 @@ fn main() {
     let tokens: Vec<u32> = (0..n).map(|i| (1000 + i * 7) as u32).collect();
     let kv_max = n + 16;
 
-    let run = |gpu: &mut hipfire_rdna::Gpu, batched: bool, kv_mode: &str| -> Vec<Vec<f32>> {
+    // `grouped` toggles the MoE path-2 grouped GEMM. It is read per call by
+    // `moe_grouped_gemm_supported_for_dtype`, so both arms can run in ONE
+    // process against ONE loaded model -- which is the only way to compare them
+    // honestly. (An env var set outside the process does NOT reach the daemon,
+    // and `hipfire-eval --battery perplexity` does not route through
+    // `forward_prefill_batch` at all, so neither can gate this path.)
+    let run = |gpu: &mut hipfire_rdna::Gpu,
+               batched: bool,
+               kv_mode: &str,
+               grouped: bool|
+     -> Vec<Vec<f32>> {
+        if grouped {
+            std::env::set_var("HIPFIRE_MOE_COMPACT_GROUPED", "1");
+        } else {
+            std::env::set_var("HIPFIRE_MOE_COMPACT_GROUPED", "0");
+        }
         if batched {
             std::env::remove_var("HIPFIRE_PREFILL_BATCHED");
         } else {
@@ -173,9 +188,9 @@ fn main() {
     };
 
     eprintln!("-- batched --");
-    let a = run(&mut gpu, true, &kv_mode);
+    let a = run(&mut gpu, true, &kv_mode, false);
     eprintln!("-- per-token --");
-    let b = run(&mut gpu, false, &kv_mode);
+    let b = run(&mut gpu, false, &kv_mode, false);
     // WHICH PATH IS RIGHT? Unquantized KV is the reference: both paths agree
     // EXACTLY there (measured 0.00e0), so it is the only fixed point available.
     // Comparing each quantized arm against it says which one the fix should make
@@ -184,7 +199,7 @@ fn main() {
         None
     } else {
         eprintln!("-- reference: per-token, fp32 KV --");
-        Some(run(&mut gpu, false, "fp32"))
+        Some(run(&mut gpu, false, "fp32", false))
     };
 
     let dim = config.dim;
@@ -244,6 +259,83 @@ fn main() {
                 / sc;
             println!("  row {r0:>3}  {d:.3e}");
         }
+    }
+
+    // ── MoE PATH-2 GATE ─────────────────────────────────────────────────────
+    //
+    // The grouped MoE GEMM is worth +37.6% prefill and takes DFlash decode past
+    // AR, but it changes what every prefill computes, and until now NOTHING
+    // measured it: perplexity does not route through `forward_prefill_batch`,
+    // and a token-stream diff is not evidence on this model (four separate
+    // false alarms on this branch alone). This is the missing measurement --
+    // same tokens, same model, same process, batched path either side, MoE
+    // grouped GEMM the only thing that changes.
+    {
+        eprintln!("-- batched, MoE grouped (path 2) --");
+        let g = run(&mut gpu, true, &kv_mode, true);
+        let mut worst = 0f32;
+        let mut worst_layer = 0usize;
+        let mut nonfinite = 0usize;
+        let mut first_bad: Option<(usize, f32)> = None;
+        let mut per_layer: Vec<f32> = Vec::new();
+        for (l, (x, y)) in g.iter().zip(&a).enumerate() {
+            let mut lworst = 0f32;
+            let rows = (x.len() / dim).min(y.len() / dim).min(n);
+            for row in 0..rows {
+                let (xs, ys) = (
+                    &x[row * dim..(row + 1) * dim],
+                    &y[row * dim..(row + 1) * dim],
+                );
+                if xs.iter().any(|v| !v.is_finite()) {
+                    nonfinite += 1;
+                    continue;
+                }
+                let sc = ys.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                let d = xs
+                    .iter()
+                    .zip(ys)
+                    .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
+                    / sc;
+                if d > lworst {
+                    lworst = d;
+                }
+                if d > worst {
+                    worst = d;
+                    worst_layer = l;
+                }
+            }
+            per_layer.push(lworst);
+            if lworst > 1e-4 && first_bad.is_none() {
+                first_bad = Some((l, lworst));
+            }
+        }
+        println!("\nMoE PATH-2 GATE (grouped vs indexed, both batched, same KV):");
+        println!("  worst |rel| {worst:.3e} at layer {worst_layer}   nonfinite rows {nonfinite}");
+        match first_bad {
+            Some((l, v)) => println!("  first layer over 1e-4: {l} ({v:.3e})"),
+            None => println!("  no layer over 1e-4"),
+        }
+        let shown = per_layer.len().min(10);
+        let head: Vec<String> = per_layer[..shown]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("L{i}={v:.1e}"))
+            .collect();
+        println!("  per-layer head: {}", head.join(" "));
+        // The GEMM itself is bit-exact (parity_gemm_oq_compact_moe_grouped), so
+        // anything here is the surrounding pipeline: scatter/unscatter and the
+        // down combine's summation order. Order-of-summation over k_top experts
+        // is legitimate and lands near f32 epsilon; a layout or indexing fault
+        // does not.
+        let ok = nonfinite == 0 && worst < 1e-4;
+        println!(
+            "  {}",
+            if ok {
+                "PASS — consistent with summation order in the down combine"
+            } else {
+                "FAIL — too large for reordering: suspect scatter/unscatter or indexing"
+            }
+        );
     }
 
     if let Some(r) = reference {

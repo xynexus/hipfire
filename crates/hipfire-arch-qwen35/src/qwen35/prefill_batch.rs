@@ -6350,6 +6350,50 @@ pub fn forward_prefill_batch_with_pbs_opts(
             "qwen35 forward_prefill_batch: -> per-token forward_scratch loop (batched prefill declined)",
             &format!("base={pbs_eligible_base} kv_f32={kv_f32} kv_asym2_tree={kv_asym2_tree} n={n} arch={arch} dn_quant={:?}", dn_state.quant),
         );
+        // KNOWN-WRONG COMBINATION, and silent until now — hence a real warning
+        // rather than another trace-gated line. Measured 2026-08-26 on
+        // Qwen3.5-35B-A3B (bf16 and oq4.25++), greedy AR decode, batched vs
+        // per-token prefill over the same 14-token prompt:
+        //
+        //     kv f32     -> identical      kv q8      -> identical
+        //     kv kvarn4  -> DIVERGES       kv kvarn8  -> DIVERGES
+        //
+        // Batched is the correct arm: it reproduces the unquantized-KV token
+        // stream exactly, per-token under KVarN does not. kvarn4 and kvarn8
+        // diverge BYTE-IDENTICALLY to each other, so this is structural, not a
+        // precision effect — and on a 14-token prompt the K values still sit in
+        // KVarN's f32 window, where no K quantization has happened at all.
+        //
+        // The strongest evidence is per-LAYER, not the tokens:
+        // `examples/compare_prefill_hidden_paths` reports batched == per-token
+        // EXACTLY (0.00e0, every layer) at fp32 KV, and a split from LAYER 3
+        // reaching 1.23e-1 relative at kvarn. A greedy token flip alone would
+        // not justify this warning — several unrelated perturbations of this
+        // model land on the same degenerate loop for this prompt while scoring
+        // IDENTICAL perplexity, so token divergence on its own is weak evidence.
+        // A 1.2e-1 hidden-state split from layer 3 is not that.
+        //
+        // NOT measured: the quality (ppl/KLD) cost. `hipfire-eval --battery
+        // perplexity` cannot measure it — that battery does not route through
+        // this function at all (verified by hardcoding `force_fallback = true`:
+        // elapsed time unchanged and this very warning never fires).
+        //
+        // It matters here because KVarN is the DEFAULT KV mode and this fallback
+        // is silent, so a model that declines the batched path for any unrelated
+        // reason (an unwired dtype, a MoE term) starts emitting different tokens
+        // with nothing in the log to say so. It is also on the DFlash rollback
+        // path now that FullPrefill is the rollback default, since that replays
+        // the committed prefix through this very function.
+        if kv_cache.quant_kvarn {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[prefill] WARNING: batched prefill declined and KV is KVarN ({} bit) —                      the per-token fallback is MEASURED to emit a different token stream than                      the batched path on qwen3.5 MoE, while f32 and q8 KV agree between the two.                      Output from this point is not trustworthy. Use --kv-mode q8 (or f32) until                      the KVarN per-token write path is fixed.                      (base={pbs_eligible_base} kv_f32={kv_f32} n={n} arch={arch} dn_quant={:?})",
+                    kv_cache.kvarn_bits, dn_state.quant,
+                );
+            }
+        }
         assert!(
             tree_verify.is_none(),
             "tree-verify mode requires the batched-FA-eligible prefill path; \

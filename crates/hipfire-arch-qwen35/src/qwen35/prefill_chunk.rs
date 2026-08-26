@@ -835,12 +835,34 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
         )
     });
-    let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
-        dtypes.expert_gate_up,
-        &gpu.arch,
-        (use_path2 || dtypes.routed_profile.is_mixed())
-            && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
-    );
+    // BATCH THRESHOLD. Grouped MoE amortizes an expert's weight read across the
+    // tokens routed to it, but for Opus dtypes it first has to expand
+    // activations into [N x K_TOP x dim] so each slot gets its OWN expert's AWQ
+    // scale (see the OqCompact arm below and b86eb4397). That expansion is
+    // O(N x K_TOP), so it only pays once N is large enough for the weight reuse
+    // to outrun it. Measured end-to-end on Qwen3.5-35B-A3B--oq4.25++, prefill
+    // tok/s, indexed vs grouped:
+    //
+    //     N=31    193.29 -> 179.89   -7%   grouped LOSES
+    //     N=115   249.71 -> 288.93  +16%
+    //     N=459   250.75 -> 327.92  +31%
+    //     N=1720  248.20 -> 325.47  +31%
+    //     N=3445  238.78 -> 309.48  +30%
+    //
+    // Crossover is between 31 and 115. 64 sits above it with margin and well
+    // clear of DFlash verify, which runs B <= 16 -- and verify must stay on the
+    // indexed path anyway: at B=8 the grouped path measured 56.20 -> 45.95
+    // tok/s. Both paths are bit-exact to each other (MoE path-2 gate reads
+    // 0.000e0 on every layer), so this threshold is purely a speed choice and
+    // cannot change output.
+    const MOE_GROUPED_MIN_BATCH: usize = 64;
+    let path2_eligible = n >= MOE_GROUPED_MIN_BATCH
+        && moe_grouped_gemm_path2_eligible_for_dtype(
+            dtypes.expert_gate_up,
+            &gpu.arch,
+            (use_path2 || dtypes.routed_profile.is_mixed())
+                && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
+        );
     // Report the DECISION, not one of its inputs. An earlier version of this
     // line keyed on `routed_expert_buckets` and kept printing "not reachable
     // here" after the hoist had made it reachable -- the exact failure the rule
@@ -1069,19 +1091,48 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     // for routed MoE. block_stride comes from the expert's own blocks;
                     // the kernel derives side_stride and n_ov from it and applies the
                     // overlay inline, so no expert-indexed correction pass is needed.
-                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
-                        &ffn.expert_gate_up_ptrs,
-                        tile_ids,
-                        sorted,
-                        &pbs.x_rot_batch,
-                        y_gu_grouped,
-                        2 * mi,
-                        gate_up_k,
-                        path2_shape.gate_up_x_row_div,
-                        m_total,
-                        path2_shape.gate_up_source_rows,
-                        super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
-                    )?,
+                    // f32-activation grouped GEMM, NOT the WMMA sibling: this one
+                    // is bit-exact against the decode GEMV, which is what lets
+                    // DFlash verify keep committing what AR decode would. The
+                    // WMMA one rounds activations to f16 (~3e-4) and is slower
+                    // here besides. See gemm_oq_compact_moe_grouped_f32.hip.
+                    //
+                    // PER-SLOT x, exactly as path 1 does for this dtype. Routed
+                    // Opus experts carry DIFFERENT AWQ scales -- each sees a
+                    // different token subset, hence a different imatrix -- and
+                    // the divide precedes the FWHT, so one rotation cannot serve
+                    // them all. `x_rot_batch` is a REPRESENTATIVE expert's
+                    // rotation, [N x dim]; feeding it here with x_row_div=K_TOP
+                    // gave every slot the wrong scale and put the grouped path
+                    // ~40% off from LAYER 0 (measured by the MoE path-2 gate in
+                    // compare_prefill_hidden_paths). Expand into
+                    // [N x K_TOP x dim] first, then index slots directly.
+                    DType::OqCompactG256 => {
+                        let x_rot_slots =
+                            pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
+                        gpu.rotate_x_mq_awq_indexed_batched(
+                            &pbs.x_norm_batch,
+                            ffn.expert_gate_up_awq_ptrs.as_ref(),
+                            topk_indices,
+                            x_rot_slots,
+                            gate_up_k,
+                            k_top,
+                            n,
+                        )?;
+                        gpu.gemm_oq_compact_moe_grouped_f32(
+                            &ffn.expert_gate_up_ptrs,
+                            tile_ids,
+                            sorted,
+                            x_rot_slots,
+                            y_gu_grouped,
+                            2 * mi,
+                            gate_up_k,
+                            // rows ARE flat slots now, so no division
+                            1,
+                            m_total,
+                            super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
+                        )?;
+                    }
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                         &ffn.expert_gate_up_ptrs,
                         tile_ids,
@@ -1620,7 +1671,10 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         0,
                     )?,
                     // Compact routed down. See the gate_up arm.
-                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_wmma(
+                    // See the gate_up arm. down_k = 512 -> ng = 2, so this takes
+                    // the kernel's NARROW lane arm, mirroring the narrow GEMV the
+                    // reference uses at that shape.
+                    DType::OqCompactG256 => gpu.gemm_oq_compact_moe_grouped_f32(
                         &ffn.expert_down_ptrs,
                         tile_ids,
                         sorted,
@@ -1630,7 +1684,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         down_k,
                         path2_shape.down_x_row_div,
                         m_total,
-                        path2_shape.down_source_rows,
                         super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].down)?,
                     )?,
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(

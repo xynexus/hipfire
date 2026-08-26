@@ -139,3 +139,111 @@ __launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_grouped_v3(
         if (lane == 0) Y[row] = facc;
     }
 }
+
+// SPLIT-K twin of the kernel above, for SMALL M.
+//
+// v3 gives each row one wave, so the wave count IS M. That is plenty for
+// lm_head (M=248320) but starves the per-layer projections. Measured on
+// Qwen3.5-35B-A3B--oq4.25++ decode, from one kernel trace — note rows 2 and 3
+// move the SAME 4.7 MB and differ only in shape:
+//
+//     M=248320 K=2048  16384 waves (clamped)   1204 us   225 GB/s
+//     M=8192   K=2048   8192 waves   9.4 MB      49.9    189
+//     M=4096   K=2048   4096 waves   4.7 MB      29.1    162
+//     M=2048   K=4096   2048 waves   4.7 MB      44.6    106   <-- same bytes
+//     M=512    K=2048    512 waves   0.6 MB       6.1     97
+//
+// Identical bytes at half the waves costs 1.53x the time, so this is
+// PARALLELISM, not bandwidth: too few waves, each walking a serial chain of ng
+// groups with a dependent accumulate.
+//
+// So: SPLIT waves cooperate on one row, each taking a contiguous ng/SPLIT slice
+// of the groups, then one LDS reduction folds the partials. Wave count becomes
+// M*SPLIT and each chain shortens by SPLIT, which is exactly the axis the table
+// above is monotonic in.
+//
+// Requires (ng / SPLIT) % 4 == 0, because a wave still consumes 4 groups per
+// round (8 lanes x dwordx4). The caller picks SPLIT and falls back to the
+// one-wave-per-row kernel when no split divides cleanly.
+//
+// Numerics: each wave reduces its own slice with the same 32-lane __shfl_down,
+// then the slices are summed low-to-high. Against the unsplit kernel that is a
+// different summation ASSOCIATION over groups (the same class of difference as
+// the wide-load port), not a different computation.
+__launch_bounds__(256) extern "C" __global__ void gemv_oq_compact_grouped_v3_splitk(
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int group /* == 256 */, int block_stride, int split
+) {
+    const int lane = threadIdx.x & 31;
+    const int wig  = (int)(threadIdx.x >> 5);      // wave index in workgroup, 0..7
+    const int rpb  = 8 / split;                    // rows per workgroup
+    const int rib  = wig / split;                  // which row this wave serves
+    const int sub  = wig % split;                  // which K-slice
+    const int nrow = gridDim.x * rpb;
+    const int ng   = K / 256;
+    const int gir  = lane >> 3;
+    const int lig  = lane & 7;
+    const int n_ov = (block_stride - 130) >> 1;
+    const int elt  = lig * 32;
+    const int gpw  = ng / split;                   // groups per wave, multiple of 4
+    const int g0   = sub * gpw;
+
+    __shared__ float part[8];
+
+    for (int row = blockIdx.x * rpb + rib; row < M; row += nrow) {
+        const int side_stride = block_stride - 128;
+        const uint8_t* n_row = W + (long long)row * ng * 128LL;
+        const uint8_t* s_row = W + (long long)M * ng * 128LL
+                                 + (long long)row * ng * (long long)side_stride;
+
+        float facc = 0.0f;
+        for (int r = 0; r < gpw; r += 4) {
+            const int gi = g0 + r + gir;
+            const uint8_t* sb = s_row + (long long)gi * side_stride;
+            const float sw = (float)(*(const _Float16*)sb);
+
+            uint32_t wv[4];
+            __builtin_memcpy(wv, n_row + (long long)gi * 128 + lig * 16, 16);
+
+            const int xoff = gi * 256 + elt;
+            const float4 x0 = *(const float4*)(X + xoff);
+            const float4 x1 = *(const float4*)(X + xoff + 4);
+            const float4 x2 = *(const float4*)(X + xoff + 8);
+            const float4 x3 = *(const float4*)(X + xoff + 12);
+            const float4 x4 = *(const float4*)(X + xoff + 16);
+            const float4 x5 = *(const float4*)(X + xoff + 20);
+            const float4 x6 = *(const float4*)(X + xoff + 24);
+            const float4 x7 = *(const float4*)(X + xoff + 28);
+
+            float sdot = OQCV3_WORD(wv[0], x0, x1) + OQCV3_WORD(wv[1], x2, x3)
+                       + OQCV3_WORD(wv[2], x4, x5) + OQCV3_WORD(wv[3], x6, x7);
+
+            const uint8_t* table = sb + 2;
+            {
+                const int e   = (lig < n_ov) ? lig : 0;
+                const int idx = (int)table[2 * e];
+                const int val = (lig < n_ov) ? (int)(int8_t)table[2 * e + 1] : 0;
+                sdot += (float)val * X[gi * 256 + idx];
+            }
+            for (int e = lig + 8; e < n_ov; e += 8) {
+                const int idx = (int)table[2 * e];
+                const int val = (int)(int8_t)table[2 * e + 1];
+                sdot += (float)val * X[gi * 256 + idx];
+            }
+
+            facc += sdot * sw;
+        }
+
+        for (int off = 16; off > 0; off >>= 1) facc += __shfl_down(facc, off);
+        if (lane == 0) part[wig] = facc;
+        __syncthreads();
+        if (sub == 0 && lane == 0) {
+            float t = 0.0f;
+            for (int i = 0; i < split; ++i) t += part[rib * split + i];
+            Y[row] = t;
+        }
+        __syncthreads();
+    }
+}

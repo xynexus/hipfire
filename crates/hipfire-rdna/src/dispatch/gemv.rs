@@ -7,6 +7,14 @@
 use super::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
+
+/// Output rows per workgroup for the indexed compact-MoE GEMVs. MUST match
+/// `OQCM_ROWS_PER_BLOCK` / `OQCM_BLOCK_THREADS` in
+/// `kernels/src/gemv_oq_compact_moe_indexed.hip` — the kernel derives its row
+/// from `blockIdx.x * OQCM_ROWS_PER_BLOCK + threadIdx.x/32`, so a mismatch
+/// silently computes the wrong rows rather than failing to launch.
+const OQCM_ROWS_PER_BLOCK: usize = 8;
+const OQCM_BLOCK_THREADS: u32 = (OQCM_ROWS_PER_BLOCK * 32) as u32;
 use std::ffi::c_void;
 
 impl Gpu {
@@ -4120,10 +4128,21 @@ impl Gpu {
         x_per_slot: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // SPLIT-K when every wave would otherwise walk more than one round.
+        // The wide path eats 4 groups per round, so ng=8 (routed gate_up, K=2048)
+        // means two dependent rounds; the dense split-K shape hits 195 GB/s with
+        // the same 8192 waves and ONE round. Needs (ng/2) % 4 == 0 and M % 4 == 0.
+        let ng_gu = k / 256;
+        let gu_split = ng_gu % 8 == 0 && m % 4 == 0;
+        let gu_name = if gu_split {
+            "gemv_oq_compact_moe_gate_up_k8_indexed_batched_splitk"
+        } else {
+            "gemv_oq_compact_moe_gate_up_k8_indexed_batched"
+        };
         self.ensure_kernel(
             "gemv_oq_compact_moe_indexed",
             kernels::GEMV_OQ_COMPACT_MOE_INDEXED_SRC,
-            "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
+            gu_name,
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -4133,10 +4152,17 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
         let xps = i32::from(x_per_slot);
+        // 8 rows per workgroup (256 threads = 8 waves of 32), not one row per
+        // single-wave workgroup — see the note on OQCM_ROWS_PER_BLOCK in
+        // kernels/src/gemv_oq_compact_moe_indexed.hip. Math is unchanged and
+        // bit-identical; this only stops the per-CU workgroup-slot limit from
+        // capping occupancy at 16 waves/CU on a memory-bound GEMV.
+        // splitk packs 8/SPLIT=4 rows per workgroup; the plain kernel packs 8.
+        let gx = m.div_ceil(if gu_split { 4 } else { OQCM_ROWS_PER_BLOCK }) as u32;
         self.launch_kernargs(
-            "gemv_oq_compact_moe_gate_up_k8_indexed_batched",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
+            gu_name,
+            [gx, k_top as u32, batch_size as u32],
+            [OQCM_BLOCK_THREADS, 1, 1],
             0,
             &kernargs![ptr pp, ptr ip, ptr sp, ptr xp, ptr ygp, ptr yup,
                        i32 m_val, i32 k_val, i32 kt, i32 xps],
@@ -4169,10 +4195,12 @@ impl Gpu {
         let rp = rot_batch.buf.as_ptr();
         let op = expert_outputs.buf.as_ptr();
         let (m_val, k_val, kt) = (m as i32, k as i32, k_top as i32);
+        // Same 8-rows-per-workgroup geometry as gate_up above.
+        let gx = m.div_ceil(OQCM_ROWS_PER_BLOCK) as u32;
         self.launch_kernargs(
             "gemv_oq_compact_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
+            [gx, k_top as u32, batch_size as u32],
+            [OQCM_BLOCK_THREADS, 1, 1],
             0,
             &kernargs![ptr pp, ptr ip, ptr sp, ptr rp, ptr op,
                        i32 m_val, i32 k_val, i32 kt],
@@ -5721,7 +5749,40 @@ impl Gpu {
                 .ok()
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        let (kname, ksrc) = if v3 {
+        // SPLIT-K for small M. v3 gives each row one wave, so the wave count IS
+        // M — fine for lm_head (M=248320), starving for the per-layer
+        // projections. From one decode trace on Qwen3.5-35B-A3B--oq4.25++, where
+        // the middle two shapes move the SAME 4.7 MB:
+        //
+        //     M=8192 K=2048  8192 waves  49.9 us  189 GB/s
+        //     M=4096 K=2048  4096 waves  29.1 us  162 GB/s
+        //     M=2048 K=4096  2048 waves  44.6 us  106 GB/s   <-- same bytes
+        //     M=512  K=2048   512 waves   6.1 us   97 GB/s
+        //
+        // Same bytes at half the waves costs 1.53x the time, so the limit is
+        // parallelism, not bandwidth. Pick the smallest split that lifts M*split
+        // to ~8192 waves, subject to (ng/split) % 4 == 0 — a wave still eats 4
+        // groups per round — and split | 8 so rows-per-workgroup divides evenly.
+        let ng = k / 256;
+        let split = if v3 {
+            [8u32, 4, 2]
+                .into_iter()
+                .find(|&sp| {
+                    (m as u32) * sp <= 16384
+                        && (m as u32) * sp >= 4096
+                        && ng % (4 * sp as usize) == 0
+                        && (m as u32) % (8 / sp) == 0
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (kname, ksrc) = if v3 && split > 1 {
+            (
+                "gemv_oq_compact_grouped_v3_splitk",
+                kernels::GEMV_OQ_COMPACT_GROUPED_V3_SRC,
+            )
+        } else if v3 {
             (
                 "gemv_oq_compact_grouped_v3",
                 kernels::GEMV_OQ_COMPACT_GROUPED_V3_SRC,
@@ -5744,11 +5805,25 @@ impl Gpu {
         // x 256 measured 239.0 GB/s against 234.5 for one workgroup per row on
         // the synthetic sweep (examples/bench_oq_layout). Capped at the row count
         // so small M does not launch idle waves. v2 keeps one row per workgroup.
-        let (grid, tpb) = if v3 {
+        let (grid, tpb) = if v3 && split > 1 {
+            // rows-per-workgroup = 8/split, so grid covers M rows.
+            let rpb = 8 / split;
+            ((m as u32).div_ceil(rpb).clamp(1, 2048), 256u32)
+        } else if v3 {
             (((m as u32).div_ceil(8)).clamp(1, 2048), 256u32)
         } else {
             (m as u32, 32u32)
         };
+        if split > 1 {
+            let sp = split as i32;
+            return self.launch_kernargs(
+                kname,
+                [grid, 1, 1],
+                [tpb, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi, i32 bs, i32 sp],
+            );
+        }
         self.launch_kernargs(
             kname,
             [grid, 1, 1],

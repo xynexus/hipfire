@@ -2646,9 +2646,57 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // grouped GEMM against gemm_oq8_grouped_wmma on expanded blocks -- the
         // shape `parity_gemm_oq_compact` already uses for the dense twin -- before
         // flipping it on.
+        // ⚠️ STILL OPT-IN, and NOT because of the GEMM. See the note below.
+        //
+        // Path 2 was moved onto
+        // `gemm_oq_compact_moe_grouped_f32`, which is BIT-EXACT against the
+        // decode GEMV -- 0 mismatches of up to 2,097,152 values across every
+        // shape in `parity_gemm_oq_compact_moe_grouped`, both lane arms -- and
+        // 1.4-3.3x faster than the indexed GEMV it replaces.
+        //
+        // The opt-in gate here was for the WMMA sibling, which had never been
+        // checked against a reference. It has been now (0624cbc50): it is
+        // numerically fine but only to the f16-activation floor (~3e-4), and it
+        // is SLOWER in practice. f16 is why it can never back DFlash verify --
+        // verify has to commit what AR decode would, and AR decode runs the
+        // f32 GEMV.
+        //
+        // ⚠️ Path 2 produces a DIFFERENT token stream than path 1, but there is
+        // no evidence it is WRONG, and an earlier revision of this comment
+        // asserting a pipeline "defect" was overstated. What is actually known:
+        //
+        //   * the GEMM is bit-exact vs the decode GEMV (0 mismatches, both lane
+        //     arms, every shape in parity_gemm_oq_compact_moe_grouped),
+        //   * `moe_scatter_offsets_k8` pads each expert's count up to block_m,
+        //     so a tile never spans two experts -- the layout both grouped
+        //     kernels assume is the layout produced,
+        //   * `moe_gate_up_unscatter_k8` restores FLAT (token, krank) order
+        //     before the shared AWQ silu+rotate, so per-expert AWQ is keyed on
+        //     topk_indices exactly as on path 1,
+        //   * output under path 2 is coherent: humaneval_0 yields a valid
+        //     docstring-then-body continuation, the prose prompt loops the same
+        //     way path 1 loops on it.
+        //
+        // The token split is at a genuine near-tie (docstring vs function body),
+        // and this model flips such ties under ANY small perturbation -- the
+        // remaining candidate is summation ORDER in the down combine, which is
+        // a legitimate difference, not a bug.
+        //
+        // It stays OPT-IN regardless, because "coherent and probably rounding"
+        // is not the bar for changing what every prefill computes, and no
+        // quantitative gate covers this path today: `hipfire-eval --battery
+        // perplexity` does not route through `forward_prefill_batch` at all
+        // (verified by hardcoding the fallback -- elapsed unchanged). Building
+        // one is the prerequisite for turning this on.
+        //
+        // The prize for fixing it is large and measured, with the flag forced on:
+        //     prefill        248.76 -> 342.28 tok/s  (+37.6%)
+        //     DFlash decode   56.16 ->  73.60 tok/s  (+31%), tau 3.47 -> 5.19
+        // which puts spec-decode AHEAD of AR decode (64.15) for the first time.
+        // So this is worth chasing -- but not worth shipping wrong.
         DType::OqCompactG256 => {
             arch.starts_with("gfx11")
-                && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() == Ok("1")
+                && std::env::var("HIPFIRE_MOE_COMPACT_GROUPED").as_deref() != Ok("0")
         }
         // ⚠️ Oq8G256 grouped is OPT-IN and OFF by default: the kernel is FAST and
         // WRONG. gemm_oq8g256_moe_grouped_wmma + its path-2 arms exist and route
