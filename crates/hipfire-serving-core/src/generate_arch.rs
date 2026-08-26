@@ -112,7 +112,7 @@ pub fn generate_registered_backend(
                 return;
             }
             Err(error) => {
-                eprintln!("[{family}] prompt render failed ({error}); using shared fallback");
+                tracing::warn!("{family} prompt render failed ({error}); using shared fallback");
                 let ids = prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
@@ -410,8 +410,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                         .as_deref()
                         == Some("1")
                     {
-                        eprintln!(
-                            "[asst-cache lookup] fp={:#018x} content.len={} tool_calls={} hit={}",
+                        tracing::debug!(
+                            "asst-cache lookup: fp={:#018x} content.len={} tool_calls={} hit={}",
                             fp,
                             msg.content.len(),
                             msg.tool_calls.len(),
@@ -502,7 +502,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             &path,
             format!("# tokens: {}\n{}\n", prompt_ids.len(), rendered),
         );
-        eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
+        tracing::debug!("v4f prompt dump: tokens={} → {}", prompt_ids.len(), path);
     }
 
     // Triaged config resolution for MTP speculative decode.
@@ -1156,8 +1156,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 .as_deref()
                 == Some("1")
             {
-                eprintln!(
-                    "[asst-cache store] fp={:#018x} content.len={} tool_calls={} tokens={}",
+                tracing::debug!(
+                    "asst-cache store: fp={:#018x} content.len={} tool_calls={} tokens={}",
                     fp,
                     emit_text_buf.len(),
                     emit_tool_calls_buf.len(),
@@ -1374,7 +1374,7 @@ pub fn generate_nemotron(
             match rendered {
                 Ok(text) => tokenizer.encode(&text),
                 Err(e) => {
-                    eprintln!("[daemon] nemotron jinja render failed ({e}) — Plain fallback");
+                    tracing::warn!("nemotron jinja render failed ({e}) — Plain fallback");
                     prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -1554,7 +1554,7 @@ pub fn generate_zaya(
             match rendered {
                 Ok(text) => tokenizer.encode(&text),
                 Err(e) => {
-                    eprintln!("[daemon] zaya jinja render failed ({e}) — Plain fallback");
+                    tracing::warn!("zaya jinja render failed ({e}) — Plain fallback");
                     prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -1809,7 +1809,7 @@ pub fn generate_llama(
             match rendered {
                 Ok(text) => tokenizer.encode(&text),
                 Err(e) => {
-                    eprintln!("[daemon] llama jinja render failed ({e}) — Plain fallback");
+                    tracing::warn!("llama jinja render failed ({e}) — Plain fallback");
                     prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -2202,7 +2202,9 @@ pub fn generate_minimax(
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
+                    tracing::warn!(
+                        "jinja render failed in minimax path ({e}) — falling back to Plain"
+                    );
                     prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -2249,7 +2251,7 @@ pub fn generate_minimax(
             let state = m.minimax_state.as_ref().unwrap();
             (state.n_tokens, state.max_seq)
         };
-        eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
+        tracing::warn!("arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
         m.minimax_state.as_mut().unwrap().reset();
         m.active.cursor.seq_pos = 0;
         m.active.cursor.conversation_tokens.clear();
@@ -2493,7 +2495,9 @@ pub fn generate_lfm2moe(
             match render_result {
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
+                    tracing::warn!(
+                        "jinja render failed in lfm2moe path ({e}) — falling back to Plain"
+                    );
                     prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -2565,8 +2569,8 @@ pub fn generate_lfm2moe(
             );
             return;
         }
-        eprintln!(
-            "[daemon] arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
+        tracing::warn!(
+            "arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
         );
         let _ = m.active.lfm2moe_state.as_mut().unwrap().reset(gpu);
         m.active.cursor.seq_pos = 0;
@@ -2843,8 +2847,8 @@ fn generate_lfm2moe_dflash(
             match render_result {
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
-                    eprintln!(
-                        "[daemon] jinja render failed in lfm2moe dflash path ({e}) - falling back to Plain"
+                    tracing::warn!(
+                        "jinja render failed in lfm2moe dflash path ({e}) - falling back to Plain"
                     );
                     prompt_frame::ChatFrame {
                         tokenizer,

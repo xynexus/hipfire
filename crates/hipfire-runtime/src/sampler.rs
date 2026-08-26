@@ -294,8 +294,8 @@ pub fn sample(
                 return tok;
             }
             Err(e) => {
-                eprintln!(
-                    "sampler: GPU sample_top_p failed (attempt {attempt}/{GPU_SAMPLE_ATTEMPTS}): {e:?}"
+                tracing::warn!(
+                    "GPU sample_top_p failed (attempt {attempt}/{GPU_SAMPLE_ATTEMPTS}): {e:?}"
                 );
                 last_err = Some(e);
             }
@@ -307,8 +307,8 @@ pub fn sample(
     match gpu.download_f32(logits) {
         Ok(mut host_logits) => {
             let n = host_logits.len().min(vocab_size);
-            eprintln!(
-                "sampler: GPU sample failed after {GPU_SAMPLE_ATTEMPTS} attempts ({last_err:?}); \
+            tracing::warn!(
+                "GPU sample failed after {GPU_SAMPLE_ATTEMPTS} attempts ({last_err:?}); \
                  falling back to CPU sampling"
             );
             // Continue the CALLER's stream rather than a process-global one:
@@ -323,8 +323,8 @@ pub fn sample(
             // The device is unusable (even the logits readback failed). Emit a
             // deterministic fallback token with a loud log rather than panic;
             // the decode loop's stop/EOS handling winds the request down.
-            eprintln!(
-                "sampler: GPU sample AND logits readback both failed \
+            tracing::error!(
+                "GPU sample AND logits readback both failed \
                  (sample_err={last_err:?}, readback_err={readback_err:?}); emitting fallback token 0"
             );
             0

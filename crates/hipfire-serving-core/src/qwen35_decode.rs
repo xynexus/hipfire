@@ -300,7 +300,7 @@ pub fn maybe_dump_kvarn_state(
     };
     let kv = state.kv_cache();
     if !kv.quant_kvarn {
-        eprintln!("[kvarn-dump] session KV is not kvarn; nothing to dump");
+        tracing::debug!("session KV is not kvarn; nothing to dump");
         return;
     }
     // First layer whose window is actually POPULATED. Selecting on `numel() > 0`
@@ -328,8 +328,8 @@ pub fn maybe_dump_kvarn_state(
         }
     }
     if layer == usize::MAX || layer >= kv.k_window.len() {
-        eprintln!(
-            "[kvarn-dump] no populated KVarN window found across {} layers",
+        tracing::debug!(
+            "no populated KVarN window found across {} layers",
             kv.k_window.len()
         );
         return;
@@ -346,7 +346,7 @@ pub fn maybe_dump_kvarn_state(
                 .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect::<Vec<f32>>(),
             Err(e) => {
-                eprintln!("[kvarn-dump] window readback (f16) failed: {}", e.message);
+                tracing::warn!("window readback (f16) failed: {}", e.message);
                 return;
             }
         }
@@ -354,7 +354,7 @@ pub fn maybe_dump_kvarn_state(
         match gpu.download_f32(&kv.k_window[layer]) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[kvarn-dump] window readback failed: {}", e.message);
+                tracing::warn!("window readback failed: {}", e.message);
                 return;
             }
         }
@@ -362,7 +362,7 @@ pub fn maybe_dump_kvarn_state(
     let records = match gpu.download_f32(&kv.k_gpu[layer]) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[kvarn-dump] records readback failed: {}", e.message);
+            tracing::warn!("records readback failed: {}", e.message);
             return;
         }
     };
@@ -466,8 +466,8 @@ pub fn maybe_dump_kvarn_state(
                 break; // first few layers are enough to characterise the range
             }
         }
-        eprintln!(
-            "[dn-range] pos={} layers=0..3 elems={n_tot} max|S|={gmax:.6e} \
+        tracing::debug!(
+            "dn-range pos={} layers=0..3 elems={n_tot} max|S|={gmax:.6e} \
              min_nonzero|S|={:.6e} over_fp16_max={n_over} subnormal_in_fp16={n_sub} \
              ({:.3}%) nonfinite={n_nonfinite} l2={:.9e} mean_abs={:.9e}",
             state.cursor.seq_pos,
@@ -490,12 +490,12 @@ pub fn maybe_dump_kvarn_state(
         out.extend_from_slice(&v.to_le_bytes());
     }
     match std::fs::File::create(&path).and_then(|mut f| f.write_all(&out)) {
-        Ok(()) => eprintln!(
-            "[kvarn-dump] layer={layer} seq_pos={pos} window={} records={} -> {path}",
+        Ok(()) => tracing::debug!(
+            "layer={layer} seq_pos={pos} window={} records={} -> {path}",
             window.len(),
             records.len()
         ),
-        Err(e) => eprintln!("[kvarn-dump] write failed: {e}"),
+        Err(e) => tracing::warn!("write failed: {e}"),
     }
 }
 
@@ -656,7 +656,7 @@ pub fn run_generate_batch_decode_step_qwen35(
                     .as_deref()
                     == Some("1")
                 {
-                    eprintln!("  [decode] fused dense declined: {reason}");
+                    tracing::debug!("fused dense declined: {reason}");
                 }
             }
         }

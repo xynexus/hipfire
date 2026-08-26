@@ -377,11 +377,8 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
         // read this handler. The label is the bug; naming it is the fix that
         // does not require rewriting five arch arms.
         if !is_qwen35_family_arch_id(m_arch_id_for_report) {
-            eprintln!(
-                "[bench_prefill] NOTE: arch_id={m_arch_id_for_report} runs a per-token WARM-PASS here, not the production prefill path."
-            );
-            eprintln!(
-                "[bench_prefill]       The tok/s below is a DECODE rate. For real prefill throughput, trace a `generate` request with HIPFIRE_KERNEL_TRACE=1."
+            tracing::warn!(
+                "[bench_prefill] NOTE: arch_id={m_arch_id_for_report} runs a per-token WARM-PASS here, not the production prefill path.\n[bench_prefill]       The tok/s below is a DECODE rate. For real prefill throughput, trace a `generate` request with HIPFIRE_KERNEL_TRACE=1."
             );
         }
         // Which kernels actually ran, so the claim above is checkable.

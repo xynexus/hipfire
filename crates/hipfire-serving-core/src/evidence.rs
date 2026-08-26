@@ -63,7 +63,7 @@ pub fn write_daemon_runtime_oneshot_evidence(
     if let Err(err) =
         hipfire_evidence::write_runtime_oneshot_evidence(Path::new(dir), &runtime_context, evidence)
     {
-        eprintln!("[daemon/evidence] failed to write runtime oneshot evidence: {err}");
+        tracing::warn!("failed to write runtime oneshot evidence: {err}");
     }
 }
 
@@ -136,6 +136,6 @@ pub fn write_daemon_moe_router_evidence(
         &runtime_context,
         evidence,
     ) {
-        eprintln!("[daemon/evidence] failed to write MoE router evidence: {err}");
+        tracing::warn!("failed to write MoE router evidence: {err}");
     }
 }

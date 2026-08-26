@@ -324,9 +324,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
         match render_result {
             Ok(rendered) => Ok(tokenizer.encode(&rendered)),
             Err(e) => {
-                eprintln!(
-                    "[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain"
-                );
+                tracing::warn!("batch-prefill jinja render failed ({e}) -- falling back to Plain");
                 Ok(prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
@@ -491,15 +489,15 @@ pub fn qwen35_semantic_boundary_checkpoints(
     }
     let candidates = qwen35_prefix_hash_candidates_for_tokens(m, session, full_tokens)?;
     if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
-        eprintln!(
-            "[daemon] prefix boundary candidates session={} tokens={} candidates={}",
+        tracing::debug!(
+            "prefix boundary candidates session={} tokens={} candidates={}",
             session.id,
             full_tokens.len(),
             candidates.len()
         );
         for candidate in &candidates {
-            eprintln!(
-                "[daemon] prefix boundary candidate session={} boundary={} index={} len={} hash={}",
+            tracing::debug!(
+                "prefix boundary candidate session={} boundary={} index={} len={} hash={}",
                 session.id,
                 candidate.boundary,
                 candidate.boundary_index,
@@ -663,7 +661,7 @@ pub fn qwen35_prefill_suffix_batch(
     ) {
         if let Err(err) = qwen35_fused_prefill_boundary_cuts(prepared) {
             if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
-                eprintln!("[daemon] fused prefill boundary checkpoint fallback: {err}");
+                tracing::warn!("fused prefill boundary checkpoint fallback: {err}");
             }
             return qwen35_prefill_suffix_batch_serial_reference(
                 m,

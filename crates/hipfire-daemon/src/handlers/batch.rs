@@ -187,7 +187,7 @@ pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Valu
             // to N sessions in one step that fails to amortise the weight pass.
             // Those are opposite defects.
             if std::env::var("HIPFIRE_BATCH_WIDTH_TRACE").ok().as_deref() == Some("1") {
-                eprintln!("  [batch] decode_step rows={}", envelope.sessions.len());
+                tracing::debug!("[batch] decode_step rows={}", envelope.sessions.len());
             }
             let target_worker_id = message_worker_id(&msg);
             match activate_model_worker(

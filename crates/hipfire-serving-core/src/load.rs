@@ -284,8 +284,8 @@ pub fn resolve_chat_template(
             // 5/6), the known chat arch this guards; base models of other arches
             // legitimately resolve no template and must not be warned on.
             if hipfire_model::is_qwen35_family_arch_id(hfq.arch_id) {
-                eprintln!(
-                    "[chat_template] WARNING: chat arch (arch_id={}) resolved NO chat template \
+                tracing::warn!(
+                    "chat arch (arch_id={}) resolved NO chat template \
                      for {model_path} — the daemon will serve RAW/unframed prompts, which can \
                      collapse a chat model into a token attractor. Provide one via \
                      HIPFIRE_CHAT_TEMPLATE_FILE, ~/.hipfire/templates/<model-basename>.j2, or \
@@ -310,7 +310,7 @@ pub fn profile_chat_template(
             match prompt_frame::ChatTemplateProfile::from_template(tokenizer, template) {
                 Ok(profile) => Some(profile),
                 Err(e) => {
-                    eprintln!("[chat_template] failed to profile template ({e}); using fallback stop policy");
+                    tracing::warn!("failed to profile template ({e}); using fallback stop policy");
                     None
                 }
             }
@@ -400,8 +400,8 @@ fn warn_if_unoptimized(path: &str, hfq: &HfqFile) {
         .filter(|t| t.quant_type == hipfire_runtime::hfq::OQ4_CANONICAL_QT)
         .count();
     if canonical_oq4 > 0 {
-        eprintln!(
-            "[optimize] '{path}' has {canonical_oq4} canonical OQ4 tensor(s) repacked per load; \
+        tracing::warn!(
+            "'{path}' has {canonical_oq4} canonical OQ4 tensor(s) repacked per load; \
              run `hipfire optimize {path}` to prebake the arch-optimal layout and skip the per-load repack"
         );
     }
@@ -460,15 +460,15 @@ fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize 
                 .as_deref()
                 == Some("1")
             {
-                eprintln!(
-                    "  WARNING: max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
+                tracing::warn!(
+                    "max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
                      HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding with {max_seq} \
                      (may exceed trained context and/or OOM the KV allocation)"
                 );
                 max_seq
             } else {
-                eprintln!(
-                    "  WARNING: max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
+                tracing::warn!(
+                    "max_seq={max_seq} exceeds model max_position_embeddings={model_max}; \
                      clamping to {model_max}. Set HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 to force the larger value."
                 );
                 model_max
@@ -540,8 +540,8 @@ fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
         return Ok(());
     }
     if std::env::var("HIPFIRE_KV_ALLOW_DEPRECATED").ok().as_deref() == Some("1") {
-        eprintln!(
-            "  WARNING: kv_mode={kv_mode} is deprecated and will be removed; running only \
+        tracing::warn!(
+            "kv_mode={kv_mode} is deprecated and will be removed; running only \
              because HIPFIRE_KV_ALLOW_DEPRECATED=1. Migrate to kvarn (kvarn2/kvarn/kvarn8) \
              or fp32."
         );
@@ -604,15 +604,15 @@ fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> us
         .as_deref()
         == Some("1")
     {
-        eprintln!(
-            "  WARNING: gemma3 max_seq={max_seq} — the global-layer F32 KV alone may OOM the \
+        tracing::warn!(
+            "gemma3 max_seq={max_seq} — the global-layer F32 KV alone may OOM the \
              shared GTT pool at this context; HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding \
              (use kv_mode=q8 for full 128K)."
         );
         max_seq
     } else {
-        eprintln!(
-            "  NOTE: capping gemma3 max_seq {max_seq} -> {GEMMA3_STOPGAP_MAX_SEQ} to fit the GTT \
+        tracing::warn!(
+            "capping gemma3 max_seq {max_seq} -> {GEMMA3_STOPGAP_MAX_SEQ} to fit the GTT \
              pool (sliding-window KV bounds local layers; global F32 KV still scales with context \
              — use kv_mode=q8 for full 128K). Override: HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1."
         );
@@ -924,8 +924,8 @@ pub fn load_model(
         view.verify_digest()
             .map_err(|error| format!("embedded DFLASH digest: {error}"))?;
         DflashConfig::from_source(&view).ok_or("embedded DFLASH metadata/config is invalid")?;
-        eprintln!(
-            "  embedded DFLASH verified: encoding={} bytes={} sha256={} elapsed={:.2}s",
+        tracing::info!(
+            "embedded DFLASH verified: encoding={} bytes={} sha256={} elapsed={:.2}s",
             view.source_format(),
             view.original_byte_len(),
             view.sha256(),
@@ -997,8 +997,8 @@ pub fn load_model(
                         .to_string(),
                 );
             }
-            eprintln!(
-                "  WARNING: LFM2 DFlash is experimental; admission is gated by HIPFIRE_LFM2_DFLASH=1"
+            tracing::warn!(
+                "LFM2 DFlash is experimental; admission is gated by HIPFIRE_LFM2_DFLASH=1"
             );
         } else {
             // Arch-level capability gate FIRST (matrix-backed). DFlash spec-decode
@@ -1219,8 +1219,8 @@ pub fn load_model(
         }
         let state = Qwen3EmbeddingState::load(&hfq, config, metadata)?;
         hfq.drop_mmap();
-        eprintln!(
-            "  qwen3 embedding: hidden={}, layers={}, heads={}, kv_heads={}, head_dim={}, intermediate={}, backend=xdna-only",
+        tracing::info!(
+            "qwen3 embedding: hidden={}, layers={}, heads={}, kv_heads={}, head_dim={}, intermediate={}, backend=xdna-only",
             state.config.dim,
             state.config.n_layers,
             state.config.n_heads,
@@ -1320,8 +1320,8 @@ pub fn load_model(
         let cfg = hipfire_arch_embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
             .ok_or("embeddinggemma: failed to parse config from HFQ metadata")?;
         let embedding_metadata = embedding_metadata;
-        eprintln!(
-            "  embeddinggemma: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}, embedding_dim={}, matryoshka={:?}",
+        tracing::info!(
+            "embeddinggemma: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}, embedding_dim={}, matryoshka={:?}",
             cfg.hidden_size,
             cfg.num_hidden_layers,
             cfg.num_attention_heads,
@@ -1337,8 +1337,8 @@ pub fn load_model(
             .is_some_and(|npu| npu.required);
         let requires_npu = metadata_requires_npu || storage.requires_npu();
         if requires_npu {
-            eprintln!(
-                "  embeddinggemma: artifact contract requires XDNA{}",
+            tracing::info!(
+                "embeddinggemma: artifact contract requires XDNA{}",
                 if !metadata_requires_npu {
                     " (legacy implicit qt=35; requantize to explicit qt=43)"
                 } else {
@@ -1581,9 +1581,13 @@ pub fn load_model(
             .ok_or("zaya: metadata_json missing 'config'")?;
         let cfg = hipfire_arch_zaya::ZayaConfig::from_json(cfg_json)
             .map_err(|e| format!("zaya config: {e}"))?;
-        eprintln!(
-            "  zaya: hidden={}, blocks={}, experts={}, vocab={}, eos={}",
-            cfg.hidden_size, cfg.num_blocks, cfg.moe.num_experts, cfg.vocab_size, cfg.eos_token_id,
+        tracing::info!(
+            "zaya: hidden={}, blocks={}, experts={}, vocab={}, eos={}",
+            cfg.hidden_size,
+            cfg.num_blocks,
+            cfg.moe.num_experts,
+            cfg.vocab_size,
+            cfg.eos_token_id,
         );
         let model = hipfire_arch_zaya::arch::ZayaModel::from_hfq(gpu, &hfq, cfg, max_seq)
             .map_err(|e| format!("ZayaModel::from_hfq: {e}"))?;
@@ -1697,8 +1701,8 @@ pub fn load_model(
             // the base `eos_token_id` (`</s>` = 2 for Nano).
             cfg.eos_token_id = im_end;
         }
-        eprintln!(
-            "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+        tracing::info!(
+            "{}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
             if hfq.arch_id == ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
@@ -2436,7 +2440,7 @@ pub fn load_model(
                     .as_ref()
                     .expect("resolved TriAttention source has parsed centers")
                     .uniform_centers()?;
-                eprintln!("  TriAttention component source: {}", source.label());
+                tracing::info!("TriAttention component source: {}", source.label());
                 let n_attn = config.num_attention_layers();
                 if centers.n_layers != n_attn
                     || centers.n_heads != config.num_attention_heads
@@ -2477,9 +2481,13 @@ pub fn load_model(
                 )
                 .map_err(|e| format!("lfm2moe build EvictionCtx: {e}"))?;
                 if cask.cask_m_folding {
-                    eprintln!(
-                        "  lfm2moe eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                        cask.core_frac, cask.fold_m, cask.budget, cask.beta, physical_cap,
+                    tracing::info!(
+                        "lfm2moe eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                        cask.core_frac,
+                        cask.fold_m,
+                        cask.budget,
+                        cask.beta,
+                        physical_cap,
                     );
                     Some(Eviction::Cask(CaskCtx::new(
                         base,
@@ -2487,8 +2495,8 @@ pub fn load_model(
                         cask.fold_m,
                     )))
                 } else {
-                    eprintln!(
-                        "  lfm2moe eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                    tracing::info!(
+                        "lfm2moe eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
                         cask.budget, cask.beta, physical_cap,
                     );
                     Some(Eviction::Plain(base))
@@ -2621,9 +2629,10 @@ pub fn load_model(
             if has_vision_tensors {
                 let vw = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vc, gpu)
                     .map_err(|e| e.to_string())?;
-                eprintln!(
-                    "  VL model: vision encoder (hidden={}, layers={})",
-                    vc.hidden_size, vc.num_layers
+                tracing::info!(
+                    "VL model: vision encoder (hidden={}, layers={})",
+                    vc.hidden_size,
+                    vc.num_layers
                 );
                 (Some(vc), Some(vw))
             } else {
@@ -2658,8 +2667,8 @@ pub fn load_model(
             let t0 = std::time::Instant::now();
             let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
             let elapsed = t0.elapsed();
-            eprintln!(
-                "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
+            tracing::info!(
+                "MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
                 gpu.mmq_screen_threshold,
                 elapsed.as_secs_f64() * 1000.0,
             );
@@ -2690,7 +2699,7 @@ pub fn load_model(
             )
             .map_err(|e| format!("{e}"))?,
             "q8" => {
-                eprintln!("  KV cache: Q8");
+                tracing::info!("KV cache: Q8");
                 kv::KvCache::new_gpu_q8_capped(
                     gpu,
                     config.n_layers,
@@ -2739,7 +2748,7 @@ pub fn load_model(
             )
             .map_err(|e| format!("{e}"))?,
             other => {
-                eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
+                tracing::warn!("KV cache: unrecognized '{other}', defaulting to asym3");
                 kv::KvCache::new_gpu_asym3_capped(
                     gpu,
                     config.n_layers,
@@ -2769,7 +2778,7 @@ pub fn load_model(
             let parsed = parse_state_quant(state_quant_override, &config)?;
             resolve_tiny_model_state(&hfq, state_quant_override, parsed)
         };
-        eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+        tracing::info!("DeltaNet state: {}", state_quant_label(dn_quant));
         let dn =
             DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
@@ -2791,11 +2800,11 @@ pub fn load_model(
                 .as_ref()
                 .expect("resolved TriAttention source has parsed centers")
                 .uniform_centers()?;
-            eprintln!("  TriAttention component source: {}", source.label());
+            tracing::info!("TriAttention component source: {}", source.label());
             let fa_layer_ids =
                 crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_indices();
             if fa_layer_ids.is_empty() {
-                eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
+                tracing::warn!("cask_sidecar set but model has no FullAttention layers — ignoring");
                 None
             } else {
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
@@ -2814,9 +2823,13 @@ pub fn load_model(
                 )
                 .map_err(|e| format!("build EvictionCtx: {e}"))?;
                 if cask.cask_m_folding {
-                    eprintln!(
-                        "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-                        cask.core_frac, cask.fold_m, cask.budget, cask.beta, physical_cap,
+                    tracing::info!(
+                        "eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                        cask.core_frac,
+                        cask.fold_m,
+                        cask.budget,
+                        cask.beta,
+                        physical_cap,
                     );
                     Some(Eviction::Cask(CaskCtx::new(
                         base,
@@ -2824,9 +2837,11 @@ pub fn load_model(
                         cask.fold_m,
                     )))
                 } else {
-                    eprintln!(
-                        "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-                        cask.budget, cask.beta, physical_cap,
+                    tracing::info!(
+                        "eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                        cask.budget,
+                        cask.beta,
+                        physical_cap,
                     );
                     Some(Eviction::Plain(base))
                 }
@@ -2863,8 +2878,8 @@ pub fn load_model(
                     load_dflash_state_source(&view, physical_cap, &config, &dn, gpu)?
                 }
             };
-            eprintln!(
-                "  DFlash draft loaded: source={} layers={} hidden={} block={}",
+            tracing::info!(
+                "DFlash draft loaded: source={} layers={} hidden={} block={}",
                 source.label(),
                 state.draft_config.n_layers,
                 state.draft_config.hidden,
@@ -2973,7 +2988,7 @@ pub fn load_model(
         // Q8 cache under an asym label. Supported menu: fp32 | q8.
         let kv = match kv_mode.as_str() {
             "fp32" | "f32" => {
-                eprintln!("  KV cache: FP32");
+                tracing::info!("KV cache: FP32");
                 kv::KvCache::new_gpu(
                     gpu,
                     config.n_layers,
@@ -2984,7 +2999,7 @@ pub fn load_model(
                 .map_err(|e| format!("{e}"))?
             }
             "q8" | "int8" | "auto" | "" => {
-                eprintln!("  KV cache: Q8");
+                tracing::info!("KV cache: Q8");
                 kv::KvCache::new_gpu_q8(
                     gpu,
                     config.n_layers,
@@ -3003,8 +3018,8 @@ pub fn load_model(
             // who explicitly wants FP32 still gets it via the fp32 arm.
             "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" | "asym2" | "asym3" | "asym4" | "turbo"
             | "turbo2" | "turbo3" | "turbo4" => {
-                eprintln!(
-                    "  KV cache: Q8 (llama has no kvarn/asym path at head_dim={}; \
+                tracing::warn!(
+                    "KV cache: Q8 (llama has no kvarn/asym path at head_dim={}; \
                      '{kv_mode}' → Q8)",
                     config.head_dim
                 );
@@ -3128,7 +3143,9 @@ fn load_embeddinggemma_npu_projector(
         Ok(value) => match value.parse::<usize>() {
             Ok(batch) if batch > 0 => batch,
             _ => {
-                eprintln!("embeddinggemma NPU disabled: HIPFIRE_EMBED_NPU_BATCH must be positive");
+                tracing::warn!(
+                    "embeddinggemma NPU disabled: HIPFIRE_EMBED_NPU_BATCH must be positive"
+                );
                 return None;
             }
         },
@@ -3138,7 +3155,7 @@ fn load_embeddinggemma_npu_projector(
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire/npu")));
     let Some(cache_root) = cache_root else {
-        eprintln!(
+        tracing::warn!(
             "embeddinggemma NPU disabled: set HIPFIRE_EMBED_NPU_CACHE or HOME to locate caches"
         );
         return None;
@@ -3150,21 +3167,21 @@ fn load_embeddinggemma_npu_projector(
         batch,
     ) {
         Ok(projector) if !storage_requires_npu || projector.resident_layer_enabled() => {
-            eprintln!(
-                "  embeddinggemma: resident NPU enabled, batch={batch}, cache={}",
+            tracing::info!(
+                "embeddinggemma: resident NPU enabled, batch={batch}, cache={}",
                 cache_root.display()
             );
             Some(std::sync::Mutex::new(projector))
         }
         Ok(_) => {
-            eprintln!(
+            tracing::warn!(
                 "embeddinggemma NPU unavailable (row-padded OQ8 requires the complete \
                  resident-layer cache); serving will use an explicit GPU fallback if configured"
             );
             None
         }
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "embeddinggemma NPU unavailable ({error}); serving will use an explicit GPU fallback if configured"
             );
             None
@@ -3203,8 +3220,8 @@ fn load_embeddinggemma_gpu_fallback_weights(
             fallback_path.display()
         ));
     }
-    eprintln!(
-        "  embeddinggemma: GPU fallback weights={}",
+    tracing::info!(
+        "embeddinggemma: GPU fallback weights={}",
         fallback_path.display()
     );
     hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(
@@ -3287,7 +3304,7 @@ pub fn load_model_safetensors(
     use hipfire_model::ModelSource;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
 
-    eprintln!("  opening safetensors directory: {path}");
+    tracing::info!("opening safetensors directory: {path}");
     let model_memory = unknown_model_memory(path);
     let source =
         SafetensorsSource::open(Path::new(path)).map_err(|e| format!("safetensors open: {e}"))?;
@@ -3297,7 +3314,7 @@ pub fn load_model_safetensors(
         .quant_config()
         .map(|q| q.method.as_str())
         .unwrap_or("none");
-    eprintln!("  arch_id={arch_id}, quant_method={qm}");
+    tracing::info!("arch_id={arch_id}, quant_method={qm}");
 
     // Tokenizer from tokenizer.json
     let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
@@ -3319,8 +3336,8 @@ pub fn load_model_safetensors(
         let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
             .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
 
-        eprintln!(
-            "  LLaMA/Qwen3: dim={}, layers={}, heads={}, kv_heads={}, head_dim={}, qk_norm={}",
+        tracing::info!(
+            "LLaMA/Qwen3: dim={}, layers={}, heads={}, kv_heads={}, head_dim={}, qk_norm={}",
             config.dim,
             config.n_layers,
             config.n_heads,
@@ -3496,8 +3513,8 @@ pub fn load_model_safetensors(
             // tokenizer; fall back to the config eos if the model isn't ChatML.
             cfg.eos_token_id = im_end;
         }
-        eprintln!(
-            "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
+        tracing::info!(
+            "{}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
             if arch_id == ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
@@ -3593,9 +3610,11 @@ pub fn load_model_safetensors(
     let config = qwen35::config_from_safetensors(&source)
         .ok_or("failed to parse Qwen3.5 config from config.json")?;
 
-    eprintln!(
-        "  Qwen3.5/3.6: dim={}, layers={}, heads={}",
-        config.dim, config.n_layers, config.n_heads
+    tracing::info!(
+        "Qwen3.5/3.6: dim={}, layers={}, heads={}",
+        config.dim,
+        config.n_layers,
+        config.n_heads
     );
 
     // Load weights via ParoQuant path
@@ -3825,7 +3844,7 @@ pub fn load_model_pp(
                     sum, config.n_layers
                 ));
             }
-            eprintln!("  HIPFIRE_PP_LAYERS override: {:?}", counts);
+            tracing::info!("HIPFIRE_PP_LAYERS override: {:?}", counts);
             Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
         }
         None => Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?,
@@ -3909,7 +3928,7 @@ pub fn load_model_pp(
         )
         .map_err(|e| format!("{e}"))?,
         other => {
-            eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
+            tracing::warn!("KV cache: unrecognized '{other}', defaulting to asym3");
             kv::KvCache::new_gpu_asym3_capped_multi(
                 &mut gpus,
                 config.n_layers,
@@ -3940,7 +3959,7 @@ pub fn load_model_pp(
         let parsed = parse_state_quant(state_quant_override, &config)?;
         resolve_tiny_model_state(&hfq, state_quant_override, parsed)
     };
-    eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+    tracing::info!("DeltaNet state: {}", state_quant_label(dn_quant));
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
 
@@ -3954,9 +3973,11 @@ pub fn load_model_pp(
         .enable_peer_all()
         .map_err(|e| format!("enable_peer_all: {e}"))?;
 
-    eprintln!(
-        "  pp={pp} loaded: layer_to_device={:?}, output_device={}, peer_access={}",
-        gpus.layer_to_device, gpus.output_device, gpus.peer_access_enabled,
+    tracing::info!(
+        "pp={pp} loaded: layer_to_device={:?}, output_device={}, peer_access={}",
+        gpus.layer_to_device,
+        gpus.output_device,
+        gpus.peer_access_enabled,
     );
 
     let chat_template = resolve_chat_template(&hfq, path);
@@ -4352,8 +4373,8 @@ fn load_lfm2_dflash_state_source(
     let target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_config.num_extract() * draft_config.hidden);
     let block_size = draft_config.block_size;
-    eprintln!(
-        "  LFM2 DFlash draft loaded: block={} extract_layers={:?} hidden={} ctx_capacity={} f16_weights={} sync_gemm={}",
+    tracing::info!(
+        "LFM2 DFlash draft loaded: block={} extract_layers={:?} hidden={} ctx_capacity={} f16_weights={} sync_gemm={}",
         block_size, draft_config.target_layer_ids, draft_config.hidden, ctx_capacity, use_f16_weights, sync_gemm
     );
 
@@ -4389,17 +4410,17 @@ fn maybe_load_dspark(
     }
     let sidecar = hipfire_model::discover_dspark_draft_for_model(Path::new(target_path))?;
     let sidecar = sidecar.to_string_lossy().to_string();
-    eprintln!("  llama: DSpark sidecar discovered: {sidecar}");
+    tracing::info!("llama: DSpark sidecar discovered: {sidecar}");
     match load_dspark_state(&sidecar, backend, ctx_capacity, gpu) {
         Ok(state) => {
-            eprintln!(
-                "  llama DSpark speculator enabled (sidecar, block={})",
+            tracing::info!(
+                "llama DSpark speculator enabled (sidecar, block={})",
                 state.speculator.block_size()
             );
             Some(state)
         }
         Err(e) => {
-            eprintln!("  llama: WARNING DSpark sidecar load failed: {e}");
+            tracing::warn!("llama: DSpark sidecar load failed: {e}");
             None
         }
     }
@@ -4515,8 +4536,8 @@ fn load_dflash_state_source(
     let weights_started = std::time::Instant::now();
     let draft_weights = DflashWeights::load_source(gpu, source, &draft_config)
         .map_err(|e| format!("load weights: {e}"))?;
-    eprintln!(
-        "  DFlash weight upload: {:.2}s",
+    tracing::info!(
+        "DFlash weight upload: {:.2}s",
         weights_started.elapsed().as_secs_f64()
     );
     let draft_scratch = DflashScratch::new_with_mq(
@@ -4567,16 +4588,16 @@ fn load_dflash_state_source(
             Ok(0) => 0,
             Ok(n) if n <= DDTREE_BUDGET_MAX => n,
             Ok(n) => {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={} exceeds cap {DDTREE_BUDGET_MAX} \
+                tracing::warn!(
+                    "HIPFIRE_DDTREE_BUDGET={} exceeds cap {DDTREE_BUDGET_MAX} \
                      (attn_bias is O(budget²); typical values are 12-22). Disabling DDTree.",
                     n
                 );
                 0
             }
             Err(_) => {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={:?} is not a non-negative integer. \
+                tracing::warn!(
+                    "HIPFIRE_DDTREE_BUDGET={:?} is not a non-negative integer. \
                      Disabling DDTree.",
                     s
                 );
@@ -4638,15 +4659,15 @@ fn load_dflash_state_source(
                 Some(s) => match s.parse::<usize>() {
                     Ok(k) if k >= 1 && k <= effective_topk_max => k,
                     Ok(k) => {
-                        eprintln!(
-                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {effective_topk_max}] \
+                        tracing::warn!(
+                            "HIPFIRE_DDTREE_TOPK={k} out of range [1, {effective_topk_max}] \
                              (vocab_size={vocab}). Falling back to default topk={default_topk}."
                         );
                         default_topk
                     }
                     Err(_) => {
-                        eprintln!(
-                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={:?} is not a positive integer. \
+                        tracing::warn!(
+                            "HIPFIRE_DDTREE_TOPK={:?} is not a positive integer. \
                              Falling back to default topk={default_topk}.",
                             s
                         );
@@ -4679,8 +4700,8 @@ fn load_dflash_state_source(
                 n_fa_layers,
             )
             .map_err(|e| format!("ddtree scratch: {e}"))?;
-            eprintln!(
-                "[hipfire-daemon] DDTree enabled: budget={budget}, topk={topk}, n_fa_layers={n_fa_layers}"
+            tracing::info!(
+                "DDTree enabled: budget={budget}, topk={topk}, n_fa_layers={n_fa_layers}"
             );
             Some(DdtreeState {
                 post_seed_snap,

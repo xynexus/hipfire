@@ -110,7 +110,7 @@ pub fn report(current: u32, total: u32, phase: &str) {
     // No sink (CLI-direct load, eval, tests), or a report from a thread that
     // installed none: emit the human progress line loaders used to `eprintln!`
     // themselves, so text callers still see it.
-    eprintln!("  loading {phase} {current}/{total}");
+    tracing::info!("loading {phase} {current}/{total}");
 }
 
 #[cfg(test)]

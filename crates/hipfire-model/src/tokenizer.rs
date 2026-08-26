@@ -1407,34 +1407,31 @@ impl Tokenizer {
             return;
         }
         let limit: usize = tokenizer_config().prompt_heat_limit;
-        eprintln!(
-            "[token-heat] prompt={} bytes  tokens={}",
-            text.len(),
-            ids.len()
-        );
-        eprintln!(
-            "[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}",
-            "pos", "id", "rank", "class", "decoded"
+        tracing::debug!("prompt={} bytes  tokens={}", text.len(), ids.len());
+        tracing::debug!(
+            "{:>4}  {:>6}  {:>7}  {:7}  {}",
+            "pos",
+            "id",
+            "rank",
+            "class",
+            "decoded"
         );
         for (pos, &id) in ids.iter().take(limit).enumerate() {
             let rank = self.rank_of(id, &table);
             let class = HeatClass::from_rank(rank);
-            let display = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
+            let decoded = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
             let rank_str = rank
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            eprintln!(
-                "[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}",
+            tracing::debug!(
+                "{pos:>4}  {id:>6}  {rank_str:>7}  {}  {decoded:?}",
                 class.label()
             );
         }
         if ids.len() > limit {
-            eprintln!(
-                "[token-heat] ... ({} more tokens omitted)",
-                ids.len() - limit
-            );
+            tracing::debug!("... ({} more tokens omitted)", ids.len() - limit);
         }
-        eprintln!("[token-heat] summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
+        tracing::debug!("summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
             counts[0], 100.0*counts[0] as f32/total as f32,
             counts[1], 100.0*counts[1] as f32/total as f32,
             counts[2], 100.0*counts[2] as f32/total as f32,
@@ -1443,10 +1440,7 @@ impl Tokenizer {
             counts[5], 100.0*counts[5] as f32/total as f32);
         let cold_frac = (counts[3] + counts[4]) as f32 / total as f32;
         if cold_frac > 0.05 {
-            eprintln!(
-                "[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor",
-                100.0 * cold_frac
-            );
+            tracing::warn!("{:.1}% cold tokens — likely τ depressor", 100.0 * cold_frac);
         }
     }
 }

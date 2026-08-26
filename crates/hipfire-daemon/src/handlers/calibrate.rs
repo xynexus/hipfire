@@ -512,7 +512,7 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
     // `m.max_seq`, which raises this ceiling.
     let model_ctx = m.max_seq.max(2);
     if n_ctx > model_ctx {
-        eprintln!(
+        tracing::warn!(
             "kld_eval: clamping n_ctx {n_ctx} → {model_ctx} (model trained context; \
              load with HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 + a larger --max-seq to raise it)"
         );

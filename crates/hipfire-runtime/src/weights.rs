@@ -744,10 +744,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
                 &format!("{:?}", w.gpu_dtype),
             );
             if std::env::var_os("HIPFIRE_OQ4_TRACE").is_some() {
-                eprintln!(
-                    "[oq4-trace] weight_gemv generic _ => arm dtype={:?}",
-                    w.gpu_dtype
-                );
+                tracing::debug!("weight_gemv generic _ => arm dtype={:?}", w.gpu_dtype);
             }
             gpu.ensure_mq_signs()?;
             let xr = xr!();

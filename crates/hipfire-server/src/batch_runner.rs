@@ -536,14 +536,12 @@ async fn batch_runner_loop(state: SharedState) {
             let Some(lease) = lease else {
                 continue;
             };
-            if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
-                eprintln!(
-                    "[batch-cycle] lease {} class={:?} workloads={}",
-                    lease.lease_id,
-                    lease.class,
-                    lease.workloads.len()
-                );
-            }
+            tracing::debug!(
+                "lease {} class={:?} workloads={}",
+                lease.lease_id,
+                lease.class,
+                lease.workloads.len()
+            );
             let jobs: Vec<ScheduledJob> = {
                 let mut inbox = state.batch_inbox.lock().await;
                 lease
@@ -795,11 +793,7 @@ async fn batch_runner_loop(state: SharedState) {
                 let preempt = Arc::new(AtomicBool::new(false));
                 let (release_tx, release_rx) = oneshot::channel();
                 let watcher = spawn_preempt_watcher(&state, preempt.clone(), running_priority);
-                if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
-                    eprintln!(
-                        "[batch-cycle] image turn granted (pri {running_priority}), holding GPU"
-                    );
-                }
+                tracing::debug!("image turn granted (pri {running_priority}), holding GPU");
                 if job
                     .grant
                     .send(ImageTurn {
@@ -952,13 +946,11 @@ async fn run_batch_cycle(
     let batch_id = format!("batch-{}", batch[0].spec.id);
     let resuming = batch[0].resume_position.is_some();
     let specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
-    if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
-        eprintln!(
-            "[batch-cycle] {} {} request(s) into one batch",
-            if resuming { "resumed" } else { "coalesced" },
-            specs.len()
-        );
-    }
+    tracing::debug!(
+        "{} {} request(s) into one batch",
+        if resuming { "resumed" } else { "coalesced" },
+        specs.len()
+    );
 
     let mut txs: HashMap<String, mpsc::UnboundedSender<BatchEvent>> = HashMap::new();
     let mut remaining: HashMap<String, usize> = HashMap::new();
@@ -1143,13 +1135,11 @@ async fn run_batch_cycle(
                 .await
                 .peek_next_priority(now_ms());
             if waiter.is_some_and(|top| top < running_priority) {
-                if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
-                    eprintln!(
-                        "[batch-cycle] parked {} session(s) at step {steps}: pri {running_priority} yields to {}",
-                        active.len(),
-                        waiter.unwrap()
-                    );
-                }
+                tracing::debug!(
+                    "parked {} session(s) at step {steps}: pri {running_priority} yields to {}",
+                    active.len(),
+                    waiter.unwrap()
+                );
                 let parked: Vec<PendingRequest> = active
                     .iter()
                     .filter_map(|id| {

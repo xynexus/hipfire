@@ -112,7 +112,7 @@ fn dflash_golden_npy(gpu: &mut Gpu, dir: &str, name: &str, t: &GpuTensor, shape:
     let data = match gpu.download_f32(t) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[dflash-golden] download {name} failed: {e:?}");
+            tracing::warn!("download {name} failed: {e:?}");
             return;
         }
     };
@@ -141,7 +141,7 @@ fn dflash_golden_npy(gpu: &mut Gpu, dir: &str, name: &str, t: &GpuTensor, shape:
     }
     let _ = std::fs::create_dir_all(dir);
     if let Err(e) = std::fs::write(format!("{dir}/{name}.npy"), &out) {
-        eprintln!("[dflash-golden] write {name} failed: {e}");
+        tracing::warn!("write {name} failed: {e}");
     }
 }
 
@@ -304,8 +304,8 @@ impl DflashConfig {
         let conv_group_size = u("conv_group_size");
         if version >= 2 || selector_rank > 0 {
             if conv_kernel_size == 0 || conv_group_size == 0 {
-                eprintln!(
-                    "  DFlash draft REFUSED: DFlash2 drafter without conv geometry \
+                tracing::warn!(
+                    "DFlash draft REFUSED: DFlash2 drafter without conv geometry \
                      (conv_kernel_size={conv_kernel_size}, conv_group_size={conv_group_size}). \
                      Loading it as DFlash1 would run the wrong architecture."
                 );
@@ -316,8 +316,8 @@ impl DflashConfig {
                 .is_some()
             {
                 if !dflash2_selector_enabled() {
-                    eprintln!(
-                        "  DFlash2 candidate_selector (rank={selector_rank}, \
+                    tracing::warn!(
+                        "DFlash2 candidate_selector (rank={selector_rank}, \
                          top_k={selector_top_k}) carried by this drafter, NOT applied — \
                          the draft path takes a per-position argmax. Output is correct \
                          either way (the target verifies every token). \
@@ -1166,9 +1166,7 @@ fn load_dflash_awq_scale(
     };
     let tensor = source.tensor(&sidecar_name)?;
     if tensor.quant_type != 1 || tensor.shape != [k as u32] {
-        eprintln!(
-            "warning: DFLASH AWQ sidecar {sidecar_name} has incompatible type/shape; skipping"
-        );
+        tracing::warn!("DFLASH AWQ sidecar {sidecar_name} has incompatible type/shape; skipping");
         return None;
     }
     let f32_bytes: Vec<u8> = tensor
@@ -1778,7 +1776,9 @@ impl DflashScratch {
                 .as_deref()
                 == Some("1")
             {
-                eprintln!("[npu-draft] cycle: position={position} b={b} l_ctx={l_ctx} (NPU block forward ran)");
+                tracing::debug!(
+                    "cycle: position={position} b={b} l_ctx={l_ctx} (NPU block forward ran)"
+                );
             }
             Ok(true)
         }
@@ -2016,8 +2016,8 @@ fn gemm_dispatch(
         };
         let bytes = weight_bytes + batch * w.k * 4 + batch * w.m * 4 * 2;
         let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0;
-        eprintln!(
-            "[draft-gemm] dtype={:?} M={} K={} B={} us={} bytes={}KB GB/s={:.1}",
+        tracing::debug!(
+            "dtype={:?} M={} K={} B={} us={} bytes={}KB GB/s={:.1}",
             w.gpu_dtype,
             w.m,
             w.k,
@@ -2321,9 +2321,9 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
 
 fn dflash_subphase_sync(gpu: &mut Gpu, enabled: bool, layer: usize, label: &str) -> HipResult<()> {
     if enabled {
-        eprintln!("[draft-sub] layer={layer} {label}: sync");
+        tracing::debug!("layer={layer} {label}: sync");
         gpu.hip.device_synchronize()?;
-        eprintln!("[draft-sub] layer={layer} {label}: ok");
+        tracing::debug!("layer={layer} {label}: ok");
     }
     Ok(())
 }
@@ -2926,9 +2926,14 @@ pub fn draft_forward_opts(
 
     if dbg {
         gpu.hip.device_synchronize()?;
-        eprintln!(
-            "[draft-sub] attn_gemm={}µs concat={}µs attn_kernel={}µs ffn_gemm={}µs (B={} L={})",
-            us_attn_gemm, us_concat, us_attn_kernel, us_ffn_gemm, b, l,
+        tracing::debug!(
+            "attn_gemm={}µs concat={}µs attn_kernel={}µs ffn_gemm={}µs (B={} L={})",
+            us_attn_gemm,
+            us_concat,
+            us_attn_kernel,
+            us_ffn_gemm,
+            b,
+            l,
         );
     }
 

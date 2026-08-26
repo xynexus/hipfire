@@ -584,8 +584,8 @@ fn load_labelled_corpus_samples(
         .iter()
         .map(|sample| sample.stratum.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    eprintln!(
-        "calibrate: labelled corpus supplied {} samples across {} strata: {}",
+    tracing::info!(
+        "labelled corpus supplied {} samples across {} strata: {}",
         samples.len(),
         strata.len(),
         strata.into_iter().collect::<Vec<_>>().join(", "),
@@ -2038,8 +2038,8 @@ impl LayerStreamEngine {
             }
             remove_stale_layer_progress(&self.artifact_output, completed_layers, model.num_layers)?;
             if completed_layers > 0 {
-                eprintln!(
-                    "calibrate: resuming {} at layer {completed_layers}/{}",
+                tracing::info!(
+                    "resuming {} at layer {completed_layers}/{}",
                     self.artifact_output.display(),
                     model.num_layers
                 );
@@ -2150,8 +2150,8 @@ impl CalibrationSession {
             elapsed_us(prefetch_wait_started)
         };
         if !prefetch_report.errors.is_empty() {
-            eprintln!(
-                "calibrate: layer {layer_index} prefetch completed {}/{} bytes with {} error(s): {}",
+            tracing::warn!(
+                "layer {layer_index} prefetch completed {}/{} bytes with {} error(s): {}",
                 prefetch_report.completed_bytes,
                 prefetch_report.requested_bytes,
                 prefetch_report.errors.len(),
@@ -2208,8 +2208,8 @@ impl CalibrationSession {
                         Ok(prefetch) => self.pending_prefetch = Some((next_layer, prefetch)),
                         Err(error) => {
                             next_prefetch_disabled_reason = Some("worker_spawn_failed".into());
-                            eprintln!(
-                                "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
+                            tracing::warn!(
+                                "layer {next_layer} prefetch disabled for this transition: {error}"
                             );
                         }
                     }
@@ -2218,8 +2218,8 @@ impl CalibrationSession {
                         .disabled_reason
                         .unwrap_or("no_complete_tensor_fits_budget");
                     next_prefetch_disabled_reason = Some(reason.to_string());
-                    eprintln!(
-                        "calibrate: layer {next_layer} prefetch disabled for this transition: {reason}"
+                    tracing::warn!(
+                        "layer {next_layer} prefetch disabled for this transition: {reason}"
                     );
                 }
             }
@@ -2355,8 +2355,8 @@ impl CalibrationSession {
         let eta = estimated_remaining_layer_us(&self.layer_timings, remaining)
             .map(format_duration_us)
             .unwrap_or_else(|| "unknown".to_string());
-        eprintln!(
-            "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {} [view {}, decode {}, upload {}, release {}], execute {}, capture+sync {}); rolling layer ETA {eta}",
+        tracing::debug!(
+            "committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {} [view {}, decode {}, upload {}, release {}], execute {}, capture+sync {}); rolling layer ETA {eta}",
             self.model.num_layers,
             format_duration_us(latest.total_before_checkpoint_us),
             format_duration_us(latest.prefetch_read_us),

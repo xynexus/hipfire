@@ -189,19 +189,17 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hipfire=info,hipfire_server=info,warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    hipfire_runtime::logging::init_stderr_logging("cli", "hipfire=info,hipfire_server=info,warn");
 
     let cli = Cli::parse_from(normalize_help_args());
     let loaded_config = load_config_bundle();
     let config = loaded_config.config.clone();
 
     match cli.command {
+        // Bare `hipfire` as a systemd service means serve, not the TUI.
+        None if hipfire_runtime::logging::stderr_is_journal() => {
+            commands::serve::run(Default::default(), loaded_config).await
+        }
         None | Some(Command::Tui) => hipfire_tui::run(),
         Some(Command::Start(args)) => commands::daemon::start(args, loaded_config).await,
         Some(Command::Stop(args)) => commands::daemon::stop(args, loaded_config).await,

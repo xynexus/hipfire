@@ -2,7 +2,7 @@ use clap::Args;
 use hipfire_config::{ConfigLayer, ConfigLayerKind, LoadedConfig};
 use serde_json::json;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 #[command(
     after_help = "Examples:\n  hipfire serve\n  hipfire serve --host 0.0.0.0 --port 11435\n  hipfire serve --model Qwen3.5-30B-A3B\n"
 )]

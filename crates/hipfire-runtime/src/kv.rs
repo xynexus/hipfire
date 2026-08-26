@@ -323,7 +323,7 @@ impl KvCache {
         let cache_size = physical_cap * kv_dim;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_size, cache_size, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: fp32 ({n_kv}/{} layers carry KV, others placeholder, physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
         );
@@ -558,7 +558,7 @@ impl KvCache {
         let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: q8 ({n_kv}/{} layers carry KV, others placeholder)",
             is_kv_layer.len()
         );
@@ -870,7 +870,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: asym4 filtered ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -946,7 +946,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: fwht4 filtered ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -1023,7 +1023,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
+        tracing::info!(
             "KV cache: asym4 (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
@@ -1127,7 +1127,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
+        tracing::info!(
             "KV cache: fwht4 (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
@@ -1310,7 +1310,7 @@ impl KvCache {
             Some("8") => 8,
             Some("4") | None => 4,
             Some(other) => {
-                eprintln!("[kvarn] HIPFIRE_KVARN_BITS={other} invalid (want 2|4|8); using 4");
+                tracing::warn!("HIPFIRE_KVARN_BITS={other} invalid (want 2|4|8); using 4");
                 4
             }
         }
@@ -1383,7 +1383,7 @@ impl KvCache {
         }
         let k_bph = rec_bytes / n_kv_heads.max(1); // informational; record is per-head already
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
+        tracing::info!(
             "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + {} window + V Q8 {v_bph}B/head)",
             group,
             if win_is_f16 { "f16" } else { "f32" },
@@ -1489,7 +1489,7 @@ impl KvCache {
             });
         }
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + {} window + V Q8)",
             is_kv_layer.len(),
             if win_is_f16 { "f16" } else { "f32" }
@@ -1601,7 +1601,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: asym3 filtered ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -1673,7 +1673,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: fwht3 filtered ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -1754,7 +1754,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+        tracing::info!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu,
@@ -1839,7 +1839,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: asym2 filtered ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -1909,7 +1909,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
+        tracing::info!(
             "KV cache: fwht2 filtered ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
@@ -1986,7 +1986,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&ct.buf, &cb)?;
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
+        tracing::info!(
             "KV cache: asym2 (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64

@@ -682,7 +682,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         }
     } else if has_image && has_vl {
         if image_base64.is_some() && image.is_some() {
-            eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+            tracing::warn!("vl: both image and image_base64 provided — using image_base64");
         }
         let source = if let Some(b64) = image_base64 {
             if b64.len() > MAX_BASE64_ENCODED_LEN {

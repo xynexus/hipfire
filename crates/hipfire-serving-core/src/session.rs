@@ -1477,9 +1477,10 @@ pub fn daemon_accelerator_inventory(gpu: &mut hipfire_rdna::Gpu) -> AcceleratorI
     }
 
     if let Err(err) = gpu.hip.set_device(selected_device) {
-        eprintln!(
-            "WARNING: failed to restore HIP device {} after inventory probe: {}",
-            selected_device, err
+        tracing::warn!(
+            "failed to restore HIP device {} after inventory probe: {}",
+            selected_device,
+            err
         );
     }
 
@@ -1685,9 +1686,10 @@ pub fn qwen35_allocate_session_state(
     // the per-mode constructor banners are inconsistent — asym/q8 report
     // `physical_cap=N / max_seq=N`, kvarn reports neither — so an over-sized KV
     // was invisible on the mode operators are meant to use.
-    eprintln!(
-        "  session KV: mode={kv_mode} max_seq={} physical_cap={}",
-        m.max_seq, m.physical_cap
+    tracing::info!(
+        "session KV: mode={kv_mode} max_seq={} physical_cap={}",
+        m.max_seq,
+        m.physical_cap
     );
     let kv_cache = match kv_mode {
         "fp32" | "f32" => {
@@ -1789,7 +1791,7 @@ pub fn qwen35_allocate_session_state(
         )
         .map_err(|e| format!("{e}"))?,
         other => {
-            eprintln!("  batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
+            tracing::warn!("batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
             kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
