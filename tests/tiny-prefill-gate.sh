@@ -162,6 +162,52 @@ for raw_family in "${families[@]}"; do
         continue
     fi
 
+    # ── HIDDEN-STATE arm (drafter fidelity) ──────────────────────────────
+    # The KL checks below compare DECODE DISTRIBUTIONS, i.e. what the prefill
+    # wrote into KV. A DFlash drafter consumes something else entirely: the
+    # HiddenStateRingBuffer. Those can disagree — measured 2026-08-26, batched
+    # vs per-token hidden states diverge under QUANTISED KV while greedy token
+    # output stays byte-identical (the 2026-08-23 battery is a token-level
+    # result and does not cover this):
+    #
+    #     target        q8        kvarn     fp32
+    #     tiny fixture  1.27e-2   1.30e-2   EXACTLY 0
+    #     27B dense     1.32e-2   2.28e-2   —
+    #     35B-A3B MoE   1.36e-1   1.57e-1   EXACTLY 0
+    #
+    # Two assertions. The fp32 one is an INVARIANT: absent KV quantisation the
+    # two prefill paths must agree exactly, and that is the positive control
+    # proving the probe can see anything at all. The quantised one is a
+    # regression ceiling pinned just above today's ~1.3e-2 — it does not claim
+    # the current divergence is acceptable, only that it must not grow.
+    if [ "${HIPFIRE_TINYPREFILL_SKIP_HIDDEN:-0}" != "1" ]; then
+        HID="./target/release/examples/compare_prefill_hidden_paths"
+        if [ -x "$HID" ]; then
+            hid_worst() {
+                "$HID" --model "$2" --n 32 --kv-mode "$1" 2>/dev/null |
+                    grep -oE 'worst overall [0-9.e+-]+' | awk '{print $3}' | tail -1
+            }
+            w32="$(hid_worst fp32 "$hfq")"
+            if [ -n "$w32" ] && [ "$(awk -v a="$w32" 'BEGIN{print (a>0)?1:0}')" = "1" ]; then
+                echo "  FAIL hidden states differ at fp32 KV (worst $w32) — the prefill"
+                echo "       paths must be exactly equivalent absent KV quantisation"
+                fail=$((fail + 1))
+            fi
+            for hkv in "${kv_modes[@]}"; do
+                hkv="$(echo "$hkv" | xargs)"; [ -n "$hkv" ] || continue
+                wq="$(hid_worst "$hkv" "$hfq")"
+                [ -n "$wq" ] || continue
+                if [ "$(awk -v a="$wq" -v c="${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}" 'BEGIN{print (a>c)?1:0}')" = "1" ]; then
+                    echo "  FAIL hidden-state divergence $hkv = $wq exceeds ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}"
+                    echo "       a drafter reads these; see the note above this block"
+                    fail=$((fail + 1))
+                else
+                    echo "  hidden $hkv: worst $wq (ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2})"
+                fi
+            done
+        fi
+    fi
+
     for kv in "${kv_modes[@]}"; do
         kv="$(echo "$kv" | xargs)"
         [ -n "$kv" ] || continue

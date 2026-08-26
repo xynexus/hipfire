@@ -5492,9 +5492,29 @@ pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) ->
     let start: f32 = 1.0;
     let end: f32 = (num_target_layers as i32 - 3).max(1) as f32;
     let step = (end - start) / (num_extract as f32 - 1.0);
-    (0..num_extract)
+    let mut ids: Vec<usize> = (0..num_extract)
         .map(|i| (start + i as f32 * step).round() as usize)
-        .collect()
+        .collect();
+    // Force strictly increasing. On a SHALLOW target the spread collapses:
+    // `end` floors at 1, so n_layers <= 4 with num_extract >= 2 produced
+    // [1, 1, ...] — duplicates that `validate_hidden_extract_layers` rejects
+    // with "must be unique and increasing", i.e. a panic at ring-buffer
+    // construction rather than a diagnosable error. A 4-layer tiny fixture hits
+    // it immediately.
+    //
+    // This pass only fires on collapse: the 40-layer/8-extract production shape
+    // yields [1, 6, 11, 16, 22, 27, 32, 37] both before and after.
+    let last = num_target_layers.saturating_sub(1);
+    for i in 0..ids.len() {
+        if i > 0 && ids[i] <= ids[i - 1] {
+            ids[i] = ids[i - 1] + 1;
+        }
+        ids[i] = ids[i].min(last);
+    }
+    // Clamping can re-collapse at the tail when num_extract > num_target_layers,
+    // which is unsatisfiable; drop the overflow rather than emit duplicates.
+    ids.dedup();
+    ids
 }
 
 /// Ring buffer holding the most recent `max_positions` of hidden state
@@ -6464,6 +6484,26 @@ pub struct DflashVerifyOutput {
 /// unlike the GDN-tape fast path it has no parity question. Off by default
 /// while it is proven, and because the checkpoint slots cost ~832 MB on
 /// Qwen3.5-35B-A3B (2 MB/layer x 26 layers x 16 slots).
+///
+/// 🔴 **DO NOT ENABLE ON THE SERVING PATH.** Measured 2026-08-26 through the
+/// daemon, same model/drafter/prompt/B=4, fp32 KV, ONE variable:
+///
+///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=0   tau 1.595   accept 0.399   14.6 tok/s
+///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1   tau 0.056   accept 0.014    9.4 tok/s
+///
+/// A 28x acceptance collapse, and the path ENGAGED (the announce fired), so it
+/// is restoring WRONG state rather than skipping. Stock serving DFlash is
+/// healthy at tau 1.595 — identical to dflash_spec_demo.
+///
+/// This does NOT reproduce in `dflash_spec_demo`, where the restore is
+/// byte-exact against both the replay path and --ar-baseline, on the 35B and on
+/// a tiny fixture. So the defect is in how SERVING reaches it, not in the
+/// restore arithmetic. Prime suspect: the two harnesses build `VerifyScratch`
+/// through different constructors (demo `new_with_prefill_batch`, serving
+/// `with_prefill` at load.rs:4595), so the snapshot slots may be sized or
+/// populated differently than the code that reads them assumes.
+///
+/// Until that is understood, treat this as demo/bench-only.
 fn dflash_checkpoint_rollback_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -8252,11 +8292,31 @@ pub fn spec_step_dflash(
         && dflash_checkpoint_rollback_from_env()
         && matches!(target.dn_state.quant, qwen35::StateQuant::FP32)
         && !hipfire_rdna::gdn_chunk::chunk_enabled()
-        && verify_scratch
-            .prefill_batch
-            .as_ref()
-            .is_some_and(|p| !p.dn_s_snapshots.is_empty() && !p.dn_conv_snapshots.is_empty());
+        && verify_scratch.prefill_batch.as_ref().is_some_and(|p| {
+            // ⚠️ ALLOCATION IS NOT PROOF OF WRITING. Two batched GDN paths
+            // exist and only `prefill_lowered.rs` writes snapshots; serving's
+            // verify takes the ROUTED path in `prefill_batch.rs`, which does
+            // not. Restoring from unwritten slots copies ZEROS over live
+            // DeltaNet state — measured tau 1.595 -> 0.056 through the daemon.
+            // Require the writer to have marked exactly this block size.
+            !p.dn_s_snapshots.is_empty()
+                && !p.dn_conv_snapshots.is_empty()
+                && p.dn_snapshots_written
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == b
+        });
     if checkpoint_rollback {
+        // One-shot, like the hand-path warning in decode_layers.rs. Without it
+        // there is no way to tell from outside whether this path ENGAGED: a
+        // gate can pass with the flag on simply because no block was ever
+        // rejected (`verify_complete_rollback`), which looks like coverage and
+        // is not.
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[dflash] checkpoint rollback ENGAGED (b={b} accept={accept_len}) —                  DeltaNet restored from per-token slots, replay skipped"
+            );
+        }
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         for (layer_idx, s_dst) in target.dn_state.s_matrices.iter().enumerate() {
             let per_slot = s_dst.buf.size();
