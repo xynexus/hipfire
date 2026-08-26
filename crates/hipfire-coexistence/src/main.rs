@@ -706,7 +706,7 @@ fn hub_cli(op: &str, repo_arg: Option<&str>, args: &[String]) -> Result<(), Box<
             "repair" if !raw && archive.exists() => {
                 return Err(format!(
                     "hub: {} is an archive — a damaged payload cannot be patched in place. \
-                     Re-run `hub fetch --repo {repo} --force`, or restore from it with \
+                     Re-run `download {repo} --force`, or restore from it with \
                      `repack --input <archive> --output <dir>` if it still checks out",
                     archive.display()
                 )

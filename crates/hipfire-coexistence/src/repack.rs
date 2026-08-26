@@ -94,7 +94,7 @@ pub(crate) const UNIT: u64 = 1 << 30;
 
 /// Source-keyed chunk tables live in `hipfire-hub`, which owns fetching and
 /// verifying files and is the crate that acts on a mismatched window. The
-/// archive is one producer of a table; `hub fetch` is the other, and both must
+/// archive is one producer of a table; `download` is the other, and both must
 /// agree byte for byte, so there is exactly one implementation.
 ///
 /// See [`hipfire_hub::chunks`] for why the window is keyed to the source file
