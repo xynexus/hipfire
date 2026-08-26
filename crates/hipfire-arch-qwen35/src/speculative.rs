@@ -8292,10 +8292,19 @@ pub fn spec_step_dflash(
         && dflash_checkpoint_rollback_from_env()
         && matches!(target.dn_state.quant, qwen35::StateQuant::FP32)
         && !hipfire_rdna::gdn_chunk::chunk_enabled()
-        && verify_scratch
-            .prefill_batch
-            .as_ref()
-            .is_some_and(|p| !p.dn_s_snapshots.is_empty() && !p.dn_conv_snapshots.is_empty());
+        && verify_scratch.prefill_batch.as_ref().is_some_and(|p| {
+            // ⚠️ ALLOCATION IS NOT PROOF OF WRITING. Two batched GDN paths
+            // exist and only `prefill_lowered.rs` writes snapshots; serving's
+            // verify takes the ROUTED path in `prefill_batch.rs`, which does
+            // not. Restoring from unwritten slots copies ZEROS over live
+            // DeltaNet state — measured tau 1.595 -> 0.056 through the daemon.
+            // Require the writer to have marked exactly this block size.
+            !p.dn_s_snapshots.is_empty()
+                && !p.dn_conv_snapshots.is_empty()
+                && p.dn_snapshots_written
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == b
+        });
     if checkpoint_rollback {
         // One-shot, like the hand-path warning in decode_layers.rs. Without it
         // there is no way to tell from outside whether this path ENGAGED: a
