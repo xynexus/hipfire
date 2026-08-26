@@ -134,3 +134,48 @@ hipfire bench "$M" --json -r 5
 Do not wrap `hipfire bench` in `hipfire lock` — it drives the daemon, which
 takes the lock itself. Clear a lingering daemon by the pid you recorded; never
 `pkill -f`, which matches the calling shell's own command line.
+
+## A coverage hole in tiny-affected-gate, found while validating this change
+
+`./tests/tiny-affected-gate.sh --base origin/master --require-coverage` on the
+`moe_decode.rs` change returned **INCONCLUSIVE**:
+
+- `tiny-prefill`: 4 ran, 0 failed, corrupt-prefix falsifiability firing on every
+  cell. Genuinely green.
+- `tiny-state`: **0 matched, 4 no-baseline** — there are no gfx1103 baselines at
+  `hip=7.14.60850-d34cbb6409`.
+
+Running `origin/master` as a control produced **bit-identical** tiny-state
+hashes on both MoE cells. That looks like verification and is not:
+
+```
+flag off (mine):    0x4cae89af9546e58c 0xb01e019f669dd361   qwen3_5_moe
+flag ON  (mine):    0x4cae89af9546e58c 0xb01e019f669dd361   <- unchanged!
+master control:     0x4cae89af9546e58c 0xb01e019f669dd361
+```
+
+Forcing the *other* decode arm does not move the hash, so **the tiny-state
+fixtures do not exercise the routed-MoE decode path at all.** "Matches master"
+from that gate carries no information about a change to this arm.
+
+The dangerous part: had those baselines existed, the gate would have reported a
+confident `OK` for a change it cannot see. `--require-coverage` selected the
+right families and still gave zero coverage of the edited arm — coverage of a
+*family* is not coverage of a *path*.
+
+What actually verified it was the real artifact, where the path is known to
+execute (`HIPFIRE_QWEN35_MOE_DTYPE_DEBUG=1` reports the dispatch counts):
+
+| | use_gpu_topk=true | =false | 8-token greedy output |
+|---|---|---|---|
+| `origin/master` | 920 | 0 | `Hello! How can I help you today` |
+| this branch, flag off | 920 | 0 | `Hello! How can I help you today` |
+| this branch, flag ON | 0 | 920 | (arm forced) |
+
+That check can fail — the third row proves the instrument responds — which is
+what makes the first two rows worth anything.
+
+**Follow-up worth doing:** either record gfx1103 tiny-state baselines at this
+HIP version *and* give the MoE fixtures a shape that reaches the indexed decode
+arm (`k=8`, enough experts, an indexable routed dtype), or stop implying the
+qwen35 MoE families are covered for decode-path changes.
