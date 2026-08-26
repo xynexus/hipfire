@@ -6484,6 +6484,26 @@ pub struct DflashVerifyOutput {
 /// unlike the GDN-tape fast path it has no parity question. Off by default
 /// while it is proven, and because the checkpoint slots cost ~832 MB on
 /// Qwen3.5-35B-A3B (2 MB/layer x 26 layers x 16 slots).
+///
+/// 🔴 **DO NOT ENABLE ON THE SERVING PATH.** Measured 2026-08-26 through the
+/// daemon, same model/drafter/prompt/B=4, fp32 KV, ONE variable:
+///
+///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=0   tau 1.595   accept 0.399   14.6 tok/s
+///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1   tau 0.056   accept 0.014    9.4 tok/s
+///
+/// A 28x acceptance collapse, and the path ENGAGED (the announce fired), so it
+/// is restoring WRONG state rather than skipping. Stock serving DFlash is
+/// healthy at tau 1.595 — identical to dflash_spec_demo.
+///
+/// This does NOT reproduce in `dflash_spec_demo`, where the restore is
+/// byte-exact against both the replay path and --ar-baseline, on the 35B and on
+/// a tiny fixture. So the defect is in how SERVING reaches it, not in the
+/// restore arithmetic. Prime suspect: the two harnesses build `VerifyScratch`
+/// through different constructors (demo `new_with_prefill_batch`, serving
+/// `with_prefill` at load.rs:4595), so the snapshot slots may be sized or
+/// populated differently than the code that reads them assumes.
+///
+/// Until that is understood, treat this as demo/bench-only.
 fn dflash_checkpoint_rollback_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
