@@ -601,7 +601,47 @@ fn main() {
     // ⚠️ tau, and therefore the optimum, tracks how PREDICTABLE the
     // continuation is: B=3 is best on the attractor prompt, B=6 on humaneval.
     // Do not tune this on a single prompt.
-    let mut adaptive_b_min: usize = 4;
+    // Floor 2, not 4. ADAPTIVE_B_STEP=2 means this floor picks the RESIDUE
+    // CLASS the controller can ever sample: 4 generates {4,6,8}, 2 generates
+    // {2,4,6,8}. Floor 2 therefore STRICTLY DOMINATES floor 4 -- same class,
+    // one extra option -- and can only lose through exploration cost.
+    //
+    // MECHANISM, not just a tuned number: rollback replay is skipped entirely
+    // when `accept_len + 1 == b` (`verify_complete_rollback`), and replay is
+    // ~37% of a spec cycle (15.6-32.0 ms of a ~72 ms cycle, measured with
+    // HIPFIRE_SPEC_PHASES=1). At B=2 skipping it needs ONE accepted draft,
+    // common at tau~1.6; at B=6 it needs five. Small B buys out the replay.
+    //
+    // Six prompts, decode tok/s, both arms back-to-back in ONE harness:
+    //
+    //     prompt                    floor 4   floor 2
+    //     dflash_resident_smoke       35.91     39.70
+    //     humaneval_0                 69.61     69.69
+    //     humaneval_2_truncate        53.80     57.82
+    //     coherence_sheep_reason      80.05     75.04   <-- the one regression
+    //     lru_cache_pep8_strict       48.82     55.36
+    //     coherence_lloyd_long        45.91     48.45
+    //     mean                        55.68     57.68   (+3.6%)
+    //
+    // Wins 5 of 6. sheep loses 6.3%, which is exploration cost -- floor 2 can
+    // reach everything floor 4 can, so a loss means cycles spent probing B=2.
+    //
+    // ⚠️ tau FALLS as throughput RISES here (e.g. lru_cache 2.38 -> 1.02 while
+    // tok/s goes 48.82 -> 55.36). Another reminder that tau is the wrong
+    // objective; the controller optimises ms/committed-token for this reason.
+    //
+    // ⚠️ Do NOT compare these against the older table above -- those numbers do
+    // not reproduce, and the cause is NOT machine drift. Six hypotheses were
+    // tested and refuted: (1) machine state -- AR on the same prompt is 64.17
+    // today vs 64.27 there, and AR is deterministic; (2) the lm_head commit --
+    // parent == HEAD; (3) controller nondeterminism -- 3 repeats land within
+    // 0.03 with identical tau; (4) changed inputs -- prompt files untouched
+    // since 2026-05-25, model/drafter mtimes unchanged; (5) resident vs cold
+    // harness -- `--prompts-file` reproduces the cold numbers to ~1% with
+    // identical tau; (6) the rollback default flip in 4b3cdcffd -- the older
+    // table POSTDATES it. Most likely those figures were carried forward rather
+    // than re-measured. Trust only arms measured back-to-back in one run.
+    let mut adaptive_b_min: usize = 2;
     let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
@@ -701,6 +741,7 @@ fn main() {
     //    exactly at --block-size 4 but not at 2 or the default). That is
     //    batched-verify vs serial-decode parity, a separate question from
     //    #17. Cross-drafter identity holds regardless.
+    let mut no_speculate: bool = false;
     let mut no_tape: bool = false;
     let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 
@@ -936,6 +977,10 @@ fn main() {
             "--debug-cycle" => {
                 debug_cycles = args[i + 1].parse().unwrap();
                 i += 2;
+            }
+            "--no-speculate" => {
+                no_speculate = true;
+                i += 1;
             }
             "--no-tape" => {
                 no_tape = true;
@@ -2435,8 +2480,17 @@ fn main() {
                 }
                 (None, None) => None,
             };
-            let pld_spine: Option<&[u32]> = pld_spine_owned.as_deref();
-            let used_pld = pld_spine.is_some();
+            let used_pld = pld_spine_owned.is_some();
+            // Debug harness only. An EMPTY spine is the engine's no-speculate
+            // signal: b=1, no drafter forward, no rollback. `--block-size 1`
+            // does NOT reach it -- the drafter still launches with b-1 = 0 rows
+            // and dies in mq_rotate_x with grid=8x0x1. This flag is how you
+            // measure what a spec cycle costs with the speculation removed.
+            let pld_spine: Option<&[u32]> = if no_speculate {
+                Some(&[])
+            } else {
+                pld_spine_owned.as_deref()
+            };
             if used_pld {
                 pld_hits += 1;
             }

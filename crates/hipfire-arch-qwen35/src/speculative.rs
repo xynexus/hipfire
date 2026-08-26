@@ -6687,6 +6687,29 @@ fn verify_dflash_block_inner(
                 // Capture bugs here are subtle and this file documents a tau
                 // collapse (code 7.08 -> 4.51) from enabling capture too eagerly
                 // on the tree path, so this does not go default-on untested.
+                //
+                // ⚠️ TESTED 2026-08-26 ON Qwen3.5-35B-A3B--oq4.25++ (bf16 embed):
+                // THE CAPTURE-EQUIVALENCE ARGUMENT ABOVE IS WRONG IN PRACTICE.
+                // With HIPFIRE_VERIFY_GRAPH_WIDE_EMBD=1 the b=1 no-speculate path
+                // STOPS being byte-identical to --ar-baseline. That is a
+                // controlled case -- with the flag off it matches AR exactly, so
+                // the capture is what changes the output. It is also SLOWER
+                // there (48.47 -> 44.28 tok/s); normal spec-decode moves
+                // 48.39 -> 49.32, not worth an output change.
+                //
+                // And replay IS engaging, so this is a STALENESS bug, not a
+                // capture failure: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
+                // cycles at mode=replay (1 warmup, 1 capture, 1365 blobs) — and
+                // it is still slower than direct dispatch. `pbs.tokens` and
+                // `pbs.positions` are re-uploaded before every replay, so those
+                // are not it; look for state derived host-side from `start_pos`
+                // (a KV write offset, say) baked into kernel args at capture.
+                //
+                // So do NOT promote BF16 into this list on the reasoning above.
+                // The pointer-stability argument may well be right; something
+                // else in the bf16 embed capture is not. Fix that first, and use
+                // `--no-speculate` vs `--ar-baseline` byte-equality as the test
+                // -- it is the only arm here that is AR-exact by construction.
                 | hipfire_runtime::weights::EmbeddingFormat::BF16
                     if !matches!(
                         target.weights.embd_format,
@@ -7225,8 +7248,17 @@ pub fn spec_step_dflash(
     // so we don't run off the end of the PLD continuation. PLD-supplied
     // spines are often shorter than the trained B; the paper caps at 8.
     let requested_b = block_size_override.unwrap_or(draft_cfg.block_size);
+    // `.max(1)`, not `.max(2)`: an EMPTY spine means "do not speculate at all".
+    // b=1 verifies only the seed and commits the bonus -- one target forward,
+    // which is exactly an AR step, with hidden/KV/DeltaNet left coherent because
+    // the engine owns them. It also needs NO rollback: verify advances exactly
+    // as far as the committed prefix, so there is nothing to undo.
+    //
+    // This is the "stop speculating" capability the engine previously lacked.
+    // Without it a caller cannot fall back on a prompt the drafter cannot
+    // predict, and DFlash measures 0.60x AR there while nothing notices.
     let b = match pld_spine {
-        Some(pld) => (1 + pld.len()).min(requested_b).max(2),
+        Some(pld) => (1 + pld.len()).min(requested_b).max(1),
         None => requested_b,
     };
     let h = draft_cfg.hidden;
@@ -7242,7 +7274,10 @@ pub fn spec_step_dflash(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
-    assert!(b >= 2, "dflash block size must be ≥ 2");
+    // b == 1 is the no-speculation step (empty pld_spine); it skips the drafter
+    // via the pld branch below, so the `b >= 2` asserts in the draft helpers are
+    // unreachable from here.
+    assert!(b >= 1, "dflash block size must be ≥ 1");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default
     // ctx_slice=None path the data lives on GPU in draft_scratch.target_hidden
@@ -7799,7 +7834,19 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    // b == 1 needs NO snapshot: rows_to_keep = accept_len + 1 = 1 = b, so
+    // `verify_complete_rollback` is true and `restore_to` is never reached.
+    // Skipping it is exact, not an approximation.
+    //
+    // Worth ~4.3 ms/token, most of the b=1 gap against a plain AR step (21.35
+    // vs 15.82 ms). Only ~0.7 ms of that is GPU: rocprofv3 shows 3 copies per
+    // LA layer (gx=10240 / 6144 / 512) x 30 layers = 90 BLOCKING memcpy_dtod
+    // per cycle, and it is their HOST round-trip -- invisible to every GPU
+    // counter -- that dominates. That is why b1 wall (169 ms) so exceeded b1
+    // GPU busy (109.84 ms) while AR sat at 94.28 / 122.
+    if b > 1 {
+        target_snap.save_from(&target.dn_state, gpu)?;
+    }
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
@@ -8942,7 +8989,13 @@ pub fn spec_step_dflash(
     } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
-            qwen35::forward_scratch(
+            // `_no_logits`: replay exists only to walk dn_state + kv_cache
+            // forward over tokens that are ALREADY committed. Nothing reads
+            // `scratch.logits` afterwards -- the compare diagnostic below runs
+            // its own logits-producing forward. The lm_head is vocab-wide and
+            // costs ~1.2 ms/token on Qwen3.5-35B-A3B (rocprofv3), so the
+            // logits-producing variant burned that per replayed token.
+            qwen35::forward_scratch_no_logits(
                 gpu,
                 &target.weights,
                 &target.config,
