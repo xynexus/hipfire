@@ -1484,9 +1484,33 @@ copied there that has one, or a run on a third machine. Recorded rather than
 retried because two attempts already failed the same way for a reason unrelated
 to the question, and a third would too.
 
-What that leaves for M4, unchanged from the 2026-08-22 scoping: qwen35 joins
-deepseek4 on a coarse `Escape` with a capability predicate that NAMES the reason,
-and `MoeExpert(e)` exists only for arches whose MoE is not fused.
+What that left for M4, as of the 2026-08-22 scoping: qwen35 joins deepseek4 on a
+coarse `Escape` with a capability predicate that NAMES the reason, and
+`MoeExpert(e)` exists only for arches whose MoE is not fused.
+
+**Measured 2026-08-26 — the cost objection to option B does not hold at batch-1
+decode.** See `docs/experiments/2026-08-26-m4-unfused-moe-decode.md`. The
+per-expert arm already exists in `moe_decode.rs` as the non-all-MQ4 / k != 8
+correctness fallback, so B was measurable behind a flag rather than a new
+kernel. On gfx1103 with `Qwen3.6-35B-A3B--oq4.hfq`, A/B/A at 5 reps:
+fused **11.52** t/s vs per-expert **11.46** t/s — **−0.52%**, and the per-expert
+arm pays a CPU top-K D2H sync the fused path does not. Batch-1 decode is
+bandwidth-bound on expert weights, so the fused kernel's launch amortization
+buys nothing.
+
+So B is viable on qwen35 decode and `Escape` is not forced by throughput there.
+Still open before M4 is settled: batch > 1 (where fusion should start to pay),
+gfx1151's grouped WMMA path, and deepseek4 — which has no existing per-expert
+fallback, so B there is real kernel work rather than a flag. The defensible
+middle is B where a per-expert arm already measures free, `Escape` for
+deepseek4 until its per-expert path is written and measured.
+
+⚠️ **That experiment also found a benchmarking hazard on nix1**: after sustained
+load the DPM governor drops `mclk` to level 0 (1000 MHz) at only 46 °C — not
+thermal — and batch-1 decode tracks it, so a fresh run reports ~1.8× the
+sustained number. The first A/B here read "unfusing costs 31%" purely from
+comparing a fresh run against a warm one. Any A/B on this box must be A/B/A or
+pinned to one DPM state.
 
 ### M4 — scoped 2026-08-22. qwen35 has deepseek4's problem too.
 

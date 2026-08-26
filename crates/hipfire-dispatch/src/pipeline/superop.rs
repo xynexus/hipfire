@@ -166,6 +166,70 @@ pub enum EscapeKind {
     Deepseek4SwaTopK,
 }
 
+/// Whether an arch's MoE decode can be lowered to per-expert ops, and if not,
+/// **why not** — §M4 option A.
+///
+/// `SuperOpKind::Moe` is one coarse op that calls a hand-written arm. For some
+/// arches that is a deliberate choice and for others it is a hard limit, and
+/// from the outside the two are indistinguishable: a scheduler that wants
+/// expert-level granularity just finds an opaque op and cannot tell whether
+/// asking for `MoeExpert(e)` is unimplemented or impossible. This makes the
+/// distinction declarative and greppable instead of folklore.
+///
+/// It carries no execution behaviour. An arch reporting `Splittable` still runs
+/// whatever arm it runs today; this is the predicate a per-expert scheduler
+/// consults before assuming a seam exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeSplitCapability {
+    /// This arch has no MoE at all.
+    NotApplicable,
+    /// A per-expert seam exists and is measured to cost approximately nothing
+    /// at the stated regime. Carries the evidence pointer so the claim is not
+    /// re-litigated from memory.
+    Splittable {
+        /// Where the measurement lives.
+        evidence: &'static str,
+    },
+    /// MoE decode is a single fused dispatch with no per-expert seam. The
+    /// reason is a sentence, not a flag, because "why" is the part a caller
+    /// needs in order to decide whether to invest in unfusing.
+    FusedOpaque { reason: &'static str },
+}
+
+impl MoeSplitCapability {
+    pub fn is_splittable(self) -> bool {
+        matches!(self, Self::Splittable { .. })
+    }
+
+    /// Human-readable explanation, for error messages and traces that would
+    /// otherwise report only that a per-expert lowering was declined.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "arch has no MoE",
+            Self::Splittable { evidence } => evidence,
+            Self::FusedOpaque { reason } => reason,
+        }
+    }
+}
+
+/// qwen35: the per-expert arm already exists as the non-all-MQ4 / k != 8
+/// correctness fallback, and A/B/A on gfx1103 put it within 0.52% of the fused
+/// indexed path at batch-1 decode — while additionally paying a CPU top-K D2H
+/// sync the fused path does not.
+pub const QWEN35_MOE_SPLIT: MoeSplitCapability = MoeSplitCapability::Splittable {
+    evidence: "docs/experiments/2026-08-26-m4-unfused-moe-decode.md \
+               (gfx1103, Oq4G256 resident experts, k=8, batch 1: -0.52%)",
+};
+
+/// deepseek4: routing, gather, both GEMMs and the combine are one dispatch, so
+/// there is no point at which a per-expert op could be emitted without writing
+/// a new kernel. Unlike qwen35 there is no existing fallback arm to borrow.
+pub const DEEPSEEK4_MOE_SPLIT: MoeSplitCapability = MoeSplitCapability::FusedOpaque {
+    reason: "fused MoE decode: routing, gather, both GEMMs and combine are a \
+             single dispatch with no per-expert seam, and no per-expert \
+             fallback arm exists to borrow",
+};
+
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the
 /// FUSED_TABLE/`resolve()` result frozen at lower time; for `Attend`/`Recurrent`/
 /// `Conv`/`Escape` it may be `None` (those route by kind + flavor + escape tag).
@@ -746,5 +810,35 @@ mod tests {
         let prog = lower_walk(2, |_| SuperOpKind::Proj, |_| Some((fk(), 0)));
         assert_eq!(prog.len(), 2);
         assert!(prog.iter().all(|op| op.binding.key.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod moe_split_capability_tests {
+    use super::*;
+
+    #[test]
+    fn qwen35_is_splittable_and_cites_its_evidence() {
+        assert!(QWEN35_MOE_SPLIT.is_splittable());
+        // The point of carrying evidence is that the claim is checkable.
+        assert!(QWEN35_MOE_SPLIT.explain().contains("2026-08-26"));
+    }
+
+    #[test]
+    fn deepseek4_is_opaque_and_names_a_reason_not_a_flag() {
+        assert!(!DEEPSEEK4_MOE_SPLIT.is_splittable());
+        let why = DEEPSEEK4_MOE_SPLIT.explain();
+        // A caller deciding whether to invest in unfusing needs the "why".
+        assert!(why.contains("single dispatch"), "got: {why}");
+        assert!(why.contains("no per-expert"), "got: {why}");
+    }
+
+    #[test]
+    fn not_applicable_still_explains_itself() {
+        assert!(!MoeSplitCapability::NotApplicable.is_splittable());
+        assert_eq!(
+            MoeSplitCapability::NotApplicable.explain(),
+            "arch has no MoE"
+        );
     }
 }
