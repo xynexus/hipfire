@@ -6697,6 +6697,14 @@ fn verify_dflash_block_inner(
                 // there (48.47 -> 44.28 tok/s); normal spec-decode moves
                 // 48.39 -> 49.32, not worth an output change.
                 //
+                // And replay IS engaging, so this is a STALENESS bug, not a
+                // capture failure: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
+                // cycles at mode=replay (1 warmup, 1 capture, 1365 blobs) — and
+                // it is still slower than direct dispatch. `pbs.tokens` and
+                // `pbs.positions` are re-uploaded before every replay, so those
+                // are not it; look for state derived host-side from `start_pos`
+                // (a KV write offset, say) baked into kernel args at capture.
+                //
                 // So do NOT promote BF16 into this list on the reasoning above.
                 // The pointer-stability argument may well be right; something
                 // else in the bf16 embed capture is not. Fix that first, and use
