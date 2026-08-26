@@ -1355,14 +1355,31 @@ fn main() {
     // Size for the max block we may use this session so adaptive-B-up
     // doesn't overflow.
     let hrb_max_block = draft_scratch_b;
-    let mut hidden_rb = HiddenStateRingBuffer::new(
-        &mut gpu,
-        target.config.n_layers,
-        draft_cfg.num_extract(),
-        draft_cfg.hidden,
-        ctx_capacity + hrb_max_block,
-        hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
-    )
+    // Use the layer ids the DRAFTER DECLARES, not a re-derived spread. They are
+    // what it was trained against, so re-deriving is at best redundant and at
+    // worst feeds it hidden states from layers it never saw. For the shipped
+    // 35B drafter the two agree exactly ([1,6,11,16,22,27,32,37]), so this is a
+    // no-op there; on a shallow target the spread collapses to duplicates and
+    // panics.
+    let mut hidden_rb = if draft_cfg.target_layer_ids.is_empty() {
+        HiddenStateRingBuffer::new(
+            &mut gpu,
+            target.config.n_layers,
+            draft_cfg.num_extract(),
+            draft_cfg.hidden,
+            ctx_capacity + hrb_max_block,
+            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
+        )
+    } else {
+        HiddenStateRingBuffer::new_for_layers(
+            &mut gpu,
+            target.config.n_layers,
+            draft_cfg.target_layer_ids.clone(),
+            draft_cfg.hidden,
+            ctx_capacity + hrb_max_block,
+            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
+        )
+    }
     .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");

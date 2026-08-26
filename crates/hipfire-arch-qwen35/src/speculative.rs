@@ -5492,9 +5492,29 @@ pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) ->
     let start: f32 = 1.0;
     let end: f32 = (num_target_layers as i32 - 3).max(1) as f32;
     let step = (end - start) / (num_extract as f32 - 1.0);
-    (0..num_extract)
+    let mut ids: Vec<usize> = (0..num_extract)
         .map(|i| (start + i as f32 * step).round() as usize)
-        .collect()
+        .collect();
+    // Force strictly increasing. On a SHALLOW target the spread collapses:
+    // `end` floors at 1, so n_layers <= 4 with num_extract >= 2 produced
+    // [1, 1, ...] — duplicates that `validate_hidden_extract_layers` rejects
+    // with "must be unique and increasing", i.e. a panic at ring-buffer
+    // construction rather than a diagnosable error. A 4-layer tiny fixture hits
+    // it immediately.
+    //
+    // This pass only fires on collapse: the 40-layer/8-extract production shape
+    // yields [1, 6, 11, 16, 22, 27, 32, 37] both before and after.
+    let last = num_target_layers.saturating_sub(1);
+    for i in 0..ids.len() {
+        if i > 0 && ids[i] <= ids[i - 1] {
+            ids[i] = ids[i - 1] + 1;
+        }
+        ids[i] = ids[i].min(last);
+    }
+    // Clamping can re-collapse at the tail when num_extract > num_target_layers,
+    // which is unsatisfiable; drop the overflow rather than emit duplicates.
+    ids.dedup();
+    ids
 }
 
 /// Ring buffer holding the most recent `max_positions` of hidden state
