@@ -1818,6 +1818,20 @@ as specified — it needs either a prefill term or a preemptible prefill, and
 `2026-08-22-prefill-lowering.md` argues the second. **Blocked on that decision,
 not on M4.**
 
+*Measured 2026-08-26 — the VRAM test now has numbers, and the obvious
+implementation of it would not work.* See
+`docs/experiments/2026-08-26-load-eviction-semantics-nix1.md`. On nix1 (42.0 GB
+GTT) three co-resident models OOM the fourth load with
+`free=41.9 MiB of total=43008.0 MiB`; nothing is evicted to make room, because
+`resident_models` has no policy and `plan_model_residency` is server-side only.
+The failure is safe — survivors are bit-identical afterwards, and the 2.5 GB the
+failed load retains is pool reuse rather than a leak (three consecutive failures
+add 0.00 GB each) — but it is late, discovered by allocating into a wall.
+**The guard must size against `mem_info_gtt_used`, NOT the daemon's ledger**: at
+three models the ledger read 31.25 GB against 39.47 GB actual, so a
+ledger-sized guard would have approved the load that OOM'd. `rocm-smi` is
+equally useless here — it reports only the 0.2 GB dedicated carveout.
+
 *The VRAM test is real and cheaper than expected, but it is a load-path change.*
 The assumption that one model is resident is **wrong**: `DaemonState` carries
 `resident_models: HashMap<String, LoadedModel>` of parked workers, documented as
