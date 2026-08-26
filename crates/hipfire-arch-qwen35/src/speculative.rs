@@ -6724,13 +6724,24 @@ fn verify_dflash_block_inner(
                 // there (48.47 -> 44.28 tok/s); normal spec-decode moves
                 // 48.39 -> 49.32, not worth an output change.
                 //
-                // And replay IS engaging, so this is a STALENESS bug, not a
-                // capture failure: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
+                // Replay IS engaging: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
                 // cycles at mode=replay (1 warmup, 1 capture, 1365 blobs) — and
-                // it is still slower than direct dispatch. `pbs.tokens` and
-                // `pbs.positions` are re-uploaded before every replay, so those
-                // are not it; look for state derived host-side from `start_pos`
-                // (a KV write offset, say) baked into kernel args at capture.
+                // it is still slower than direct dispatch.
+                //
+                // ⚠️ It is NOT a stale capture-time scalar, which an earlier
+                // revision of this comment guessed. Bisected with b=1
+                // no-speculate as the oracle (AR-exact by construction at every
+                // length): first divergence is at token 4, i.e. NOT the first
+                // replay, and the streams then RE-CONVERGE for six tokens
+                // before flipping again. Isolated near-tie flips with coherent
+                // output are tiny NUMERICAL differences, not the garbage a bad
+                // KV offset or context length would produce — and batched
+                // attention reads positions from a DEVICE buffer with max_seq
+                // constant, so neither can go stale anyway.
+                //
+                // Since replay is also a net LOSS here, this path is a dead end
+                // on this model: the ~4.5 ms/token launch gap needs FEWER
+                // dispatches, not cheaper ones.
                 //
                 // So do NOT promote BF16 into this list on the reasoning above.
                 // The pointer-stability argument may well be right; something
