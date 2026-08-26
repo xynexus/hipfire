@@ -340,8 +340,39 @@ impl Gpu {
         v_dim: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
+        self.conv1d_silu_split_f32_n_opts(
+            q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens, None,
+        )
+    }
+
+    /// `conv1d_silu_split_f32_n` with per-token conv-ring checkpoints.
+    ///
+    /// `snapshots`, when given, must hold `n_tokens * n_channels * 3` floats;
+    /// the ring AFTER token t lands at slot t, same [c*3 + {0,1,2}] layout as
+    /// `state`. DFlash rollback restores slot `accept_len` instead of
+    /// re-forwarding the committed prefix through the whole model.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_split_f32_n_opts(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        snapshots: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch_caps.is_gfx1151() && n_tokens >= 64 {
+        // The gfx1151 fast path is a DIFFERENT kernel with no snapshot support,
+        // so taking it while checkpoints are requested would silently write
+        // nothing and corrupt a later restore. Fall through to the generic
+        // kernel instead. DFlash verify runs B <= 16 and never reaches the
+        // n_tokens >= 64 threshold; this only makes that explicit.
+        if snapshots.is_none() && self.arch_caps.is_gfx1151() && n_tokens >= 64 {
             return self.conv1d_silu_split_f32_n_gfx1151(
                 q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens,
             );
@@ -357,6 +388,10 @@ impl Gpu {
         let ip = input.buf.as_ptr();
         let wp = weight.buf.as_ptr();
         let sp = state.buf.as_ptr();
+        let snapp: *mut std::ffi::c_void = match snapshots {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let kd = k_dim as i32;
         let vd = v_dim as i32;
         let nt = n_tokens as i32;
@@ -371,7 +406,7 @@ impl Gpu {
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &kernargs![ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, i32 kd, i32 vd, i32 nt],
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, i32 kd, i32 vd, i32 nt, ptr snapp],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
