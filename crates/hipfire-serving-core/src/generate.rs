@@ -2105,6 +2105,29 @@ fn qwen35_prefill_tokens(
         // engages (qwen3.5-2b/4b bf16, Qwen3.5/3.6/3.8-27B oq4.25++), prefill
         // 15-21 -> 308-1573 tok/s.
         //
+        // ⚠️ THAT BATTERY MEASURES TOKENS, NOT HIDDEN STATES — do not read it as
+        // blanket path equivalence. `compare_prefill_hidden_paths` on the SAME
+        // buffer a DFlash drafter consumes (2026-08-26):
+        //
+        //     model         kv      first diverging layer   worst
+        //     27B dense     kvarn   2                       2.28e-2
+        //     27B dense     q8      2                       1.32e-2
+        //     35B-A3B MoE   kvarn   0                       1.57e-1
+        //     35B-A3B MoE   q8      0                       1.36e-1
+        //     35B-A3B MoE   fp32    NONE                    0.000e0
+        //
+        // Both results hold: hidden states differ ~1e-2 without flipping a
+        // greedy argmax, so token output stays byte-identical. NOT a regression
+        // in 8ea5a303e.
+        //
+        // But a DFlash drafter consumes the HiddenStateRingBuffer, not the token
+        // stream, so this path can pass the battery and still starve a drafter —
+        // a candidate mechanism for serving tau 0.05 vs 0.764 in
+        // dflash_spec_demo on the same pair. Quantised KV is the trigger (fp32
+        // is exactly 0); the MoE expert path amplifies it ~7x and moves first
+        // divergence from layer 2 to layer 0. If drafter fidelity under
+        // quantised KV matters, that battery needs a hidden-state arm.
+        //
         // Only the LAST prompt token's logits are ever read; the rest are
         // discarded. On Qwen3.8-27B the lm_head is 675 MB at oq4.25 (vocab
         // 248320 x 5120) = ~2.9 ms per call, so a logits-producing forward per
