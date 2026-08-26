@@ -67,9 +67,17 @@ Three pieces of code, in the order they matter:
 
 3. **The fast path is elsewhere.** `activate_model_worker` — the function that
    swaps a parked worker back into the active slot without reloading — is called
-   only from `handlers/sessions.rs` (:17, :96) and `handlers/batch.rs` (:18,
-   :134). **It is not called from `lifecycle.rs` at all.** Switching without a
-   reload goes through the session/batch API, not through `load`.
+   from `handlers/generate.rs` (:27, :89), `handlers/sessions.rs` (:17, :96) and
+   `handlers/batch.rs` (:18, :134). **It is not called from `lifecycle.rs` at
+   all.** Switching without a reload goes through those paths, not through
+   `load`.
+
+   ⚠️ **Corrected 2026-08-26:** this list originally said "called *only* from
+   `sessions.rs` and `batch.rs`" and omitted `generate.rs`. That omission
+   mattered — `generate` carrying a `worker_key_id` activates the target worker
+   by itself, so it is the simplest way to switch, and no separate activation
+   call is needed. Measured cost in
+   `2026-08-26-resident-swap-cost-nix1.md`: **free**.
 
 ## What this means
 
@@ -79,10 +87,9 @@ Three pieces of code, in the order they matter:
   paid anyway — the worst of both. Route switches through the session/batch
   path.
 - **For the M6/M8 residency claims:** co-residency itself is real and now
-  directly evidenced (2 workers, 32.9 GB, both live). What has *not* been
-  measured here is the cost of the actual resident swap via
-  `activate_model_worker`; that is the number that would justify multi-model
-  serving, and it remains open.
+  directly evidenced (2 workers, 32.9 GB, both live). ~~What has not been
+  measured here is the cost of the actual resident swap.~~ **Now measured** on
+  nix1 — it is free; see `2026-08-26-resident-swap-cost-nix1.md`.
 
 ## Two measurement traps hit while getting this
 
@@ -114,6 +121,6 @@ On halo, `/tmp/claude-1000/m8b/`: `sw2.py` (two-worker probe, distinct
 extractor), plus `soloA.json` / `soloB.json` baselines and `probe_switch.py`
 (the single-`__default__` negative case).
 
-Next step, not done here: drive the switch through `reserve_session_state` /
-`generate_batch_prefill` so `activate_model_worker` is exercised, and measure
-that against the 12–13 s `load` figure.
+Follow-up, done: `2026-08-26-resident-swap-cost-nix1.md` measures the resident
+swap against this 12–13 s `load` figure. A `generate` carrying `worker_key_id`
+activates the worker itself, so no separate session/batch call is required.
