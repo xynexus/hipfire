@@ -869,6 +869,10 @@ pub(crate) fn moe_ffn_decode_impl(
     // not per-expert GEMV alone. Any A/B using this must attribute the sync
     // separately or it will overstate what unfusing costs.
     let force_per_expert =
+        // HIPFIRE_QWEN35_MOE_FORCE_PER_EXPERT=1 forces the per-expert MoE decode
+        // arm (§M4 option B) so it can be A/B'd against the fused indexed path on
+        // one artifact. Measurement lever, not a perf option: the forced arm also
+        // pays a CPU top-K D2H sync the fused path does not.
         std::env::var("HIPFIRE_QWEN35_MOE_FORCE_PER_EXPERT").as_deref() == Ok("1");
     let use_gpu_topk = dispatch_flags.use_gpu_topk && !force_per_expert;
     let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
