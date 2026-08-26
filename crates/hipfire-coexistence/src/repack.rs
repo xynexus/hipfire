@@ -187,7 +187,10 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Serialized into the streaming packer's resume manifest so a resumed run's
 /// summary still counts the files fetched before the interruption.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Stats {
+/// Public because `hub_archive::StreamPacker::{stats_snapshot, resume}` are
+/// `pub` and name this type in their signatures; `pub(crate)` here made those
+/// signatures reference a more-private type (private_interfaces warning).
+pub struct Stats {
     pub n_bf16h: usize,
     pub n_verbatim_files: usize,
     /// Logical bytes fed to the codecs, and what they became.

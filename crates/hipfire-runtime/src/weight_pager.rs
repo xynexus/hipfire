@@ -2513,12 +2513,6 @@ mod tests {
         ));
     }
 
-    /// Regression: a need bigger than the entire budget must NOT cause
-    /// `evict_lru_until` to silently drain the residency map and return Ok.
-    /// Prior to this guard, `target_used = budget.saturating_sub(need)` was 0
-    /// and the loop exited cleanly even though the subsequent fetch in
-    /// `ensure_resident` would push usage past the cap.
-    #[test]
     /// `PinAll` must never evict and never reject. Both were previously
     /// spelled `vram_budget_bytes == u64::MAX`, and the old code carried that
     /// comparison at three separate sites — miss one and a pinned pager quietly
@@ -2554,6 +2548,12 @@ mod tests {
         assert_eq!(unlimited.eviction_budget(), None);
     }
 
+    /// Regression: a need bigger than the entire budget must NOT cause
+    /// `evict_lru_until` to silently drain the residency map and return Ok.
+    /// Prior to this guard, `target_used = budget.saturating_sub(need)` was 0
+    /// and the loop exited cleanly even though the subsequent fetch in
+    /// `ensure_resident` would push usage past the cap.
+    #[test]
     fn would_fit_rejects_need_bigger_than_budget() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-budget-{}.bin", std::process::id()));
