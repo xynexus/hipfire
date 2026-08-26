@@ -242,6 +242,113 @@ pub fn plan_model_residency(
     })
 }
 
+/// The §1.1 realtime entry-latency contract, in milliseconds.
+///
+/// This bounds the delay to a realtime stream's FIRST dispatch, not its
+/// steady-state jitter — once admitted the stream has the GPU essentially to
+/// itself.
+pub const REALTIME_ADMISSION_BUDGET_MS: u32 = 200;
+
+/// The terms of `admit(realtime)`.
+///
+/// §1.1 wrote the inequality as
+///
+/// ```text
+/// drain_to_suspend + realtime_model_residency_cost <= 200 ms
+/// ```
+///
+/// which omits the term that actually dominates. §M3d measurement 2 clocked
+/// **81.4 ms** from admission to first realtime token, of which **~71 ms was
+/// the realtime stream's own prefill** and only ~10-17 ms was queueing. The
+/// inequality as specified therefore budgets ~12% of the latency it claims to
+/// bound, and it gets *worse* as context grows.
+///
+/// So prefill is a term here. It is priced **per chunk, not per token**:
+/// prefill is executed in chunks and the chunk is the scheduling quantum, so
+/// a chunked prefill of N tokens costs `ceil(N / chunk) * per_chunk`, not
+/// `N * per_token`. Pricing it per token misprices every chunked prefill and
+/// mis-ranks the one lever that actually moves this number (chunk size).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RealtimeAdmissionCost {
+    /// Worst-case execution time of the largest indivisible unit currently
+    /// dispatchable — the granularity at which a bulk stream can be stopped.
+    pub max_module_wcet_ms: u32,
+    /// Cost of parking every running bulk stream.
+    pub park_cost_ms: u32,
+    /// Cost of making the realtime model resident (0 when already resident).
+    pub model_residency_ms: u32,
+    /// Number of prefill chunks the realtime stream must run before its first
+    /// token. See `prefill_chunks_for`.
+    pub prefill_chunks: u32,
+    /// Measured cost of one prefill chunk for this model/shape.
+    pub per_chunk_ms: u32,
+}
+
+impl RealtimeAdmissionCost {
+    /// `max_module_wcet + park_cost(all running bulk streams)` — §1.1.
+    pub fn drain_to_suspend_ms(self) -> u32 {
+        self.max_module_wcet_ms.saturating_add(self.park_cost_ms)
+    }
+
+    /// The realtime stream's own prefill, priced per chunk.
+    pub fn prefill_ms(self) -> u32 {
+        self.prefill_chunks.saturating_mul(self.per_chunk_ms)
+    }
+
+    pub fn total_ms(self) -> u32 {
+        self.drain_to_suspend_ms()
+            .saturating_add(self.model_residency_ms)
+            .saturating_add(self.prefill_ms())
+    }
+}
+
+/// Chunks needed to prefill `prompt_tokens` at `chunk_tokens`.
+///
+/// `chunk_tokens == 0` means unchunked: the whole prompt is one indivisible
+/// chunk, which is the pessimistic reading and the safe one for admission.
+pub fn prefill_chunks_for(prompt_tokens: u32, chunk_tokens: u32) -> u32 {
+    if prompt_tokens == 0 {
+        return 0;
+    }
+    if chunk_tokens == 0 {
+        return 1;
+    }
+    prompt_tokens.div_ceil(chunk_tokens)
+}
+
+/// `admit(realtime)` — the time half of §1.1. The VRAM half is
+/// `plan_model_residency`.
+///
+/// On refusal the message NAMES the dominating term, so a rejection says which
+/// lever to pull rather than just that the budget was exceeded.
+pub fn admit_realtime(cost: RealtimeAdmissionCost, budget_ms: u32) -> Result<(), String> {
+    let total = cost.total_ms();
+    if total <= budget_ms {
+        return Ok(());
+    }
+    let drain = cost.drain_to_suspend_ms();
+    let prefill = cost.prefill_ms();
+    let (worst, worst_ms) = [
+        ("prefill", prefill),
+        ("drain_to_suspend", drain),
+        ("model_residency", cost.model_residency_ms),
+    ]
+    .into_iter()
+    .max_by_key(|(_, ms)| *ms)
+    .unwrap_or(("prefill", prefill));
+    Err(format!(
+        "realtime admission needs {total} ms > {budget_ms} ms budget; \
+         dominant term is {worst} at {worst_ms} ms \
+         (drain_to_suspend={drain} [module_wcet={} + park={}], \
+         model_residency={}, prefill={prefill} [{} chunks x {} ms])",
+        cost.max_module_wcet_ms,
+        cost.park_cost_ms,
+        cost.model_residency_ms,
+        cost.prefill_chunks,
+        cost.per_chunk_ms,
+    ))
+}
+
 /// Work classes coordinated by the long-lived accelerator orchestrator.
 ///
 /// Token and image work may be microbatched when callers provide the same
@@ -3041,5 +3148,100 @@ mod tests {
             "a classifiable non-recurrent model must remain batchable",
         );
         assert!(sessions_compatible_for_prefill(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod realtime_admission_tests {
+    use super::*;
+
+    /// The §M3d numbers: 81.4 ms admission->first token, ~71 ms of it prefill.
+    fn m3d_observed() -> RealtimeAdmissionCost {
+        RealtimeAdmissionCost {
+            max_module_wcet_ms: 3,
+            park_cost_ms: 7,
+            model_residency_ms: 0,
+            prefill_chunks: 71,
+            per_chunk_ms: 1,
+        }
+    }
+
+    #[test]
+    fn prefill_is_the_dominant_term_in_the_measured_case() {
+        let cost = m3d_observed();
+        assert_eq!(cost.drain_to_suspend_ms(), 10);
+        assert_eq!(cost.prefill_ms(), 71);
+        assert_eq!(cost.total_ms(), 81);
+        // The whole point: the spec's inequality saw only the 10 ms.
+        assert!(cost.prefill_ms() > cost.drain_to_suspend_ms() * 7);
+    }
+
+    #[test]
+    fn the_old_formula_would_admit_what_the_new_one_prices() {
+        let cost = m3d_observed();
+        // Old: drain + residency only. Passes a 20 ms budget it should not.
+        let old = cost.drain_to_suspend_ms() + cost.model_residency_ms;
+        assert!(old <= 20);
+        // New: the same stream against the same 20 ms budget is refused.
+        assert!(admit_realtime(cost, 20).is_err());
+        // And it still fits the real 200 ms contract.
+        assert!(admit_realtime(cost, REALTIME_ADMISSION_BUDGET_MS).is_ok());
+    }
+
+    #[test]
+    fn refusal_names_the_dominant_term() {
+        let err = admit_realtime(m3d_observed(), 20).unwrap_err();
+        assert!(err.contains("dominant term is prefill"), "got: {err}");
+        assert!(err.contains("71 chunks x 1 ms"), "got: {err}");
+    }
+
+    #[test]
+    fn a_long_park_can_dominate_instead() {
+        let cost = RealtimeAdmissionCost {
+            max_module_wcet_ms: 5,
+            park_cost_ms: 400,
+            prefill_chunks: 2,
+            per_chunk_ms: 3,
+            ..Default::default()
+        };
+        let err = admit_realtime(cost, REALTIME_ADMISSION_BUDGET_MS).unwrap_err();
+        assert!(
+            err.contains("dominant term is drain_to_suspend"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn prefill_grows_with_context_which_is_why_it_must_be_a_term() {
+        let short = prefill_chunks_for(512, 256);
+        let long = prefill_chunks_for(32_768, 256);
+        assert_eq!(short, 2);
+        assert_eq!(long, 128);
+        let mut cost = m3d_observed();
+        cost.prefill_chunks = long;
+        cost.per_chunk_ms = 4;
+        // 128 chunks x 4 ms = 512 ms: blows the 200 ms contract outright.
+        assert!(admit_realtime(cost, REALTIME_ADMISSION_BUDGET_MS).is_err());
+    }
+
+    #[test]
+    fn chunking_is_the_lever_the_per_chunk_pricing_exposes() {
+        // Same 8192-token prompt, two chunk sizes, same per-token throughput.
+        // Larger chunks = fewer, longer chunks; the admission cost is the same
+        // total but the INDIVISIBLE unit differs, which is what admission cares
+        // about. Pricing per token would make these identical and hide it.
+        assert_eq!(prefill_chunks_for(8192, 512), 16);
+        assert_eq!(prefill_chunks_for(8192, 2048), 4);
+    }
+
+    #[test]
+    fn unchunked_prefill_counts_as_one_indivisible_chunk() {
+        assert_eq!(prefill_chunks_for(4096, 0), 1);
+        assert_eq!(prefill_chunks_for(0, 512), 0);
+    }
+
+    #[test]
+    fn zero_cost_admits() {
+        assert!(admit_realtime(RealtimeAdmissionCost::default(), 0).is_ok());
     }
 }
