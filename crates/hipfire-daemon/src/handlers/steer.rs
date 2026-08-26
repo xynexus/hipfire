@@ -12,6 +12,23 @@
 // keeps that dependency in one place instead of re-deriving it per module.
 use crate::*;
 
+/// §M1d: the session a steer op applies to.
+///
+/// `"session"` absent — every caller today — yields the UNSCOPED key, which is
+/// where the process-wide session lives and is exactly the previous behaviour.
+/// Naming a session scopes the op to that stream instead, and the forward path
+/// resolves it per quantum via `hipfire_steer::effective_key`, falling back to
+/// the unscoped session for streams that have none.
+///
+/// Additive on purpose: this is what lets steering stop being process-global
+/// without breaking the callers that rely on it being process-global.
+fn steer_key(msg: &serde_json::Value) -> hipfire_steer::SteerKey {
+    match msg.get("session").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => hipfire_steer::SteerKey::session(id),
+        _ => hipfire_steer::SteerKey::default(),
+    }
+}
+
 pub(crate) fn begin_capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let num_layers = msg
         .get("num_layers")
@@ -27,7 +44,7 @@ pub(crate) fn begin_capture(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .error("steer_begin_capture: missing 'num_layers'/'hidden'".to_string());
         return;
     };
-    hipfire_steer::begin_capture(num_layers, hidden);
+    hipfire_steer::begin_capture_for(&steer_key(msg), num_layers, hidden);
     daemon_state
         .out
         .emit(serde_json::json!({ "type": "steer_ok" }));
@@ -108,7 +125,7 @@ pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     };
     match result {
         Ok(()) => {
-            hipfire_steer::commit_capture();
+            hipfire_steer::commit_capture_for(&steer_key(msg));
             daemon_state
                 .out
                 .emit(serde_json::json!({ "type": "steer_ok" }));
@@ -157,26 +174,34 @@ pub(crate) fn begin_apply(daemon_state: &mut DaemonState, msg: &serde_json::Valu
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(directions.len());
-    hipfire_steer::begin_apply(hipfire_steer::SteerSpec {
-        directions,
-        mode,
-        strength,
-        layer_range: layer_start..layer_end,
-    });
+    hipfire_steer::begin_apply_for(
+        &steer_key(msg),
+        hipfire_steer::SteerSpec {
+            directions,
+            mode,
+            strength,
+            layer_range: layer_start..layer_end,
+        },
+    );
     daemon_state
         .out
         .emit(serde_json::json!({ "type": "steer_ok" }));
 }
 
-pub(crate) fn clear(daemon_state: &mut DaemonState) {
-    hipfire_steer::clear();
+pub(crate) fn clear(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
+    // Scoped like its begin/apply siblings. Without `msg` this cleared only the
+    // unscoped session, so a stream's own steering could never be cleared.
+    hipfire_steer::clear_for(&steer_key(msg));
     daemon_state
         .out
         .emit(serde_json::json!({ "type": "steer_ok" }));
 }
 
-pub(crate) fn finish_capture(daemon_state: &mut DaemonState) {
-    match hipfire_steer::finish_capture() {
+pub(crate) fn finish_capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
+    // Must resolve the SAME key `begin_capture` used, or a scoped capture is
+    // begun and then unreachable — the bug this signature change exists to
+    // prevent, not a tidy-up.
+    match hipfire_steer::finish_capture_for(&steer_key(msg)) {
         Some(means) => {
             let resp = serde_json::json!({
                 "type": "steer_captured",

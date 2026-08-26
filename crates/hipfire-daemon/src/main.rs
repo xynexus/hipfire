@@ -1416,6 +1416,25 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
             Retired,
         }
 
+        // §M1d: scope this quantum to the stream's own steer session.
+        //
+        // One executor thread serves every stream, so without this the forward's
+        // `maybe_steer_block` hooks resolve against an unset `CURRENT_KEY` and
+        // every stream shares one process-wide session — which is what
+        // `handlers/steer.rs` means by "two steer ops must never interleave", a
+        // rule the executor removes the ability to honour.
+        //
+        // Per QUANTUM, and dropped at the end of it: the guard is `!Send` and
+        // restores the previous key on drop, so it cannot leak into whichever
+        // stream this thread marches next.
+        //
+        // A stream with no session of its own falls back to the unscoped one
+        // (`hipfire_steer::effective_key`), so a process-wide steer op keeps
+        // applying exactly as before.
+        let _steer_scope = hipfire_steer::SteerKeyGuard::install(hipfire_steer::SteerKey::session(
+            session.clone(),
+        ));
+
         let outcome = match daemon_state.model.as_mut() {
             None => Outcome::Retired,
             Some(m) => {
@@ -1949,7 +1968,9 @@ fn main() {
             // End the capture session and return the per-block means as a
             // num_layers × hidden f32 matrix (the client derives directions from
             // the +/- means it collected).
-            DaemonRequest::SteerFinishCapture => handlers::steer::finish_capture(&mut daemon_state),
+            DaemonRequest::SteerFinishCapture => {
+                handlers::steer::finish_capture(&mut daemon_state, &msg)
+            }
 
             // Begin an apply session: steer (additive) or ablate (projective) each
             // block in [layer_start, layer_end) along the per-block `directions`.
@@ -1958,7 +1979,7 @@ fn main() {
             }
 
             // Tear down any active steer session (back to the base model).
-            DaemonRequest::SteerClear => handlers::steer::clear(&mut daemon_state),
+            DaemonRequest::SteerClear => handlers::steer::clear(&mut daemon_state, &msg),
 
             // ── H-Neurons intervention gain (arXiv 2512.01797) ──────────────
             // Set a process-global per-neuron activation gain on the resident

@@ -255,6 +255,37 @@ fn with_current_key<R>(f: impl FnOnce(&SteerKey) -> R) -> R {
     })
 }
 
+/// The key whose session actually applies to this thread's forward.
+///
+/// This thread's own key when it HAS a session; otherwise the default key.
+///
+/// The fallback is what makes per-stream steering additive rather than a
+/// breaking change. Every steer op registers under the default key unless a
+/// request names a session, and the forward path had no key installed at all —
+/// so once the daemon started installing a per-stream `SteerKeyGuard`, a
+/// process-wide steer op would have stopped applying to every stream at once,
+/// silently. With the fallback the semantics are:
+///
+/// * a stream WITH its own session is steered by that session, and by nothing
+///   else — which is the per-stream isolation §M1d is for;
+/// * a stream WITHOUT one falls back to the process-wide session, i.e. exactly
+///   today's behaviour.
+///
+/// Costs one extra map lookup, and only while someone is steering: every hot
+/// path checks the global `ACTIVE` gate first and returns before reaching here.
+fn effective_key() -> SteerKey {
+    let own = current_key();
+    // ACTIVE, not merely present. `clear_for` leaves an `Inactive` entry behind,
+    // so "this key has a map entry" is true for a stream that has explicitly
+    // cleared its steering — which must still fall back, not resolve to a
+    // session that does nothing.
+    if own != SteerKey::default() && is_active_for(&own) {
+        own
+    } else {
+        SteerKey::default()
+    }
+}
+
 /// This thread's current steering session.
 pub fn current_key() -> SteerKey {
     with_current_key(|k| k.clone())
@@ -659,7 +690,7 @@ pub fn current_is_active() -> bool {
     if !is_active() {
         return false;
     }
-    with_current_key(is_active_for)
+    is_active_for(&effective_key())
 }
 
 // ── Direction derivation ────────────────────────────────────────────────────
@@ -704,7 +735,7 @@ pub fn maybe_steer_block(gpu: &mut Gpu, x: &GpuTensor, layer_idx: usize) -> HipR
     if !is_active() {
         return Ok(());
     }
-    with_current_key(|key| maybe_steer_block_for(key, gpu, x, layer_idx))
+    maybe_steer_block_for(&effective_key(), gpu, x, layer_idx)
 }
 
 /// [`maybe_steer_block`] against a specific session — the per-stream hook.
@@ -757,9 +788,14 @@ pub fn maybe_steer_block_batched(
     if !is_active() {
         return Ok(());
     }
-    with_current_key(|key| {
-        maybe_steer_block_batched_for(key, gpu, x_batch, layer_idx, num_positions, hidden)
-    })
+    maybe_steer_block_batched_for(
+        &effective_key(),
+        gpu,
+        x_batch,
+        layer_idx,
+        num_positions,
+        hidden,
+    )
 }
 
 /// [`maybe_steer_block_batched`] against a specific session.
@@ -1581,5 +1617,45 @@ mod tests {
         acc.commit();
         let m = acc.means();
         assert_eq!(m.0[0], vec![3.0, 6.0]);
+    }
+    /// §M1d: a stream with its own session is steered by THAT session, and a
+    /// stream without one falls back to the process-wide session.
+    ///
+    /// The fallback half is what makes per-stream steering additive. Every steer
+    /// op registers under the default key unless a request names a session, and
+    /// until now the forward path installed no key at all — so the moment the
+    /// daemon began installing a per-stream guard, a process-wide steer op would
+    /// have stopped applying to every stream at once, silently.
+    #[test]
+    fn effective_key_prefers_the_streams_own_session_and_falls_back() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for(&SteerKey::default());
+        let mine = SteerKey::session("stream-a");
+        clear_for(&mine);
+
+        // No key installed at all: the unscoped session, as before.
+        assert_eq!(effective_key(), SteerKey::default());
+
+        // A key installed but with NO session of its own must fall back, or a
+        // process-wide steer op silently stops applying to it.
+        let guard = SteerKeyGuard::install(mine.clone());
+        assert_eq!(
+            effective_key(),
+            SteerKey::default(),
+            "a stream with no session of its own must fall back to the unscoped one"
+        );
+
+        // Once that stream HAS a session, it is the one that applies.
+        begin_capture_for(&mine, 1, 4);
+        assert_eq!(
+            effective_key(),
+            mine,
+            "a stream with its own session must not be resolved to the unscoped one"
+        );
+
+        drop(guard);
+        // Off that stream's thread scope, resolution is unscoped again.
+        assert_eq!(effective_key(), SteerKey::default());
+        clear_for(&mine);
     }
 }
