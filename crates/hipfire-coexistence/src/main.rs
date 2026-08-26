@@ -108,8 +108,9 @@ fn usage() {
          [--dest <dir>] [--output <archive.hfa>] [--force] [--raw] [--jobs <n>]\n\
          \x20            default: streams into ~/.hipfire/models/models--Org--Name.hfa,\n\
          \x20            encoding as it downloads so the raw checkpoint is never staged.\n\
-         \x20            --raw fetches a HuggingFace cache tree instead; --jobs (default 4,\n\
-         \x20            raw only) downloads that many whole files concurrently.\n\
+         \x20            --raw fetches a HuggingFace cache tree instead. --jobs (default 4)\n\
+         \x20            opens that many connections: whole files in raw mode, ranged\n\
+         \x20            windows within each file in archive mode.\n\
          hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
          [--only <glob>]\n\
          hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
@@ -620,8 +621,8 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     // Verify and repair read every byte they cover, so restricting them to one
     // shard is the difference between seconds and hashing the whole repo.
     let only = val("--only");
-    // Raw mode only: whole files in parallel. Archive mode is a single ordered
-    // append stream, so it stays one connection.
+    // Parallel connections: whole files in raw mode, ranged windows within a
+    // file in archive mode (drained in order, so the stream stays sequential).
     let jobs = val("--jobs")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4);
@@ -655,6 +656,7 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     &revision,
                     include.as_deref(),
                     files,
+                    jobs,
                 )
                 .await?;
                 eprintln!("hub: wrote {}", archive.display());

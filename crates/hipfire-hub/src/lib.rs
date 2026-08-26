@@ -479,6 +479,116 @@ pub async fn fetch_file_streamed(
     Ok(())
 }
 
+/// Window size for ranged parallel fetch. Small enough that the in-order
+/// drain advances every few seconds on a slow link (a 32 MiB window at the
+/// ~1.3 MB/s this link bottoms out at would trip the archiver's 10 s stall
+/// detector on every window); large enough that request setup is noise.
+const RANGE_WINDOW: u64 = 8 << 20;
+/// Below this a file takes the single stream: connection setup dominates and
+/// the windows would mostly be the whole file anyway.
+const RANGE_MIN_FILE: u64 = 64 << 20;
+
+/// [`fetch_file_streamed`] over `jobs` parallel range connections.
+///
+/// The file is cut into fixed windows from the resume point; up to `jobs`
+/// windows download concurrently, and `buffered` yields them strictly in
+/// order, so the sink and the running digest see exactly the byte sequence a
+/// single stream would deliver. Memory is bounded at ~`jobs` windows.
+///
+/// Falls back to the single stream when parallelism cannot help or cannot be
+/// verified: one connection requested, no declared size, no SHA-256 (the git
+/// blob path buffers the body anyway), or a server that refuses ranges on the
+/// first window.
+pub async fn fetch_file_streamed_ranged(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    file: &RepoFile,
+    st: &mut StreamProgress,
+    sink: &mut dyn ByteSink,
+    jobs: usize,
+) -> Result<()> {
+    if jobs <= 1 || file.size < RANGE_MIN_FILE || file.sha256.is_none() || st.consumed >= file.size
+    {
+        return fetch_file_streamed(base, repo, revision, file, st, sink).await;
+    }
+
+    use futures_util::StreamExt;
+    let path = file.path.as_str();
+    let windows = (st.consumed..file.size)
+        .step_by(RANGE_WINDOW as usize)
+        .map(|from| (from, RANGE_WINDOW.min(file.size - from)));
+    let mut bodies = futures_util::stream::iter(
+        windows.map(|(from, len)| fetch_window_with_retry(base, repo, revision, path, from, len)),
+    )
+    .buffered(jobs.min(16));
+
+    let mut first = true;
+    let mut fall_back = false;
+    while let Some(r) = bodies.next().await {
+        match r {
+            Ok(body) => {
+                sink.chunk(&body)?;
+                st.accept(&body);
+                first = false;
+            }
+            // A Fatal on the very first window before any byte landed is the
+            // range-refusing-server case fetch_range surfaces; the single
+            // stream handles that server. Any later error is real.
+            Err(Error::Fatal(_)) if first => {
+                fall_back = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    drop(bodies);
+    if fall_back {
+        return fetch_file_streamed(base, repo, revision, file, st, sink).await;
+    }
+
+    let got = hex(&st.sha.clone().finalize());
+    let want = file.sha256.as_deref().expect("checked above");
+    if got != want {
+        return Err(Error::Digest {
+            path: file.path.clone(),
+            want: want.to_string(),
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Per-window retry: transient failures cost one window, not the file. A
+/// window that still fails surfaces as Retryable so the caller's whole-file
+/// retry loop resumes from the in-order high-water mark.
+async fn fetch_window_with_retry(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    path: &str,
+    from: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    const ATTEMPTS: u32 = 8;
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        match fetch_range(base, repo, revision, path, from, len).await {
+            Err(Error::Retryable(m)) => {
+                last = Some(m);
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+            other => return other,
+        }
+    }
+    Err(Error::Retryable(format!(
+        "{path}: window at {from} failed {ATTEMPTS} attempts ({})",
+        last.unwrap_or_default()
+    )))
+}
+
 /// Fetch one byte range of a file.
 ///
 /// The building block for chunk repair: a damaged window costs its own bytes

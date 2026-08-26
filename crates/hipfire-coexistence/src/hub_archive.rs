@@ -580,6 +580,7 @@ pub async fn fetch_to_archive(
     revision: &str,
     include: Option<&str>,
     files: Vec<RepoFile>,
+    jobs: usize,
 ) -> Result<u64, Box<dyn Error>> {
     let mut files = files;
     if let Some(pat) = include {
@@ -607,6 +608,7 @@ pub async fn fetch_to_archive(
             f,
             &mut st,
             &mut packer,
+            jobs,
         )
         .await
         {

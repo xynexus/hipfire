@@ -408,6 +408,7 @@ pub async fn fetch_file_streamed_with_retry(
     f: &RepoFile,
     st: &mut crate::StreamProgress,
     sink: &mut dyn crate::ByteSink,
+    jobs: usize,
 ) -> Result<()> {
     const MAX_STALLED: u32 = 5;
     const MAX_ATTEMPTS: u32 = 200;
@@ -416,7 +417,8 @@ pub async fn fetch_file_streamed_with_retry(
     let mut delay = std::time::Duration::from_secs(1);
     for attempt in 1..=MAX_ATTEMPTS {
         let before = st.consumed();
-        match crate::fetch_file_streamed(crate::HUB, repo, revision, f, st, sink).await {
+        match crate::fetch_file_streamed_ranged(crate::HUB, repo, revision, f, st, sink, jobs).await
+        {
             Ok(()) => return Ok(()),
             Err(Error::Retryable(m)) => {
                 let after = st.consumed();
