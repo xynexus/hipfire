@@ -297,6 +297,19 @@ cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-quantize \
 # hipfire-monitor: standalone terminal hardware telemetry view
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-monitor --root "$HIPFIRE_DIR"
 
+# hipfire-coexistence: import/export, format conversion and hub fetch/repair.
+# AGENTS.md keeps this OUT of the inference binaries, so it is its own crate and
+# needs its own install line.
+#
+# ⚠️ This list must stay in sync with the Makefile's DEV_BINS. `make link`
+# symlinks 8 binaries into $HIPFIRE_DIR/bin; `cargo install --root` writes REAL
+# FILES to the same directory, so `make link && make install` REPLACES the
+# symlink set with whatever this script installs. Omitting a binary here does
+# not just skip it — it deletes the working symlink `make link` created and
+# leaves ~/.local/bin/<bin> dangling, with no error. That is how
+# hipfire-coexistence went missing.
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-coexistence --root "$HIPFIRE_DIR"
+
 # hipfire-priv-helper: narrow helper used by `hipfire doctor --fix` for
 # explicitly-approved privileged repairs. Installed non-SUID by default.
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-priv-helper --root "$HIPFIRE_DIR"
