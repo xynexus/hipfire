@@ -500,9 +500,9 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             .and_then(|v| v.as_str())
             .map(String::from)
         else {
-            daemon_state
-                .out
-                .error("train_lora: 'model' (fp32 base model dir) required".to_string());
+            daemon_state.out.error(
+                "train_lora: 'model' (safetensors dir or .hfq artifact) required".to_string(),
+            );
             return;
         };
         let getu = |k: &str, d: usize| -> usize {
@@ -545,12 +545,26 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
         );
         let _ = daemon_state.out.sink.flush();
         let built: Result<LoraTrainSession, String> = (|| {
-            let dir = std::path::Path::new(&base_dir);
-            if !dir.exists() {
-                return Err(format!("base model dir not found: {base_dir}"));
+            let base = std::path::Path::new(&base_dir);
+            if !base.exists() {
+                return Err(format!("base model not found: {base_dir}"));
             }
-            let (cfg, weights) = hipfire_train::loader::load_llama_fp32(&mut daemon_state.gpu, dir)
-                .map_err(|e| e.to_string())?;
+            // A `.hfq` artifact is accepted as well as a safetensors directory.
+            // `loader::load_llama_fp32_hfq` exists precisely because the HF
+            // snapshots on these boxes ship Meta `.pth` and no safetensors
+            // shards, so `.hfq` is the only large base actually on disk; without
+            // this arm the daemon could not train on one at all. Weights widen
+            // to f32 on load, which is exact for a bf16/f16 source.
+            let (cfg, weights) = if base.extension().is_some_and(|e| e == "hfq") {
+                hipfire_train::loader::load_llama_fp32_hfq(&mut daemon_state.gpu, base)
+            } else if base.is_dir() {
+                hipfire_train::loader::load_llama_fp32(&mut daemon_state.gpu, base)
+            } else {
+                return Err(format!(
+                    "base model must be a safetensors directory or a .hfq artifact: {base_dir}"
+                ));
+            }
+            .map_err(|e| e.to_string())?;
             let vocab = cfg.vocab_size;
             let model = hipfire_train::model::LlamaModel::from_f32_weights(
                 &mut daemon_state.gpu,
