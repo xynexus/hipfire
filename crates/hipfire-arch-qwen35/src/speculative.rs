@@ -7811,7 +7811,19 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    // b == 1 needs NO snapshot: rows_to_keep = accept_len + 1 = 1 = b, so
+    // `verify_complete_rollback` is true and `restore_to` is never reached.
+    // Skipping it is exact, not an approximation.
+    //
+    // Worth ~4.3 ms/token, most of the b=1 gap against a plain AR step (21.35
+    // vs 15.82 ms). Only ~0.7 ms of that is GPU: rocprofv3 shows 3 copies per
+    // LA layer (gx=10240 / 6144 / 512) x 30 layers = 90 BLOCKING memcpy_dtod
+    // per cycle, and it is their HOST round-trip -- invisible to every GPU
+    // counter -- that dominates. That is why b1 wall (169 ms) so exceeded b1
+    // GPU busy (109.84 ms) while AR sat at 94.28 / 122.
+    if b > 1 {
+        target_snap.save_from(&target.dn_state, gpu)?;
+    }
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
