@@ -100,7 +100,7 @@ pub fn embed_batch_embeddinggemma(
                             "embeddinggemma resident NPU encode failed ({error}); no GPU fallback is loaded"
                         ));
                     }
-                    Err(error) => eprintln!(
+                    Err(error) => tracing::warn!(
                         "embeddinggemma resident NPU encode failed ({error}); retrying on GPU"
                     ),
                 }
@@ -112,7 +112,9 @@ pub fn embed_batch_embeddinggemma(
                 );
             }
             Err(_) => {
-                eprintln!("embeddinggemma resident NPU state is poisoned; retrying encode on GPU")
+                tracing::warn!(
+                    "embeddinggemma resident NPU state is poisoned; retrying encode on GPU"
+                )
             }
         }
     }

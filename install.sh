@@ -365,6 +365,22 @@ if [ -x "$BIN_DIR/hipfire-daemon" ]; then
         || echo "  Pre-compile finished with warnings — missing kernels will JIT on first use."
 fi
 
+# ─── systemd user unit ───────────────────────────────────
+# Installed but not enabled: `systemctl --user enable --now hipfire` opts in.
+SYSTEMD_TEMPLATE="$REPO_DIR/packaging/systemd/hipfire.service.in"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+if command -v systemctl >/dev/null 2>&1 && [ -f "$SYSTEMD_TEMPLATE" ]; then
+    mkdir -p "$SYSTEMD_USER_DIR"
+    HIPFIRE_BIN_ESCAPED=$(printf '%s' "$BIN_DIR/hipfire" | sed 's/[&|\]/\\&/g')
+    sed "s|@HIPFIRE_BIN@|$HIPFIRE_BIN_ESCAPED|g" \
+        "$SYSTEMD_TEMPLATE" >"$SYSTEMD_USER_DIR/hipfire.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo ""
+    echo "Installed systemd user unit: $SYSTEMD_USER_DIR/hipfire.service"
+    echo "  Start at login:  systemctl --user enable --now hipfire"
+    echo "  Run when logged out too:  loginctl enable-linger $USER"
+fi
+
 # ─── Config ──────────────────────────────────────────────
 CONFIG="$HIPFIRE_DIR/config.json"
 if [ ! -f "$CONFIG" ]; then
@@ -411,6 +427,7 @@ echo "Quick start:"
 echo "  hipfire list                        # see local models"
 echo "  hipfire run <model> \"Hello\"         # generate text"
 echo "  hipfire serve                       # start OpenAI-compatible API"
+echo "  systemctl --user enable --now hipfire   # or run it as a service"
 echo "  hipfire                             # open terminal operator UI"
 echo "  hipfire-monitor                     # open standalone system monitor"
 echo ""

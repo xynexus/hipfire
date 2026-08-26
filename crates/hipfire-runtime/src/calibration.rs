@@ -72,8 +72,8 @@ pub fn calib_sequences<'a>(inputs: &[&'a [u32]]) -> Vec<&'a [u32]> {
         .flat_map(|s| s.chunks(seq_len).filter(|c| c.len() >= 2))
         .collect();
     if seqs.len() > inputs.len() {
-        eprintln!(
-            "  calib: {n_in} tokens as {} independent sequences of <= {seq_len} \
+        tracing::info!(
+            "{n_in} tokens as {} independent sequences of <= {seq_len} \
              (was {})",
             seqs.len(),
             inputs.len()
@@ -99,8 +99,8 @@ pub fn reject_eval_corpus(corpus: &str) -> Result<(), String> {
     let is_eval = corpus.contains("quality-baselines");
     if !is_eval || hipfire_env::CALIB_ALLOW_EVAL_CORPUS.get().is_some() {
         if is_eval {
-            eprintln!(
-                "  calib: WARNING calibrating on the EVAL slice {corpus} \
+            tracing::warn!(
+                "calibrating on the EVAL slice {corpus} \
                  (HIPFIRE_CALIB_ALLOW_EVAL_CORPUS set) — results are train-on-test"
             );
         }
@@ -138,7 +138,7 @@ fn effective_imatrix_only(arch_default: Vec<String>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    eprintln!("  calib: imatrix-only override active: {list:?} (was {arch_default:?})");
+    tracing::info!("imatrix-only override active: {list:?} (was {arch_default:?})");
     list
 }
 
@@ -920,7 +920,7 @@ impl CalibCollector {
         })?;
 
         if audit_n.get() > 0 {
-            eprintln!(
+            tracing::debug!(
                 "F64 AUDIT: max f32-vs-f64 Σxxᵀ rel-diff = {:.3e} over {} Hessians (worst: {})",
                 audit_max.get(),
                 audit_n.get(),

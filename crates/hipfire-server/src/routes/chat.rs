@@ -235,8 +235,8 @@ fn load_params_for_model_config(
     // something silently paid for in KV.
     let min_viable = resolved.max_tokens.saturating_add(1024);
     if params.max_seq < min_viable {
-        eprintln!(
-            "  NOTE: max_tokens={} would need {min_viable} context but max_seq={} — \
+        tracing::warn!(
+            "max_tokens={} would need {min_viable} context but max_seq={} — \
              honouring max_seq. Requests generating past {} tokens will be truncated; \
              raise --max-seq if you need the longer budget.",
             resolved.max_tokens,

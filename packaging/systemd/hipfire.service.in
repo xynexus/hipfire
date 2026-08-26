@@ -1,0 +1,16 @@
+# hipfire systemd user unit. Rendered by install.sh with the installed binary
+# path and placed in ~/.config/systemd/user/hipfire.service.
+[Unit]
+Description=hipfire OpenAI-compatible inference server
+Documentation=man:hipfire-serve(1)
+
+[Service]
+# Bare `hipfire` detects the journald stream and serves in the foreground;
+# host/port/model overrides belong in ~/.hipfire/config.json, not here.
+# If you redirect StandardError away from the journal, use `... serve` explicitly.
+ExecStart=@HIPFIRE_BIN@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

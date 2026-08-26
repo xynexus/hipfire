@@ -250,15 +250,15 @@ pub fn lfm2_semantic_boundary_checkpoints(
     }
     let candidates = lfm2_prefix_hash_candidates_for_tokens(m, session, full_tokens)?;
     if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
-        eprintln!(
-            "[daemon] lfm2 prefix boundary candidates session={} tokens={} candidates={}",
+        tracing::debug!(
+            "lfm2 prefix boundary candidates session={} tokens={} candidates={}",
             session.id,
             full_tokens.len(),
             candidates.len()
         );
         for candidate in &candidates {
-            eprintln!(
-                "[daemon] lfm2 prefix boundary candidate session={} boundary={} index={} len={} hash={}",
+            tracing::debug!(
+                "lfm2 prefix boundary candidate session={} boundary={} index={} len={} hash={}",
                 session.id,
                 candidate.boundary,
                 candidate.boundary_index,

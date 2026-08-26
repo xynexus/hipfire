@@ -137,7 +137,7 @@ pub fn generate_mtp(
         match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
-                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
+                tracing::warn!("jinja render failed in mtp path ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
@@ -575,9 +575,7 @@ pub fn generate_dflash(
         match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
-                eprintln!(
-                    "[daemon] jinja render failed in dflash path ({e}) — falling back to Plain"
-                );
+                tracing::warn!("jinja render failed in dflash path ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
@@ -740,7 +738,7 @@ pub fn generate_dflash(
         prompt_tokens.len(),
         prompt_tokens.len(),
     ) {
-        eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        tracing::warn!("scatter failed: {e} — falling back to per-cycle upload");
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     df.draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
@@ -809,9 +807,11 @@ pub fn generate_dflash(
     if let Some(ref ev) = m.eviction {
         if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
             let pre_phys = position;
-            eprintln!(
-                "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                pre_phys, res.new_physical, target.kv_cache.compact_offset,
+            tracing::debug!(
+                "post-prefill evict: {} -> {} (compact_offset={})",
+                pre_phys,
+                res.new_physical,
+                target.kv_cache.compact_offset,
             );
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
@@ -881,8 +881,8 @@ pub fn generate_dflash(
         Some(s) if s == "phase2" => Some("phase2"),
         Some(s) => {
             if df.ddtree.is_some() {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_PATH_C={:?} is not 'phase1' or 'phase2'. \
+                tracing::warn!(
+                    "HIPFIRE_DDTREE_PATH_C={:?} is not 'phase1' or 'phase2'. \
                      Falling back to spec_step_ddtree_batched.",
                     s
                 );
@@ -1216,9 +1216,10 @@ pub fn generate_multi(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     if m.active.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
-        eprintln!(
-            "[daemon] context full ({}/{}) — resetting conversation",
-            m.active.cursor.seq_pos, m.max_seq
+        tracing::warn!(
+            "context full ({}/{}) — resetting conversation",
+            m.active.cursor.seq_pos,
+            m.max_seq
         );
         m.active.cursor.seq_pos = 0;
         m.active.cursor.conversation_tokens.clear();
@@ -1387,7 +1388,7 @@ pub fn generate_multi(
         match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
-                eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
+                tracing::warn!("jinja render failed in pp path ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
                     system: if m.active.cursor.seq_pos == 0 {
@@ -1648,7 +1649,7 @@ pub fn generate_multi(
                         dn,
                         scratch_set,
                     ) {
-                        eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
+                        tracing::error!("max_think close forward_scratch_multi: {}", e);
                         break;
                     }
                     m.active.cursor.seq_pos += 1;
@@ -1775,7 +1776,7 @@ pub fn generate_multi(
                         dn,
                         scratch_set,
                     ) {
-                        eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
+                        tracing::error!("budget_alert forward_scratch_multi: {}", e);
                         break;
                     }
                     m.active.cursor.seq_pos += 1;
@@ -1846,7 +1847,7 @@ pub fn generate_multi(
                 dn,
                 scratch_set,
             ) {
-                eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
+                tracing::error!("trailer forward_scratch_multi: {}", e);
                 break;
             }
             m.active.cursor.seq_pos += 1;
@@ -3832,8 +3833,8 @@ pub fn generate_start(
     if m.dflash.is_some() && kvarn_active {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
-            eprintln!(
-                "  WARNING: a DFlash drafter is loaded but KVarN is active, so decode is \
+            tracing::warn!(
+                "a DFlash drafter is loaded but KVarN is active, so decode is \
                  running PLAIN AR. Any tok/s measured here is NOT a DFlash number. Set \
                  HIPFIRE_KVARN_BATCHED_PREFILL=1 to route KVarN through the batched \
                  forward and actually engage the drafter (measured coherent; see \
@@ -3972,9 +3973,10 @@ pub fn generate_start(
         && m.eviction.is_none()
         && current_seq_pos + prompt_est + max_tokens > m.max_seq
     {
-        eprintln!(
-            "[daemon] context full ({}/{}) — resetting conversation",
-            current_seq_pos, m.max_seq
+        tracing::warn!(
+            "context full ({}/{}) — resetting conversation",
+            current_seq_pos,
+            m.max_seq
         );
         if let Some(session) = q35_session.as_mut() {
             session.reset(gpu);
@@ -4053,8 +4055,8 @@ pub fn generate_start(
     // PRD §3.1 lists alpha as a required done-object field.
     let pflash_alpha: Option<f32> = pflash_cfg.map(|c| c.alpha);
     if std::env::var("HIPFIRE_PFLASH_DEBUG").is_ok() {
-        eprintln!(
-            "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
+        tracing::debug!(
+            "gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
             pflash_state.is_some(),
             q35_session
                 .as_ref()
@@ -4085,9 +4087,11 @@ pub fn generate_start(
             gpu.bind_thread_or_warn();
             match decision {
                 Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
-                    eprintln!(
-                        "[pflash] COMPRESSED {} -> {} tok dev1 ({}ms)",
-                        cp.source_tokens, cp.kept_tokens, cp.timings.total_ms
+                    tracing::debug!(
+                        "COMPRESSED {} -> {} tok dev1 ({}ms)",
+                        cp.source_tokens,
+                        cp.kept_tokens,
+                        cp.timings.total_ms
                     );
                     let _ = writeln!(
                         stdout,
@@ -4109,11 +4113,7 @@ pub fn generate_start(
                     token_ids
                 }
                 Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
-                    eprintln!(
-                        "[pflash] BYPASS reason={} q={}",
-                        reason.as_str(),
-                        raw_q_tokens.len()
-                    );
+                    tracing::debug!("BYPASS reason={} q={}", reason.as_str(), raw_q_tokens.len());
                     // Only emit bypass events for non-trivial reasons.
                     // ModeOff is the silent default; nothing to report.
                     if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
@@ -4133,7 +4133,7 @@ pub fn generate_start(
                     raw_q_tokens
                 }
                 Err(e) => {
-                    eprintln!("[pflash] ERROR compress: {e}");
+                    tracing::warn!("pflash compress failed: {e}");
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
@@ -4238,7 +4238,7 @@ pub fn generate_start(
         match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
-                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                tracing::warn!("jinja render failed ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,

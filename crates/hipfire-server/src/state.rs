@@ -332,16 +332,16 @@ impl AppState {
     /// the daemon still serves (slowly) rather than failing every request.
     pub fn resolve_diffusion_runtime_default(&self) {
         let resolved = if DiffusionGenerationRuntimeOptions::cpu_reference_requested() {
-            eprintln!(
-                "[hipfire] diffusion: HIPFIRE_DIFFUSION_CPU_REFERENCE set; using the CPU reference oracle"
+            tracing::info!(
+                "diffusion: HIPFIRE_DIFFUSION_CPU_REFERENCE set; using the CPU reference oracle"
             );
             DiffusionGenerationRuntimeOptions::cpu_reference()
         } else {
             match hipfire_runtime::multi_gpu::resolve_primary_device(None) {
                 Ok(device) => DiffusionGenerationRuntimeOptions::rocm_hybrid(device),
                 Err(error) => {
-                    eprintln!(
-                        "[hipfire] diffusion: no ROCm device resolved ({error}); falling back to \
+                    tracing::warn!(
+                        "diffusion: no ROCm device resolved ({error}); falling back to \
                          the slow CPU reference oracle. Set HIPFIRE_DIFFUSION_CPU_REFERENCE=1 to \
                          silence this warning."
                     );

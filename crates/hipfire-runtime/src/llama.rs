@@ -245,8 +245,8 @@ pub fn lmhead_project(
             if stale {
                 let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-                eprintln!(
-                    "[lmhead] two-stage active: coarse q{bits} tier built for [{vocab}, {hidden}], top-K={topk}"
+                tracing::info!(
+                    "two-stage active: coarse q{bits} tier built for [{vocab}, {hidden}], top-K={topk}"
                 );
                 LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
             }

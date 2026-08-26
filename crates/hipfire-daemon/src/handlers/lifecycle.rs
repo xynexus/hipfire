@@ -233,8 +233,8 @@ pub(crate) fn load(
         .filter(|s| !s.is_empty());
     let draft_path = if dflash_mode == "off" {
         if raw_draft.is_some() {
-            eprintln!(
-                "[hipfire-daemon] dflash_mode=off — skipping draft load ({})",
+            tracing::warn!(
+                "dflash_mode=off — skipping draft load ({})",
                 raw_draft.unwrap()
             );
         }
@@ -334,8 +334,8 @@ pub(crate) fn load(
     // when a draft is attached. User's context window + eviction
     // cadence still work; just the fold step is skipped.
     let cask_m_folding_effective = if cask_enabled && draft_path.is_some() {
-        eprintln!(
-            "[hipfire-daemon] cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
+        tracing::warn!(
+            "cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
         );
         false
     } else {
@@ -724,18 +724,16 @@ pub(crate) fn load(
                 Ok(Some(adapter)) => {
                     let (id, n) = (adapter.id.clone(), adapter.deltas.len());
                     match hipfire_steer::load_lora_adapter(&adapter) {
-                        Ok(()) => eprintln!(
-                            "[hipfire-daemon] auto-applied bundled LoRA '{id}' ({n} deltas, scale {:.2})",
+                        Ok(()) => tracing::info!(
+                            "auto-applied bundled LoRA '{id}' ({n} deltas, scale {:.2})",
                             adapter.scale
                         ),
-                        Err(e) => eprintln!(
-                            "[hipfire-daemon] bundled LoRA '{id}' load failed: {e}"
-                        ),
+                        Err(e) => tracing::warn!("bundled LoRA '{id}' load failed: {e}"),
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[hipfire-daemon] bundled LoRA probe failed: {e}")
+                    tracing::warn!("bundled LoRA probe failed: {e}")
                 }
             }
 
@@ -766,7 +764,7 @@ pub(crate) fn load(
                 if let Ok(secs) = secs_str.parse::<f32>() {
                     if secs > 0.0 {
                         if let Err(e) = daemon_state.gpu.dpm_warmup(secs) {
-                            eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
+                            tracing::warn!("dpm_warmup failed (non-fatal): {e:?}");
                         }
                     }
                 }
@@ -863,7 +861,7 @@ pub(crate) fn load(
                             pf_max_kv,
                         ) {
                             Ok(()) => {
-                                eprintln!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
+                                tracing::info!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
                                     pf_drafter_path, pflash_drafter_device, pflash_mode_str,
                                     pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
                                 let _ = writeln!(
@@ -882,7 +880,7 @@ pub(crate) fn load(
                                 // persist sibling across requests (None if shared)
                             }
                             Err(e) => {
-                                eprintln!("[pflash] LOAD FAILED: {}", e);
+                                tracing::error!("[pflash] LOAD FAILED: {}", e);
                                 let _ = writeln!(
                                     daemon_state.out.sink,
                                     r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
@@ -906,9 +904,7 @@ pub(crate) fn load(
                 .resource_reservations
                 .reacquire_placeholders(&mut daemon_state.gpu)
             {
-                eprintln!(
-                    "[hipfire-daemon] failed to restore resource reservations after load failure: {err}"
-                );
+                tracing::warn!("failed to restore resource reservations after load failure: {err}");
             }
             let (vram_free, vram_total) = daemon_state.gpu.hip.get_vram_info().unwrap_or((0, 0));
             let free_mb = vram_free / (1024 * 1024);
@@ -1160,7 +1156,7 @@ pub(crate) fn unload(daemon_state: &mut DaemonState) {
         .resource_reservations
         .reacquire_placeholders(&mut daemon_state.gpu)
     {
-        eprintln!("[hipfire-daemon] failed to restore resource reservations after unload: {err}");
+        tracing::warn!("failed to restore resource reservations after unload: {err}");
     }
     daemon_state.generic_state_arena.clear();
     daemon_state.dummy_model = None;
@@ -1209,9 +1205,7 @@ pub(crate) fn unload_worker(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .resource_reservations
             .reacquire_placeholders(&mut daemon_state.gpu)
         {
-            eprintln!(
-                "[hipfire-daemon] failed to restore resource reservations after worker unload: {err}"
-            );
+            tracing::warn!("failed to restore resource reservations after worker unload: {err}");
         }
     }
     let done = unload_worker_done_json(

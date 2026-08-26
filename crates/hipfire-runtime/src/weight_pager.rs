@@ -733,13 +733,13 @@ pub mod page_timing {
         let total: u64 = vals.iter().sum();
         if total == 0 {
             if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!("[pager-timing] no phase time recorded — is the paged path live?");
+                tracing::debug!("no phase time recorded — is the paged path live?");
             }
             return;
         }
         let pct = |v: u64| (v as f64) * 100.0 / (total as f64);
-        eprintln!(
-            "[pager-timing] admissions={n} last_set={experts_admitted} total={:.2}s | \
+        tracing::debug!(
+            "admissions={n} last_set={experts_admitted} total={:.2}s | \
              topk_readback {:.2}s ({:.1}%) | would_fit {:.2}s ({:.1}%) | \
              ensure_resident {:.2}s ({:.1}%) | patch_ptrs {:.2}s ({:.1}%)",
             total as f64 / 1e9,
@@ -1534,8 +1534,8 @@ impl WeightPager {
         );
         self.lru.push_back(id);
         if self.config.trace {
-            eprintln!(
-                "[weight_pager] cold-load {id:?} ({} bytes) — {} resident, {} bytes used",
+            tracing::debug!(
+                "cold-load {id:?} ({} bytes) — {} resident, {} bytes used",
                 range.len,
                 self.resident.len(),
                 self.vram_used_bytes
@@ -1644,8 +1644,8 @@ impl WeightPager {
         self.module_lru.push_back(key);
         self.module_stats.module_cold_loads = self.module_stats.module_cold_loads.saturating_add(1);
         if self.config.trace {
-            eprintln!(
-                "[weight_pager] cold-load module layer={} expert={} ({} bytes) — {} modules resident, {} bytes used",
+            tracing::debug!(
+                "cold-load module layer={} expert={} ({} bytes) — {} modules resident, {} bytes used",
                 key.layer,
                 key.expert,
                 need,
@@ -1852,8 +1852,8 @@ impl WeightPager {
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
                 if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] evict {id:?} ({} bytes) — {} resident, {} used",
+                    tracing::debug!(
+                        "evict {id:?} ({} bytes) — {} resident, {} used",
                         r.bytes,
                         self.resident.len(),
                         self.vram_used_bytes
@@ -1892,8 +1892,8 @@ impl WeightPager {
                 self.module_stats.module_evictions =
                     self.module_stats.module_evictions.saturating_add(1);
                 if self.config.trace {
-                    eprintln!(
-                        "[weight_pager] evict module layer={} expert={} ({} bytes) — {} modules resident, {} used",
+                    tracing::debug!(
+                        "evict module layer={} expert={} ({} bytes) — {} modules resident, {} used",
                         key.layer,
                         key.expert,
                         r.bytes,

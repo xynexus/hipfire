@@ -288,20 +288,22 @@ impl HierKvState {
             match std::env::var("HIPFIRE_KV_TRIATTN_SIDECAR") {
                 Ok(p) => match TriAttnCenters::load(std::path::Path::new(&p)) {
                     Ok(c) => {
-                        eprintln!(
-                            "[kv_hier] TriAttn importance: centers {}L x {}H (hd={}) from {p}",
-                            c.n_layers, c.n_heads, c.head_dim
+                        tracing::info!(
+                            "TriAttn importance: centers {}L x {}H (hd={}) from {p}",
+                            c.n_layers,
+                            c.n_heads,
+                            c.head_dim
                         );
                         Some(c)
                     }
                     Err(e) => {
-                        eprintln!("[kv_hier] TRIA sidecar load failed ({e}); using vnorm");
+                        tracing::warn!("TRIA sidecar load failed ({e}); using vnorm");
                         None
                     }
                 },
                 Err(_) => {
-                    eprintln!(
-                        "[kv_hier] ImportanceMode::TriAttn but HIPFIRE_KV_TRIATTN_SIDECAR unset; using vnorm"
+                    tracing::warn!(
+                        "ImportanceMode::TriAttn but HIPFIRE_KV_TRIATTN_SIDECAR unset; using vnorm"
                     );
                     None
                 }
@@ -350,7 +352,7 @@ impl HierKvState {
             Some("16") => 16,
             Some("8") | None => 8,
             Some(other) => {
-                eprintln!("[kv-hier] HIPFIRE_KV_HOT_BITS={other} invalid (want 8|16); using 8");
+                tracing::warn!("HIPFIRE_KV_HOT_BITS={other} invalid (want 8|16); using 8");
                 8
             }
         };
@@ -430,13 +432,13 @@ impl HierKvState {
                 if hot_q8 {
                     let f16_total = n_kv_layers * 2 * (n_kv_heads * hot_budget * head_dim * 2);
                     let saved = 100.0 * (1.0 - total as f64 / f16_total as f64);
-                    eprintln!(
-                        "[kv-hier] hot tier: int8, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); f16 baseline {:.1} MB → {saved:.0}% saved; ~{gb_1k:.0} GB at 1000 sessions",
+                    tracing::info!(
+                        "hot tier: int8, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); f16 baseline {:.1} MB → {saved:.0}% saved; ~{gb_1k:.0} GB at 1000 sessions",
                         f16_total as f64 / 1e6
                     );
                 } else {
-                    eprintln!(
-                        "[kv-hier] hot tier: f16, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); ~{gb_1k:.0} GB at 1000 sessions (HIPFIRE_KV_HOT_BITS=8 halves it)"
+                    tracing::info!(
+                        "hot tier: f16, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); ~{gb_1k:.0} GB at 1000 sessions (HIPFIRE_KV_HOT_BITS=8 halves it)"
                     );
                 }
             });

@@ -89,7 +89,7 @@ pub fn generate_vl(
     // over-budget request before vision_forward saves expensive GPU work.
     let (pixels, img_h, img_w) = match image_source {
         ImageSource::Path(path) => {
-            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+            tracing::debug!("preprocessing image: path: {}", path);
             match image::load_and_preprocess(
                 Path::new(path),
                 vision_config.patch_size,
@@ -118,10 +118,7 @@ pub fn generate_vl(
             } else {
                 b64
             };
-            eprintln!(
-                "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
-                raw_b64.len()
-            );
+            tracing::debug!("preprocessing image: <{}-byte buffer>", raw_b64.len());
             let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
                 Ok(b) => b,
                 Err(e) => {
@@ -146,7 +143,7 @@ pub fn generate_vl(
             }
         }
     };
-    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+    tracing::debug!("preprocessed: {}x{}", img_w, img_h);
 
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
@@ -164,9 +161,10 @@ pub fn generate_vl(
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
     if m.eviction.is_none() && m.active.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
-        eprintln!(
-            "[daemon/vl] context full ({}/{}) — resetting conversation",
-            m.active.cursor.seq_pos, m.max_seq
+        tracing::warn!(
+            "context full ({}/{}) — resetting conversation",
+            m.active.cursor.seq_pos,
+            m.max_seq
         );
         m.active.cursor.seq_pos = 0;
         m.active.cursor.conversation_tokens.clear();
@@ -698,7 +696,7 @@ pub fn generate_vl_dots_ocr(
     // 1. Preprocess image (CPU; no model borrow yet so error returns are clean).
     let img = match image_source {
         ImageSource::Path(path) => {
-            eprintln!("[dots-ocr] preprocessing image: {path}");
+            tracing::debug!("preprocessing image: {path}");
             dots_image::preprocess_image(Path::new(path))
         }
         ImageSource::Base64(b64) => {
@@ -713,8 +711,8 @@ pub fn generate_vl_dots_ocr(
                 },
                 None => &b64[..],
             };
-            eprintln!(
-                "[dots-ocr] preprocessing base64 image (<{}-byte payload>)",
+            tracing::debug!(
+                "preprocessing base64 image (<{}-byte payload>)",
                 raw_b64.len()
             );
             match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
@@ -739,9 +737,12 @@ pub fn generate_vl_dots_ocr(
     };
     let n_visual = img.n_visual_tokens();
     let n_patches = img.n_patches();
-    eprintln!(
-        "[dots-ocr] grid {}x{}, {} patches → {} visual tokens",
-        img.grid_h, img.grid_w, n_patches, n_visual
+    tracing::debug!(
+        "grid {}x{}, {} patches → {} visual tokens",
+        img.grid_h,
+        img.grid_w,
+        n_patches,
+        n_visual
     );
 
     let max_seq = m.max_seq;
@@ -1152,7 +1153,7 @@ pub fn generate_vl_gemma3(
                     continue;
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("[gemma3-vl] vision cache get failed: {e}"),
+                Err(e) => tracing::warn!("vision cache get failed: {e}"),
             }
         }
         // Miss (or cache disabled): encode through SigLIP + projector, then insert.
@@ -1166,16 +1167,17 @@ pub fn generate_vl_gemma3(
         if let (Some(c), Some(k)) = (cache.as_ref(), key.as_ref()) {
             let emb = hipfire_vision_cache::CachedEmbedding::new(mm, th, rows.clone());
             if let Err(e) = c.insert(k, &emb, vision_tier) {
-                eprintln!("[gemma3-vl] vision cache insert failed: {e}");
+                tracing::warn!("vision cache insert failed: {e}");
             }
         }
         img_embeds.extend_from_slice(&rows);
     }
     if let Some(c) = cache.as_ref() {
         let s = c.stats();
-        eprintln!(
-            "[gemma3-vl] vision cache: {hits}/{n_images} frame(s) hit (lifetime hits={}, misses={})",
-            s.hits, s.misses
+        tracing::debug!(
+            "vision cache: {hits}/{n_images} frame(s) hit (lifetime hits={}, misses={})",
+            s.hits,
+            s.misses
         );
     }
 
@@ -1244,7 +1246,7 @@ fn open_vision_cache() -> Option<hipfire_vision_cache::VisionCache> {
     match hipfire_vision_cache::VisionCache::open(&dir, max_bytes) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("[gemma3-vl] vision cache disabled (open '{dir}' failed: {e})");
+            tracing::warn!("vision cache disabled (open '{dir}' failed: {e})");
             None
         }
     }

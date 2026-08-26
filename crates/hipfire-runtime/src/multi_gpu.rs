@@ -46,8 +46,8 @@ pub struct BoundaryEvent {
 impl Drop for BoundaryEvent {
     fn drop(&mut self) {
         if self.completion.is_some() {
-            eprintln!(
-                "WARN: BoundaryEvent for dst_dev={} dropped without wait_boundary — \
+            tracing::warn!(
+                "BoundaryEvent for dst_dev={} dropped without wait_boundary — \
                  HIP event handle leaked. Always pair boundary_copy with wait_boundary.",
                 self.dst_dev,
             );
@@ -791,7 +791,7 @@ pub fn resolve_primary_device(explicit: Option<i32>) -> HipResult<i32> {
     let (id, warning) =
         resolve_primary_device_id(count, crate::config::get().devices.as_deref(), explicit)?;
     if let Some(warning) = warning {
-        eprintln!("[hipfire] {warning}");
+        tracing::warn!("{warning}");
     }
     Ok(id)
 }
@@ -814,13 +814,14 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     for d in devices {
         if d.arch != arch0 {
             if allow_mixed {
-                eprintln!(
+                tracing::warn!(
                     "preflight_vram: mixed-arch detected — dev 0 is {arch0}, dev {} is {}. \
                      Proceeding because HIPFIRE_ALLOW_MIXED_ARCH=1. \
                      Per-arch JIT cache will be populated on first run; boundary_copy uses \
                      hipMemcpyPeer / hipMemcpyPeerAsync which fall through to host-staging \
                      if peer access is unsupported by the pair (correctness holds either way).",
-                    d.device_id, d.arch,
+                    d.device_id,
+                    d.arch,
                 );
             } else {
                 return Err(HipError::new(

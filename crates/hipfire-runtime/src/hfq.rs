@@ -824,8 +824,8 @@ fn collect_hf_sidecars_into(
             continue;
         };
         if meta.len() > MAX_SIDECAR_FILE_BYTES || *total + meta.len() > MAX_SIDECAR_TOTAL_BYTES {
-            eprintln!(
-                "hfq: skipping sidecar {key} ({} bytes) — over the capture budget",
+            tracing::warn!(
+                "skipping sidecar {key} ({} bytes) — over the capture budget",
                 meta.len()
             );
             continue;
@@ -2333,16 +2333,17 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
     // Must be 1D F16, length K. quant_type 1 = F16 per the existing
     // load_f16_tensor path.
     if sc_info.quant_type != 1 {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+        tracing::warn!(
+            "AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
             sc_info.quant_type
         );
         return None;
     }
     if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
-            sc_info.shape, k
+        tracing::warn!(
+            "AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape,
+            k
         );
         return None;
     }
@@ -2957,7 +2958,7 @@ pub fn load_weights_hfq(
         ));
     }
 
-    eprintln!("  loading token_embd...");
+    tracing::info!("loading token_embd...");
     // `tensor_data_cow`, not `tensor_data`: a LUT3/Huffman-recoded embed table
     // is stored compressed, and the borrowing accessor refuses those. Reaching
     // for it here reported the tensor as MISSING when it was merely coded.
@@ -2967,26 +2968,26 @@ pub fn load_weights_hfq(
     let embd_info = (embd_info.0, embd_info.1.as_ref());
     let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
         // Q4_K: upload raw, use Q4K embedding lookup at inference
-        eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::Q4K,
         )
     } else if embd_info.0.quant_type == 6 {
-        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::HFQ4G256,
         )
     } else if embd_info.0.quant_type == 7 {
-        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::HFQ4G128,
         )
     } else if embd_info.0.quant_type == 3 {
         // Q8F16: upload raw, use Q8 embedding lookup at inference
-        eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::Q8_0,
@@ -3006,8 +3007,8 @@ pub fn load_weights_hfq(
         let n = embd_info.0.shape.iter().map(|&d| d as usize).product();
         let logical = decode_bf16_packed(49, embd_info.1, n)
             .ok_or_else(|| HipError::new(0, "token_embd: BF16L3 decode failed"))?;
-        eprintln!(
-            "    (bf16l3 -> bf16 for gather, {} MB packed -> {} MB)",
+        tracing::info!(
+            "(bf16l3 -> bf16 for gather, {} MB packed -> {} MB)",
             embd_info.1.len() / 1_000_000,
             logical.len() / 1_000_000
         );
@@ -3018,14 +3019,14 @@ pub fn load_weights_hfq(
     } else if embd_info.0.quant_type == 16 {
         // Native bf16 table: upload raw 2 B/elem; gather converts to f32 inline
         // (no F32 promotion). Keeps the largest tensor at half the memory.
-        eprintln!("    (bf16 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(bf16 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::BF16,
         )
     } else if embd_info.0.quant_type == 1 {
         // Native f16 table: upload raw; gather converts f16->f32 inline.
-        eprintln!("    (f16 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        tracing::info!("(f16 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::F16,
@@ -3042,10 +3043,10 @@ pub fn load_weights_hfq(
         )
     };
 
-    eprintln!("  loading output_norm...");
+    tracing::info!("loading output_norm...");
     let output_norm = load_f16_tensor(hfq, gpu, "model.norm.weight", &[config.dim])?;
 
-    eprintln!("  loading output...");
+    tracing::info!("loading output...");
     let mut return_packed_head: Option<WeightTensor> = None;
     let output = if hfq.find_tensor("lm_head.weight").is_some() {
         load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
@@ -3571,7 +3572,7 @@ pub fn load_weights_paroquant_llama(
     let kr = qc.krot;
 
     // Embedding
-    eprintln!("  loading token_embd (ParoQuant LLaMA/Qwen3)...");
+    tracing::info!("loading token_embd (ParoQuant LLaMA/Qwen3)...");
     let embd_name = "model.embed_tokens.weight";
     let (_, embd_data) = source
         .tensor_data(embd_name)
@@ -3584,12 +3585,12 @@ pub fn load_weights_paroquant_llama(
     let embd_fmt = EmbeddingFormat::F32;
 
     // Output norm
-    eprintln!("  loading output_norm...");
+    tracing::info!("loading output_norm...");
     let output_norm = paro_load_llama_norm_raw(source, gpu, "norm.weight", &[config.dim])?;
 
     // Output / lm_head (tied or separate)
     let output = if source.tensor_info("lm_head.weight").is_some() {
-        eprintln!("  loading output (separate lm_head)...");
+        tracing::info!("loading output (separate lm_head)...");
         let lm_prefix = "lm_head";
         if source
             .tensor_info(&format!("{lm_prefix}.qweight"))
@@ -3614,7 +3615,7 @@ pub fn load_weights_paroquant_llama(
             )?
         }
     } else {
-        eprintln!("  loading output (tied embeddings)...");
+        tracing::info!("loading output (tied embeddings)...");
         let (_, td) = source
             .tensor_data(embd_name)
             .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens for lm_head"))?;
@@ -3639,8 +3640,8 @@ pub fn load_weights_paroquant_llama(
     // Layers
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!(
-            "  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
+        tracing::info!(
+            "loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
             config.n_layers
         );
         crate::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");

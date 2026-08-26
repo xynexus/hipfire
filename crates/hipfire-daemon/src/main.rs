@@ -1054,28 +1054,27 @@ use state::DaemonState;
 /// AMD GPU driver visible to the runtime; on Linux it is usually missing
 /// `libamdhip64.so` or kernel-side amdgpu / kfd not loaded.
 fn report_gpu_init_failure(err: &hip_bridge::HipError) {
-    eprintln!();
-    eprintln!("hipfire: failed to initialize GPU runtime.");
-    eprintln!("  HIP error: {} (code {})", err.message, err.code);
-    eprintln!();
-    if cfg!(target_os = "windows") {
-        eprintln!("  Most common Windows cause: HIP SDK is loaded but no");
-        eprintln!("  AMD GPU is visible to the runtime. Verify:");
-        eprintln!("    1. AMD Adrenalin driver is installed and current.");
-        eprintln!("    2. AMD HIP SDK 6.2 or newer is installed:");
-        eprintln!("       https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html");
-        eprintln!("    3. `amdhip64.dll` is reachable (HIP_PATH set or DLL on PATH).");
-        eprintln!("    4. Reboot after driver / SDK install if you have not yet.");
+    let hints = if cfg!(target_os = "windows") {
+        "  Most common Windows cause: HIP SDK is loaded but no\n  \
+         AMD GPU is visible to the runtime. Verify:\n    \
+         1. AMD Adrenalin driver is installed and current.\n    \
+         2. AMD HIP SDK 6.2 or newer is installed:\n       \
+         https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html\n    \
+         3. `amdhip64.dll` is reachable (HIP_PATH set or DLL on PATH).\n    \
+         4. Reboot after driver / SDK install if you have not yet."
     } else {
-        eprintln!("  Most common Linux causes:");
-        eprintln!("    1. amdgpu kernel module not loaded (check `lsmod | grep amdgpu`).");
-        eprintln!("    2. /dev/kfd missing or not readable by the current user");
-        eprintln!("       (add to the `render` group; reboot).");
-        eprintln!("    3. ROCm not installed or libamdhip64.so missing");
-        eprintln!("       (check `ldconfig -p | grep amdhip64`).");
-    }
-    eprintln!();
-    eprintln!("  Run `hipfire diag` for a full environment report.");
+        "  Most common Linux causes:\n    \
+         1. amdgpu kernel module not loaded (check `lsmod | grep amdgpu`).\n    \
+         2. /dev/kfd missing or not readable by the current user\n       \
+         (add to the `render` group; reboot).\n    \
+         3. ROCm not installed or libamdhip64.so missing\n       \
+         (check `ldconfig -p | grep amdhip64`)."
+    };
+    tracing::error!(
+        "hipfire: failed to initialize GPU runtime.\n  HIP error: {} (code {})\n\n{hints}\n\n  Run `hipfire diag` for a full environment report.",
+        err.message,
+        err.code
+    );
 }
 
 /// Resident state of a micro-step-preemptible `train_lora` run. The daemon runs
@@ -1529,6 +1528,9 @@ fn main() {
     // per-token decode loops poll it and stop cleanly. See
     // `hipfire_runtime::GENERATION_CANCEL`.
     hipfire_runtime::install_generation_cancel_handler();
+    // Init logging first so every later tracing event (including --precompile
+    // and lock-acquisition paths) is captured, not dropped.
+    hipfire_runtime::logging::init_stderr_logging("daemon", "info");
 
     // Before ANY Gpu::init: FeatureFlags snapshots once at init and hot paths
     // read the cached struct, so config values installed later would be ignored.
@@ -1591,20 +1593,20 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        eprintln!("Pre-compiling kernels for {}...", gpu.arch);
+        tracing::info!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
         for kv in &["asym3", "q8"] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
-                    eprintln!("  {wq}/{kv}: {e}");
+                    tracing::warn!("{wq}/{kv}: {e}");
                     errors += 1;
                 }
             }
         }
         if errors > 0 {
-            eprintln!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
+            tracing::warn!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
         } else {
-            eprintln!("Kernel precompilation done.");
+            tracing::info!("Kernel precompilation done.");
         }
         return;
     }
@@ -1625,14 +1627,13 @@ fn main() {
 
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
-    hipfire_runtime::logging::init_stderr_logging("daemon");
     // Per-module durations (§M3d measurement 1) land in the executor trace only
     // if something wires the two crates together; dispatch cannot reach the
     // trace on its own.
     hipfire_runtime::exec_trace::install_dispatch_module_observer();
     let llm_registry = build_local_llm_registry();
-    eprintln!(
-        "[hipfire-daemon] model registry: {} model(s), {} sidecar/template artifact(s) (models={}, triattn={}, drafts={}, templates={})",
+    tracing::info!(
+        "model registry: {} model(s), {} sidecar/template artifact(s) (models={}, triattn={}, drafts={}, templates={})",
         llm_registry.model_count(),
         llm_registry.sidecar_count(),
         llm_registry.models_dir,
@@ -1672,7 +1673,7 @@ fn main() {
         None => transport::spawn_stdin_reader(),
         Some(path) => match transport::spawn_socket_listener(&path) {
             Ok(inbound) => {
-                eprintln!("hipfire daemon listening on {}", path.display());
+                tracing::info!("hipfire daemon listening on {}", path.display());
                 inbound
             }
             // `fatal_startup_error` diverges — it emits a fatal frame and exits.
@@ -1715,7 +1716,7 @@ fn main() {
         // order does NOT report what the daemon actually chose. This trace is the
         // ground truth, and is what the reordering test asserts on.
         if std::env::var("HIPFIRE_DAEMON_SCHED_DEBUG").as_deref() == Ok("1") {
-            eprintln!(
+            tracing::debug!(
                 "[sched] chose conn={} seq={} pri={} (queue depth after: {})",
                 frame.conn,
                 frame.seq,

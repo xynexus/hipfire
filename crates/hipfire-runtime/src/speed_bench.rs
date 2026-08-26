@@ -162,7 +162,7 @@ pub fn maybe_dpm_warmup(gpu: &mut Gpu, label: Option<&str>) -> Result<(), String
     let secs: f32 = secs_str.parse().unwrap_or(0.0);
     if secs > 0.0 {
         if let Some(label) = label {
-            eprintln!("\n=== DPM warmup ({secs:.1}s, {label}) ===");
+            tracing::info!("\n=== DPM warmup ({secs:.1}s, {label}) ===");
         }
         gpu.dpm_warmup(secs)
             .map_err(|err| format!("dpm warmup: {err}"))?;
