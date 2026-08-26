@@ -19,22 +19,29 @@
 //!
 //! This lives in `hipfire-runtime` because it is the lowest crate reachable by
 //! every loader: `hfq.rs` is in this crate, and the arch crates all depend on
-//! it. The daemon (which also depends on this crate) is the only installer, and
-//! it installs the thread-scoped sink — [`set_sink`] has no production caller.
-//! The process-wide sink remains only as the fallback a CROSS-THREAD reporter
-//! would reach; no loader currently reports off the loading thread, so in
-//! practice it is unused and a report reaching it would print the human line.
-
-use std::sync::Mutex;
+//! it. The daemon (which also depends on this crate) is the only installer.
+//!
+//! **There is no process-wide sink.** There was one, kept as a fallback for a
+//! hypothetical cross-thread reporter, with no production caller. It is gone
+//! (v2 plan, M1d): while it existed, two overlapping loads could still
+//! cross-talk through it, so the per-thread scoping was a convention rather
+//! than a guarantee. Deleting it makes the property structural — there is now
+//! no shared location for a second load to redirect the first's frames.
+//!
+//! Verified before removal, because it is the load-bearing assumption: all 14
+//! `report` call sites sit directly in a synchronous loader on the calling
+//! thread. `hipfire-arch-zaya/src/gpu.rs` does use rayon, but ~2,000 lines away
+//! in CPU GEMM helpers, not in its `load()`. If a loader ever reports from a
+//! spawned thread it will fall through to the human stderr line — visibly
+//! degraded, not silently misrouted.
 
 /// Sink signature: `(current, total, phase)`. Kept simple (no error return) so
 /// loader call sites stay one-liners next to the existing `eprintln!`.
 pub type ProgressFn = dyn Fn(u32, u32, &str) + Send + Sync;
 
-static SINK: Mutex<Option<Box<ProgressFn>>> = Mutex::new(None);
-
 thread_local! {
-    /// Per-thread sink, consulted before [`SINK`].
+    /// The sink. Per-thread by construction — see the module doc for why there
+    /// is no process-wide fallback beside it.
     ///
     /// The process-wide sink is correct only while one load runs at a time. The
     /// v2 daemon moves loading off the executor thread precisely so a
@@ -53,26 +60,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Install (or clear, with `None`) the process-wide load-progress sink.
-///
-/// No production caller: the daemon moved to [`ThreadSinkGuard`]. Kept as the
-/// fallback a cross-thread reporter would reach, and for single-load callers.
-///
-/// Prefer [`set_thread_sink`] for anything that can run concurrently with
-/// another load; this one stays for single-load callers and as the fallback a
-/// cross-thread reporter still reaches.
-pub fn set_sink(sink: Option<Box<ProgressFn>>) {
-    if let Ok(mut guard) = SINK.lock() {
-        *guard = sink;
-    }
-}
-
-/// Install (or clear) a sink for THIS THREAD only, taking precedence over the
-/// process-wide one. Returns the previous thread sink so a caller can restore
+/// Install (or clear) a sink for THIS THREAD only. Returns the previous thread sink so a caller can restore
 /// it, which is what makes nesting safe.
 ///
-/// Additive on purpose: the global path is untouched, so a caller that has not
-/// migrated behaves exactly as before.
 pub fn set_thread_sink(sink: Option<Box<ProgressFn>>) -> Option<Box<ProgressFn>> {
     THREAD_SINK.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), sink))
 }
@@ -99,13 +89,9 @@ impl Drop for ThreadSinkGuard {
 
 /// Report load progress. `current`/`total` are phase-relative unit counts
 /// (e.g. layer `i+1` of `n`); `phase` is a coarse label such as `"weights"`.
-/// No-op when no sink is installed. The `SINK` lock is held across the sink
-/// call, which serializes concurrent reports into whole, non-interleaved frames.
+/// No-op when no sink is installed. Touches no shared state, so concurrent
+/// loads on different threads never contend.
 pub fn report(current: u32, total: u32, phase: &str) {
-    // Thread sink first: it is the narrower scope, and when two loads overlap it
-    // is the only one that can name the right caller. Returns without touching
-    // the global mutex, so a migrated load path does not contend with another
-    // thread's load at all.
     let handled = THREAD_SINK.with(|cell| match cell.try_borrow() {
         Ok(guard) => match guard.as_ref() {
             Some(sink) => {
@@ -121,15 +107,10 @@ pub fn report(current: u32, total: u32, phase: &str) {
     if handled {
         return;
     }
-    if let Ok(guard) = SINK.lock() {
-        if let Some(sink) = guard.as_ref() {
-            sink(current, total, phase);
-            return;
-        }
-        // No sink (CLI-direct load, eval, tests): emit the human progress line
-        // loaders used to `eprintln!` themselves, so text callers still see it.
-        eprintln!("  loading {phase} {current}/{total}");
-    }
+    // No sink (CLI-direct load, eval, tests), or a report from a thread that
+    // installed none: emit the human progress line loaders used to `eprintln!`
+    // themselves, so text callers still see it.
+    eprintln!("  loading {phase} {current}/{total}");
 }
 
 #[cfg(test)]
@@ -137,7 +118,7 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     /// Serializes every test in this module, because one of them installs the
@@ -226,55 +207,12 @@ mod tests {
         let _ = set_thread_sink(None);
     }
 
-    /// Precedence over an INSTALLED global, not merely over an absent one — and
-    /// the global still reached by a thread that has not migrated.
-    ///
-    /// The two tests above only ever install thread sinks, so they pass even if
-    /// `report` consulted the global first. That is the daemon's actual
-    /// configuration during the v2 transition (thread sink on the load path, the
-    /// global left as the fallback a cross-thread reporter still reaches), so the
-    /// precedence is the property the migration rests on.
-    #[test]
-    fn thread_sink_takes_precedence_over_installed_global() {
-        let _serial = serial();
-        let global = Arc::new(AtomicU32::new(0));
-        let g2 = Arc::clone(&global);
-        set_sink(Some(Box::new(move |c, _, _| {
-            g2.fetch_add(c, Ordering::Relaxed);
-        })));
-
-        let mine = Arc::new(AtomicU32::new(0));
-        let m2 = Arc::clone(&mine);
-        std::thread::spawn(move || {
-            let _g = ThreadSinkGuard::install(Box::new(move |c, _, _| {
-                m2.fetch_add(c, Ordering::Relaxed);
-            }));
-            report(5, 10, "weights");
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(
-            mine.load(Ordering::Relaxed),
-            5,
-            "thread sink did not receive its own report"
-        );
-        assert_eq!(
-            global.load(Ordering::Relaxed),
-            0,
-            "report reached the global sink too — a migrated load would double-report"
-        );
-
-        // A thread that has NOT installed one still falls through to the global.
-        std::thread::spawn(|| report(4, 10, "weights"))
-            .join()
-            .unwrap();
-        assert_eq!(
-            global.load(Ordering::Relaxed),
-            4,
-            "global fallback missed an unmigrated report"
-        );
-
-        set_sink(None);
-    }
+    // NOTE: the test that used to sit here,
+    // `thread_sink_takes_precedence_over_installed_global`, was removed with the
+    // process-wide sink it tested. It is deliberately NOT replaced by a
+    // "sinkless thread cannot reach another thread's sink" test: with no shared
+    // location, `thread_local!` enforces that at compile time, so such a test
+    // cannot fail and would be coverage theatre. The property is now structural
+    // — the way to break it is to re-add a global, which is a code review
+    // question, not a runtime one.
 }

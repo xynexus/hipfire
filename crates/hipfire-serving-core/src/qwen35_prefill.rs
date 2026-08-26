@@ -1196,7 +1196,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
                 "qwen35 scratch missing; fused grouped-MoE debug sampling unavailable".to_string()
             })?;
-            let mut rng_state = 0x13579BDFu32;
+            let mut rng_state = hipfire_runtime::sampler::initial_rng_state();
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
@@ -1631,7 +1631,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
                 "qwen35 scratch missing; fused dense debug sampling unavailable".to_string()
             })?;
-            let mut rng_state = 0x13579BDFu32;
+            let mut rng_state = hipfire_runtime::sampler::initial_rng_state();
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
@@ -1783,7 +1783,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
             let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
                 "qwen35 scratch missing; PP batch-prefill is not supported".to_string()
             })?;
-            let mut rng_state = 0x13579BDFu32;
+            let mut rng_state = hipfire_runtime::sampler::initial_rng_state();
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
