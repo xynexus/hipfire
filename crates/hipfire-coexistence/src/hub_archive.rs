@@ -33,9 +33,12 @@
 //! returns the archive to exactly where the file began. The end state is the
 //! same; the window in between is the cost of not staging.
 //!
-//! Cross-process resume, for the same reason a `.part` no longer exists. A
-//! dropped connection still resumes byte-for-byte within the run; a run that
-//! dies restarts the file it was on.
+//! Mid-file cross-process resume. A dropped connection still resumes
+//! byte-for-byte within the run, and a run that dies resumes at the file it
+//! was on — the `.manifest` sidecar records each completed file's index record
+//! and archive offset (see [`fetch_to_archive`]) — but the interrupted file
+//! itself starts over, because the packer's mid-file state (an open piece, a
+//! partial chunk hash) dies with the process.
 
 use std::error::Error;
 use std::io;
@@ -316,6 +319,42 @@ impl StreamPacker {
         })
     }
 
+    /// Reopen a partial archive at the last completed-file boundary the resume
+    /// manifest recorded. `total_bytes` counts only the files still to fetch.
+    pub fn resume(
+        out: &Path,
+        total_bytes: u64,
+        pos: u64,
+        files: Vec<serde_json::Value>,
+        stats: repack::Stats,
+    ) -> io::Result<Self> {
+        Ok(StreamPacker {
+            aw: ArchiveWriter::resume(out, pos, files, stats)?,
+            cur: None,
+            progress: Progress::new(total_bytes),
+        })
+    }
+
+    /// Archive write position — a resumable boundary right after
+    /// [`Self::finish_file`], when no file is in flight.
+    pub fn pos(&self) -> u64 {
+        self.aw.pos()
+    }
+
+    /// The index record [`Self::finish_file`] just pushed.
+    pub fn last_record(&self) -> Option<&serde_json::Value> {
+        self.aw.last_file()
+    }
+
+    pub fn stats_snapshot(&self) -> repack::Stats {
+        self.aw.stats_snapshot()
+    }
+
+    /// Flush and sync the archive so a just-recorded resume boundary is real.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.aw.sync()
+    }
+
     /// Begin a file. Every subsequent [`ByteSink::chunk`] belongs to it until
     /// [`Self::finish_file`] or [`Self::abort_file`].
     pub fn begin_file(&mut self, file: &RepoFile) -> io::Result<()> {
@@ -574,6 +613,92 @@ impl ByteSink for StreamPacker {
 /// Files are taken in the listing's sorted order, which is the order
 /// [`repack::pack`] walks a directory in, so the archive this produces is the
 /// archive packing the same checkpoint would produce.
+/// The resume manifest for a partial archive: `<out>.manifest`, JSON lines.
+/// Line one names the fetch (repo/revision/include); each further line is a
+/// file completed and digest-verified, with its index record and the archive
+/// position after it. What the manifest buys: a killed multi-shard run resumes
+/// at the file it died in, not at file one — completed shards are recheck-read
+/// from local disk instead of re-downloaded.
+fn manifest_path(out: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.manifest", out.display()))
+}
+
+/// What a prior interrupted run left behind, once proven trustworthy.
+struct ResumeState {
+    pos: u64,
+    records: Vec<serde_json::Value>,
+    stats: repack::Stats,
+    /// path → sha256 (or empty) of each completed file, to skip and to detect
+    /// a revision that moved underneath a re-run.
+    done: std::collections::HashMap<String, String>,
+}
+
+/// Parse and validate a resume manifest against the partial archive and the
+/// current fetch parameters. Any doubt returns `None` and the caller restarts
+/// from scratch — resume is an optimization, never a correctness risk.
+fn load_resume(
+    out: &Path,
+    repo: &str,
+    revision: &str,
+    include: Option<&str>,
+) -> Option<ResumeState> {
+    let text = std::fs::read_to_string(manifest_path(out)).ok()?;
+    let mut lines = text.lines();
+    let head: serde_json::Value = serde_json::from_str(lines.next()?).ok()?;
+    if head.get("v")?.as_u64()? != 1
+        || head.get("repo")?.as_str()? != repo
+        || head.get("revision")?.as_str()? != revision
+        || head.get("include").and_then(|v| v.as_str()) != include
+    {
+        return None;
+    }
+    let mut st = ResumeState {
+        pos: 0,
+        records: Vec::new(),
+        stats: repack::Stats::default(),
+        done: std::collections::HashMap::new(),
+    };
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        st.pos = v.get("pos")?.as_u64()?;
+        st.records.push(v.get("record")?.clone());
+        st.stats = serde_json::from_value(v.get("stats")?.clone()).ok()?;
+        st.done.insert(
+            v.get("path")?.as_str()?.to_string(),
+            v.get("sha256")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    if st.records.is_empty() || std::fs::metadata(out).ok()?.len() < st.pos {
+        return None;
+    }
+    // Trust but verify: the manifest says these payloads are in the partial
+    // archive — prove it from the bytes before skipping their downloads.
+    match repack::verify_stored_payloads(out, &st.records) {
+        Ok(bytes) => {
+            eprintln!(
+                "hub: resuming {} — {} completed file(s) recheck clean ({:.2} GB kept)",
+                out.display(),
+                st.records.len(),
+                bytes as f64 / 1e9
+            );
+            Some(st)
+        }
+        Err(e) => {
+            eprintln!("hub: partial archive failed recheck ({e}) — restarting from scratch");
+            None
+        }
+    }
+}
+
+fn append_manifest(m: &mut std::fs::File, v: &serde_json::Value) -> io::Result<()> {
+    use std::io::Write;
+    writeln!(m, "{v}")?;
+    m.sync_data()
+}
+
 pub async fn fetch_to_archive(
     out: &Path,
     repo: &str,
@@ -590,15 +715,51 @@ pub async fn fetch_to_archive(
         return Err(format!("{repo}: no files matched").into());
     }
 
+    // A completed file resumes only if the live listing still offers the same
+    // content: same sha for LFS files, and any hash-less file forces a restart
+    // rather than guessing. A moved `main` must not splice two revisions.
+    let resume = load_resume(out, repo, revision, include).filter(|st| {
+        let ok = st.done.iter().all(|(path, sha)| {
+            files
+                .iter()
+                .any(|f| &f.path == path && f.sha256.as_deref().unwrap_or("") == sha)
+        });
+        if !ok {
+            eprintln!("hub: repo content changed since the interrupted run — restarting");
+        }
+        ok
+    });
+
     let src_bytes: u64 = files.iter().map(|f| f.size).sum();
+    if let Some(st) = &resume {
+        files.retain(|f| !st.done.contains_key(&f.path));
+    }
+    let remaining: u64 = files.iter().map(|f| f.size).sum();
     eprintln!(
         "hub: {} file(s), {:.2} GB to fetch → {}",
         files.len(),
-        src_bytes as f64 / 1e9,
+        remaining as f64 / 1e9,
         out.display()
     );
 
-    let mut packer = StreamPacker::create(out, src_bytes)?;
+    let mut packer = match &resume {
+        Some(st) => {
+            StreamPacker::resume(out, remaining, st.pos, st.records.clone(), st.stats.clone())?
+        }
+        None => StreamPacker::create(out, remaining)?,
+    };
+    let mut manifest = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(manifest_path(out))?;
+    if resume.is_none() {
+        manifest.set_len(0)?;
+        append_manifest(
+            &mut manifest,
+            &serde_json::json!({ "v": 1, "repo": repo, "revision": revision, "include": include }),
+        )?;
+    }
+
     for f in &files {
         let mut st = StreamProgress::new(f);
         packer.begin_file(f)?;
@@ -612,7 +773,21 @@ pub async fn fetch_to_archive(
         )
         .await
         {
-            Ok(()) => packer.finish_file()?,
+            Ok(()) => {
+                packer.finish_file()?;
+                // The boundary is only worth recording once the bytes it covers
+                // are durably in the archive, hence the flush-then-manifest
+                // order; sync_data on the manifest keeps the pair ordered.
+                packer.sync()?;
+                let line = serde_json::json!({
+                    "path": f.path,
+                    "sha256": f.sha256.as_deref().unwrap_or(""),
+                    "pos": packer.pos(),
+                    "record": packer.last_record(),
+                    "stats": packer.stats_snapshot(),
+                });
+                append_manifest(&mut manifest, &line)?;
+            }
             Err(e) => {
                 // The file's payloads are already in the archive; take them back
                 // out so a failed run leaves no half-file behind.
@@ -621,7 +796,9 @@ pub async fn fetch_to_archive(
             }
         }
     }
-    Ok(packer.finish(src_bytes)?)
+    let total = packer.finish(src_bytes)?;
+    let _ = std::fs::remove_file(manifest_path(out));
+    Ok(total)
 }
 
 /// Minimal `*` glob, matching `hipfire_hub::run`'s so `--include` behaves the

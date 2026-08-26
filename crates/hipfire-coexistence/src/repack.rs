@@ -184,7 +184,9 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 /// What a completed archive cost, for the one-line summary each producer prints.
-#[derive(Default)]
+/// Serialized into the streaming packer's resume manifest so a resumed run's
+/// summary still counts the files fetched before the interruption.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Stats {
     pub n_bf16h: usize,
     pub n_verbatim_files: usize,
@@ -277,6 +279,54 @@ impl ArchiveWriter {
             left -= n as u64;
         }
         Ok(self.end_payload())
+    }
+
+    /// Reopen a partial archive at a known-good boundary and keep appending.
+    ///
+    /// `pos` must be the position recorded after a completed file (the resume
+    /// manifest's last line); anything past it is a torn write from the
+    /// interrupted run and is truncated away. `files` are the index records for
+    /// everything below `pos`, so the eventual [`Self::finish`] emits a footer
+    /// covering old and new files alike.
+    pub fn resume(
+        out: &Path,
+        pos: u64,
+        files: Vec<serde_json::Value>,
+        stats: Stats,
+    ) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(out)?;
+        f.set_len(pos)?;
+        let mut w = std::io::BufWriter::new(f);
+        w.seek(SeekFrom::Start(pos))?;
+        Ok(Self {
+            w,
+            pos,
+            files,
+            cur: None,
+            stats,
+        })
+    }
+
+    pub fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    pub fn last_file(&self) -> Option<&serde_json::Value> {
+        self.files.last()
+    }
+
+    pub fn stats_snapshot(&self) -> Stats {
+        self.stats.clone()
+    }
+
+    /// Make everything appended so far durable — the streaming packer calls
+    /// this before recording a resume boundary that points at it.
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        self.w.flush()?;
+        self.w.get_ref().sync_data()
     }
 
     pub fn push_file(&mut self, entry: serde_json::Value) {
@@ -1002,6 +1052,66 @@ impl Write for Sink {
 }
 
 /// XXH3-64 over a byte range of the archive, streamed.
+/// Recheck stored payloads named by `files` index records against their
+/// recorded XXH3-64, without needing a footer — the resume path's "trust but
+/// verify" over a partial archive. Returns bytes verified; the first mismatch
+/// or short read is an error.
+pub(crate) fn verify_stored_payloads(
+    archive: &Path,
+    files: &[serde_json::Value],
+) -> Result<u64, Box<dyn Error>> {
+    let mut f = File::open(archive)?;
+    let mut bytes = 0u64;
+    let mut spans: Vec<(&str, &str, u64, u64, Option<u64>)> = Vec::new();
+    for fe in files {
+        let path = fe.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        match fe.get("kind").and_then(|v| v.as_str()) {
+            Some("raw") => spans.push((
+                path,
+                "",
+                fe.get("off").and_then(|v| v.as_u64()).unwrap_or(0),
+                fe.get("len").and_then(|v| v.as_u64()).unwrap_or(0),
+                fe.get("xxh3").and_then(|v| v.as_u64()),
+            )),
+            Some("safetensors") => {
+                for t in fe
+                    .get("tensors")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    spans.push((
+                        path,
+                        t.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                        t.get("stored_off").and_then(|v| v.as_u64()).unwrap_or(0),
+                        t.get("stored_len").and_then(|v| v.as_u64()).unwrap_or(0),
+                        t.get("xxh3").and_then(|v| v.as_u64()),
+                    ));
+                }
+                spans.push((
+                    path,
+                    "<header>",
+                    fe.get("header_off").and_then(|v| v.as_u64()).unwrap_or(0),
+                    fe.get("header_len").and_then(|v| v.as_u64()).unwrap_or(0),
+                    None,
+                ));
+            }
+            _ => {}
+        }
+    }
+    for (path, name, off, len, want) in spans {
+        let got = hash_range(&mut f, off, len)
+            .map_err(|e| format!("{path} {name}: unreadable at {off}+{len}: {e}"))?;
+        if let Some(w) = want {
+            if got != w {
+                return Err(format!("{path} {name}: stored payload hash mismatch").into());
+            }
+            bytes += len;
+        }
+    }
+    Ok(bytes)
+}
+
 fn hash_range(f: &mut File, off: u64, len: u64) -> std::io::Result<u64> {
     f.seek(SeekFrom::Start(off))?;
     let mut h = twox_hash::xxhash3_64::Hasher::new();
