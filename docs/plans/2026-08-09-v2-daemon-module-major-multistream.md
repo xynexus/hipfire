@@ -1168,6 +1168,17 @@ does); and `None` disables reclaiming entirely. 41/41 scheduler tests pass.
 
 **M1d — the remaining process globals become per-stream:** `RAW_OVERRIDE`,
 `hipfire_steer::{SESSION, ACTIVE, EPOCH}`, `load_progress::SINK`.
+`RAW_OVERRIDE` is retired as of 2026-08-25; the other two remain.
+
+**Scoped 2026-08-25 — see `docs/plans/2026-08-25-m1-scope.md`.** Headline: M1b
+is NOT as landed as this section reads. The `static SAMPLER_STATE` is gone, but
+nothing samples through the per-stream `SamplerRng` (`daemon/stream.rs:181` says
+so), no request seed reaches it (`SamplerRng::from_seed` has zero production
+call sites), and the RNG state is still shared per MODEL — it round-trips
+through `Qwen35Scratch::sample_buf`, a single `[2]` tensor on the one
+`LoadedModel::q35_scratch`. The global was removed; the sharing was relocated,
+so M1b's own failure mode is still live and its exit criterion is unmeetable
+today.
 
 *Breaks:* M1b changes sampled output for every `temperature>0` request — deliberately;
 today's output is not reproducible under batching anyway. Greedy tiny-quant baselines must
@@ -2041,13 +2052,17 @@ rather than a cleared prerequisite.
 
 ### Tier 2 (blocks the latency goal) — mostly open, and one dominates
 
+**Re-verified 2026-08-25 against the tree, item by item.** Two rows had gone
+stale in the closing direction and are corrected below; the one that dominates
+has barely moved.
+
 | item | state |
 |---|---|
-| **prefill not lowered** | **OPEN — the critical-path blocker.** Zero `SuperOp`/`LayerProgram` references in `prefill_chunk.rs` or `prefill_batch.rs` |
-| `hipEventQuery` / `hipStreamQuery` | **OPEN** — zero occurrences in `hip-bridge/src/ffi.rs` |
-| `hipfire_steer` globals | **OPEN** — `static SESSION`, `static ACTIVE`, `static EPOCH` all still present |
-| `load_progress::SINK` | **OPEN** — still `static SINK: Mutex<Option<...>>` |
-| the four hand-path escapes | **REDUCED** — the `hidden_rb` escape is gone and RoughQuant is now opt-in behind `HIPFIRE_RQ_HAND=1`; GDN tape capture and a live steer session still force the hand path |
+| **prefill not lowered** | **OPEN — still the critical-path blocker.** `prefill_chunk.rs` is no longer zero: it now carries 11 `SuperOp`/`LayerProgram`/`Qwen35Prefill*Bindings` references, because the DeltaNetMoe and FullAttnMoe branches were folded onto the shared lowered super-ops (`0bbbfd08f`, -1834 lines). But **`prefill_batch.rs` is still zero across 6,426 lines**, and the hand-path total is 13,954 lines against the 14,200 this audit first cited — a ~2% dent. The shape improved; the blocker did not |
+| `hipEventQuery` / `hipStreamQuery` | **CLOSED** — 5 occurrences in `hip-bridge/src/ffi.rs`. The async-prefetch prereq is in |
+| `hipfire_steer` globals | **OPEN** — `static SESSIONS`, `static ACTIVE`, `static EPOCH` at `hipfire-steer/src/lib.rs:265/274/289` |
+| `load_progress::SINK` | **OPEN** — still `static SINK: Mutex<Option<Box<ProgressFn>>>` at `load_progress.rs:34` |
+| the four hand-path escapes | **REDUCED, unchanged since** — RoughQuant is dormant behind `HIPFIRE_RQ_HAND=1` (`loading.rs:3036` calls the hand path "broken"); GDN tape capture and a live steer session still force it |
 
 **Prefill is the one that matters.** ~14.2k lines of hand-written control flow
 across the two files is, by definition, one indivisible quantum — which defeats
@@ -2068,19 +2083,29 @@ over the protocol via the `ExecutorTrace` request (`handlers/status.rs` →
 `snapshot_json`). `TraceEvent` has five variants: `DispatchBegin`,
 `DispatchEnd`, `TokenEmitted`, `Completed`, `VramSample`.
 
-**Not built: the module dimension.** `TraceRecord.module` exists but its own doc
-says "Which module (M4 onward). 0 until the module graph exists", and every
-`record()` call site passes 0. `TraceRecord` has no field that could carry a
-`SuperOpKind`, and the type appears in `exec_trace.rs` **zero** times. The file
-also records that a `Yielded` variant was deliberately left out because "today
-nothing can construct it".
+**The module dimension was BUILT 2026-08-23** (§M0 module dimension, PR #338).
+This section previously said it was not, and that every `record()` call site
+passed 0. Both are now false:
 
-So the original warning still holds, but narrowly: **§M3d's first exit
-measurement — p99/max module duration and which `SuperOpKind` owns the max —
-cannot be read off this trace as it stands.** Measurements 2 and 3
-(admission→first-dispatch, and loaded-vs-solo bulk throughput) are event-level
-and are obtainable today. Scope M3d accordingly, or budget the module
-instrumentation as part of it.
+* `TraceEvent::ModuleEnd = 7` carries a real `SuperOpKind` discriminant, recorded
+  at `exec_trace.rs:489` — the one call site that passes a non-zero `module`.
+  Every other site is event-level and still passes 0, correctly.
+* `module_duration_stats()` reads it back as per-module percentiles, and
+  `module_name()` names the discriminant.
+* The measurement lives in `hipfire-dispatch`'s super-op loop and reaches the
+  trace through `install_dispatch_module_observer()`, called once from
+  `daemon/main.rs:1609`. The indirection exists because `hipfire-dispatch`
+  cannot depend on `hipfire-runtime` — the dependency runs the other way.
+
+**Caveat that keeps this honest:** the observer is gated on `HIPFIRE_TRACE_MODULES`
+and is **off by default**, because timing each module serializes the loop. So
+§M3d's first exit measurement is now *obtainable*, but in a diagnostic mode
+rather than from ambient production traffic. An always-on version wants
+`hipEvent` timing instead of the serializing path — and `hipEventQuery` is now
+in the bridge (see Tier 2), so that is no longer blocked either.
+
+Measurements 2 and 3 (admission→first-dispatch, loaded-vs-solo bulk throughput)
+were event-level all along and were taken in §M3d.
 
 ### Tier 3 — one item improved
 
@@ -2099,3 +2124,11 @@ exit criterion) → `hipEventQuery`/`hipStreamQuery` (~15 lines, hard prereq for
 async prefetch) → the three remaining process globals (they become *wrong*, not
 merely ugly, the moment two streams interleave) → `upload_raw` slabs → prefill
 lowering.
+
+**Where that order stands, 2026-08-25.** The first two steps are done: M0 has
+both its event and module dimensions, and `hipEventQuery`/`hipStreamQuery` are
+in the bridge. The next unclaimed step is therefore the process globals
+(`hipfire_steer`'s `SESSIONS`/`ACTIVE`/`EPOCH`, `load_progress::SINK`), then the
+`upload_raw` slabs, then prefill lowering — which remains large enough to be its
+own project and is now concentrated almost entirely in `prefill_batch.rs`, the
+fused multi-session path that the MoE consolidation did not touch.
