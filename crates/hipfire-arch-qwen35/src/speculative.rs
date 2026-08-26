@@ -8257,6 +8257,17 @@ pub fn spec_step_dflash(
             .as_ref()
             .is_some_and(|p| !p.dn_s_snapshots.is_empty() && !p.dn_conv_snapshots.is_empty());
     if checkpoint_rollback {
+        // One-shot, like the hand-path warning in decode_layers.rs. Without it
+        // there is no way to tell from outside whether this path ENGAGED: a
+        // gate can pass with the flag on simply because no block was ever
+        // rejected (`verify_complete_rollback`), which looks like coverage and
+        // is not.
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[dflash] checkpoint rollback ENGAGED (b={b} accept={accept_len}) —                  DeltaNet restored from per-token slots, replay skipped"
+            );
+        }
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         for (layer_idx, s_dst) in target.dn_state.s_matrices.iter().enumerate() {
             let per_slot = s_dst.buf.size();
