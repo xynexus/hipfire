@@ -3126,7 +3126,10 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 config.linear_value_head_dim,
             )?;
         } else if matches!(dn_state.quant, StateQuant::FP32) {
-            gpu.gated_delta_net_f32_batch_seq(
+            // `.get()` yields None whenever the slots were never allocated,
+            // which is every caller except DFlash verify with checkpoint
+            // rollback enabled — so this stays a plain batched call there.
+            gpu.gated_delta_net_f32_batch_seq_opts(
                 &pbs.dn_q_batch,
                 &pbs.dn_k_batch,
                 &pbs.dn_v_batch,
@@ -3137,6 +3140,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
                 n_v_heads,
                 config.linear_value_head_dim,
+                pbs.dn_s_snapshots.get(delta_layer_idx),
             )?;
         } else if use_gdn_per_token {
             // FP16 only — the FP32 arm above is batched, and batched
