@@ -21,6 +21,30 @@ use hipfire_runtime::moe::grouped as grouped_moe;
 pub struct PrefillBatchScratch {
     pub max_batch: usize,
 
+    /// Per-token S checkpoints for DFlash rollback, one entry per DeltaNet
+    /// layer, each `max_batch * n_v_heads * head_dim^2` F32 (the state after
+    /// token t at slot t).
+    ///
+    /// EMPTY unless `alloc_dn_s_snapshots` was called. It is not cheap —
+    /// 2 MB/layer x 26 layers x 16 slots = ~832 MB on Qwen3.5-35B-A3B — and
+    /// `PrefillBatchScratch::new` has many callers (regular prefill, MTP,
+    /// calibration, EP bands) that must not pay it.
+    ///
+    /// Allocated UP FRONT rather than on demand: the verify forward can run
+    /// inside a captured graph, and hipMalloc is not permitted under stream
+    /// capture.
+    pub dn_s_snapshots: Vec<GpuTensor>,
+
+    /// Per-token conv-ring checkpoints for DFlash rollback, one entry per
+    /// DeltaNet layer, each `max_batch * n_channels * 3` F32 (the ring after
+    /// token t at slot t, same [c*3 + {0,1,2}] layout as `conv_states`).
+    ///
+    /// Small next to `dn_s_snapshots` (~40 MB vs ~832 MB) but not optional:
+    /// the ring holds the last three conv INPUTS, and that input buffer is
+    /// per-layer scratch the next layer overwrites, so it cannot be
+    /// reconstructed once the forward has finished.
+    pub dn_conv_snapshots: Vec<GpuTensor>,
+
     // Residual stream and rotation scratch — all [N × dim]
     pub x_batch: GpuTensor,
     pub x_rot_batch: GpuTensor,
@@ -4838,6 +4862,38 @@ pub fn forward_prefill_grouped_moe_session_batch(
 }
 
 impl PrefillBatchScratch {
+    /// Allocate the per-token S checkpoint slots (see `dn_s_snapshots`).
+    ///
+    /// Idempotent. Only the DFlash verify scratch should call this — every
+    /// other `PrefillBatchScratch` user would pay ~832 MB for buffers it never
+    /// reads.
+    pub fn alloc_dn_s_snapshots(&mut self, gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<()> {
+        if !self.dn_s_snapshots.is_empty() {
+            return Ok(());
+        }
+        // Sizes MUST match DeltaNetState::new_with_quant's `s_size` exactly —
+        // note it squares linear_key_head_dim and counts linear_num_value_heads
+        // heads, which is not the pairing the field names suggest.
+        let s_dim = config.linear_key_head_dim;
+        let n_heads = config.linear_num_value_heads;
+        let per_slot = n_heads * s_dim * s_dim;
+        let n_dn_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
+        // Same channel expression the conv kernel and DeltaNetState use.
+        let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        for _ in 0..n_dn_layers {
+            self.dn_s_snapshots
+                .push(gpu.alloc_tensor(&[self.max_batch * per_slot], DType::F32)?);
+            self.dn_conv_snapshots
+                .push(gpu.alloc_tensor(&[self.max_batch * conv_channels * 3], DType::F32)?);
+        }
+        Ok(())
+    }
+
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
@@ -4850,6 +4906,8 @@ impl PrefillBatchScratch {
 
         Ok(Self {
             max_batch,
+            dn_s_snapshots: Vec::new(),
+            dn_conv_snapshots: Vec::new(),
             x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_norm_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,

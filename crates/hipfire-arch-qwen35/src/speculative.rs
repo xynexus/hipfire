@@ -5712,7 +5712,14 @@ impl VerifyScratch {
         config: &qwen35::Qwen35Config,
     ) -> HipResult<Self> {
         let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
-        s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
+        let mut pbs = qwen35::PrefillBatchScratch::new(gpu, config, max_n)?;
+        if dflash_checkpoint_rollback_from_env() {
+            // Up front, not on demand: the verify forward can run inside a
+            // captured graph and hipMalloc is not permitted under stream
+            // capture.
+            pbs.alloc_dn_s_snapshots(gpu, config)?;
+        }
+        s.prefill_batch = Some(pbs);
         Ok(s)
     }
 
@@ -6449,6 +6456,26 @@ pub struct DflashVerifyOutput {
 /// NOTE `HIPFIRE_COMPACT_GDN_TAPE=0` is NOT a substitute: it gates only the
 /// COMPACT tape writer, so on a bf16 target the non-compact tape stays live and
 /// the broken path is still taken. This knob covers both.
+/// `HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1` — rewind DeltaNet by RESTORING the
+/// per-token state the verify forward already produced, instead of re-forwarding
+/// the committed prefix through the whole model.
+///
+/// Exact by construction (the restored bytes are the ones verify wrote), so
+/// unlike the GDN-tape fast path it has no parity question. Off by default
+/// while it is proven, and because the checkpoint slots cost ~832 MB on
+/// Qwen3.5-35B-A3B (2 MB/layer x 26 layers x 16 slots).
+fn dflash_checkpoint_rollback_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn dflash_rollback_gdn_tape_from_env() -> bool {
     matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_GDN_TAPE")
@@ -6697,13 +6724,24 @@ fn verify_dflash_block_inner(
                 // there (48.47 -> 44.28 tok/s); normal spec-decode moves
                 // 48.39 -> 49.32, not worth an output change.
                 //
-                // And replay IS engaging, so this is a STALENESS bug, not a
-                // capture failure: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
+                // Replay IS engaging: HIPFIRE_VERIFY_GRAPH_TIMING=1 shows 21/24
                 // cycles at mode=replay (1 warmup, 1 capture, 1365 blobs) — and
-                // it is still slower than direct dispatch. `pbs.tokens` and
-                // `pbs.positions` are re-uploaded before every replay, so those
-                // are not it; look for state derived host-side from `start_pos`
-                // (a KV write offset, say) baked into kernel args at capture.
+                // it is still slower than direct dispatch.
+                //
+                // ⚠️ It is NOT a stale capture-time scalar, which an earlier
+                // revision of this comment guessed. Bisected with b=1
+                // no-speculate as the oracle (AR-exact by construction at every
+                // length): first divergence is at token 4, i.e. NOT the first
+                // replay, and the streams then RE-CONVERGE for six tokens
+                // before flipping again. Isolated near-tie flips with coherent
+                // output are tiny NUMERICAL differences, not the garbage a bad
+                // KV offset or context length would produce — and batched
+                // attention reads positions from a DEVICE buffer with max_seq
+                // constant, so neither can go stale anyway.
+                //
+                // Since replay is also a net LOSS here, this path is a dead end
+                // on this model: the ~4.5 ms/token launch gap needs FEWER
+                // dispatches, not cheaper ones.
                 //
                 // So do NOT promote BF16 into this list on the reasoning above.
                 // The pointer-stability argument may well be right; something
@@ -8198,7 +8236,49 @@ pub fn spec_step_dflash(
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
     let verify_complete_rollback = rows_to_keep == b;
-    if !verify_complete_rollback {
+    // Checkpoint rollback: the verify forward already wrote the DeltaNet state
+    // after every token, so rewinding is a COPY of slot `accept_len` — no
+    // rewind-to-pre-verify and no replay. Exact by construction: these are the
+    // bytes verify itself produced, which is why this needs no parity gate the
+    // way the GDN-tape path does.
+    //
+    // ⚠️ These conditions MUST mirror the WRITE site in
+    // `prefill_lowered.rs`, which passes the snapshot buffers only from the
+    // FP32 non-chunk arm. The Q8 state path runs a different GDN kernel, and
+    // the chunkwise arm resolves tokens together — NEITHER writes checkpoints,
+    // so restoring under them would copy never-written buffers and silently
+    // corrupt DeltaNet state. Non-empty slots are not evidence of a write.
+    let checkpoint_rollback = !verify_complete_rollback
+        && dflash_checkpoint_rollback_from_env()
+        && matches!(target.dn_state.quant, qwen35::StateQuant::FP32)
+        && !hipfire_rdna::gdn_chunk::chunk_enabled()
+        && verify_scratch
+            .prefill_batch
+            .as_ref()
+            .is_some_and(|p| !p.dn_s_snapshots.is_empty() && !p.dn_conv_snapshots.is_empty());
+    if checkpoint_rollback {
+        let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
+        for (layer_idx, s_dst) in target.dn_state.s_matrices.iter().enumerate() {
+            let per_slot = s_dst.buf.size();
+            gpu.hip.memcpy_dtod_at(
+                &s_dst.buf,
+                0,
+                &pbs.dn_s_snapshots[layer_idx].buf,
+                accept_len * per_slot,
+                per_slot,
+            )?;
+        }
+        for (layer_idx, c_dst) in target.dn_state.conv_states.iter().enumerate() {
+            let per_slot = c_dst.buf.size();
+            gpu.hip.memcpy_dtod_at(
+                &c_dst.buf,
+                0,
+                &pbs.dn_conv_snapshots[layer_idx].buf,
+                accept_len * per_slot,
+                per_slot,
+            )?;
+        }
+    } else if !verify_complete_rollback {
         target_snap.restore_to(&mut target.dn_state, gpu)?;
     }
 
@@ -8228,6 +8308,9 @@ pub fn spec_step_dflash(
     );
     let rollback_replay = if verify_complete_rollback {
         SpecRollbackReplayKind::VerifyComplete
+    } else if checkpoint_rollback {
+        // State is already at token `accept_len`; nothing to replay.
+        SpecRollbackReplayKind::Checkpoint
     } else if dflash_prefix_verify_rollback_replay_from_env() && gdn_tape_opt.is_some() {
         let replay_tokens = &committed[..accept_len + 1];
         let mut prefix_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;

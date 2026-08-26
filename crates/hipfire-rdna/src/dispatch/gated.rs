@@ -153,6 +153,9 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
+        // Per-token S checkpoints; null here. `gated_delta_net_f32_snapshots`
+        // is the arm that passes a real buffer.
+        let mut snapp: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -164,6 +167,7 @@ impl Gpu {
             &mut nt as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
+            &mut snapp as *mut _ as *mut c_void,
         ];
         // 32 threads, tiled S in LDS (4KB per tile). Grid: [n_heads, 128/8=16].
         let n_tiles = (128 / 4) as u32;
@@ -178,9 +182,38 @@ impl Gpu {
             )
         }
     }
+    /// `gated_delta_net_f32_batch_seq` with per-token S checkpoints.
+    ///
+    /// `snapshots`, when given, must hold `n_tokens * n_heads * head_dim^2`
+    /// floats; the state AFTER token t lands at slot t. DFlash rollback
+    /// restores slot `accept_len` instead of re-forwarding the committed
+    /// prefix through the whole model. Exact — these are the bytes this kernel
+    /// would have left in `state`.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_batch_seq_opts(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state: &GpuTensor,
+        output: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        snapshots: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.gated_delta_net_f32_batch_seq_inner(
+            q, k, v, gate, beta, state, output, n_tokens, n_heads, head_dim, snapshots,
+        )
+    }
+
     /// Batched FP32-state Gated Delta Net recurrence. Processes all tokens
     /// sequentially inside the kernel and advances the FP32 state in place.
     #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_f32_batch_seq(
         &mut self,
         q: &GpuTensor,
@@ -193,6 +226,27 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+    ) -> HipResult<()> {
+        self.gated_delta_net_f32_batch_seq_inner(
+            q, k, v, gate, beta, state, output, n_tokens, n_heads, head_dim, None,
+        )
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_f32_batch_seq_inner(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state: &GpuTensor,
+        output: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        snapshots: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
@@ -231,6 +285,17 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
+        // Per-token S checkpoints; null unless the caller asked for them. Both
+        // entries this launch can select take the trailing pointer, so the
+        // kernarg list stays uniform.
+        //
+        // The f64 oracle entry IGNORES it — checkpointing a diagnostic path is
+        // not needed, and silently dropping the request there is better than a
+        // kernarg-shape mismatch.
+        let snap_null: *mut std::ffi::c_void = match snapshots {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -244,7 +309,7 @@ impl Gpu {
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
-            &kernargs![ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op, i32 nt, i32 nh, i32 hd],
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op, i32 nt, i32 nh, i32 hd, ptr snap_null],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

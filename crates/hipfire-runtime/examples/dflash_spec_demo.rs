@@ -606,11 +606,31 @@ fn main() {
     // {2,4,6,8}. Floor 2 therefore STRICTLY DOMINATES floor 4 -- same class,
     // one extra option -- and can only lose through exploration cost.
     //
-    // MECHANISM, not just a tuned number: rollback replay is skipped entirely
-    // when `accept_len + 1 == b` (`verify_complete_rollback`), and replay is
-    // ~37% of a spec cycle (15.6-32.0 ms of a ~72 ms cycle, measured with
-    // HIPFIRE_SPEC_PHASES=1). At B=2 skipping it needs ONE accepted draft,
-    // common at tau~1.6; at B=6 it needs five. Small B buys out the replay.
+    // ⚠️ THE MECHANISM THIS COMMENT USED TO CLAIM IS WRONG, and is retracted.
+    // It said small B wins by buying out rollback replay — replay is skipped
+    // when `accept_len + 1 == b`, needing ONE accepted draft at B=2 vs five at
+    // B=6, and replay was ~37% of a cycle. That is a real effect, but it is not
+    // why floor 2 wins: checkpoint rollback (394ec0156) REMOVED replay
+    // entirely, and floor 2's margin GREW rather than vanishing.
+    //
+    // Re-measured with HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1, six prompts,
+    // resident harness:
+    //
+    //     prompt                         floor 2   floor 4   floor 6
+    //     dflash_resident_smoke            56.48     50.23     42.95
+    //     humaneval_0                      86.96     88.21     80.45
+    //     humaneval_2_truncate             69.94     70.64     61.08
+    //     coherence_sheep_reason           98.05     86.18    101.83
+    //     lru_cache_pep8_strict            85.52     79.30     82.05
+    //     coherence_lloyd_long             69.14     60.85     59.16
+    //     MEAN                             77.68     72.57     71.25
+    //
+    // +7.0% over floor 4 with replay gone, against +3.6% with replay present.
+    // So the floor-2 advantage is INDEPENDENT of replay. The remaining
+    // candidates are that draft cost scales with B while tau grows sublinearly,
+    // and that a rejected block wastes verify work proportional to B — neither
+    // has been isolated. Keep floor 2 on the evidence; do not restate a
+    // mechanism until one is measured.
     //
     // Six prompts, decode tok/s, both arms back-to-back in ONE harness:
     //
@@ -2238,6 +2258,7 @@ fn main() {
         let mut rollback_replay_prefix_verify: usize = 0;
         let mut rollback_replay_serial_tape: usize = 0;
         let mut rollback_replay_verify_complete: usize = 0;
+        let mut rollback_replay_checkpoint: usize = 0;
         let mut verify_graph_direct: usize = 0;
         let mut verify_graph_warmup: usize = 0;
         let mut verify_graph_capture: usize = 0;
@@ -2618,6 +2639,7 @@ fn main() {
                 speculative::SpecRollbackReplayKind::VerifyComplete => {
                     rollback_replay_verify_complete += 1
                 }
+                speculative::SpecRollbackReplayKind::Checkpoint => rollback_replay_checkpoint += 1,
             }
             match step.verify_graph_mode {
                 speculative::SpecVerifyGraphMode::Direct => verify_graph_direct += 1,
@@ -2955,7 +2977,7 @@ fn main() {
             stats.mean_committed(),
         );
         eprintln!(
-            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_batched_prefill={} replay_full_prefill={} replay_prefix_verify={} replay_serial_tape={} replay_verify_complete={}",
+            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_batched_prefill={} replay_full_prefill={} replay_prefix_verify={} replay_serial_tape={} replay_verify_complete={} replay_checkpoint={}",
             rollback_checked_cycles,
             rollback_single_session_ok,
             rollback_multi_request_disabled,
@@ -2965,6 +2987,7 @@ fn main() {
             rollback_replay_prefix_verify,
             rollback_replay_serial_tape,
             rollback_replay_verify_complete,
+            rollback_replay_checkpoint,
         );
         eprintln!(
             "verify_graph: direct={} warmup={} capture={} replay={} not_applicable={}",
