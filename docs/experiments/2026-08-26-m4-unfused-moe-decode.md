@@ -135,6 +135,20 @@ Do not wrap `hipfire bench` in `hipfire lock` — it drives the daemon, which
 takes the lock itself. Clear a lingering daemon by the pid you recorded; never
 `pkill -f`, which matches the calling shell's own command line.
 
+⚠️ **`hipfire bench` omits `dflash_mode` from its load request**, so the daemon
+falls through to `.unwrap_or("auto")` and will **auto-pair a sibling DFlash
+drafter by filename** if one exists next to the model (or in a drafts search
+dir). On such a box these commands would silently measure *speculative decode*
+rather than plain decode, and the MoE arm comparison would be meaningless.
+
+The numbers above are unaffected — `~/.hipfire/drafts/` does not exist on nix1
+and there is no `*dflash*` sidecar in `~/.hipfire/models/`, so nothing was
+discoverable — but that was luck, not design. **Before reproducing this
+elsewhere, check for a sibling drafter**, and prefer a client that sends
+`dflash_mode` explicitly (`hipfire chat`, `hipfire-eval --dflash off`) if one
+exists. Mechanism confirmed by capture on halo: absent field reproduces the
+`quant_type=36` load failure exactly; `"off"` loads cleanly.
+
 ## A coverage hole in tiny-affected-gate, found while validating this change
 
 `./tests/tiny-affected-gate.sh --base origin/master --require-coverage` on the

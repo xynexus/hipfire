@@ -134,10 +134,13 @@ layering):
   runs; `random` seeds each stream from entropy and would make the decode output
   differ run to run for reasons unrelated to interleaving.
 
-Record the values you actually used. `plan_model_residency` currently chooses
-the mode **silently** — the plan's `reason` field says `"admitted"` whether or
-not it downgraded `full` → `qwen_moe_modules` — so if you want to know which
-mode you got, log it explicitly rather than inferring it.
+Record the values you actually used.
+
+**Corrected 2026-08-26 by the halo run:** this section used to say
+`plan_model_residency` chooses the mode silently and told you to log it by hand.
+It does not need logging — the daemon's `resource_status` reports
+`residency_mode` per worker. (The `reason` field on the plan itself is still
+`"admitted"` either way, which is what the original claim was reading.)
 
 ## 6. What to bring back
 
@@ -147,8 +150,17 @@ mode you got, log it explicitly rather than inferring it.
 - The verdict, with the worst-case deviation.
 - Exact config: residency mode actually used, VRAM budget/headroom, model paths,
   `sampler_rng`, step count, LoRA rank/target modules.
-- `rocm-smi` peak memory across each run — the residency claim is half the
-  point of running on halo, so show the pressure was real.
+- Evidence that the served model stayed resident across the training quanta —
+  the residency claim is half the point of running on halo.
+
+  ⚠️ **Corrected 2026-08-26: do NOT use `rocm-smi` for this on halo.** This line
+  used to ask for `rocm-smi` peak memory, and that is a trap on this host:
+  `rocm-smi --showmeminfo vram` reports the 512 MB *dedicated* carveout
+  (536,870,912 B), flat across every run, because these models live in the
+  ~120 GB GTT pool it cannot see. Following it literally yields a flat line and
+  the false conclusion that nothing was resident. Use the daemon's
+  `resource_status` (`resident_vram_bytes`, `total_resident_bytes`, per-worker
+  `residency_mode`) instead.
 - Anything that surprised you. Failed approaches are worth documenting; they
   narrow the search space.
 
@@ -172,10 +184,20 @@ actually says:
 - The **daemon never reads that env var**. `dflash_mode` arrives only inside the
   load request params (`hipfire-daemon/src/handlers/lifecycle.rs:225`), and
   `.unwrap_or("auto")` when the field is absent.
-- Only clients calling `load_params_from_config` forward it — the CLI chat path
-  and `hipfire-server`. **`hipfire-eval` does not**: it builds params from its
-  own `DflashMode` (`--dflash`, default `Off`, `hipfire-eval/src/config.rs:43`),
-  which never consults `HipfireConfig`.
+- Clients calling `load_params_from_config` forward it — the CLI chat path and
+  `hipfire-server`.
+- **Corrected 2026-08-26 by the halo run.** An earlier version of this line said
+  "`hipfire-eval` does not [forward it]". That is **wrong**, and the grep that
+  disproves it was already on screen when it was written:
+  `hipfire-eval/src/executor_daemon.rs:605,615` both send
+  `dflash_mode: Some(config.dflash.as_str().to_string())`. Eval forwards its own
+  `--dflash` (default `Off`, `hipfire-eval/src/config.rs:43`) — so a default eval
+  run sends `"off"` and *cannot* cause the reported failure. The accurate half of
+  the original claim is only that eval never consults `HipfireConfig`, so
+  `HIPFIRE_DFLASH_MODE` is invisible to it.
+- The clients that **omit** the field entirely — and therefore hit the
+  `.unwrap_or("auto")` default — are **`hipfire-cli bench`** (nothing in
+  `commands/bench.rs`) and **`hipfire-daemon-adapter`** (no occurrence at all).
 - Anything other than `off` then lets `hipfire-serving-core/src/load.rs:857`
   auto-pair a sibling drafter **by filename** from the drafts directory. halo has
   `Qwen3.5-35B-A3B--dflash.oq4+.hfq` sitting there.
