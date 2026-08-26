@@ -1030,15 +1030,33 @@ pub fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     }
     let v1 = &magic == MAGIC_V1;
     let total = f.metadata()?.len();
+    // The index footer is the last thing written, so a plausible one is what
+    // separates "archive" from "interrupted write". Validate it before seeking
+    // by it: garbage offsets otherwise surface as bare OS errors (EINVAL),
+    // which is exactly what a user sent here to judge a suspect file gets.
+    let truncated = || {
+        format!(
+            "{}: no valid index footer — the archive is truncated, most likely \
+             an interrupted download or pack; re-fetch or re-pack it",
+            archive.display()
+        )
+    };
+    if total < 24 {
+        return Err(truncated().into());
+    }
     f.seek(SeekFrom::Start(total - 16))?;
     let mut b = [0u8; 16];
     f.read_exact(&mut b)?;
     let io = u64::from_le_bytes(b[..8].try_into()?);
     let il = u64::from_le_bytes(b[8..].try_into()?);
+    if io < 8 || il == 0 || io.checked_add(il).map_or(true, |end| end + 16 != total) {
+        return Err(truncated().into());
+    }
     f.seek(SeekFrom::Start(io))?;
     let mut ib = vec![0u8; il as usize];
     f.read_exact(&mut ib)?;
-    let index: serde_json::Value = serde_json::from_slice(&ib)?;
+    let index: serde_json::Value = serde_json::from_slice(&ib)
+        .map_err(|e| format!("{}: index footer is unreadable: {e}", archive.display()))?;
     let files = index
         .get("files")
         .and_then(|v| v.as_array())
@@ -1730,5 +1748,24 @@ mod tests {
         // A zero-length tensor owns no bytes and needs no piece; the header it is
         // described by is stored verbatim.
         assert!(!named.contains(&"empty"));
+    }
+}
+
+#[cfg(test)]
+mod check_footer_tests {
+    #[test]
+    fn truncated_archive_reports_truncation_not_an_os_error() {
+        let dir = std::env::temp_dir().join(format!("hfa-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("partial.hfa");
+        // Valid magic followed by payload bytes cut off mid-write: no footer.
+        std::fs::write(&p, [&super::MAGIC[..], &[0u8; 4096]].concat()).unwrap();
+        let msg = super::check(&p).unwrap_err().to_string();
+        assert!(msg.contains("truncated"), "got: {msg}");
+        // Shorter than even a footer.
+        std::fs::write(&p, &super::MAGIC[..]).unwrap();
+        let msg = super::check(&p).unwrap_err().to_string();
+        assert!(msg.contains("truncated"), "got: {msg}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -60,7 +60,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             hipfire_coexistence::export_safetensors::run_cli(&args[2..])
         }
         (Some("repack"), _) => hipfire_coexistence::repack::run_cli(&args[1..]),
-        (Some("hub"), Some(op)) => hub_cli(op, &args[2..]),
+        (Some("download"), Some(repo)) if !repo.starts_with("--") => {
+            hub_cli("fetch", Some(repo), &args[2..])
+        }
+        (Some("hub"), Some("fetch")) => {
+            Err("`hub fetch` moved: use `hipfire-coexistence download <org/name>`".into())
+        }
+        (Some("hub"), Some(op)) => hub_cli(op, None, &args[2..]),
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
@@ -104,10 +110,12 @@ fn usage() {
          import safetensors --input <hf_dir> --output <model.hfq> [--arch <family>]\n\
          export safetensors --input <model.hfq> --output <hf_dir> \
          [--arch <family>] [--shard-size 5G]\n\
-         hub fetch  --repo <org/name> [--revision <sha|main>] [--include <glob>] \
+         download <org/name> [--revision <sha|main>] [--include <glob>] \
          [--dest <dir>] [--output <archive.hfa>] [--force] [--raw] [--jobs <n>]\n\
          \x20            default: streams into ~/.hipfire/models/models--Org--Name.hfa,\n\
          \x20            encoding as it downloads so the raw checkpoint is never staged.\n\
+         \x20            an interrupted run leaves <archive>.hfa.part and restarts\n\
+         \x20            automatically on the next download.\n\
          \x20            --raw fetches a HuggingFace cache tree instead. --jobs (default 4)\n\
          \x20            opens that many connections: whole files in raw mode, ranged\n\
          \x20            windows within each file in archive mode.\n\
@@ -595,14 +603,19 @@ fn archive_root() -> PathBuf {
 /// the raw checkpoint is never staged. `--raw` restores the older behaviour of
 /// materialising a HuggingFace cache tree, which is what you want when another
 /// tool has to read the checkpoint as files.
-fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
+fn hub_cli(op: &str, repo_arg: Option<&str>, args: &[String]) -> Result<(), Box<dyn Error>> {
     let val = |k: &str| -> Option<String> {
         args.iter()
             .position(|a| a == k)
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let repo = val("--repo").ok_or("hub: --repo <org/name> is required")?;
+    // `download <org/name>` passes the repo positionally; verify/repair still
+    // take --repo. A --provider flag can join here when a second source exists.
+    let repo = repo_arg
+        .map(str::to_string)
+        .or_else(|| val("--repo"))
+        .ok_or("hub: --repo <org/name> is required")?;
     let revision = val("--revision").unwrap_or_else(|| "main".to_string());
     let raw = args.iter().any(|a| a == "--raw");
     let force = args.iter().any(|a| a == "--force");
@@ -646,12 +659,28 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     )
                     .into());
                 }
+                // The archive is written under a `.part` marker and only
+                // renamed into place once complete and digest-verified, so the
+                // final name never holds a truncated file. A leftover marker is
+                // by definition from an interrupted run: restart it without
+                // ceremony.
+                // ponytail: restart re-downloads completed files too; per-file
+                // resume needs a sidecar manifest of finished entries (the
+                // index is only written at the end) — add if multi-shard
+                // interrupts get common.
+                let part = PathBuf::from(format!("{}.part", archive.display()));
+                if part.exists() {
+                    eprintln!(
+                        "hub: {} is a partial archive from an interrupted run — restarting",
+                        part.display()
+                    );
+                }
                 if let Some(p) = archive.parent() {
                     std::fs::create_dir_all(p)?;
                 }
                 let files = hipfire_hub::list_files(&repo, &revision).await?;
                 hipfire_coexistence::hub_archive::fetch_to_archive(
-                    &archive,
+                    &part,
                     &repo,
                     &revision,
                     include.as_deref(),
@@ -659,6 +688,7 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     jobs,
                 )
                 .await?;
+                std::fs::rename(&part, &archive)?;
                 eprintln!("hub: wrote {}", archive.display());
             }
             "fetch" => {
