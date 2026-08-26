@@ -35,6 +35,16 @@ pub struct PrefillBatchScratch {
     /// capture.
     pub dn_s_snapshots: Vec<GpuTensor>,
 
+    /// Per-token conv-ring checkpoints for DFlash rollback, one entry per
+    /// DeltaNet layer, each `max_batch * n_channels * 3` F32 (the ring after
+    /// token t at slot t, same [c*3 + {0,1,2}] layout as `conv_states`).
+    ///
+    /// Small next to `dn_s_snapshots` (~40 MB vs ~832 MB) but not optional:
+    /// the ring holds the last three conv INPUTS, and that input buffer is
+    /// per-layer scratch the next layer overwrites, so it cannot be
+    /// reconstructed once the forward has finished.
+    pub dn_conv_snapshots: Vec<GpuTensor>,
+
     // Residual stream and rotation scratch — all [N × dim]
     pub x_batch: GpuTensor,
     pub x_rot_batch: GpuTensor,
@@ -4872,9 +4882,14 @@ impl PrefillBatchScratch {
             .iter()
             .filter(|t| **t == LayerType::LinearAttention)
             .count();
+        // Same channel expression the conv kernel and DeltaNetState use.
+        let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
         for _ in 0..n_dn_layers {
             self.dn_s_snapshots
                 .push(gpu.alloc_tensor(&[self.max_batch * per_slot], DType::F32)?);
+            self.dn_conv_snapshots
+                .push(gpu.alloc_tensor(&[self.max_batch * conv_channels * 3], DType::F32)?);
         }
         Ok(())
     }
@@ -4892,6 +4907,7 @@ impl PrefillBatchScratch {
         Ok(Self {
             max_batch,
             dn_s_snapshots: Vec::new(),
+            dn_conv_snapshots: Vec::new(),
             x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_norm_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,

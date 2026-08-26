@@ -37,7 +37,20 @@ extern "C" __global__ void conv1d_silu_split_f32(
     float* __restrict__ state,
     int k_dim,
     int v_dim,
-    int n_tokens
+    int n_tokens,
+    // Per-token conv-ring checkpoints for DFlash rollback. When non-null, the
+    // ring AFTER token t lands at `state_snapshots + t * n_channels * 3`, in
+    // the same [c*3 + {0,1,2}] layout as `state`.
+    //
+    // The ring cannot be reconstructed after the fact: it holds the last three
+    // INPUTS, and `input` is per-layer scratch that the next layer overwrites,
+    // so once the forward finishes only the final layer's rows survive.
+    //
+    // Null costs one predicated branch per token. The write is placed strictly
+    // AFTER the existing math and the q/k/v stores — nothing above it moves,
+    // because the weight[] indexing there is load-bearing for byte-exactness
+    // (see the note in the loop).
+    float* __restrict__ state_snapshots
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int n_channels = 2 * k_dim + v_dim;
@@ -74,6 +87,13 @@ extern "C" __global__ void conv1d_silu_split_f32(
             k_out[t * k_dim + (c - k_dim)] = result;
         } else {
             v_out[t * v_dim + (c - 2 * k_dim)] = result;
+        }
+
+        if (state_snapshots != nullptr) {
+            float* snap = state_snapshots + (size_t)t * (size_t)n_channels * 3 + (size_t)c * 3;
+            snap[0] = x;
+            snap[1] = s0;
+            snap[2] = s1;
         }
     }
 }
