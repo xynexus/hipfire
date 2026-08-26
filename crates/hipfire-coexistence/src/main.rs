@@ -105,10 +105,12 @@ fn usage() {
          export safetensors --input <model.hfq> --output <hf_dir> \
          [--arch <family>] [--shard-size 5G]\n\
          hub fetch  --repo <org/name> [--revision <sha|main>] [--include <glob>] \
-         [--dest <dir>] [--output <archive.hfa>] [--force] [--raw]\n\
+         [--dest <dir>] [--output <archive.hfa>] [--force] [--raw] [--jobs <n>]\n\
          \x20            default: streams into ~/.hipfire/models/models--Org--Name.hfa,\n\
          \x20            encoding as it downloads so the raw checkpoint is never staged.\n\
-         \x20            --raw fetches a HuggingFace cache tree instead.\n\
+         \x20            --raw fetches a HuggingFace cache tree instead. --jobs (default 4)\n\
+         \x20            opens that many connections: whole files in raw mode, ranged\n\
+         \x20            windows within each file in archive mode.\n\
          hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
          [--only <glob>]\n\
          hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
@@ -619,6 +621,11 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     // Verify and repair read every byte they cover, so restricting them to one
     // shard is the difference between seconds and hashing the whole repo.
     let only = val("--only");
+    // Parallel connections: whole files in raw mode, ranged windows within a
+    // file in archive mode (drained in order, so the stream stays sequential).
+    let jobs = val("--jobs")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -649,13 +656,14 @@ fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
                     &revision,
                     include.as_deref(),
                     files,
+                    jobs,
                 )
                 .await?;
                 eprintln!("hub: wrote {}", archive.display());
             }
             "fetch" => {
-                let n =
-                    hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref()).await?;
+                let n = hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref(), jobs)
+                    .await?;
                 eprintln!("hub: {n} file(s) present and verified");
             }
             // An archive keeps a checksum per stored payload, not the hub's

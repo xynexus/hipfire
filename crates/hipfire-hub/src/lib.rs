@@ -142,23 +142,57 @@ fn auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-/// List a revision's files via the tree API.
+/// Pull the `rel="next"` URL out of a `Link` header, if any.
+///
+/// The hub paginates the tree API (RFC 8288 style): `<url>; rel="next"`.
+/// Ignoring it silently truncates large repos, and a truncated listing means a
+/// fetch that reports success with files missing — so every page is followed.
+fn link_next(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in link.split(',') {
+        let (url, params) = part.split_once(';')?;
+        if params.contains("rel=\"next\"") {
+            return Some(
+                url.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// List a revision's files via the tree API, following pagination.
 ///
 /// `lfs.oid` is the SHA-256 this module verifies against; the top-level `oid`
 /// is a git blob sha1 and is *not* a content hash of the file.
 pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
-    let url = format!("{HUB}/api/models/{repo}/tree/{revision}?recursive=1");
-    let resp = auth(client()?.get(&url)).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(classify(status, &format!("listing {repo}@{revision}")));
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let arr = body
-        .as_array()
-        .ok_or_else(|| Error::Fatal(format!("{repo}: tree API did not return a list")))?;
-
+    let client = client()?;
+    let mut url = format!("{HUB}/api/models/{repo}/tree/{revision}?recursive=1");
     let mut out = Vec::new();
+    loop {
+        let resp = auth(client.get(&url)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(classify(status, &format!("listing {repo}@{revision}")));
+        }
+        let next = link_next(resp.headers());
+        let body: serde_json::Value = resp.json().await?;
+        let arr = body
+            .as_array()
+            .ok_or_else(|| Error::Fatal(format!("{repo}: tree API did not return a list")))?;
+        push_tree_page(arr, &mut out);
+        match next {
+            Some(n) => url = n,
+            None => break,
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn push_tree_page(arr: &[serde_json::Value], out: &mut Vec<RepoFile>) {
     for e in arr {
         if e.get("type").and_then(|v| v.as_str()) != Some("file") {
             continue;
@@ -184,8 +218,6 @@ pub async fn list_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>> {
             git_oid,
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
 }
 
 fn classify(status: reqwest::StatusCode, what: &str) -> Error {
@@ -445,6 +477,116 @@ pub async fn fetch_file_streamed(
         )));
     }
     Ok(())
+}
+
+/// Window size for ranged parallel fetch. Small enough that the in-order
+/// drain advances every few seconds on a slow link (a 32 MiB window at the
+/// ~1.3 MB/s this link bottoms out at would trip the archiver's 10 s stall
+/// detector on every window); large enough that request setup is noise.
+const RANGE_WINDOW: u64 = 8 << 20;
+/// Below this a file takes the single stream: connection setup dominates and
+/// the windows would mostly be the whole file anyway.
+const RANGE_MIN_FILE: u64 = 64 << 20;
+
+/// [`fetch_file_streamed`] over `jobs` parallel range connections.
+///
+/// The file is cut into fixed windows from the resume point; up to `jobs`
+/// windows download concurrently, and `buffered` yields them strictly in
+/// order, so the sink and the running digest see exactly the byte sequence a
+/// single stream would deliver. Memory is bounded at ~`jobs` windows.
+///
+/// Falls back to the single stream when parallelism cannot help or cannot be
+/// verified: one connection requested, no declared size, no SHA-256 (the git
+/// blob path buffers the body anyway), or a server that refuses ranges on the
+/// first window.
+pub async fn fetch_file_streamed_ranged(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    file: &RepoFile,
+    st: &mut StreamProgress,
+    sink: &mut dyn ByteSink,
+    jobs: usize,
+) -> Result<()> {
+    if jobs <= 1 || file.size < RANGE_MIN_FILE || file.sha256.is_none() || st.consumed >= file.size
+    {
+        return fetch_file_streamed(base, repo, revision, file, st, sink).await;
+    }
+
+    use futures_util::StreamExt;
+    let path = file.path.as_str();
+    let windows = (st.consumed..file.size)
+        .step_by(RANGE_WINDOW as usize)
+        .map(|from| (from, RANGE_WINDOW.min(file.size - from)));
+    let mut bodies = futures_util::stream::iter(
+        windows.map(|(from, len)| fetch_window_with_retry(base, repo, revision, path, from, len)),
+    )
+    .buffered(jobs.min(16));
+
+    let mut first = true;
+    let mut fall_back = false;
+    while let Some(r) = bodies.next().await {
+        match r {
+            Ok(body) => {
+                sink.chunk(&body)?;
+                st.accept(&body);
+                first = false;
+            }
+            // A Fatal on the very first window before any byte landed is the
+            // range-refusing-server case fetch_range surfaces; the single
+            // stream handles that server. Any later error is real.
+            Err(Error::Fatal(_)) if first => {
+                fall_back = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    drop(bodies);
+    if fall_back {
+        return fetch_file_streamed(base, repo, revision, file, st, sink).await;
+    }
+
+    let got = hex(&st.sha.clone().finalize());
+    let want = file.sha256.as_deref().expect("checked above");
+    if got != want {
+        return Err(Error::Digest {
+            path: file.path.clone(),
+            want: want.to_string(),
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Per-window retry: transient failures cost one window, not the file. A
+/// window that still fails surfaces as Retryable so the caller's whole-file
+/// retry loop resumes from the in-order high-water mark.
+async fn fetch_window_with_retry(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    path: &str,
+    from: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    const ATTEMPTS: u32 = 8;
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        match fetch_range(base, repo, revision, path, from, len).await {
+            Err(Error::Retryable(m)) => {
+                last = Some(m);
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+            other => return other,
+        }
+    }
+    Err(Error::Retryable(format!(
+        "{path}: window at {from} failed {ATTEMPTS} attempts ({})",
+        last.unwrap_or_default()
+    )))
 }
 
 /// Fetch one byte range of a file.
@@ -715,4 +857,29 @@ pub async fn fetch_file_from(
     // holds a correct blob, and verify falls back to the whole-file digest.
     let _ = store.write_chunks(&blob_name, &ch.finish());
     Ok(final_path)
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::link_next;
+    use reqwest::header::{HeaderMap, HeaderValue, LINK};
+
+    fn map(v: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(LINK, HeaderValue::from_str(v).unwrap());
+        m
+    }
+
+    #[test]
+    fn follows_next_and_ignores_other_rels() {
+        let m = map("<https://h.co/api/models/x/tree/main?cursor=abc>; rel=\"next\"");
+        assert_eq!(
+            link_next(&m).as_deref(),
+            Some("https://h.co/api/models/x/tree/main?cursor=abc")
+        );
+        let m = map("<https://h.co/p1>; rel=\"prev\", <https://h.co/p3>; rel=\"next\"");
+        assert_eq!(link_next(&m).as_deref(), Some("https://h.co/p3"));
+        assert_eq!(link_next(&map("<https://h.co/p1>; rel=\"prev\"")), None);
+        assert_eq!(link_next(&HeaderMap::new()), None);
+    }
 }
