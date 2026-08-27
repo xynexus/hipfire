@@ -4,6 +4,38 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## HFQ requantization ignores the K %% 256 fallback, producing artifacts that panic at load
+
+**Found 2026-08-27, master `8b0ecc253`. Reproducible.**
+
+The direct path (HF dir → `--format oq4`) correctly keeps tensors whose `K` is
+not a multiple of 256 at `Q8_0`, because `Oq4G256` has a 256-wide group. The
+**requantization** path (`.hfq` → `--format oq4`, with or without
+`--tensor-format`) does not — it applies Opus to them anyway:
+
+| tensor (K=128) | direct | requant |
+|---|---|---|
+| `linear_attn.in_proj_a.weight` | `qt=3` (Q8_0) | **`qt=34`** (Oq4G256) |
+| `linear_attn.in_proj_b.weight` | `qt=3` (Q8_0) | **`qt=34`** (Oq4G256) |
+
+Loading the resulting artifact aborts:
+
+```
+hipfire-runtime/src/oq4_arch.rs:53: assertion `left == right` failed:
+OQ4G256 requires K %% 256 == 0 (got K=128)
+```
+
+- Repro: `hipfire-quantize --emit-fixture qwen3_5_moe_indexed --out hf`, then
+  `--input hf --output base.hfq --format bf16`, then
+  `--input base.hfq --output out.hfq --format oq4` → `out.hfq` panics on load.
+- The quantizer exits 0 and reports "Done", so the artifact looks good until
+  something tries to run it.
+- Severity: it is a `panic!` in the load path, so it takes the process down —
+  same class as the Oq4 MoE prefill panic fixed in #368/#369.
+- Surfaced while building an Opus-attention fixture for
+  `docs/plans/2026-08-27-is-batchable-la-opus-scope.md`; the shape guard is the
+  thing standing between that scope and a testable fixture.
+
 ## Batched MoE prefill PANICS on an `Oq4G256` MoE artifact (daemon dies)
 
 **Found 2026-08-27 on master `556249d8c`, nix1 gfx1103. Reproducible, rc=101.**

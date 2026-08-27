@@ -141,8 +141,18 @@ exist yet and has to be produced first.
 
 1. ~~Resolve the `is_mq` / `qkv_is_mq` asymmetry~~ — **retracted, no gap exists**
    (§2). Both predicates already cover all three Opus dtypes.
-2. **Produce a fixture with Opus attention** — needs per-tensor-class format
-   control in `--emit-fixture`, which does not exist today.
+2. **Produce a fixture with Opus attention.** ⚠️ **Corrected**: this does NOT
+   need new per-tensor format control. `--tensor-format <GLOB=FMT>` already
+   exists, is repeatable, and has `--tensor-source` / `--copy-untargeted`
+   companions. Used on the tiny fixture it does put Opus on the attention
+   projections (`in_proj_qkv`/`in_proj_z`/`out_proj`/`k_proj`/`o_proj` → qt=35
+   Oq8G256, Q8_0 count 11 → 4).
+
+   What blocks it instead is a **bug it exposed**: the requant path ignores the
+   `K % 256` fallback the direct path applies, so the K=128 `in_proj_a`/`in_proj_b`
+   get `Oq4G256` and the artifact panics at load with "OQ4G256 requires
+   K % 256 == 0 (got K=128)". Filed in BUGS.md. Either fix that guard, or give
+   the fixture dims ≥256 on every quantized tensor.
 3. **Widen `is_batchable_la`** to the Opus dtypes the rotation predicates
    actually cover.
 4. **Widen the MoE ladder** to accept whatever the shared-expert tensors become,
