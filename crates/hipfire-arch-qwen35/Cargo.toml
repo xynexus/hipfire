@@ -19,6 +19,7 @@ npu-kernels = []
 
 [dependencies]
 hipfire-env = { path = "../hipfire-env" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-kld = { path = "../hipfire-kld" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = [

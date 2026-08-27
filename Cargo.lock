@@ -1755,6 +1755,7 @@ name = "hipfire-arch-qwen35"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-env",

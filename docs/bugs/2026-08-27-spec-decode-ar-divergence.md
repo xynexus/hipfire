@@ -151,6 +151,59 @@ Two notes on reading that table:
   void. The metric now flattens to 1-D and asserts `cos <= 1`, so a broken metric
   cannot quietly emit a table again.
 
+## Hypothesis 3, also refuted: DeltaNet fp16 vs fp32
+
+Raised because it has exactly the right shape — there IS an f32/f16 split running
+along precisely the batched/per-token seam. Per-token calls
+`gated_delta_net_f32(`; batched calls `gated_delta_net_f16_batch_seq(`; the arm
+is chosen by `dn_state.quant`, i.e. by `HIPFIRE_DN_STATE_FP16`. And **every**
+spec-decode run in this investigation had that env var set to 1.
+
+`prefill_lowered.rs` even documents the asymmetry:
+
+> FP16 only — the FP32 arm above is batched, and batched vs per-token is
+> identical there (no narrowing). f16 narrows once per launch, so per-token
+> matters.
+
+So fp16 narrowing once per LAUNCH genuinely makes a batch of n differ from n
+single steps, while fp32 has no narrowing and is identical either way.
+
+**Refuted anyway, on both symptoms.** Qwen3.8-27B--oq4.25++, env verified to
+have taken effect (`dn_quant=` read back from the feature report, not assumed):
+
+- *Byte divergence*: with DN pinned to FP32 the spec output STILL differs from
+  AR, and the divergence lands at the same 595th character as under FP16.
+  Stronger still, AR output is byte-identical across FP32/FP16, and so is spec
+  output — DN precision changes neither stream.
+- *Faithfulness gap*: batched/per-token vs the fp32-KV reference is
+  4.760e-2 / 1.254e-2 at DN FP32 and 4.839e-2 / 1.203e-2 at DN FP16. The 3.8x
+  gap is fully present at FP32, where DeltaNet is bit-identical between paths.
+
+Keep the mechanism in mind for other models — on one where DeltaNet carries more
+of the signal it would bite, and `use_gdn_per_token` exists to neutralise it.
+It is simply not what is happening here.
+
+### Side effect worth keeping: fp16 DeltaNet is now the default
+
+Measured while refuting the above, and the reason `deltanet_state_precision`
+defaults to fp16 as of 2026-08-27:
+
+| DN state | decode tok/s | tau |
+|---|---|---|
+| fp32 | 16.78, 14.48 | 3.682 |
+| fp16 | 19.14, 18.88 | **4.103** |
+
+Generation is byte-identical to fp32 on code, prose, numbers and JSON prompts,
+and tau reproduces EXACTLY across repeats, so the +11.4% is signal rather than
+the run-to-run noise that contaminated the raw tok/s. Plain AR decode is flat,
+which locates the win: the drafter reads the verify path's hidden states and
+agrees with the fp16 ones more often, while the verifier's committed tokens are
+unchanged. That is why tau can move without the output moving.
+
+⚠️ An earlier note in this session claimed fp16 was "+11% faster" on the basis of
+a single pair of runs (15.80 vs 14.18). That was contention noise — AR decode is
+flat. The real and reproducible effect is on tau, not on raw decode rate.
+
 ## Still open: the compact 27B batched arm is a separate outlier
 
 Faithfulness to each model's own fp32-KV reference (lower is better):

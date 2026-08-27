@@ -4456,14 +4456,20 @@ mod tests {
         // it no longer SELECTS anything. The threshold that once chose Q8 above a
         // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-        // FP32 unless HIPFIRE_DN_STATE_FP16 opts in. Guarded so a developer
+        // FP16 by default as of 2026-08-27 (`deltanet_state_precision`); the
+        // env var still overrides in EITHER direction. Guarded so a developer
         // running with it exported does not see a false failure — the env is
         // process-wide and this test cannot own it.
-        if hipfire_env::DN_STATE_FP16.flag() {
-            assert_eq!(default_state_quant(&cfg), StateQuant::FP16);
+        let want = if hipfire_env::DN_STATE_FP16.is_set() {
+            if hipfire_env::DN_STATE_FP16.flag() {
+                StateQuant::FP16
+            } else {
+                StateQuant::FP32
+            }
         } else {
-            assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
-        }
+            StateQuant::FP16
+        };
+        assert_eq!(default_state_quant(&cfg), want);
     }
 
     #[test]
