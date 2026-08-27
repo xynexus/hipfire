@@ -152,3 +152,22 @@ Two separable changes:
 - Whether `ParoQ4G128` MoE artifacts are affected (they have an explicit arm, so
   presumably not).
 - gfx1151, where the grouped WMMA path differs.
+
+
+## Path-1 divergence re-checked under q8 KV (2026-08-27)
+
+The original measurement used **KVarN** KV, and the code warns that under KVarN
+"the per-token fallback is MEASURED to emit a different token stream than the
+batched path on qwen3.5 MoE, while f32 and q8 KV agree between the two". That
+raised the possibility the divergence was the KV bug rather than path 1.
+
+Re-run under **q8 KV**, which removes the confound:
+
+| configuration | vs per-token reference |
+|---|---|
+| path-1, KVarN KV | DIFFER — shared prefix 255 of 433 |
+| path-1, **q8 KV** | **DIFFER** — shared prefix 221 of 417 |
+
+The divergence persists where the two paths are documented to agree, so it is the
+batched arm's own. **`HIPFIRE_MOE_OQ4_UNIFORM_PATH1` staying opt-in is correct,
+and now for a verified reason rather than an assumed one.**
