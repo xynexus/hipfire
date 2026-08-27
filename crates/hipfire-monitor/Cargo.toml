@@ -7,8 +7,8 @@ description = "Standalone terminal system monitor backed by HIP-independent sysf
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.28"
+crossterm = "0.29"
 libc = "0.2"
-ratatui = "0.29"
+ratatui = "0.30"
 hipfire-admin-types = { path = "../hipfire-admin-types" }
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
