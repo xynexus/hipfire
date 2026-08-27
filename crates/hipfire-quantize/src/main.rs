@@ -4824,6 +4824,24 @@ fn quantize_hfq_source_tensor(
             // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
             // int8 in the compact ~4 b/w layout (130 + 2*N_out B/group, qt=36).
             // Composes AWQ + LDLQ like the Oq4 arm.
+            // qt=36 is a 256-element group and the runtime rotates it 256-wide:
+            // "256-wide FWHT rotation requires K % 256 == 0 and K > 0". The group
+            // is chosen RUN-WIDE (`opus_group`), not per tensor, so a group-256
+            // run reaches here for a K=128 tensor too and emits an artifact that
+            // cannot be loaded at all.
+            //
+            // REPRODUCED from the tiny MoE fixture: re-quantizing through the HFQ
+            // path picks up `mlp.shared_expert.down_proj [256, 128]`, which the
+            // safetensors path leaves alone (`should_quantize(name) || k % 256 != 0`),
+            // and the result hard-errors on first forward.
+            //
+            // Fall back to Q8, matching the Oq2/Oq3/Oq6/Mq3/Mq6 arms. A K%128==0
+            // tensor could instead take OqPlusCompactG128 (qt 52) and keep ~4 b/w,
+            // but that is a per-tensor group choice this function cannot make
+            // today -- the group arrives run-wide.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
             let m_dim = shape[0] as usize;
             let w8_frac =
                 outliers_per_group_for(name, OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01));
