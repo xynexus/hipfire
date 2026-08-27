@@ -277,3 +277,88 @@ early.
   the daemon — it just stops being a separate *executable*.
 - **Concurrency.** One process does not mean simultaneous kernels; induction
   interleaved with serving remains alternating quanta.
+
+---
+
+## Status — executed 2026-08-27
+
+All seven steps addressed on `feat/daemon-subcommand` (8 commits, unpushed).
+`hipfire` is one executable carrying every former binary as a subcommand:
+`daemon quantize convert eval monitor atlas steer hneurons-probe hfq
+host-profile`. All 17 standalone bin targets still build and run, so nothing
+that invokes them by name broke.
+
+| step | state | commit |
+|---|---|---|
+| 1 daemon | done | `41e9d97e7` |
+| 2 quantize + 5 aux | done | `0ad21f5ed` |
+| — runtime/env fix | done | `9acad7bb8` |
+| 3 induction | **partial** — see below | `72127c9ee` |
+| 4 eval | done | `fa32b6d4b` |
+| 5 the small ones | done | `e58996c21` |
+| 6 coexistence | done | `19e7bcc17` |
+| 7 priv-helper | **redirected** — see below | `a5c63e769` |
+
+**Size, the §7 risk, settled by measurement:** 36.9 → 72.2 MB. It replaces
+36.9 + 33.0 + 10.7 + 9.7 + 22.5 + 20.9 + … across 16 executables. The merged
+binary is smaller than the set it subsumes; nothing approached 300 MB.
+
+**End-to-end proof:** a lone `hipfire` copied into a directory that is not a git
+repo, with no `HIPFIRE_DAEMON_BIN` and no sibling binaries, spawns itself as the
+daemon and generates tokens (24.8 tok/s on halo/gfx1151).
+
+### The recurring hazard was argv, not size
+
+Two shapes, and the difference decides how much work a fold is:
+
+- **Flag-scanners** (daemon, quantizer) search argv for `--flags` position-
+  independently, so an extra leading subcommand token is invisible. Zero argv
+  work.
+- **Positional parsers** (the five conversion tools, atlas, hfq, steer, the
+  probe, eval, coexistence) index argv absolutely or `.skip(1)`, and most
+  reject the first token they do not recognise. Every one needed to be handed
+  the argv it would have had as its own binary.
+
+Guessing wrong is silent: `hipfire convert mtp-extract` failed with
+`unknown arg: convert`, and `hipfire eval qwen` would have read `eval` as the
+model name.
+
+### Corrections to this plan, found by executing it
+
+- §2's "four separate call sites" undercounted: 12 literal strings, 7
+  message-producing sites, 22 call sites in 8 crates. But resolution has ONE
+  owner, so closing the class needed zero call-site churn.
+- §7's "six arch-crate dependencies … the main structural unknown" does not
+  apply to induction. All 3,189 lines of `induction/` import exactly two
+  hipfire crates. No cycle exists.
+- §1 lists `hipfire-admin-ui` and `hipfire-chat-ui` as binaries. They are
+  wasm32 Leptos apps in the workspace `exclude` list, built by `trunk`. Not
+  native binaries; already embedded via hipfire-server's feature flags.
+- The lib split is a rename, not a code move — but only where submodules say
+  `use crate::*`. Where a `main.rs` names its own crate (`hipfire_quantize::`,
+  ×37; coexistence ×14; steer, hfq, atlas) it needs
+  `extern crate self as <name>;` or the paths rewritten.
+- `#[tokio::main]` had to go. It is what would have made `hipfire eval` panic:
+  that crate builds its own runtime and calls `block_on` at seven sites.
+
+### Step 3 — what is left, precisely
+
+Pass 1 is already in-process (M6). Pass 2 calls the quantizer, and
+`hipfire_quantize::cli::main` has **68 `std::process::exit` calls**, so
+in-process any failure kills the caller. A daemon-resident induction therefore
+needs exactly one thing and nothing else: **make the quantizer fallible**. A
+partial conversion would be worse than none. What is fixed: the orchestrator no
+longer defaults to CWD-relative `target/release/...` paths, so induction works
+from a deployed install.
+
+### Step 7 — redirected, deliberately
+
+Investigating §5's constraint surfaced a live vulnerability that predates this
+plan: `install.sh` installs the helper into user-writable `~/.hipfire/bin` and
+renders a polkit policy pinning `pkexec` to that path. Following the printed
+instructions authorises running a user-writable file as root. `hipfire doctor`
+now refuses to offer polkit elevation for any path that is not root-owned along
+its whole chain, and install.sh refuses to suggest installing the policy until
+the helper lives somewhere root owns. The embedding itself still wants the
+security review §6 asked for — it needs a privileged emit target, an embedded
+hash re-verified after write, and `O_EXCL`.
