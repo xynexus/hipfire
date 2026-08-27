@@ -59,20 +59,38 @@ onto the shared lowered super-ops. Those super-ops carry the machinery:
 So the codebase already asserts, in the MoE path, that the attention arms rotate
 for Opus.
 
-### The concrete gap: `is_mq` and `qkv_is_mq` disagree
+### ⚠️ RETRACTED: there is no `is_mq` / `qkv_is_mq` gap
 
-| predicate | Opus coverage |
-|---|---|
-| `qkv_is_mq` (`prefill_lowered.rs:99`) | `Oq4G256`, `Oq8G256`, `OqCompactG256` |
-| **`is_mq`** (`prefill_lowered.rs:2378`) | **`Oq4G256` only** |
+An earlier revision of this scope claimed `is_mq` covered `Oq4G256` only while
+`qkv_is_mq` covered all three, made that "step 1", and called it "small, and
+everything else depends on it". **That was wrong — I truncated the `sed` window
+and reported the truncation as a finding.** Parsed in full, the two are
+identical:
 
-`is_mq` omits `Oq8G256` and `OqCompactG256`. Since `oq8++` is the like-for-like
-replacement for `Q8_0`, **that omission is directly on the migration path**.
-Either it is an oversight to fix, or there is a reason the non-QKV projections
-cannot rotate those two — and that reason is not written down anywhere.
+```
+qkv_is_mq (8): MFP4G32 MQ3G256 MQ3G256Lloyd MQ4G256 MQ6G256 Oq4G256 Oq8G256 OqCompactG256
+is_mq     (8): MFP4G32 MQ3G256 MQ3G256Lloyd MQ4G256 MQ6G256 Oq4G256 Oq8G256 OqCompactG256
+```
 
-**This is the first thing to settle.** It is a small, checkable question and the
-rest of the scope depends on the answer.
+(Same class of error as the `head -8` that made an earlier panic-count look like
+it had grown. A truncated view of a list is not a finding about the list.)
+
+**This makes the scope easier, not harder.** The rotation support for all three
+Opus dtypes is already complete on both attention paths — there is no
+prerequisite to fix before widening `is_batchable_la`.
+
+It also locates the "garbage: PPL 3.5e6" number that justifies the exclusion. It
+is not a general claim about Opus attention; it is the comment recording a
+historical bug in *these very predicates*:
+
+> *"Opus W8A8 needs the SAME FWHT rotation as W4A4 — its weights are rotated
+> offline too. Omitting it here fed the oq8 GEMM an unrotated activation
+> (garbage: PPL 3.5e6)."*
+
+That omission was already fixed — which is why both predicates list `Oq8G256`
+today. So the failure the `is_batchable_la` exclusion cites has **already been
+repaired at the layer that actually rotates**, strengthening the case that the
+exclusion is vestigial.
 
 ## 3. Widening `is_batchable_la` alone is NOT sufficient
 
@@ -121,8 +139,8 @@ exist yet and has to be produced first.
 
 ## 5. Order of work
 
-1. **Resolve the `is_mq` / `qkv_is_mq` asymmetry** (§2). Small, and everything
-   else depends on it.
+1. ~~Resolve the `is_mq` / `qkv_is_mq` asymmetry~~ — **retracted, no gap exists**
+   (§2). Both predicates already cover all three Opus dtypes.
 2. **Produce a fixture with Opus attention** — needs per-tensor-class format
    control in `--emit-fixture`, which does not exist today.
 3. **Widen `is_batchable_la`** to the Opus dtypes the rotation predicates
@@ -134,9 +152,9 @@ exist yet and has to be produced first.
    by the same gate — it is opt-in today precisely because that evidence is
    missing.
 
-Steps 1–2 are prerequisites and can start now. **Step 6 of the migration
-(re-encoding Q8) must not land before step 3**, or every oq4 MoE artifact loses
-batched prefill with no error to point at.
+Step 2 is the only prerequisite and can start now. **Re-encoding Q8 (step 5)
+must not land before step 3**, or every oq4 MoE artifact loses batched prefill
+with no error to point at.
 
 ## 6. What made this findable
 
