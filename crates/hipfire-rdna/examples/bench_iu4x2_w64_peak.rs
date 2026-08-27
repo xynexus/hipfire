@@ -13,7 +13,9 @@
 use hipfire_rdna::Gpu;
 use std::time::Instant;
 
-const GROUP: usize = 256;
+/// Swept: the compact dispatches accept 256 or 128, and `OqPlusCompactG128`
+/// (qt=52) is a real on-disk format, but the timing benches were 256-only.
+const GROUPS: [usize; 2] = [256, 128];
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
@@ -26,45 +28,48 @@ fn main() {
     println!("gemm_oq_compact_iu4x2_w64 vs iu4 issue ceiling ({peak:.1} TOPS)\n");
     println!("  proj                  M      K    B      ms   hwTOPS  %peak  usefulTOPS");
 
-    for &(name, m, k, b) in &[
-        ("gate/up", 17408usize, 5120usize, 512usize),
-        ("down", 5120, 17408, 512),
-        ("qkv", 6144, 5120, 512),
-        ("wo", 5120, 4096, 512),
-        ("gate/up B=2048", 17408, 5120, 2048),
-    ] {
-        let ng = k / GROUP;
-        let stride = 2 + GROUP / 2 + 2 * 3;
-        let mut dev = vec![0u8; m * ng * stride];
-        for v in dev.iter_mut() {
-            *v = rnd();
-        }
-        let x: Vec<u8> = (0..b * k).map(|_| rnd()).collect();
-        let xs: Vec<f32> = (0..b * ng).map(|_| 0.01f32).collect();
-        let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
-        let xb = gpu.upload_raw(&x, &[x.len()]).expect("x");
-        let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
-        let yb = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).expect("y");
+    for group in GROUPS {
+        println!("-- group={group} --");
+        for &(name, m, k, b) in &[
+            ("gate/up", 17408usize, 5120usize, 512usize),
+            ("down", 5120, 17408, 512),
+            ("qkv", 6144, 5120, 512),
+            ("wo", 5120, 4096, 512),
+            ("gate/up B=2048", 17408, 5120, 2048),
+        ] {
+            let ng = k / group;
+            let stride = 2 + group / 2 + 2 * 3;
+            let mut dev = vec![0u8; m * ng * stride];
+            for v in dev.iter_mut() {
+                *v = rnd();
+            }
+            let x: Vec<u8> = (0..b * k).map(|_| rnd()).collect();
+            let xs: Vec<f32> = (0..b * ng).map(|_| 0.01f32).collect();
+            let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
+            let xb = gpu.upload_raw(&x, &[x.len()]).expect("x");
+            let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
+            let yb = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).expect("y");
 
-        for _ in 0..3 {
-            gpu.gemm_oq_compact_iu4x2_w64(&wb, &xb, &xsb, &yb, m, k, b, stride)
-                .expect("warm");
+            for _ in 0..3 {
+                gpu.gemm_oq_compact_iu4x2_w64(&wb, &xb, &xsb, &yb, m, k, b, stride)
+                    .expect("warm");
+            }
+            gpu.device_synchronize().expect("sync");
+            let iters = 20usize;
+            let t = Instant::now();
+            for _ in 0..iters {
+                gpu.gemm_oq_compact_iu4x2_w64(&wb, &xb, &xsb, &yb, m, k, b, stride)
+                    .expect("run");
+            }
+            gpu.device_synchronize().expect("sync");
+            let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            // 2 ops per MAC, and the kernel retires 2 iu4 passes per MAC.
+            let useful = 2.0 * m as f64 * k as f64 * b as f64 / (ms * 1e-3) / 1e12;
+            let hw = 2.0 * useful;
+            println!(
+                "  {name:<16} {m:6} {k:6} {b:4}  {ms:6.2}  {hw:7.1}  {:5.1}%  {useful:10.1}",
+                hw / peak * 100.0
+            );
         }
-        gpu.device_synchronize().expect("sync");
-        let iters = 20usize;
-        let t = Instant::now();
-        for _ in 0..iters {
-            gpu.gemm_oq_compact_iu4x2_w64(&wb, &xb, &xsb, &yb, m, k, b, stride)
-                .expect("run");
-        }
-        gpu.device_synchronize().expect("sync");
-        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        // 2 ops per MAC, and the kernel retires 2 iu4 passes per MAC.
-        let useful = 2.0 * m as f64 * k as f64 * b as f64 / (ms * 1e-3) / 1e12;
-        let hw = 2.0 * useful;
-        println!(
-            "  {name:<16} {m:6} {k:6} {b:4}  {ms:6.2}  {hw:7.1}  {:5.1}%  {useful:10.1}",
-            hw / peak * 100.0
-        );
     }
 }

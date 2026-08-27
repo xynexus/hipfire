@@ -15,7 +15,13 @@
 use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
-const GROUP: usize = 256;
+/// Group sizes swept. `OqPlusCompactG128` (qt=52) is a real on-disk format with
+/// its own resident `DType::OqCompactG128` path, and every compact dispatch
+/// asserts "compact group must be 256 or 128" — but until now the timing benches
+/// were 256-only, so the 128 arm had parity coverage and NO perf coverage.
+/// Halving the group doubles the per-weight scale/table overhead and changes the
+/// access pattern, so it cannot be assumed to hold 256's throughput.
+const GROUPS: [usize; 2] = [256, 128];
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
@@ -25,92 +31,98 @@ fn main() {
         (seed >> 16) as u32
     };
     let n_out = 3usize;
-    let stride = 2 + GROUP / 2 + 2 * n_out; // 136 at n_out=3 => 4.25 bits
     let iters = 10usize;
 
-    println!("gemv_oq_compact_multicol at Qwen3.8-27B shapes (n_out={n_out}, stride={stride})");
+    println!("gemm_oq_compact_grouped_wmma at Qwen3.8-27B shapes (n_out={n_out})");
     println!("weight bytes only; 233 GB/s is the measured achievable ceiling\n");
-    println!("  proj             M      K    B      ms     TOPS   % of 56");
+    println!("  group  proj             M      K    B      ms     TOPS   % of 56");
 
-    for &(name, m, k, b) in &[
-        ("gate/up", 17408usize, 5120usize, 256usize),
-        ("down", 5120, 17408, 256),
-        ("qkv", 6144, 5120, 256),
-        ("wo", 5120, 4096, 256),
-        ("gate/up B=128", 17408, 5120, 128),
-        ("gate/up B=512", 17408, 5120, 512),
-    ] {
-        let ng = k / GROUP;
-        let nblk = m * ng;
-        let bytes = nblk * stride;
-        let mut blocks = vec![0u8; bytes];
-        for blk in 0..nblk {
-            let off = blk * stride;
-            let bits = (((14 + rnd() % 3) as u16) << 10) | (rnd() % 1024) as u16;
-            blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
-            for i in 0..GROUP / 2 {
-                blocks[off + 2 + i] = (rnd() & 0xff) as u8;
-            }
-            let hdr = 2 + GROUP / 2;
-            let mut used = [false; GROUP];
-            for s in 0..n_out {
-                let mut idx = (rnd() % GROUP as u32) as usize;
-                while used[idx] {
-                    idx = (idx + 1) % GROUP;
+    for group in GROUPS {
+        // bits-per-weight rises as the group shrinks: the [f16 scale] + n_out table
+        // entries are amortized over half as many weights at G=128.
+        let stride = 2 + group / 2 + 2 * n_out;
+        let bpw = 8.0 * stride as f64 / group as f64;
+        println!("  -- group={group}, stride={stride}, {bpw:.2} bits/weight --");
+        for &(name, m, k, b) in &[
+            ("gate/up", 17408usize, 5120usize, 256usize),
+            ("down", 5120, 17408, 256),
+            ("qkv", 6144, 5120, 256),
+            ("wo", 5120, 4096, 256),
+            ("gate/up B=128", 17408, 5120, 128),
+            ("gate/up B=512", 17408, 5120, 512),
+        ] {
+            let ng = k / group;
+            let nblk = m * ng;
+            let bytes = nblk * stride;
+            let mut blocks = vec![0u8; bytes];
+            for blk in 0..nblk {
+                let off = blk * stride;
+                let bits = (((14 + rnd() % 3) as u16) << 10) | (rnd() % 1024) as u16;
+                blocks[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+                for i in 0..group / 2 {
+                    blocks[off + 2 + i] = (rnd() & 0xff) as u8;
                 }
-                used[idx] = true;
-                blocks[off + hdr + 2 * s] = idx as u8;
-                blocks[off + hdr + 2 * s + 1] = (rnd() & 0xff) as u8;
-                let nb = &mut blocks[off + 2 + idx / 2];
-                *nb &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
+                let hdr = 2 + group / 2;
+                let mut used = vec![false; group];
+                for s in 0..n_out {
+                    let mut idx = (rnd() % group as u32) as usize;
+                    while used[idx] {
+                        idx = (idx + 1) % group;
+                    }
+                    used[idx] = true;
+                    blocks[off + hdr + 2 * s] = idx as u8;
+                    blocks[off + hdr + 2 * s + 1] = (rnd() & 0xff) as u8;
+                    let nb = &mut blocks[off + 2 + idx / 2];
+                    *nb &= if idx % 2 == 0 { 0xf0 } else { 0x0f };
+                }
             }
-        }
-        // Split planes: all nibble groups first, then all [f16 scale][table].
-        let side = stride - GROUP / 2;
-        let mut dev = vec![0u8; bytes];
-        for blk in 0..nblk {
-            let src = blk * stride;
-            dev[blk * (GROUP / 2)..blk * (GROUP / 2) + GROUP / 2]
-                .copy_from_slice(&blocks[src + 2..src + 2 + GROUP / 2]);
-            let d = nblk * (GROUP / 2) + blk * side;
-            dev[d..d + 2].copy_from_slice(&blocks[src..src + 2]);
-            dev[d + 2..d + side].copy_from_slice(&blocks[src + 2 + GROUP / 2..src + stride]);
-        }
+            // Split planes: all nibble groups first, then all [f16 scale][table].
+            let side = stride - group / 2;
+            let mut dev = vec![0u8; bytes];
+            for blk in 0..nblk {
+                let src = blk * stride;
+                dev[blk * (group / 2)..blk * (group / 2) + group / 2]
+                    .copy_from_slice(&blocks[src + 2..src + 2 + group / 2]);
+                let d = nblk * (group / 2) + blk * side;
+                dev[d..d + 2].copy_from_slice(&blocks[src..src + 2]);
+                dev[d + 2..d + side].copy_from_slice(&blocks[src + 2 + group / 2..src + stride]);
+            }
 
-        let xq: Vec<i8> = (0..b * k).map(|_| (rnd() % 255) as i8).collect();
-        let xs: Vec<f32> = (0..b * ng)
-            .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
-            .collect();
-        let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
-        let xqb = gpu
-            .upload_raw(
-                unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
-                &[xq.len()],
-            )
-            .expect("xq");
-        let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
-        let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
+            let xq: Vec<i8> = (0..b * k).map(|_| (rnd() % 255) as i8).collect();
+            let xs: Vec<f32> = (0..b * ng)
+                .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
+                .collect();
+            let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
+            let xqb = gpu
+                .upload_raw(
+                    unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
+                    &[xq.len()],
+                )
+                .expect("xq");
+            let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
+            let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
 
-        gpu.gemm_oq_compact_grouped_wmma(&wb, &xqb, &xsb, &yb, m, k, b, GROUP, stride)
-            .expect("warm");
-        gpu.device_synchronize().expect("sync");
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            gpu.gemm_oq_compact_grouped_wmma(&wb, &xqb, &xsb, &yb, m, k, b, GROUP, stride)
-                .expect("launch");
+            gpu.gemm_oq_compact_grouped_wmma(&wb, &xqb, &xsb, &yb, m, k, b, group, stride)
+                .expect("warm");
+            gpu.device_synchronize().expect("sync");
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                gpu.gemm_oq_compact_grouped_wmma(&wb, &xqb, &xsb, &yb, m, k, b, group, stride)
+                    .expect("launch");
+            }
+            gpu.device_synchronize().expect("sync");
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            // 2 ops per MAC, as TOPS is conventionally quoted for int8.
+            let tops = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms * 1e-3) / 1e12;
+            println!(
+                "  {group:>5}  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>7.3} {tops:>8.2} {:>8.1}%",
+                100.0 * tops / 56.0
+            );
+            let _ = bytes;
+            let _ = gpu.free_tensor(wb);
+            let _ = gpu.free_tensor(xqb);
+            let _ = gpu.free_tensor(xsb);
+            let _ = gpu.free_tensor(yb);
         }
-        gpu.device_synchronize().expect("sync");
-        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        // 2 ops per MAC, as TOPS is conventionally quoted for int8.
-        let tops = 2.0 * (m as f64) * (k as f64) * (b as f64) / (ms * 1e-3) / 1e12;
-        println!(
-            "  {name:<14} {m:>6} {k:>6} {b:>4} {ms:>7.3} {tops:>8.2} {:>8.1}%",
-            100.0 * tops / 56.0
-        );
-        let _ = bytes;
-        let _ = gpu.free_tensor(wb);
-        let _ = gpu.free_tensor(xqb);
-        let _ = gpu.free_tensor(xsb);
-        let _ = gpu.free_tensor(yb);
     }
 }
