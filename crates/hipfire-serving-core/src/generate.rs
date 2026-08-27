@@ -2071,14 +2071,17 @@ fn qwen35_sample_next_from(
 /// KVarN prefill was per-token until the 2026-08-23 coherence battery; it is
 /// batched by default now and only rolls back on an explicit `=0`.
 ///
-/// Deliberately NOT symmetric with the spec-decode gate (`kvarn_specdecode_ok`),
-/// which still requires `=1`: engaging a DFlash drafter under KVarN measured
-/// 5.77 tok/s against plain decode's 14.4 -- 2.5x SLOWER, because verify runs
-/// per-token. Flipping both together would have quietly regressed every drafter
-/// user.
+/// The spec-decode gate (`kvarn_specdecode_ok`) is now default-on too. It
+/// originally required `=1` on a 2026-08-22 measurement of 5.77 vs 14.4 tok/s
+/// plain, but two later measurements contradict that: dflash_spec_demo records
+/// near-parity drafter engagement under kvarn (57.39 vs 57.54 tok/s), and
+/// Qwen3.8-27B+dflash2 on gfx1103 measured 8.03 vs 5.2 tok/s plain -- a 1.54x
+/// WIN (docs/plans/2026-08-27-dflash-blocksize-gfx1103.md). A model that loses
+/// with its drafter under kvarn should not carry that drafter; per-model
+/// opt-out is `dflash_mode=off` (or simply no draft), not a KV-mode side gate.
 ///
-///   unset -> batched prefill, drafter OFF   (default)
-///   =1    -> batched prefill, drafter ON    (opt-in)
+///   unset -> batched prefill, drafter ON    (default)
+///   =1    -> same as unset (back-compat with the old opt-in)
 ///   =0    -> per-token prefill, drafter OFF (full rollback)
 fn kvarn_forced_per_token() -> bool {
     std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
@@ -3850,25 +3853,27 @@ pub fn generate_start(
     // KVarN window/records (and hier hot ring) unpopulated → garbage. Route kvarn
     // models to the plain AR path below (per-token forward_scratch prefill+decode).
     let kvarn_active = m.kv_cache().map(|c| c.quant_kvarn).unwrap_or(false);
-    // A drafter loads fine under KVarN and then never runs, because of the rule
-    // just above. Nothing else says so, so an operator benchmarking "DFlash on
-    // kvarn8" measures plain AR and reads it as a DFlash number. Say it once.
-    if m.dflash.is_some() && kvarn_active {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                "a DFlash drafter is loaded but KVarN is active, so decode is \
-                 running PLAIN AR. Any tok/s measured here is NOT a DFlash number. Set \
-                 HIPFIRE_KVARN_BATCHED_PREFILL=1 to route KVarN through the batched \
-                 forward and actually engage the drafter (measured coherent; see \
-                 docs/experiments/2026-08-22-kvarn-batched-prefill.md)."
-            );
-        });
-    }
+    // Default-on since 2026-08-27 (see kvarn_forced_per_token's doc comment for
+    // the measurement history); `=0` rolls back to per-token prefill with the
+    // drafter off.
     let kvarn_specdecode_ok = std::env::var("HIPFIRE_KVARN_BATCHED_PREFILL")
         .ok()
         .as_deref()
-        == Some("1");
+        != Some("0");
+    // Under the `=0` rollback a loaded drafter never runs. Nothing else says
+    // so, so an operator benchmarking "DFlash on kvarn8" would measure plain AR
+    // and read it as a DFlash number. Say it once.
+    if m.dflash.is_some() && kvarn_active && !kvarn_specdecode_ok {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "a DFlash drafter is loaded but HIPFIRE_KVARN_BATCHED_PREFILL=0 \
+                 forces KVarN per-token, so decode is running PLAIN AR. Any tok/s \
+                 measured here is NOT a DFlash number. Unset the variable to engage \
+                 the drafter."
+            );
+        });
+    }
     if m.dflash.is_some()
         && (!kvarn_active || kvarn_specdecode_ok)
         && temp <= 1e-6
