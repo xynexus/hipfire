@@ -347,6 +347,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         "gemma4_moe" | "gemma4_dense_moe" => {
             named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "dense-moe", seed)?
         }
+        "cohere2" | "cohere2_moe" | "bls" | "bls_mini_code" => {
+            toy_fixture_from_registry(hipfire_arch_api::ARCH_ID_COHERE2_MOE as u16, seed)?
+        }
         "lfm2" | "lfm2_moe" | "lfm2moe" | "lfm2_moe_text" => {
             toy_fixture_from_registry(ARCH_ID_LFM2_MOE as u16, seed)?
         }
@@ -366,7 +369,7 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
                  qwen2 (arch 7, quantize with --arch-id 7), qwen3_legacy (arch 1), dots_ocr (arch 8), \
                  gemma3 (arch 12), gemma3_vl (arch 13), \
                  minimax (arch 10), nemotron_h (arch 14), mamba2 (arch 15), zaya (arch 16), lfm2_moe (arch 11), \
-                 gemma4_dense/gemma4_ple/gemma4_moe (arch 24), llama (arch 0), \
+                 gemma4_dense/gemma4_ple/gemma4_moe (arch 24), cohere2_moe/bls (arch 25), llama (arch 0), \
                  dflash (draft sidecar). Add a tiny preset per arch as support lands."
             ));
         }

@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-arch-cohere2-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline identity and ingest policy for Cohere2-MoE/BLS models"
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"

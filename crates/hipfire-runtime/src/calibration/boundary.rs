@@ -202,6 +202,82 @@ impl BoundaryStore {
         })
     }
 
+    /// Adopt an mmap checkpoint before any transformer layer was committed.
+    ///
+    /// This is intentionally narrower than ordinary resume: it permits the
+    /// producer executable fingerprint to change only while the boundary still
+    /// contains the model input and has no committed layer/KLD/artifact state.
+    /// Callers must opt into this recovery path explicitly.
+    pub fn resume_zero_layer_mmap(
+        directory: &Path,
+        expected_rows: usize,
+        expected_width: usize,
+        expected_total_layers: usize,
+        expected_sample_fingerprint: &str,
+        expected_execution_fingerprint: &str,
+    ) -> Result<Self, CalibError> {
+        validate_geometry(expected_rows, expected_width, expected_total_layers)?;
+        if expected_execution_fingerprint.is_empty() {
+            return Err(CalibError::Checkpoint(
+                "boundary execution fingerprint must not be empty".into(),
+            ));
+        }
+        let manifest_path = directory.join(MANIFEST_FILE);
+        let bytes =
+            fs::read(&manifest_path).map_err(|error| CalibError::Checkpoint(error.to_string()))?;
+        let mut checkpoint: BoundaryCheckpoint = serde_json::from_slice(&bytes)
+            .map_err(|error| CalibError::Checkpoint(error.to_string()))?;
+        let prior_execution_fingerprint = checkpoint.execution_fingerprint.clone();
+        validate_checkpoint(
+            &checkpoint,
+            expected_sample_fingerprint,
+            &prior_execution_fingerprint,
+        )?;
+        if (checkpoint.rows, checkpoint.width, checkpoint.total_layers)
+            != (expected_rows, expected_width, expected_total_layers)
+        {
+            return Err(CalibError::Checkpoint(format!(
+                "zero-layer checkpoint geometry [{}, {}, {}] differs from expected [{expected_rows}, {expected_width}, {expected_total_layers}]",
+                checkpoint.rows, checkpoint.width, checkpoint.total_layers
+            )));
+        }
+        if checkpoint.completed_layers != 0
+            || checkpoint.active_buffer != 0
+            || checkpoint.kld_finalized
+            || checkpoint.artifact_complete
+        {
+            return Err(CalibError::Checkpoint(format!(
+                "execution identity can only be rebound at an incomplete zero-layer checkpoint; found completed_layers={}, active_buffer={}, kld_finalized={}, artifact_complete={}",
+                checkpoint.completed_layers,
+                checkpoint.active_buffer,
+                checkpoint.kld_finalized,
+                checkpoint.artifact_complete
+            )));
+        }
+        let bytes_per_buffer = boundary_bytes(checkpoint.rows, checkpoint.width)?;
+        let buffers = [
+            open_mmap(
+                &directory.join(&checkpoint.buffer_files[0]),
+                bytes_per_buffer,
+            )?,
+            open_mmap(
+                &directory.join(&checkpoint.buffer_files[1]),
+                bytes_per_buffer,
+            )?,
+        ];
+        checkpoint.execution_fingerprint = expected_execution_fingerprint.to_owned();
+        let store = Self {
+            checkpoint,
+            buffers,
+            manifest_path: Some(manifest_path),
+            bytes_per_buffer,
+        };
+        if prior_execution_fingerprint != expected_execution_fingerprint {
+            store.persist_manifest()?;
+        }
+        Ok(store)
+    }
+
     /// Resume an existing mmap checkpoint, or create a fresh one when no
     /// manifest exists. The boolean reports whether durable state was resumed.
     pub fn resume_or_create_mmap(
@@ -698,6 +774,40 @@ mod tests {
         drop(store);
         assert!(BoundaryStore::resume_mmap(&dir, "wrong", "engine-a").is_err());
         assert!(BoundaryStore::resume_mmap(&dir, "right", "engine-b").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zero_layer_resume_can_rebind_execution_identity_only_before_commit() {
+        let dir = temp_checkpoint_dir("zero-layer-rebind");
+        let mut store = BoundaryStore::create(
+            BoundaryBackend::Mmap {
+                directory: dir.clone(),
+            },
+            1,
+            2,
+            1,
+            "sample-fp",
+            "engine-a",
+        )
+        .unwrap();
+        store.write_active_rows(0, &[3.0, 4.0]).unwrap();
+        drop(store);
+
+        let rebound =
+            BoundaryStore::resume_zero_layer_mmap(&dir, 1, 2, 1, "sample-fp", "engine-b").unwrap();
+        assert_eq!(rebound.checkpoint().execution_fingerprint, "engine-b");
+        assert_eq!(rebound.read_active_rows(0, 1).unwrap(), [3.0, 4.0]);
+        drop(rebound);
+        assert!(BoundaryStore::resume_mmap(&dir, "sample-fp", "engine-a").is_err());
+
+        let mut committed = BoundaryStore::resume_mmap(&dir, "sample-fp", "engine-b").unwrap();
+        committed.write_next_rows(0, &[5.0, 6.0]).unwrap();
+        committed.commit_layer(0).unwrap();
+        drop(committed);
+        assert!(
+            BoundaryStore::resume_zero_layer_mmap(&dir, 1, 2, 1, "sample-fp", "engine-c").is_err()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

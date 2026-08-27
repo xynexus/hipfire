@@ -2395,6 +2395,14 @@ fn forward_dense_session_batch_layers_full_precision(
                     config.head_dim,
                     config.norm_eps,
                 )?;
+                record_streamed_prerope_q_if_enabled(
+                    gpu,
+                    capture_layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    row_count,
+                    config,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
@@ -2961,6 +2969,52 @@ fn capture_streamed_dense_input(
             width,
         )
         .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
+}
+
+fn record_streamed_prerope_q_if_enabled(
+    gpu: &mut Gpu,
+    layer: usize,
+    q_batch: &GpuTensor,
+    k_batch: &GpuTensor,
+    rows: usize,
+    config: &Qwen35Config,
+) -> HipResult<()> {
+    if !hipfire_runtime::triattn::tap_enabled() {
+        return Ok(());
+    }
+    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+        gpu,
+        layer,
+        &q_batch.buf,
+        rows,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    if gpu_handled {
+        return Ok(());
+    }
+
+    let q_stride = config.n_heads * config.head_dim;
+    let q_cpu = gpu.download_f32(q_batch)?;
+    if hipfire_runtime::triattn::tap_needs_k() {
+        let k_stride = config.n_kv_heads * config.head_dim;
+        let k_cpu = gpu.download_f32(k_batch)?;
+        for row in 0..rows {
+            hipfire_runtime::triattn::record_prerope_qk(
+                layer,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+                Some(&k_cpu[row * k_stride..(row + 1) * k_stride]),
+            );
+        }
+    } else {
+        for row in 0..rows {
+            hipfire_runtime::triattn::record_prerope_q(
+                layer,
+                &q_cpu[row * q_stride..(row + 1) * q_stride],
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3629,6 +3683,14 @@ fn forward_grouped_moe_session_batch_layers(
                     row_count * config.n_kv_heads,
                     config.head_dim,
                     config.norm_eps,
+                )?;
+                record_streamed_prerope_q_if_enabled(
+                    gpu,
+                    capture_layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    row_count,
+                    config,
                 )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(

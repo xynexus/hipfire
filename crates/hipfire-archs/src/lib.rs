@@ -152,9 +152,9 @@ mod tests {
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
         // 14 nemotron-h, 15 mamba2, 16 zaya, 17 krea2 (diffusion),
         // 18 qwen-image (diffusion), 19 embeddinggemma, 23 flux2 (diffusion),
-        // 24 gemma4, 0xFF template.
+        // 24 gemma4, 25 cohere2-moe, 0xFF template.
         let expected: BTreeSet<u16> = [
-            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 0xFF,
+            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25, 0xFF,
         ]
         .into_iter()
         .collect();

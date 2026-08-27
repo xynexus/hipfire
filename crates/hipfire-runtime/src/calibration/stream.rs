@@ -131,6 +131,7 @@ pub struct RmsNormLmHeadFinalizer {
     dim: usize,
     vocab_size: usize,
     norm_eps: f32,
+    logit_softcap: Option<f32>,
     max_rows: usize,
 }
 
@@ -144,6 +145,29 @@ impl RmsNormLmHeadFinalizer {
         norm_eps: f32,
         max_rows: usize,
     ) -> Result<Self, CalibError> {
+        Self::new_with_softcap(
+            gpu, norm, lm_head, dim, vocab_size, norm_eps, max_rows, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_softcap(
+        gpu: &mut Gpu,
+        norm: GpuTensor,
+        lm_head: WeightTensor,
+        dim: usize,
+        vocab_size: usize,
+        norm_eps: f32,
+        max_rows: usize,
+        logit_softcap: Option<f32>,
+    ) -> Result<Self, CalibError> {
+        if logit_softcap.is_some_and(|cap| !cap.is_finite() || cap <= 0.0) {
+            let _ = gpu.free_tensor(norm);
+            let _ = gpu.free_tensor(lm_head.buf);
+            return Err(CalibError::InvalidOptions(
+                "KLD finalizer logit softcap must be finite and positive".into(),
+            ));
+        }
         if max_rows == 0 || dim == 0 || vocab_size == 0 {
             let _ = gpu.free_tensor(norm);
             let _ = gpu.free_tensor(lm_head.buf);
@@ -164,6 +188,7 @@ impl RmsNormLmHeadFinalizer {
             dim,
             vocab_size,
             norm_eps,
+            logit_softcap,
             max_rows,
         };
         let result = (|| {
@@ -275,6 +300,10 @@ impl CalibrationFinalizer for RmsNormLmHeadFinalizer {
                 }
             }
             .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            if let Some(cap) = self.logit_softcap {
+                gpu.vector_softcap_f32(&logits, &logits, rows * tile_rows, cap)
+                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            }
             gpu.kld_tile_topk_lse_f32(
                 &logits,
                 self.top_values.as_ref().unwrap(),
@@ -428,6 +457,17 @@ pub trait CalibrationFamilyAdapter {
         model: &ModelInspection,
         job: &CalibrationJob,
     ) -> Result<CaptureRegistry, CalibError>;
+
+    /// Describe architecture-owned pre-RoPE Q capture geometry for the common
+    /// offline CASK producer. `None` means the family has no native producer;
+    /// callers must fail explicitly rather than synthesize uniform geometry.
+    fn cask_metadata(
+        &self,
+        _model: &ModelInspection,
+        _job: &CalibrationJob,
+    ) -> Result<Option<crate::triattn::TriAttnPackageMetadata>, CalibError> {
+        Ok(None)
+    }
 
     fn load_embedding(
         &mut self,

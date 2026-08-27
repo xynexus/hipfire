@@ -1002,11 +1002,9 @@ pub fn scheduler_priority_class(priority: u8) -> SchedulerPriorityClass {
 pub fn parse_server_prefill_policy_controls(
     env: &SchedulerPolicyEnv,
 ) -> ServerPrefillPolicyControls {
-    // Default ON: resident shared-prefix KV reuse — the batching/swarm design relies
-    // on byte-identical prefixes reusing prefill KV. Env vars still override.
     let resident_state_cache = parse_boolean(
         env.get("HIPFIRE_SERVER_PREFILL_STATE_CACHE"),
-        parse_boolean(env.get("HIPFIRE_SCHED_STATE_CACHE_RESIDENT"), true),
+        parse_boolean(env.get("HIPFIRE_SCHED_STATE_CACHE_RESIDENT"), false),
     );
     let resident_checkpoint_max = parse_integer(
         env.get("HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS")
@@ -1014,12 +1012,11 @@ pub fn parse_server_prefill_policy_controls(
         4,
     )
     .clamp(0, 64) as usize;
-    // Default ON: persist prefix/state checkpoints to disk too.
     let state_cache_disk = parse_boolean(
         env.get("HIPFIRE_SCHED_STATE_CACHE_DISK"),
         parse_boolean(
             env.get("HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK"),
-            true,
+            false,
         ),
     );
     let legacy_state_cache_disk = parse_boolean(

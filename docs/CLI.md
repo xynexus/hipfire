@@ -377,6 +377,9 @@ Merge a base `.hfq` and its role/feature sidecars into one bundled container (re
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model.mq4.hfq` + `Model.mtp.hfq` -> `Model.mtp.mq4.hfq`)
+* `--check` — Validate component roles, formats, architectures, geometry, lengths, digests, and reserved namespaces without writing a bundle
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace an existing output bundle. Without this flag compose fails closed when the destination exists
 
 
 
@@ -394,6 +397,8 @@ Split a bundled `.hfq` back into its base + sidecar files
 ###### **Options:**
 
 * `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Legacy bundles with a plain filename fall back to inferring roles from tensor names alone. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace existing reconstructed component files. Without this flag decompose fails closed before replacing a destination
 
 
 

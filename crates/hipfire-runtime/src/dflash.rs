@@ -26,12 +26,69 @@
 //!   equivalent to the reference's cropped draft-KV cache and avoids
 //!   one whole layer of persistence bookkeeping.
 
-use crate::hfq::{load_awq_scale, HfqFile};
+use crate::hfq::HfqFile;
 use crate::weights::WeightTensor;
 use hip_bridge::{Graph, GraphExec, HipResult};
 use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_f16_bits};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+
+/// Narrow borrowed source contract shared by standalone DFLASH HFQM files and
+/// namespaced DFLASH components embedded in a compose.v2 bundle.
+#[derive(Clone)]
+pub struct DflashTensor<'a> {
+    pub quant_type: u8,
+    pub shape: &'a [u32],
+    pub group_size: u32,
+    pub data: Cow<'a, [u8]>,
+}
+
+pub trait DflashSource {
+    fn arch_id(&self) -> u32;
+    fn metadata_json(&self) -> &str;
+    fn tensor(&self, name: &str) -> Option<DflashTensor<'_>>;
+}
+
+impl DflashSource for HfqFile {
+    fn arch_id(&self) -> u32 {
+        self.arch_id
+    }
+
+    fn metadata_json(&self) -> &str {
+        &self.metadata_json
+    }
+
+    fn tensor(&self, name: &str) -> Option<DflashTensor<'_>> {
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(DflashTensor {
+            quant_type: info.quant_type,
+            shape: &info.shape,
+            group_size: info.group_size,
+            data: Cow::Owned(data),
+        })
+    }
+}
+
+impl DflashSource for crate::hfq_compose::HfqFileComponentView<'_> {
+    fn arch_id(&self) -> u32 {
+        self.arch_id()
+    }
+
+    fn metadata_json(&self) -> &str {
+        self.metadata_json()
+    }
+
+    fn tensor(&self, name: &str) -> Option<DflashTensor<'_>> {
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(DflashTensor {
+            quant_type: info.quant_type,
+            shape: &info.shape,
+            group_size: info.group_size,
+            data: Cow::Owned(data),
+        })
+    }
+}
 
 /// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)
 /// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
@@ -121,10 +178,65 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
+    pub fn validate_target_geometry(
+        &self,
+        target_layers: usize,
+        target_hidden: usize,
+        target_vocab: usize,
+        target_rope_theta: f32,
+    ) -> Result<(), String> {
+        for (name, draft, target) in [
+            ("num_target_layers", self.num_target_layers, target_layers),
+            ("hidden_size", self.hidden, target_hidden),
+            ("vocab_size", self.vocab_size, target_vocab),
+        ] {
+            if draft != target {
+                return Err(format!(
+                    "DFLASH {name} mismatch: draft={draft}, target={target}"
+                ));
+            }
+        }
+        if (self.rope_theta - target_rope_theta).abs()
+            > 1e-5 * self.rope_theta.abs().max(target_rope_theta.abs()).max(1.0)
+        {
+            return Err(format!(
+                "DFLASH rope_theta mismatch: draft={}, target={target_rope_theta}",
+                self.rope_theta
+            ));
+        }
+        if self.block_size == 0 {
+            return Err("DFLASH block_size must be non-zero".to_string());
+        }
+        if self.target_layer_ids.is_empty()
+            || self.target_layer_ids.len() > target_layers
+            || self
+                .target_layer_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .target_layer_ids
+                .iter()
+                .any(|layer| *layer >= target_layers)
+        {
+            return Err(format!(
+                "DFLASH target_layer_ids {:?} are not a strictly increasing subset of 0..{target_layers}",
+                self.target_layer_ids
+            ));
+        }
+        Ok(())
+    }
+
     /// Parse from an HFQ file's metadata JSON. Expects the top-level
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
-        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
+        Self::from_source(hfq)
+    }
+
+    pub fn from_source(source: &(impl DflashSource + ?Sized)) -> Option<Self> {
+        if source.arch_id() != 20 {
+            return None;
+        }
+        let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
         let df = meta.get("dflash")?;
 
         let n_layers = df.get("num_hidden_layers").and_then(|v| v.as_u64())? as usize;
@@ -206,24 +318,27 @@ pub struct DflashWeights {
 
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
 fn hfq_tensor_f32(
-    hfq: &HfqFile,
+    source: &(impl DflashSource + ?Sized),
     gpu: &mut Gpu,
     name: &str,
     shape: Vec<usize>,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
+    let tensor = source
+        .tensor(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
+    let f32_data: Vec<f32> = match tensor.quant_type {
+        1 => tensor
+            .data
             .chunks_exact(2)
             .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
-        2 => data
+        2 => tensor
+            .data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        16 => data
+        16 => tensor
+            .data
             .chunks_exact(2)
             .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
@@ -243,24 +358,27 @@ fn hfq_tensor_f32(
 /// Load an optional F32-only tensor. Returns `None` when the sidecar does not
 /// carry the tensor, preserving compatibility with existing DFlash artifacts.
 fn optional_hfq_tensor_f32(
-    hfq: &HfqFile,
+    source: &(impl DflashSource + ?Sized),
     gpu: &mut Gpu,
     name: &str,
     shape: Vec<usize>,
 ) -> HipResult<Option<GpuTensor>> {
-    let Some((info, data)) = hfq.tensor_data(name) else {
+    let Some(tensor) = source.tensor(name) else {
         return Ok(None);
     };
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
+    let f32_data: Vec<f32> = match tensor.quant_type {
+        1 => tensor
+            .data
             .chunks_exact(2)
             .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
-        2 => data
+        2 => tensor
+            .data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        16 => data
+        16 => tensor
+            .data
             .chunks_exact(2)
             .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
@@ -288,18 +406,142 @@ fn optional_hfq_tensor_f32(
 /// the unaligned byte length; for MQ4 we skip shape verification (the
 /// quantized bytes are not a function of m*k alone — group padding can add
 /// up to 255 trailing bytes per row group).
+fn validate_plain_opus_tensor(
+    source: &(impl DflashSource + ?Sized),
+    tensor: &DflashTensor<'_>,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> usize {
+    const GROUP: usize = 256;
+    assert_eq!(
+        tensor.shape,
+        [m as u32, k as u32],
+        "dflash {name}: plain Opus logical shape mismatch"
+    );
+    assert_eq!(
+        tensor.group_size, GROUP as u32,
+        "dflash {name}: plain Opus group_size must be 256"
+    );
+    let metadata: serde_json::Value = serde_json::from_str(source.metadata_json())
+        .unwrap_or_else(|error| panic!("dflash {name}: invalid metadata JSON: {error}"));
+    assert_eq!(
+        metadata
+            .get("architecture")
+            .and_then(|value| value.as_str()),
+        Some("dflash"),
+        "dflash {name}: plain Opus artifact architecture must be dflash"
+    );
+    let dflash = metadata
+        .get("dflash")
+        .unwrap_or_else(|| panic!("dflash {name}: missing dflash metadata block"));
+    assert_eq!(
+        dflash.get("rotated").and_then(|value| value.as_bool()),
+        Some(false),
+        "dflash {name}: qt=45/46/47 requires explicit rotated=false"
+    );
+    let expected_name = if tensor.quant_type == 45 {
+        "oq8"
+    } else {
+        "oq4"
+    };
+    assert_eq!(
+        dflash.get("draft_dtype").and_then(|value| value.as_str()),
+        Some(expected_name),
+        "dflash {name}: quant_type and draft_dtype disagree"
+    );
+
+    let blocks = (m * k).div_ceil(GROUP);
+    assert!(blocks > 0, "dflash {name}: zero-sized plain Opus tensor");
+    assert_eq!(
+        tensor.data.len() % blocks,
+        0,
+        "dflash {name}: payload length is not an integer number of blocks"
+    );
+    let block_stride = tensor.data.len() / blocks;
+    match tensor.quant_type {
+        45 => assert_eq!(block_stride, 258, "dflash {name}: oq8 block must be 258 B"),
+        47 => assert_eq!(block_stride, 130, "dflash {name}: oq4 block must be 130 B"),
+        46 => {
+            assert!(
+                block_stride >= 132 && (block_stride - 130) % 2 == 0,
+                "dflash {name}: mixed block must be 130 + 2*N bytes"
+            );
+            let overlays = (block_stride - 130) / 2;
+            assert_eq!(
+                dflash
+                    .get("mixed_outliers_per_group")
+                    .and_then(|value| value.as_u64()),
+                Some(overlays as u64),
+                "dflash {name}: mixed overlay metadata disagrees with payload"
+            );
+            let expected_bits = 4.0625 + overlays as f64 / 16.0;
+            let actual_bits = dflash
+                .get("mixed_storage_bits")
+                .and_then(|value| value.as_f64())
+                .unwrap_or_else(|| panic!("dflash {name}: missing mixed_storage_bits"));
+            assert!(
+                (actual_bits - expected_bits).abs() <= 1e-6,
+                "dflash {name}: mixed_storage_bits={actual_bits} expected {expected_bits}"
+            );
+        }
+        other => panic!("dflash {name}: not a plain Opus quant type: {other}"),
+    }
+    let expected_token = match tensor.quant_type {
+        45 => "oq8+".to_string(),
+        47 => "oq4+".to_string(),
+        46 => format!("oq{}+", 4.0625 + ((block_stride - 130) / 2) as f64 / 16.0),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        dflash.get("quant_token").and_then(|value| value.as_str()),
+        Some(expected_token.as_str()),
+        "dflash {name}: quant_token disagrees with payload"
+    );
+    assert_eq!(
+        dflash.get("group_size").and_then(|value| value.as_u64()),
+        Some(GROUP as u64),
+        "dflash {name}: metadata group_size must be 256"
+    );
+    assert_eq!(
+        dflash.get("block_bytes").and_then(|value| value.as_u64()),
+        Some(block_stride as u64),
+        "dflash {name}: metadata block_bytes disagrees with payload"
+    );
+    assert_eq!(
+        dflash
+            .get("clip_search_recipe")
+            .and_then(|value| value.as_str()),
+        Some("symmetric_grid_v1"),
+        "dflash {name}: unsupported clip-search recipe"
+    );
+    assert!(
+        dflash
+            .get("producer_fingerprint")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty()),
+        "dflash {name}: missing producer_fingerprint"
+    );
+    for block in tensor.data.chunks_exact(block_stride) {
+        let scale = crate::quant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        assert!(scale.is_finite(), "dflash {name}: non-finite Opus scale");
+    }
+    block_stride
+}
+
 fn hfq_weight(
-    hfq: &HfqFile,
+    source: &(impl DflashSource + ?Sized),
     gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     use_f16_weights: bool,
 ) -> HipResult<WeightTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
+    let tensor = source
+        .tensor(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    let mut wt = match info.quant_type {
+    let data = tensor.data.as_ref();
+    let mut wt = match tensor.quant_type {
         1 => {
             // F16 on disk. Default: upload as F16 (no lift) and dispatch through
             // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
@@ -414,100 +656,120 @@ fn hfq_weight(
             })
         }
         45 | 46 | 47 => {
-            // Plain-basis (non-rotated) NPU sidecar formats, dequantized at
-            // load so the GPU spec-decode path can run a drafter that was
-            // built for the AIE2 projection kernels. There is no GPU kernel for
-            // these layouts (they carry no FWHT rotation), so this is a
-            // measurement path: the *weight values* are exactly the quantized
-            // ones, only the arithmetic differs. Decode is staged through f32
-            // and lands in F16 — see the dtype note at the end of this arm.
-            // Layouts are the on-disk
-            // contract documented in hipfire-quantize/src/bin/dflash_convert.rs
-            // (`Oq8Plain = 45`, `Oq4MixedPlain = 46`).
+            // Plain-basis (non-rotated) NPU sidecar formats. Production keeps
+            // the original qt=45/46/47 blocks packed on GPU and dispatches the
+            // DFLASH reference HIP kernels directly. The former host-expanded
+            // F16 route remains only behind HIPFIRE_DFLASH_OQ_ORACLE=f16.
             const GROUP: usize = 256;
             let n = m * k;
             let n_blocks = n.div_ceil(GROUP);
-            let block_bytes = data.len() / n_blocks.max(1);
-            let mut f32_data = vec![0.0f32; n_blocks * GROUP];
-            if info.quant_type == 45 {
-                assert_eq!(
-                    block_bytes,
-                    2 + GROUP,
-                    "dflash {name}: oq8-plain block must be 258 B, got {block_bytes}"
-                );
-                for b in 0..n_blocks {
-                    let off = b * block_bytes;
-                    let scale =
-                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-                    for i in 0..GROUP {
-                        f32_data[b * GROUP + i] = scale * (data[off + 2 + i] as i8) as f32;
-                    }
-                }
-            } else if info.quant_type == 47 {
-                // PURE int4: block = [f16 scale][128 nibbles] = 130 B/group.
-                // Minimum-bandwidth weight format for the AIE2 W4A8 kernel.
-                assert_eq!(
-                    block_bytes, 130,
-                    "dflash {name}: oq4-plain block must be 130 B, got {block_bytes}"
-                );
-                for b in 0..n_blocks {
-                    let off = b * block_bytes;
-                    let scale =
-                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
-                    for i in 0..128 {
-                        let byte = data[off + 2 + i];
-                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
-                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
-                    }
-                }
+            let block_bytes = validate_plain_opus_tensor(source, &tensor, name, m, k);
+            if !crate::config::get().dflash_oq_f16_oracle {
+                let gpu_dtype = match tensor.quant_type {
+                    45 => DType::DflashOq8Plain,
+                    46 => DType::DflashOq4MixedPlain,
+                    47 => DType::DflashOq4Plain,
+                    _ => unreachable!(),
+                };
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = gpu_dtype;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype,
+                    m,
+                    k,
+                    row_stride: block_bytes,
+                    paro: None,
+                    awq_scale: None,
+                })
             } else {
-                // block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)]
-                assert!(
+                let mut f32_data = vec![0.0f32; n_blocks * GROUP];
+                if tensor.quant_type == 45 {
+                    assert_eq!(
+                        block_bytes,
+                        2 + GROUP,
+                        "dflash {name}: oq8-plain block must be 258 B, got {block_bytes}"
+                    );
+                    for b in 0..n_blocks {
+                        let off = b * block_bytes;
+                        let scale = crate::quant::f16_to_f32(u16::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                        ]));
+                        for i in 0..GROUP {
+                            f32_data[b * GROUP + i] = scale * (data[off + 2 + i] as i8) as f32;
+                        }
+                    }
+                } else if tensor.quant_type == 47 {
+                    // PURE int4: block = [f16 scale][128 nibbles] = 130 B/group.
+                    // Minimum-bandwidth weight format for the AIE2 W4A8 kernel.
+                    assert_eq!(
+                        block_bytes, 130,
+                        "dflash {name}: oq4-plain block must be 130 B, got {block_bytes}"
+                    );
+                    for b in 0..n_blocks {
+                        let off = b * block_bytes;
+                        let scale = crate::quant::f16_to_f32(u16::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                        ]));
+                        let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                        for i in 0..128 {
+                            let byte = data[off + 2 + i];
+                            grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                            grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
+                        }
+                    }
+                } else {
+                    // block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)]
+                    assert!(
                     block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
                     "dflash {name}: oq4-mixed-plain block length {block_bytes} is not 130 + 2·n_out"
                 );
-                let n_out = (block_bytes - 130) / 2;
-                for b in 0..n_blocks {
-                    let off = b * block_bytes;
-                    let scale =
-                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
-                    // int4 bulk, nibbles sign-extended from 4 bits.
-                    for i in 0..128 {
-                        let byte = data[off + 2 + i];
-                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
-                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
-                    }
-                    // sparse int8 overlay wins wherever present.
-                    let tbl = off + 130;
-                    for s in 0..n_out {
-                        let pos = data[tbl + 2 * s] as usize;
-                        grp[pos] = scale * (data[tbl + 2 * s + 1] as i8) as f32;
+                    let n_out = (block_bytes - 130) / 2;
+                    for b in 0..n_blocks {
+                        let off = b * block_bytes;
+                        let scale = crate::quant::f16_to_f32(u16::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                        ]));
+                        let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                        // int4 bulk, nibbles sign-extended from 4 bits.
+                        for i in 0..128 {
+                            let byte = data[off + 2 + i];
+                            grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                            grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
+                        }
+                        // sparse int8 overlay wins wherever present.
+                        let tbl = off + 130;
+                        for s in 0..n_out {
+                            let pos = data[tbl + 2 * s] as usize;
+                            grp[pos] = scale * (data[tbl + 2 * s + 1] as i8) as f32;
+                        }
                     }
                 }
+                f32_data.truncate(n);
+                // Land in F16, not F32: the F32 draft dispatch goes through
+                // gemm_f32_batched, which has a known batch>1 transpose bug (the
+                // pure-F32 drafter scores tau=0 for the same reason). F16 is the
+                // golden WMMA path, and f16 round-trip is ~-42 dB of headroom
+                // below the int8 quantization error being measured here, so it
+                // does not perturb the comparison.
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| crate::quant::f32_to_f16(v).to_le_bytes())
+                    .collect();
+                let buf = gpu.upload_raw(&f16_bytes, &[n])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F16,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
             }
-            f32_data.truncate(n);
-            // Land in F16, not F32: the F32 draft dispatch goes through
-            // gemm_f32_batched, which has a known batch>1 transpose bug (the
-            // pure-F32 drafter scores tau=0 for the same reason). F16 is the
-            // golden WMMA path, and f16 round-trip is ~-42 dB of headroom
-            // below the int8 quantization error being measured here, so it
-            // does not perturb the comparison.
-            let f16_bytes: Vec<u8> = f32_data
-                .iter()
-                .flat_map(|&v| crate::quant::f32_to_f16(v).to_le_bytes())
-                .collect();
-            let buf = gpu.upload_raw(&f16_bytes, &[n])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F16,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
@@ -517,7 +779,7 @@ fn hfq_weight(
     // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
     // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+        wt.awq_scale = load_dflash_awq_scale(source, gpu, name, k);
     }
     Ok(wt)
 }
@@ -539,14 +801,58 @@ fn dflash_bf16_to_f16_bytes(data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+fn load_dflash_awq_scale(
+    source: &(impl DflashSource + ?Sized),
+    gpu: &Gpu,
+    weight_name: &str,
+    k: usize,
+) -> Option<GpuTensor> {
+    let sidecar_name = match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    };
+    let tensor = source.tensor(&sidecar_name)?;
+    if tensor.quant_type != 1 || tensor.shape != [k as u32] {
+        eprintln!(
+            "warning: DFLASH AWQ sidecar {sidecar_name} has incompatible type/shape; skipping"
+        );
+        return None;
+    }
+    let f32_bytes: Vec<u8> = tensor
+        .data
+        .chunks_exact(2)
+        .flat_map(|chunk| {
+            crate::quant::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])).to_le_bytes()
+        })
+        .collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+}
+
 impl DflashWeights {
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
-        Self::load_with_f16(gpu, hfq, cfg, crate::config::get().draft_f16)
+        Self::load_source(gpu, hfq, cfg)
+    }
+
+    pub fn load_source(
+        gpu: &mut Gpu,
+        source: &(impl DflashSource + ?Sized),
+        cfg: &DflashConfig,
+    ) -> HipResult<Self> {
+        Self::load_source_with_f16(gpu, source, cfg, crate::config::get().draft_f16)
     }
 
     pub fn load_with_f16(
         gpu: &mut Gpu,
         hfq: &HfqFile,
+        cfg: &DflashConfig,
+        use_f16_weights: bool,
+    ) -> HipResult<Self> {
+        Self::load_source_with_f16(gpu, hfq, cfg, use_f16_weights)
+    }
+
+    pub fn load_source_with_f16(
+        gpu: &mut Gpu,
+        hfq: &(impl DflashSource + ?Sized),
         cfg: &DflashConfig,
         use_f16_weights: bool,
     ) -> HipResult<Self> {
@@ -1198,6 +1504,9 @@ fn gemm_dispatch(
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
+        DType::DflashOq8Plain | DType::DflashOq4Plain | DType::DflashOq4MixedPlain => {
+            gpu.gemm_dflash_oq_plain(w.gpu_dtype, &w.buf, x, y, w.m, w.k, batch, w.row_stride)
+        }
         DType::MQ4G256 => {
             // Chunk on `batch` when the request exceeds the scratch capacity
             // for this w.k. `mq_x_rot` is sized to MQ_X_ROT_CHUNK_ROWS × max(...)
@@ -1288,6 +1597,9 @@ fn gemm_dispatch(
         let weight_bytes = match w.gpu_dtype {
             DType::F32 => w.m * w.k * 4,
             DType::F16 | DType::BF16 => w.m * w.k * 2,
+            DType::DflashOq8Plain | DType::DflashOq4Plain | DType::DflashOq4MixedPlain => {
+                (w.m * w.k).div_ceil(256) * w.row_stride
+            }
             // HFQ4/MQ4: 136B per group of 256
             _ => w.m * (w.k / 256).max(1) * 136,
         };
@@ -2019,8 +2331,73 @@ pub fn draft_forward_opts(
 
 #[cfg(test)]
 mod dtype_tests {
-    use super::{dflash_bf16_load_dtype, dflash_bf16_to_f16_bytes};
+    use super::{
+        dflash_bf16_load_dtype, dflash_bf16_to_f16_bytes, validate_plain_opus_tensor, DflashConfig,
+        DflashSource, DflashTensor,
+    };
     use hipfire_rdna::DType;
+    use std::borrow::Cow;
+
+    struct MetadataSource(String);
+
+    impl DflashSource for MetadataSource {
+        fn arch_id(&self) -> u32 {
+            20
+        }
+
+        fn metadata_json(&self) -> &str {
+            &self.0
+        }
+
+        fn tensor(&self, _name: &str) -> Option<DflashTensor<'_>> {
+            None
+        }
+    }
+
+    fn metadata(dtype: &str, rotated: bool, overlays: Option<usize>) -> MetadataSource {
+        let block_bytes = if dtype == "oq8" {
+            258
+        } else {
+            130 + 2 * overlays.unwrap_or(0)
+        };
+        let quant_token = if dtype == "oq8" {
+            "oq8+".to_string()
+        } else if let Some(count) = overlays {
+            format!("oq{}+", 4.0625 + count as f64 / 16.0)
+        } else {
+            "oq4+".to_string()
+        };
+        MetadataSource(
+            serde_json::json!({
+                "architecture": "dflash",
+                "dflash": {
+                    "draft_dtype": dtype,
+                    "rotated": rotated,
+                    "mixed_outliers_per_group": overlays,
+                    "mixed_storage_bits": overlays.map(|n| 4.0625 + n as f64 / 16.0),
+                    "quant_token": quant_token,
+                    "group_size": 256,
+                    "block_bytes": block_bytes,
+                    "clip_search_recipe": "symmetric_grid_v1",
+                    "producer_fingerprint": "test-producer",
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn tensor(quant_type: u8, stride: usize, group_size: u32) -> DflashTensor<'static> {
+        let mut bytes = vec![0u8; stride * 2]; // shape 2x256 = two groups
+        for block in bytes.chunks_exact_mut(stride) {
+            block[..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+        }
+        DflashTensor {
+            quant_type,
+            shape: &[2, 256],
+            group_size,
+            data: Cow::Owned(bytes),
+        }
+    }
 
     #[test]
     fn bf16_draft_weights_stay_native_on_bf16_wmma_arches() {
@@ -2040,5 +2417,107 @@ mod dtype_tests {
     fn bf16_fallback_conversion_preserves_representable_values() {
         let bf16 = [0x80, 0x3f, 0x00, 0xc0]; // 1.0, -2.0
         assert_eq!(dflash_bf16_to_f16_bytes(&bf16), [0x00, 0x3c, 0x00, 0xc0]);
+    }
+
+    #[test]
+    fn target_geometry_allows_independent_draft_attention_shape() {
+        let draft = DflashConfig {
+            n_layers: 5,
+            hidden: 4096,
+            intermediate: 12288,
+            n_heads: 32,
+            n_kv_heads: 8,
+            head_dim: 128,
+            vocab_size: 248320,
+            norm_eps: 1e-6,
+            rope_theta: 10_000_000.0,
+            block_size: 16,
+            mask_token_id: 248070,
+            target_layer_ids: vec![1, 8, 15, 22, 29],
+            num_target_layers: 32,
+        };
+        // Qwen3.5-9B target geometry is 16 Q heads x 256, but those fields are
+        // not part of the hidden-state/vocabulary interface to this drafter.
+        draft
+            .validate_target_geometry(32, 4096, 248320, 10_000_000.0)
+            .unwrap();
+    }
+
+    #[test]
+    fn plain_opus_contract_accepts_exact_qt45_qt46_qt47_layouts() {
+        assert_eq!(
+            validate_plain_opus_tensor(
+                &metadata("oq8", false, None),
+                &tensor(45, 258, 256),
+                "w",
+                2,
+                256
+            ),
+            258
+        );
+        assert_eq!(
+            validate_plain_opus_tensor(
+                &metadata("oq4", false, None),
+                &tensor(47, 130, 256),
+                "w",
+                2,
+                256
+            ),
+            130
+        );
+        assert_eq!(
+            validate_plain_opus_tensor(
+                &metadata("oq4", false, Some(3)),
+                &tensor(46, 136, 256),
+                "w",
+                2,
+                256
+            ),
+            136
+        );
+    }
+
+    #[test]
+    fn plain_opus_contract_rejects_rotated_or_malformed_payloads() {
+        assert!(std::panic::catch_unwind(|| {
+            validate_plain_opus_tensor(
+                &metadata("oq4", true, None),
+                &tensor(47, 130, 256),
+                "w",
+                2,
+                256,
+            )
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            validate_plain_opus_tensor(
+                &metadata("oq4", false, Some(2)),
+                &tensor(46, 136, 256),
+                "w",
+                2,
+                256,
+            )
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            validate_plain_opus_tensor(
+                &metadata("oq8", false, None),
+                &tensor(45, 258, 128),
+                "w",
+                2,
+                256,
+            )
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn plain_opus_contract_rejects_non_finite_scales() {
+        let mut bad = tensor(47, 130, 256);
+        bad.data.to_mut()[..2].copy_from_slice(&0x7c00u16.to_le_bytes()); // +inf
+        assert!(std::panic::catch_unwind(|| {
+            validate_plain_opus_tensor(&metadata("oq4", false, None), &bad, "w", 2, 256)
+        })
+        .is_err());
     }
 }

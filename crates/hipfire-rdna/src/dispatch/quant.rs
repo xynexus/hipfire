@@ -14,6 +14,226 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 impl Gpu {
+    /// Ensure reusable plain-basis DFLASH activation staging for `n` rows.
+    /// Capacity only grows; sequential projections safely reuse it on the same
+    /// stream. `k` is G256-aligned for the staged W4A8/W8A8 path.
+    fn ensure_dflash_oq_scratch(&mut self, n: usize, k: usize) -> HipResult<()> {
+        let need_xq = n * k;
+        let need_xs = n * (k / 256);
+        if self
+            .dflash_oq_xq_batch
+            .as_ref()
+            .map(|t| t.numel() < need_xq)
+            .unwrap_or(true)
+        {
+            self.dflash_oq_xq_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if self
+            .dflash_oq_xs_batch
+            .as_ref()
+            .map(|t| t.numel() < need_xs)
+            .unwrap_or(true)
+        {
+            self.dflash_oq_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
+        Ok(())
+    }
+
+    /// Packed plain-basis DFLASH Opus production dispatch. G256-aligned rows use
+    /// the fused A8+dot4 path; ragged rows retain the exact scalar-F16 fallback
+    /// because checkpoint blocks can cross logical row boundaries there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dflash_oq_plain(
+        &mut self,
+        dtype: DType,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const QUANT_CHUNK_ROWS: usize = 64;
+        let aligned = k % 256 == 0;
+        let (kernel_name, expected_stride) = dflash_plain_kernel(dtype, aligned);
+        validate_dflash_plain_stride(kernel_name, block_stride, expected_stride);
+        if aligned {
+            self.ensure_dflash_oq_scratch(batch_size.min(QUANT_CHUNK_ROWS), k)?;
+            self.ensure_kernel(
+                "quantize_dflash_act_g256",
+                kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+                "quantize_dflash_act_g256",
+            )?;
+        }
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+            kernel_name,
+        )?;
+        if !aligned {
+            let wp = w_blocks.buf.as_ptr();
+            let xp = x_f32.buf.as_ptr();
+            let yp = y_f32.buf.as_ptr();
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut bi = batch_size as i32;
+            let mut stride = block_stride as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &wp as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut bi as *mut _ as *mut c_void,
+                &mut stride as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions[kernel_name];
+            return unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [m.div_ceil(8) as u32, batch_size as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        let groups = k / 256;
+        let mut row = 0;
+        while row < batch_size {
+            let n = (batch_size - row).min(QUANT_CHUNK_ROWS);
+            let x_chunk = x_f32.sub_offset(row * k, n * k);
+            let y_chunk = y_f32.sub_offset(row * m, n * m);
+            let xq = GpuTensor {
+                // SAFETY: bounded view of persistent scratch, used only by
+                // stream-ordered launches before the next projection reuses it.
+                buf: unsafe { self.dflash_oq_xq_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * k],
+                dtype: DType::Raw,
+            };
+            let xs = GpuTensor {
+                // SAFETY: same lifetime/order contract as `xq`.
+                buf: unsafe { self.dflash_oq_xs_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * groups],
+                dtype: DType::F32,
+            };
+
+            let xp = x_chunk.buf.as_ptr();
+            let xqp = xq.buf.as_ptr();
+            let xsp = xs.buf.as_ptr();
+            let mut ki = k as i32;
+            let mut ni = n as i32;
+            let mut quant_params: Vec<*mut c_void> = vec![
+                &xp as *const _ as *mut c_void,
+                &xqp as *const _ as *mut c_void,
+                &xsp as *const _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            let quant_func = &self.functions["quantize_dflash_act_g256"];
+            unsafe {
+                self.hip.launch_kernel(
+                    quant_func,
+                    [groups as u32, n as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut quant_params,
+                )?;
+            }
+
+            let wp = w_blocks.buf.as_ptr();
+            let yp = y_chunk.buf.as_ptr();
+            let mut mi = m as i32;
+            let mut stride = block_stride as i32;
+            let mut gemm_params: Vec<*mut c_void> = vec![
+                &wp as *const _ as *mut c_void,
+                &xqp as *const _ as *mut c_void,
+                &xsp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut stride as *mut _ as *mut c_void,
+            ];
+            let gemm_func = &self.functions[kernel_name];
+            unsafe {
+                self.hip.launch_kernel(
+                    gemm_func,
+                    [m.div_ceil(8) as u32, n as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut gemm_params,
+                )?;
+            }
+            row += n;
+        }
+        Ok(())
+    }
+
+    /// Native packed reference GEMM for DFLASH qt=45/46/47 plain-basis Opus
+    /// blocks. This is intentionally separate from the primary-model
+    /// `Oq{4,8}G256` paths: those consume split f32 scales after FWHT, while
+    /// DFLASH preserves interleaved f16-scale NPU blocks and unrotated X.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dflash_oq_plain_ref(
+        &mut self,
+        dtype: DType,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kernel_name, expected_stride) = match dtype {
+            DType::DflashOq8Plain => ("gemm_dflash_oq8_plain_ref", Some(258usize)),
+            DType::DflashOq4Plain => ("gemm_dflash_oq4_plain_ref", Some(130usize)),
+            DType::DflashOq4MixedPlain => ("gemm_dflash_oq4_mixed_plain_ref", None),
+            other => panic!("gemm_dflash_oq_plain_ref: unsupported dtype {other:?}"),
+        };
+        validate_dflash_plain_stride(kernel_name, block_stride, expected_stride);
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+            kernel_name,
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut stride = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut stride as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[kernel_name];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer.
     /// `x_f32` [B,K] → `xq_i4` [B,K/2] (packed signed int4) + `xs` [B,K/group]
     /// (f32 scales). gfx1103 wave32, zero LDS. `group % 32 == 0`, `k % group == 0`.
@@ -601,6 +821,79 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        }
+    }
+}
+
+fn dflash_plain_kernel(dtype: DType, aligned: bool) -> (&'static str, Option<usize>) {
+    match (dtype, aligned) {
+        (DType::DflashOq8Plain, true) => ("gemm_dflash_oq8_plain_dp4a_staged_8w", Some(258)),
+        (DType::DflashOq4Plain, true) => ("gemm_dflash_oq4_plain_dp4a_staged_8w", Some(130)),
+        (DType::DflashOq4MixedPlain, true) => ("gemm_dflash_oq4_mixed_plain_dp4a_staged_8w", None),
+        (DType::DflashOq8Plain, false) => ("gemm_dflash_oq8_plain_8w", Some(258)),
+        (DType::DflashOq4Plain, false) => ("gemm_dflash_oq4_plain_8w", Some(130)),
+        (DType::DflashOq4MixedPlain, false) => ("gemm_dflash_oq4_mixed_plain_8w", None),
+        other => panic!("gemm_dflash_oq_plain: unsupported dtype {other:?}"),
+    }
+}
+
+fn validate_dflash_plain_stride(
+    kernel_name: &str,
+    block_stride: usize,
+    expected_stride: Option<usize>,
+) {
+    if let Some(expected) = expected_stride {
+        assert_eq!(
+            block_stride, expected,
+            "{kernel_name}: invalid block stride"
+        );
+    } else {
+        assert!(
+            block_stride >= 132 && (block_stride - 130) % 2 == 0,
+            "{kernel_name}: mixed block stride must be 130 + 2*N"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dflash_plain_aligned_routes_all_formats_through_staged_a8() {
+        for (dtype, expected, stride) in [
+            (
+                DType::DflashOq8Plain,
+                "gemm_dflash_oq8_plain_dp4a_staged_8w",
+                Some(258),
+            ),
+            (
+                DType::DflashOq4Plain,
+                "gemm_dflash_oq4_plain_dp4a_staged_8w",
+                Some(130),
+            ),
+            (
+                DType::DflashOq4MixedPlain,
+                "gemm_dflash_oq4_mixed_plain_dp4a_staged_8w",
+                None,
+            ),
+        ] {
+            assert_eq!(dflash_plain_kernel(dtype, true), (expected, stride));
+        }
+    }
+
+    #[test]
+    fn dflash_plain_ragged_keeps_exact_f16_activation_path() {
+        for (dtype, expected, stride) in [
+            (DType::DflashOq8Plain, "gemm_dflash_oq8_plain_8w", Some(258)),
+            (DType::DflashOq4Plain, "gemm_dflash_oq4_plain_8w", Some(130)),
+            (
+                DType::DflashOq4MixedPlain,
+                "gemm_dflash_oq4_mixed_plain_8w",
+                None,
+            ),
+        ] {
+            assert_eq!(dflash_plain_kernel(dtype, false), (expected, stride));
         }
     }
 }

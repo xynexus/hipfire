@@ -32,6 +32,7 @@ hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-archs = { path = "../hipfire-archs" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-hfq-tooling = { path = "../hipfire-hfq-tooling" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
 regex.workspace = true

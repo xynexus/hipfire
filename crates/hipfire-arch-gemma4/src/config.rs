@@ -134,7 +134,10 @@ impl Gemma4Config {
     }
 
     pub fn from_value(root: &Value) -> Result<Self, String> {
-        let text = root.get("text_config").unwrap_or(root);
+        // HFQ metadata wraps the original Hugging Face config under `config`,
+        // while direct safetensors callers pass the config object itself.
+        let config = root.get("config").unwrap_or(root);
+        let text = config.get("text_config").unwrap_or(config);
         let model_type = required(text, "model_type")?
             .as_str()
             .ok_or_else(|| "Gemma 4 `model_type` must be a string".to_string())?

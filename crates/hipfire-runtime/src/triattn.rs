@@ -39,14 +39,138 @@
 //! dependent phase, no de-rotation kernel needed. (asym3's Givens stage
 //! does require de-Givens at scoring time — not implemented yet.)
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::kv::KvCache;
+use crate::layered_kv::{KvStorageKind, LayeredKvArena, LogicalKvBinding};
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use serde::{Deserialize, Serialize};
+
+/// Canonical schema identifier for family-neutral, heterogeneous CASK center
+/// packages. Legacy uniform sidecars keep using the raw `TRIA` v1 encoding.
+pub const TRIATTN_HFQM_SCHEMA: &str = "hipfire.triattn.v2";
+pub const TRIATTN_ARTIFACT_KIND: &str = "triattn";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriAttnAttentionKind {
+    Full,
+    Sliding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriAttnRopeConvention {
+    None,
+    Interleaved,
+    HalfSplit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriAttnContextPolicy {
+    Full,
+    Sliding,
+}
+
+/// Geometry and provenance for one physical attention layer in a CASK package.
+/// `center_offset` and `center_count` bind the logical record to a range in its
+/// named tensor, rather than relying on uniform global geometry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriAttnLayerRecord {
+    pub physical_layer: u32,
+    pub attention_kind: TriAttnAttentionKind,
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub rotary_dim: u32,
+    pub rope_theta: f32,
+    pub rope_convention: TriAttnRopeConvention,
+    pub context_policy: TriAttnContextPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_producer: Option<u32>,
+    pub center_tensor: String,
+    pub center_offset: u64,
+    pub center_count: u64,
+    pub sample_count: u64,
+}
+
+/// Metadata stored in a canonical TriAttention HFQM sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriAttnPackageMetadata {
+    pub artifact_kind: String,
+    pub package_schema: String,
+    pub model_arch_id: u32,
+    pub model_layers: u32,
+    pub model_fingerprint: String,
+    pub corpus_fingerprint: String,
+    pub adapter: String,
+    pub engine: String,
+    pub layers: Vec<TriAttnLayerRecord>,
+}
+
+/// Decoded family-neutral CASK artifact. Center banks are parallel to
+/// `metadata.layers` and may have different head or rotary geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriAttnArtifact {
+    pub metadata: TriAttnPackageMetadata,
+    pub centers: Vec<Vec<BandCenter>>,
+}
+
+#[derive(Clone)]
+pub struct TriAttnTensor<'a> {
+    pub quant_type: u8,
+    pub shape: &'a [u32],
+    pub data: Cow<'a, [u8]>,
+}
+
+/// Narrow source seam shared by standalone and compose-namespaced HFQM.
+pub trait TriAttnSource {
+    fn arch_id(&self) -> u32;
+    fn metadata_json(&self) -> &str;
+    fn tensor(&self, name: &str) -> Option<TriAttnTensor<'_>>;
+}
+
+impl TriAttnSource for crate::hfq::HfqFile {
+    fn arch_id(&self) -> u32 {
+        self.arch_id
+    }
+    fn metadata_json(&self) -> &str {
+        &self.metadata_json
+    }
+    fn tensor(&self, name: &str) -> Option<TriAttnTensor<'_>> {
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(TriAttnTensor {
+            quant_type: info.quant_type,
+            shape: &info.shape,
+            data: Cow::Owned(data),
+        })
+    }
+}
+
+impl TriAttnSource for crate::hfq_compose::HfqFileComponentView<'_> {
+    fn arch_id(&self) -> u32 {
+        self.arch_id()
+    }
+    fn metadata_json(&self) -> &str {
+        self.metadata_json()
+    }
+    fn tensor(&self, name: &str) -> Option<TriAttnTensor<'_>> {
+        let (info, data) = self.tensor_data_vec(name)?;
+        Some(TriAttnTensor {
+            quant_type: info.quant_type,
+            shape: &info.shape,
+            data: Cow::Owned(data),
+        })
+    }
+}
 
 /// Q-side centers for one (layer, head, band) triple.
 ///
@@ -54,7 +178,7 @@ use hipfire_rdna::{DType, Gpu, GpuTensor};
 /// pre-RoPE queries in band f, `E[abs_q_f]` is the mean of their scalar
 /// magnitude. The ratio `||E[q_f]|| / E[abs_q_f]` recovers the Mean
 /// Resultant Length R_f used in the concentration-based weighting.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BandCenter {
     /// Re(E[q_f])
     pub eq_re: f32,
@@ -62,6 +186,202 @@ pub struct BandCenter {
     pub eq_im: f32,
     /// E[||q_f||]  (scalar, ≥ 0)
     pub e_abs_q: f32,
+}
+
+impl TriAttnArtifact {
+    pub fn validate(&self) -> std::io::Result<()> {
+        let m = &self.metadata;
+        if m.artifact_kind != TRIATTN_ARTIFACT_KIND || m.package_schema != TRIATTN_HFQM_SCHEMA {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "not a canonical TriAttention package: kind={:?} schema={:?}",
+                    m.artifact_kind, m.package_schema
+                ),
+            ));
+        }
+        if m.model_arch_id == 0
+            || m.model_layers == 0
+            || m.model_fingerprint.is_empty()
+            || m.corpus_fingerprint.is_empty()
+            || m.adapter.is_empty()
+            || m.engine.is_empty()
+            || m.layers.is_empty()
+            || m.layers.len() != self.centers.len()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TriAttention package has incomplete identity or layer metadata",
+            ));
+        }
+        let mut seen_layers = std::collections::BTreeSet::new();
+        let mut seen_tensors = std::collections::BTreeSet::new();
+        for (record, centers) in m.layers.iter().zip(&self.centers) {
+            let expected = (record.q_heads as u64)
+                .checked_mul((record.head_dim / 2) as u64)
+                .ok_or_else(|| invalid_triattn("center count overflow"))?;
+            if record.physical_layer >= m.model_layers
+                || !seen_layers.insert(record.physical_layer)
+                || !seen_tensors.insert(record.center_tensor.as_str())
+                || record.q_heads == 0
+                || record.kv_heads == 0
+                || record.q_heads % record.kv_heads != 0
+                || record.head_dim == 0
+                || record.head_dim % 2 != 0
+                || record.rotary_dim > record.head_dim
+                || record.rotary_dim % 2 != 0
+                || (record.rotary_dim == 0 && record.rope_convention != TriAttnRopeConvention::None)
+                || (record.rotary_dim != 0 && record.rope_convention == TriAttnRopeConvention::None)
+                || !record.rope_theta.is_finite()
+                || record.rope_theta <= 0.0
+                || record.center_tensor.is_empty()
+                || record.center_offset != 0
+                || record.center_count != expected
+                || centers.len() as u64 != expected
+                || record.sample_count == 0
+                || (record.context_policy == TriAttnContextPolicy::Sliding
+                    && record.sliding_window.is_none())
+                || (record.context_policy == TriAttnContextPolicy::Full
+                    && record.sliding_window.is_some())
+            {
+                return Err(invalid_triattn(format!(
+                    "invalid TriAttention layer record for physical layer {}",
+                    record.physical_layer
+                )));
+            }
+            if centers.iter().any(|center| {
+                !center.eq_re.is_finite()
+                    || !center.eq_im.is_finite()
+                    || !center.e_abs_q.is_finite()
+                    || center.e_abs_q < 0.0
+            }) {
+                return Err(invalid_triattn(format!(
+                    "non-finite center in physical layer {}",
+                    record.physical_layer
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn from_source(source: &dyn TriAttnSource) -> std::io::Result<Self> {
+        let metadata: TriAttnPackageMetadata = serde_json::from_str(source.metadata_json())
+            .map_err(|error| invalid_triattn(format!("invalid TriAttention metadata: {error}")))?;
+        if source.arch_id() != metadata.model_arch_id {
+            return Err(invalid_triattn(format!(
+                "TriAttention arch {} does not match model_arch_id {}",
+                source.arch_id(),
+                metadata.model_arch_id
+            )));
+        }
+        let mut centers = Vec::with_capacity(metadata.layers.len());
+        for record in &metadata.layers {
+            let tensor = source.tensor(&record.center_tensor).ok_or_else(|| {
+                invalid_triattn(format!(
+                    "TriAttention center tensor {:?} is absent",
+                    record.center_tensor
+                ))
+            })?;
+            let expected_shape = [record.q_heads, record.head_dim / 2, 3];
+            if tensor.quant_type != hipfire_quant_format::QuantType::F32.code()
+                || tensor.shape != expected_shape
+                || tensor.data.len() != record.center_count as usize * 12
+            {
+                return Err(invalid_triattn(format!(
+                    "TriAttention center tensor {:?} has invalid encoding, shape, or length",
+                    record.center_tensor
+                )));
+            }
+            let mut bank = Vec::with_capacity(record.center_count as usize);
+            for raw in tensor.data.chunks_exact(12) {
+                bank.push(BandCenter {
+                    eq_re: f32::from_le_bytes(raw[0..4].try_into().unwrap()),
+                    eq_im: f32::from_le_bytes(raw[4..8].try_into().unwrap()),
+                    e_abs_q: f32::from_le_bytes(raw[8..12].try_into().unwrap()),
+                });
+            }
+            centers.push(bank);
+        }
+        let artifact = Self { metadata, centers };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    pub fn load_hfqm(path: &Path) -> std::io::Result<Self> {
+        let file = crate::hfq::HfqFile::open(path)?;
+        Self::from_source(&file)
+    }
+
+    pub fn save_hfqm(&self, path: &Path) -> std::io::Result<()> {
+        self.validate()?;
+        let metadata_json = serde_json::to_string(&self.metadata)
+            .map_err(|error| invalid_triattn(format!("serialize metadata: {error}")))?;
+        let tensors: Vec<crate::hfq::HfqMemTensor> = self
+            .metadata
+            .layers
+            .iter()
+            .zip(&self.centers)
+            .map(|(record, centers)| {
+                let mut data = Vec::with_capacity(centers.len() * 12);
+                for center in centers {
+                    data.extend_from_slice(&center.eq_re.to_le_bytes());
+                    data.extend_from_slice(&center.eq_im.to_le_bytes());
+                    data.extend_from_slice(&center.e_abs_q.to_le_bytes());
+                }
+                crate::hfq::HfqMemTensor {
+                    name: record.center_tensor.clone(),
+                    quant_type: hipfire_quant_format::QuantType::F32.code(),
+                    shape: vec![record.q_heads, record.head_dim / 2, 3],
+                    group_size: 1,
+                    data,
+                }
+            })
+            .collect();
+        crate::hfq::write_hfqm_package_mem(
+            path,
+            self.metadata.model_arch_id,
+            &metadata_json,
+            &tensors,
+        )
+    }
+
+    /// Convert a v2 package to the uniform in-memory view consumed by today's
+    /// eviction kernels. Heterogeneous packages remain loadable/inspectable,
+    /// but execution fails explicitly until a family runtime supplies matching
+    /// per-layer kernel geometry.
+    pub fn to_uniform_centers(&self) -> std::io::Result<TriAttnCenters> {
+        self.validate()?;
+        let first = &self.metadata.layers[0];
+        if self.metadata.layers.iter().any(|record| {
+            record.q_heads != first.q_heads
+                || record.head_dim != first.head_dim
+                || record.rotary_dim != first.rotary_dim
+                || record.rope_theta != first.rope_theta
+                || record.rope_convention != first.rope_convention
+        }) {
+            return Err(invalid_triattn(
+                "heterogeneous TriAttention geometry requires a per-layer runtime",
+            ));
+        }
+        let partial_rotary_factor = first.rotary_dim as f32 / first.head_dim as f32;
+        let mut out = TriAttnCenters::new(
+            self.metadata.model_layers as usize,
+            first.q_heads as usize,
+            first.head_dim as usize,
+            first.rope_theta,
+            partial_rotary_factor,
+        );
+        out.half_split = first.rope_convention == TriAttnRopeConvention::HalfSplit;
+        for (record, bank) in self.metadata.layers.iter().zip(&self.centers) {
+            let start = record.physical_layer as usize * bank.len();
+            out.centers[start..start + bank.len()].copy_from_slice(bank);
+        }
+        Ok(out)
+    }
+}
+
+fn invalid_triattn(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
 impl BandCenter {
@@ -92,6 +412,9 @@ pub struct TriAttnCenters {
     pub head_dim: usize,
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
+    /// False for legacy TRIA v1 adjacent-pair centers; true for HFQM
+    /// packages calibrated against HF `rotate_half` geometry.
+    pub half_split: bool,
     pub centers: Vec<BandCenter>,
 }
 
@@ -110,6 +433,7 @@ impl TriAttnCenters {
             head_dim,
             rope_theta,
             partial_rotary_factor,
+            half_split: false,
             centers: vec![BandCenter::default(); n_layers * n_heads * n_bands],
         }
     }
@@ -143,6 +467,11 @@ impl TriAttnCenters {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if self.half_split {
+            return Err(invalid_triattn(
+                "TRIA v1 cannot encode half-split RoPE; save a TriAttention HFQM package",
+            ));
+        }
         let mut f = std::fs::File::create(path)?;
         // Header: magic=TRIA, version=1, then geometry.
         f.write_all(b"TRIA")?;
@@ -161,7 +490,22 @@ impl TriAttnCenters {
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        let mut f = std::fs::File::open(path)?;
+        Self::from_reader(std::fs::File::open(path)?)
+    }
+
+    /// Parse centers from any reader. This is the shared path for standalone
+    /// files and embedded HFQ component bytes.
+    pub fn from_reader(mut reader: impl Read) -> std::io::Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Strict TRIA v1 parser over borrowed bytes. Rejects unknown versions,
+    /// invalid/overflowing geometry, non-finite fields, truncated payloads, and
+    /// trailing bytes.
+    pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        let mut f = std::io::Cursor::new(bytes);
         let mut magic = [0u8; 4];
         f.read_exact(&mut magic)?;
         if &magic != b"TRIA" {
@@ -172,7 +516,13 @@ impl TriAttnCenters {
         }
         let mut u32buf = [0u8; 4];
         f.read_exact(&mut u32buf)?;
-        let _ver = u32::from_le_bytes(u32buf);
+        let version = u32::from_le_bytes(u32buf);
+        if version != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported TRIA version {version}"),
+            ));
+        }
         f.read_exact(&mut u32buf)?;
         let n_layers = u32::from_le_bytes(u32buf) as usize;
         f.read_exact(&mut u32buf)?;
@@ -183,8 +533,40 @@ impl TriAttnCenters {
         let rope_theta = f32::from_le_bytes(u32buf);
         f.read_exact(&mut u32buf)?;
         let partial_rotary_factor = f32::from_le_bytes(u32buf);
+        if n_layers == 0
+            || n_heads == 0
+            || head_dim == 0
+            || head_dim % 2 != 0
+            || !rope_theta.is_finite()
+            || rope_theta <= 0.0
+            || !partial_rotary_factor.is_finite()
+            || !(0.0..=1.0).contains(&partial_rotary_factor)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid TRIA v1 geometry",
+            ));
+        }
         let n_bands = head_dim / 2;
-        let n = n_layers * n_heads * n_bands;
+        let n = n_layers
+            .checked_mul(n_heads)
+            .and_then(|n| n.checked_mul(n_bands))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "TRIA geometry overflow")
+            })?;
+        let expected = 28usize
+            .checked_add(n.checked_mul(12).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "TRIA length overflow")
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "TRIA length overflow")
+            })?;
+        if bytes.len() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TRIA v1 length {} != expected {expected}", bytes.len()),
+            ));
+        }
         let mut centers = Vec::with_capacity(n);
         for _ in 0..n {
             f.read_exact(&mut u32buf)?;
@@ -193,6 +575,12 @@ impl TriAttnCenters {
             let eq_im = f32::from_le_bytes(u32buf);
             f.read_exact(&mut u32buf)?;
             let e_abs_q = f32::from_le_bytes(u32buf);
+            if !eq_re.is_finite() || !eq_im.is_finite() || !e_abs_q.is_finite() || e_abs_q < 0.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TRIA v1 contains an invalid center value",
+                ));
+            }
             centers.push(BandCenter {
                 eq_re,
                 eq_im,
@@ -205,6 +593,7 @@ impl TriAttnCenters {
             head_dim,
             rope_theta,
             partial_rotary_factor,
+            half_split: false,
             centers,
         })
     }
@@ -331,8 +720,104 @@ impl TriAttnCalibState {
             head_dim: self.head_dim,
             rope_theta: self.rope_theta,
             partial_rotary_factor: self.partial_rotary_factor,
+            half_split: false,
             centers,
         }
+    }
+}
+
+/// Family-neutral CPU accumulator for heterogeneous per-layer CASK geometry.
+/// Architecture forwards feed normalized pre-RoPE Q rows through the same
+/// global tap used by the legacy Qwen harness; only calibration runs install
+/// this state, so ordinary inference still pays one relaxed atomic read.
+pub struct LayeredTriAttnCalibState {
+    metadata: TriAttnPackageMetadata,
+    accs: Vec<Vec<BandAccumulator>>,
+    layer_index: std::collections::BTreeMap<u32, usize>,
+}
+
+impl LayeredTriAttnCalibState {
+    pub fn new(metadata: TriAttnPackageMetadata) -> std::io::Result<Self> {
+        let centers = metadata
+            .layers
+            .iter()
+            .map(|record| vec![BandCenter::default(); record.center_count as usize])
+            .collect::<Vec<_>>();
+        TriAttnArtifact {
+            metadata: metadata.clone(),
+            centers,
+        }
+        .validate()?;
+        let layer_index = metadata
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.physical_layer, index))
+            .collect();
+        let accs = metadata
+            .layers
+            .iter()
+            .map(|record| vec![BandAccumulator::default(); record.center_count as usize])
+            .collect();
+        Ok(Self {
+            metadata,
+            accs,
+            layer_index,
+        })
+    }
+
+    pub fn add_sample(&mut self, physical_layer: usize, q: &[f32]) -> std::io::Result<()> {
+        let index = *self
+            .layer_index
+            .get(&(physical_layer as u32))
+            .ok_or_else(|| {
+                invalid_triattn(format!("layer {physical_layer} is not CASK-eligible"))
+            })?;
+        let record = &self.metadata.layers[index];
+        let expected = record.q_heads as usize * record.head_dim as usize;
+        if q.len() != expected {
+            return Err(invalid_triattn(format!(
+                "layer {physical_layer} pre-RoPE Q length {} != expected {expected}",
+                q.len()
+            )));
+        }
+        let n_bands = record.head_dim as usize / 2;
+        for head in 0..record.q_heads as usize {
+            for band in 0..n_bands {
+                let head_base = head * record.head_dim as usize;
+                let (real, imag) = match record.rope_convention {
+                    TriAttnRopeConvention::HalfSplit => {
+                        (q[head_base + band], q[head_base + band + n_bands])
+                    }
+                    TriAttnRopeConvention::Interleaved | TriAttnRopeConvention::None => {
+                        (q[head_base + band * 2], q[head_base + band * 2 + 1])
+                    }
+                };
+                self.accs[index][head * n_bands + band].add(real, imag);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finalize(mut self) -> std::io::Result<TriAttnArtifact> {
+        let mut centers = Vec::with_capacity(self.accs.len());
+        for (record, accs) in self.metadata.layers.iter_mut().zip(self.accs) {
+            let sample_count = accs.first().map(|acc| acc.count).unwrap_or(0);
+            if sample_count == 0 || accs.iter().any(|acc| acc.count != sample_count) {
+                return Err(invalid_triattn(format!(
+                    "physical layer {} has missing or inconsistent CASK samples",
+                    record.physical_layer
+                )));
+            }
+            record.sample_count = sample_count;
+            centers.push(accs.iter().map(BandAccumulator::finalize).collect());
+        }
+        let artifact = TriAttnArtifact {
+            metadata: self.metadata,
+            centers,
+        };
+        artifact.validate()?;
+        Ok(artifact)
     }
 }
 
@@ -390,6 +875,7 @@ impl TriAttnCapture {
 enum TapState {
     Calibrate(TriAttnCalibState),
     CalibrateGpu(TriAttnCalibStateGpu),
+    LayeredCalibrate(LayeredTriAttnCalibState),
     Capture(TriAttnCapture),
 }
 
@@ -497,6 +983,7 @@ impl TriAttnCalibStateGpu {
             head_dim: self.head_dim,
             rope_theta: self.rope_theta,
             partial_rotary_factor: self.partial_rotary_factor,
+            half_split: false,
             centers,
         })
     }
@@ -523,6 +1010,22 @@ pub fn install_tap(state: TriAttnCalibState) {
 pub fn install_tap_gpu(state: TriAttnCalibStateGpu) {
     *tap_state() = Some(TapState::CalibrateGpu(state));
     TAP_ENABLED.store(true, Ordering::SeqCst);
+}
+
+pub fn install_layered_tap(state: LayeredTriAttnCalibState) {
+    *tap_state() = Some(TapState::LayeredCalibrate(state));
+    TAP_ENABLED.store(true, Ordering::SeqCst);
+}
+
+pub fn take_layered_tap() -> Option<LayeredTriAttnCalibState> {
+    TAP_ENABLED.store(false, Ordering::SeqCst);
+    match tap_state().take() {
+        Some(TapState::LayeredCalibrate(state)) => Some(state),
+        other => {
+            *tap_state() = other;
+            None
+        }
+    }
 }
 
 /// Remove and return the GPU calibration tap so the caller can finalize.
@@ -673,6 +1176,9 @@ pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
                 q.len(),
             );
         }
+        Some(TapState::LayeredCalibrate(state)) => state
+            .add_sample(layer_idx, q)
+            .unwrap_or_else(|error| panic!("triattn layered capture failed: {error}")),
         Some(TapState::Capture(cap)) => {
             cap.pending_layer_ids.push(layer_idx);
             cap.pending_q.push(q.to_vec());
@@ -690,11 +1196,22 @@ pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
 /// `k_post` is `[head_dim]` (one head, one position). Returns `(||k_f||,
 /// arg(k_f))` per band f=0..head_dim/2.
 pub fn kpost_per_band(k_post: &[f32]) -> Vec<(f32, f32)> {
+    kpost_per_band_with_convention(k_post, false)
+}
+
+/// Compute post-RoPE complex bands using either adjacent-pair
+/// (`interleaved`) or HF `rotate_half` (`half_split`) component layout.
+pub fn kpost_per_band_with_convention(k_post: &[f32], half_split: bool) -> Vec<(f32, f32)> {
     let n_bands = k_post.len() / 2;
     let mut out = Vec::with_capacity(n_bands);
     for f in 0..n_bands {
-        let re = k_post[2 * f];
-        let im = k_post[2 * f + 1];
+        let (re_dim, im_dim) = if half_split {
+            (f, f + n_bands)
+        } else {
+            (2 * f, 2 * f + 1)
+        };
+        let re = k_post[re_dim];
+        let im = k_post[im_dim];
         let mag = (re * re + im * im).sqrt();
         let ph = im.atan2(re);
         out.push((mag, ph));
@@ -812,6 +1329,253 @@ pub struct EvictionResult {
     pub retain_mask: Vec<u32>,
 }
 
+struct LayeredEvictionLayer {
+    group: usize,
+    slot: usize,
+    centers: GpuTensor,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    half_split: bool,
+    rope_theta: f32,
+}
+
+/// CASK eviction for heterogeneous layered KV arenas. Sliding-window records
+/// remain in their bounded rings; each owned full-context layer is scored and
+/// compacted with its own geometry and center bank. The first implementation
+/// intentionally admits F32 full-context caches only, which is the exact
+/// Gemma 4 fallback path and avoids pretending packed KVarN has a compatible
+/// TriAttention reader.
+pub struct LayeredEvictionCtx {
+    layers: Vec<LayeredEvictionLayer>,
+    pub budget: usize,
+    pub beta: usize,
+    scores: GpuTensor,
+    k_compact: GpuTensor,
+    v_compact: GpuTensor,
+    retain: GpuTensor,
+    pub eviction_count: std::cell::Cell<usize>,
+}
+
+impl LayeredEvictionCtx {
+    pub fn new(
+        gpu: &mut Gpu,
+        artifact: &TriAttnArtifact,
+        arena: &LayeredKvArena,
+        budget: usize,
+        beta: usize,
+    ) -> Result<Self, String> {
+        artifact
+            .validate()
+            .map_err(|error| format!("validate layered CASK artifact: {error}"))?;
+        if budget == 0 || beta == 0 {
+            return Err("layered CASK budget and beta must be nonzero".into());
+        }
+        if artifact.metadata.model_layers as usize != arena.plan().layers().len() {
+            return Err(format!(
+                "layered CASK model layer count {} != KV plan {}",
+                artifact.metadata.model_layers,
+                arena.plan().layers().len()
+            ));
+        }
+        let mut layers = Vec::new();
+        let mut max_heads = 0usize;
+        let mut max_kv_width = 0usize;
+        let mut physical_cap = None;
+        for (record, bank) in artifact.metadata.layers.iter().zip(&artifact.centers) {
+            if record.context_policy != TriAttnContextPolicy::Full {
+                continue;
+            }
+            let physical_layer = record.physical_layer as usize;
+            let spec = arena
+                .plan()
+                .layers()
+                .get(physical_layer)
+                .ok_or_else(|| format!("CASK layer {physical_layer} is outside the KV plan"))?;
+            if spec.storage != KvStorageKind::Full
+                || spec.q_heads != record.q_heads as usize
+                || spec.kv_heads != record.kv_heads as usize
+                || spec.head_dim != record.head_dim as usize
+            {
+                return Err(format!(
+                    "CASK layer {physical_layer} geometry/storage does not match the KV plan"
+                ));
+            }
+            if !matches!(
+                arena.plan().binding(physical_layer),
+                Ok(LogicalKvBinding::Owned { .. })
+            ) {
+                return Err(format!(
+                    "CASK layer {physical_layer} shares KV; layered shared-cache aggregation is not implemented"
+                ));
+            }
+            let (group, slot) = arena.cache_binding(physical_layer)?;
+            let cache = arena.group_cache(group)?;
+            if cache.quant_mode() != crate::kv::KvQuantMode::Unquantized {
+                return Err(format!(
+                    "CASK layer {physical_layer} requires F32 KV, got {:?}",
+                    cache.quant_mode()
+                ));
+            }
+            if cache.physical_cap < budget + beta {
+                return Err(format!(
+                    "CASK layer {physical_layer} physical cap {} is below budget+beta {}",
+                    cache.physical_cap,
+                    budget + beta
+                ));
+            }
+            if physical_cap
+                .replace(cache.physical_cap)
+                .is_some_and(|cap| cap != cache.physical_cap)
+            {
+                return Err("layered CASK full-context groups have inconsistent capacities".into());
+            }
+            let mut flat = Vec::with_capacity(bank.len() * 3);
+            for center in bank {
+                flat.extend([center.eq_re, center.eq_im, center.e_abs_q]);
+            }
+            let centers = gpu
+                .upload_f32(&flat, &[flat.len()])
+                .map_err(|error| format!("upload CASK layer {physical_layer}: {error}"))?;
+            max_heads = max_heads.max(record.q_heads as usize);
+            max_kv_width = max_kv_width.max(record.kv_heads as usize * record.head_dim as usize);
+            layers.push(LayeredEvictionLayer {
+                group,
+                slot,
+                centers,
+                q_heads: record.q_heads as usize,
+                kv_heads: record.kv_heads as usize,
+                head_dim: record.head_dim as usize,
+                rotary_dim: record.rotary_dim as usize,
+                half_split: record.rope_convention == TriAttnRopeConvention::HalfSplit,
+                rope_theta: record.rope_theta,
+            });
+        }
+        if layers.is_empty() {
+            return Err("layered CASK artifact has no owned full-context layers".into());
+        }
+        let cap = physical_cap.expect("nonempty layered CASK has a physical cap");
+        Ok(Self {
+            layers,
+            budget,
+            beta,
+            scores: gpu
+                .alloc_tensor(&[max_heads * cap], DType::F32)
+                .map_err(|error| format!("allocate layered CASK scores: {error}"))?,
+            k_compact: gpu
+                .alloc_tensor(&[budget * max_kv_width], DType::F32)
+                .map_err(|error| format!("allocate layered CASK K scratch: {error}"))?,
+            v_compact: gpu
+                .alloc_tensor(&[budget * max_kv_width], DType::F32)
+                .map_err(|error| format!("allocate layered CASK V scratch: {error}"))?,
+            retain: gpu
+                .alloc_tensor(&[budget], DType::F32)
+                .map_err(|error| format!("allocate layered CASK retain indices: {error}"))?,
+            eviction_count: std::cell::Cell::new(0),
+        })
+    }
+
+    pub fn maybe_evict(
+        &self,
+        gpu: &mut Gpu,
+        arena: &mut LayeredKvArena,
+    ) -> HipResult<Option<EvictionResult>> {
+        let current_physical = arena
+            .full_physical_len()
+            .unwrap_or_else(|error| panic!("layered CASK physical cursor: {error}"));
+        if current_physical < self.budget + self.beta {
+            return Ok(None);
+        }
+        let p_q = arena.next_pos() as f32;
+        let mut last_retain = Vec::new();
+        for layer in &self.layers {
+            let cache = arena
+                .group_cache(layer.group)
+                .unwrap_or_else(|error| panic!("layered CASK cache: {error}"));
+            gpu.triattn_score_f32(
+                &cache.k_gpu[layer.slot],
+                &layer.centers,
+                &self.scores,
+                layer.q_heads,
+                layer.kv_heads,
+                layer.head_dim,
+                layer.rotary_dim,
+                layer.half_split,
+                layer.rope_theta,
+                p_q,
+                current_physical,
+            )?;
+            gpu.hip.device_synchronize()?;
+            let scores = gpu.download_f32(&self.scores)?;
+            let retain = compute_retain_indices(
+                &scores[..layer.q_heads * current_physical],
+                layer.q_heads,
+                current_physical,
+                self.budget,
+            );
+            let retain_bytes = retain
+                .iter()
+                .flat_map(|&index| (index as i32).to_ne_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip.memcpy_htod(&self.retain.buf, &retain_bytes)?;
+            let bytes_per_position = layer.kv_heads * layer.head_dim * 4;
+            gpu.kv_compact_gather(
+                &cache.k_gpu[layer.slot],
+                &self.k_compact,
+                &self.retain,
+                bytes_per_position,
+                self.budget,
+            )?;
+            gpu.kv_compact_gather(
+                &cache.v_gpu[layer.slot],
+                &self.v_compact,
+                &self.retain,
+                bytes_per_position,
+                self.budget,
+            )?;
+            gpu.hip.device_synchronize()?;
+            gpu.hip.memcpy_dtod_at(
+                &cache.k_gpu[layer.slot].buf,
+                0,
+                &self.k_compact.buf,
+                0,
+                self.budget * bytes_per_position,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &cache.v_gpu[layer.slot].buf,
+                0,
+                &self.v_compact.buf,
+                0,
+                self.budget * bytes_per_position,
+            )?;
+            last_retain = retain;
+        }
+        let delta = current_physical - self.budget;
+        let groups = arena.full_group_ids().collect::<Vec<_>>();
+        for group in groups {
+            arena
+                .group_cache_mut(group)
+                .unwrap_or_else(|error| panic!("layered CASK cache: {error}"))
+                .compact_offset += delta;
+        }
+        self.eviction_count.set(self.eviction_count.get() + 1);
+        Ok(Some(EvictionResult {
+            new_physical: self.budget,
+            retain_mask: last_retain,
+        }))
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for layer in self.layers {
+            let _ = gpu.free_tensor(layer.centers);
+        }
+        for tensor in [self.scores, self.k_compact, self.v_compact, self.retain] {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
 /// Pre-allocated scratch + policy for periodic TriAttention eviction during
 /// autoregressive decode. Instantiate once per inference session; call
 /// `maybe_evict` after every new-token write. When the physical cache has
@@ -834,6 +1598,7 @@ pub struct EvictionCtx {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub n_rot: usize,
+    pub half_split: bool,
     pub rope_theta: f32,
     pub max_seq: usize,
     /// Reusable scratch: sized to handle any state up to `max_seq`.
@@ -914,6 +1679,7 @@ impl EvictionCtx {
             n_kv_heads,
             head_dim,
             n_rot,
+            half_split: centers.half_split,
             rope_theta,
             max_seq,
             scores_buf,
@@ -978,6 +1744,7 @@ impl EvictionCtx {
                     self.n_kv_heads,
                     self.head_dim,
                     self.n_rot,
+                    self.half_split,
                     self.rope_theta,
                     p_q,
                     current_physical,
@@ -996,6 +1763,7 @@ impl EvictionCtx {
                     self.n_kv_heads,
                     self.head_dim,
                     self.n_rot,
+                    self.half_split,
                     self.rope_theta,
                     p_q,
                     current_physical,
@@ -1014,6 +1782,7 @@ impl EvictionCtx {
                     self.n_kv_heads,
                     self.head_dim,
                     self.n_rot,
+                    self.half_split,
                     self.rope_theta,
                     p_q,
                     current_physical,
@@ -1026,6 +1795,7 @@ impl EvictionCtx {
                     self.n_kv_heads,
                     self.head_dim,
                     self.n_rot,
+                    self.half_split,
                     self.rope_theta,
                     p_q,
                     current_physical,
@@ -1142,6 +1912,17 @@ mod tests {
     }
 
     #[test]
+    fn post_rope_bands_respect_component_convention() {
+        let values = [1.0, 2.0, 3.0, 4.0];
+        let adjacent = kpost_per_band_with_convention(&values, false);
+        let half_split = kpost_per_band_with_convention(&values, true);
+        assert!((adjacent[0].0 - 5.0f32.sqrt()).abs() < 1e-6);
+        assert!((adjacent[1].0 - 25.0f32.sqrt()).abs() < 1e-6);
+        assert!((half_split[0].0 - 10.0f32.sqrt()).abs() < 1e-6);
+        assert!((half_split[1].0 - 20.0f32.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
     fn mrl_constant_vectors_is_one() {
         // If every sample is identical, R_f should be ≈ 1.
         let mut a = BandAccumulator::default();
@@ -1213,6 +1994,179 @@ mod tests {
             assert!((d.centers[i].e_abs_q - c.centers[i].e_abs_q).abs() < 1e-6);
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_version_trailing_and_nonfinite_data() {
+        let tmp =
+            std::env::temp_dir().join(format!("triattn_strict_test_{}.bin", std::process::id()));
+        let mut centers = TriAttnCenters::new(1, 1, 2, 10_000.0, 1.0);
+        centers.set(
+            0,
+            0,
+            0,
+            BandCenter {
+                eq_re: 0.25,
+                eq_im: -0.5,
+                e_abs_q: 1.0,
+            },
+        );
+        centers.save(&tmp).unwrap();
+        let bytes = std::fs::read(&tmp).unwrap();
+        assert_eq!(TriAttnCenters::from_bytes(&bytes).unwrap().centers.len(), 1);
+
+        let mut unknown = bytes.clone();
+        unknown[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(TriAttnCenters::from_bytes(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported TRIA version"));
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(TriAttnCenters::from_bytes(&trailing)
+            .unwrap_err()
+            .to_string()
+            .contains("length"));
+
+        let mut nonfinite = bytes;
+        nonfinite[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(TriAttnCenters::from_bytes(&nonfinite)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid center"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn heterogeneous_fixture() -> TriAttnArtifact {
+        let layer = |physical_layer, q_heads, kv_heads, head_dim, rotary_dim, kind| {
+            let context_policy = if kind == TriAttnAttentionKind::Sliding {
+                TriAttnContextPolicy::Sliding
+            } else {
+                TriAttnContextPolicy::Full
+            };
+            TriAttnLayerRecord {
+                physical_layer,
+                attention_kind: kind,
+                q_heads,
+                kv_heads,
+                head_dim,
+                rotary_dim,
+                rope_theta: if physical_layer == 0 {
+                    10_000.0
+                } else {
+                    1_000_000.0
+                },
+                rope_convention: TriAttnRopeConvention::Interleaved,
+                context_policy: context_policy.clone(),
+                sliding_window: (context_policy == TriAttnContextPolicy::Sliding).then_some(4096),
+                kv_producer: (physical_layer != 0).then_some(0),
+                center_tensor: format!("triattn.layers.{physical_layer}.centers"),
+                center_offset: 0,
+                center_count: (q_heads * (head_dim / 2)) as u64,
+                sample_count: 128,
+            }
+        };
+        let layers = vec![
+            layer(0, 2, 1, 4, 4, TriAttnAttentionKind::Full),
+            layer(2, 4, 2, 8, 4, TriAttnAttentionKind::Sliding),
+        ];
+        let centers = layers
+            .iter()
+            .map(|record| {
+                (0..record.center_count)
+                    .map(|i| BandCenter {
+                        eq_re: i as f32 + record.physical_layer as f32,
+                        eq_im: -(i as f32),
+                        e_abs_q: i as f32 + 1.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        TriAttnArtifact {
+            metadata: TriAttnPackageMetadata {
+                artifact_kind: TRIATTN_ARTIFACT_KIND.to_string(),
+                package_schema: TRIATTN_HFQM_SCHEMA.to_string(),
+                model_arch_id: 24,
+                model_layers: 3,
+                model_fingerprint: "sha256:model".to_string(),
+                corpus_fingerprint: "sha256:corpus".to_string(),
+                adapter: "gemma4-cask-v1".to_string(),
+                engine: "hipfire-cask-v1".to_string(),
+                layers,
+            },
+            centers,
+        }
+    }
+
+    #[test]
+    fn heterogeneous_hfqm_roundtrip_is_lossless_and_strict() {
+        let tmp =
+            std::env::temp_dir().join(format!("triattn_v2_roundtrip_{}.hfq", std::process::id()));
+        let artifact = heterogeneous_fixture();
+        artifact.save_hfqm(&tmp).unwrap();
+        let loaded = TriAttnArtifact::load_hfqm(&tmp).unwrap();
+        assert_eq!(loaded, artifact);
+        assert!(loaded
+            .to_uniform_centers()
+            .unwrap_err()
+            .to_string()
+            .contains("heterogeneous"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn heterogeneous_metadata_rejects_duplicate_physical_layers() {
+        let mut artifact = heterogeneous_fixture();
+        artifact.metadata.layers[1].physical_layer = 0;
+        assert!(artifact
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("physical layer"));
+    }
+
+    #[test]
+    fn layered_accumulator_binds_samples_to_physical_geometry() {
+        let mut fixture = heterogeneous_fixture();
+        for record in &mut fixture.metadata.layers {
+            record.sample_count = 1;
+        }
+        let mut state = LayeredTriAttnCalibState::new(fixture.metadata.clone()).unwrap();
+        state.add_sample(0, &[1.0; 8]).unwrap();
+        state.add_sample(0, &[3.0; 8]).unwrap();
+        state.add_sample(2, &[2.0; 32]).unwrap();
+        state.add_sample(2, &[4.0; 32]).unwrap();
+        let artifact = state.finalize().unwrap();
+        assert_eq!(artifact.metadata.layers[0].sample_count, 2);
+        assert_eq!(artifact.metadata.layers[1].sample_count, 2);
+        assert_eq!(artifact.centers[0][0].eq_re, 2.0);
+        assert_eq!(artifact.centers[1][0].eq_re, 3.0);
+        assert!(LayeredTriAttnCalibState::new(fixture.metadata)
+            .unwrap()
+            .add_sample(1, &[0.0; 8])
+            .unwrap_err()
+            .to_string()
+            .contains("not CASK-eligible"));
+    }
+
+    #[test]
+    fn layered_accumulator_honors_halfsplit_rope_pairs() {
+        let mut fixture = heterogeneous_fixture();
+        fixture.metadata.layers.truncate(1);
+        fixture.metadata.layers[0].rope_convention = TriAttnRopeConvention::HalfSplit;
+        fixture.metadata.layers[0].sample_count = 1;
+        let mut state = LayeredTriAttnCalibState::new(fixture.metadata).unwrap();
+        state
+            .add_sample(0, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+            .unwrap();
+        let artifact = state.finalize().unwrap();
+        assert_eq!(artifact.centers[0][0].eq_re, 1.0);
+        assert_eq!(artifact.centers[0][0].eq_im, 3.0);
+        assert_eq!(artifact.centers[0][1].eq_re, 2.0);
+        assert_eq!(artifact.centers[0][1].eq_im, 4.0);
+        assert_eq!(artifact.centers[0][2].eq_re, 5.0);
+        assert_eq!(artifact.centers[0][2].eq_im, 7.0);
     }
 
     #[test]

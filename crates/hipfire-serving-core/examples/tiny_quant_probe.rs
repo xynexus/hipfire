@@ -157,6 +157,7 @@ fn main() {
                 None,
                 None,
                 None,
+                None,
                 &hipfire_serving_core::model::CaskConfig::default(),
                 1,
                 &mut gpu,

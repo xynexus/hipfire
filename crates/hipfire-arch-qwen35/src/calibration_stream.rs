@@ -35,11 +35,22 @@ use hipfire_runtime::calibration::stream::{
 };
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::kv::KvCache;
+use hipfire_runtime::triattn::{
+    TriAttnAttentionKind, TriAttnContextPolicy, TriAttnLayerRecord, TriAttnPackageMetadata,
+    TriAttnRopeConvention, TRIATTN_ARTIFACT_KIND, TRIATTN_HFQM_SCHEMA,
+};
 use hipfire_runtime::weights::WeightTensor;
 use std::ffi::c_void;
 use std::sync::Arc;
 
 const SOURCE_DTYPES: &[&str] = &["BF16", "F16", "F32"];
+
+fn capture_registry_is_cask_only(registry: &CaptureRegistry) -> bool {
+    !registry.is_empty()
+        && registry
+            .descriptors()
+            .all(|descriptor| descriptor.policy == CapturePolicy::Skip)
+}
 
 #[derive(Default)]
 pub struct Qwen35CalibrationAdapter {
@@ -948,6 +959,59 @@ impl CalibrationFamilyAdapter for Qwen35CalibrationAdapter {
         qwen35_capture_registry(config, job.options.expert_quota)
     }
 
+    fn cask_metadata(
+        &self,
+        model: &ModelInspection,
+        job: &CalibrationJob,
+    ) -> Result<Option<TriAttnPackageMetadata>, CalibError> {
+        let config = self.config()?;
+        let rotary_dim = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        if rotary_dim == 0 || rotary_dim > config.head_dim || rotary_dim % 2 != 0 {
+            return Err(CalibError::InvalidSourcePlan(format!(
+                "Qwen3.5 has unsupported CASK rotary dimension {rotary_dim}"
+            )));
+        }
+        let layers = config
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| **kind == LayerType::FullAttention)
+            .map(|(layer, _)| TriAttnLayerRecord {
+                physical_layer: layer as u32,
+                attention_kind: TriAttnAttentionKind::Full,
+                q_heads: config.n_heads as u32,
+                kv_heads: config.n_kv_heads as u32,
+                head_dim: config.head_dim as u32,
+                rotary_dim: rotary_dim as u32,
+                rope_theta: config.rope_theta,
+                rope_convention: TriAttnRopeConvention::HalfSplit,
+                context_policy: TriAttnContextPolicy::Full,
+                sliding_window: None,
+                kv_producer: None,
+                center_tensor: format!("triattn.layers.{layer}.centers"),
+                center_offset: 0,
+                center_count: (config.n_heads * (config.head_dim / 2)) as u64,
+                sample_count: 1,
+            })
+            .collect::<Vec<_>>();
+        if layers.is_empty() {
+            return Err(CalibError::InvalidSourcePlan(
+                "Qwen3.5 model has no CASK-eligible full-attention layers".into(),
+            ));
+        }
+        Ok(Some(TriAttnPackageMetadata {
+            artifact_kind: TRIATTN_ARTIFACT_KIND.to_string(),
+            package_schema: TRIATTN_HFQM_SCHEMA.to_string(),
+            model_arch_id: model.arch_id,
+            model_layers: model.num_layers as u32,
+            model_fingerprint: job.source_fingerprint.clone(),
+            corpus_fingerprint: job.corpus_fingerprint.clone(),
+            adapter: self.adapter_version().to_string(),
+            engine: "hipfire-cask-layer-stream-v1".to_string(),
+            layers,
+        }))
+    }
+
     fn load_embedding(
         &mut self,
         reader: &mut PlannedTensorReader<'_, '_, '_>,
@@ -1479,6 +1543,10 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
         arch_id: u32,
         metadata_json: &str,
     ) -> Result<LayerCapturePartSummary, CalibError> {
+        let capture_is_intentionally_empty = self
+            .capture_registry
+            .as_ref()
+            .is_some_and(|registry| capture_registry_is_cask_only(registry));
         let expert_telemetry = if let Some(capture) = self.expert_capture.take() {
             capture.finalize()?;
             let snapshot = capture
@@ -1501,7 +1569,7 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
             ))
         })?;
         let descriptors = collector.tensor_descriptors();
-        if descriptors.is_empty() {
+        if descriptors.is_empty() && !capture_is_intentionally_empty {
             collector.free_gpu(gpu);
             return Err(CalibError::InvalidCapture(format!(
                 "layer {} captured no calibration tensors",
@@ -2031,6 +2099,8 @@ mod tests {
         let config = config_from_safetensors(&source).unwrap();
         let registry = qwen35_capture_registry(&config, ExpertCaptureQuota::default()).unwrap();
         assert_eq!(registry.len(), 4 * 4);
+        assert!(!capture_registry_is_cask_only(&registry));
+        assert!(capture_registry_is_cask_only(&registry.clone().skip_all()));
 
         let gate = registry
             .resolve_output("model.language_model.layers.0.mlp.gate_proj")

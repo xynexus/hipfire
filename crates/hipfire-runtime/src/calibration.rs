@@ -436,8 +436,16 @@ impl CalibCollector {
             if descriptor.layer != plan.layer
                 || descriptor.role != projection_role
                 || descriptor.expert != Some(action.expert)
-                || descriptor.policy != contracts::CapturePolicy::ImatrixOnly
             {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} does not match the routed expert capture identity",
+                    capture_id.0
+                )));
+            }
+            if descriptor.policy == contracts::CapturePolicy::Skip {
+                continue;
+            }
+            if descriptor.policy != contracts::CapturePolicy::ImatrixOnly {
                 return Err(contracts::CalibError::InvalidCapture(format!(
                     "descriptor {} is not the expected imatrix-only routed expert capture",
                     capture_id.0
@@ -1081,7 +1089,10 @@ fn calib_part_path(output: &std::path::Path, group_idx: usize) -> std::path::Pat
 
 /// Concatenate the per-group part packages (+ in-RAM `extra` tensors) into the
 /// final combined `.calib.hfq`, streaming each part's blobs through without
-/// materializing them all at once.
+/// materializing them all at once. Part payloads use the index-only + `pread`
+/// path on Unix: mmaping every layer part at once makes tens of GiB of
+/// calibration pages participate in AMD HMM on unified-memory APUs and can
+/// reduce the final sequential copy to kilobytes per second.
 pub fn combine_calib_parts(
     output: &std::path::Path,
     arch_id: u32,
@@ -1089,7 +1100,7 @@ pub fn combine_calib_parts(
     part_paths: &[std::path::PathBuf],
     extra: &[HfqMemTensor],
 ) -> std::io::Result<()> {
-    use crate::hfq::{write_hfqm_package_streaming, HfqPackage, HfqStreamEntry};
+    use crate::hfq::{write_hfqm_package_streaming, HfqFile, HfqStreamEntry};
     enum Plan {
         Part { package_idx: usize, name: String },
         Extra { extra_idx: usize },
@@ -1098,9 +1109,12 @@ pub fn combine_calib_parts(
     let mut entries = Vec::new();
     let mut plan = Vec::new();
     for part in part_paths {
-        let package = HfqPackage::open(part)?;
+        #[cfg(unix)]
+        let package = HfqFile::open_index_only(part)?;
+        #[cfg(not(unix))]
+        let package = HfqFile::open(part)?;
         let package_idx = packages.len();
-        for e in package.entries() {
+        for e in package.tensors() {
             entries.push(HfqStreamEntry {
                 name: e.name.clone(),
                 quant_type: e.quant_type,
@@ -1132,13 +1146,27 @@ pub fn combine_calib_parts(
         &entries,
         |i, w| match &plan[i] {
             Plan::Part { package_idx, name } => {
-                let data = packages[*package_idx].blob_data(name).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("part tensor not found: {name}"),
-                    )
-                })?;
-                w.write_all(data)
+                let (info, data) =
+                    packages[*package_idx]
+                        .tensor_data_vec(name)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("part tensor not found: {name}"),
+                            )
+                        })?;
+                if info.name != *name || data.len() != info.data_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "part tensor {name} resolved as {} with {}/{} bytes",
+                            info.name,
+                            data.len(),
+                            info.data_size
+                        ),
+                    ));
+                }
+                w.write_all(&data)
             }
             Plan::Extra { extra_idx } => w.write_all(&extra[*extra_idx].data),
         },
@@ -1625,6 +1653,81 @@ mod tests {
             },
         ];
         assert!(build_calibration_metadata(&descriptors, None, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn calibration_part_combiner_preserves_tensor_bytes_without_payload_mmaps() {
+        use crate::hfq::{write_hfqm_package_mem, HfqFile};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-calib-combine-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let part_a = root.join("part-a.hfq");
+        let part_b = root.join("part-b.hfq");
+        let output = root.join("combined.calib.hfq");
+        write_hfqm_package_mem(
+            &part_a,
+            24,
+            r#"{"artifact_kind":"calibration-part"}"#,
+            &[HfqMemTensor {
+                name: "layer.0.imatrix".into(),
+                quant_type: 2,
+                shape: vec![2],
+                group_size: 0,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }],
+        )
+        .unwrap();
+        write_hfqm_package_mem(
+            &part_b,
+            24,
+            r#"{"artifact_kind":"calibration-part"}"#,
+            &[HfqMemTensor {
+                name: "layer.1.imatrix".into(),
+                quant_type: 2,
+                shape: vec![1],
+                group_size: 0,
+                data: vec![9, 10, 11, 12],
+            }],
+        )
+        .unwrap();
+        combine_calib_parts(
+            &output,
+            24,
+            r#"{"artifact_kind":"calibration"}"#,
+            &[part_a.clone(), part_b.clone()],
+            &[HfqMemTensor {
+                name: "extra".into(),
+                quant_type: 2,
+                shape: vec![1],
+                group_size: 0,
+                data: vec![13, 14, 15, 16],
+            }],
+        )
+        .unwrap();
+
+        let combined = HfqFile::open_index_only(&output).unwrap();
+        assert_eq!(combined.arch_id, 24);
+        assert_eq!(
+            combined.tensor_data_vec("layer.0.imatrix").unwrap().1,
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            combined.tensor_data_vec("layer.1.imatrix").unwrap().1,
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            combined.tensor_data_vec("extra").unwrap().1,
+            vec![13, 14, 15, 16]
+        );
+        drop(combined);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

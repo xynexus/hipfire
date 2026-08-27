@@ -31,6 +31,7 @@ __global__ void triattn_score_q8(
     int n_kv_heads,
     int head_dim,
     int n_rot,                           // partial_rotary_factor × head_dim
+    int rope_layout,                     // 0=interleaved, 1=half-split
     float rope_theta,
     float p_q,
     int seq_len
@@ -58,16 +59,14 @@ __global__ void triattn_score_q8(
 
     // Each thread handles n_bands/32 bands. For head_dim=256 → 4 bands/thread.
     for (int f = tid; f < n_bands; f += 32) {
-        // Complex pair (2f, 2f+1) lies within a single 32-wide block.
-        const int dim0 = 2 * f;
-        const int block_idx = dim0 / 32;
-        const int within = dim0 % 32;
-        const unsigned char* blk = k_head + block_idx * 34;
-        const float scale = (float)(*(const _Float16*)blk);
-        const int q0 = (signed char)blk[2 + within];
-        const int q1 = (signed char)blk[2 + within + 1];
-        const float k_re = scale * (float)q0;
-        const float k_im = scale * (float)q1;
+        const int dim0 = rope_layout == 1 ? f : 2 * f;
+        const int dim1 = rope_layout == 1 ? f + n_bands : 2 * f + 1;
+        const unsigned char* blk0 = k_head + (dim0 / 32) * 34;
+        const unsigned char* blk1 = k_head + (dim1 / 32) * 34;
+        const float k_re = (float)(*(const _Float16*)blk0)
+                         * (float)(signed char)blk0[2 + dim0 % 32];
+        const float k_im = (float)(*(const _Float16*)blk1)
+                         * (float)(signed char)blk1[2 + dim1 % 32];
         const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
         const float k_phase = atan2f(k_im, k_re);
 

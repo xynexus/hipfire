@@ -1,6 +1,7 @@
 use std::{
+    fmt::Write as _,
     fs::{self, OpenOptions},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -75,8 +76,8 @@ pub async fn start(args: StartArgs, loaded: LoadedConfig) -> Result<()> {
     let status = current_status(&paths, &effective).await;
     if status.pid_alive || status.health_ok {
         println!(
-            "hipfire already running: {}",
-            status.summary_line(&paths, &effective)
+            "{}",
+            status.render("Hipfire server is already running.", &paths, &effective)
         );
         return Ok(());
     }
@@ -114,25 +115,33 @@ pub async fn start(args: StartArgs, loaded: LoadedConfig) -> Result<()> {
     fs::write(&paths.serve_pid, child.id().to_string())
         .with_context(|| format!("write {}", paths.serve_pid.display()))?;
 
-    print!("started hipfire serve pid {}", child.id());
-    if let Some(model) = effective.config.default_model.as_deref() {
-        print!(" model {model}");
-    }
-    println!(" log {}", paths.serve_log.display());
-
     if args.wait_secs == 0 {
-        println!("health: not waited; check with `hipfire status`");
+        println!("{}", render_start_summary(child.id(), &paths, &effective));
         return Ok(());
     }
 
     match wait_for_health(&effective, Duration::from_secs(args.wait_secs)).await {
         Ok(()) => {
-            println!("health ok at {}", health_url(&effective));
+            let status = current_status(&paths, &effective).await;
+            println!(
+                "{}",
+                status.render("Hipfire server is ready.", &paths, &effective)
+            );
             Ok(())
         }
         Err(err) => {
-            println!("health not ready yet: {err}");
-            println!("tail the log with: tail -f {}", paths.serve_log.display());
+            let status = current_status(&paths, &effective).await;
+            let mut output = status.render(
+                "Hipfire server started, but is not ready yet.",
+                &paths,
+                &effective,
+            );
+            let _ = write!(
+                output,
+                "\n\n  Wait error  {err}\n  Next step   tail -f {}",
+                human_path(&paths.serve_log)
+            );
+            println!("{output}");
             Ok(())
         }
     }
@@ -192,12 +201,7 @@ pub async fn restart(args: RestartArgs, loaded: LoadedConfig) -> Result<()> {
 pub async fn status(_args: StatusArgs, loaded: LoadedConfig) -> Result<()> {
     let paths = DaemonPaths::new()?;
     let status = current_status(&paths, &loaded).await;
-    println!("{}", status.summary_line(&paths, &loaded));
-    if let Some(text) = status.health_text {
-        println!("health: {text}");
-    }
-    println!("pid file: {}", paths.serve_pid.display());
-    println!("log: {}", paths.serve_log.display());
+    println!("{}", status.render("Hipfire server", &paths, &loaded));
     Ok(())
 }
 
@@ -227,22 +231,139 @@ struct ServeStatus {
 }
 
 impl ServeStatus {
-    fn summary_line(&self, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
-        let url = health_url(loaded);
+    fn render(&self, title: &str, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
+        let health = self
+            .health_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        let mut fields = vec![
+            ("Status", self.state_label().to_string()),
+            ("Address", server_url(loaded)),
+            ("Process", self.process_label()),
+            ("Health", self.health_label().to_string()),
+        ];
+        if let Some(version) = health
+            .as_ref()
+            .and_then(|value| value.get("version"))
+            .and_then(serde_json::Value::as_str)
+        {
+            fields.push(("Version", version.to_string()));
+        }
+        if let Some(model) = health.as_ref().and_then(health_model) {
+            fields.push(("Model", model.to_string()));
+        }
+        fields.push(("PID file", human_path(&paths.serve_pid)));
+        fields.push(("Log", human_path(&paths.serve_log)));
+
+        render_block(title, &fields, self.note(paths, loaded).as_deref())
+    }
+
+    fn state_label(&self) -> &'static str {
         match (self.pid, self.pid_alive, self.health_ok) {
-            (Some(pid), true, true) => format!("online pid {pid} at {url}"),
-            (Some(pid), true, false) => format!("pid {pid} alive, health not ready at {url}"),
-            (Some(_pid), false, true) => {
-                format!(
-                    "health ok at {url}, but {} is stale",
-                    paths.serve_pid.display()
-                )
-            }
-            (Some(pid), false, false) => format!("offline, stale pid {pid}"),
-            (None, _, true) => format!("online at {url}, pid file missing"),
-            (None, _, false) => format!("offline at {url}"),
+            (Some(_), true, true) | (None, _, true) => "online",
+            (_, true, false) => "starting",
+            (Some(_), false, true) => "degraded",
+            (_, false, false) => "offline",
         }
     }
+
+    fn process_label(&self) -> String {
+        match (self.pid, self.pid_alive) {
+            (Some(pid), true) => format!("{pid} (running)"),
+            (Some(pid), false) => format!("{pid} (not running)"),
+            (None, _) => "not found".to_string(),
+        }
+    }
+
+    fn health_label(&self) -> &'static str {
+        if self.health_ok {
+            "healthy"
+        } else if self.pid_alive {
+            "not ready"
+        } else {
+            "unreachable"
+        }
+    }
+
+    fn note(&self, paths: &DaemonPaths, loaded: &LoadedConfig) -> Option<String> {
+        match (self.pid, self.pid_alive, self.health_ok) {
+            (Some(_), true, true) => None,
+            (Some(_), true, false) => Some(format!(
+                "The process is running, but {} is not responding yet.",
+                health_url(loaded)
+            )),
+            (Some(pid), false, true) => Some(format!(
+                "The server is healthy, but {} still refers to process {pid}.",
+                human_path(&paths.serve_pid)
+            )),
+            (Some(pid), false, false) => Some(format!(
+                "The PID file refers to process {pid}, which is no longer running."
+            )),
+            (None, _, true) => Some(format!(
+                "The server is healthy, but {} is missing.",
+                human_path(&paths.serve_pid)
+            )),
+            (None, _, false) => Some(format!(
+                "Could not reach the server. Start it with `hipfire start` or inspect {}.",
+                human_path(&paths.serve_log)
+            )),
+        }
+    }
+}
+
+fn health_model(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("active_model")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("model").and_then(serde_json::Value::as_str))
+}
+
+fn render_start_summary(pid: u32, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
+    let mut fields = vec![
+        ("Status", "starting".to_string()),
+        ("Address", server_url(loaded)),
+        ("Process", format!("{pid} (running)")),
+        ("Health", "not checked".to_string()),
+    ];
+    if let Some(model) = loaded.config.default_model.as_deref() {
+        fields.push(("Model", model.to_string()));
+    }
+    fields.push(("Log", human_path(&paths.serve_log)));
+    render_block(
+        "Hipfire server started.",
+        &fields,
+        Some("Run `hipfire status` to check readiness."),
+    )
+}
+
+fn render_block(title: &str, fields: &[(&str, String)], note: Option<&str>) -> String {
+    let width = fields
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or_default();
+    let mut output = String::from(title);
+    if !fields.is_empty() {
+        output.push('\n');
+        for (label, value) in fields {
+            let _ = write!(output, "\n  {label:<width$}  {value}");
+        }
+    }
+    if let Some(note) = note {
+        let _ = write!(output, "\n\n  {note}");
+    }
+    output
+}
+
+fn human_path(path: &Path) -> String {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| {
+            path.strip_prefix(home)
+                .ok()
+                .map(|relative| format!("~/{}", relative.display()))
+        })
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 async fn current_status(paths: &DaemonPaths, loaded: &LoadedConfig) -> ServeStatus {
@@ -324,12 +445,20 @@ fn effective_config(
 }
 
 fn health_url(loaded: &LoadedConfig) -> String {
+    format!("{}/health", server_url(loaded))
+}
+
+fn server_url(loaded: &LoadedConfig) -> String {
     let host = match loaded.config.host.as_str() {
         "" | "0.0.0.0" => "127.0.0.1",
         "::" => "::1",
         other => other,
     };
-    format!("http://{}:{}/health", host, loaded.config.port)
+    if host.contains(':') {
+        format!("http://[{host}]:{}", loaded.config.port)
+    } else {
+        format!("http://{host}:{}", loaded.config.port)
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -353,5 +482,92 @@ fn detach_process_group(command: &mut Command) {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths() -> DaemonPaths {
+        DaemonPaths {
+            root: PathBuf::from("/tmp/hipfire-test"),
+            serve_pid: PathBuf::from("/tmp/hipfire-test/serve.pid"),
+            serve_log: PathBuf::from("/tmp/hipfire-test/serve.log"),
+        }
+    }
+
+    fn loaded(host: &str, port: u16) -> LoadedConfig {
+        let mut layer = ConfigLayer::new(ConfigLayerKind::Cli);
+        layer.values.insert("host".to_string(), json!(host));
+        layer.values.insert("port".to_string(), json!(port));
+        hipfire_config::load_config_bundle().with_additional_layer(layer)
+    }
+
+    #[test]
+    fn status_render_is_scannable_and_summarizes_health_json() {
+        let status = ServeStatus {
+            pid: Some(4242),
+            pid_alive: true,
+            health_ok: true,
+            health_text: Some(
+                json!({
+                    "status": "ok",
+                    "version": "v0.3.0-1-gdeadbeef",
+                    "active_model": "Qwen3.5-9B"
+                })
+                .to_string(),
+            ),
+        };
+        let output = status.render("Hipfire server", &paths(), &loaded("0.0.0.0", 11435));
+
+        assert!(output.starts_with("Hipfire server\n\n  Status"));
+        assert!(output.contains("online"));
+        assert!(output.contains("http://127.0.0.1:11435"));
+        assert!(output.contains("4242 (running)"));
+        assert!(output.contains("v0.3.0-1-gdeadbeef"));
+        assert!(output.contains("Qwen3.5-9B"));
+        assert!(!output.contains("active_model"));
+    }
+
+    #[test]
+    fn offline_status_recommends_the_next_action_without_raw_http_noise() {
+        let status = ServeStatus {
+            pid: None,
+            pid_alive: false,
+            health_ok: false,
+            health_text: Some("error sending request for url".to_string()),
+        };
+        let output = status.render("Hipfire server", &paths(), &loaded("127.0.0.1", 11435));
+
+        assert!(output.contains("offline"));
+        assert!(output.contains("unreachable"));
+        assert!(output.contains("`hipfire start`"));
+        assert!(!output.contains("error sending request"));
+    }
+
+    #[test]
+    fn start_summary_sets_expectations_and_includes_the_configured_model() {
+        let base = loaded("127.0.0.1", 11435);
+        let mut layer = ConfigLayer::new(ConfigLayerKind::Cli);
+        layer
+            .values
+            .insert("default_model".to_string(), json!("Qwen3.5-9B"));
+        let loaded = base.with_additional_layer(layer);
+        let output = render_start_summary(4242, &paths(), &loaded);
+
+        assert!(output.starts_with("Hipfire server started."));
+        assert!(output.contains("starting"));
+        assert!(output.contains("not checked"));
+        assert!(output.contains("4242 (running)"));
+        assert!(output.contains("Qwen3.5-9B"));
+        assert!(output.contains("`hipfire status`"));
+    }
+
+    #[test]
+    fn ipv6_health_url_uses_brackets() {
+        let loaded = loaded("::", 11435);
+        assert_eq!(server_url(&loaded), "http://[::1]:11435");
+        assert_eq!(health_url(&loaded), "http://[::1]:11435/health");
     }
 }

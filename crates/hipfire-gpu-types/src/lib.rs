@@ -59,6 +59,17 @@ pub enum DType {
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
     Oq8G256, // Opus Quant W8A8: symmetric signed-INT8, FWHT-rotated, per-group f32 scale (iu8 WMMA).
+    // DFLASH plain-basis Opus storage. These variants preserve the arch-20
+    // sidecar's original interleaved blocks on device:
+    //   Oq8Plain        [f16 scale | 256 i8]                       (258 B)
+    //   Oq4Plain        [f16 scale | 128 packed signed nibbles]    (130 B)
+    //   Oq4MixedPlain   Oq4Plain + (u8 position, i8 replacement)*N
+    // They are deliberately distinct from Oq{4,8}G256: those primary-model
+    // formats are FWHT-rotated and use split f32 scales. Treating these as the
+    // same dtype would silently rotate DFLASH activations into the wrong basis.
+    DflashOq8Plain,
+    DflashOq4Plain,
+    DflashOq4MixedPlain,
     // On-disk storage is [f16 scale][128 nibbles]/256-group (130 B/group, codec
     // `quantize_oq4g256`). The loader repacks to the kernel layout: packed nibbles
     // [M,K/2] followed by per-group f32 scales [M,K/256] in one buffer. The forward
@@ -104,6 +115,9 @@ impl DType {
             | DType::MFP4G32
             | DType::ParoQ4G128
             | DType::Oq4G256
+            | DType::DflashOq8Plain
+            | DType::DflashOq4Plain
+            | DType::DflashOq4MixedPlain
             | DType::W8A8Ref
             | DType::Oq8G256
             | DType::Raw => 1, // byte-level

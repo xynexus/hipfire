@@ -19,6 +19,8 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-cohere2 = { path = "../hipfire-arch-cohere2" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-hash = { path = "../hipfire-hash" }
 hipfire-lock = { path = "../hipfire-lock" }

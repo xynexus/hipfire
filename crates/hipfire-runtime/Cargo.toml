@@ -70,6 +70,7 @@ hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
@@ -90,6 +91,7 @@ base64.workspace = true
 libc.workspace = true
 rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64", "xxhash3_128"] }
+sha2 = "0.10"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }

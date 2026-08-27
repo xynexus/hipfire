@@ -17,8 +17,14 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::calibration::contracts::{
+    CaptureAdmission, CaptureId, CaptureRegistry, ExpertCaptureRole, ExpertTelemetry,
+    ProjectionRole,
+};
+use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
 use hipfire_runtime::layered_kv::{KvStorageKind, LayeredAttentionScratch, LayeredKvArena};
+use hipfire_runtime::triattn::{EvictionResult, LayeredEvictionCtx};
 use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat, WeightTensor};
 use std::collections::BTreeMap;
 
@@ -31,6 +37,37 @@ pub struct Gemma4ForwardCapture {
     /// captures leave this unset, so no intermediate downloads occur.
     pub operator_layer: Option<usize>,
     pub operator_boundaries: BTreeMap<String, Vec<f32>>,
+}
+
+/// Borrowed capture state for one streamed calibration layer. This is kept at
+/// the production layer boundary so calibration cannot drift from Gemma 4's
+/// attention, dense-plus-MoE, or layer-scalar math.
+pub struct Gemma4CalibrationCapture<'a> {
+    pub collector: &'a CalibCollector,
+    pub registry: &'a CaptureRegistry,
+    pub telemetry: Option<&'a mut ExpertTelemetry>,
+    pub logical_layer: usize,
+}
+
+fn calibration_capture(
+    gpu: &mut Gpu,
+    calibration: &Gemma4CalibrationCapture<'_>,
+    role: ProjectionRole,
+    expert: Option<usize>,
+    input: &GpuTensor,
+    width: usize,
+) -> HipResult<()> {
+    calibration
+        .collector
+        .capture_by_id(
+            gpu,
+            calibration.registry,
+            CaptureId::new(calibration.logical_layer, role, expert),
+            input,
+            1,
+            width,
+        )
+        .map_err(|error| HipError::new(0, &error.to_string()))
 }
 
 pub struct Gemma4DenseState {
@@ -91,6 +128,26 @@ impl Gemma4DenseState {
         kv_mode: KvQuantMode,
         kvarn_bits: usize,
     ) -> HipResult<Self> {
+        Self::new_with_kv_mode_capped(gpu, config, max_seq, max_seq, kv_mode, kvarn_bits)
+    }
+
+    /// CASK-aware constructor: the plan retains `max_seq` as the logical
+    /// context while full-context groups allocate only `physical_cap` slots.
+    /// Sliding layers retain their architecture-defined bounded rings.
+    pub fn new_with_kv_mode_capped(
+        gpu: &mut Gpu,
+        config: &Gemma4Config,
+        max_seq: usize,
+        physical_cap: usize,
+        kv_mode: KvQuantMode,
+        kvarn_bits: usize,
+    ) -> HipResult<Self> {
+        if physical_cap == 0 || physical_cap > max_seq {
+            return Err(HipError::new(
+                0,
+                "Gemma 4 physical KV cap must be in 1..=max_seq",
+            ));
+        }
         let plan = config
             .layered_kv_plan(max_seq)
             .unwrap_or_else(|error| panic!("Gemma 4 KV plan: {error}"));
@@ -112,14 +169,20 @@ impl Gemma4DenseState {
             .iter()
             .any(|l| !matches!(l.kv_producer, KvProducer::Own));
         let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0;
+        if kv_kvarn && physical_cap != max_seq {
+            return Err(HipError::new(
+                0,
+                "Gemma 4 capped full-context KV currently requires F32 mode",
+            ));
+        }
         let kv = if kv_kvarn {
             LayeredKvArena::new_kvarn(gpu, plan.clone(), kvarn_bits)?
         } else {
-            LayeredKvArena::new_fp32(gpu, plan.clone())?
+            LayeredKvArena::new_fp32_capped(gpu, plan.clone(), physical_cap)?
         };
         let (kvarn_tiles, kvarn_flash_partials) = if kv_kvarn {
             let tiles = gpu.alloc_tensor(&[max_kv_width * KvCache::KVARN_GROUP], DType::F32)?;
-            let max_tiles = plan.max_seq().div_ceil(KvCache::KVARN_GROUP);
+            let max_tiles = physical_cap.div_ceil(KvCache::KVARN_GROUP);
             let partials = gpu.alloc_tensor(
                 &[max_q_heads * max_tiles * (2 + kvarn_head_dim)],
                 DType::F32,
@@ -231,6 +294,24 @@ impl Gemma4DenseState {
 
     pub fn reset(&mut self) {
         self.kv.reset();
+    }
+
+    pub fn maybe_evict(
+        &mut self,
+        gpu: &mut Gpu,
+        eviction: &LayeredEvictionCtx,
+    ) -> HipResult<Option<EvictionResult>> {
+        eviction.maybe_evict(gpu, &mut self.kv)
+    }
+
+    pub fn build_eviction(
+        &self,
+        gpu: &mut Gpu,
+        artifact: &hipfire_runtime::triattn::TriAttnArtifact,
+        budget: usize,
+        beta: usize,
+    ) -> Result<LayeredEvictionCtx, String> {
+        LayeredEvictionCtx::new(gpu, artifact, &self.kv, budget, beta)
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -376,6 +457,10 @@ fn round_f32_to_bf16(value: f32) -> f32 {
     f32::from_bits(bits.wrapping_add(0x7fff + lsb) & 0xffff_0000)
 }
 
+fn cask_physical_layer(resident_layer: usize, calibration_layer: Option<usize>) -> usize {
+    calibration_layer.unwrap_or(resident_layer)
+}
+
 fn attention_block(
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -384,6 +469,7 @@ fn attention_block(
     state: &Gemma4DenseState,
     position: usize,
     mut capture: Option<&mut Gemma4ForwardCapture>,
+    calibration: Option<&Gemma4CalibrationCapture<'_>>,
 ) -> HipResult<()> {
     let plan = &config.layers[layer_idx];
     let geometry = plan.attention;
@@ -395,6 +481,16 @@ fn attention_block(
         .unwrap_or_else(|error| panic!("Gemma 4 attention scratch: {error}"));
 
     gpu.rmsnorm_f32(&state.x, &layer.input_norm, &state.tmp, config.rms_norm_eps)?;
+    if let Some(calibration) = calibration {
+        calibration_capture(
+            gpu,
+            calibration,
+            ProjectionRole::QueryInput,
+            None,
+            &state.tmp,
+            config.hidden_size,
+        )?;
+    }
     if let Some(capture) = capture.as_deref_mut() {
         capture_operator(gpu, capture, layer_idx, "input_norm", &state.tmp)?;
     }
@@ -449,6 +545,18 @@ fn attention_block(
         capture_operator(gpu, capture, layer_idx, "q_norm", &scratch.q)?;
         capture_operator(gpu, capture, layer_idx, "k_norm", &scratch.k)?;
         capture_operator(gpu, capture, layer_idx, "v_norm", &scratch.v)?;
+    }
+    // Architecture-owned CASK tap: normalized Q immediately before this
+    // layer's RoPE. The common layer-stream producer installs the tap only
+    // during calibration, so serving pays only the relaxed enabled check.
+    if hipfire_runtime::triattn::tap_enabled() {
+        let q = gpu.download_f32(&scratch.q)?;
+        // A streamed calibration layer is represented by a one-layer resident
+        // state, so `layer_idx` is zero there. CASK metadata is keyed by the
+        // physical model layer and must use the adapter's logical index.
+        let cask_layer =
+            cask_physical_layer(layer_idx, calibration.map(|capture| capture.logical_layer));
+        hipfire_runtime::triattn::record_prerope_q(cask_layer, &q[..q_width]);
     }
 
     set_position(gpu, state, position)?;
@@ -743,6 +851,16 @@ fn attention_block(
     if let Some(capture) = capture.as_deref_mut() {
         capture_operator(gpu, capture, layer_idx, "attention_raw", &scratch.attention)?;
     }
+    if let Some(calibration) = calibration {
+        calibration_capture(
+            gpu,
+            calibration,
+            ProjectionRole::AttentionOutputInput,
+            None,
+            &scratch.attention,
+            q_width,
+        )?;
+    }
     debug_assert_eq!(scratch.attention.numel(), q_width);
     weight_gemv(gpu, &layer.wo, &scratch.attention, &state.o)?;
     if let Some(capture) = capture.as_deref_mut() {
@@ -765,6 +883,7 @@ fn ffn_project(
     layer: &Gemma4DenseLayerWeights,
     config: &Gemma4Config,
     state: &Gemma4DenseState,
+    calibration: Option<&Gemma4CalibrationCapture<'_>>,
 ) -> HipResult<()> {
     gpu.rmsnorm_f32(
         &state.x,
@@ -772,6 +891,16 @@ fn ffn_project(
         &state.ffn_norm,
         config.rms_norm_eps,
     )?;
+    if let Some(calibration) = calibration {
+        calibration_capture(
+            gpu,
+            calibration,
+            ProjectionRole::DenseMlpInput,
+            None,
+            &state.ffn_norm,
+            config.hidden_size,
+        )?;
+    }
     weight_gemv(gpu, &layer.w_gate, &state.ffn_norm, &state.gate)?;
     weight_gemv(gpu, &layer.w_up, &state.ffn_norm, &state.up)
 }
@@ -847,15 +976,49 @@ fn moe_ffn_finish(
     moe: &Gemma4MoeLayerWeights,
     config: &Gemma4Config,
     state: &Gemma4DenseState,
+    mut calibration: Option<&mut Gemma4CalibrationCapture<'_>>,
 ) -> HipResult<()> {
     let router_logits = state
         .router_logits
         .as_ref()
         .ok_or_else(|| HipError::new(0, "Gemma 4 MoE state is missing router logits"))?;
     gpu.rmsnorm_f32(&state.x, &moe.router_scale, &state.tmp, config.rms_norm_eps)?;
+    if let Some(calibration) = calibration.as_deref() {
+        calibration_capture(
+            gpu,
+            calibration,
+            ProjectionRole::RouterInput,
+            None,
+            &state.tmp,
+            config.hidden_size,
+        )?;
+    }
     weight_gemv(gpu, &moe.router, &state.tmp, router_logits)?;
     let logits = gpu.download_f32(router_logits)?;
     let selected = topk_router_weights(&logits, &moe.per_expert_scale, moe.top_k)?;
+    if let Some(calibration) = calibration.as_deref_mut() {
+        if let Some(telemetry) = calibration.telemetry.as_deref_mut() {
+            let indices = selected
+                .iter()
+                .map(|(expert, _)| *expert)
+                .collect::<Vec<_>>();
+            let weights = selected
+                .iter()
+                .map(|(_, weight)| *weight)
+                .collect::<Vec<_>>();
+            telemetry
+                .record_router_selection(calibration.logical_layer, &indices, &weights)
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+            telemetry
+                .record_grouped_batch_shape(
+                    calibration.logical_layer,
+                    indices.len(),
+                    indices.len(),
+                    indices.len(),
+                )
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
+    }
 
     weight_gemv(
         gpu,
@@ -865,6 +1028,46 @@ fn moe_ffn_finish(
     )?;
     for (expert_idx, weight) in selected {
         let expert = &moe.experts[expert_idx];
+        let capture_gate_up = if let Some(calibration) = calibration.as_deref_mut() {
+            match calibration.telemetry.as_deref_mut() {
+                Some(telemetry) => {
+                    telemetry
+                        .record_capture_route(
+                            calibration.logical_layer,
+                            expert_idx,
+                            ExpertCaptureRole::GateUpInput,
+                            weight,
+                        )
+                        .map_err(|error| HipError::new(0, &error.to_string()))?
+                        == CaptureAdmission::Capture
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
+        if capture_gate_up {
+            calibration_capture(
+                gpu,
+                calibration.as_deref().unwrap(),
+                ProjectionRole::GateUpInput,
+                Some(expert_idx),
+                &state.ffn_norm,
+                config.hidden_size,
+            )?;
+            if let Some(calibration) = calibration.as_deref_mut() {
+                let logical_layer = calibration.logical_layer;
+                if let Some(telemetry) = calibration.telemetry.as_deref_mut() {
+                    telemetry
+                        .record_direct_capture_launch(
+                            logical_layer,
+                            expert_idx,
+                            ExpertCaptureRole::GateUpInput,
+                        )
+                        .map_err(|error| HipError::new(0, &error.to_string()))?;
+                }
+            }
+        }
         weight_gemv(gpu, &expert.gate, &state.ffn_norm, &state.gate)?;
         weight_gemv(gpu, &expert.up, &state.ffn_norm, &state.up)?;
         gpu.gelu_mul_f32(
@@ -872,6 +1075,46 @@ fn moe_ffn_finish(
             &state.up,
             &state.ffn.sub_offset(0, expert.down.k),
         )?;
+        let capture_down = if let Some(calibration) = calibration.as_deref_mut() {
+            match calibration.telemetry.as_deref_mut() {
+                Some(telemetry) => {
+                    telemetry
+                        .record_capture_route(
+                            calibration.logical_layer,
+                            expert_idx,
+                            ExpertCaptureRole::DownInput,
+                            weight,
+                        )
+                        .map_err(|error| HipError::new(0, &error.to_string()))?
+                        == CaptureAdmission::Capture
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
+        if capture_down {
+            calibration_capture(
+                gpu,
+                calibration.as_deref().unwrap(),
+                ProjectionRole::DownInput,
+                Some(expert_idx),
+                &state.ffn.sub_offset(0, expert.down.k),
+                expert.down.k,
+            )?;
+            if let Some(calibration) = calibration.as_deref_mut() {
+                let logical_layer = calibration.logical_layer;
+                if let Some(telemetry) = calibration.telemetry.as_deref_mut() {
+                    telemetry
+                        .record_direct_capture_launch(
+                            logical_layer,
+                            expert_idx,
+                            ExpertCaptureRole::DownInput,
+                        )
+                        .map_err(|error| HipError::new(0, &error.to_string()))?;
+                }
+            }
+        }
         weight_gemv(
             gpu,
             &expert.down,
@@ -1025,6 +1268,7 @@ fn run_reference_layer(
     position: usize,
     bf16_staged_geglu: bool,
     mut capture: Option<&mut Gemma4ForwardCapture>,
+    mut calibration: Option<&mut Gemma4CalibrationCapture<'_>>,
 ) -> HipResult<()> {
     let layer = &weights.layers[layer_idx];
     if let Some(capture) = capture.as_deref_mut() {
@@ -1038,11 +1282,12 @@ fn run_reference_layer(
         state,
         position,
         capture.as_deref_mut(),
+        calibration.as_deref(),
     )?;
     if let Some(capture) = capture.as_deref_mut() {
         capture_operator(gpu, capture, layer_idx, "post_attention_residual", &state.x)?;
     }
-    ffn_project(gpu, layer, config, state)?;
+    ffn_project(gpu, layer, config, state, calibration.as_deref())?;
     if bf16_staged_geglu {
         gpu.bf16_round_trip_f32(&state.gate)?;
         gpu.bf16_round_trip_f32(&state.up)?;
@@ -1070,8 +1315,18 @@ fn run_reference_layer(
             &state.ffn.sub_offset(0, layer.w_down.k),
         )?;
     }
+    if let Some(calibration) = calibration.as_deref() {
+        calibration_capture(
+            gpu,
+            calibration,
+            ProjectionRole::DownInput,
+            None,
+            &state.ffn.sub_offset(0, layer.w_down.k),
+            layer.w_down.k,
+        )?;
+    }
     if let Some(moe) = &layer.moe {
-        moe_ffn_finish(gpu, layer, moe, config, state)?;
+        moe_ffn_finish(gpu, layer, moe, config, state, calibration.as_deref_mut())?;
     } else {
         ffn_finish(gpu, layer, config, state)?;
     }
@@ -1141,6 +1396,7 @@ pub fn forward_step_reference(
             position,
             false,
             capture.as_deref_mut(),
+            None,
         )?;
         if let Some(capture) = capture.as_deref_mut() {
             capture_layer(gpu, state, capture);
@@ -1193,7 +1449,7 @@ pub fn diagnostic_forward_layer_from_hidden_capture(
     capture: Option<&mut Gemma4ForwardCapture>,
 ) -> HipResult<Vec<f32>> {
     diagnostic_forward_layer_from_hidden_impl(
-        gpu, weights, config, state, layer_idx, position, hidden, false, capture,
+        gpu, weights, config, state, layer_idx, position, hidden, false, capture, None,
     )
 }
 
@@ -1211,7 +1467,34 @@ pub fn diagnostic_forward_layer_from_hidden_bf16_geglu_capture(
     capture: Option<&mut Gemma4ForwardCapture>,
 ) -> HipResult<Vec<f32>> {
     diagnostic_forward_layer_from_hidden_impl(
-        gpu, weights, config, state, layer_idx, position, hidden, true, capture,
+        gpu, weights, config, state, layer_idx, position, hidden, true, capture, None,
+    )
+}
+
+/// Stream one production Gemma 4 layer while accumulating its registered
+/// dense/router/expert projection inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn calibration_forward_layer_from_hidden(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &mut Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    hidden: &[f32],
+    calibration: &mut Gemma4CalibrationCapture<'_>,
+) -> HipResult<Vec<f32>> {
+    diagnostic_forward_layer_from_hidden_impl(
+        gpu,
+        weights,
+        config,
+        state,
+        layer_idx,
+        position,
+        hidden,
+        false,
+        None,
+        Some(calibration),
     )
 }
 
@@ -1226,6 +1509,7 @@ fn diagnostic_forward_layer_from_hidden_impl(
     hidden: &[f32],
     bf16_staged_geglu: bool,
     capture: Option<&mut Gemma4ForwardCapture>,
+    calibration: Option<&mut Gemma4CalibrationCapture<'_>>,
 ) -> HipResult<Vec<f32>> {
     if layer_idx >= weights.layers.len() || layer_idx >= config.layers.len() {
         return Err(HipError::new(
@@ -1266,6 +1550,7 @@ fn diagnostic_forward_layer_from_hidden_impl(
         position,
         bf16_staged_geglu,
         capture,
+        calibration,
     )?;
     let output = gpu.download_f32(&state.x)?;
     state
@@ -1386,8 +1671,14 @@ impl ForwardBindings for Gemma4Bindings<'_> {
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
         match self.layer_idx {
-            Some(layer) => ffn_project(gpu, &self.weights.layers[layer], self.config, self.state)
-                .map_err(|error| dispatch_error("FFN projection", error)),
+            Some(layer) => ffn_project(
+                gpu,
+                &self.weights.layers[layer],
+                self.config,
+                self.state,
+                None,
+            )
+            .map_err(|error| dispatch_error("FFN projection", error)),
             None => weight_gemv(
                 gpu,
                 &self.weights.core.output,
@@ -1462,6 +1753,7 @@ impl ForwardBindings for Gemma4Bindings<'_> {
             self.config,
             self.state,
             self.position,
+            None,
             None,
         )
         .map_err(|error| dispatch_error("attention", error))
@@ -1673,5 +1965,11 @@ mod tests {
     fn embedding_scale_uses_bf16_round_to_nearest_even() {
         assert_eq!(round_f32_to_bf16(5376.0_f32.sqrt()).to_bits(), 0x4293_0000);
         assert_eq!(round_f32_to_bf16(f32::INFINITY), f32::INFINITY);
+    }
+
+    #[test]
+    fn streamed_cask_uses_physical_not_one_layer_resident_index() {
+        assert_eq!(cask_physical_layer(0, Some(17)), 17);
+        assert_eq!(cask_physical_layer(17, None), 17);
     }
 }
