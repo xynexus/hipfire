@@ -107,7 +107,33 @@ no third `+`.** `oq4.25+++` therefore needs:
   does not validate the quant grammar, so it will not catch a malformed token
   either way. Worth tightening while the grammar is being changed.
 
-### 2.2 Admission control exists but has no caller
+### 2.2 Admission control exists but has no caller — and the quanta are far too long
+
+**Measured 2026-08-27**, see `docs/experiments/2026-08-27-induction-quantum-wcet-nix1.md`:
+
+| quantum | WCET | vs the 200 ms contract |
+|---|---|---|
+| QAT step (1B fp32) | **15.3 s** | 77× |
+| KLD chunk (n_ctx 1024) | **280.8 s** | 1,404× |
+| serving baseline | 2.455 s | — |
+| serving *between* QAT quanta | 2.884 s (**+17.5%**) | — |
+
+This changes item 3 of §3 below. Giving `kld_eval` a `step()` is **necessary but
+not sufficient**: a 280 s chunk is not a quantum in any useful sense, and
+`admit_realtime` can only decide whether to *start* one — nothing preempts a
+step once running. Both stages need **sub-quantum yielding**, at a layer or
+token-block boundary, which is a stronger requirement than exposing a step
+function.
+
+The +17.5% steady-state tax is the encouraging half: that is what interleaving
+costs *between* quanta, and it is a number a policy could trade against.
+
+⚠️ The KLD figure may be a batching fallback rather than intrinsic cost —
+0.274 s/token is decode-speed, and the run logged `KV cache: Q8` despite loading
+`kvarn`. `HIPFIRE_KERNEL_TRACE` was not on, so it is unresolved. Settle it before
+designing around 280 s.
+
+#### Original note
 
 `admit_realtime` (merged in #350) prices the drain budget including the prefill
 term. **Nothing calls it.** For non-disruptive induction it needs to actually
