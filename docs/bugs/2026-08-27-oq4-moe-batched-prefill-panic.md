@@ -104,11 +104,21 @@ path 1. Both `panic!`s became error returns as a backstop.
 Path 1 runs and is **deterministic** (run-to-run identical), but its 96-token
 greedy output **DIFFERS from the per-token reference**, diverging after 255 of
 433 chars. That is an accumulation-order difference between two kernels, not
-instability — but it is *unverified*, not known-good, and
-**`tiny-prefill-gate` SKIPS `qwen3_5_moe`** ("batched prefill did not execute for
-this fixture"), so batched MoE prefill has no parity coverage at all. This file's
-own history is the argument: the Oq8 grouped kernel "ran 1.8x faster and emitted
-garbage".
+instability — but it is *unverified*, not known-good.
+
+⚠️ **Correction 2026-08-27.** This paragraph originally continued: *"and
+tiny-prefill-gate SKIPS qwen3_5_moe … so batched MoE prefill has no parity
+coverage at all."* **Wrong.** That SKIP is deliberate regression cover for the
+admission guard (top-2-of-8 vs the required k_top ∈ {8,10}), and
+`qwen3_5_moe_indexed` covers batched MoE prefill and passes. The real gap is
+narrower — every gate cell is `--format fp16`, so none exercises `Oq4G256`
+experts — and it cannot be closed by adding an oq4 cell, because
+`is_batchable_la` rejects Opus dtypes on the *attention* projections, so an
+all-Opus fixture declines batching before MoE is reached. See
+`docs/todo/2026-08-27-oq4-moe-prefill-coverage.md`.
+
+The Oq8 precedent still stands as the reason the default is conservative: that
+grouped kernel "ran 1.8x faster and emitted garbage".
 
 Measured after the fix:
 
