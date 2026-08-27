@@ -891,6 +891,16 @@ fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────
 
+/// Validate a `--format` token against the converter's own vocabulary.
+///
+/// Callers that BUILD a `dflash_convert` command line (the induction
+/// orchestrator) used to keep their own copy of this list. It drifted: the
+/// converter moved to `--format <token>` and grew oq4+/oq8+/oq4.25+, while the
+/// copy still emitted the retired boolean flags. One authority instead.
+pub fn validate_format_token(token: &str) -> Result<(), String> {
+    DraftFormat::from_token(Some(token)).map(|_| ())
+}
+
 pub fn main() {
     let args: Vec<String> = crate::tools::argv();
     let mut input_dir: Option<String> = None;

@@ -96,15 +96,14 @@ impl ArtifactLayout {
 
 /// DFlash converter dtype flags — the twin of `induct_model._dflash_format_args`.
 pub fn dflash_format_args(dflash_format: &str) -> Result<Vec<String>, String> {
-    Ok(match dflash_format {
-        "bf16" => vec![],
-        "f16" => vec!["--f16".into()],
-        "f32" => vec!["--keep-f32".into()],
-        "mq3" => vec!["--mq3".into()],
-        "mq4" => vec!["--mq4".into()],
-        "mq6" => vec!["--mq6".into()],
-        other => return Err(format!("unknown dflash format {other:?}")),
-    })
+    // The converter takes `--format <token>`. This used to emit retired boolean
+    // flags (`--mq4`, `--f16`, `--keep-f32`) from a hand-copied vocabulary, and
+    // dflash_convert rejects every one of them with `unknown arg`, so any
+    // non-bf16 dflash stage failed at spawn. Validation delegates to the
+    // converter's own table, which also accepts oq4+/oq8+/oq4.25+ that the copy
+    // did not know about.
+    hipfire_quantize::tools::dflash_convert::validate_format_token(dflash_format)?;
+    Ok(vec!["--format".into(), dflash_format.to_string()])
 }
 
 /// Default quantizer flags from the format suffix — twin of
@@ -726,4 +725,39 @@ pub fn preflight_sources(target: &Path, draft: &Path) -> Result<Value, Box<dyn E
         "draft": draft_summary,
         "compatibility": "compatible",
     }))
+}
+
+#[cfg(test)]
+mod dflash_format_tests {
+    use super::dflash_format_args;
+
+    #[test]
+    fn emits_the_flag_the_converter_actually_accepts() {
+        // dflash_convert takes `--format <token>`. Emitting the retired boolean
+        // flags (`--mq4`) made it exit with `unknown arg`, so every non-bf16
+        // dflash stage failed at spawn.
+        assert_eq!(
+            dflash_format_args("mq4").unwrap(),
+            vec!["--format".to_string(), "mq4".to_string()]
+        );
+        assert_eq!(
+            dflash_format_args("bf16").unwrap(),
+            vec!["--format".to_string(), "bf16".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_the_opus_tokens_the_old_hand_copied_list_did_not() {
+        for token in ["oq4+", "oq8+", "oq4.25+"] {
+            assert!(
+                dflash_format_args(token).is_ok(),
+                "{token} is in the converter's vocabulary and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn still_rejects_an_unknown_token() {
+        assert!(dflash_format_args("nonsense").is_err());
+    }
 }
