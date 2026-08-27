@@ -74,10 +74,69 @@ Not a gate change — a **fixture** change. Options, roughly in order of effort:
 3. **Gate against a real artifact** rather than a tiny fixture — slow, needs a
    35B on the box, and is the sort of thing tiny-prefill-gate exists to avoid.
 
-(1) is the right one. (2) is worth *investigating* separately, because if the
-attention arms do handle Opus dtypes then real oq4 artifacts are being pushed to
-the per-token path unnecessarily — which would be a significant prefill
-regression hiding in plain sight.
+(1) is the right one. **(2) was investigated 2026-08-27 — see below. The feared
+regression does not exist, and the exclusion is not the sole barrier.**
+
+## The `is_batchable_la` Opus question — investigated
+
+**Q: is excluding Opus dtypes there an oversight that costs real oq4 artifacts
+the batched path?**
+
+**A: no measurable regression, and the stated justification is stale — but
+lifting the exclusion is not sufficient either.**
+
+Three findings:
+
+**1. The justification in the code is out of date.** `prefill_chunk.rs` argues
+Opus must be excluded because "Opus (Oq4/Oq8/OqCompact) weights are FWHT(+AWQ)-
+rotated OFFLINE, so the activation must be rotated to match. Leaving them out of
+this predicate sends an UNROTATED x into an Opus GEMM — the dense path records
+that outcome as 'garbage: PPL 3.5e6'." That describes the **old hand-rolled LA
+body**, which the very same comment says was replaced ("This used to be ~790
+lines of hand-rolled dtype dispatch"). The shared lowered super-ops that replaced
+it **do** carry Opus arms and rotation machinery:
+
+| dtype | arms in the lowered LA matcher |
+|---|---|
+| `Oq4G256` | 18 |
+| `Oq8G256` | 18 |
+| `OqCompactG256` | 17 |
+
+plus 31 `FWHT` / 14 `fwht` / 5 `rotate_x` references in that file.
+
+**2. Lifting the exclusion does not make an all-Opus fixture batch.** Measured
+behind a temporary flag that made `is_batchable_la` accept all three Opus dtypes:
+`oq4` and `oq8` both still returned **rc=3, "batched prefill did not execute"**,
+with `[pbs-gate] verdict=false` while every *named* term printed true. The
+remaining decline is inside `moe_ffn_batched_admissible` on a path that records
+no fallback line. So `is_batchable_la` is **not the sole barrier**, and the flag
+was reverted rather than shipped — it demonstrated nothing.
+
+**3. Production oq4 artifacts are unaffected anyway.** They do not have Opus
+attention. The engine quantizer "keeps q/k/v/o at Q8 alongside the Q8 router +
+shared_expert_gate", and the tiny fixture's own dtype dump shows the same mixed
+shape a real artifact has:
+
+```
+router=BF16 shared_gate=Oq4G256 shared_up=Oq4G256 shared_down=Q8_0
+expert_gate_up=Oq4G256 expert_down=Oq4G256 gu_uniform=true down_uniform=true
+```
+
+Q8_0 **is** in `is_batchable_la`'s accepted set, which is why the real 35B
+batches (and why it reached the panic). **No prefill regression is hiding here.**
+
+### Are OqCompact and Oq8 supported?
+
+They differ by path, and the distinction matters:
+
+| dtype | lowered LA | MoE grouped path-2 | notes |
+|---|---|---|---|
+| `Oq8G256` | ✅ 18 arms | ✅ real arms (`gemm_oq8g256_moe_grouped_wmma`) | declared legitimately |
+| `OqCompactG256` | ✅ 17 arms | ✅ arms (`gemm_oq_compact_moe_grouped_f32`) | **opt-in**: path 2 is BIT-EXACT vs the decode GEMV and 1.4–3.3× faster, but the WMMA sibling was unverified |
+| `Oq4G256` | ✅ 18 arms | ❌ **none** | the gap that caused the panic (#368) |
+
+So of the three, only `Oq4G256` lacked a path-2 arm — which is exactly why it,
+and not its siblings, hit `other => panic!`.
 
 ## Do not add a cell that always SKIPs
 
