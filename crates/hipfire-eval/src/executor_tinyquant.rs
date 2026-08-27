@@ -120,7 +120,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "deepseek4",
             anchor: "deepseek4-source-precision",
-            candidates: &["deepseek4-source-precision", "oq4", "oq8"],
+            candidates: &["oq4", "oq8"],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -134,17 +134,29 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "deepseek4_compressed",
             anchor: "deepseek4-source-precision",
-            candidates: &["deepseek4-source-precision", "oq4", "oq8"],
+            candidates: &["oq4", "oq8"],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
         },
         // DeepSeek4 MTP coverage: one main layer seeds `mtp_last_hidden`, then
         // the tiny probe returns logits from the draft MTP layer itself.
+        //
+        // `candidates` is empty because its only entry used to be
+        // `deepseek4-source-precision`, which is ALSO its anchor — that cell
+        // scored the artifact against itself, recorded 0.00000000, and could
+        // never fail. See `no_family_scores_a_candidate_against_itself`.
+        //
+        // This family's OQ coverage is tracked separately and deliberately, via
+        // `explicit_blocked_oq_cells` (7 cells, count pinned by test), which
+        // reports them as visible `blocked:` skips rather than hiding the gap.
+        // So the `collect` cell plus those placeholders are the whole of its
+        // tiny-quant presence; real KLD coverage needs native MTP tensor
+        // inclusion in OQ artifacts first.
         FamilyPlan {
             arch: "deepseek4_mtp",
             anchor: "deepseek4-source-precision",
-            candidates: &["deepseek4-source-precision"],
+            candidates: &[],
             quant_flags: &["--allow-mq2-lloyd"],
             calibrated: &[],
             probe_env: &[],
@@ -152,7 +164,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "gemma3",
             anchor: "fp16",
-            candidates: &["q8f16", "hfq4", "oq4", "oq8"],
+            candidates: &["hfq4", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -205,7 +217,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "minimax",
             anchor: "q8f16",
-            candidates: &["q8f16", "mq4", "oq4", "oq8"],
+            candidates: &["oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -215,7 +227,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "nemotron_h",
             anchor: "q8f16",
-            candidates: &["q8f16", "oq4", "oq8"],
+            candidates: &["oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -245,7 +257,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "zaya",
             anchor: "q8f16",
-            candidates: &["q8f16", "oq4", "oq8"],
+            candidates: &["oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -253,7 +265,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "qwen3_5",
             anchor: "fp16",
-            candidates: &["q8f16", "mq6", "mq4", "mq3", "oq4", "oq8"],
+            candidates: &["mq6", "mq4", "mq3", "oq4", "oq8"],
             quant_flags: &[],
             // qtip3-sim is the runtime format that consumes our HFQM Hessian
             // (LDLQ); emits bf16, which only the qwen3.5 loader accepts.
@@ -283,7 +295,7 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "qwen3_5_moe",
             anchor: "fp16",
-            candidates: &["q8f16", "mq6", "mq4", "mq3", "oq4", "oq8"],
+            candidates: &["mq3", "oq4", "oq8"],
             quant_flags: &[],
             calibrated: &["oq4+", "oq4++", "oq4.25++", "oq8+", "oq8++"],
             probe_env: &[],
@@ -1116,6 +1128,29 @@ mod tests {
     /// when the path was opt-in; now that the default is on it is a pin, and it
     /// stays — this family's entire job is covering that path, so it must not
     /// follow the default if someone flips it back.
+    /// A candidate that equals its family's anchor compares an artifact against
+    /// ITSELF, so its KLD is identically zero and the cell can never fail — a
+    /// dead tripwire that still looks configured. Three families shipped that
+    /// way (minimax, nemotron_h, zaya, all `q8f16`), each recorded at exactly
+    /// 0.00000000 while their real candidates recorded small nonzero values.
+    #[test]
+    fn no_family_scores_a_candidate_against_itself() {
+        for f in families() {
+            assert!(
+                !f.candidates.contains(&f.anchor),
+                "{}: candidate {:?} IS the anchor — that cell measures nothing",
+                f.arch,
+                f.anchor
+            );
+            assert!(
+                !f.calibrated.contains(&f.anchor),
+                "{}: calibrated cell {:?} IS the anchor",
+                f.arch,
+                f.anchor
+            );
+        }
+    }
+
     #[test]
     fn indexed_moe_family_opts_into_the_indexed_path() {
         let plan = families()
