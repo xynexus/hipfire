@@ -95,3 +95,65 @@ sits much higher than that commit's N>=64.
 
 ⚠️ Do this AFTER coherence. A faster incoherent model is not progress, and the
 mixed-layer path is precisely the region the open coherence bug lives in.
+
+# Coherence bisect against the 35B control (2026-08-27)
+
+## The control
+
+`Qwen3.6-35B-A3B--oq4.25++` — same arch (qwen3_5_moe), same kernels, same
+quant family — is COHERENT at 61.5 tok/s decode. Census of the two:
+
+| | expert dtypes | gate_up AWQ missing | down AWQ missing |
+|---|---|---|---|
+| 35B (coherent) | **uniform** `OqPlusCompact` | 0 (0%) | 0 (0%) |
+| 122B (incoherent) | **mixed** compact + Oq8 | 644 (5.2%) | 2018 (16.4%) |
+
+The control never exercises a mixed layer, nor an expert without an AWQ
+sidecar. 37 of the 122B's 48 layers are mixed.
+
+## Ruled out
+
+- **lm_head.** `--fix` and `122b-lmbf16` (which differs ONLY in lm_head:
+  2 Bf16Lut3 tensors vs 1) emit BYTE-IDENTICAL garbage.
+- **OQ8 router path.** `HIPFIRE_OQ8_ROUTER=1` changes nothing.
+- **Per-expert missing AWQ.** The design is documented ("a 0 entry means that
+  expert has no sidecar") and `rotate_x_mq_awq_indexed_batched` honours it:
+  `awq = ptrs == nullptr ? nullptr : ptrs[topk_indices[slot]]`, then
+  `if (awq != nullptr)`. Null → plain rotation, per expert. Correct.
+- **Compact residency / quantization of unrotated data.** Already exonerated
+  upstream: `f3d3a5efd` (106 real-weight checks), `ce7a3d25f` (626 unrotated
+  tensors at cosine 1.000000).
+
+## What the artifacts say — the sharpest evidence
+
+Three 122B artifacts exist, and which ones LOAD is itself the clue:
+
+| artifact | routed experts | profile | residency | outcome |
+|---|---|---|---|---|
+| `--oq4.25++fix` / `122b-lmbf16` | compact + **Oq8G256** | `Invalid` | compact-resident, 68.99 GB | loads, **INCOHERENT** |
+| `122b-passA` | compact + **BF16** | `QuantWithFullPrecisionFallback` (supported) | EXPANDED | 148.7 GiB, refuses to load |
+| `--oq4.25++` | compact + Q8F16 | — | — | (the original digit-soup artifact) |
+
+`servable_by_stride_table` accepts `OqCompactG256 | Oq8G256` only, so the
+BF16-fallback variant cannot be compact-resident and does not fit, while the
+Oq8-fallback variant rides the per-expert stride table and does.
+
+**The only loadable 122B is the one on the newest, least-covered path.** The
+stride table (`cc532499d`) is what makes a mixed layer dispatchable at all, its
+`block_stride == 0` sentinel selects the Oq8 arm inside a compact GEMV, and
+nothing else in the tree exercises it — the 35B is uniform, and no tiny fixture
+has mixed experts (`fixture.rs` builds `qwen3_5_moe` and `qwen3_5_moe_indexed`,
+both uniform).
+
+## Next step, and it is a fixture not a kernel
+
+Build a tiny fixture with MIXED compact + Oq8 routed experts. That is the one
+thing that would reproduce this in seconds instead of a 65-second load of a
+69 GB artifact, and its absence is why the path shipped uncovered. The same
+pattern as the DeltaNet contraction bug: the invariant existed, nothing ran it.
+
+Only once it reproduces small is it worth deciding between:
+  - the stride-table Oq8 arm inside `oqc_moe_row_dot` reading an activation
+    rotated for the compact basis, and
+  - the promoted Oq8 experts having been quantized in a basis the runtime does
+    not reproduce (they carry NO awq_scale sidecar — exactly 644 of them).
