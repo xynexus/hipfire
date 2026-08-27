@@ -247,3 +247,64 @@ routed expert would pass silently. The counter that answers it
 discards. Answering it needs either that stderr surfaced or one real MoE
 quantized to `oq8+` and `oq8++` with payload hashes compared — the same
 technique used above.
+
+---
+
+## Resolved 2026-08-27: cleared to zero failures, and the vacuous class was bigger than this document knew
+
+The gate now reports **0 failures** (INCONCLUSIVE on 135 no-baseline cells,
+which `classify_gate` does not treat as a failure). It was FAIL(13) — the
+standing 8, plus 5 `qwen3_5_moe_indexed` cells invalidated by shrinking that
+fixture from 20.7M to 9.7M params earlier the same day.
+
+### The general rule this document was missing
+
+It classified `minimax/kld:mq4` as "vacuous" and flagged the `qwen3_5_moe`
+mq4/mq6 pair, but treated each as a one-off. There is a structural rule behind
+them: **a candidate that equals its family's anchor scores an artifact against
+itself.** Its KLD is identically zero, it can never fail, and it looks like
+configured coverage.
+
+Six families shipped that way, not one:
+
+| family | anchor = candidate | recorded |
+|---|---|---|
+| `minimax` | `q8f16` | 0.00000000 |
+| `nemotron_h` | `q8f16` | 0.00000000 |
+| `zaya` | `q8f16` | 0.00000000 |
+| `deepseek4` | `deepseek4-source-precision` | 0.00000000 |
+| `deepseek4_compressed` | `deepseek4-source-precision` | 0.00000000 |
+| `deepseek4_mtp` | `deepseek4-source-precision` | 0.00000000 |
+
+The zero is structural, not lossless: real candidates on the same families
+record small nonzero values (`minimax/oq8` 0.00000674, `nemotron_h/oq8`
+0.00000533, `zaya/oq8` 0.00000385).
+
+**Five of the six were invisible precisely because they passed.** This document
+exists because standing failures hide the next failure; these are the mirror
+image — standing *passes* that hide the absence of a test. Only the one that
+happened to have a stale baseline (`minimax/mq4`) ever got looked at.
+
+Now asserted by `no_family_scores_a_candidate_against_itself`
+(`executor_tinyquant.rs`), over candidates and calibrated cells for every
+family. It caught `deepseek4` on its first run, which a hand grep had missed
+because that anchor name contains a hyphen.
+
+### What was done
+
+- **Deleted** the six self-comparing cells, plus `qwen3_5_moe/kld:{mq4,mq6}`
+  (vacuous per the table above) and the three deprecated `q8f16` cells
+  (`gemma3`, `qwen3_5`, `qwen3_5_moe`). 18 orphaned baseline rows dropped.
+- **Re-recorded** `qwen2/kld:hfq4`, `gemma3/kld:hfq4` (stale, better direction)
+  and the five `qwen3_5_moe_indexed` cells (fixture shape changed).
+- `deepseek4_mtp` keeps 7 `blocked:` OQ skips. Those come from
+  `explicit_blocked_oq_cells`, not from `candidates`, and a test pins the count
+  — a deliberate visible placeholder for missing MTP tensor inclusion, not noise.
+
+### Still open
+
+135 cells have no gfx1151 baseline and report INCONCLUSIVE. Unlike the
+tiny-state gate — where a token hash is arch-independent and gave a genuine
+cross-arch confirmation before recording — KLD values legitimately differ
+between architectures, so there is no equivalent free cross-check. Recording
+them needs its own justification and is deliberately not bundled here.
