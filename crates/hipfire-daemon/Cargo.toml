@@ -7,7 +7,7 @@ description = "hipfire inference daemon — JSON-lines IPC worker process"
 
 [[bin]]
 name = "hipfire-daemon"
-path = "src/main.rs"
+path = "src/bin/hipfire-daemon.rs"
 
 [features]
 default = ["arch-lfm2moe", "deltanet"]

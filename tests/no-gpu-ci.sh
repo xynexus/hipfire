@@ -18,14 +18,15 @@ cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
 cargo test -p hipfire-runtime quant_catalog_matches_derived_gemv_routes
-# hipfire-daemon is BIN-ONLY (no src/lib.rs, only [[bin]]), so ci.yml's
-# `cargo test --lib --workspace` selects zero targets from it — it does not fail,
-# it silently tests nothing. `cargo check --workspace --examples` above does not
-# type-check #[cfg(test)] code either. Its unit tests therefore ran in NO gate:
-# the executor-v2 stream tests were added with a file-scope #![allow(dead_code)]
-# justified by "the unit tests exercise every item", while nothing in CI ran them.
-# --bin is required; -p alone inherits the same empty --lib selection.
-cargo test -p hipfire-daemon --bin hipfire-daemon
+# hipfire-daemon's 96 unit tests live in its LIB target. It used to be bin-only,
+# and back then `cargo test --lib` selected zero targets from it — it did not
+# fail, it silently tested nothing, which is how the executor-v2 stream tests
+# shipped with a file-scope #![allow(dead_code)] that nothing in CI ever ran.
+# The crate now has src/lib.rs (the bin is a shim calling hipfire_daemon::main),
+# so the selection flipped: `--bin hipfire-daemon` is what now matches 0 tests.
+# Keep this on --lib, and if you change the target layout, re-check the COUNT —
+# both spellings exit 0, only one of them runs anything.
+cargo test -p hipfire-daemon --lib
 cargo test -p hipfire-arch-api --lib
 cargo test -p hipfire-arch-specs --lib
 cargo test -p hipfire-arch-template-spec --lib

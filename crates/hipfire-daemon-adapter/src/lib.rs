@@ -191,6 +191,7 @@ impl StdioTransport {
         // value (e.g. `full`) wins so deeper traces can be requested.
         let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
         let mut child = Command::new(bin)
+            .args(daemon_argv(bin))
             .env("RUST_BACKTRACE", backtrace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1487,11 +1488,32 @@ fn tagged_extended_event(
     serde_json::Value::Object(payload)
 }
 
-/// Locate the daemon binary. Priority:
+/// Extra argv the daemon binary needs to actually be the daemon.
+///
+/// `hipfire` is a multi-call binary: the daemon lives inside it behind the
+/// `daemon` subcommand, so spawning it bare would land in the TUI. Every other
+/// candidate (`hipfire-daemon`, or whatever `HIPFIRE_DAEMON_BIN` names) is a
+/// dedicated daemon executable and takes no extra argument.
+///
+/// Dispatching on the file name is the usual multi-call convention, and it is
+/// what makes `HIPFIRE_DAEMON_BIN=/path/to/hipfire` work as an override too.
+fn daemon_argv(bin: &Path) -> &'static [&'static str] {
+    match bin.file_stem().and_then(|s| s.to_str()) {
+        Some("hipfire") => &["daemon"],
+        _ => &[],
+    }
+}
+
+/// Locate a binary that can serve as the daemon. Priority:
 /// 1. `HIPFIRE_DAEMON_BIN` env var
-/// 2. `~/.hipfire/bin/daemon`
-/// 3. repo-root `target/release/hipfire-daemon`
-/// 4. repo-root `target/debug/hipfire-daemon`
+/// 2. this executable, when it is `hipfire` itself
+/// 3. a `hipfire` sibling next to this executable
+/// 4. `~/.hipfire/bin/{hipfire-daemon,daemon,hipfire}`
+/// 5. repo-root `target/{release,debug}/{hipfire-daemon,hipfire}`
+///
+/// 2 and 3 are what stop this being a filesystem hunt in a normal install: a
+/// deployed `hipfire` is its own daemon, and anything shipped beside it finds
+/// it without a repo, an env var, or a `git rev-parse`.
 pub fn find_daemon_bin() -> Option<PathBuf> {
     find_daemon_bin_candidates()
         .into_iter()
@@ -1501,29 +1523,46 @@ pub fn find_daemon_bin() -> Option<PathBuf> {
 pub fn find_daemon_bin_or_error() -> anyhow::Result<PathBuf> {
     find_daemon_bin().ok_or_else(|| {
         anyhow::anyhow!(
-            "daemon binary not found; build with: cargo build -p hipfire-daemon --bin hipfire-daemon"
+            "daemon binary not found; build with: cargo build --bin hipfire \
+             (or the standalone worker: cargo build -p hipfire-daemon --bin hipfire-daemon)"
         )
     })
 }
 
 fn find_daemon_bin_candidates() -> Vec<PathBuf> {
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
     let mut candidates = Vec::new();
     if let Ok(p) = std::env::var("HIPFIRE_DAEMON_BIN") {
         candidates.push(PathBuf::from(p));
     }
 
+    // We may already BE the daemon's binary. Checked before anything on disk so
+    // a running `hipfire` never spawns some older build of itself that happens
+    // to sit in ~/.hipfire/bin or a stale target/.
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_stem().and_then(|s| s.to_str()) == Some("hipfire") {
+            candidates.push(exe.clone());
+        }
+        // Shipped beside us: this is how hipfire-eval and friends reach the
+        // daemon without probing a repo they may not be inside.
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(format!("hipfire{exe_suffix}")));
+        }
+    }
+
     if let Some(home) = dirs::home_dir() {
         let hipfire_bin = home.join(".hipfire").join("bin");
-        for name in &["hipfire-daemon", "daemon"] {
+        for name in &["hipfire-daemon", "daemon", "hipfire"] {
             candidates.push(hipfire_bin.join(name));
         }
     }
 
-    let exe = std::env::consts::EXE_SUFFIX;
     let repo = repo_root().unwrap_or_else(|| PathBuf::from("."));
     for rel in &[
-        format!("target/release/hipfire-daemon{exe}"),
-        format!("target/debug/hipfire-daemon{exe}"),
+        format!("target/release/hipfire-daemon{exe_suffix}"),
+        format!("target/release/hipfire{exe_suffix}"),
+        format!("target/debug/hipfire-daemon{exe_suffix}"),
+        format!("target/debug/hipfire{exe_suffix}"),
     ] {
         candidates.push(repo.join(rel));
     }
@@ -1970,6 +2009,47 @@ mod tests {
 
     fn event_payload(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn multi_call_hipfire_gets_the_daemon_subcommand_others_get_nothing() {
+        // Spawning the multi-call binary bare would land in the TUI, not the
+        // daemon — this argv is the whole difference.
+        assert_eq!(daemon_argv(Path::new("/usr/bin/hipfire")), &["daemon"]);
+        assert_eq!(
+            daemon_argv(Path::new("./target/release/hipfire")),
+            &["daemon"]
+        );
+        // Dedicated daemon executables must NOT be given a subcommand.
+        assert!(daemon_argv(Path::new("/usr/bin/hipfire-daemon")).is_empty());
+        assert!(daemon_argv(Path::new("~/.hipfire/bin/daemon")).is_empty());
+        // file_stem drops the extension, so an EXE_SUFFIX build matches too.
+        // (Spelled without a drive prefix: `\` is not a separator on unix, so
+        // a literal windows path would not parse here even though it does there.)
+        assert_eq!(daemon_argv(Path::new("hipfire.exe")), &["daemon"]);
+    }
+
+    #[test]
+    fn current_exe_is_preferred_over_stale_builds_on_disk() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DAEMON_BIN");
+        }
+        let candidates = find_daemon_bin_candidates();
+        let exe = std::env::current_exe().unwrap();
+        // The sibling `hipfire` next to us must come before anything in
+        // ~/.hipfire/bin or target/, or a deployed install can spawn an older
+        // build of itself that happens to still be lying around.
+        let sibling = candidates
+            .iter()
+            .position(|p| p == &exe.parent().unwrap().join("hipfire"));
+        let home_bin = candidates
+            .iter()
+            .position(|p| p.ends_with(".hipfire/bin/hipfire-daemon"));
+        assert!(sibling.is_some(), "exe-sibling candidate missing");
+        if let (Some(s), Some(h)) = (sibling, home_bin) {
+            assert!(s < h, "sibling {s} must precede ~/.hipfire/bin {h}");
+        }
     }
 
     #[test]

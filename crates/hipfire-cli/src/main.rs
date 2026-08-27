@@ -33,6 +33,8 @@ enum Command {
     Status(commands::daemon::StatusArgs),
     /// Start the hipfire HTTP server (OpenAI-compatible)
     Serve(commands::serve::ServeArgs),
+    /// Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
+    Daemon(commands::daemon::DaemonRunArgs),
     /// Load a model and generate a response (one-shot)
     Chat(commands::chat::ChatArgs),
     /// List locally available models
@@ -206,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Restart(args)) => commands::daemon::restart(args, loaded_config).await,
         Some(Command::Status(args)) => commands::daemon::status(args, loaded_config).await,
         Some(Command::Serve(args)) => commands::serve::run(args, loaded_config).await,
+        Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
         Some(Command::Chat(args)) => commands::chat::run(args, loaded_config).await,
         Some(Command::List) => {
             commands::list::run(loaded_config);

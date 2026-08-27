@@ -11,6 +11,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire restart`↴](#hipfire-restart)
 * [`hipfire status`↴](#hipfire-status)
 * [`hipfire serve`↴](#hipfire-serve)
+* [`hipfire daemon`↴](#hipfire-daemon)
 * [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
@@ -79,6 +80,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `restart` — Restart the background hipfire server
 * `status` — Show background server status
 * `serve` — Start the hipfire HTTP server (OpenAI-compatible)
+* `daemon` — Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
 * `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
@@ -202,6 +204,25 @@ Examples:
 * `--max-tokens <MAX_TOKENS>` — Override the startup-resolved maximum generated-token budget
 * `--kv-cache <KV_CACHE>` — Override the startup-resolved KV-cache mode
 * `--debug-chat` — Log full raw chat requests and raw model replies
+
+
+
+## `hipfire daemon`
+
+Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
+
+**Usage:** `hipfire daemon [ARGS]...`
+
+Examples:
+  hipfire daemon
+  hipfire daemon --listen
+  hipfire daemon --listen /run/hipfire.sock
+  hipfire daemon --precompile
+
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the daemon
 
 
 
