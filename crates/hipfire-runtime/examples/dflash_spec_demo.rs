@@ -539,14 +539,15 @@ fn main() {
     // 2026-04-16: initial two-level version shrank B from 16→8 when rolling
     // τ dropped below 4.
     //
-    // 2026-04-24 (Task #93 Phase B fallback): replaced with a continuous
-    // scheduler that adjusts B across the range [ADAPTIVE_B_MIN ..
-    // ADAPTIVE_B_MAX] using
-    // EWMA of accept_len with hysteresis + cooldown. Raises B when the
-    // recent cycle is under-budgeted (draft accepting almost everything →
-    // amortize verify over more positions). Drops B when draft is losing
-    // early (small B cuts verify cost and lets τ recover). Override range
-    // with --adaptive-b-range MIN:MAX.
+    // 2026-04-24 (Task #93 Phase B fallback): replaced with a scheduler over
+    // the range [ADAPTIVE_B_MIN .. ADAPTIVE_B_MAX]. Override with
+    // --adaptive-b-range MIN:MAX.
+    //
+    // ⚠️ The EWMA/hysteresis/cooldown rule this comment used to describe is
+    // GONE, and the description outlived it long enough to mislead a later
+    // session into "the controller maximises τ". It does not: it probes each
+    // candidate B and commits to the lowest measured ms/committed-token. See
+    // the scheduler itself for the objective and its failure modes.
     //
     // ADAPTIVE_B_MAX caps: scratches are pre-allocated to it, so setting a
     // larger max raises VRAM cost. Default 16 preserves the pre-Task-#93
@@ -2237,8 +2238,21 @@ fn main() {
         // That silently invalidated every adaptive measurement on this model:
         // ranges 8..16, 4..8 and 6:6 all effectively ran near B=16, which is the
         // WORST block size here (48.95 tok/s at B=12 vs 68.36 at B=6).
-        // (B -> (summed ms/token, samples)) for the throughput controller.
-        let mut adaptive_b_perf: std::collections::HashMap<usize, (f64, usize)> =
+        // (B -> (total ms, total tokens gained, samples)) for the throughput
+        // controller. Cost is Sigma(ms)/Sigma(gained) -- a RATIO OF SUMS.
+        //
+        // ⚠️ It used to accumulate per-cycle ms/token and divide by the sample
+        // count, i.e. a MEAN OF RATIOS, and that is biased. By Jensen the mean
+        // of elapsed/gained overestimates the true rate, with the bias growing
+        // in the variance of `gained` -- and `gained` ranges 1..B, so the
+        // variance, and hence the penalty, GROWS WITH B. Worked example at B=8:
+        // one cycle gaining 1 token (60 ms) and one gaining 6 (60 ms) score
+        // (60 + 10)/2 = 35 ms/token against a true 120/7 = 17.1. At B=2, where
+        // `gained` is 1 or 2, the same bias is negligible. So the estimator
+        // handed small B a systematic advantage and the controller walked to it:
+        // measured on Qwen3.8-27B it settled at B=4 (19.0 tok/s) and never
+        // probed B=8 at all, against 21.4 at a fixed B=6.
+        let mut adaptive_b_perf: std::collections::HashMap<usize, (f64, usize, usize)> =
             std::collections::HashMap::new();
         let mut current_adaptive_b: usize =
             draft_cfg.block_size.clamp(adaptive_b_min, adaptive_b_max);
@@ -2246,6 +2260,9 @@ fn main() {
             std::collections::HashMap::new();
         let mut adaptive_b_changes: u32 = 0;
         const ADAPTIVE_B_STEP: usize = 2;
+        // Ascending probe abandons the rest of the range only when a candidate
+        // is worse than its predecessor by more than this factor.
+        const EARLY_STOP_MARGIN: f64 = 1.05;
         // Hysteresis thresholds on util = EWMA(accept_len) / (current_B - 1):
         //   util > UP   → draft keeps up, stretch B further.
         //   util < DOWN → draft lags, shrink B to cut verify cost.
@@ -2381,16 +2398,12 @@ fn main() {
             }
             // Adaptive-B scheduler (Task #93 Phase B replacement — 2026-04-24).
             //
-            // Online rule, no training. Tracks recent EWMA(accept_len), divides
-            // by current_B-1 to get "utilization". When draft is over-performing
-            // (util > UP), bump B — amortize verify over more positions. When
-            // draft is under-performing (util < DOWN), shrink B — cut verify
-            // cost, let τ recover. Hysteresis + cooldown prevent flapping.
+            // Online rule, no training. OBJECTIVE: ms PER COMMITTED TOKEN,
+            // measured. Not utilisation, and not τ.
             //
-            // adaptive_b_min/max default to 8..=16 (pre-2026-04-24 behaviour
-            // bounded by the draft's trained block_size). User can widen with
-            // --adaptive-b-range MIN:MAX; scratches upstream pre-sized for MAX.
-            // OBJECTIVE: ms PER COMMITTED TOKEN, measured. Not utilisation.
+            // adaptive_b_min/max are bounded by the draft's trained block_size.
+            // User can widen with --adaptive-b-range MIN:MAX; scratches
+            // upstream pre-sized for MAX.
             //
             // The old rule tracked EWMA(accept_len)/(B-1) and grew B when that
             // ran high. That maximises ACCEPTANCE, which is not what anyone
@@ -2422,7 +2435,7 @@ fn main() {
                 let cost = |b: &usize| -> f64 {
                     adaptive_b_perf
                         .get(b)
-                        .map(|(ms, n)| ms / (*n).max(1) as f64)
+                        .map(|(ms, gained, _)| ms / (*gained).max(1) as f64)
                         .unwrap_or(f64::MAX)
                 };
                 // ASCENDING probe with EARLY STOP: once a candidate is worse
@@ -2441,11 +2454,19 @@ fn main() {
                 // the early stop.
                 let mut unexplored = None;
                 for (i, b) in candidates.iter().enumerate() {
-                    if adaptive_b_perf.get(b).map_or(0, |(_, n)| *n) < need {
+                    if adaptive_b_perf.get(b).map_or(0, |(_, _, n)| *n) < need {
                         unexplored = Some(*b);
                         break;
                     }
-                    if i > 0 && cost(b) > cost(&candidates[i - 1]) {
+                    // Require a MARGIN before abandoning the rest of the
+                    // range. A bare `>` lets two unlucky cycles at one
+                    // candidate permanently exclude every larger one -- which
+                    // is what hid B=8 on Qwen3.8-27B, where B=6 and B=8 are
+                    // within 1% of each other and both beat the B=4 the
+                    // controller settled on. The margin is a noise guard, not a
+                    // preference for large B: a candidate that is genuinely
+                    // past the peak loses by far more than this.
+                    if i > 0 && cost(b) > cost(&candidates[i - 1]) * EARLY_STOP_MARGIN {
                         break; // past the peak; stop probing upward
                     }
                 }
@@ -2736,12 +2757,16 @@ fn main() {
             // which would libel whichever candidate happened to go first.
             if adaptive_b && stats.cycles > 1 {
                 let gained = step.committed.len().saturating_sub(1).max(1);
-                let ms = ab_t0.elapsed().as_secs_f64() * 1e3 / gained as f64;
+                let ms = ab_t0.elapsed().as_secs_f64() * 1e3;
                 let e = adaptive_b_perf
                     .entry(current_adaptive_b)
-                    .or_insert((0.0f64, 0usize));
+                    .or_insert((0.0f64, 0usize, 0usize));
+                // Sum ms and gained SEPARATELY; the division happens once, in
+                // `cost`. Dividing here and averaging later is the mean-of-
+                // ratios bias documented at the declaration.
                 e.0 += ms;
-                e.1 += 1;
+                e.1 += gained;
+                e.2 += 1;
             }
 
             // Rolling τ.
