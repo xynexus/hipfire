@@ -13,6 +13,14 @@
 //!
 //! See `docs/plans/2026-06-30-steer-daemon-pivot.md`.
 
+// `cli` and `hneurons_probe` were separate crate roots; they are modules now so
+// `hipfire steer` can call them directly. The thin shims under src/bin/ keep the
+// standalone executables building.
+/// The `hipfire-steer` command line.
+pub mod cli;
+/// The `hipfire-hneurons-probe` command line.
+pub mod hneurons_probe;
+
 use std::path::{Path, PathBuf};
 
 use hip_bridge::{HipError, HipResult};

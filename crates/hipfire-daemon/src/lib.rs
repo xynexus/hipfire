@@ -1520,7 +1520,13 @@ fn march_streams(daemon_state: &mut state::DaemonState) {
     }
 }
 
-fn main() {
+/// Run the daemon: JSON-lines executor over stdin/stdout (or `--listen`).
+///
+/// Diverges on startup failure (`process::exit` / `fatal_startup_error`) and
+/// blocks the calling thread until the transport hangs up. That is correct for
+/// a process whose whole job is to be the daemon — both the `hipfire-daemon`
+/// bin shim and `hipfire daemon` call it as the last thing they do.
+pub fn main() {
     // Cooperative generation cancellation: install the SIGUSR1 handler so the
     // HTTP server can abort an in-flight generation (on client disconnect)
     // without SIGKILL-ing this worker and destroying the loaded model. The

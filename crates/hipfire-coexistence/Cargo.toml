@@ -7,7 +7,7 @@ description = "Offline coexistence / compatibility tooling for hipfire: import/e
 
 [[bin]]
 name = "hipfire-coexistence"
-path = "src/main.rs"
+path = "src/bin/hipfire-coexistence.rs"
 
 [dependencies]
 hipfire-steer = { path = "../hipfire-steer" }

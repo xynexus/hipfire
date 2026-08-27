@@ -89,7 +89,7 @@ pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 // SpinQuant R1 deploy-time merge (--rotate): fold+rotate readers/writers by FᵀM
 // before the Oq4 quantize so the codec FWHT leaves the int4 grid in learned M.
 // (fixture/roughquant/codecs/qtip/ldlq are owned by the library, re-exported above.)
-mod rotate;
+use crate::rotate;
 
 use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
@@ -4958,12 +4958,19 @@ fn quantize_hfq_source_tensor(
 /// QTIP beam-search width for the real trellis encoder. Default 128 (near-
 /// Viterbi); override with `--beam N` / `HIPFIRE_QTIP_BEAM=N` to trade a little
 /// quality for a large encode speedup on big models (the beam search is the
-/// offline bottleneck). `--beam` sets this env in `main`, so both the
-/// `.hfq`-requantize and direct-source paths read it here.
+/// offline bottleneck).
+///
+/// `--beam` arms a OnceLock in `main` rather than writing the env var, so both
+/// the `.hfq`-requantize and direct-source paths read one value. The env var
+/// still works for callers who set it from outside the process; the flag just
+/// wins over it.
 fn qtip_beam_width() -> usize {
-    hipfire_env::QTIP_BEAM
-        .get()
-        .and_then(|s| s.parse::<usize>().ok())
+    hipfire_quantize::qtip_beam_override()
+        .or_else(|| {
+            hipfire_env::QTIP_BEAM
+                .get()
+                .and_then(|s| s.parse::<usize>().ok())
+        })
         .filter(|&b| b > 0)
         .unwrap_or(128)
 }
@@ -7597,7 +7604,7 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -8600,15 +8607,16 @@ fn main() {
 
     // `--beam N` sets the QTIP trellis beam-search width (default 128, near-
     // Viterbi). Smaller = much faster offline encode on big models, slightly
-    // lower quality. Bridged through HIPFIRE_QTIP_BEAM so both the .hfq-requant
-    // and direct-source pack paths (`qtip_beam_width`) read one value.
+    // lower quality. Carried in a OnceLock, not an env var, so both the
+    // .hfq-requant and direct-source pack paths (`qtip_beam_width`) read one
+    // value without writing process env while rayon's workers are live.
     if let Some(i) = args.iter().position(|a| a == "--beam") {
         if let Some(b) = args
             .get(i + 1)
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&b| b > 0)
         {
-            std::env::set_var("HIPFIRE_QTIP_BEAM", b.to_string());
+            hipfire_quantize::set_qtip_beam(b);
             eprintln!("QTIP trellis beam width: {b} (--beam)");
         } else {
             eprintln!("--beam requires a positive integer; ignoring");

@@ -7,13 +7,13 @@ description = "Daemon-backed CLI for the hipfire-steer driver. Drives capture→
 
 [[bin]]
 name = "hipfire-steer"
-path = "src/main.rs"
+path = "src/bin/hipfire-steer.rs"
 
 # H-Neurons (arXiv 2512.01797) reproduction driver: capture per-sample CETT
 # features via the daemon `cett_*` ops, then fit the hipfire-hneurons L1 probe.
 [[bin]]
 name = "hipfire-hneurons-probe"
-path = "src/bin/hneurons_probe.rs"
+path = "src/bin/hipfire-hneurons-probe.rs"
 
 [dependencies]
 hipfire-steer = { path = "../hipfire-steer" }

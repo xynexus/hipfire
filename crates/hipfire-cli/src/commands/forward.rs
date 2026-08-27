@@ -145,27 +145,68 @@ pub struct OptimizeArgs {
 
 pub fn run_eval(args: EvalArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let server_env = running_server_env(&loaded);
-    run_forwarded(
-        Runner::eval(),
-        resolve_forwarded_model_args(args.args, true, &loaded),
-        "HIPFIRE_EVAL_BIN",
-        "hipfire-eval",
-        EVAL_HELP,
-        "cargo build --release -p hipfire-eval",
-        &server_env,
-    )
+    let forwarded = resolve_forwarded_model_args(args.args, true, &loaded);
+
+    // `HIPFIRE_EVAL_BIN` means "use THIS build of the harness", which only a
+    // separate process can honour. Everything else runs in-process.
+    if std::env::var_os("HIPFIRE_EVAL_BIN").is_some() {
+        return run_forwarded(
+            Runner::eval(),
+            forwarded,
+            "HIPFIRE_EVAL_BIN",
+            "hipfire-eval",
+            EVAL_HELP,
+            "cargo build --release -p hipfire-eval",
+            &server_env,
+        );
+    }
+
+    if is_help(&forwarded) {
+        println!("{EVAL_HELP}");
+        return Ok(());
+    }
+
+    // The server URL used to reach the harness as a child-process env var. With
+    // no child there is only the process env — safe to write here specifically
+    // because `main` is not `#[tokio::main]` and nothing has spawned a thread
+    // yet on this path, so this is still a single-threaded process.
+    for (key, value) in &server_env {
+        // SAFETY-BY-TIMING: see above — single-threaded at this point.
+        std::env::set_var(key, value);
+    }
+
+    // argv as the harness would have seen it as its own binary: name, then args.
+    let mut argv = vec!["hipfire-eval".to_string()];
+    argv.extend(forwarded.iter().map(|a| a.to_string_lossy().into_owned()));
+
+    // The standalone binary maps Err -> eprintln + exit(1); returning the error
+    // here gives `hipfire` the same exit status through main's Result.
+    hipfire_eval::run_from_args(argv).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 pub fn run_host_profile(args: HostProfileArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
-    run_forwarded(
-        Runner::host_profile(),
-        host_profile_args_with_models_dir(args.args, &loaded),
-        "HIPFIRE_HOST_PROFILE_BIN",
-        "hipfire-host-profile",
-        HOST_PROFILE_HELP,
-        "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
-        &[],
-    )
+    let forwarded = host_profile_args_with_models_dir(args.args, &loaded);
+
+    // Same escape hatch as `hipfire eval`: an explicit binary override can only
+    // be honoured by a separate process.
+    if std::env::var_os("HIPFIRE_HOST_PROFILE_BIN").is_some() {
+        return run_forwarded(
+            Runner::host_profile(),
+            forwarded,
+            "HIPFIRE_HOST_PROFILE_BIN",
+            "hipfire-host-profile",
+            HOST_PROFILE_HELP,
+            "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
+            &[],
+        );
+    }
+    if is_help(&forwarded) {
+        println!("{HOST_PROFILE_HELP}");
+        return Ok(());
+    }
+    let mut argv = vec!["hipfire-host-profile".to_string()];
+    argv.extend(forwarded.iter().map(|a| a.to_string_lossy().into_owned()));
+    hipfire_runtime::host_profile::run_from_args(argv).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn host_profile_args_with_models_dir(

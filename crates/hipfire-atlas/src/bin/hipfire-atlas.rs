@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Standalone `hfq` executable — see `hipfire_runtime::hfq_cli`.
+//! Standalone `hipfire-atlas` executable — see `hipfire_atlas::cli`.
 
 fn main() {
-    hipfire_runtime::hfq_cli::main();
+    hipfire_atlas::cli::main();
 }

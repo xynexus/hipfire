@@ -32,6 +32,9 @@ pub mod eos_filter;
 pub mod ep;
 pub mod exec_trace;
 pub mod hfq;
+/// The `hfq` artefact-inspection command line. Named `hfq_cli` because
+/// `crate::hfq` above is the format implementation it drives.
+pub mod hfq_cli;
 pub mod hfq_compose;
 pub mod hfq_modules;
 pub mod host_profile;
