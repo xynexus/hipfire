@@ -46,6 +46,29 @@ pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
 ///   `[split f32 scales m*ng]` — prefill weight-scale region (`sub_offset m*(k/2)`)
 ///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
 ///                               contiguous → one coalesced stream (mq4-style).
+/// Why this tensor cannot be loaded through the GPU arch-packed OQ4 path, if it
+/// cannot. `None` means it can.
+///
+/// `Oq4G256` groups 256 weights, so a ragged `K` has no whole group. The
+/// quantizer's DEFAULT for such tensors is zero-padded Opus, which is valid for
+/// the NPU-native loader — the GPU loaders assert `K % 256 == 0`. Reaching the
+/// packer with a ragged `K` therefore meant a `panic!` and a dead process, on an
+/// artifact that is not corrupt but simply targeted elsewhere.
+///
+/// This turns that into a message that names the remedy. See
+/// `HIPFIRE_OQ_RAGGED_Q8` in the quantizer, which keeps ragged tensors at Q8 so
+/// the artifact loads on GPU.
+pub fn oq4_arch_unsupported_reason(m: usize, k: usize) -> Option<String> {
+    (k % 256 != 0).then(|| {
+        format!(
+            "OQ4G256 needs K % 256 == 0 but this tensor is M={m} K={k}. The artifact \
+             stores it as zero-padded Opus, which only the NPU-native loader accepts. \
+             Re-quantize with HIPFIRE_OQ_RAGGED_Q8=1 to keep ragged-K tensors at Q8 \
+             so the artifact loads on GPU."
+        )
+    })
+}
+
 pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     const GROUP: usize = 256;
     const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles

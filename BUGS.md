@@ -4,6 +4,55 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## [RETRACTED — opt-in by design] HFQ requant and the K % 256 fallback
+
+**Retracted 2026-08-27, same day it was filed.** The fallback is not missing, it
+is opt-in. `HIPFIRE_OQ_RAGGED_Q8=1` keeps ragged-K tensors at Q8, and the code
+says so plainly: *"Default stays padded-Opus (NPU loader), unchanged … padded
+Opus ragged tensors only load on the NPU-native path."* Setting it produced a
+loadable artifact (rc 101 -> no panic). I filed this without setting the
+documented flag.
+
+**The narrower residual issue is real:** the GPU load path `panic!`s
+(`oq4_arch.rs:53`, "OQ4G256 requires K % 256 == 0") on an artifact that is
+legitimately NPU-targeted, rather than erroring with what to do about it. Same
+class as the MoE prefill panics fixed in #368/#369 — a `panic!` where a
+descriptive error belongs, taking the process down with it.
+
+Original entry, wrong as written, follows.
+
+### HFQ requantization ignores the K % 256 fallback (RETRACTED)
+
+**Found 2026-08-27, master `8b0ecc253`. Reproducible.**
+
+The direct path (HF dir → `--format oq4`) correctly keeps tensors whose `K` is
+not a multiple of 256 at `Q8_0`, because `Oq4G256` has a 256-wide group. The
+**requantization** path (`.hfq` → `--format oq4`, with or without
+`--tensor-format`) does not — it applies Opus to them anyway:
+
+| tensor (K=128) | direct | requant |
+|---|---|---|
+| `linear_attn.in_proj_a.weight` | `qt=3` (Q8_0) | **`qt=34`** (Oq4G256) |
+| `linear_attn.in_proj_b.weight` | `qt=3` (Q8_0) | **`qt=34`** (Oq4G256) |
+
+Loading the resulting artifact aborts:
+
+```
+hipfire-runtime/src/oq4_arch.rs:53: assertion `left == right` failed:
+OQ4G256 requires K %% 256 == 0 (got K=128)
+```
+
+- Repro: `hipfire-quantize --emit-fixture qwen3_5_moe_indexed --out hf`, then
+  `--input hf --output base.hfq --format bf16`, then
+  `--input base.hfq --output out.hfq --format oq4` → `out.hfq` panics on load.
+- The quantizer exits 0 and reports "Done", so the artifact looks good until
+  something tries to run it.
+- Severity: it is a `panic!` in the load path, so it takes the process down —
+  same class as the Oq4 MoE prefill panic fixed in #368/#369.
+- Surfaced while building an Opus-attention fixture for
+  `docs/plans/2026-08-27-is-batchable-la-opus-scope.md`; the shape guard is the
+  thing standing between that scope and a testable fixture.
+
 ## Batched MoE prefill PANICS on an `Oq4G256` MoE artifact (daemon dies)
 
 **Found 2026-08-27 on master `556249d8c`, nix1 gfx1103. Reproducible, rc=101.**

@@ -6419,6 +6419,21 @@ pub fn forward_prefill_batch_with_pbs_opts(
     }
 
     if !eligible {
+        // Flush the recorded declines on the path that actually refuses.
+        //
+        // Every decline calls `decline()` -> `record_fallback`, which only fills
+        // a map; `kernel_trace::report()` prints it. Two things kept that
+        // invisible for qwen35: the tree's only `report()` caller was
+        // `hipfire-arch-llama`, and `report()` used to bail out when no kernels
+        // had dispatched — which is always true of an ADMISSION decline, since it
+        // happens before the forward runs. With that fixed, this prints the term
+        // that actually refused instead of leaving `[pbs-gate] verdict=false`
+        // with every named term reading true.
+        if let Some(rep) = hipfire_rdna::kernel_trace::report(&format!(
+            "qwen35 prefill batching DECLINED at n={n}"
+        )) {
+            eprint!("{rep}");
+        }
         hipfire_rdna::kernel_trace::record_fallback(
             "qwen35 forward_prefill_batch: -> per-token forward_scratch loop (batched prefill declined)",
             &format!("base={pbs_eligible_base} kv_f32={kv_f32} kv_asym2_tree={kv_asym2_tree} n={n} arch={arch} dn_quant={:?}", dn_state.quant),

@@ -2848,6 +2848,12 @@ fn load_weight_tensor(
         // into the dense-llama path — incl. SpinQuant-R1 `.hfq` (`--rotate`), whose
         // per-group FWHT is exactly the activation rotation this GEMV applies.
         OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            // Fail with a reason instead of aborting inside the packer. A ragged
+            // K is not corruption — it is an NPU-targeted artifact reaching a GPU
+            // loader — and a panic here takes the whole process down.
+            if let Some(why) = crate::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+                return Err(HipError::new(0, &format!("tensor '{}': {why}", info.name)));
+            }
             let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, data, m, k)
                 .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;

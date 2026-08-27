@@ -2102,10 +2102,26 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // The batched indexed path (path 1) runs and is deterministic, but its output
     // DIFFERS from the per-token reference (96-token greedy: divergence after 255
     // chars, run-to-run identical, so accumulation order rather than instability).
-    // That is unverified, not known-good: `tiny-prefill-gate` SKIPS qwen3_5_moe
-    // ("batched prefill did not execute for this fixture"), so batched MoE prefill
-    // has NO parity coverage. This file already records why that matters — the Oq8
-    // grouped kernel "ran 1.8x faster and emitted garbage".
+    // That is unverified, not known-good.
+    //
+    // CORRECTED 2026-08-27: an earlier version of this comment said
+    // "tiny-prefill-gate SKIPS qwen3_5_moe, so batched MoE prefill has NO parity
+    // coverage". Wrong twice over. That SKIP is DELIBERATE regression cover for the
+    // admission guard — the preset is top-2-of-8 while
+    // `moe_prefill_topk_shape_supported` wants k_top in {8,10} — and
+    // `qwen3_5_moe_indexed` DOES cover batched MoE prefill, and passes.
+    //
+    // The real gap is narrower: every gate cell is `--format fp16`, so none
+    // exercises `Oq4G256` routed experts. An oq4 cell cannot simply be added —
+    // `is_batchable_la` rejects the Opus dtypes for the ATTENTION projections, so
+    // an all-Opus fixture declines batching before MoE is reached (measured: oq4,
+    // oq4.25 and oq8 all report "batched prefill did not execute"). Real coverage
+    // needs a fixture with a BATCHABLE attention dtype and Oq4G256 experts, the
+    // shape mixed-precision artifacts actually have.
+    // See docs/todo/2026-08-27-oq4-moe-prefill-coverage.md.
+    //
+    // The Oq8 precedent is still the reason this matters: that grouped kernel
+    // "ran 1.8x faster and emitted garbage".
     //
     // HIPFIRE_MOE_OQ4_UNIFORM_PATH1=1 opts into the speed. Drop the gate once
     // tiny-prefill-gate covers batched MoE prefill and it passes.

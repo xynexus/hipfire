@@ -1156,6 +1156,12 @@ fn load_weight_tensor_raw(
             // weights are FWHT-rotated offline so the forward FWHT-rotates x to match
             // (shared mq_rotate_x path). AWQ smooth, when present, is applied to x by
             // the wrapper via the awq_scale sidecar.
+            // Same guard as the dense hfq loader: a ragged K means an
+            // NPU-targeted artifact, not corruption, and the packer's assert
+            // would abort the process.
+            if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+                return Err(HipError::new(0, &why));
+            }
             let (bytes, gpu_dtype) = oq4_arch_load(quant_type, data, m, k)
                 .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
