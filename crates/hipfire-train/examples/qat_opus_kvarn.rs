@@ -1,7 +1,13 @@
-//! Light QAT (recovery-FT) prototype for a W3 (Oq3) weight-quantized model, with the
+//! Light QAT (recovery-FT) prototype for an Opus weight-quantized model, with the
 //! KVarN KV-cache-quant path in the loop — the deploy-faithful combination.
 //!
-//! Student = weights fake-quantized to Oq3 (sym-int3 + FWHT-256, FROZEN) + trainable
+//! TIER-PARAMETERIC as of 2026-08-28: `HIPFIRE_QAT_TIER=oq3|oq4|oq8` selects the
+//! Opus tier the student is fake-quantized to, so the recoverable share of each
+//! tier's deploy loss is measurable on ONE footing. Default `oq4` — OQ+ W4 is
+//! the deployed Opus tier; `oq3` reproduces this file's original behaviour
+//! (it was `qat_w3_kvarn.rs`, hardcoded to W3).
+//!
+//! Student = weights fake-quantized to the chosen tier (FROZEN) + trainable
 //! LoRA(q/v) + RMSNorm; its attention forward optionally runs post-RoPE K/V through
 //! KVarN-4bit + CASK merge (STE). Teacher = clean fp32. We KL-distill the student
 //! toward the clean teacher and report the KL gap recovered, measured on an IN-SAMPLE
@@ -24,7 +30,7 @@ use hipfire_train::model::{
 };
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_train::oqplus_quant::oq3_simquant;
+use hipfire_train::oqplus_quant::{oq3_simquant, oq8_simquant, oqplus_simquant};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =
@@ -37,10 +43,64 @@ const ALPHA: f32 = 32.0;
 const LR: f32 = 1e-3;
 const STEPS: usize = 120;
 
-/// Oq3 (W3) sim-quant the 7 linears per layer (base weights, frozen thereafter).
+/// Which Opus tier the student is fake-quantized to.
+///
+/// All three share the FWHT-256 rotation and the symmetric clip-searched scale;
+/// they differ only in code width, so a tier sweep isolates the width and
+/// nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Oq3,
+    Oq4,
+    Oq8,
+}
+
+impl Tier {
+    /// `HIPFIRE_QAT_TIER`, defaulting to the deployed tier (oq4 / OQ+ W4).
+    fn from_env() -> Self {
+        match std::env::var("HIPFIRE_QAT_TIER")
+            .unwrap_or_else(|_| "oq4".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "oq3" | "w3" => Tier::Oq3,
+            "oq8" | "w8" => Tier::Oq8,
+            "oq4" | "w4" | "oqplus" | "oq+" => Tier::Oq4,
+            other => panic!("HIPFIRE_QAT_TIER: unknown tier {other:?} (want oq3|oq4|oq8)"),
+        }
+    }
+
+    fn simquant(self, w: &[f32]) -> Vec<f32> {
+        match self {
+            Tier::Oq3 => oq3_simquant(w),
+            Tier::Oq4 => oqplus_simquant(w),
+            Tier::Oq8 => oq8_simquant(w),
+        }
+    }
+
+    /// Short deploy label, e.g. "W4".
+    fn width(self) -> &'static str {
+        match self {
+            Tier::Oq3 => "W3",
+            Tier::Oq4 => "W4",
+            Tier::Oq8 => "W8",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Tier::Oq3 => "Oq3 (W3, sym-int3 + FWHT-256)",
+            Tier::Oq4 => "OQ+ (W4, sym-int4 + FWHT-256, clip-searched)",
+            Tier::Oq8 => "Oq8 (W8, sym-int8 + FWHT-256)",
+        }
+    }
+}
+
+/// Opus sim-quant the 7 linears per layer (base weights, frozen thereafter).
 fn quantize_linears(
     gpu: &mut Gpu,
     w: &mut LlamaWeightsF32,
+    tier: Tier,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for l in w.layers.iter_mut() {
         for t in [
@@ -53,7 +113,7 @@ fn quantize_linears(
             &mut l.down_proj,
         ] {
             let host = gpu.download_f32(t)?;
-            let q = oq3_simquant(&host);
+            let q = tier.simquant(&host);
             *t = gpu.upload_f32(&q, &t.shape.clone())?;
         }
     }
@@ -98,8 +158,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (_, mut w_student) = load_llama_fp32(&mut gpu, dir)?;
     let vocab = cfg.vocab_size;
-    println!("quantizing student to Oq3 (W3, sym-int3 + FWHT-256)...");
-    quantize_linears(&mut gpu, &mut w_student)?;
+    let tier = Tier::from_env();
+    println!("quantizing student to {}...", tier.describe());
+    quantize_linears(&mut gpu, &mut w_student, tier)?;
 
     let teacher = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_teacher, SEQ, RANK, ALPHA)?;
     let student = LlamaModel::from_f32_weights(&mut gpu, &cfg, w_student, SEQ, RANK, ALPHA)?;
@@ -139,17 +200,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hot = std::env::var("HIPFIRE_KVNOISE_HOT").unwrap_or_else(|_| "4".into());
         let fold = std::env::var("HIPFIRE_KVNOISE_FOLD").unwrap_or_else(|_| "4".into());
         println!(
-            "student: Oq3 W3 weights + KVarN-{bits}bit + CASK (hot={hot}, fold={fold}) on K&V"
+            "student: {} {} weights + KVarN-{bits}bit + CASK (hot={hot}, fold={fold}) on K&V",
+            tier.describe(),
+            tier.width()
         );
     } else {
-        println!("student: Oq3 W3 weights, KV clean (ablation: HIPFIRE_QAT_KVNOISE=0)");
+        println!(
+            "student: {} weights, KV clean (ablation: HIPFIRE_QAT_KVNOISE=0)",
+            tier.describe()
+        );
     }
 
     let sizes = student.recovery_param_sizes();
     let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
     println!(
-        "recovery-FT: {} trainable tensors (LoRA q/v + RMSNorm); base W3 frozen\n",
-        sizes.len()
+        "recovery-FT: {} trainable tensors (LoRA q/v + RMSNorm); base {} frozen\n",
+        sizes.len(),
+        tier.width()
     );
 
     // Held-out gap BEFORE recovery (LoRA=0): the raw W3(+KVarN) deploy loss.
@@ -183,7 +250,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pct = |a: f32, b: f32| if a > 1e-6 { 100.0 * (a - b) / a } else { 0.0 };
     println!(
-        "\n  ── W3{} recovery-FT ──",
+        "\n  ── {}{} recovery-FT ──",
+        tier.width(),
         if kvnoise { "+KVarN" } else { "" }
     );
     println!(
@@ -194,7 +262,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  HELD-OUT  KL: {eval_before:.4} → {eval_after:.4}  ({:.1}% recovered)",
         pct(eval_before, eval_after)
     );
-    println!("\n  (base W3 weights frozen; only LoRA(q/v)+norm trained — measures the LIGHT-QAT\n   recoverable share of the W3{} deploy loss. Held-out is the honest number.)",
+    println!("\n  (base {} weights frozen; only LoRA(q/v)+norm trained — measures the LIGHT-QAT\n   recoverable share of the {}{} deploy loss. Held-out is the honest number.)",
+        tier.width(),
+        tier.width(),
         if kvnoise { "+KVarN" } else { "" });
     Ok(())
 }
