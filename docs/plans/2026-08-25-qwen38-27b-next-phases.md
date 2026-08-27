@@ -1774,11 +1774,21 @@ Two corrections to earlier notes in this file:
 Spec-decode output is **not** byte-identical to `--ar-baseline` on this model —
 and this is pre-existing, not caused by disabling the controller. Control run:
 AR reproduces byte-for-byte across runs, while BOTH the default adaptive path
-and fixed B=8 diverge from it. This is the same verify-forward divergence
-already recorded for the 35B (`project_dflash_35b_verify_divergence`), now
-confirmed on the 27B. tau remains a valid measure of draft-vs-verifier
-agreement, but any "max tok/s via spec decode" figure for this model carries
-that asterisk until the verify path is fixed.
+and fixed B=8 diverge from it.
+
+ROOT-CAUSED 2026-08-27: **verify runs the batched forward, AR runs the
+per-token forward, and the two are not numerically equivalent** — a difference
+documented and deliberately accepted at `is_batchable_la`. Not a KV bug and not
+a drafter bug; layer 0 already differs. ⚠️ `--kv-mode f32` looks identical only
+because f32 fails the batched-verify predicate and silently falls back to
+per-token (it runs 6.79 tok/s against AR's 15.56 — 2.3x slower). Two tempting
+explanations are refuted with measurements in
+`docs/bugs/2026-08-27-spec-decode-ar-divergence.md`; read it before re-deriving
+either. Summary in `BUGS.md`.
+
+tau remains a valid measure of draft-vs-verifier agreement, but any "max tok/s
+via spec decode" figure for this model carries that asterisk until the two
+forwards are pinned to one path.
 
 
 ### Root cause and fix — a biased estimator, not a wrong objective
