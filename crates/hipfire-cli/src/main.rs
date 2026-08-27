@@ -196,27 +196,51 @@ enum Command {
     GenModelSupport(commands::gen_model_support::GenModelSupportArgs),
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     hipfire_runtime::logging::init_stderr_logging("cli", "hipfire=info,hipfire_server=info,warn");
 
     let cli = Cli::parse_from(normalize_help_args());
     let loaded_config = load_config_bundle();
     let config = loaded_config.config.clone();
 
+    // `main` is deliberately NOT `#[tokio::main]`. That would start runtime
+    // worker threads before dispatch, for every command — including the ones
+    // that now live in this binary and own the process while they run:
+    //
+    //   * `daemon` blocks forever on a `hipfire_rdna::Gpu`, which is !Send;
+    //   * `quantize` calls `env::set_var` to bridge `--beam` into the QTIP
+    //     path, which is a data race the moment another thread exists, and
+    //     was only ever safe because it used to be its own single-threaded
+    //     process;
+    //   * `eval` (step 4) builds its OWN multi-thread runtime and calls
+    //     `block_on`, which panics if a runtime is already running the caller.
+    //
+    // So the runtime is built here, lazily, and only by the arms that await
+    // something. Everything else runs on a bare main thread exactly as it did
+    // when it was a separate executable.
+    let rt = || -> anyhow::Result<tokio::runtime::Runtime> {
+        Ok(tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?)
+    };
+
     match cli.command {
         // Bare `hipfire` as a systemd service means serve, not the TUI.
         None if hipfire_runtime::logging::stderr_is_journal() => {
-            commands::serve::run(Default::default(), loaded_config).await
+            rt()?.block_on(commands::serve::run(Default::default(), loaded_config))
         }
         None | Some(Command::Tui) => hipfire_tui::run(),
-        Some(Command::Start(args)) => commands::daemon::start(args, loaded_config).await,
-        Some(Command::Stop(args)) => commands::daemon::stop(args, loaded_config).await,
-        Some(Command::Restart(args)) => commands::daemon::restart(args, loaded_config).await,
-        Some(Command::Status(args)) => commands::daemon::status(args, loaded_config).await,
-        Some(Command::Serve(args)) => commands::serve::run(args, loaded_config).await,
+        Some(Command::Start(args)) => rt()?.block_on(commands::daemon::start(args, loaded_config)),
+        Some(Command::Stop(args)) => rt()?.block_on(commands::daemon::stop(args, loaded_config)),
+        Some(Command::Restart(args)) => {
+            rt()?.block_on(commands::daemon::restart(args, loaded_config))
+        }
+        Some(Command::Status(args)) => {
+            rt()?.block_on(commands::daemon::status(args, loaded_config))
+        }
+        Some(Command::Serve(args)) => rt()?.block_on(commands::serve::run(args, loaded_config)),
         Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
-        Some(Command::Chat(args)) => commands::chat::run(args, loaded_config).await,
+        Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
         Some(Command::List) => {
             commands::list::run(loaded_config);
             Ok(())
@@ -225,8 +249,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Quantize(args)) => commands::quantize::run(args),
         Some(Command::Convert { command }) => commands::quantize::run_convert(command),
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
-        Some(Command::Bench(args)) => commands::bench::run(args, loaded_config).await,
-        Some(Command::Doctor(args)) => commands::doctor::run(args, loaded_config).await,
+        Some(Command::Bench(args)) => rt()?.block_on(commands::bench::run(args, loaded_config)),
+        Some(Command::Doctor(args)) => rt()?.block_on(commands::doctor::run(args, loaded_config)),
         Some(Command::Env(args)) => commands::env::run(args),
         Some(Command::HostProfile(args)) => {
             commands::forward::run_host_profile(args, loaded_config)
@@ -239,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Lock(args)) => commands::lock::run(args),
         Some(Command::Detect(args)) => commands::detect::run(args),
         Some(Command::Diffusion(args)) => commands::diffusion::run(args, loaded_config),
-        Some(Command::Admin(args)) => commands::admin::run(args, config).await,
+        Some(Command::Admin(args)) => rt()?.block_on(commands::admin::run(args, config)),
         Some(Command::GenDocs(args)) => commands::gen_docs::run(args),
         Some(Command::GenConfigSchema(args)) => commands::gen_config_schema::run(args),
         Some(Command::GenEnvDocs(args)) => commands::gen_env_docs::run(args),

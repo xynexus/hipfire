@@ -79,3 +79,23 @@ pub fn mq_clipsearch_enabled() -> bool {
 pub fn set_mq_clipsearch(enabled: bool) {
     let _ = MQ_CLIPSEARCH.set(enabled);
 }
+
+// QTIP trellis beam width, when `--beam` supplied one. This used to be bridged
+// through `env::set_var("HIPFIRE_QTIP_BEAM", …)`, which is a data race: the
+// quantizer has already called `rayon::ThreadPoolBuilder::build_global()` by
+// then, so ~26 worker threads are live and any of them may be in `getenv`.
+// (That race predates the single-binary merge — it was never safe, it was only
+// never observed.) Same shape as MQ_CLIPSEARCH above: set once from the flag,
+// read by the codec.
+static QTIP_BEAM: OnceLock<usize> = OnceLock::new();
+
+/// QTIP beam width set by `--beam`, if any. `None` means fall back to the
+/// `HIPFIRE_QTIP_BEAM` env var and then the default.
+pub fn qtip_beam_override() -> Option<usize> {
+    QTIP_BEAM.get().copied()
+}
+
+/// Arm the QTIP beam width from `--beam` (idempotent; first set wins).
+pub fn set_qtip_beam(width: usize) {
+    let _ = QTIP_BEAM.set(width);
+}
