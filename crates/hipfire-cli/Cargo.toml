@@ -18,6 +18,7 @@ chat-ui-embed = ["hipfire-server/chat-ui-embed"]
 [dependencies]
 hipfire-env = { path = "../hipfire-env" }
 hipfire-daemon = { path = "../hipfire-daemon" }
+hipfire-eval = { path = "../hipfire-eval" }
 hipfire-quantize = { path = "../hipfire-quantize" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-detect = { path = "../hipfire-detect" }

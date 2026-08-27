@@ -1930,6 +1930,7 @@ dependencies = [
  "hipfire-diffusion",
  "hipfire-diffusion-coexist",
  "hipfire-env",
+ "hipfire-eval",
  "hipfire-generate",
  "hipfire-hfq-tooling",
  "hipfire-lock",

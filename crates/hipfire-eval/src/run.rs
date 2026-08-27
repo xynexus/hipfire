@@ -14,7 +14,17 @@
 use crate::*;
 
 pub fn run_from_env() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+    run_from_args(std::env::args().collect())
+}
+
+/// Same as [`run_from_env`], but for a caller that supplies argv.
+///
+/// `hipfire eval …` cannot use the process argv: `parse_args_from` scans from
+/// index 1, so the `eval` token would be read as the positional `<model>` and
+/// the real model would then fail as an unexpected positional. The `hipfire`
+/// subcommand therefore passes the argv this would have had as its own binary —
+/// `hipfire-eval` at index 0, then the forwarded arguments.
+pub fn run_from_args(args: Vec<String>) -> Result<(), String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         eprint!("{}", usage());
         return Ok(());
