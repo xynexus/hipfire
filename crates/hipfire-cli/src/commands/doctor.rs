@@ -1020,7 +1020,13 @@ fn check_monitoring_prereqs(report: &mut DoctorReport, fix: bool) {
         .and_then(|details| details.get("is_root"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let pkexec = find_in_path("pkexec");
+    // Only offer polkit elevation for a helper an unprivileged user cannot
+    // replace between the prompt and the exec. See `unsafe_to_elevate`.
+    let elevation_risk = helper.as_deref().and_then(unsafe_to_elevate);
+    let pkexec = match &elevation_risk {
+        Some(_) => None,
+        None => find_in_path("pkexec"),
+    };
     report.checks.push(DoctorCheck {
         id: "priv_helper.binary",
         status: if helper_can_execute && (helper_direct_root || pkexec.is_some()) {
@@ -1067,6 +1073,9 @@ fn check_monitoring_prereqs(report: &mut DoctorReport, fix: bool) {
             "direct_effective_root": helper_direct_root,
             "pkexec": pkexec,
             "sudo_fallback": find_in_path("sudo"),
+            // Present only when polkit elevation was deliberately withheld,
+            // so the reason is visible instead of looking like "no pkexec".
+            "elevation_refused": elevation_risk,
         }),
         fix: None,
     });
@@ -1391,6 +1400,58 @@ fn probe_helper_direct(helper: &Path) -> Value {
     }
 }
 
+/// Whether elevating `path` would hand root to anyone who can write it.
+///
+/// `pkexec <path>` runs `path` as root. If an unprivileged user can replace
+/// that file — or replace any directory on the way to it — then the elevation
+/// is a local privilege-escalation primitive: swap the binary, trigger the
+/// prompt, get root. The same applies to a symlink we would resolve.
+///
+/// This is not hypothetical for this project. `install.sh` installs the helper
+/// under `~/.hipfire/bin` and renders a polkit policy whose
+/// `org.freedesktop.policykit.exec.path` points there, so a stock install pins
+/// an elevation to a path its own user can overwrite.
+///
+/// Returns `Some(reason)` when unsafe, `None` when the whole chain is
+/// root-owned and not group/other-writable.
+#[cfg(unix)]
+fn unsafe_to_elevate(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Resolve symlinks first: the target is what actually executes.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut cursor = Some(resolved.as_path());
+    while let Some(current) = cursor {
+        let meta = match std::fs::metadata(current) {
+            Ok(meta) => meta,
+            // Cannot prove it is safe, so do not claim it is.
+            Err(err) => return Some(format!("cannot stat {}: {err}", current.display())),
+        };
+        if meta.uid() != 0 {
+            return Some(format!(
+                "{} is owned by uid {}, not root",
+                current.display(),
+                meta.uid()
+            ));
+        }
+        // 0o022 = group-write or other-write.
+        if meta.mode() & 0o022 != 0 {
+            return Some(format!(
+                "{} is writable by group or other (mode {:o})",
+                current.display(),
+                meta.mode() & 0o7777
+            ));
+        }
+        cursor = current.parent();
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn unsafe_to_elevate(_path: &Path) -> Option<String> {
+    Some("ownership checks are only implemented on unix".to_string())
+}
+
 fn privileged_fix_command(helper: Option<&Path>, pkexec: Option<&Path>, args: &[&str]) -> String {
     let helper = helper
         .map(|path| path.display().to_string())
@@ -1516,5 +1577,43 @@ mod tests {
             assert_eq!(parse_module_bool(value), Some(true));
         }
         assert_eq!(parse_module_bool("unexpected"), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod elevation_safety_tests {
+    use super::unsafe_to_elevate;
+    use std::path::Path;
+
+    #[test]
+    fn a_user_writable_helper_is_refused() {
+        // Anything under the user's own home is replaceable by that user, so
+        // elevating it would hand root to whoever can write there. This is the
+        // shape install.sh produces today (~/.hipfire/bin/hipfire-priv-helper).
+        let home = std::env::var("HOME").expect("HOME");
+        let candidate = Path::new(&home).join(".hipfire/bin/hipfire-priv-helper");
+        assert!(
+            unsafe_to_elevate(&candidate).is_some(),
+            "a helper inside $HOME must never be offered for polkit elevation"
+        );
+    }
+
+    #[test]
+    fn a_root_owned_system_binary_is_accepted() {
+        // Control: a normal root-owned system path must pass, or the check is
+        // useless because it refuses everything.
+        let sh = Path::new("/bin/sh");
+        if sh.exists() {
+            assert_eq!(
+                unsafe_to_elevate(sh),
+                None,
+                "/bin/sh should be root-owned and not group/other-writable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_path_is_refused_rather_than_assumed_safe() {
+        assert!(unsafe_to_elevate(Path::new("/nonexistent/hipfire-priv-helper")).is_some());
     }
 }

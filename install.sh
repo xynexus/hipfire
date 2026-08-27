@@ -323,13 +323,39 @@ POLKIT_SYSTEM_DIR="/usr/share/polkit-1/actions"
 if [ -f "$POLKIT_TEMPLATE" ] && [ -x "$BIN_DIR/hipfire-priv-helper" ]; then
     mkdir -p "$(dirname "$POLKIT_RENDERED")"
     POLKIT_HELPER_PATH=$(readlink -f "$BIN_DIR/hipfire-priv-helper" 2>/dev/null || printf '%s' "$BIN_DIR/hipfire-priv-helper")
+    # A polkit policy makes `pkexec <path>` run <path> as root. If an
+    # unprivileged user can write <path>, that is a local privilege-escalation
+    # primitive: replace the binary, trigger the prompt, get root. A default
+    # install puts the helper under ~/.hipfire/bin, which is exactly that — so
+    # render the policy, but never suggest installing it system-wide until the
+    # helper lives somewhere root owns.
+    POLKIT_HELPER_OWNER=$(stat -c '%u' "$POLKIT_HELPER_PATH" 2>/dev/null || echo "")
+    POLKIT_HELPER_MODE=$(stat -c '%a' "$POLKIT_HELPER_PATH" 2>/dev/null || echo "")
+    POLKIT_HELPER_SAFE=1
+    if [ "$POLKIT_HELPER_OWNER" != "0" ]; then
+        POLKIT_HELPER_SAFE=0
+    fi
+    case "$POLKIT_HELPER_MODE" in
+        *[2367])  POLKIT_HELPER_SAFE=0 ;;  # other-writable
+        *[2367]?) POLKIT_HELPER_SAFE=0 ;;  # group-writable
+    esac
     POLKIT_HELPER_ESCAPED=$(printf '%s' "$POLKIT_HELPER_PATH" | sed 's/[&|\]/\\&/g')
     sed "s|@HIPFIRE_PRIV_HELPER@|$POLKIT_HELPER_ESCAPED|g" \
         "$POLKIT_TEMPLATE" >"$POLKIT_RENDERED"
     echo ""
     echo "Rendered polkit policy:"
     echo "  $POLKIT_RENDERED"
-    if [ -w "$POLKIT_SYSTEM_DIR" ]; then
+    if [ "$POLKIT_HELPER_SAFE" != "1" ]; then
+        echo "  NOT installing this policy: $POLKIT_HELPER_PATH is not root-owned"
+        echo "  (owner uid='$POLKIT_HELPER_OWNER' mode='$POLKIT_HELPER_MODE')."
+        echo "  Authorising pkexec for a path its own user can overwrite would let"
+        echo "  any process running as you replace the helper and obtain root."
+        echo "  To enable polkit-backed doctor fixes, first put the helper somewhere"
+        echo "  root owns, then point the policy at THAT path, e.g.:"
+        echo "    sudo install -D -o root -g root -m 0755 '$BIN_DIR/hipfire-priv-helper' /usr/libexec/hipfire/hipfire-priv-helper"
+        echo "    sudo sed -i 's|$POLKIT_HELPER_PATH|/usr/libexec/hipfire/hipfire-priv-helper|' '$POLKIT_RENDERED'"
+        echo "    sudo install -m 0644 '$POLKIT_RENDERED' '$POLKIT_SYSTEM_DIR/com.hipfire.priv-helper.policy'"
+    elif [ -w "$POLKIT_SYSTEM_DIR" ]; then
         install -m 0644 "$POLKIT_RENDERED" "$POLKIT_SYSTEM_DIR/com.hipfire.priv-helper.policy"
         echo "  Installed polkit policy to $POLKIT_SYSTEM_DIR ✓"
     else
