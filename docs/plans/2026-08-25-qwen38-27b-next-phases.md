@@ -1710,3 +1710,128 @@ Two gaps, both of which let the contraction defect reach master:
 A byte-exactness invariant that nothing runs is not an invariant. Both f16 and
 f32 routed kernels had the same defect; only the half with a test — a test
 nobody ran automatically — showed it.
+
+## 2026-08-27 — drafter quality: it was the adaptive-B controller, not the draft
+
+Question asked: is the DFlash2 drafter functioning correctly, and can its
+quality be improved? Answer: the drafter is fine. **The adaptive-B controller
+was pinning it at B=4 on every prompt**, and that is what a whole session of
+"the drafter saturates at tau 2.25 on code" was actually measuring.
+
+`--block-size` is silently overridden per cycle by the controller (`adaptive_b`
+defaults to **true**, range 2..16 clamped to the draft's trained block). Every
+value of `--block-size` from 6 to 20 therefore produced a **bit-identical**
+trace — same cycles, same accepted count, tau=2.2532 to four decimals. That
+identity reads as "drafter saturation" and is not: it is one operating point
+sampled fifteen times.
+
+Qwen3.8-27B--oq4.25++ + its dflash2.oq4+ draft, 256 tokens, kvarn, Python BST
+prompt (a background download was contending for UMA bandwidth, so absolute
+tok/s is a floor; tau is exact and contention-free):
+
+| config | tau | decode tok/s |
+|---|---|---|
+| adaptive (default) | 2.253 | 19.19 |
+| `--no-adaptive-b --block-size 2` | 0.889 | 14.88 |
+| `--no-adaptive-b --block-size 4` | **2.253** | 19.04 |
+| `--no-adaptive-b --block-size 6` | 3.483 | **21.40** |
+| `--no-adaptive-b --block-size 8` | **3.849** | 21.26 |
+
+The adaptive row is byte-identical to the fixed B=4 row, which is what pins the
+diagnosis: the controller settles on 4 and stays there. Fixed B=8 is **+71%
+tau**; throughput peaks at B=6, same shape the 35B comment block already
+documented ("tau rises monotonically with B; THROUGHPUT peaks at 6 and falls
+... picking B to maximise tau maximises the wrong quantity").
+
+So this is the SECOND model on which the shipped controller default loses to a
+fixed B, and the failure mode is identical.
+
+⚠️ **The attribution in the paragraph above is WRONG and is retracted.** The
+controller does NOT maximise tau — it has optimised measured ms/committed-token
+since 2026-04-24, and the EWMA/utilisation description at the top of
+`dflash_spec_demo.rs` is a stale comment that outlived the code it described.
+Root cause below.
+
+Against the literature this drafter is **not** underperforming: EAGLE-3 reports
+tau 3.21 on Qwen3-30B-A3B/HumanEval, and driven at its trained block this draft
+does 3.85 on code. The earlier "30% below the published comparable" reading was
+an artifact of the clamp.
+
+Two corrections to earlier notes in this file:
+
+- The baseline recipe above says "do NOT set HIPFIRE_KV_MODE=asym3; the numbers
+  below are Q8 KV, which is this harness's default". Both halves are now stale:
+  Q8 KV is deprecated, and the default is KVarN. kvarn4 and kvarn8 produce
+  **bit-identical** traces here (tau 2.253, same cycles/accepted), so the KV
+  tier is not a tau lever on this model either way.
+- DFlash1 (`Qwen3.8-27B--dflash.oq4+`) carries `block_size: 16`, not 8. Re-run
+  at its trained block it is still far behind DFlash2: tau 1.361 at both B=8 and
+  B=16, with `anypos_match=0.019` — its proposals match the target at any
+  position 2% of the time. DFlash2 is the only viable draft for this target.
+
+### Open, and it gates the headline number
+
+Spec-decode output is **not** byte-identical to `--ar-baseline` on this model —
+and this is pre-existing, not caused by disabling the controller. Control run:
+AR reproduces byte-for-byte across runs, while BOTH the default adaptive path
+and fixed B=8 diverge from it. This is the same verify-forward divergence
+already recorded for the 35B (`project_dflash_35b_verify_divergence`), now
+confirmed on the 27B. tau remains a valid measure of draft-vs-verifier
+agreement, but any "max tok/s via spec decode" figure for this model carries
+that asterisk until the verify path is fixed.
+
+
+### Root cause and fix — a biased estimator, not a wrong objective
+
+The controller sweeps each candidate B and commits to the lowest measured
+ms/committed-token. Its objective was already right. What was wrong is how it
+estimated that cost.
+
+It accumulated, per cycle, `elapsed / gained` and divided by the sample count —
+a **mean of ratios**. That is a biased estimator of a rate: by Jensen it
+overestimates ms/token, and the bias grows with the variance of `gained`. Since
+`gained` ranges 1..B, **the variance, and therefore the penalty, grows with B.**
+
+    B=8, one cycle gaining 1 token (60 ms) and one gaining 6 (60 ms):
+      mean-of-ratios = (60/1 + 60/6)/2 = 35 ms/token
+      true rate      = 120/7           = 17.1 ms/token
+    At B=2, where `gained` is 1 or 2, the same bias is negligible.
+
+So every comparison was rigged in favour of small B, and the controller walked
+to the small end and stayed. Two compounding factors: `need = 2` samples, and an
+ascending probe that abandons the rest of the range as soon as one candidate
+scores worse than its predecessor — so a single unlucky pair at B=6 permanently
+excluded B=8. Observed on the Python prompt before the fix:
+
+    adaptive-b: range=2..=8 mean_B=3.97 changes=1 dist=[B=2:3.8% B=4:93.7% B=6:2.5%]
+
+B=8 was never measured once.
+
+Fix (`dflash_spec_demo.rs`): accumulate ms and gained separately and divide once
+— cost is now a **ratio of sums** — and require a 5% margin before the ascending
+probe abandons the range. The margin is a noise guard, not a thumb on the scale:
+a candidate genuinely past the peak loses by far more than 5%.
+
+    adaptive-b: range=2..=8 mean_B=5.28 changes=3 dist=[B=2:4.7% B=4:34.4% B=6:53.1% B=8:7.8%]
+
+Python prompt: **19.12 -> 20.97 tok/s (+9.7%)**, closing the gap to the fixed-B
+optimum (21.75) from 12% to 3.6%; the residue is exploration cost.
+
+Validated on a prompt MIX, per this file's own standing warning, 192 tokens:
+
+| prompt | adaptive | B=4 | B=6 | B=8 | vs best fixed |
+|---|---|---|---|---|---|
+| numbers 1..30 | 21.52 | 18.22 | 20.92 | **22.23** | −3.2% |
+| B-tree prose | 13.75 | 13.91 | 12.88 | **13.92** | −1.2% |
+| Python BST | 17.59 | 16.06 | **17.88** | 17.23 | −1.6% |
+| MIT license | **12.91** | 12.86 | 12.84 | 12.51 | +0.4% |
+
+The controller now picks a genuinely different B per prompt (B=8 on numbers,
+B=6 on code and license), which is the only reason to have one. Summed across
+the mix it ties the best global fixed choice (65.77 vs 65.89 for a fixed B=8)
+while avoiding B=8's 3.6% loss on code. The prose and license spreads are inside
+run-to-run noise; the real wins are `numbers` and `code`.
+
+`./tests/no-gpu-ci.sh` green. Note `hipfire-eval`'s
+`run_eval_reuses_cached_battery_rows` flakes under the parallel test run (shared
+result-cache dir) and passes 3/3 in isolation — unrelated to this change.
