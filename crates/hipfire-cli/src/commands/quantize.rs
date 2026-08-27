@@ -50,6 +50,14 @@ pub enum ConvertCommand {
     MtpExtract(ToolArgs),
     /// Merge an MTP head into an mq4 artefact
     MtpMerge(ToolArgs),
+    /// Everything hipfire-coexistence dispatches: calibrate, artifact, import,
+    /// export, repack, lora, hub, download, npu, induct, two-pass.
+    ///
+    /// Captured as an external subcommand rather than enumerated, because that
+    /// crate routes on `args[0]`/`args[1]` itself and its flag bags reject any
+    /// token they do not recognise — so the vector has to arrive verbatim.
+    #[command(external_subcommand)]
+    Coexistence(Vec<String>),
 }
 
 #[derive(Debug, Args)]
@@ -65,6 +73,9 @@ pub fn run_convert(cmd: ConvertCommand) -> Result<()> {
     // they cannot simply see the process argv: `hipfire convert mtp-extract`
     // would reach the tool as `unknown arg: convert`. Hand each one the argv it
     // would have had as its own binary — its name, then the forwarded args.
+    if let ConvertCommand::Coexistence(argv) = &cmd {
+        return hipfire_coexistence::cli::run(argv).map_err(|e| anyhow::anyhow!("{e}"));
+    }
     let (name, args, run): (&str, &ToolArgs, fn()) = match &cmd {
         ConvertCommand::Dflash(a) => (
             "dflash_convert",
@@ -89,6 +100,7 @@ pub fn run_convert(cmd: ConvertCommand) -> Result<()> {
             a,
             hipfire_quantize::tools::mq4_merge_mtp::main,
         ),
+        ConvertCommand::Coexistence(_) => unreachable!("handled above"),
     };
     let mut argv = vec![name.to_string()];
     argv.extend(args.args.iter().map(|a| a.to_string_lossy().into_owned()));

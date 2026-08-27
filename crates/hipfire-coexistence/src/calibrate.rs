@@ -502,9 +502,12 @@ fn acquire_gpu_lock() -> Result<hipfire_lock::FlockGuard, Box<dyn Error>> {
         };
         eprintln!("calibrate: GPU busy ({holder}); waited {waited}s");
     })?;
+    // Name the command the user actually ran: this exact string is what a
+    // contention error reports as "is locked by ...".
     guard.write_holder(&format!(
-        "{} hipfire-coexistence calibrate",
-        std::process::id()
+        "{} {} calibrate",
+        std::process::id(),
+        crate::invoked_as()
     ))?;
     Ok(guard)
 }

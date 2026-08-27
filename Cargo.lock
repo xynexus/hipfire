@@ -1924,6 +1924,7 @@ dependencies = [
  "hipfire-archs",
  "hipfire-atlas",
  "hipfire-build-info",
+ "hipfire-coexistence",
  "hipfire-config",
  "hipfire-daemon",
  "hipfire-daemon-adapter",

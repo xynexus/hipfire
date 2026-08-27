@@ -23,8 +23,21 @@ use hipfire_steer_harness::DaemonHarness;
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Entry point for the standalone `hipfire-coexistence` binary.
+pub fn main() -> Result<(), Box<dyn Error>> {
+    run(&std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+/// Entry point for `hipfire convert …`, which must supply the argument vector.
+///
+/// Unlike the daemon and the quantizer — both of which scan for `--flags`
+/// anywhere and so never notice an extra leading token — this dispatch reads
+/// `args[0]` as the command GROUP and `args[1]` as the OP, and its flag bags
+/// reject any token that does not start with `--`. Feeding the exact tail is
+/// therefore mandatory, not a convenience: `["convert", "calibrate", …]` would
+/// match no arm and exit(2) on the usage path.
+pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = args.to_vec();
     let group = args.first().map(String::as_str);
     let op = args.get(1).map(String::as_str);
     match (group, op) {
@@ -77,8 +90,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn usage() {
+    let invoked = hipfire_coexistence::invoked_as();
     eprintln!(
-        "usage: hipfire-coexistence <group> <op> [flags]\n\
+        "usage: {invoked} <group> <op> [flags]\n\
          \n\
          calibrate --model <safetensors-dir-or-cache-root> --corpus <text> \
          --output <model.calib.hfq> [--sequences N] [--context N] \
