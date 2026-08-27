@@ -89,7 +89,7 @@ pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 // SpinQuant R1 deploy-time merge (--rotate): fold+rotate readers/writers by FᵀM
 // before the Oq4 quantize so the codec FWHT leaves the int4 grid in learned M.
 // (fixture/roughquant/codecs/qtip/ldlq are owned by the library, re-exported above.)
-mod rotate;
+use crate::rotate;
 
 use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
@@ -7597,7 +7597,7 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {

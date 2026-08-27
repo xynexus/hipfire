@@ -1934,6 +1934,7 @@ dependencies = [
  "hipfire-hfq-tooling",
  "hipfire-lock",
  "hipfire-model",
+ "hipfire-quantize",
  "hipfire-runtime",
  "hipfire-server",
  "hipfire-sysinfo",
