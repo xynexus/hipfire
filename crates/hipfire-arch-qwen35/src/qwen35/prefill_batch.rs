@@ -26,9 +26,17 @@ pub struct PrefillBatchScratch {
     /// token t at slot t).
     ///
     /// EMPTY unless `alloc_dn_s_snapshots` was called. It is not cheap —
-    /// 2 MB/layer x 26 layers x 16 slots = ~832 MB on Qwen3.5-35B-A3B — and
+    /// 2 MB/layer x 26 layers x 16 slots = ~832 MB on Qwen3.5-35B-A3B
+    /// (~768 MB on Qwen3.8-27B: 48 DeltaNet layers x 16 slots x 1 MB) — and
     /// `PrefillBatchScratch::new` has many callers (regular prefill, MTP,
     /// calibration, EP bands) that must not pay it.
+    ///
+    /// ⚠️ FP32 DeltaNet state ONLY. Only the FP32 kernels take a
+    /// `state_snapshots` pointer; `gated_delta_net_f16{,_routed_batch_seq,
+    /// _tree}.hip` have no such parameter, so under FP16 nothing fills these
+    /// slots. The caller in `speculative.rs` therefore skips the allocation
+    /// entirely (and says so) rather than reserving buffers the kernels cannot
+    /// write — allocating them as f16 would not help for the same reason.
     ///
     /// Allocated UP FRONT rather than on demand: the verify forward can run
     /// inside a captured graph, and hipMalloc is not permitted under stream
