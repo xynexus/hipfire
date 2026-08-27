@@ -227,7 +227,14 @@ impl Qwen35Tiny {
             //
             // i.e. the preset shaped to reach the indexed path was still being
             // turned away, by its own shared expert.
-            shared_inter: 512,
+            //
+            // 256, not 512: one G256 group per row is all the constraint needs,
+            // and `indexed_moe_fixture_stays_tiny` budgets this fixture under
+            // 10M params. 512 costs 393k more and lands at 10,300,548 — the
+            // bound `13f022d4b` added on purpose when it shrank this fixture
+            // 20.7M -> 9.7M. Multi-group accumulation is already covered by the
+            // routed side, which is why `moe_inter` is 512.
+            shared_inter: 256,
             layers: 2,
             full_attn_interval: 2,
             ..Self::preset()
