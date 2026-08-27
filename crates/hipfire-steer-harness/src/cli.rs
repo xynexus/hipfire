@@ -14,9 +14,9 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use crate::{DaemonHarness, HttpHarness};
 use hipfire_steer::driver::{load_prompts, run_driver, DriverConfig, ModelHarness, Prompt};
 use hipfire_steer::SteerMode;
-use hipfire_steer_harness::{DaemonHarness, HttpHarness};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
@@ -51,7 +51,7 @@ struct Args {
     eval_refusals: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut hfq = None;
     let mut server_url = None;
     let mut num_layers = None;
@@ -69,7 +69,7 @@ fn parse_args() -> Result<Args, String> {
     let mut stack_demo = None;
     let mut eval_refusals = false;
 
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter().skip(1).cloned();
     while let Some(a) = it.next() {
         let mut next = || it.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -155,8 +155,19 @@ fn load_set(dir: &Path, name: &str, limit: usize) -> Result<Vec<Prompt>, Box<dyn
     Ok(prompts)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = parse_args()?;
+/// Entry point for the standalone `hipfire-steer` binary.
+pub fn main() -> Result<(), Box<dyn Error>> {
+    main_with_args(&std::env::args().collect::<Vec<_>>())
+}
+
+/// Entry point for `hipfire steer`, which must supply argv.
+///
+/// `parse_args` skips exactly one leading token, so the real process argv
+/// (`hipfire steer --hfq …`) would have `steer` consumed as argv[0]'s stand-in
+/// and the first real flag dropped. Callers pass the argv this would have had
+/// as its own binary.
+pub fn main_with_args(argv: &[String]) -> Result<(), Box<dyn Error>> {
+    let args = parse_args(argv)?;
 
     let good_prompts = load_set(&args.data_dir, "good_prompts.txt", args.limit)?;
     let bad_prompts = load_set(&args.data_dir, "bad_prompts.txt", args.limit)?;

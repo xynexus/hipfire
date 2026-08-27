@@ -51,6 +51,16 @@ enum Command {
     },
     /// Run the quant admission/model evaluation harness
     Eval(commands::forward::EvalArgs),
+    /// Live terminal monitor for GPU, memory, and daemon state
+    Monitor,
+    /// Kernel Atlas: inspect, count, and render Atlas rows
+    Atlas(commands::tools::PassthroughArgs),
+    /// Steering-vector harness
+    Steer(commands::tools::PassthroughArgs),
+    /// Harmful-neuron probe
+    HneuronsProbe(commands::tools::PassthroughArgs),
+    /// Inspect a .hfq artefact (verify, list, extract, meta-get/set, rearch)
+    Hfq(commands::tools::PassthroughArgs),
     /// Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
     Bench(commands::bench::BenchArgs),
     /// Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
@@ -249,6 +259,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Quantize(args)) => commands::quantize::run(args),
         Some(Command::Convert { command }) => commands::quantize::run_convert(command),
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
+        Some(Command::Monitor) => commands::tools::run_monitor(),
+        Some(Command::Atlas(args)) => commands::tools::run_atlas(args),
+        Some(Command::Steer(args)) => commands::tools::run_steer(args),
+        Some(Command::HneuronsProbe(args)) => commands::tools::run_hneurons_probe(args),
+        Some(Command::Hfq(args)) => commands::tools::run_hfq(args),
         Some(Command::Bench(args)) => rt()?.block_on(commands::bench::run(args, loaded_config)),
         Some(Command::Doctor(args)) => rt()?.block_on(commands::doctor::run(args, loaded_config)),
         Some(Command::Env(args)) => commands::env::run(args),

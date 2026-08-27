@@ -63,7 +63,7 @@ struct Args {
     identify_3v1: Option<PathBuf>,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut daemon = None;
     let mut model = None;
     let mut colnorms = None;
@@ -81,7 +81,7 @@ fn parse_args() -> Result<Args, String> {
     let mut limit = Some(200usize);
     let mut l1 = 1e-3f32;
     let mut max_seq = 2048usize;
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter().skip(1).cloned();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a}: missing value"));
         match a.as_str() {
@@ -436,15 +436,21 @@ fn looks_like_wedge(err: &str) -> bool {
         || e.contains("stream")
 }
 
-fn main() {
-    if let Err(e) = run() {
+/// Entry point for the standalone `hipfire-hneurons-probe` binary.
+pub fn main() {
+    main_with_args(&std::env::args().collect::<Vec<_>>());
+}
+
+/// Entry point for `hipfire steer hneurons-probe`, which must supply argv.
+pub fn main_with_args(argv: &[String]) {
+    if let Err(e) = run(argv) {
         eprintln!("hneurons-probe: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = parse_args()?;
+fn run(argv: &[String]) -> Result<(), String> {
+    let args = parse_args(argv)?;
     let daemon_bin = match &args.daemon {
         Some(p) => p.clone(),
         None => find_daemon_bin_or_error().map_err(|e| e.to_string())?,

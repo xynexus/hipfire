@@ -185,15 +185,28 @@ pub fn run_eval(args: EvalArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 }
 
 pub fn run_host_profile(args: HostProfileArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
-    run_forwarded(
-        Runner::host_profile(),
-        host_profile_args_with_models_dir(args.args, &loaded),
-        "HIPFIRE_HOST_PROFILE_BIN",
-        "hipfire-host-profile",
-        HOST_PROFILE_HELP,
-        "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
-        &[],
-    )
+    let forwarded = host_profile_args_with_models_dir(args.args, &loaded);
+
+    // Same escape hatch as `hipfire eval`: an explicit binary override can only
+    // be honoured by a separate process.
+    if std::env::var_os("HIPFIRE_HOST_PROFILE_BIN").is_some() {
+        return run_forwarded(
+            Runner::host_profile(),
+            forwarded,
+            "HIPFIRE_HOST_PROFILE_BIN",
+            "hipfire-host-profile",
+            HOST_PROFILE_HELP,
+            "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
+            &[],
+        );
+    }
+    if is_help(&forwarded) {
+        println!("{HOST_PROFILE_HELP}");
+        return Ok(());
+    }
+    let mut argv = vec!["hipfire-host-profile".to_string()];
+    argv.extend(forwarded.iter().map(|a| a.to_string_lossy().into_owned()));
+    hipfire_runtime::host_profile::run_from_args(argv).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn host_profile_args_with_models_dir(

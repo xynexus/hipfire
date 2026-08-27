@@ -106,7 +106,12 @@ pub struct BandwidthRecord {
 }
 
 pub fn run_from_env() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+    run_from_args(std::env::args().collect())
+}
+
+/// Same as [`run_from_env`], but for a caller that supplies argv — `hipfire
+/// host-profile` must, since the scan would otherwise see its subcommand token.
+pub fn run_from_args(args: Vec<String>) -> Result<(), String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print!("{}", usage());
         return Ok(());

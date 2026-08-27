@@ -23,6 +23,11 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire convert mtp-extract`↴](#hipfire-convert-mtp-extract)
 * [`hipfire convert mtp-merge`↴](#hipfire-convert-mtp-merge)
 * [`hipfire eval`↴](#hipfire-eval)
+* [`hipfire monitor`↴](#hipfire-monitor)
+* [`hipfire atlas`↴](#hipfire-atlas)
+* [`hipfire steer`↴](#hipfire-steer)
+* [`hipfire hneurons-probe`↴](#hipfire-hneurons-probe)
+* [`hipfire hfq`↴](#hipfire-hfq)
 * [`hipfire bench`↴](#hipfire-bench)
 * [`hipfire doctor`↴](#hipfire-doctor)
 * [`hipfire env`↴](#hipfire-env)
@@ -94,6 +99,11 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `quantize` — Quantize a model artefact
 * `convert` — Convert model artefacts (drafters, MTP heads)
 * `eval` — Run the quant admission/model evaluation harness
+* `monitor` — Live terminal monitor for GPU, memory, and daemon state
+* `atlas` — Kernel Atlas: inspect, count, and render Atlas rows
+* `steer` — Steering-vector harness
+* `hneurons-probe` — Harmful-neuron probe
+* `hfq` — Inspect a .hfq artefact (verify, list, extract, meta-get/set, rearch)
 * `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
 * `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
 * `env` — List the environment variables hipfire reads, with descriptions
@@ -387,6 +397,62 @@ Run the quant admission/model evaluation harness
 ###### **Arguments:**
 
 * `<ARGS>` — Arguments forwarded to hipfire-eval. Use positional <model>; common flags include --compare, --reference, --battery, --suite, --benchmark, --runs, --force, and --regenerate
+
+
+
+## `hipfire monitor`
+
+Live terminal monitor for GPU, memory, and daemon state
+
+**Usage:** `hipfire monitor`
+
+
+
+## `hipfire atlas`
+
+Kernel Atlas: inspect, count, and render Atlas rows
+
+**Usage:** `hipfire atlas [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire steer`
+
+Steering-vector harness
+
+**Usage:** `hipfire steer [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire hneurons-probe`
+
+Harmful-neuron probe
+
+**Usage:** `hipfire hneurons-probe [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire hfq`
+
+Inspect a .hfq artefact (verify, list, extract, meta-get/set, rearch)
+
+**Usage:** `hipfire hfq [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
 
 
 

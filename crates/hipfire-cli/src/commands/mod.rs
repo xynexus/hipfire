@@ -18,3 +18,4 @@ pub mod lock;
 pub mod model;
 pub mod quantize;
 pub mod serve;
+pub mod tools;

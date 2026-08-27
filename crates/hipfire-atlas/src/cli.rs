@@ -181,8 +181,7 @@ fn write_rows_jsonl(rows: &[AtlasRow], path: &str) -> Result<(), String> {
     fs::write(path, body).map_err(|e| format!("write {path}: {e}"))
 }
 
-fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+fn run(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
         print_usage();
         return Err("missing subcommand".into());
@@ -242,8 +241,19 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn main() {
-    if let Err(msg) = run() {
+/// Entry point for the standalone `hipfire-atlas` binary.
+pub fn main() {
+    main_with_args(&std::env::args().collect::<Vec<_>>());
+}
+
+/// Entry point for `hipfire atlas`, which must supply argv.
+///
+/// `run` selects on `args[1]` and guards on exact `args.len()`, so the real
+/// process argv (`hipfire atlas read x.jsonl`) would land on the fallback arm
+/// and print usage. Callers pass the argv this would have had as its own
+/// binary: the tool name, then the arguments.
+pub fn main_with_args(args: &[String]) {
+    if let Err(msg) = run(args) {
         eprintln!("error: {msg}");
         std::process::exit(1);
     }

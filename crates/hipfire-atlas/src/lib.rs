@@ -19,6 +19,12 @@
 //! The legacy stdout parsers in [`parse`] remain as a migration bridge
 //! for captures from binaries not yet wired with `--emit-atlas`.
 
+// `cli` was a separate crate root (src/main.rs) and spells its imports
+// `hipfire_atlas::…`. A crate cannot name itself in Rust 2018+ without this.
+extern crate self as hipfire_atlas;
+
+/// The `hipfire-atlas` command line, as a module rather than a crate root.
+pub mod cli;
 pub mod eval;
 pub mod parse;
 pub mod profile_report;
