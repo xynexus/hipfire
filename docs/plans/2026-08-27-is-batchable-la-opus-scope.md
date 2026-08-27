@@ -1,3 +1,55 @@
+# ⚠️ RETRACTED — `is_batchable_la` already supports Opus. There is no prerequisite.
+
+**Retracted 2026-08-27, the same day it was written.** The premise is false.
+
+`is_batchable_la` is 264 lines. I read the ~15-line `always_ok` block, saw no
+Opus dtype, and concluded Opus attention was excluded. Parsed in full it has
+explicit arms for all three:
+
+```rust
+let oq4_with_wmma = matches!(dt, DType::Oq4G256)
+    && matches!(arch, "gfx1100" | … | "gfx1201")
+    && std::env::var("HIPFIRE_OQ4_BATCHED_PREFILL").as_deref() != Ok("0");
+let oq8_with_wmma = matches!(dt, DType::Oq8G256) && matches!(arch, …) && …;
+if dt == DType::OqCompactG256 { return if allow_compact { true } else { decline(…) }; }
+```
+
+**Confirmed at runtime**, not just by reading: an artifact built with Opus
+attention (`--tensor-format '*in_proj_qkv*=oq8' …`) produced **zero**
+`is_batchable_la` declines and execution proceeded past it to the MoE check.
+
+So **`Q8_0` attention is NOT load-bearing for batched prefill**, and re-encoding
+it as `oq8++` or `oq4.25` does not need any predicate widened first. The
+migration is unblocked from this direction.
+
+This was the third truncated-read error in one session (a `head -8` on a panic
+list, a `sed` window on `is_mq`, and this). Each time a partial view of a long
+construct was reported as a property of the construct. The tell was available
+every time: a count or a list that did not match what the code plainly had to
+contain.
+
+## What is actually true
+
+The one real constraint found while testing this: with Opus attention in place,
+the remaining decline is **`shared_down=Q8_0`** — the shared-expert `down_proj`,
+which the tiny fixture keeps at `Q8_0` because its `K=128` is not a multiple of
+the 256-wide Opus group. The **MoE quant-family ladder** refuses `Q8_0`:
+
+```
+3x moe_ffn_batched DECLINED (dtype unsupported on this arch)
+   [shared_gate_up=Oq4G256/true shared_down=Q8_0/false routed=Uniform(Oq4G256)/true]
+3x moe_prefill_quant_family ladder `_` arm -> dtype not batched-admissible [Q8_0]
+```
+
+So a full Q8 removal has to answer what ragged-K tensors (K % 256 != 0) become,
+since Opus cannot encode them without padding. That is a narrower, real question
+and it belongs to the quantizer, not to `is_batchable_la`.
+
+---
+
+<details>
+<summary>Original scope, retained for the record — its premise is wrong</summary>
+
 # Scope: Opus support in `is_batchable_la` — the Q8-removal prerequisite
 
 Status: scope, 2026-08-27. Driver: retiring `Q8_0` from model weights, re-encoding
@@ -174,3 +226,6 @@ admission decline. Fixed in `fix-kernel-trace-predispatch-declines`. Before that
 `[pbs-gate]` printed `verdict=false` with every *named* term reading true —
 recomputed proxies, not the deciding terms — which is exactly the failure its own
 comment ("Name every term") warns against.
+
+
+</details>
