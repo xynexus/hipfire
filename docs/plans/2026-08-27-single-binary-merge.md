@@ -51,11 +51,17 @@ AGENTS.md has to warn that wrapping `hipfire-eval` deadlocks *and names your own
 label as the blocker*. One process, one lock holder, and the whole class of
 warning disappears.
 
-**Binaries hunt for each other on the filesystem.** `hipfire-eval` fails with
-*"daemon binary not found; build with `cargo build -p hipfire-daemon --bin
-hipfire-daemon`"* at four separate call sites. `find_priv_helper()` probes three
-locations. Every such lookup is a deployment failure mode that in-process
-dispatch cannot have.
+**Binaries hunt for each other on the filesystem.** Counted rather than
+estimated: the "daemon binary not found" string appears 12 times, behind 7
+message-producing `find_daemon_bin*` sites, with 22 call sites across 8 crates.
+The saving grace is that resolution has exactly ONE owner —
+`find_daemon_bin_candidates()` — so the whole class has a single chokepoint.
+Its last two candidates are a repo-root `target/` located by shelling out to
+`git rev-parse`, which is why a deployed install outside a repo had one working
+path and no fallback. `find_priv_helper()` probes three locations. Every such
+lookup is a deployment failure mode that in-process dispatch cannot have.
+
+*Closed in step 1* — see §6.
 
 **Subprocesses cannot be scheduled.** `induction/orchestrate.rs:264` spawns via
 `std::process::Command::new`. A spawned child cannot be preempted at a quantum
@@ -138,7 +144,53 @@ be adopted with eyes open.
 Ordered so each step is independently shippable and the load-bearing one comes
 early.
 
-1. **`hipfire daemon`** — fold the daemon in first. It removes the four
+1. **`hipfire daemon`** — ✅ **DONE** (`41e9d97e7`). What it took, versus what
+   this section guessed:
+
+   - The lib split was a *rename*, not the ~1,500-line code move it looked like:
+     the submodules already `use crate::*`, which resolves against the crate root
+     whether that root is `main.rs` or `lib.rs`. So `git mv src/main.rs
+     src/lib.rs`, `fn main` → `pub fn main`, and a 3-line `src/bin/` shim. The
+     standalone `hipfire-daemon` binary still builds and behaves identically.
+   - The daemon still runs as its **own OS process**. That is what made this step
+     small: the `process::exit` calls, the startup panics, the stdin lock and the
+     stdout responder are all *correct* for a process whose whole job is to be
+     the daemon, so none of them had to be converted to `Result`.
+   - `current_exe()` went to the FRONT of the candidate chain, ahead of anything
+     on disk, so a running `hipfire` can never spawn an older build of itself
+     left in `~/.hipfire/bin` or a stale `target/`. Spawn dispatches on the file
+     name (`hipfire` ⇒ pass `daemon`), the ordinary multi-call convention, which
+     also makes `HIPFIRE_DAEMON_BIN=/path/to/hipfire` work. **Zero churn at the
+     22 call sites** — they still receive a `PathBuf`.
+   - Verified on halo/gfx1151 from a copy of `hipfire` in a non-repo directory,
+     with no `HIPFIRE_DAEMON_BIN` and no `hipfire-daemon` beside it: `hipfire
+     chat` spawned `<that path>/hipfire daemon` and generated 12 tokens at
+     24.56 tok/s.
+
+   **Size, measured rather than feared** (§7 asked for this deliberately):
+   `hipfire` 36.9 → 59.1 MB, replacing the 36.9 + 33.0 = 69.9 MB pair. The merged
+   binary is **10.8 MB smaller** than what it subsumes; shared code dedupes.
+
+   **The trap this re-armed.** The daemon's 96 unit tests followed the code into
+   the lib target, so `cargo test -p hipfire-daemon --bin hipfire-daemon` now
+   matches **zero** tests and still exits 0 — the same silent-green failure the
+   comment above that line was written to warn about, exactly inverted. Any step
+   that moves a crate's target layout must re-check the test COUNT, because both
+   spellings pass. `no-gpu-ci.sh` moved to `--lib` (96 pass) and `ci.yml`'s
+   workspace-wide `cargo test --lib` now picks them up for free, which it never
+   could while the crate was bin-only.
+
+   **Deferred to rung 2 (not done here):** `hipfire-daemon-adapter` still spawns
+   a child. Collapsing it to an in-process `DaemonTransport` is blocked on a real
+   structural problem this section did not anticipate: the trait and all three
+   impls are **private** to the adapter, and `hipfire-daemon` already depends on
+   `hipfire-daemon-adapter` — so an in-process arm inside the adapter would need
+   the reverse edge and close a dependency cycle. That needs the shared pieces
+   (`fatal_startup_error`, `acquire_resource_lease_or_exit`, `default_socket_path`
+   — all daemon-SERVER functions the client adapter should never have owned) to
+   move out first.
+
+   *Original text follows.* Fold the daemon in first. It removes the four
    "daemon binary not found" call sites and the eval→daemon spawn, and it is the
    process everything else needs to be inside.
 
@@ -197,9 +249,15 @@ early.
   `hipfire-daemon/src/main.rs:1523` is a plain `fn main()`: no tokio, serial
   executor over process globals. Folding it into `hipfire` puts that blocking,
   GPU-owning loop on a tokio worker of the same runtime serving axum, where a
-  multi-second kernel sweep starves request handling. Give it a dedicated thread
-  (or `spawn_blocking`) as a decision, and preserve the guarantee that exactly
-  one thread touches the GPU.
+  multi-second kernel sweep starves request handling.
+
+  It must get a **dedicated OS thread**, and `spawn_blocking` is not an
+  alternative — an earlier draft of this line said it was, and that was wrong.
+  `hipfire_rdna::Gpu` is `!Send` and `!Sync` (three raw `*mut c_void` fields, no
+  `unsafe impl` anywhere in the tree), so the handle cannot be built on one
+  thread and moved to another: the executor thread has to call `Gpu::init()`
+  itself. Tokio's blocking pool does not pin work to a thread, so it cannot make
+  that guarantee. Done this way in step 1.
 - **Six arch-crate dependencies in coexistence** suggest induction reaches into
   arch specifics. Whether that survives a move into `hipfire-runtime` without a
   dependency cycle is the main structural unknown, and it may force a different
