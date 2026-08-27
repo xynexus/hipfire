@@ -155,6 +155,30 @@ pub fn report(label: &str) -> Option<String> {
     }
     let snap = snapshot();
     if snap.is_empty() {
+        // No kernels ran — but a report can still be worth printing. An
+        // ADMISSION decline happens BEFORE any dispatch, so its recorded
+        // `record_fallback` entries would be thrown away here. That is why
+        // qwen35's prefill declines were invisible while llama's showed: llama's
+        // only `report()` call sits AFTER its forward, when dispatches exist.
+        // Emit the fallback section alone rather than nothing.
+        if let Ok(f) = fallbacks().lock() {
+            if !f.is_empty() {
+                let mut s = format!(
+                    "[kernel-trace] {label}: no dispatches; {} slow-path/decline site(s) recorded
+",
+                    f.len()
+                );
+                let mut v: Vec<(&String, &(u64, String))> = f.iter().collect();
+                v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+                for (site, (n, detail)) in v {
+                    s.push_str(&format!(
+                        "  {n:>9}x  {site}  [{detail}]
+"
+                    ));
+                }
+                return Some(s);
+            }
+        }
         return None;
     }
     let total: u64 = snap.iter().map(|(_, n)| n).sum();
