@@ -141,6 +141,26 @@ early.
 1. **`hipfire daemon`** — fold the daemon in first. It removes the four
    "daemon binary not found" call sites and the eval→daemon spawn, and it is the
    process everything else needs to be inside.
+
+   **This is also where `hipfire-daemon-adapter` collapses**, and that is the
+   bulk of the step rather than a detail of it. The adapter is 2,506 lines whose
+   whole job is talking to the daemon as a *child process*:
+   `StdioTransport::spawn` at `lib.rs:193` runs `tokio::process::Command::new`
+   and pipes JSONL over stdin/stdout. Seven crates depend on it — cli, server,
+   eval, coexistence, coherence, steer-harness, and `hipfire-daemon` itself — so
+   it is the widest blast radius in the sequence.
+
+   The seam already exists. `DaemonTransport` is a trait with three
+   implementations: `StdioTransport` (child process), `SocketTransport`
+   (`lib.rs:345`, already not a spawn), and a test `MockTransport`. So in-process
+   means adding a fourth peer, not rewriting seven call sites and not inventing
+   an abstraction. Keep the spawn path for the cases that still want a separate
+   process — crash isolation, a daemon outliving the CLI.
+
+   The catch, and the reason this is step 1's real work: `DaemonTransport`'s
+   methods return `BoxFuture`, while the daemon handlers behind them are
+   synchronous. An in-process transport has to bridge that without blocking a
+   runtime worker — the constraint §7 names.
 2. **`hipfire quantize`** (+ the five aux binaries as subcommands) — needed
    before induction can call codecs in-process.
 3. **`induction/` into a daemon-reachable crate**, replacing `Command::new` with
@@ -160,9 +180,26 @@ early.
   + arch crates will be large and slow to link. Feature-gating subcommands is the
   escape hatch, but it partially recreates the split — decide deliberately rather
   than discovering it at 300 MB.
-- **`tokio` from coexistence.** It appears in coexistence's deps; the daemon is
-  not obviously async in the same way. Check before moving `induction/`, not
-  during.
+- **The async/sync seam is the daemon's, not coexistence's.** The original
+  worry — that `tokio` arrives as a new dependency from coexistence — does not
+  survive checking, on either half. The merge host is already a tokio process:
+  `hipfire-cli/src/main.rs:190` is `#[tokio::main]` with
+  `tokio = { features = ["full"] }`, and it embeds `hipfire-server` (axum,
+  tokio-stream, async-stream). Coexistence asks only for `rt-multi-thread`, a
+  strict subset, so folding it in does not even move the feature union. Nor does
+  its tokio travel with `induction/`: there is exactly one use site in the crate,
+  `hipfire-coexistence/src/main.rs:643`, building a runtime for `hipfire hub`
+  fetch/verify/repair — squarely the offline half of §4 — while
+  `crates/hipfire-coexistence/src/induction/` contains no `async`, no `.await`,
+  and no `tokio` at all.
+
+  The real mismatch runs the other way and lands in **step 1**, not step 3.
+  `hipfire-daemon/src/main.rs:1523` is a plain `fn main()`: no tokio, serial
+  executor over process globals. Folding it into `hipfire` puts that blocking,
+  GPU-owning loop on a tokio worker of the same runtime serving axum, where a
+  multi-second kernel sweep starves request handling. Give it a dedicated thread
+  (or `spawn_blocking`) as a decision, and preserve the guarantee that exactly
+  one thread touches the GPU.
 - **Six arch-crate dependencies in coexistence** suggest induction reaches into
   arch specifics. Whether that survives a move into `hipfire-runtime` without a
   dependency cycle is the main structural unknown, and it may force a different
