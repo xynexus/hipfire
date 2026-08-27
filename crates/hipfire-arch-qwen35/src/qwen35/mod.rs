@@ -2095,6 +2095,30 @@ fn moe_ffn_batched_admissible_for_dtypes(
             ),
         );
     }
+    // ⚠️ Uniform Oq4G256 is DECLINED by default, and the default is the
+    // slow-but-verified per-token route — matching how the OqCompact sibling is
+    // gated in `moe_grouped_gemm_supported_for_dtype`.
+    //
+    // The batched indexed path (path 1) runs and is deterministic, but its output
+    // DIFFERS from the per-token reference (96-token greedy: divergence after 255
+    // chars, run-to-run identical, so accumulation order rather than instability).
+    // That is unverified, not known-good: `tiny-prefill-gate` SKIPS qwen3_5_moe
+    // ("batched prefill did not execute for this fixture"), so batched MoE prefill
+    // has NO parity coverage. This file already records why that matters — the Oq8
+    // grouped kernel "ran 1.8x faster and emitted garbage".
+    //
+    // HIPFIRE_MOE_OQ4_UNIFORM_PATH1=1 opts into the speed. Drop the gate once
+    // tiny-prefill-gate covers batched MoE prefill and it passes.
+    if matches!(
+        routed_profile,
+        RoutedExpertDtypeProfile::Uniform(DType::Oq4G256)
+    ) && std::env::var("HIPFIRE_MOE_OQ4_UNIFORM_PATH1").as_deref() != Ok("1")
+    {
+        return decline(
+            "qwen35 moe_ffn_batched DECLINED (uniform Oq4G256: path-1 parity unverified) -> per-token MoE FFN",
+            format!("gate_up={:?} arch={arch} (set HIPFIRE_MOE_OQ4_UNIFORM_PATH1=1 to opt in)", dtypes.expert_gate_up),
+        );
+    }
     let profile_metadata_consistent = match routed_profile {
         RoutedExpertDtypeProfile::Uniform(_) => true,
         RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, .. } => {

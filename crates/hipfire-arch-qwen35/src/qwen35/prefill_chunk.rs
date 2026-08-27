@@ -856,7 +856,27 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // 0.000e0 on every layer), so this threshold is purely a speed choice and
     // cannot change output.
     const MOE_GROUPED_MIN_BATCH: usize = 64;
+    // Oq4G256 is declared grouped-GEMM-supported for the MIXED routing profile,
+    // which dispatches through the indexed-block W4A16 grouped kernel. Path 2 has
+    // no arm for a UNIFORM Oq4G256 profile — the design says those "can still use
+    // the existing indexed Path 1 kernels" (see
+    // `moe_grouped_gemm_supported_for_dtype`). Without this guard a uniform oq4
+    // MoE reached path 2's `other` arm and aborted the daemon
+    // (docs/bugs/2026-08-27-oq4-moe-batched-prefill-panic.md). Route it to path 1,
+    // which HAS an Oq4G256 arm, rather than declining to the per-token loop.
+    // A UNIFORM Oq4G256 profile has no path-2 arm — the design routes it to the
+    // indexed path 1 ("Uniform OQ can still use the existing indexed Path 1
+    // kernels", see `moe_grouped_gemm_supported_for_dtype`). Without this it
+    // reached path 2's `other` arm and aborted the daemon
+    // (docs/bugs/2026-08-27-oq4-moe-batched-prefill-panic.md).
+    //
+    // Whether this layer is admitted for batching AT ALL is decided upstream by
+    // `moe_ffn_batched_admissible`, which declines uniform Oq4 by default because
+    // path-1 parity is unverified. This only picks the arm once admitted.
+    let uniform_oq4_belongs_on_path1 =
+        dtypes.expert_gate_up == DType::Oq4G256 && !dtypes.routed_profile.is_mixed();
     let path2_eligible = n >= MOE_GROUPED_MIN_BATCH
+        && !uniform_oq4_belongs_on_path1
         && moe_grouped_gemm_path2_eligible_for_dtype(
             dtypes.expert_gate_up,
             &gpu.arch,
@@ -1279,10 +1299,23 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             )?;
                         }
                     }
-                    other => panic!(
-                    "prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
-                             — admit predicate should have rejected this layer"
-                ),
+                    // Backstop, not the primary guard: `grouped_moe_prefill_supports`
+                    // in the admit predicate should have declined this layer to
+                    // the per-token path already. This used to `panic!`, which
+                    // turned a missing fast-path arm into a daemon-wide outage
+                    // that killed every co-resident model
+                    // (docs/bugs/2026-08-27-oq4-moe-batched-prefill-panic.md).
+                    other => {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "prefill_moe_ffn_body_batched: unsupported \
+                                 experts[0].gate_up dtype {other:?} — the admit \
+                                 predicate (grouped_moe_prefill_supports) should have \
+                                 declined this layer to the per-token path"
+                            ),
+                        ));
+                    }
                 }
 
                 // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
@@ -1472,11 +1505,18 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         )?;
                     }
                 }
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
-                             experts[0].gate_up dtype {other:?} — admit predicate should \
-                             have rejected this layer"
-                ),
+                // Backstop; see the path-2 note above.
+                other => {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
+                             experts[0].gate_up dtype {other:?} — the admit predicate \
+                             (grouped_moe_prefill_supports) should have declined this \
+                             layer to the per-token path"
+                        ),
+                    ));
+                }
             }
         }
 

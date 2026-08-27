@@ -69,7 +69,58 @@ model was to compare batched scoring against the 4.2 tok/s per-token blanket
 impl (`docs/experiments/2026-08-27-induction-quantum-wcet-nix1.md`). That
 comparison is still unmeasured because the batched path crashes.
 
-## The fix is a decline, not an arm
+## FIXED 2026-08-27 — and the first two attempts were both wrong
+
+**The defect is path SELECTION, not a missing dtype.** Path 1 (the indexed route
+*inside* the batched body) already has an `Oq4G256` arm:
+
+| path | dtypes |
+|---|---|
+| path-2 (grouped WMMA) | `F16, BF16, ParoQ4G128` |
+| path-1 (indexed) | `Oq4G256, Oq8G256, OqCompactG256, ParoQ4G128` |
+
+`mod.rs:2651` declares `DType::Oq4G256 => arch.starts_with("gfx11")` — directly
+beneath a comment warning *"Do NOT add a dtype here just to satisfy an admission
+check… A dtype declared here without a grouped-WMMA arm is a latent panic."* It
+was declared for the **mixed** routing profile, but `use_path2` defaults on, so a
+**uniform** oq4 profile also became path-2 eligible and hit the `other` arm.
+
+**Two wrong attempts, recorded because each looked right:**
+
+1. *Decline all Oq4 batching in the admit predicate.* Correct behaviour, wrong
+   reason — it would have dropped a working artifact to the 4.2 tok/s per-token
+   loop on the false premise that Oq4 is unsupported.
+2. *Route uniform Oq4 to path 1 and return `Err` when unavailable.* The `Err`
+   fails the **request** rather than declining to the fallback; verified by
+   running it (`"prefill failed: … batched MoE prefill declined"`). Declining
+   must happen in the admit predicate, before dispatch.
+
+**Shipped:** the admit predicate declines uniform `Oq4G256` **by default**, so the
+forward drops to the per-token path; `HIPFIRE_MOE_OQ4_UNIFORM_PATH1=1` opts into
+path 1. Both `panic!`s became error returns as a backstop.
+
+### Why the default is the slow route
+
+Path 1 runs and is **deterministic** (run-to-run identical), but its 96-token
+greedy output **DIFFERS from the per-token reference**, diverging after 255 of
+433 chars. That is an accumulation-order difference between two kernels, not
+instability — but it is *unverified*, not known-good, and
+**`tiny-prefill-gate` SKIPS `qwen3_5_moe`** ("batched prefill did not execute for
+this fixture"), so batched MoE prefill has no parity coverage at all. This file's
+own history is the argument: the Oq8 grouped kernel "ran 1.8x faster and emitted
+garbage".
+
+Measured after the fix:
+
+| configuration | vs per-token reference |
+|---|---|
+| default (declined) | **IDENTICAL** (423 chars) |
+| `HIPFIRE_MOE_OQ4_UNIFORM_PATH1=1` | DIFFER (433 chars, diverges at 255) |
+
+**To remove the flag:** make `tiny-prefill-gate` cover batched MoE prefill and
+show path-1 parity. Until then the fast path is opt-in and the default is right.
+
+## Original analysis — the fix is a decline, not an arm
 
 Two separable changes:
 
