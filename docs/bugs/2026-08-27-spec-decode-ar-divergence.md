@@ -122,6 +122,26 @@ There is no defective batched kernel to hunt here: this is benign numerics.
 So the fix is to **pin the path** so verify and AR provably take the same one,
 NOT to rewrite the batched GEMM/attention for bit-parity.
 
+### Cross-checked on independent hardware
+
+The arbitration above decides between a one-line path pin and a kernel-parity
+project, so it was re-run on a second box rather than trusted from one.
+
+`duat` (RTX 3090, **CUDA** torch 2.13.0+cu130, **transformers 5.15.0**) against
+halo (gfx1151, **ROCm** torch 2.12.0a0, **transformers 5.2.0**), same NFS
+snapshot `2fc06364…`, same hipfire dump:
+
+    layer 0   halo 0.999996416575   duat 0.999996416569
+    layer 22  halo 0.999989880219   duat 0.999989880257
+    layer 23  halo 0.935017734096   duat 0.935017733706
+    verdict   pertoken 23 / batched 1 on BOTH
+
+Agreement to ~10 significant figures across two GPU vendors and two transformers
+majors. So the ~1e-6 per-token edge is a real, reproducible signal rather than
+per-box noise — it is just far too small to be worth a kernel rewrite. And the
+layer-23 figure reproducing to 9 digits confirms it is a structural convention
+difference, not numerical noise on either machine.
+
 Two notes on reading that table:
 - Layer 23 reads 0.935 for BOTH arms equally. That is a hipfire-vs-HF export
   convention at the last layer (HF's final `hidden_states` entry has the final
