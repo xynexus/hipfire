@@ -5,6 +5,17 @@ Date: 2026-08-27. Companion to
 demo 9.29 tok/s τ=5.9 vs daemon 1.31 tok/s τ=2.24, same target, same
 drafter, same host).
 
+> **Status update (same day):** ① and ② landed in PR #372 and the daemon
+> was re-measured. ① is a no-op for dflash2 (declared ids coincide with
+> the derived spread on 5-extract/64-layer) but stays as a correctness
+> fix for drafters where they diverge; the τ gap this doc attributes to
+> it was actually prompt-dependent. The dominant lever turned out to be
+> ⑤'s KVarN gate: daemon DFlash goes 4.12 → **8.03 tok/s (1.54× over
+> plain)** under kvarn + `HIPFIRE_KVARN_BATCHED_PREFILL=1`, matching the
+> demo's τ=5.9 exactly. Re-prioritize: ⑤ (kvarn gate default) first,
+> then ③/④ for the remaining ~15% (B=10 vs trained 8). Findings doc has
+> the numbers.
+
 Both paths call the same `spec_step_dflash`
 (`hipfire-arch-qwen35/src/speculative.rs:7297`). The gap is setup and
 per-cycle arguments, not the kernel. Of `dflash_spec_demo.rs`'s ~3300

@@ -43,7 +43,30 @@ B=5); above it the drafted tokens past the accepted run are wasted verify
 work — B=12 has the *highest* τ yet worse throughput. B=10/11 is a plateau;
 pick 10.
 
-## The daemon contradiction
+## Update (same day): daemon re-measured — the τ gap was the prompt, the tok/s gap was KV mode
+
+After landing the two scope-doc bug fixes (PR #372), the daemon was
+re-measured on the demo's own prompt. Corrections to the analysis below:
+
+- **τ 2.24 vs 5.9 was prompt-dependent, not a mis-fed drafter.** The
+  daemon hits exactly τ=5.9 / 74% accept on the numbers prompt; the
+  hash-map prompt sits at τ=2.24 on both paths. The declared-layer fix
+  is a no-op for dflash2 specifically (its declared ids [1,16,31,46,61]
+  coincide with the derived spread) though it remains a real bug for
+  drafters where they diverge.
+- **The tok/s gap is KV mode.** Daemon, numbers prompt, 256 tokens:
+  plain decode 5.2; DFlash on the default fp32 KV ring 4.12 (a loss);
+  DFlash under kvarn with `HIPFIRE_KVARN_BATCHED_PREFILL=1` **8.03
+  tok/s — a 1.54× win**, with prefill 2.5× faster as well. The demo
+  defaults to kvarn; the daemon defaults to fp32 and refuses DFlash
+  under kvarn without the env flag. That gate default is the real
+  blocker the parking verdict measured.
+- Remaining demo delta (8.03 vs 9.29) is consistent with block size:
+  the daemon runs the trained B=8; the demo's optimum here was B=10
+  (unsafe to force in the daemon until scratches are sized for it —
+  scope doc item ④).
+
+## The daemon contradiction (original analysis — superseded above)
 
 Same target, same drafter, same machine, same day, via the daemon
 (`HIPFIRE_DFLASH_ALLOW_OPUS=1`, `params.draft`):
