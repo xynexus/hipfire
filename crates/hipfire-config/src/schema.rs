@@ -480,6 +480,32 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          depended on knowing an env var."
     ),
     field!(
+        "deltanet_state_precision",
+        ConfigType::Enum {
+            values: &["fp16", "fp32"]
+        },
+        Requirement::Optional,
+        Some("fp16"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Storage dtype for the Gated DeltaNet recurrent state (the S matrices). \
+         Defaults to fp16 as of 2026-08-27. Measured on Qwen3.8-27B--oq4.25++: \
+         generation is BYTE-IDENTICAL to fp32 across code/prose/numbers/JSON \
+         prompts, and spec-decode acceptance IMPROVES — tau 3.682 -> 4.103 \
+         (+11.4%), decode 14.5-16.8 -> 18.9-19.1 tok/s. tau is deterministic and \
+         reproduced exactly across repeats, so that is signal, not run noise. \
+         Plain AR decode is flat, so the win is specific to speculative decode: \
+         the drafter sees the verify path's hidden states and agrees with the \
+         fp16 ones more often, while the verifier's committed tokens are \
+         unchanged. fp32 remains available as the diffing oracle — losing the \
+         ability to compare against it is how quantised state hid for months. \
+         NOTE fp16 narrows once per LAUNCH, so a batched call is not identical \
+         to the same tokens issued one at a time; fp32 has no narrowing and is \
+         identical either way. That asymmetry is real but was MEASURED not to \
+         drive the spec-decode/AR divergence (docs/bugs/2026-08-27-spec-decode-\
+         ar-divergence.md)."
+    ),
+    field!(
         "kv_window_precision",
         ConfigType::Enum {
             values: &["auto", "f16", "f32"]

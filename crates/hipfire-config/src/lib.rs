@@ -125,6 +125,9 @@ fn default_oq_compact_multicol_wide() -> bool {
 fn default_kv_window_precision() -> String {
     "auto".to_string()
 }
+fn default_deltanet_state_precision() -> String {
+    "fp16".to_string()
+}
 fn default_flash_mode() -> String {
     "auto".to_string()
 }
@@ -334,6 +337,8 @@ pub struct HipfireConfig {
     pub kv_adaptive: String,
     #[serde(default = "default_kv_window_precision")]
     pub kv_window_precision: String,
+    #[serde(default = "default_deltanet_state_precision")]
+    pub deltanet_state_precision: String,
     #[serde(default = "default_oq_compact_multicol_wide")]
     pub oq_compact_multicol_wide: bool,
     #[serde(default = "default_lmhead_twostage")]
@@ -523,6 +528,7 @@ impl Default for HipfireConfig {
             kv_cache: default_kv_cache(),
             kv_adaptive: default_kv_adaptive(),
             kv_window_precision: default_kv_window_precision(),
+            deltanet_state_precision: default_deltanet_state_precision(),
             oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
