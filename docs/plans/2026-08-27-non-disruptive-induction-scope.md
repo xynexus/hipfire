@@ -133,14 +133,15 @@ costs *between* quanta, and it is a number a policy could trade against.
 `kvarn`. `HIPFIRE_KERNEL_TRACE` was not on, so it is unresolved. Settle it before
 designing around 280 s.
 
-#### Original note
-
 `admit_realtime` (merged in #350) prices the drain budget including the prefill
 term. **Nothing calls it.** For non-disruptive induction it needs to actually
 gate: an induction quantum should be admitted only when serving's latency budget
-tolerates it, otherwise the "non-disruptive" property is aspirational. The
-per-quantum WCET of each induction step (a calibration layer, a KLD chunk, a QAT
-step) is the input it needs and none of those are currently measured.
+tolerates it, otherwise the "non-disruptive" property is aspirational.
+
+The WCETs above are the input it needed. What they show is that gating alone
+cannot deliver the property — the quanta must also shrink. Calibration's
+per-layer step is the one induction quantum still unmeasured; it is the most
+likely to already be short enough, and worth measuring next.
 
 ### 2.3 Memory is the binding constraint, and the ledger lies
 
