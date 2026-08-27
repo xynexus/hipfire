@@ -15,6 +15,12 @@
 //! `f32_to_f16`) are re-exported from `hipfire-primitives` so the in-crate
 //! `crate::{…}` references inside the modules below keep resolving unchanged.
 
+// `cli` and `tools` were separate crate roots (src/main.rs, src/bin/*.rs) and
+// still spell their imports `hipfire_quantize::…`. A crate cannot refer to
+// itself by name in Rust 2018+ without this alias, so it is what lets those
+// modules move in here untouched.
+extern crate self as hipfire_quantize;
+
 use std::sync::OnceLock;
 
 pub use hipfire_kvquant::{kv_compact, kvarn};
@@ -48,7 +54,15 @@ pub mod quant_plan;
 pub mod fixture;
 #[allow(dead_code)]
 pub mod qtip;
+/// Weight-rotation helpers. Lived in `main.rs` when that was a crate root; now
+/// in the lib so both `cli` and any other consumer can reach it.
+pub mod rotate;
 pub mod roughquant;
+
+/// The `hipfire-quantize` command line, as a module rather than a crate root.
+pub mod cli;
+/// The former standalone conversion binaries.
+pub mod tools;
 
 // Process-global toggle for the `mqN+` clip-search codec variant. Lives in the
 // library so the codecs (which read it via `crate::mq_clipsearch_enabled`) and

@@ -42,6 +42,13 @@ enum Command {
     List,
     /// Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
     Inspect(commands::inspect::InspectArgs),
+    /// Quantize a model artefact
+    Quantize(commands::quantize::QuantizeArgs),
+    /// Convert model artefacts (drafters, MTP heads)
+    Convert {
+        #[command(subcommand)]
+        command: commands::quantize::ConvertCommand,
+    },
     /// Run the quant admission/model evaluation harness
     Eval(commands::forward::EvalArgs),
     /// Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
@@ -215,6 +222,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
+        Some(Command::Quantize(args)) => commands::quantize::run(args),
+        Some(Command::Convert { command }) => commands::quantize::run_convert(command),
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
         Some(Command::Bench(args)) => commands::bench::run(args, loaded_config).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, loaded_config).await,

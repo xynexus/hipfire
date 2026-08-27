@@ -15,6 +15,13 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
+* [`hipfire quantize`↴](#hipfire-quantize)
+* [`hipfire convert`↴](#hipfire-convert)
+* [`hipfire convert dflash`↴](#hipfire-convert-dflash)
+* [`hipfire convert dspark`↴](#hipfire-convert-dspark)
+* [`hipfire convert draft-mq4`↴](#hipfire-convert-draft-mq4)
+* [`hipfire convert mtp-extract`↴](#hipfire-convert-mtp-extract)
+* [`hipfire convert mtp-merge`↴](#hipfire-convert-mtp-merge)
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire bench`↴](#hipfire-bench)
 * [`hipfire doctor`↴](#hipfire-doctor)
@@ -84,6 +91,8 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+* `quantize` — Quantize a model artefact
+* `convert` — Convert model artefacts (drafters, MTP heads)
 * `eval` — Run the quant admission/model evaluation harness
 * `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
 * `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
@@ -273,6 +282,99 @@ Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 
 * `--tensors` — List every tensor (name, quant type, shape, group size, size)
 * `--json` — Emit a machine-readable JSON object (includes the full tensor array and the raw metadata verbatim); ignores `--tensors`
+
+
+
+## `hipfire quantize`
+
+Quantize a model artefact
+
+**Usage:** `hipfire quantize [ARGS]...`
+
+Examples:
+  hipfire quantize --input model.hfa --output model--oq4.hfq --quant oq4
+  hipfire quantize --help
+
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the quantizer
+
+
+
+## `hipfire convert`
+
+Convert model artefacts (drafters, MTP heads)
+
+**Usage:** `hipfire convert <COMMAND>`
+
+###### **Subcommands:**
+
+* `dflash` — Build a DFlash drafter sidecar from a model
+* `dspark` — Build a DSpark drafter sidecar from a model
+* `draft-mq4` — Convert a drafter to mq4
+* `mtp-extract` — Extract an MTP head into its own artefact
+* `mtp-merge` — Merge an MTP head into an mq4 artefact
+
+
+
+## `hipfire convert dflash`
+
+Build a DFlash drafter sidecar from a model
+
+**Usage:** `hipfire convert dflash [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire convert dspark`
+
+Build a DSpark drafter sidecar from a model
+
+**Usage:** `hipfire convert dspark [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire convert draft-mq4`
+
+Convert a drafter to mq4
+
+**Usage:** `hipfire convert draft-mq4 [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire convert mtp-extract`
+
+Extract an MTP head into its own artefact
+
+**Usage:** `hipfire convert mtp-extract [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
+
+
+
+## `hipfire convert mtp-merge`
+
+Merge an MTP head into an mq4 artefact
+
+**Usage:** `hipfire convert mtp-merge [ARGS]...`
+
+###### **Arguments:**
+
+* `<ARGS>` — Arguments forwarded verbatim to the tool
 
 
 
