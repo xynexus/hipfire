@@ -59,6 +59,52 @@ measured at ~52% recoverable. W4 (the deployed tier) has no number.
 3. Then decide whether light QAT (LoRA only) is enough for W4 or whether the
    base weights need to move.
 
+### Stage A2 — QAT the Opus **W4A4** path
+
+The tier sweep above is **weight-only**: `oqplus_quant` bakes W4 weight error and
+says so, on the grounds that A8 adds ~negligible KLD over A16 (oq8 W8A8 0.00156
+vs q8f16 W8A16 0.00101). That reasoning does **not** carry to A4 — the W×A
+precision matrix puts A4 at roughly **−3.5 dB**, where A8 ≈ A16. So W4A4 is a
+materially harder QAT target than W4A8 and deserves its own stage, not a flag.
+
+Everything needed already exists and has simply never been wired to the QAT loop:
+
+- `src/a4_quant.rs` — `a4_simquant(x, rows, feat)`, `GROUP = 256`, `snr_db(..)`.
+  The activation side of the `Oq4G256` W4A4 path. ⚠️ It uses an **absmax** scale,
+  deliberately, not the weights' clip-search: online per-token activation quant
+  cannot afford a clip search. Do not "improve" it into clip-search — that would
+  model a grid the runtime never deploys.
+  It models only the int4 round-trip; rotations (R1 residual / R3 KV / R4 down)
+  are applied to the activation **upstream**.
+- `src/learn_rotation.rs` — SpinQuant Phase 2: learned R1 by Cayley SGD on the
+  Stiefel manifold. Read its header before touching the objective: a plain STE on
+  `Q(XRᵀ)·Q(WRᵀ)ᵀ` has a near-zero gradient w.r.t. R, because the clean term is
+  rotation-invariant and STE zeroes the quant-noise derivative — so the loss
+  looks flat exactly where it is not. It minimises a per-element 4th-moment
+  (kurtosis) surrogate instead.
+- `src/kv_noise.rs` — the worked template for injecting a forward-only sim-noise
+  perturbation into a differentiable student.
+- Today `a4_quant` is used **only** by `examples/rotation_a4_snr_probe.rs` and
+  `examples/learned_r1_probe.rs`. Nothing connects it to `qat_opus_kvarn`.
+
+Steps:
+
+1. Add an activation-quant arm to `qat_opus_kvarn` — student activations through
+   `a4_simquant` with an STE so gradients survive — gated separately from the
+   weight tier (e.g. `HIPFIRE_QAT_ACT=a16|a8|a4`, default `a16` so Stage A1's
+   numbers do not move).
+2. Sweep **W4A16 / W4A8 / W4A4** with the same LoRA budget and report held-out
+   recovered share. The question is whether light QAT recovers the ~3.5 dB A4
+   costs, or whether A4 needs the base weights to move.
+3. Then add the rotation: A4 is what rotations exist *for* (they Gaussianize
+   activations whose measured kurtosis exceeds 200). Score fixed-FWHT vs learned
+   R1 under QAT.
+
+⚠️ **Learned rotations are PREFILL-ONLY.** A previously measured result: the
+learned M wins on prefill, while plain FWHT is best at decode. So a learned-R1
+QAT result does not automatically transfer to the decode path — state which
+phase any number belongs to.
+
 ### Known weakness worth fixing early
 
 The batches are **synthetic random token ids**
@@ -144,6 +190,30 @@ Two facts that shape the work:
 5. Train, export via the `dflash_convert` metadata shape, measure τ on the mix.
 
 ---
+
+## Housekeeping — add a disk-free watcher for `/home/sadara`
+
+**TODO, not yet built.** Add a watcher that keeps at least **20 GB** free on
+`/home/sadara` at all times.
+
+Why it matters here: both tracks write large artefacts (fake-quantized student
+checkpoints, captured 27B target features across five layers, drafter exports),
+and a long unattended download has been running for days. `/home` is a 3.6 T
+volume at 77% (833 G free as of 2026-08-28) so there is headroom today — this is
+about not discovering the limit mid-training-run.
+
+Shape it should take:
+
+- Threshold 20 GB free, on the `/home` mount (`/dev/nvme0n1p3`), not the repo dir.
+- Warn well before the floor, and make the failure *loud and early* rather than a
+  half-written artefact — a training run that dies at hour six on ENOSPC costs
+  far more than the check.
+- Prefer refusing to START a run that cannot fit its expected output over
+  aborting midway; that means the estimate lives next to whatever allocates.
+- Candidate homes: a preflight in the training examples, or a periodic check in
+  the daemon. Do **not** roll a new lock or sentinel-file mechanism for it —
+  `AGENTS.md` allows exactly one lock primitive (`hipfire-lock` `flock(2)`).
+- Nothing should silently delete anything; report and stop.
 
 ## Ground rules that apply to both
 
