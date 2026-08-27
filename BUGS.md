@@ -4,6 +4,34 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## Spec-decode output is not byte-identical to plain AR decode
+
+**Found 2026-08-27 on master, halo gfx1151. Qwen3.8-27B--oq4.25++ + dflash2.**
+
+Greedy spec decode must be lossless, and is not: `--ar-baseline` reproduces
+byte-for-byte, but every speculating config differs from it. The divergence
+point is B-dependent (char 697 at B=6, 401 at B=8), so it tracks cycle
+boundaries, not context length.
+
+- **Root cause: verify runs the BATCHED forward, AR runs the PER-TOKEN forward,
+  and the two are not numerically equivalent.** Documented and deliberately
+  accepted at `is_batchable_la` (`qwen35/mod.rs`): |delta logit| ~6e-2 vs ~4e-6
+  for pure reordering, 15% top-256 overlap, "anything that needs the two to
+  agree bit-for-bit must pin the path explicitly". Spec decode is exactly that.
+- **⚠️ `--kv-mode f32` looks IDENTICAL and that is an ARTIFACT** — f32 fails the
+  batched-verify predicate, so verify silently falls back to per-token. Tell by
+  the clock: f32 spec runs 6.79 tok/s vs AR's 15.56 (2.3x SLOWER), where kvarn8
+  runs 21.35 vs 12.40. This also retires the older "diverges even at the f32
+  oracle, therefore a verify bug" reading.
+- **Two plausible causes are REFUTED, do not re-derive them:** a KVarN block
+  sealed with later-rejected tokens (killed — `--kv-mode q8` diverges too, and
+  q8 has no block tiling); and per-tile q8 KV scales in batched attention
+  (killed — `kv_cache_write_q8_0_batched` scales per position per 32-elem block,
+  identical granularity to per-token).
+- Layer 0 already differs (1.29e-3, worst row = the last row of the 256-chunk),
+  so it is not accumulated drift, and the MoE gate reads 0.000e0.
+- Not a drafter problem: tau is measured against the verifier's own argmax.
+- Full evidence: `docs/bugs/2026-08-27-spec-decode-ar-divergence.md`.
 ## [RETRACTED — opt-in by design] HFQ requant and the K % 256 fallback
 
 **Retracted 2026-08-27, same day it was filed.** The fallback is not missing, it
