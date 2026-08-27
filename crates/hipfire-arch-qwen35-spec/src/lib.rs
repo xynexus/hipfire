@@ -213,7 +213,28 @@ impl Qwen35Tiny {
             experts: 10,
             experts_per_tok: 8,
             moe_inter: 512,
-            shared_inter: 128,
+            // The G256 constraint this preset exists to satisfy applies to the
+            // SHARED expert too, not just the routed ones. This was 128 —
+            // inherited from `moe_preset` and never raised alongside
+            // `moe_inter` — which made `shared_expert.down_proj` K=128, ragged
+            // for a 256-wide Opus group. The quantizer therefore kept it at
+            // Q8_0, and the MoE quant-family ladder refuses Q8_0, so the whole
+            // layer declined batched prefill:
+            //
+            //   moe_ffn_batched DECLINED (dtype unsupported on this arch)
+            //     [shared_gate_up=Oq4G256/true shared_down=Q8_0/false ...]
+            //   moe_prefill_quant_family ladder `_` arm [Q8_0 arch=gfx1103]
+            //
+            // i.e. the preset shaped to reach the indexed path was still being
+            // turned away, by its own shared expert.
+            //
+            // 256, not 512: one G256 group per row is all the constraint needs,
+            // and `indexed_moe_fixture_stays_tiny` budgets this fixture under
+            // 10M params. 512 costs 393k more and lands at 10,300,548 — the
+            // bound `13f022d4b` added on purpose when it shrank this fixture
+            // 20.7M -> 9.7M. Multi-group accumulation is already covered by the
+            // routed side, which is why `moe_inter` is 512.
+            shared_inter: 256,
             layers: 2,
             full_attn_interval: 2,
             ..Self::preset()
