@@ -178,10 +178,66 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     //
     // Keeping FP32 one flag away also keeps the oracle: losing the ability to
     // diff against it is how quantized state hid for months.
-    if hipfire_env::DN_STATE_FP16.flag() {
-        StateQuant::FP16
-    } else {
-        StateQuant::FP32
+    match dn_state_precedence(
+        hipfire_env::DN_STATE_FP16.is_set(),
+        hipfire_env::DN_STATE_FP16.flag(),
+        deltanet_state_precision(),
+    ) {
+        true => StateQuant::FP16,
+        false => StateQuant::FP32,
+    }
+}
+
+/// Resolve DeltaNet state precision: the debug env var wins when SET (either
+/// way, so `=0` still reaches the fp32 oracle), otherwise the config field.
+///
+/// Pure so the precedence is testable without touching process env or config.
+pub(crate) fn dn_state_precedence(env_set: bool, env_flag: bool, cfg: &str) -> bool {
+    if env_set {
+        return env_flag;
+    }
+    !cfg.eq_ignore_ascii_case("fp32")
+}
+
+/// Resolved `deltanet_state_precision`. Load-time mutability, so resolving once
+/// is correct; a bad value falls back to the fp16 default rather than failing a
+/// load, and says so.
+fn deltanet_state_precision() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let v = hipfire_config::load_config_bundle()
+            .config
+            .deltanet_state_precision;
+        if v.eq_ignore_ascii_case("fp16") || v.eq_ignore_ascii_case("fp32") {
+            v
+        } else {
+            eprintln!(
+                "deltanet_state_precision: unknown value {v:?} (want fp16|fp32) — using fp16"
+            );
+            "fp16".to_string()
+        }
+    })
+    .as_str()
+}
+
+#[cfg(test)]
+mod dn_precision_tests {
+    use super::dn_state_precedence;
+
+    #[test]
+    fn env_wins_when_set_in_either_direction() {
+        // `=0` must still reach the fp32 oracle even though the config says fp16.
+        assert!(!dn_state_precedence(true, false, "fp16"));
+        assert!(dn_state_precedence(true, true, "fp32"));
+    }
+
+    #[test]
+    fn config_decides_when_env_absent_and_default_is_fp16() {
+        assert!(dn_state_precedence(false, false, "fp16"));
+        assert!(!dn_state_precedence(false, false, "fp32"));
+        assert!(!dn_state_precedence(false, false, "FP32"));
+        // Anything unrecognised lands on the fp16 default rather than fp32.
+        assert!(dn_state_precedence(false, false, ""));
     }
 }
 
