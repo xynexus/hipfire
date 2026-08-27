@@ -5734,10 +5734,39 @@ impl VerifyScratch {
         let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
         let mut pbs = qwen35::PrefillBatchScratch::new(gpu, config, max_n)?;
         if dflash_checkpoint_rollback_from_env() {
-            // Up front, not on demand: the verify forward can run inside a
-            // captured graph and hipMalloc is not permitted under stream
-            // capture.
-            pbs.alloc_dn_s_snapshots(gpu, config)?;
+            // Snapshots follow the DeltaNet state precision, and for FP16 that
+            // means NOT ALLOCATING THEM AT ALL.
+            //
+            // Only the FP32 kernels take a `state_snapshots` pointer —
+            // `gated_delta_net_f16{,_routed_batch_seq,_tree}.hip` have no such
+            // parameter, so under FP16 nothing ever writes these slots. The
+            // restore already refuses to read them (it gates on
+            // `dn_snapshots_written`, which only the FP32 arm sets), so the
+            // buffers were correct-but-dead: ~768 MB of F32 on Qwen3.8-27B
+            // (48 DeltaNet layers x 16 slots x 1 MB) allocated and never
+            // touched. Allocating half as much f16 would not help — the f16
+            // kernels cannot fill it either.
+            //
+            // Say so rather than silently skipping: `deltanet_state_precision`
+            // defaults to fp16 as of 2026-08-27, so anyone opting into
+            // checkpoint rollback on the default now gets a flag that does
+            // nothing, and the reason has to be findable.
+            match qwen35::default_state_quant(config) {
+                qwen35::StateQuant::FP32 => {
+                    // Up front, not on demand: the verify forward can run inside
+                    // a captured graph and hipMalloc is not permitted under
+                    // stream capture.
+                    pbs.alloc_dn_s_snapshots(gpu, config)?;
+                }
+                other => {
+                    eprintln!(
+                        "DFlash checkpoint rollback: DISABLED — it needs FP32 DeltaNet state \
+                         and this session resolved {other:?}. Set deltanet_state_precision=fp32 \
+                         (or HIPFIRE_DN_STATE_FP16=0) to use it. Skipping the snapshot \
+                         allocation the FP16 kernels cannot fill."
+                    );
+                }
+            }
         }
         s.prefill_batch = Some(pbs);
         Ok(s)
