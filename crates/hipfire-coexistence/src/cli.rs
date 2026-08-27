@@ -487,16 +487,23 @@ fn induct_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         dry_run: bag.has("dry-run"),
         hipfire: bag
             .get("hipfire")
-            .unwrap_or("target/release/hipfire")
-            .to_string(),
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_else(|| hipfire_coexistence::tool_argv(&[], "target/release/hipfire")),
         quantizer: bag
             .get("quantizer")
-            .unwrap_or("target/release/hipfire-quantize")
-            .to_string(),
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_else(|| {
+                hipfire_coexistence::tool_argv(&["quantize"], "target/release/hipfire-quantize")
+            }),
         dflash_converter: bag
             .get("dflash-converter")
-            .unwrap_or("target/release/dflash_convert")
-            .to_string(),
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_else(|| {
+                hipfire_coexistence::tool_argv(
+                    &["convert", "dflash"],
+                    "target/release/dflash_convert",
+                )
+            }),
         triattn_bin: bag
             .get("triattn-bin")
             .unwrap_or("target/release/examples/triattn_validate")
@@ -550,12 +557,14 @@ fn two_pass_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         quant_args,
         quantizer: bag
             .get("quantizer")
-            .unwrap_or("target/release/hipfire-quantize")
-            .to_string(),
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_else(|| {
+                hipfire_coexistence::tool_argv(&["quantize"], "target/release/hipfire-quantize")
+            }),
         hipfire: bag
             .get("hipfire")
-            .unwrap_or("target/release/hipfire")
-            .to_string(),
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_else(|| hipfire_coexistence::tool_argv(&[], "target/release/hipfire")),
         skip_calib: bag.has("skip-calib"),
         dry_run: bag.has("dry-run"),
     };

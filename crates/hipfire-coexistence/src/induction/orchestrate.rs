@@ -228,9 +228,9 @@ pub struct InductConfig {
     pub force: bool,
     pub dry_run: bool,
     // Tool binaries.
-    pub hipfire: String,
-    pub quantizer: String,
-    pub dflash_converter: String,
+    pub hipfire: Vec<String>,
+    pub quantizer: Vec<String>,
+    pub dflash_converter: Vec<String>,
     pub triattn_bin: String,
 }
 
@@ -488,7 +488,7 @@ fn run_stage(
         "dflash" => {
             let draft = super::preflight::resolve_snapshot(&cfg.dflash_source)?;
             for (fmt, output) in &layout.dflash {
-                let mut command = vec![cfg.dflash_converter.clone()];
+                let mut command = cfg.dflash_converter.clone();
                 command.extend(dflash_format_args(fmt)?);
                 command.extend([
                     "--input".into(),
@@ -532,8 +532,8 @@ fn run_stage(
             Ok(())
         }
         "triattn" => {
-            let command = vec![
-                cfg.hipfire.clone(),
+            let mut command = cfg.hipfire.clone();
+            command.extend([
                 "lock".into(),
                 "run".into(),
                 "induct-triattn".into(),
@@ -549,7 +549,7 @@ fn run_stage(
                 "--chunk-len".into(),
                 cfg.triattn_chunk_len.to_string(),
                 "--gpu-calib".into(),
-            ];
+            ]);
             run_subprocess(&command)
         }
         other => Err(format!("unknown induction stage {other}").into()),

@@ -46,9 +46,9 @@ pub struct TwoPassConfig {
     pub expert_coverage_policy: String,
     pub quant_args: Vec<String>,
     /// `hipfire-quantize` binary (pass two).
-    pub quantizer: String,
+    pub quantizer: Vec<String>,
     /// `hipfire` CLI, used for the scoped GPU lock around pass two.
-    pub hipfire: String,
+    pub hipfire: Vec<String>,
     pub skip_calib: bool,
     pub dry_run: bool,
 }
@@ -124,13 +124,15 @@ impl TwoPassConfig {
     /// hipfire-quantize --input <model> --output <out> --format <fmt> --hessian
     /// <calib> <quant_args...>`.
     fn quant_command(&self) -> Vec<String> {
-        let mut cmd = vec![
-            self.hipfire.clone(),
+        let mut cmd = self.hipfire.clone();
+        cmd.extend([
             "lock".into(),
             "run".into(),
             "two-pass-quantization".into(),
             "--".into(),
-            self.quantizer.clone(),
+        ]);
+        cmd.extend(self.quantizer.clone());
+        cmd.extend([
             "--input".into(),
             self.model.to_string_lossy().into_owned(),
             "--output".into(),
@@ -139,7 +141,7 @@ impl TwoPassConfig {
             self.quant_format.clone(),
             "--hessian".into(),
             self.calib.to_string_lossy().into_owned(),
-        ];
+        ]);
         cmd.extend(self.quant_args.iter().cloned());
         cmd
     }
