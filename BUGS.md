@@ -4,7 +4,24 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## HFQ requantization ignores the K %% 256 fallback, producing artifacts that panic at load
+## [RETRACTED — opt-in by design] HFQ requant and the K % 256 fallback
+
+**Retracted 2026-08-27, same day it was filed.** The fallback is not missing, it
+is opt-in. `HIPFIRE_OQ_RAGGED_Q8=1` keeps ragged-K tensors at Q8, and the code
+says so plainly: *"Default stays padded-Opus (NPU loader), unchanged … padded
+Opus ragged tensors only load on the NPU-native path."* Setting it produced a
+loadable artifact (rc 101 -> no panic). I filed this without setting the
+documented flag.
+
+**The narrower residual issue is real:** the GPU load path `panic!`s
+(`oq4_arch.rs:53`, "OQ4G256 requires K % 256 == 0") on an artifact that is
+legitimately NPU-targeted, rather than erroring with what to do about it. Same
+class as the MoE prefill panics fixed in #368/#369 — a `panic!` where a
+descriptive error belongs, taking the process down with it.
+
+Original entry, wrong as written, follows.
+
+### HFQ requantization ignores the K % 256 fallback (RETRACTED)
 
 **Found 2026-08-27, master `8b0ecc253`. Reproducible.**
 
