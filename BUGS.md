@@ -4,6 +4,35 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## Batched MoE prefill PANICS on an `Oq4G256` MoE artifact (daemon dies)
+
+**Found 2026-08-27 on master `556249d8c`, nix1 gfx1103. Reproducible, rc=101.**
+
+`Qwen3.6-35B-A3B--oq4.hfq` loaded with `kv_cache: kvarn`, then any prefill long
+enough to admit batching:
+
+```
+thread 'main' panicked at crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1282:30:
+prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype Oq4G256
+  — admit predicate should have rejected this layer
+```
+
+The panic message is correct about the cause: the path-2 grouped arm handles
+`F16 | BF16 | ParoQ4G128` only, and the admit predicate that gates it does not
+check the routed experts' `gate_up` dtype for `Oq4G256`.
+
+- **Not KLD-specific.** First hit via `kld_eval build_ref`, but a plain
+  `generate` with a ~2.4 KB prompt panics identically. KLD merely triggers it
+  every time because it always prefills `n_ctx` tokens.
+- **Why it was not seen earlier:** with an f32 KV the batched path is *declined*
+  (`forward_prefill_batch: -> per-token forward_scratch loop (batched prefill
+  declined) [kv_f32=true]`), so the same model benches fine at pp512. Selecting
+  `kvarn` — the non-deprecated family — admits batching and reaches the panic.
+- **Severity: it kills the daemon**, so every co-resident model dies with it, not
+  just the offending request. A dtype the fast path cannot handle should decline
+  to the fallback, not `panic!`.
+- Repro + logs: `docs/bugs/2026-08-27-oq4-moe-batched-prefill-panic.md`.
+
 ## [NOT A BUG — entry was wrong, corrected 2026-08-21] "GREEDY decode is not reproducible across requests"
 
 **Retracted. Greedy decode is reproducible; the original entry mistook designed
