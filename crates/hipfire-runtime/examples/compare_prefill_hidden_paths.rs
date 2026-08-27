@@ -75,7 +75,14 @@ fn main() {
         );
     }
 
-    let mut hfq = HfqFile::open(std::path::Path::new(&model)).expect("open model");
+    // Accept an HF safetensors snapshot directory as well as a .hfq, so this
+    // can be pointed at the same weights a transformers oracle loads.
+    let model_path = std::path::Path::new(&model);
+    let mut hfq = if model_path.is_dir() {
+        HfqFile::from_safetensors(model_path).expect("open safetensors dir")
+    } else {
+        HfqFile::open(model_path).expect("open model")
+    };
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
@@ -203,6 +210,34 @@ fn main() {
     };
 
     let dim = config.dim;
+
+    // Oracle export: HIPFIRE_ORACLE_DUMP=<dir> writes each arm's per-layer
+    // hidden states as raw f32 so an external reference (HF transformers on the
+    // same weights and the same token ids) can say WHICH arm is closer. The
+    // internal fp32-KV reference above only fixes the KV axis; it cannot
+    // arbitrate the batched-vs-per-token forward, because both arms are ours.
+    if let Ok(dir) = std::env::var("HIPFIRE_ORACLE_DUMP") {
+        let d = std::path::Path::new(&dir);
+        std::fs::create_dir_all(d).expect("oracle dump dir");
+        for (tag, arm) in [("batched", &a), ("pertoken", &b)] {
+            for (l, x) in arm.iter().enumerate() {
+                let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(d.join(format!("{tag}.L{l}.f32")), &bytes).expect("write dump");
+            }
+        }
+        std::fs::write(
+            d.join("meta.json"),
+            format!(
+                "{{\"dim\":{},\"n\":{},\"layers\":{},\"token_rule\":\"1000+i*7\"}}",
+                dim,
+                n,
+                a.len()
+            ),
+        )
+        .expect("write meta");
+        eprintln!("oracle dump: {} layers x2 arms -> {}", a.len(), dir);
+    }
+
     println!("\n  layer   worst|rel|   at row   nonfinite(batched)");
     let mut first_bad = None;
     let mut worst_all = 0f32;

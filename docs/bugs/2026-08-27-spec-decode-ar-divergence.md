@@ -91,12 +91,72 @@ per-token path reads those same neighbours back through the quantized cache.
 The MoE grouped-vs-indexed gate in the same tool reports `worst |rel| 0.000e0`,
 so the FFN is not involved.
 
+## Transformers oracle: neither path is defective — PIN the path
+
+Run 2026-08-27. The internal fp32-KV reference can only fix the KV axis; it
+cannot arbitrate batched-vs-per-token, because both arms are ours. An external
+fp32 HF oracle can.
+
+Done on **Qwen3.5-0.8B bf16**, not the 27B: the 27B is `oq4.25++`, and comparing
+a quantized model against a bf16 reference mixes quantization error into the very
+quantity being measured. The divergence reproduces in plain bf16 anyway.
+`compare_prefill_hidden_paths` now accepts an HF snapshot directory
+(`HfqFile::from_safetensors`), so hipfire and the oracle load the *same weights*,
+and `HIPFIRE_ORACLE_DUMP=<dir>` exports each arm's per-layer hidden states.
+Tokens are the tool's own `1000 + i*7`, n=512.
+
+Alignment was verified, not assumed: hipfire's layer 0 matches HF `hidden_states[1]`
+at cos 0.999996, against 0.17 for `hidden_states[0]`.
+
+    layer   cos(batched,HF)   cos(pertoken,HF)   delta
+        0     0.999996417       0.999996849      -4.3e-07
+        7     0.999979373       0.999980380      -1.0e-06
+       22     0.999989880       0.999990868      -9.9e-07
+
+    layers where each arm is closer to the oracle: pertoken 23, batched 1
+
+**Both arms are within ~1e-5 of the fp32 reference.** Per-token is consistently
+closer, but by ~1e-6 in cosine — a reproducible sign with a negligible magnitude.
+There is no defective batched kernel to hunt here: this is benign numerics.
+
+So the fix is to **pin the path** so verify and AR provably take the same one,
+NOT to rewrite the batched GEMM/attention for bit-parity.
+
+Two notes on reading that table:
+- Layer 23 reads 0.935 for BOTH arms equally. That is a hipfire-vs-HF export
+  convention at the last layer (HF's final `hidden_states` entry has the final
+  norm applied), not a path difference, and it cancels in the comparison.
+- ⚠️ The first version of this measurement used a 2-D cosine that silently
+  returned values >1 (5.18 for two arrays that agree to 1e-6). Those numbers were
+  void. The metric now flattens to 1-D and asserts `cos <= 1`, so a broken metric
+  cannot quietly emit a table again.
+
+## Still open: the compact 27B batched arm is a separate outlier
+
+Faithfulness to each model's own fp32-KV reference (lower is better):
+
+| model | batched | per-token |
+|---|---|---|
+| Qwen3.8-27B `oq4.25++` (compact Opus) | 4.760e-2 | 1.254e-2 (**3.8x worse**) |
+| qwen3.5-2b bf16 | 2.057e-2 | 1.580e-2 (1.3x) |
+| Qwen3.5-0.8B bf16 | 1.453e-2 | 1.471e-2 (tied) |
+
+On bf16 the two arms are comparably faithful; on the compact-Opus 27B the batched
+arm is markedly worse. The compact batched arms were only admitted 2026-08-25.
+That gap is NOT explained by the oracle result above and is worth its own look —
+but it is a faithfulness question, separate from the byte-identity one.
+
+⚠️ Also retired: a recorded claim that the qwen3.5-2b bf16 control "diverges from
+layer 0 at |rel| 0.93". Re-measured here at **1.85e-3**, peak 1.36e-2. The 0.93
+figure was the documented dump-diffing trap (`.batched.L{i}` vs `.pertoken.L{i}`
+are different call sites).
+
 ## What a fix requires
 
-Numerical parity between the batched and per-token forwards, or an explicit
-pin so verify and AR provably take the same path. Not a one-line change, and not
-a KV-tier change: both KV hypotheses above are dead, layer 0 is already
-divergent, and the accumulators are f32 on both paths.
+**Pin the path.** The oracle above settles the open question: both forwards are
+~1e-5 faithful to fp32 HF, so there is no defective kernel to fix, and chasing
+bit-parity in the batched GEMM/attention would be work aimed at a ~1e-6 effect.
+Verify and AR must simply be made to take the same path.
 
 Note the scope is wider than spec decode — the same caveat means batched prefill
 and per-token prefill disagree for *every* dtype, bf16 included.
