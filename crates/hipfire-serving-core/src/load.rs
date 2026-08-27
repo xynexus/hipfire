@@ -2863,11 +2863,16 @@ pub fn load_model(
             // pass the actual allocation size so the draft ring matches.
             let state = match source {
                 ResolvedComponentSource::Explicit(dp) => {
-                    load_dflash_state(dp, physical_cap, &config, &dn, gpu)?
+                    load_dflash_state(dp, physical_cap, &config, &dn, weights.output.k, gpu)?
                 }
-                ResolvedComponentSource::Sibling(dp) => {
-                    load_dflash_state(&dp.to_string_lossy(), physical_cap, &config, &dn, gpu)?
-                }
+                ResolvedComponentSource::Sibling(dp) => load_dflash_state(
+                    &dp.to_string_lossy(),
+                    physical_cap,
+                    &config,
+                    &dn,
+                    weights.output.k,
+                    gpu,
+                )?,
                 ResolvedComponentSource::Embedded => {
                     let manifest = compose_manifest
                         .as_ref()
@@ -2875,7 +2880,14 @@ pub fn load_model(
                     let view = file_component_view(&hfq, manifest, "dflash")
                         .map_err(|error| format!("embedded DFLASH view: {error}"))?
                         .ok_or("embedded DFLASH role disappeared from manifest")?;
-                    load_dflash_state_source(&view, physical_cap, &config, &dn, gpu)?
+                    load_dflash_state_source(
+                        &view,
+                        physical_cap,
+                        &config,
+                        &dn,
+                        weights.output.k,
+                        gpu,
+                    )?
                 }
             };
             tracing::info!(
@@ -4519,10 +4531,11 @@ pub fn load_dflash_state(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
+    lm_head_k: usize,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
-    load_dflash_state_source(&hfq, ctx_capacity, target_config, target_dn, gpu)
+    load_dflash_state_source(&hfq, ctx_capacity, target_config, target_dn, lm_head_k, gpu)
 }
 
 fn load_dflash_state_source(
@@ -4530,6 +4543,11 @@ fn load_dflash_state_source(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
+    // The target lm_head's inner dimension (`weights.output.k`). A compact
+    // Opus head can pad this past `target_config.dim`; sizing VerifyScratch
+    // from `dim` then trips the "verify_scratch undersized for compact Opus
+    // lm_head" assert in speculative.rs.
+    lm_head_k: usize,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<DflashState, String> {
     let draft_config = DflashConfig::from_source(source).ok_or("parse DflashConfig")?;
@@ -4553,15 +4571,39 @@ fn load_dflash_state_source(
     // captured during each target forward. Sized so the whole context plus
     // one block fits without aliasing. Cheap (< 100 MB) next to the draft
     // weights themselves.
-    let hidden_rb = HiddenStateRingBuffer::new(
-        gpu,
-        target_config.n_layers,
-        draft_config.num_extract(),
-        draft_config.hidden,
-        ctx_capacity + draft_config.block_size,
-        hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
-    )
+    //
+    // Use the layer ids the DRAFTER DECLARES, not a re-derived spread. They
+    // are what it was trained against; the derived spread only coincides with
+    // the declared one for the shipped 40-layer drafter, and a mismatch feeds
+    // the drafter hidden states from layers it never saw (measured on
+    // Qwen3.8-27B/gfx1103 as tau 5.9 -> 2.24; see
+    // docs/plans/2026-08-27-dflash-demo-merge-scope.md). Mirrors
+    // dflash_spec_demo and the LFM2/dspark loaders, which already use the
+    // declared ids.
+    let hidden_rb = if draft_config.target_layer_ids.is_empty() {
+        HiddenStateRingBuffer::new(
+            gpu,
+            target_config.n_layers,
+            draft_config.num_extract(),
+            draft_config.hidden,
+            ctx_capacity + draft_config.block_size,
+            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
+        )
+    } else {
+        HiddenStateRingBuffer::new_for_layers(
+            gpu,
+            target_config.n_layers,
+            draft_config.target_layer_ids.clone(),
+            draft_config.hidden,
+            ctx_capacity + draft_config.block_size,
+            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
+        )
+    }
     .map_err(|e| format!("hidden_rb: {e}"))?;
+    debug_assert!(
+        draft_config.target_layer_ids.is_empty()
+            || hidden_rb.extract_layers == draft_config.target_layer_ids
+    );
 
     let target_snap =
         DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
@@ -4618,7 +4660,7 @@ fn load_dflash_state_source(
         scratch_max_n,
         target_config.dim,
         target_config.vocab_size,
-        target_config.dim,
+        lm_head_k,
         target_config,
     )
     .map_err(|e| format!("verify_scratch: {e}"))?;
