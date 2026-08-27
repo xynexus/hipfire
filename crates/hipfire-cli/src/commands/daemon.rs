@@ -792,3 +792,43 @@ mod tests {
         assert_eq!(health_url(&loaded), "http://[::1]:11435/health");
     }
 }
+
+#[derive(Debug, Args)]
+#[command(
+    // The daemon parses its own argv (`--listen`, `--precompile`, `--version`,
+    // `--help`), so clap must hand flags through untouched rather than claim
+    // them. Same passthrough shape as `hipfire eval`; see commands/forward.rs.
+    disable_help_flag = true,
+    trailing_var_arg = true,
+    after_help = "Examples:\n  hipfire daemon\n  hipfire daemon --listen\n  hipfire daemon --listen /run/hipfire.sock\n  hipfire daemon --precompile\n"
+)]
+pub struct DaemonRunArgs {
+    /// Arguments forwarded verbatim to the daemon.
+    #[arg(allow_hyphen_values = true)]
+    pub args: Vec<std::ffi::OsString>,
+}
+
+/// Run the inference daemon in this process (`hipfire daemon`).
+///
+/// The forwarded `args` are deliberately unused: `hipfire_daemon::main` reads
+/// `std::env::args()` itself, and the extra leading `daemon` token is invisible
+/// to the way it scans for flags. Capturing them here is what stops clap from
+/// rejecting `--listen` before the daemon ever sees it.
+pub fn run_worker(_args: DaemonRunArgs) -> Result<()> {
+    // The daemon owns a `hipfire_rdna::Gpu`, which is neither Send nor Sync —
+    // it must be created, used, and dropped on one thread. Our caller is
+    // #[tokio::main], so give the executor a dedicated OS thread instead of
+    // blocking a runtime worker for the process lifetime. `spawn_blocking` is
+    // NOT an alternative: its pool does not pin work to a thread.
+    //
+    // The larger stack matches the main thread's 8 MiB default (std::thread
+    // gives 2 MiB); the executor holds DaemonState by value.
+    std::thread::Builder::new()
+        .name("hipfire-daemon".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(hipfire_daemon::main)
+        .context("spawn daemon executor thread")?
+        .join()
+        .map_err(|_| anyhow!("daemon executor thread panicked"))?;
+    Ok(())
+}
