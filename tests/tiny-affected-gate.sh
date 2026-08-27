@@ -134,6 +134,10 @@ select_deltanet() {
     RUN_DELTANET=1
 }
 
+select_moe_mixed() {
+    RUN_MOEMIXED=1
+}
+
 select_spec() {
     RUN_SPEC=1
 }
@@ -154,6 +158,7 @@ RUN_STATE=0
 RUN_SPEC=0
 RUN_PREFILL=0
 RUN_DELTANET=0
+RUN_MOEMIXED=0
 PATHS="$(changed_paths)" || exit 2
 
 if [ -z "$PATHS" ]; then
@@ -186,6 +191,19 @@ while IFS= read -r path; do
         crates/hipfire-model/*)
             add_all_supported
             select_all_tiny
+            ;;
+
+        # Mixed-precision MoE: routed experts where some are OqPlusCompact and
+        # some Oq8G256 in the SAME layer, dispatched through the per-expert
+        # stride table. Every tiny fixture is uniform and the only production
+        # model that mixes is the 122B (69 GB), so this path had NO small-scale
+        # cover until 2026-08-27.
+        crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs|\
+        crates/hipfire-arch-qwen35/src/qwen35/layout.rs|\
+        kernels/src/gemv_oq_compact_moe*.hip|\
+        kernels/src/gemm_oq_compact_moe*.hip|\
+        crates/hipfire-quantize/src/mixed_precision.rs)
+            select_moe_mixed
             ;;
 
         # Gated-DeltaNet kernels and their dispatch. The f32 trio (linear /
@@ -297,6 +315,23 @@ done <<<"$PATHS"
 
 FAMILIES="$(printf '%s\n' $FAMILIES | sort -u | paste -sd, -)"
 
+# A path can select a FAMILY-LESS gate (tiny-deltanet, tiny-moe-mixed): those
+# build their own fixtures and take no family list. Without this they fell into
+# the "no tiny coverage" early-exit below and silently never ran, which is the
+# same class of hole they were added to close.
+if [ -z "$FAMILIES" ] && { [ "$RUN_DELTANET" -eq 1 ] || [ "$RUN_MOEMIXED" -eq 1 ]; }; then
+    echo "tiny-affected-gate: selected gates: deltanet=$RUN_DELTANET moe_mixed=$RUN_MOEMIXED (no family gates)"
+    if [ "$DRY_RUN" -eq 1 ]; then exit 0; fi
+    status=0
+    if [ "$RUN_DELTANET" -eq 1 ]; then
+        ./tests/tiny-deltanet-gate.sh || status=1
+    fi
+    if [ "$RUN_MOEMIXED" -eq 1 ]; then
+        ./tests/tiny-moe-mixed-gate.sh || status=1
+    fi
+    exit "$status"
+fi
+
 if [ -z "$FAMILIES" ]; then
     if [ "$UNCOVERED" -eq 1 ]; then
         echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
@@ -315,7 +350,7 @@ if [ -z "$FAMILIES" ]; then
 fi
 
 echo "tiny-affected-gate: selected families: $FAMILIES"
-echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC prefill=$RUN_PREFILL deltanet=$RUN_DELTANET"
+echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC prefill=$RUN_PREFILL deltanet=$RUN_DELTANET moe_mixed=$RUN_MOEMIXED"
 if [ "$UNCOVERED" -eq 1 ]; then
     echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
     echo "  $UNCOVERED_REASONS"
@@ -374,6 +409,11 @@ fi
 if [ "$RUN_DELTANET" -eq 1 ]; then
     ./tests/tiny-deltanet-gate.sh
     classify_gate tiny-deltanet $?
+fi
+
+if [ "$RUN_MOEMIXED" -eq 1 ]; then
+    ./tests/tiny-moe-mixed-gate.sh
+    classify_gate tiny-moe-mixed $?
 fi
 if [ "$RUN_SPEC" -eq 1 ]; then
     ./tests/tiny-spec-gate.sh

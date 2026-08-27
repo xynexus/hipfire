@@ -232,3 +232,72 @@ now supports:
 
 The fixture is the asset regardless: mixed layers now have a reproducer that
 runs in seconds, and it can be pointed at any future mixed-path change.
+
+# Landed 2026-08-27: the guard, the gate, and `.hfa` confirmed
+
+## 1. `k % 256` guard on the reproduced arm
+
+`HfqInputFormat::OqPlusCompact` (qt=36) is a 256-element group and the runtime
+rotates it 256-wide, but the group is chosen RUN-WIDE (`opus_group`), never per
+tensor. So a group-256 run reaches that arm for a K=128 tensor and emits an
+artifact that **cannot be loaded at all**:
+
+    256-wide FWHT rotation requires K % 256 == 0 and K > 0 (got K=128)
+
+Now falls back to Q8, matching `Oq2`/`Oq3`/`Oq6`/`Mq3`/`Mq6` and the safetensors
+path's `should_quantize(name) || k % 256 != 0`. Verified: the tiny mixed build
+that previously hard-errored now scores mean_kld 0.1948.
+
+NOT changed: the `Oq4` and `Oq8|Oq8Plus` arms also lack the guard, and their
+comments claim ragged K is handled by zero-padding a final 256-wide group — a
+claim the runtime check contradicts. I could not reproduce a failure there, so
+they are left alone and recorded here rather than changed on suspicion.
+
+Better fix available for someone with more time: a K%128==0 tensor could take
+`OqPlusCompactG128` (qt 52) and keep ~4 b/w instead of dropping to Q8. That
+needs the group to become a per-tensor choice; today it arrives run-wide.
+
+## 2. `tests/tiny-moe-mixed-gate.sh`
+
+Builds the mixed fixture and asserts (a) it really is mixed — BOTH
+`OqPlusCompact` and `Oq8G256` among routed experts — and (b) it loads and its
+KLD tracks the uniform build. Wired into `tiny-affected-gate.sh` on
+`moe_decode.rs`, `layout.rs`, `gemv/gemm_oq_compact_moe*.hip` and
+`mixed_precision.rs`.
+
+⚠️ **Found a hole in the affected-gate while wiring it, which also affected the
+DeltaNet gate added yesterday.** Both are FAMILY-LESS: they build their own
+fixtures and take no family list. A path that selected only such a gate left
+`FAMILIES` empty and hit the "no tiny-model-relevant changed paths" early-exit —
+so `kernels/src/gated_delta_net.hip` on its own selected the deltanet gate and
+then silently never ran it. Exactly the class of hole these gates exist to
+close. Both now run:
+
+    moe_decode.rs                     -> deltanet=0 moe_mixed=1
+    gemv_oq_compact_moe_indexed.hip   -> deltanet=0 moe_mixed=1
+    gated_delta_net.hip               -> deltanet=1 moe_mixed=0
+
+## 3. `.hfa` input IS supported
+
+Confirmed on the 122B's own 180 GB archive:
+
+    Architecture: qwen3_5_moe (id=6)
+      MoE detected — will split 3D expert tensors per-expert before quantization.
+    HFA input: 39 shard(s), read in place (no restore)
+
+`hfa::is_hfa` detects it, `HfaArchive::open` consumes it IN PLACE (no 244 GB
+restore), and each shard's safetensors header is stored verbatim so the tensor
+table, dtypes and `data_offsets` are identical to a restored file's.
+(`/srv/hipfire/models/qwen3-moe.hfa` fails, but on `model_type qwen3_moe` not
+being registered — an arch-registration gap, not an archive one.)
+
+⚠️ **But `--mixed-bpw` is IGNORED on the .hfa/safetensors path.** It is consumed
+only by `run_hfq_source_pipeline`, i.e. only for `.hfq` input — silently, with
+no warning. Demonstrated on the tiny fixture: `--input <safetensors dir>
+--mixed-bpw 4.25` produces uniform `Oq4G256` and never prints the
+"mixed-bpw ... promoted" line.
+
+That matters for the 122B: a mixed-precision artifact CANNOT be built directly
+from the archive. It has to go source -> .hfq -> re-quantize, which is exactly
+the path that over-selects tensors (§1). Making `--mixed-bpw` either work on the
+source path or fail loudly there is the obvious follow-up.
