@@ -2282,3 +2282,102 @@ Caveat that applies to all of it, per §3: these are seeded random-init tiny
 fixtures with no outlier structure, so an AWQ/Hessian format can move opposite
 to the real model here. The finding is "the gate's numbers moved and nobody
 noticed", not yet "oq4.25++ regressed on real weights".
+
+## [High] Qwen3.5-122B-A10B serves INCOHERENT text — mixed-precision path exonerated, cause still open
+
+Found 2026-08-26. `122b-lmbf16.hfq` and `Qwen3.5-122B-A10B--oq4.25++fix.hfq` both
+emit BYTE-IDENTICAL garbage ("`Here's a thinking'skeyider'`… `焄`"). Loading and
+memory are fine — 68.99 GB resident against a 64.56 GiB payload, so the old 3.5x
+GTT blowup is gone. Consistent with `a51be9b78` ("the 122B itself is NOT fixed").
+
+Ruled out, each by measurement rather than argument:
+
+- **lm_head.** The two artifacts differ ONLY there (2 `Bf16Lut3` vs 1) and the
+  garbage is byte-identical, so the earlier lm_head→BF16 fix is not the current
+  cause.
+- **OQ8 router path.** `HIPFIRE_OQ8_ROUTER=1` changes nothing.
+- **Per-expert missing AWQ.** 644 gate_up / 2018 down experts carry no
+  `awq_scale`; `rotate_x_mq_awq_indexed_batched.hip:64` resolves a null pointer
+  per expert and `:74` skips the rotation. Correct.
+- **Mixed compact+Oq8 expert layers** (37 of 48). This was the leading suspect and
+  it is WRONG: `tests/tiny-moe-mixed-gate.sh` builds the same layout at 13 MB and
+  mixing moves KLD by <1% (0.1960 uniform-experts → 0.1946 mixed).
+- **Compact residency / unrotated data.** Already exonerated by `f3d3a5efd`
+  (106 real-weight checks) and `ce7a3d25f` (626 tensors at cosine 1.000000).
+
+Control: `Qwen3.6-35B-A3B--oq4.25++`, same arch and kernels, is coherent at
+61.5 tok/s. It differs from the 122B in expert precision, depth, E (256 vs 128)
+and dim — the bisect only ever isolated the first, and that one is now cleared.
+
+Remaining candidates: scale/real-weight effects in the stride-table arm
+(`gemv_oq_compact_moe_indexed.hip:76`, `n_ov` bounds and 256-expert pointer
+tables are untested at production shapes), or something outside the MoE FFN.
+Detail in `docs/plans/2026-08-26-122b-perf-findings.md`.
+
+### Side finding, separate bug: 122B prefill is capped at 29 tok/s
+
+Flat at 29.0–29.1 tok/s for n=61, n=92 AND n=658 — flat in n means nothing
+amortises (~34 ms/token, ~8.6 GB read against ~5.3 GB of active weights), against
+69.6 for the 35B-A3B and 306 for the 27B.
+
+Two coupled causes, and fixing either alone is a no-op — verified experimentally:
+
+1. `classify_routed_expert_dtypes` (`qwen35/mod.rs:1651`) has no variant for a
+   two-QUANT mix, so compact+Oq8 is `Invalid` and `routed_supported` maps
+   `Invalid => false` (`:2106`) — while `routed_oq_mixed_compact` (`:1711`) is
+   computed alongside, is TRUE, and is never consulted by the admission.
+2. `gemm_oq_compact_moe_grouped_wmma.hip:53` takes `block_stride` as a
+   LAUNCH-WIDE scalar. The decode GEMV `oqc_moe_row_dot`
+   (`gemv_oq_compact_moe_indexed.hip:76`) takes a PER-EXPERT stride table with
+   `block_stride == 0` as the Oq8 sentinel. So a mixed layer is dispatchable at
+   decode and not at prefill.
+
+Patching only (1) gives `[pbs-gate] verdict=true` and prefill 29.0 → 29.0.
+rocprofv3 confirms why: every dominant kernel is a GEMV at one call per token per
+layer (31,680 = 658 × 48).
+
+⚠️ Do this AFTER coherence. A faster incoherent model is not progress.
+
+## [Medium] `--mixed-bpw` is SILENTLY IGNORED unless the input is an `.hfq`
+
+Found 2026-08-27. `--mixed-bpw <target>` is the per-tensor Oq4→Oq8 promoter
+(`hipfire-quantize/src/main.rs:8472`), but it is threaded only into
+`run_hfq_source_pipeline` (`:5817`, consumed at `:5886`) — the `.hfq` → `.hfq`
+path. A safetensors directory or an `.hfa` archive goes through the source
+pipeline, which never reads it. No warning, no error, no diagnostic line.
+
+Reproduce in seconds (full recipe, including the anchor and calib it needs, is
+in `tests/tiny-moe-mixed-gate.sh`):
+
+    hipfire-quantize --emit-fixture qwen3_5_moe_indexed --out $W/src --seed 42
+    hipfire-quantize --input $W/src --output $W/anchor.fp16.hfq --format fp16 --arch-id 6
+    tiny_quant_probe collect --arch qwen3_5_moe_indexed --model $W/anchor.fp16.hfq \
+        --out $W/calib.hfq --len 128
+
+    # SOURCE input: promoter silent, 64 uniform Oq4G256 experts
+    hipfire-quantize --input $W/src --output $W/a.hfq --format oq4.25++ \
+        --arch-id 6 --hessian $W/calib.hfq --mixed-bpw 4.25
+
+    # HFQ input, otherwise identical: "mixed-bpw 4.5000: promoted 14 of 82
+    # tensors to oq8++", and the experts come out mixed
+    hipfire-quantize --input $W/anchor.fp16.hfq --output $W/b.hfq --format oq4.25++ \
+        --arch-id 6 --hessian $W/calib.hfq --mixed-bpw 4.5
+
+`.hfa` input itself is fine and worth stating plainly, since it is easy to
+assume otherwise: `hfa::is_hfa` (`main.rs:8821`) detects it and the archive is
+consumed IN PLACE with each shard's safetensors header verbatim — confirmed on
+the 122B's own 180 GB archive ("HFA input: 39 shard(s), read in place (no
+restore)", arch detected, MoE split). Only the promoter is missing there.
+
+Consequence: a mixed-precision artifact CANNOT be built directly from the source
+archive. It must go source → `.hfq` → re-quantize, and that path selects a
+different (larger) tensor set than the source path — it picked up
+`mlp.shared_expert.down_proj [256, 128]`, K=128, which the runtime then refuses
+outright ("256-wide FWHT rotation requires K % 256 == 0"). That specific arm is
+guarded as of `224acb1cb`; the `Oq4` and `Oq8|Oq8Plus` arms still lack the same
+guard and their comments claim ragged K is zero-padded, which the runtime check
+contradicts. No failure reproduced there yet.
+
+Fix: either thread `mixed_bpw_target` into the source pipeline, or reject
+`--mixed-bpw` loudly when the input is not an `.hfq`. The silent no-op is the
+worst of the three.
