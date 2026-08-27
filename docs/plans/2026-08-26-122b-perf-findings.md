@@ -157,3 +157,78 @@ Only once it reproduces small is it worth deciding between:
     rotated for the compact basis, and
   - the promoted Oq8 experts having been quantized in a basis the runtime does
     not reproduce (they carry NO awq_scale sidecar — exactly 644 of them).
+
+# The mixed fixture — built, and it EXONERATES the mixed path
+
+## Recipe (12 MB, seconds, no 69 GB load)
+
+`--mixed-bpw` is the per-tensor Oq4→Oq8 promoter, and it only runs in
+`run_hfq_source_pipeline` — i.e. only when the INPUT is an `.hfq`. Quantizing
+from a safetensors directory silently ignores it, which is why `oq4.25++` alone
+never produces a mixed artifact (that flag is within-tensor magnitude tiering:
+"3 sparse W8 overlays/group, bulk W4").
+
+    hipfire-quantize --emit-fixture qwen3_5_moe_indexed --out $W/src --seed 42
+    hipfire-quantize --input $W/src --output $W/anchor.fp16.hfq --format fp16 --arch-id 6
+    tiny_quant_probe collect --arch qwen3_5_moe_indexed --model $W/anchor.fp16.hfq \
+        --out $W/calib.hfq --len 128
+    hipfire-quantize --input $W/anchor.fp16.hfq --output $W/moe-mixed.hfq \
+        --format oq4.25++ --arch-id 6 --hessian $W/calib.hfq --mixed-bpw 4.5 \
+        --tensor-format '*shared_expert.down_proj*=f16'
+
+Yields the 122B's exact layout — `OqPlusCompact` + `Oq8G256`, **both** layers
+mixed (layer 0: 2 Oq8 / 14 compact; layer 1: 1 / 15).
+
+## Result: the mixed path is NOT the bug
+
+KLD vs the fp16 anchor, `tiny_quant_probe kld --len 128`:
+
+| artifact | promotion | experts | mean_kld |
+|---|---|---|---|
+| source -> oq4.25++ | none | 64 uniform compact | **0.0390** |
+| HFQ -> oq4.25++ | none | 64 uniform compact | 0.2017 |
+| HFQ -> oq4.25++ | 14 tensors, none an expert | 64 uniform compact | 0.1960 |
+| HFQ -> oq4.25++ | 14 tensors incl. experts | **3 Oq8 + 61 compact** | 0.1946 |
+| HFQ -> oq4.25++, SAME 68-tensor set as source | none | 64 uniform compact | **0.0369** |
+
+Read the last two rows together. Mixing compact and Oq8 experts changes KLD by
+**less than 1%** (0.1960 -> 0.1946) — mixed layers are exonerated. And the 5.2x
+gap in the middle rows is NOT the HFQ pipeline being numerically worse: pin it
+to the same 68 tensors the source path chooses and it lands at 0.0369, matching
+0.0390.
+
+## What it DID find: the HFQ path over-selects tensors
+
+The whole gap is that `run_hfq_source_pipeline` quantizes 79 tensors where the
+source path quantizes 68. Among the extra is
+`mlp.shared_expert.down_proj [256, 128]` — **K=128**, which the runtime then
+refuses outright:
+
+    256-wide FWHT rotation requires K % 256 == 0 and K > 0 (got K=128)
+
+So an artifact re-quantized from HFQ can contain a tensor that hard-errors at
+first forward. The `k % 256` guard exists in the mixed-bpw candidate loop and
+is missing from the general HFQ selection path.
+
+⚠️ **This does NOT explain the 122B.** Its extra tensors are exactly the
+644 + 644 promoted Oq8 experts (K = 3072, safely rotatable); the reverse
+difference is routers and lm_head, which the newer artifact correctly leaves
+full-precision. Set difference against the original `--oq4.25++`: 1288 added,
+all experts; 97 removed, all routers/lm_head.
+
+## Where that leaves the 122B
+
+The leading hypothesis is dead: mixed compact+Oq8 layers reproduce at tiny scale
+and are numerically fine. Remaining candidates, in order of what the evidence
+now supports:
+
+1. **Scale or real weights.** The toy has 16 experts of [1536, 256]; the 122B
+   has 256 of [~5120, 3072] with top-8 routing. The stride-table arm could be
+   correct at toy shapes and wrong at production ones (e.g. `n_ov` bounds,
+   256-expert pointer tables).
+2. **Something outside the MoE FFN entirely** — the bisect only ever showed the
+   35B differing from the 122B in expert precision, but they differ in depth
+   (48 vs 32-ish), E (256 vs 128) and dim as well.
+
+The fixture is the asset regardless: mixed layers now have a reproducer that
+runs in seconds, and it can be pointed at any future mixed-path change.
