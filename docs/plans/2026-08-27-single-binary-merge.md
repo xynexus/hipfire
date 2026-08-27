@@ -144,7 +144,7 @@ be adopted with eyes open.
 Ordered so each step is independently shippable and the load-bearing one comes
 early.
 
-1. **`hipfire daemon`** — ✅ **DONE** (`41e9d97e7`). What it took, versus what
+1. **`hipfire daemon`** — ✅ **DONE** (`6101e3f07`). What it took, versus what
    this section guessed:
 
    - The lib split was a *rename*, not the ~1,500-line code move it looked like:
@@ -282,7 +282,8 @@ early.
 
 ## Status — executed 2026-08-27
 
-All seven steps addressed on `feat/daemon-subcommand` (8 commits, unpushed).
+All seven steps addressed on `feat/daemon-subcommand`, merged to master in #367
+(`38c215e9d`). SHAs below are the merged ones.
 `hipfire` is one executable carrying every former binary as a subcommand:
 `daemon quantize convert eval monitor atlas steer hneurons-probe hfq
 host-profile`. All 17 standalone bin targets still build and run, so nothing
@@ -290,14 +291,14 @@ that invokes them by name broke.
 
 | step | state | commit |
 |---|---|---|
-| 1 daemon | done | `41e9d97e7` |
-| 2 quantize + 5 aux | done | `0ad21f5ed` |
-| — runtime/env fix | done | `9acad7bb8` |
-| 3 induction | **partial** — see below | `72127c9ee` |
-| 4 eval | done | `fa32b6d4b` |
-| 5 the small ones | done | `e58996c21` |
-| 6 coexistence | done | `19e7bcc17` |
-| 7 priv-helper | **redirected** — see below | `a5c63e769` |
+| 1 daemon | done | `6101e3f07` |
+| 2 quantize + 5 aux | done | `0fc1bb277` |
+| — runtime/env fix | done | `198bd2c8f` |
+| 3 induction | **partial** — see below | `89a496736` |
+| 4 eval | done | `5e6ea9815` |
+| 5 the small ones | done | `2b6247d53` |
+| 6 coexistence | done | `78ff76077` |
+| 7 priv-helper | **redirected** — see below | `39917c9e2` |
 
 **Size, the §7 risk, settled by measurement:** 36.9 → 72.2 MB. It replaces
 36.9 + 33.0 + 10.7 + 9.7 + 22.5 + 20.9 + … across 16 executables. The merged
