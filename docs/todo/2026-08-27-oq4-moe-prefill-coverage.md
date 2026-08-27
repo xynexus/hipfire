@@ -150,3 +150,91 @@ path-check in this gate exists to prevent. A cell must be able to fail.
 `Oq4G256` routed experts through path 1 and passes the KLD comparison against the
 per-token reference — with the corrupt-prefix self-check firing, as every other
 cell requires.
+
+
+---
+
+# ⚠️ BLOCKER: removing Q8 from the models breaks batched prefill
+
+**Raised 2026-08-27 after a challenge that "there should be no Q8 tensors left in
+the models". There are — and they are load-bearing.**
+
+## The census
+
+`hfq list` on a fixture quantized minutes earlier with the current binary
+(`--format oq4`, arch `qwen3_5_moe_indexed`):
+
+| qt | dtype | count |
+|---|---|---|
+| 34 | Oq4G256 | 68 |
+| 50 | Bf16Huff | 13 |
+| **3** | **Q8_0** | **11** |
+| 16 | BF16 | 2 |
+| 49 | Bf16Lut3 | 1 |
+
+Real `Qwen3.6-35B-A3B--oq4.hfq`: **271 Q8_0 tensors** of 21,094.
+
+The Q8 tensors are not incidental — they are the attention projection set:
+
+```
+layer.N.linear_attn.in_proj_qkv / in_proj_a / in_proj_b / in_proj_z / out_proj
+layer.N.self_attn.k_proj / o_proj
+layer.N.mlp.shared_expert.down_proj          (fixture)
+layer.N.mlp.shared_expert_gate               (35B)
+lm_head.weight                               (35B)
+```
+
+## Why they are load-bearing
+
+`is_batchable_la` — which gates whether a layer may use batched prefill at all —
+accepts `MQ4G256 HFQ4G256 MQ6G256 HFQ6G256 Q8_0 ParoQ4G128 F32 F16`. **No Opus
+dtype is in that set.**
+
+So `Q8_0` attention is the *only* reason an oq4 MoE artifact reaches batched
+prefill. Replace it with Opus and every such artifact silently drops to the
+per-token path — the regime measured at **4.2 tok/s** in
+`2026-08-27-induction-quantum-wcet-nix1.md`, versus batched.
+
+This is not hypothetical. An all-Opus tiny fixture does exactly that today:
+`rc=3, "batched prefill did not execute"` for `oq4`, `oq4.25` and `oq8`.
+
+## The ordering constraint
+
+**`is_batchable_la` must gain working Opus support BEFORE Q8 attention is
+removed**, or the removal takes batched prefill with it — silently, since a
+decline is not an error.
+
+Two things make that harder than adding dtypes to a `matches!`:
+
+1. The exclusion's stated justification is stale (see above), but the
+   `moe_prefill_quant_family` ladder's own comment says the rotation exists:
+   Opus routed experts are admitted on RDNA because "both attention arms rotate
+   for it (the `is_mq`/`qkv_is_mq` predicates)". Those two statements contradict
+   each other and one of them is out of date.
+2. Widening the predicate is **not sufficient** on its own — measured. See the
+   next section.
+
+## The silent decline — partially chased
+
+With `is_batchable_la` temporarily accepting all three Opus dtypes, an all-oq4
+fixture still declined. Narrowed to `ffn_admissible=false`, i.e.
+`moe_ffn_batched_admissible`. Not resolved further, and here is the honest state:
+
+- **every decline path in that function does call `decline()`**, so nothing is
+  silent in the code;
+- but `decline()` → `record_fallback()` only fills a map. **`kernel_trace::report()`
+  is what prints it, and the tree's only caller is `hipfire-arch-llama`
+  (`arch.rs:180`).** qwen35 never calls it, which is why the 4B (llama family)
+  printed a `SLOW PATHS TAKEN` summary and every qwen35 MoE run printed nothing;
+- adding a `report()` call at the end of `forward_prefill_batch_with_pbs_opts`
+  does **not** fix it — when the gate declines, that function is never entered.
+  Adding it to the `if !eligible` branch at `prefill_batch.rs:6421` did not fire
+  either, so the tiny fixture's decline is taken on a path upstream of both.
+  That attempt was reverted rather than shipped: instrumentation that cannot be
+  shown to fire is worth nothing.
+
+**Next step for whoever picks this up:** find where the qwen35 forward decides
+against batching for this fixture (upstream of `prefill_batch.rs:6421`) and flush
+the trace there. The `[pbs-gate]` diagnostic recomputes proxy terms for display
+and prints `per_layer_dtypes~=true` while the real verdict is false — so it
+actively misleads. Its own comment demands "Name every term"; it does not.
