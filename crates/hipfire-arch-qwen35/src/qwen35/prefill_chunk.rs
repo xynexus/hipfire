@@ -221,25 +221,33 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     if !raw_router {
         use hipfire_dispatch::families::gemm::GemmParams;
         let ctx = DispatchCtx::new(gpu);
-        let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) =
-            match ffn.router.gpu_dtype {
-                DType::Q8_0 => (
-                    hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                    &pbs.x_norm_batch,
-                ),
-                DType::MQ4G256 => (
-                    hipfire_dispatch::types::KernelKey::GemmHfq4G256,
-                    &pbs.x_rot_batch,
-                ),
-                DType::F32 => (
-                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
-                    &pbs.x_norm_batch,
-                ),
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
-                ),
-            };
+        let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) = match ffn
+            .router
+            .gpu_dtype
+        {
+            DType::Q8_0 => (
+                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                &pbs.x_norm_batch,
+            ),
+            DType::MQ4G256 => (
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+                &pbs.x_rot_batch,
+            ),
+            DType::F32 => (
+                hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                &pbs.x_norm_batch,
+            ),
+            // Backstop: a dtype the batched fast path cannot dispatch must
+            // decline, not abort the daemon and every co-resident model.
+            other => {
+                return Err(HipError::new(
+                        0,
+                        &format!(
+                            "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
+                        ),
+                    ));
+            }
+        };
         let w = WeightRef {
             buf: &ffn.router.buf,
             dtype: ffn.router.gpu_dtype,
@@ -271,10 +279,16 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             DType::Q8_0 => (KernelKey::GemmQ8_0BatchedChunked, &pbs.x_norm_batch),
             DType::MQ4G256 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
             DType::F32 => (KernelKey::GemmF32Batched, &pbs.x_norm_batch),
-            other => panic!(
-                "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
-            ),
+            // Backstop: a dtype the batched fast path cannot dispatch must
+            // decline, not abort the daemon and every co-resident model.
+            other => {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
+                    ),
+                ));
+            }
         };
         run_plain_gemm_key(
             gpu,
@@ -482,10 +496,16 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
                 }
             }
-            other => panic!(
-                "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
-                             — admit predicate should have rejected this layer"
-            ),
+            // Backstop: a dtype the batched fast path cannot dispatch must
+            // decline, not abort the daemon and every co-resident model.
+            other => {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} — admit predicate should have rejected this layer"
+                    ),
+                ));
+            }
         }
     }
 
@@ -806,10 +826,16 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     n,
                 )?;
             }
-            other => panic!(
-                "prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
-                         — admit predicate should have rejected this layer"
-            ),
+            // Backstop: a dtype the batched fast path cannot dispatch must
+            // decline, not abort the daemon and every co-resident model.
+            other => {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} — admit predicate should have rejected this layer"
+                    ),
+                ));
+            }
         }
     }
 
@@ -1852,10 +1878,15 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             )?;
                         }
                     }
-                    other => panic!(
-                    "prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
-                             — admit predicate should have rejected this layer"
-                ),
+                    // Backstop: a missing fast-path arm must not abort the daemon.
+                    other => {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} — admit predicate should have rejected this layer"
+                            ),
+                        ));
+                    }
                 }
                 // Non-atomic combine via inverse_perm + topk_weights.
                 gpu.moe_down_combine_grouped_k8(
@@ -1994,11 +2025,15 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             n,
                         )?
                     }
-                    other => panic!(
-                        "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
-                                 experts[0].down dtype {other:?} — admit predicate should \
-                                 have rejected this layer"
-                    ),
+                    // Backstop: a missing fast-path arm must not abort the daemon.
+                    other => {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "prefill_moe_ffn_body_batched: Path 1 fallback unsupported experts[0].down dtype {other:?} — admit predicate should have rejected this layer"
+                            ),
+                        ));
+                    }
                 }
                 gpu.moe_down_combine_k8_batched(
                     down_expanded,
