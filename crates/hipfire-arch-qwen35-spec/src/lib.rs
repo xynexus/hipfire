@@ -177,7 +177,7 @@ impl Qwen35Tiny {
         }
     }
 
-    /// ~11M params: the arch-6 MoE shaped so the INDEXED routed-expert decode
+    /// ~9.7M params: the arch-6 MoE shaped so the INDEXED routed-expert decode
     /// path is actually admitted. [`Self::moe_preset`] never reaches it and
     /// cannot be changed to — two independent gates exclude it, and both have
     /// to be cleared at once:
@@ -193,16 +193,26 @@ impl Qwen35Tiny {
     /// inadmissible shape still routes to the CPU fallback instead of erroring.
     /// This preset is the cover for the path itself.
     ///
-    /// 16 experts rather than 8 so top-8 is a real selection — with 8-of-8 every
+    /// 10 experts rather than 8 so top-8 is a real selection — with 8-of-8 every
     /// slot is always live, and a kernel that ignored `topk_indices` entirely
-    /// could still score clean. Two layers (one linear-attn, one full) keep the
-    /// cost near `moe_preset` despite 6x the expert width; attention coverage is
-    /// already `moe_preset`'s job.
+    /// could still score clean. Two of ten stay dark per token, which is enough
+    /// to catch that.
+    ///
+    /// `moe_inter = 512` is two G256 groups per row, not one: the minimum
+    /// admissible 256 would make every rotate a single group and stop covering
+    /// multi-group accumulation. It was 768 with 16 experts, which is where this
+    /// fixture's 20.7M params came from — expert weight scales with
+    /// `experts * moe_inter`, so both multipliers compounded. Neither is
+    /// required by `oq_indexed_admissible`, which asks only for
+    /// `moe_inter % 256 == 0` and `k_top == 8`.
+    ///
+    /// Two layers (one linear-attn, one full) keep the cost near `moe_preset`;
+    /// attention coverage is already `moe_preset`'s job.
     fn moe_indexed_preset() -> Self {
         Self {
-            experts: 16,
+            experts: 10,
             experts_per_tok: 8,
-            moe_inter: 768,
+            moe_inter: 512,
             shared_inter: 128,
             layers: 2,
             full_attn_interval: 2,
@@ -757,10 +767,52 @@ mod tests {
              ignoring topk_indices would still score clean"
         );
 
+        // Two G256 groups per row, not one — the minimum admissible 256 would
+        // stop covering multi-group accumulation.
+        assert_eq!(
+            m.moe_inter / 256,
+            2,
+            "moe_inter should span two G256 groups"
+        );
+
         // And the default MoE preset must keep FAILING them — it is the
         // regression cover for the admission guard's fallback branch.
         let d = Qwen35Tiny::moe_preset();
         assert!(d.moe_inter % 256 != 0 || d.experts_per_tok != 8);
+    }
+
+    /// The indexed fixture is TINY-gate infrastructure, and expert weight scales
+    /// with `experts * moe_inter` — so a bump to either silently multiplies it.
+    /// It reached 20.7M params that way, 2x the budget, because the only size
+    /// assert in the tree covers the arch-5 DEFAULT fixture
+    /// (`qwen35_manifest_has_both_layer_types_and_is_tiny` in hipfire-quantize)
+    /// and nothing bounded this arm at all.
+    #[test]
+    fn indexed_moe_fixture_stays_tiny() {
+        let specs = Qwen35MoeSpec
+            .fixture_named("indexed", 0)
+            .expect("indexed fixture")
+            .tensors;
+        let n: usize = specs
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
+        assert!(
+            n < 10_000_000,
+            "indexed fixture is {n} params; tiny fixtures are budgeted under 10M"
+        );
+        // Expert tensors must still dominate — if they stop, the shape has been
+        // shrunk past the point where it covers the routed-expert path.
+        let experts: usize = specs
+            .iter()
+            .filter(|s| s.name.contains("experts"))
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
+        assert!(
+            experts * 2 > n,
+            "expert tensors are {experts} of {n} params; the indexed path is \
+             supposed to be what this fixture spends its size on"
+        );
     }
 
     #[test]
