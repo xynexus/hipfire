@@ -361,3 +361,92 @@ is second-order until you do.
   plane over the same weight tile — which costs nothing in weight traffic.
 - Same standing caveats as Stage A1/A2: 1B dense model, 120-step budget,
   LoRA(q/v)+norm only.
+
+---
+
+# Stage A2c — should activation quant be split across the rotation?
+
+The question: outliers are **sparse in the channel basis**, and a rotation
+Gaussianizes them but destroys that sparsity. So could a two-pass scheme have
+both — capture the sparse outliers in the ORIGINAL basis where they are cheap,
+then quantize the now-flat residual in the ROTATED basis where uniform int4 is
+near-optimal?
+
+    x ≈ s + r,  s = top-k int8 (channel basis),  r = x − s
+    y = s·Wᵀ + Q4(r Rᵀ)·(W Rᵀ)ᵀ
+
+`examples/two_pass_act_probe.rs` answers it host-side from one capture, measured
+**end to end through the real weight** (never as reconstruction SNR of the
+activation — `a4_quant`'s own tests warn that the raw norm is dominated by the
+outliers, which quantize well, so a raw metric rewards a scheme for preserving
+them while the bulk is crushed). Llama-3.2-1B, all **four** quantized sites,
+SEQ=64 of **real text**, both the dense Hadamard and the codec's own `block_fwht`.
+
+## Answer: no — two-pass never wins, at any operating point
+
+End-to-end output SNR (dB, higher better), mean over 64 (act, weight) pairs:
+
+| n_out | promote alone | + Hadamard | + codec block-FWHT | **2-pass** |
+|---|---|---|---|---|
+| 4 | 23.01 | 23.36 | **24.24** | 23.82 |
+| 8 | 25.14 | 24.32 | 25.18 | 24.56 |
+| 16 | **27.38** | 25.64 | 26.44 | 25.65 |
+| 32 | **30.06** | 27.51 | 28.28 | 27.40 |
+
+Reference at n_out=8: `a4` uniform 15.68, `a4`+Hadamard 21.20, `a4`+block-FWHT
+22.13, `a8` ceiling 39.50.
+
+Two regimes, and two-pass loses in both:
+
+- **n_out = 4** — a rotation *does* help (24.24 vs 23.01). But the winner is
+  **single-pass** rotate-then-promote, not two-pass (23.82). When you can afford
+  very few promoted values, the rotation carries the outliers the mask misses.
+- **n_out ≥ 8** — promotion alone wins outright and the gap widens with k
+  (+0.9 dB at 16, +1.8 dB at 32). Adding a rotation actively *hurts*. Once the
+  mask is wide enough to catch the outliers, rotating only smears energy the
+  promotion was already handling exactly.
+
+**Rotation and promotion are substitutes, not complements.** They attack the same
+defect from opposite sides, and past n_out ≈ 4 the sparse mask strictly dominates.
+
+Also worth recording: the codec's own `block_fwht` beats the dense Hadamard at
+every k (e.g. 25.18 vs 24.32 at n_out=8), so a rotation study that scores only
+`Rotation::hadamard` is scoring the wrong rotation.
+
+## The implementation argument kills it independently
+
+`y = s·Wᵀ + Q4(rRᵀ)·(WRᵀ)ᵀ` needs the weight in **two bases**. Storing both
+doubles weight traffic, which is fatal. The only cheap form is `s·Wᵀ` as a gather
+of a few UNROTATED weight columns — which requires the outlier positions to be
+static enough to fix offline. They are not:
+
+| site | fraction of dynamic top-8 slots a STATIC per-group mask catches |
+|---|---|
+| `xn1→q_proj` | 42.1% |
+| `xn2→gate_proj` | 44.5% |
+| `ctx→o_proj` | 49.4% |
+| `act→down_proj` | **30.0%** |
+
+Worst at `act→down_proj` — the largest tensor and the most outlier-heavy site.
+A fixed offline mask would miss ~70% of the outliers exactly where they matter
+most, so the mask has to ride the data and the cheap gather formulation is not
+available. (Coverage rises only slowly with k: 28.6% at k=4 → 36.8% at k=32.)
+
+## Method note
+
+The first version of this probe measured only `xn1→q_proj` and `xn2→gate_proj`
+on synthetic token ids — i.e. the two sites where the mechanism matters *least*,
+on the same uniform-random tokens this repo's QAT loop was already burned by. It
+reported the same ranking, but the numbers moved (e.g. promote-alone 26.77 →
+25.14) once all four sites and real text were used. Recorded because "the
+conclusion did not change" is only reassuring if you check.
+
+## What this does not settle
+
+- Only **fixed** rotations. `learn_rotation`'s Cayley-SGD R1 is untested here,
+  and learned rotations are PREFILL-ONLY, so a learned-R1 result would not carry
+  to decode regardless.
+- SNR is not KL. It ranks schemes cheaply; the QAT arms in Stage A2b are the
+  loss-level measurement.
+- Nothing here prices the runtime mask against `iu4x2`'s second activation plane,
+  which is the actual A8-vs-promotion decision.
