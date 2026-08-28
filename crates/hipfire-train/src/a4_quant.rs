@@ -66,8 +66,179 @@ pub fn simquant_bits(x: &[f32], rows: usize, feat: usize, bits: u32) -> Vec<f32>
     out
 }
 
-/// Activation tier from `HIPFIRE_QAT_ACT`: `a16` (default, no quant) | `a8` | `a4`.
-/// `None` means leave activations alone, so the default forward is byte-identical.
+/// One activation grid: a bulk code width, optionally with the largest
+/// magnitudes in each group promoted to int8.
+///
+/// `outliers = 0` is a uniform per-group absmax grid. `outliers = n` mirrors the
+/// weight side's magnitude tier (`top-w8_frac` at int8, bulk at int4 — see
+/// `hipfire-quantize::ldlq`) applied to activations instead. The payoff is not
+/// the promoted values themselves but what removing them does to the BULK scale:
+/// a single outlier inflates a group's absmax and coarsens all 256 codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActTier {
+    /// Bulk code width in bits.
+    pub bits: u32,
+    /// Per-group count promoted to int8 by magnitude; 0 = uniform.
+    pub outliers: usize,
+}
+
+impl ActTier {
+    fn label(self) -> String {
+        if self.outliers == 0 {
+            format!("A{}", self.bits)
+        } else {
+            format!("A{}o{}", self.bits, self.outliers)
+        }
+    }
+}
+
+/// Per-group grid with the top-`n_out` magnitudes promoted to int8.
+///
+/// Both tiers keep the absmax scale — no clip search, for the reason in the
+/// module header: online per-token activation quant cannot afford one, so
+/// modelling one would score against a grid the runtime never deploys.
+/// Promotion by magnitude IS affordable online (a threshold over 256 lanes),
+/// which is what makes this worth measuring rather than merely simulating.
+pub fn simquant_outlier(x: &[f32], rows: usize, feat: usize, bits: u32, n_out: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), rows * feat);
+    if n_out == 0 {
+        return simquant_bits(x, rows, feat, bits);
+    }
+    let qmax = ((1i32 << (bits - 1)) - 1) as f32;
+    const OUT_QMAX: f32 = 127.0;
+    let mut out = vec![0.0f32; rows * feat];
+    let mut idx: Vec<usize> = Vec::with_capacity(GROUP);
+    for r in 0..rows {
+        let row = &x[r * feat..r * feat + feat];
+        let dst = &mut out[r * feat..r * feat + feat];
+        let mut g = 0;
+        while g < feat {
+            let end = (g + GROUP).min(feat);
+            let grp = &row[g..end];
+            let k = n_out.min(grp.len());
+            idx.clear();
+            idx.extend(0..grp.len());
+            // Largest |v| first; the first k are promoted.
+            idx.sort_unstable_by(|&a, &b| {
+                grp[b]
+                    .abs()
+                    .partial_cmp(&grp[a].abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut promoted = vec![false; grp.len()];
+            let mut out_amax = 0.0f32;
+            for &i in &idx[..k] {
+                promoted[i] = true;
+                out_amax = out_amax.max(grp[i].abs());
+            }
+            // The bulk scale is the whole point: it now sees the group WITHOUT
+            // its outliers, so all remaining codes get finer resolution.
+            let bulk_amax = idx[k..].iter().fold(0.0f32, |a, &i| a.max(grp[i].abs()));
+            let bulk_scale = (bulk_amax / qmax).max(1e-12);
+            let out_scale = (out_amax / OUT_QMAX).max(1e-12);
+            for (i, &v) in grp.iter().enumerate() {
+                let (scale, cap) = if promoted[i] {
+                    (out_scale, OUT_QMAX)
+                } else {
+                    (bulk_scale, qmax)
+                };
+                let q = (v / scale).round().clamp(-cap, cap);
+                dst[g + i] = q * scale;
+            }
+            g = end;
+        }
+    }
+    out
+}
+
+/// Per-site activation tiers, one per linear-input the block quantizes.
+///
+/// Mixed widths are deployable, not hypothetical: each field maps to a distinct
+/// GEMM, and the W4 kernels reach A8 by carrying the int8 activation as two
+/// radix-16 int4 digits (`x = 16·x_hi + x_lo`) through the same iu4 matrix core
+/// — see `kernels/src/gemm_oq_compact_iu4x2_wmma.hip`. The weight tile is
+/// identical across the two passes, so A8 costs one extra activation plane and
+/// WMMA issue, and adds nothing to weight traffic. Choosing A8 for one
+/// projection and A4 for another is therefore a real runtime choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActTiers {
+    /// q/k/v input (post-norm1 residual).
+    pub xn1: Option<ActTier>,
+    /// o_proj input (attention context).
+    pub ctx: Option<ActTier>,
+    /// gate/up input (post-norm2 residual).
+    pub xn2: Option<ActTier>,
+    /// down_proj input (SwiGLU output) — the widest, and one of the two
+    /// high-crest-factor sites.
+    pub act: Option<ActTier>,
+}
+
+impl ActTiers {
+    /// Compact label for reports, e.g. `A4` or `A4(act=A8,ctx=A8)`.
+    pub fn label(self) -> String {
+        let w = |b: Option<ActTier>| match b {
+            Some(t) => t.label(),
+            None => "A16".to_string(),
+        };
+        if self.xn1 == self.ctx && self.xn1 == self.xn2 && self.xn1 == self.act {
+            return w(self.xn1);
+        }
+        format!(
+            "xn1={} ctx={} xn2={} act={}",
+            w(self.xn1),
+            w(self.ctx),
+            w(self.xn2),
+            w(self.act)
+        )
+    }
+
+    /// True when nothing is quantized, i.e. the forward is byte-identical.
+    pub fn is_noop(self) -> bool {
+        self.xn1.is_none() && self.ctx.is_none() && self.xn2.is_none() && self.act.is_none()
+    }
+}
+
+fn parse_act_tier(s: &str) -> Option<ActTier> {
+    if s == "a16" {
+        return None;
+    }
+    // `a<bits>` or `a<bits>o<n_out>`, e.g. `a4`, `a8`, `a4o8`.
+    let body = s
+        .strip_prefix('a')
+        .unwrap_or_else(|| panic!("HIPFIRE_QAT_ACT: unknown tier {s:?} (want a16|a8|a4|a<b>o<n>)"));
+    let (bits_s, out_s) = match body.split_once('o') {
+        Some((b, o)) => (b, Some(o)),
+        None => (body, None),
+    };
+    let bits: u32 = bits_s
+        .parse()
+        .unwrap_or_else(|_| panic!("HIPFIRE_QAT_ACT: bad bit width in {s:?}"));
+    assert!(
+        (2..=8).contains(&bits),
+        "HIPFIRE_QAT_ACT: bits {bits} out of 2..=8 in {s:?}"
+    );
+    let outliers: usize = match out_s {
+        Some(o) => o
+            .parse()
+            .unwrap_or_else(|_| panic!("HIPFIRE_QAT_ACT: bad outlier count in {s:?}")),
+        None => 0,
+    };
+    assert!(
+        outliers < GROUP,
+        "HIPFIRE_QAT_ACT: outliers {outliers} must be < GROUP {GROUP} in {s:?}"
+    );
+    Some(ActTier { bits, outliers })
+}
+
+/// Activation tiers from `HIPFIRE_QAT_ACT`.
+///
+/// Grammar: `<base>[,<site>=<tier>]...` where tier is `a16|a8|a4` and site is
+/// `xn1|ctx|xn2|act`. `a16` (the default) is a true no-op. Examples:
+///
+/// ```text
+///   a4                    every site int4
+///   a4,act=a8,ctx=a8      int4 bulk, int8 on the two high-crest inputs
+/// ```
 ///
 /// Deliberately **uncached**, matching [`crate::kv_noise::cfg_from_env`]: the QAT
 /// example flips this off for the clean-teacher precompute and back on for the
@@ -75,20 +246,40 @@ pub fn simquant_bits(x: &[f32], rows: usize, feat: usize, bits: u32) -> Vec<f32>
 /// a `OnceLock` here — `ops::linear` caches its own precision env that way, and
 /// copying that would freeze the gate at the teacher's clean state.
 ///
-/// Panics on an unrecognised value rather than silently running A16: a typo that
-/// quietly disables the arm under test is the expensive failure here.
-pub fn act_bits_from_env() -> Option<u32> {
-    // Activation sim-quant tier for QAT: a16 (default, no-op) | a8 | a4.
-    match std::env::var("HIPFIRE_QAT_ACT")
+/// Panics on an unrecognised tier or site rather than silently running A16: a
+/// typo that quietly disables the arm under test is the expensive failure here.
+pub fn act_tiers_from_env() -> ActTiers {
+    let spec = std::env::var("HIPFIRE_QAT_ACT")
         .unwrap_or_else(|_| "a16".into())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "a16" | "" => None,
-        "a8" => Some(8),
-        "a4" => Some(4),
-        other => panic!("HIPFIRE_QAT_ACT: unknown tier {other:?} (want a16|a8|a4)"),
+        .to_ascii_lowercase();
+    let mut parts = spec.split(',');
+    let base = parse_act_tier(parts.next().unwrap_or("a16").trim());
+    let mut t = ActTiers {
+        xn1: base,
+        ctx: base,
+        xn2: base,
+        act: base,
+    };
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (site, tier) = part
+            .split_once('=')
+            .unwrap_or_else(|| panic!("HIPFIRE_QAT_ACT: expected <site>=<tier>, got {part:?}"));
+        let bits = parse_act_tier(tier.trim());
+        match site.trim() {
+            "xn1" => t.xn1 = bits,
+            "ctx" => t.ctx = bits,
+            "xn2" => t.xn2 = bits,
+            "act" => t.act = bits,
+            other => {
+                panic!("HIPFIRE_QAT_ACT: unknown site {other:?} (want xn1|ctx|xn2|act)")
+            }
+        }
     }
+    t
 }
 
 /// Fake-quantize one linear's input activation **in place**, forward-only (STE).
@@ -109,11 +300,11 @@ pub fn maybe_quant_act(
     x: &GpuTensor,
     rows: usize,
     feat: usize,
-    bits: Option<u32>,
+    tier: Option<ActTier>,
 ) -> HipResult<()> {
-    let Some(bits) = bits else { return Ok(()) };
+    let Some(tier) = tier else { return Ok(()) };
     let host = gpu.download_f32(x)?;
-    let q = simquant_bits(&host, rows, feat, bits);
+    let q = simquant_outlier(&host, rows, feat, tier.bits, tier.outliers);
     let bytes = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q.len() * 4) };
     gpu.memcpy_htod_auto(&x.buf, bytes)
 }
@@ -167,6 +358,118 @@ mod tests {
             }
         }
         x
+    }
+
+    /// The per-site grammar must actually override the base, and must leave the
+    /// other three sites alone. A policy that silently parsed to uniform A4 would
+    /// run the wrong arm for half an hour and look plausible doing it.
+    #[test]
+    fn act_tiers_parse_base_and_overrides() {
+        let t = |bits: u32, outliers: usize| Some(ActTier { bits, outliers });
+        let cases: &[(&str, ActTiers)] = &[
+            (
+                "a16",
+                ActTiers {
+                    xn1: None,
+                    ctx: None,
+                    xn2: None,
+                    act: None,
+                },
+            ),
+            (
+                "a4",
+                ActTiers {
+                    xn1: t(4, 0),
+                    ctx: t(4, 0),
+                    xn2: t(4, 0),
+                    act: t(4, 0),
+                },
+            ),
+            (
+                "a4,act=a8,ctx=a8",
+                ActTiers {
+                    xn1: t(4, 0),
+                    ctx: t(8, 0),
+                    xn2: t(4, 0),
+                    act: t(8, 0),
+                },
+            ),
+            (
+                "a8,xn1=a4",
+                ActTiers {
+                    xn1: t(4, 0),
+                    ctx: t(8, 0),
+                    xn2: t(8, 0),
+                    act: t(8, 0),
+                },
+            ),
+            (
+                "a4,act=a16",
+                ActTiers {
+                    xn1: t(4, 0),
+                    ctx: t(4, 0),
+                    xn2: t(4, 0),
+                    act: None,
+                },
+            ),
+            (
+                "a4o8",
+                ActTiers {
+                    xn1: t(4, 8),
+                    ctx: t(4, 8),
+                    xn2: t(4, 8),
+                    act: t(4, 8),
+                },
+            ),
+            (
+                "a4,act=a4o16",
+                ActTiers {
+                    xn1: t(4, 0),
+                    ctx: t(4, 0),
+                    xn2: t(4, 0),
+                    act: t(4, 16),
+                },
+            ),
+        ];
+        for (spec, want) in cases {
+            std::env::set_var("HIPFIRE_QAT_ACT", spec);
+            assert_eq!(act_tiers_from_env(), *want, "spec {spec:?}");
+        }
+        std::env::remove_var("HIPFIRE_QAT_ACT");
+        assert!(act_tiers_from_env().is_noop(), "unset must be a no-op");
+
+        std::env::set_var("HIPFIRE_QAT_ACT", "a4");
+        assert_eq!(act_tiers_from_env().label(), "A4");
+        std::env::set_var("HIPFIRE_QAT_ACT", "a4,act=a8");
+        assert!(act_tiers_from_env().label().contains("act=A8"));
+        std::env::set_var("HIPFIRE_QAT_ACT", "a4o8");
+        assert_eq!(act_tiers_from_env().label(), "A4o8");
+        std::env::remove_var("HIPFIRE_QAT_ACT");
+    }
+
+    /// Promoting a group's largest magnitudes to int8 must beat the uniform grid
+    /// at the same bulk width -- that is the entire premise of the magnitude
+    /// tier, and it works by shrinking the BULK scale, not by the promoted values
+    /// themselves. Heavy-tailed data is the case it is for.
+    #[test]
+    fn outlier_promotion_beats_uniform_at_same_bulk_width() {
+        let (rows, feat) = (8, GROUP * 2);
+        let x = heavy_tailed(rows, feat, 0x0271);
+        let uniform = snr_db(&x, &simquant_outlier(&x, rows, feat, 4, 0));
+        let mut prev = uniform;
+        for n_out in [1usize, 4, 8, 16] {
+            let snr = snr_db(&x, &simquant_outlier(&x, rows, feat, 4, n_out));
+            assert!(
+                snr > prev,
+                "n_out={n_out} gave {snr} dB, not better than {prev} dB"
+            );
+            prev = snr;
+        }
+        // n_out = 0 must be exactly the uniform path, not merely close.
+        assert_eq!(
+            simquant_outlier(&x, rows, feat, 4, 0),
+            simquant_bits(&x, rows, feat, 4)
+        );
     }
 
     /// `simquant_bits` must reproduce `a4_simquant` exactly at bits=4 (the

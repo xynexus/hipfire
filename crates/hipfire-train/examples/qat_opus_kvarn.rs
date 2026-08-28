@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than 5 minutes into the teacher precompute.
     // Activation sim-quant tier for QAT: a16 (default, no-op) | a8 | a4.
     let act_tier = std::env::var("HIPFIRE_QAT_ACT").unwrap_or_else(|_| "a16".into());
-    let act_bits = hipfire_train::a4_quant::act_bits_from_env();
+    let act_tiers = hipfire_train::a4_quant::act_tiers_from_env();
     // Teacher must run CLEAN — force KV-noise AND activation-quant off during its
     // precompute. Both gates re-read the env on every block, so unsetting them
     // here and restoring after the teacher softmaxes are frozen is sufficient.
@@ -326,15 +326,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Student runs the requested weight tier + activation tier + (optionally)
     // KVarN. Whatever we train with, we eval with.
-    if act_bits.is_some() {
-        std::env::set_var("HIPFIRE_QAT_ACT", &act_tier);
+    if act_tiers.is_noop() {
         println!(
-            "student activations: {act_tier} (per-group symmetric int{}, GROUP=256, absmax) \
-             on xn1/ctx/xn2/act — forward-only STE",
-            act_bits.unwrap()
+            "student activations: A16 (unquantized; set HIPFIRE_QAT_ACT=a8|a4, or a \
+             per-site policy like a4,act=a8,ctx=a8)"
         );
     } else {
-        println!("student activations: a16 (unquantized; set HIPFIRE_QAT_ACT=a8|a4)");
+        std::env::set_var("HIPFIRE_QAT_ACT", &act_tier);
+        println!(
+            "student activations: {} (per-group symmetric, GROUP=256, absmax) — forward-only STE",
+            act_tiers.label()
+        );
     }
     if kvnoise {
         std::env::set_var("HIPFIRE_KVNOISE", "1");
@@ -443,10 +445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n  ── {}{}{} recovery-FT ──",
         tier.width(),
-        match act_bits {
-            Some(b) => format!("A{b}"),
-            None => "A16".to_string(),
-        },
+        act_tiers.label(),
         if kvnoise { "+KVarN" } else { "" }
     );
     println!(

@@ -241,13 +241,17 @@ fn block_forward_inner(
     // NOT hooked in `linear_forward`: that funnel also carries lm_head, the MoE
     // router and the LoRA A/B legs, and the B leg's K = lora_rank (8-32) is
     // below GROUP=256.
-    let act_bits = crate::a4_quant::act_bits_from_env();
+    //
+    // Per-site, because each of the four is a distinct GEMM and the W4 kernels
+    // reach A8 via two iu4 passes over the SAME weight tile — so A8 here and A4
+    // there is a real deployable choice, not a simulation-only one.
+    let act_tiers = crate::a4_quant::act_tiers_from_env();
 
     let xn1 = gpu.zeros(&[seq * h], DType::F32)?;
     let rinv1 = gpu.zeros(&[seq], DType::F32)?;
     rmsnorm_forward(gpu, x, w.norm1, &xn1, &rinv1, seq, h, dims.eps)?;
     // Safe in place: rmsnorm_backward takes the norm's INPUT (`x`), never xn1.
-    crate::a4_quant::maybe_quant_act(gpu, &xn1, seq, h, act_bits)?;
+    crate::a4_quant::maybe_quant_act(gpu, &xn1, seq, h, act_tiers.xn1)?;
 
     // q = lora_q(xn1), k = lin(xn1), v = lora_v(xn1)
     let hq = gpu.zeros(&[seq * r], DType::F32)?;
@@ -439,7 +443,7 @@ fn block_forward_inner(
     // ctx is quantized AFTER the gate multiply, so it is exactly what o_proj
     // consumes. ctx_pre_gate is a copy taken before the multiply and is
     // untouched, so the attn-gate backward keeps its own Jacobian point.
-    crate::a4_quant::maybe_quant_act(gpu, &ctx, seq, qd, act_bits)?;
+    crate::a4_quant::maybe_quant_act(gpu, &ctx, seq, qd, act_tiers.ctx)?;
     let attn = gpu.zeros(&[seq * h], DType::F32)?;
     linear_forward(gpu, &ctx, w.wo, &attn, seq, qd, h)?;
     let x_mid = gpu.zeros(&[seq * h], DType::F32)?;
@@ -450,7 +454,7 @@ fn block_forward_inner(
     let rinv2 = gpu.zeros(&[seq], DType::F32)?;
     rmsnorm_forward(gpu, &x_mid, w.norm2, &xn2, &rinv2, seq, h, dims.eps)?;
     // Safe in place: norm2's backward takes acts.x_mid, never xn2.
-    crate::a4_quant::maybe_quant_act(gpu, &xn2, seq, h, act_bits)?;
+    crate::a4_quant::maybe_quant_act(gpu, &xn2, seq, h, act_tiers.xn2)?;
     let n_mlp = if dense_mlp { seq * inter } else { 1 };
     let gate = gpu.zeros(&[n_mlp], DType::F32)?;
     let up = gpu.zeros(&[n_mlp], DType::F32)?;
@@ -464,7 +468,7 @@ fn block_forward_inner(
         // recomputes silu/silu' from those PRE-activations, so overwriting them
         // would move the Jacobian evaluation point. acts.act is read only by
         // linear_backward_w for dwdown, which is the correct STE weight grad.
-        crate::a4_quant::maybe_quant_act(gpu, &act, seq, inter, act_bits)?;
+        crate::a4_quant::maybe_quant_act(gpu, &act, seq, inter, act_tiers.act)?;
         let mlp = gpu.zeros(&[seq * h], DType::F32)?;
         linear_forward(gpu, &act, w.wdown, &mlp, seq, inter, h)?;
         gpu.add_f32(&x_mid, &mlp, &x_out)?;
