@@ -37,6 +37,7 @@
 use crate::model::LlamaModel;
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
+use rayon::prelude::*;
 
 /// An orthonormal `[h,h]` rotation, row-major (`r[i*h + j]`). Invariant: `R Rᵀ = I`.
 #[derive(Clone)]
@@ -249,9 +250,15 @@ pub fn rotate_rows(x: &[f32], rot: &Rotation, rows: usize) -> Vec<f32> {
 fn rotate_input(w: &[f32], rot: &Rotation, out: usize) -> Vec<f32> {
     let h = rot.h;
     let mut o_out = vec![0.0f32; out * h];
-    for o in 0..out {
+    // Parallel over `out` rows, which own disjoint output chunks. Splitting the
+    // OUTER loop leaves each dot product's accumulation order untouched, so this
+    // is bit-identical to the serial form — not merely close.
+    //
+    // Worth having: `apply_r1` on a 1B model is ~3e12 MACs and is dominated by
+    // the embed/lm_head rotations at vocab=128k rows each. Serial, that is hours,
+    // which is why the rotation probes default to a 50M model.
+    o_out.par_chunks_mut(h).enumerate().for_each(|(o, dst)| {
         let src = &w[o * h..o * h + h];
-        let dst = &mut o_out[o * h..o * h + h];
         for (j, d) in dst.iter_mut().enumerate() {
             let rrow = &rot.r[j * h..j * h + h];
             let mut acc = 0.0f32;
@@ -260,7 +267,7 @@ fn rotate_input(w: &[f32], rot: &Rotation, out: usize) -> Vec<f32> {
             }
             *d = acc;
         }
-    }
+    });
     o_out
 }
 
@@ -317,9 +324,10 @@ fn rotate_head_cols(w: &[f32], r2: &Rotation, n_heads: usize, rows: usize) -> Ve
 fn rotate_output(w: &[f32], rot: &Rotation, cols: usize) -> Vec<f32> {
     let h = rot.h;
     let mut o_out = vec![0.0f32; h * cols];
-    for e in 0..h {
+    // Same argument as `rotate_input`: disjoint output chunks, inner accumulation
+    // order over `d` unchanged, so bit-identical to the serial form.
+    o_out.par_chunks_mut(cols).enumerate().for_each(|(e, dst)| {
         let rrow = &rot.r[e * h..e * h + h];
-        let dst = &mut o_out[e * cols..e * cols + cols];
         for (d, &rval) in rrow.iter().enumerate() {
             if rval == 0.0 {
                 continue;
@@ -329,7 +337,7 @@ fn rotate_output(w: &[f32], rot: &Rotation, cols: usize) -> Vec<f32> {
                 *o += rval * s;
             }
         }
-    }
+    });
     o_out
 }
 
