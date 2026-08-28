@@ -649,18 +649,6 @@ pub fn resolve_tiny_model_state(
     q
 }
 
-/// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
-/// detect the arch, parse its config, upload weights and allocate the forward
-/// scratch/KV/state for that family, resolve the chat template and eviction
-/// policy, and wire any optional DFlash drafter. The single-GPU entry point
-/// (multi-GPU goes through [`load_model_pp`]).
-/// Default slack left for the rest of the system after a load, in bytes.
-///
-/// Not a KV estimate: the KV cache is sized after the config is parsed, well
-/// past this point. 4 GiB is enough to keep the session's supervisor processes
-/// alive so a too-large load fails as a refusal instead of as a reaping.
-const LOAD_MEM_RESERVE_BYTES: u64 = 4 << 30;
-
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
 ///
 /// `MemAvailable`, not `MemFree`: reclaimable page cache is genuinely available
@@ -727,6 +715,9 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
     if std::env::var("HIPFIRE_LOAD_MEM_CHECK").as_deref() == Ok("0") {
         return Ok(());
     }
+    if !hipfire_config::load_config_bundle().config.load_mem_check {
+        return Ok(());
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
@@ -750,7 +741,12 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|gib| gib << 30)
-        .unwrap_or(LOAD_MEM_RESERVE_BYTES);
+        .unwrap_or_else(|| {
+            (hipfire_config::load_config_bundle()
+                .config
+                .load_mem_reserve_gib as u64)
+                << 30
+        });
     load_headroom_verdict(need, available, reserve)
 }
 
@@ -788,6 +784,11 @@ mod load_headroom_tests {
     }
 }
 
+/// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
+/// detect the arch, parse its config, upload weights and allocate the forward
+/// scratch/KV/state for that family, resolve the chat template and eviction
+/// policy, and wire any optional DFlash drafter. The single-GPU entry point
+/// (multi-GPU goes through [`load_model_pp`]).
 pub fn load_model(
     path: &str,
     max_seq: usize,

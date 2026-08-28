@@ -11,6 +11,7 @@ arch-lfm2moe = ["hipfire-arch-lfm2moe"]
 deltanet = ["hipfire-rdna/deltanet"]
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-archs = { path = "../hipfire-archs" }
 hipfire-evidence = { path = "../hipfire-evidence" }

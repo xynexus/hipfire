@@ -122,6 +122,27 @@ fn default_lmhead_twostage() -> String {
 fn default_oq_compact_multicol_wide() -> bool {
     false
 }
+/// Off: a routed-expert model keeps every expert resident unless asked
+/// otherwise, which is the behaviour every existing deployment already has.
+fn default_qwen35_paged_experts() -> bool {
+    false
+}
+/// Matches the historical `HIPFIRE_QWEN35_EXPERT_CACHE_MB` fallback.
+fn default_qwen35_expert_cache_mb() -> u64 {
+    8192
+}
+/// On. The check is what turns an over-large load into a refusal instead of an
+/// OOM reaping unrelated processes on a UMA host.
+fn default_load_mem_check() -> bool {
+    true
+}
+/// Slack left for the rest of the system after a load. Not a KV estimate: the
+/// KV cache is sized after the model config is parsed, well past the check. 4
+/// GiB is enough to keep the session's supervisor processes alive so a
+/// too-large load fails as a refusal instead of as a reaping.
+fn default_load_mem_reserve_gib() -> u32 {
+    4
+}
 fn default_kv_window_precision() -> String {
     "auto".to_string()
 }
@@ -341,6 +362,21 @@ pub struct HipfireConfig {
     pub deltanet_state_precision: String,
     #[serde(default = "default_oq_compact_multicol_wide")]
     pub oq_compact_multicol_wide: bool,
+    /// Stream routed experts from host memory instead of keeping every expert
+    /// resident. The env var `HIPFIRE_QWEN35_PAGED_EXPERTS` still overrides.
+    #[serde(default = "default_qwen35_paged_experts")]
+    pub qwen35_paged_experts: bool,
+    /// Resident budget for the paged-expert cache, in MiB. Only meaningful with
+    /// `qwen35_paged_experts`.
+    #[serde(default = "default_qwen35_expert_cache_mb")]
+    pub qwen35_expert_cache_mb: u64,
+    /// Refuse a load that would not fit in `MemAvailable`. Turning this off on a
+    /// unified-memory host lets an over-large load invoke the OOM killer.
+    #[serde(default = "default_load_mem_check")]
+    pub load_mem_check: bool,
+    /// GiB of headroom the load check leaves for the rest of the system.
+    #[serde(default = "default_load_mem_reserve_gib")]
+    pub load_mem_reserve_gib: u32,
     #[serde(default = "default_lmhead_twostage")]
     pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
@@ -530,6 +566,10 @@ impl Default for HipfireConfig {
             kv_window_precision: default_kv_window_precision(),
             deltanet_state_precision: default_deltanet_state_precision(),
             oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
+            qwen35_paged_experts: default_qwen35_paged_experts(),
+            qwen35_expert_cache_mb: default_qwen35_expert_cache_mb(),
+            load_mem_check: default_load_mem_check(),
+            load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),

@@ -480,6 +480,57 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          depended on knowing an env var."
     ),
     field!(
+        "qwen35_paged_experts",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Stream qwen3.5-MoE routed experts from host memory instead of keeping \
+         every expert resident. Lets a routed-expert artifact larger than the \
+         host's headroom load at all; costs a host-to-GPU fetch on an expert \
+         cache miss. Defaults OFF so existing deployments keep full residency.",
+        env: ["HIPFIRE_QWEN35_PAGED_EXPERTS"]
+    ),
+    field!(
+        "qwen35_expert_cache_mb",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("8192"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Resident budget in MiB for the paged routed-expert cache. Only \
+         meaningful with qwen35_paged_experts. Larger trades host memory for \
+         fewer expert fetches.",
+        env: ["HIPFIRE_QWEN35_EXPERT_CACHE_MB"]
+    ),
+    field!(
+        "load_mem_check",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("true"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Refuse a load whose estimated resident size will not fit in \
+         MemAvailable. On a unified-memory host an over-large load does not \
+         fail the loader — it invokes the OOM killer on whatever else is \
+         running, so turn this off only when the estimate is known to \
+         over-count (e.g. paged experts, which it does not model).",
+        env: ["HIPFIRE_LOAD_MEM_CHECK"]
+    ),
+    field!(
+        "load_mem_reserve_gib",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("4"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "GiB the load check leaves free for the rest of the system. Enough to \
+         keep the session's supervisor processes alive so a too-large load \
+         fails as a refusal rather than a reaping.",
+        env: ["HIPFIRE_LOAD_MEM_RESERVE_GIB"]
+    ),
+    field!(
         "deltanet_state_precision",
         ConfigType::Enum {
             values: &["fp16", "fp32"]

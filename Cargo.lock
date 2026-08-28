@@ -2572,6 +2572,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-zaya",
  "hipfire-archs",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-evidence",
  "hipfire-generate",
