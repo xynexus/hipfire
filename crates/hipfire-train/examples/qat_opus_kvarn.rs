@@ -23,6 +23,7 @@
 //!   cargo run -p hipfire-train --release --example qat_w3_kvarn [model_dir]
 //!   hipfire lock release
 
+use hipfire_model::tokenizer::Tokenizer;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{
@@ -33,15 +34,38 @@ use hipfire_train::optim::AdamW;
 use hipfire_train::oqplus_quant::{oq3_simquant, oq8_simquant, oqplus_simquant};
 use std::path::Path;
 
-const DEFAULT_DIR: &str =
-    "/srv/huggingface/models--SupraLabs--Supra-50M-Instruct/snapshots/77a1c2a33f386f9f4bf7151ec5f2156b62caac39";
+/// Default model. Must be a `model_type: llama` snapshot holding **safetensors** —
+/// `load_llama_fp32` cannot read `.gguf`, and a snapshot dir that carries only a
+/// `.gguf` dies with a bare "no .safetensors files found" before touching the GPU.
+/// Note the `snapshots/main` pin: Llama-3.2-1B has a second, weightless snapshot
+/// dir, so globbing `snapshots/*/` picks the wrong one.
+const DEFAULT_DIR: &str = "/srv/huggingface/models--meta-llama--Llama-3.2-1B/snapshots/main";
 const SEQ: usize = 16;
-const N_TRAIN: usize = 4;
-const N_EVAL: usize = 4; // held-out sequences (disjoint tokens)
+const N_TRAIN: usize = 4; // sequences per optimizer step
+const N_EVAL: usize = 4; // held-out sequences, synthetic path (disjoint tokens)
+/// Distinct train batches cycled over on the corpus path, and held-out sequences
+/// drawn there.
+///
+/// With ONE fixed batch, this loop trains 97 tensors on `N_TRAIN * SEQ` = 64 tokens
+/// and overfits them flat: the first measured run drove in-sample KL 2.2430 -> 0.6114
+/// (72.7% "recovered") while HELD-OUT went 2.5152 -> 2.9003, i.e. 15% WORSE. Cycling
+/// a pool costs one extra teacher precompute and nothing per step, and is the
+/// difference between measuring recovery and measuring memorisation.
+const POOL_BATCHES: usize = 32;
+const N_EVAL_CORPUS: usize = 32;
 const RANK: usize = 16;
 const ALPHA: f32 = 32.0;
-const LR: f32 = 1e-3;
+const LR: f32 = 1e-3; // peak LR; override with HIPFIRE_QAT_LR
 const STEPS: usize = 120;
+/// Linear-warmup steps before the cosine decay.
+///
+/// A FLAT LR diverges at low-damage tiers, which is easy to mistake for "QAT does
+/// not help". Measured on W8 KV-clean over real text, where the student starts
+/// essentially undamaged: batch KL 0.0033 -> 0.529 -> 0.298 -> 0.365 -> 3.2295 by
+/// step 80. There is nothing to recover at W8, so a flat 1e-3 on the trainable
+/// RMSNorms just walks the model away from the teacher. Same root cause as the
+/// DSpark drafter's non-convergence.
+const WARMUP: usize = 10;
 
 /// Which Opus tier the student is fake-quantized to.
 ///
@@ -96,6 +120,16 @@ impl Tier {
     }
 }
 
+/// Linear warmup to `peak`, then cosine decay to ~0 over the remaining steps.
+fn lr_at(step: usize, peak: f32) -> f32 {
+    if step < WARMUP {
+        peak * (step + 1) as f32 / WARMUP as f32
+    } else {
+        let t = (step - WARMUP) as f32 / (STEPS - WARMUP).max(1) as f32;
+        0.5 * peak * (1.0 + (std::f32::consts::PI * t).cos())
+    }
+}
+
 /// Opus sim-quant the 7 linears per layer (base weights, frozen thereafter).
 fn quantize_linears(
     gpu: &mut Gpu,
@@ -138,6 +172,72 @@ fn eval_kl(
     Ok(total / (batch.len() * SEQ) as f32)
 }
 
+/// Real-text batches from `HIPFIRE_QAT_CORPUS`, tokenized with the model's own
+/// `tokenizer.json`. `None` when the env var is unset — the caller then falls back
+/// to synthetic ids, so Stage A1's published numbers do not move silently.
+///
+/// Worth using before trusting a number for a deploy decision: quantization damage
+/// concentrates on the activations *real text* produces, and a recoverable share
+/// measured on uniform-random token ids need not transfer. Train and held-out come
+/// from **opposite halves of the file** — this repo already retracted a
+/// "budget = -13.6%" result that came from a calib corpus and a KLD reference being
+/// the same file read from offset 0.
+fn corpus_batches(
+    model_dir: &Path,
+    vocab: usize,
+) -> Result<Option<(Vec<Vec<u32>>, Vec<Vec<u32>>)>, Box<dyn std::error::Error>> {
+    // Path to a plain-text corpus to train and evaluate on; unset means synthetic ids.
+    let Ok(path) = std::env::var("HIPFIRE_QAT_CORPUS") else {
+        return Ok(None);
+    };
+    let tok = Tokenizer::from_tokenizer_json(&model_dir.join("tokenizer.json"))?
+        .ok_or("HIPFIRE_QAT_CORPUS is set but the model dir holds no tokenizer.json")?;
+    let raw = std::fs::read_to_string(&path)?;
+    // Encode only the two slices we need. Tokenizing a multi-MB corpus to pull ~128
+    // tokens is pure waste, and the calib corpora here are 5-20 MB.
+    const SLICE: usize = 64 * 1024;
+    let bound = |mut i: usize| {
+        i = i.min(raw.len());
+        while !raw.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    };
+    let mid = bound(raw.len() / 2);
+    let encode = |t: &str| -> Vec<u32> {
+        tok.encode(t)
+            .into_iter()
+            .filter(|&i| (i as usize) < vocab)
+            .collect()
+    };
+    let take = |ids: &[u32], n: usize, what: &str| -> Result<Vec<Vec<u32>>, String> {
+        if ids.len() < n * SEQ {
+            return Err(format!(
+                "{path}: {what} slice yields {} tokens, need {}",
+                ids.len(),
+                n * SEQ
+            ));
+        }
+        Ok((0..n)
+            .map(|s| ids[s * SEQ..(s + 1) * SEQ].to_vec())
+            .collect())
+    };
+    let train_ids = encode(&raw[..bound(SLICE)]);
+    let eval_ids = encode(&raw[mid..bound(mid + SLICE)]);
+    let n_train = POOL_BATCHES * N_TRAIN;
+    println!(
+        "batches: REAL text from {path} — train @byte 0, held-out @byte {mid} \
+         ({} / {} tok encoded; disjoint halves); pool {n_train} train seq \
+         ({POOL_BATCHES} batches cycled), {N_EVAL_CORPUS} held-out seq",
+        train_ids.len(),
+        eval_ids.len()
+    );
+    Ok(Some((
+        take(&train_ids, n_train, "train")?,
+        take(&eval_ids, N_EVAL_CORPUS, "held-out")?,
+    )))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args()
         .nth(1)
@@ -146,11 +246,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !dir.exists() {
         return Err(format!("model dir not found: {}", dir.display()).into());
     }
+    // `load_llama_fp32` is safetensors-only; say so here rather than let the loader
+    // report a bare "no .safetensors files found" from three frames down.
+    let has_safetensors = std::fs::read_dir(dir)?
+        .flatten()
+        .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"));
+    if !has_safetensors {
+        return Err(format!(
+            "no .safetensors in {} — this example needs an fp32-loadable llama \
+             snapshot (a .gguf-only or weightless snapshot dir will not do)",
+            dir.display()
+        )
+        .into());
+    }
+    // Run the student with the KVarN-4bit + CASK KV path; 0 ablates to clean KV.
     let kvnoise = std::env::var("HIPFIRE_QAT_KVNOISE")
         .map(|v| v != "0")
         .unwrap_or(true);
-    // Teacher must run CLEAN — force KV-noise off during its precompute.
+    // Stage A2: activation tier, a16|a8|a4. Resolve it NOW so a typo panics here
+    // rather than 5 minutes into the teacher precompute.
+    // Activation sim-quant tier for QAT: a16 (default, no-op) | a8 | a4.
+    let act_tier = std::env::var("HIPFIRE_QAT_ACT").unwrap_or_else(|_| "a16".into());
+    let act_bits = hipfire_train::a4_quant::act_bits_from_env();
+    // Teacher must run CLEAN — force KV-noise AND activation-quant off during its
+    // precompute. Both gates re-read the env on every block, so unsetting them
+    // here and restoring after the teacher softmaxes are frozen is sufficient.
     std::env::remove_var("HIPFIRE_KVNOISE");
+    std::env::remove_var("HIPFIRE_QAT_ACT");
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}  model: {}", gpu.arch, dir.display());
@@ -175,8 +297,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect()
     };
-    let train_batch = mkbatch(N_TRAIN, 0);
-    let eval_batch = mkbatch(N_EVAL, 1000); // disjoint salt ⇒ held-out tokens
+    let (train_pool, eval_batch) = match corpus_batches(dir, vocab)? {
+        Some(b) => b,
+        None => {
+            println!(
+                "batches: SYNTHETIC random token ids — set HIPFIRE_QAT_CORPUS=<text file> \
+                 for real text before trusting these for a deploy decision"
+            );
+            // Disjoint salt ⇒ held-out tokens.
+            (mkbatch(N_TRAIN, 0), mkbatch(N_EVAL, 1000))
+        }
+    };
 
     // Frozen CLEAN teacher distributions (KV-noise off) for both batches.
     let teacher_dist =
@@ -190,10 +321,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(out)
         };
-    let teacher_p_train = teacher_dist(&mut gpu, &train_batch)?;
+    let teacher_p_pool = teacher_dist(&mut gpu, &train_pool)?;
     let teacher_p_eval = teacher_dist(&mut gpu, &eval_batch)?;
 
-    // Student runs W3 + (optionally) KVarN. Whatever we train with, we eval with.
+    // Student runs the requested weight tier + activation tier + (optionally)
+    // KVarN. Whatever we train with, we eval with.
+    if act_bits.is_some() {
+        std::env::set_var("HIPFIRE_QAT_ACT", &act_tier);
+        println!(
+            "student activations: {act_tier} (per-group symmetric int{}, GROUP=256, absmax) \
+             on xn1/ctx/xn2/act — forward-only STE",
+            act_bits.unwrap()
+        );
+    } else {
+        println!("student activations: a16 (unquantized; set HIPFIRE_QAT_ACT=a8|a4)");
+    }
     if kvnoise {
         std::env::set_var("HIPFIRE_KVNOISE", "1");
         let bits = std::env::var("HIPFIRE_KVNOISE_BITS").unwrap_or_else(|_| "4".into());
@@ -211,24 +353,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Peak learning rate for the warmup+cosine schedule; default 1e-3 is too hot.
+    let peak_lr = std::env::var("HIPFIRE_QAT_LR")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(LR);
+    // Cheap check that the schedule is the shape we think it is, before 20 minutes
+    // of GPU says otherwise: warmup reaches the peak, cosine lands on zero.
+    assert!(
+        (lr_at(WARMUP - 1, LR) - LR).abs() < 1e-9 && lr_at(STEPS, LR) < LR * 1e-6,
+        "lr schedule broken: warmup end {} peak {LR}, final {}",
+        lr_at(WARMUP - 1, LR),
+        lr_at(STEPS, LR)
+    );
     let sizes = student.recovery_param_sizes();
-    let mut opt = AdamW::new(&mut gpu, &sizes, LR, 0.9, 0.999, 1e-8, 0.0)?;
+    let mut opt = AdamW::new(&mut gpu, &sizes, peak_lr, 0.9, 0.999, 1e-8, 0.0)?;
     println!(
-        "recovery-FT: {} trainable tensors (LoRA q/v + RMSNorm); base {} frozen\n",
+        "recovery-FT: {} trainable tensors (LoRA q/v + RMSNorm); base {} frozen; \
+         LR {peak_lr:.1e} peak, {WARMUP}-step warmup then cosine\n",
         sizes.len(),
         tier.width()
     );
 
-    // Held-out gap BEFORE recovery (LoRA=0): the raw W3(+KVarN) deploy loss.
-    let eval_before = eval_kl(&mut gpu, &student, &eval_batch, &teacher_p_eval, &pos)?;
+    let batches = train_pool.len() / N_TRAIN;
+    println!(
+        "train: {} seq in {batches} batch(es) of {N_TRAIN}, cycled over {STEPS} steps; \
+         held-out {} seq",
+        train_pool.len(),
+        eval_batch.len()
+    );
 
-    let (mut train_start, mut train_last) = (0.0f32, 0.0f32);
+    // Held-out gap BEFORE recovery (LoRA=0): the raw W_tier(+KVarN) deploy loss.
+    let eval_before = eval_kl(&mut gpu, &student, &eval_batch, &teacher_p_eval, &pos)?;
+    // In-sample reference is pinned to pool slot 0 so before/after compare the SAME
+    // tokens — with a cycled pool the last step's batch is a different one.
+    let train_start = eval_kl(
+        &mut gpu,
+        &student,
+        &train_pool[..N_TRAIN],
+        &teacher_p_pool[..N_TRAIN],
+        &pos,
+    )?;
+
+    // Track the BEST held-out point, not just the last one. With a fixed step budget
+    // the final iterate can be well past the optimum -- flat-LR W8 ended 3000x worse
+    // than it started -- and "what light QAT can reach" is the honest question. This
+    // is early stopping measured, not applied: nothing is rolled back.
+    let mut best = (eval_before, 0usize);
     for step in 0..=STEPS {
+        opt.set_lr(lr_at(step, peak_lr));
+        let base = (step % batches) * N_TRAIN;
         let mut total = 0.0f32;
-        for (si, toks) in train_batch.iter().enumerate() {
-            let acts = model_forward(&mut gpu, &student, toks, &pos)?;
+        for k in 0..N_TRAIN {
+            let acts = model_forward(&mut gpu, &student, &train_pool[base + k], &pos)?;
             let (kl, grads, d_final) =
-                model_distill_backward(&mut gpu, &student, &acts, &teacher_p_train[si])?;
+                model_distill_backward(&mut gpu, &student, &acts, &teacher_p_pool[base + k])?;
             total += kl;
             if step < STEPS {
                 let params = student.recovery_params();
@@ -236,22 +415,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opt.step(&mut gpu, &params, &gflat)?;
             }
         }
-        train_last = total / (N_TRAIN * SEQ) as f32;
-        if step == 0 {
-            train_start = train_last;
-        }
         if step % 20 == 0 || step == STEPS {
-            println!("step {step:4}: train KL = {train_last:.4} nats/tok");
+            let held = eval_kl(&mut gpu, &student, &eval_batch, &teacher_p_eval, &pos)?;
+            if held < best.0 {
+                best = (held, step);
+            }
+            println!(
+                "step {step:4}: batch KL = {:.4}  held-out {held:.4}  (slot {}, lr {:.2e})",
+                total / (N_TRAIN * SEQ) as f32,
+                step % batches,
+                lr_at(step, peak_lr)
+            );
         }
     }
 
-    // Held-out gap AFTER recovery.
+    // Held-out gap AFTER recovery, and in-sample on the same slot-0 tokens.
     let eval_after = eval_kl(&mut gpu, &student, &eval_batch, &teacher_p_eval, &pos)?;
+    let train_last = eval_kl(
+        &mut gpu,
+        &student,
+        &train_pool[..N_TRAIN],
+        &teacher_p_pool[..N_TRAIN],
+        &pos,
+    )?;
 
     let pct = |a: f32, b: f32| if a > 1e-6 { 100.0 * (a - b) / a } else { 0.0 };
     println!(
-        "\n  ── {}{} recovery-FT ──",
+        "\n  ── {}{}{} recovery-FT ──",
         tier.width(),
+        match act_bits {
+            Some(b) => format!("A{b}"),
+            None => "A16".to_string(),
+        },
         if kvnoise { "+KVarN" } else { "" }
     );
     println!(
@@ -261,6 +456,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  HELD-OUT  KL: {eval_before:.4} → {eval_after:.4}  ({:.1}% recovered)",
         pct(eval_before, eval_after)
+    );
+    println!(
+        "  BEST held-out: {:.4} at step {}  ({:.1}% recovered)",
+        best.0,
+        best.1,
+        pct(eval_before, best.0)
     );
     println!("\n  (base {} weights frozen; only LoRA(q/v)+norm trained — measures the LIGHT-QAT\n   recoverable share of the {}{} deploy loss. Held-out is the honest number.)",
         tier.width(),

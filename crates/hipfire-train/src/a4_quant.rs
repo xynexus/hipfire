@@ -19,6 +19,8 @@
 //! [`crate::rotation::rotate_rows`]); so comparing [`snr_db`] across rotations is
 //! a faithful, kernel-free measurement of a rotation's A4 quality.
 
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
+
 /// int4 activation group width (matches `Oq4G256`).
 pub const GROUP: usize = 256;
 
@@ -26,7 +28,23 @@ pub const GROUP: usize = 256;
 /// activation buffer. Groups tile the `feat` dim in [`GROUP`]-wide chunks; a
 /// trailing partial group uses its own absmax. Returns the dequantized fp32.
 pub fn a4_simquant(x: &[f32], rows: usize, feat: usize) -> Vec<f32> {
+    simquant_bits(x, rows, feat, 4)
+}
+
+/// [`a4_simquant`] widened to any `bits` in `2..=8`, for sweeping the activation
+/// tier (A4 vs A8 vs unquantized A16) against one fixed weight tier.
+///
+/// Same absmax scale and the same `feat`-dim [`GROUP`] tiling — only the code
+/// width moves, so a sweep isolates the activation width and nothing else. The
+/// deliberate absence of a clip search is documented in the module header and
+/// applies at every width: online per-token activation quant cannot afford one.
+pub fn simquant_bits(x: &[f32], rows: usize, feat: usize, bits: u32) -> Vec<f32> {
     debug_assert_eq!(x.len(), rows * feat);
+    debug_assert!(
+        (2..=8).contains(&bits),
+        "simquant_bits: bits {bits} out of 2..=8"
+    );
+    let qmax = ((1i32 << (bits - 1)) - 1) as f32;
     let mut out = vec![0.0f32; rows * feat];
     for r in 0..rows {
         let row = &x[r * feat..r * feat + feat];
@@ -36,16 +54,68 @@ pub fn a4_simquant(x: &[f32], rows: usize, feat: usize) -> Vec<f32> {
             let end = (g + GROUP).min(feat);
             let grp = &row[g..end];
             let amax = grp.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let scale = (amax / 7.0).max(1e-12);
+            let scale = (amax / qmax).max(1e-12);
             let inv = 1.0 / scale;
             for (i, &v) in grp.iter().enumerate() {
-                let q = (v * inv).round().clamp(-7.0, 7.0);
+                let q = (v * inv).round().clamp(-qmax, qmax);
                 dst[g + i] = q * scale;
             }
             g = end;
         }
     }
     out
+}
+
+/// Activation tier from `HIPFIRE_QAT_ACT`: `a16` (default, no quant) | `a8` | `a4`.
+/// `None` means leave activations alone, so the default forward is byte-identical.
+///
+/// Deliberately **uncached**, matching [`crate::kv_noise::cfg_from_env`]: the QAT
+/// example flips this off for the clean-teacher precompute and back on for the
+/// student, which only works if every call re-reads the process env. Do not add
+/// a `OnceLock` here — `ops::linear` caches its own precision env that way, and
+/// copying that would freeze the gate at the teacher's clean state.
+///
+/// Panics on an unrecognised value rather than silently running A16: a typo that
+/// quietly disables the arm under test is the expensive failure here.
+pub fn act_bits_from_env() -> Option<u32> {
+    // Activation sim-quant tier for QAT: a16 (default, no-op) | a8 | a4.
+    match std::env::var("HIPFIRE_QAT_ACT")
+        .unwrap_or_else(|_| "a16".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "a16" | "" => None,
+        "a8" => Some(8),
+        "a4" => Some(4),
+        other => panic!("HIPFIRE_QAT_ACT: unknown tier {other:?} (want a16|a8|a4)"),
+    }
+}
+
+/// Fake-quantize one linear's input activation **in place**, forward-only (STE).
+/// No-op when `bits` is `None`.
+///
+/// `x` is `[rows, feat]` row-major with `feat` the projection's input width, so
+/// groups tile channels — never tokens. Writing back into the *same* buffer is
+/// what makes the STE free and self-consistent: the perturbed values are what
+/// land in `BlockActivations`, so `linear_backward_w`'s `dw = dyᵀ·x` uses the
+/// same `X` the forward multiplied, while `dx = dy·W` never reads `x` at all.
+/// Perturbing a copy and leaving the original saved would differentiate a graph
+/// that never ran.
+///
+/// In-place also avoids the alloc/free churn [`crate::kv_noise`] needs —
+/// `GpuTensor` has no `Drop`, and this runs on four tensors per block per step.
+pub fn maybe_quant_act(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    rows: usize,
+    feat: usize,
+    bits: Option<u32>,
+) -> HipResult<()> {
+    let Some(bits) = bits else { return Ok(()) };
+    let host = gpu.download_f32(x)?;
+    let q = simquant_bits(&host, rows, feat, bits);
+    let bytes = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q.len() * 4) };
+    gpu.memcpy_htod_auto(&x.buf, bytes)
 }
 
 /// Reconstruction SNR in dB: `10·log10(‖x‖² / ‖x − x̂‖²)`. Higher is better;
@@ -97,6 +167,30 @@ mod tests {
             }
         }
         x
+    }
+
+    /// `simquant_bits` must reproduce `a4_simquant` exactly at bits=4 (the
+    /// widening is not allowed to move the deployed A4 grid), and SNR must rise
+    /// monotonically with width. A sign or off-by-one in `qmax` breaks one or
+    /// the other.
+    #[test]
+    fn simquant_bits_matches_a4_and_is_monotone_in_width() {
+        let (rows, feat) = (4, GROUP + 33); // include a trailing partial group
+        let x = heavy_tailed(rows, feat, 0xA4);
+        assert_eq!(
+            simquant_bits(&x, rows, feat, 4),
+            a4_simquant(&x, rows, feat),
+            "bits=4 must be bit-identical to the a4 path"
+        );
+        let mut prev = f32::NEG_INFINITY;
+        for bits in [2u32, 3, 4, 6, 8] {
+            let snr = snr_db(&x, &simquant_bits(&x, rows, feat, bits));
+            assert!(
+                snr > prev,
+                "SNR must increase with width: {bits} bits gave {snr} dB, not > {prev}"
+            );
+            prev = snr;
+        }
     }
 
     #[test]
