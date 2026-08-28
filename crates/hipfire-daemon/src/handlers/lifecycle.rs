@@ -272,16 +272,16 @@ pub(crate) fn load(
         .and_then(|v| v.as_u64())
         .unwrap_or(2) as usize;
 
-    // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
-    // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
-    // Accepted here; the generate loop will honor it in the
-    // 0.1.7-stable release where we port the demo's outer τ-window
-    // trip-wire (below 2.5 → shrink block to 8).
-    let _adaptive_b = msg
+    // DFlash tuning knobs forwarded from the CLI. `adaptive_b` drives the
+    // cost-model BlockController in the generate loop. Opt-in for now: with
+    // the block range clamped to the trained block, the controller measured a
+    // ~25% decode loss on gfx1103/27B (no upside in range to pay for its
+    // ramp) — see DflashState::adaptive_b.
+    let adaptive_b = msg
         .get("params")
         .and_then(|p| p.get("dflash_adaptive_b"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     // 0.1.7: TriAttention / CASK eviction protocol fields. When
     // `cask_sidecar` is set, `load_model` sizes the KV cache to a
@@ -587,6 +587,9 @@ pub(crate) fn load(
     }
     match load_result {
         Ok(mut m) => {
+            if let Some(df) = m.dflash.as_mut() {
+                df.adaptive_b = adaptive_b;
+            }
             daemon_state
                 .resource_reservations
                 .set_worker_usage(requested_worker_id.clone(), planned_resource_usage);

@@ -121,6 +121,11 @@ pub struct DflashState {
     pub ctx_capacity: usize,
     /// Block size the draft was trained at.
     pub block_size: usize,
+    /// Adaptive block sizing (cost-model argmax over [2, block_size]) in the
+    /// chain-mode decode loop. Per-load `dflash_adaptive_b` param; default OFF
+    /// (opt-in) — see the load-site comment for the measurement. A
+    /// `HIPFIRE_DFLASH_BLOCK` pin overrides it.
+    pub adaptive_b: bool,
     /// Optional DDTree state. Populated only when `HIPFIRE_DDTREE_BUDGET` is
     /// set to a positive integer at daemon startup. None = DDTree disabled,
     /// the decode loop falls through to `spec_step_dflash` (chain mode).

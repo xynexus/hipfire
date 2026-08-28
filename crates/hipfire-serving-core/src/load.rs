@@ -4768,6 +4768,12 @@ fn load_dflash_state_source(
         target_hidden_host,
         ctx_capacity,
         block_size,
+        // Opt-in (dflash_adaptive_b:true). Measured on gfx1103/Qwen3.8-27B:
+        // with max_block clamped to the trained block the controller has no
+        // upside to find (the trained block IS the in-range optimum) and the
+        // ramp costs ~25% decode. Flip once scratches are sized for B above
+        // trained (scope doc item 4) and the search space contains a win.
+        adaptive_b: false,
         ddtree,
     })
 }

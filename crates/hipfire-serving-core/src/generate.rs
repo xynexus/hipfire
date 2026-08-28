@@ -891,11 +891,35 @@ pub fn generate_dflash(
         }
     };
 
+    // Adaptive block sizing (scope doc item 3): the dspark cost-model
+    // controller, driven with per-window accept depth + wall time. Chain mode
+    // only (the DDTree steps take no block override). max_block is clamped to
+    // the trained block so every scratch stays validly sized (item 4 — sizing
+    // for B above trained — is not landed); an explicit HIPFIRE_DFLASH_BLOCK
+    // pin wins over the controller.
+    let mut block_controller = if df.adaptive_b
+        && df.ddtree.is_none()
+        && dflash_block_override().is_none()
+        && df.block_size > 2
+    {
+        Some(
+            hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
+                df.block_size,
+                2,
+                df.block_size,
+                0.18, // dormant cost prior; live window timing replaces it
+            ),
+        )
+    } else {
+        None
+    };
+
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while !first_filter_stop && !first_token_is_eos && generated < max_tokens {
         if position + df.block_size >= ctx_capacity {
             break;
         }
+        let window_started = Instant::now();
 
         // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
         // at startup), route through `spec_step_ddtree_batched`. Otherwise
@@ -970,8 +994,9 @@ pub fn generate_dflash(
                 Some(&mut df.gdn_tape),
                 0.0_f32, // temperature
                 &mut rng_state,
-                dflash_block_override(), // block_size override
-                None,                    // ngram_cache
+                // Block override: env pin, else the adaptive controller.
+                dflash_block_override().or_else(|| block_controller.as_ref().map(|c| c.block())),
+                None, // ngram_cache
                 &emitted,
                 0.0_f32, // cactus_delta
                 None,    // pld_spine
@@ -995,6 +1020,13 @@ pub fn generate_dflash(
         // committed = committed.len(). (`committed` includes the seed, length
         // accept+2.)
         spec_metrics.record_window(step.drafted.len(), step.accepted, step.committed.len());
+        if let Some(c) = block_controller.as_mut() {
+            // Full-window wall time (draft+verify), the controller's calibration
+            // signal; n_verify = 1 + drafted block, matching its indexing.
+            let t_window_ms = window_started.elapsed().as_secs_f32() * 1000.0;
+            c.observe_timing(t_window_ms, step.drafted.len() + 1);
+            c.observe(step.accepted, step.drafted.len());
+        }
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
 
         let mut hit_eos = false;
