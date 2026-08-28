@@ -32,6 +32,43 @@ boundaries, not context length.
   so it is not accumulated drift, and the MoE gate reads 0.000e0.
 - Not a drafter problem: tau is measured against the verifier's own argmax.
 - Full evidence: `docs/bugs/2026-08-27-spec-decode-ar-divergence.md`.
+## 8 gfx1151 baselines are stale — `qwen3_5_moe_indexed` fixture changed shape
+
+**Created 2026-08-27 by #379 (merged). Needs a `--record` run on halo.**
+
+#379 raised `moe_indexed_preset`'s `shared_inter` 128 → 256 so the shared
+expert's `down_proj` stops being ragged for a 256-wide Opus group. That changes
+the fixture's shape, which invalidates its recorded baselines.
+
+The gfx1103 rows were re-recorded in that PR. **The gfx1151 rows could not be**
+— recording needs the GPU, and halo's was held by an active `qat-opus-sweep`
+(44+ min at the time, alongside a 1d2h `hipfire` and a 23h `hipfire-coexist`).
+Contending with a QAT sweep to refresh baselines is the wrong trade, especially
+if that sweep is measuring throughput.
+
+| file | stale rows |
+|---|---|
+| `tests/tiny-quant-baselines.txt` | 7 (`gfx1151 qwen3_5_moe_indexed …`) |
+| `tests/tiny-state-baselines.txt` | 1 (`gfx1151 qwen3_5_moe_indexed fp16`) |
+
+**To clear, on halo, once the GPU is free:**
+
+```sh
+HIPFIRE_TINYQUANT_FAMILIES=qwen3_5_moe_indexed ./tests/tiny-quant-gate.sh --record
+./tests/tiny-state-gate.sh --record   # scoped to the same family
+```
+
+Expect the recorded numbers to move substantially. That is **not** a quality
+change — the fixture is a different model now, so the values measure a different
+target and are not comparable to the pre-#379 ones. The gfx1103 side moved the
+same way for the same reason.
+
+Until then those cells report a mismatch or no-baseline. That is visible and
+non-fatal — unlike the failure mode #375 documented, where a cell *passes*
+without measuring anything — but it does mean gfx1151 has no live coverage of
+this family, on the very fixture that just gained the uniform-Oq4 batched-prefill
+cell (`docs/todo/2026-08-27-oq4-moe-prefill-coverage.md`).
+
 ## [RETRACTED — opt-in by design] HFQ requant and the K % 256 fallback
 
 **Retracted 2026-08-27, same day it was filed.** The fallback is not missing, it
