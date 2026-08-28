@@ -6,7 +6,7 @@
 //! No link-time dependency — runtime loads the shared library.
 
 use crate::error::{HipError, HipResult};
-use crate::{DeviceBuffer, MemcpyKind};
+use crate::{BufferOrigin, DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
@@ -906,7 +906,11 @@ impl HipRuntime {
                 &format!("hipMalloc({size} bytes = {:.2} MiB){where_}", mib(size)),
             ));
         }
-        Ok(DeviceBuffer { ptr, size })
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            origin: BufferOrigin::Direct,
+        })
     }
 
     /// Allocate page-locked host memory through HIP. This is the staging
@@ -938,6 +942,14 @@ impl HipRuntime {
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
+        // A non-owning view reaching hipFree frees memory it does not own, which
+        // is the corruption in #262 with the pool taken out of the middle.
+        debug_assert!(
+            buf.origin() != BufferOrigin::NonOwning,
+            "hipFree on a non-owning buffer ({:p}, {} B)",
+            buf.ptr,
+            buf.size
+        );
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
     }

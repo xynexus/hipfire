@@ -5,7 +5,7 @@
 //! GPU memory pool — eliminates hipMalloc/hipFree overhead in the hot loop.
 //! Pre-allocates buffers of common sizes and reuses them via a free list.
 
-use hip_bridge::{DeviceBuffer, HipResult, HipRuntime};
+use hip_bridge::{BufferOrigin, DeviceBuffer, HipResult, HipRuntime};
 use std::collections::HashMap;
 
 const MIN_ALLOC: usize = 256;
@@ -68,7 +68,7 @@ impl GpuPool {
                     self.total_reused += 1;
                     return Ok(buf);
                 }
-                let _ = hip.free(buf);
+                let _ = hip.free(buf.with_origin(BufferOrigin::Direct));
             }
         }
         // No suitable buffer — allocate at exact requested size. Round up
@@ -77,7 +77,10 @@ impl GpuPool {
         let actual = if size < MIN_ALLOC { MIN_ALLOC } else { size };
         self.total_new += 1;
         self.total_allocated += actual;
-        hip.malloc(actual)
+        // `hip.malloc` stamps Direct. The pool is taking responsibility for this
+        // buffer from here on, so re-stamp it Pooled: that is what routes it back
+        // to `GpuPool::free` instead of `hipFree` when the caller is done.
+        Ok(hip.malloc(actual)?.with_origin(BufferOrigin::Pooled))
     }
 
     /// Return a buffer to the pool for reuse. The buffer's ACTUAL
@@ -85,6 +88,16 @@ impl GpuPool {
     /// power-of-2 bucket so same-size-shaped requests hit the same
     /// slot.
     pub fn free(&mut self, buf: DeviceBuffer) {
+        // `Gpu::dispose` routes on the tag, so only pooled buffers should arrive.
+        // A Direct one here is the #253 leak (a hipMalloc buffer piling into a
+        // list nothing draws from); a NonOwning one is the #262 corruption.
+        debug_assert!(
+            buf.origin() == BufferOrigin::Pooled,
+            "GpuPool::free on a {:?} buffer ({:p}, {} B) — allocation and free disagree",
+            buf.origin(),
+            buf.as_ptr(),
+            buf.size()
+        );
         let bucket = Self::bucket_key(buf.size());
         self.free_lists.entry(bucket).or_default().push(buf);
     }
@@ -93,7 +106,8 @@ impl GpuPool {
     pub fn drain(&mut self, hip: &HipRuntime) {
         for (_, list) in self.free_lists.drain() {
             for buf in list {
-                let _ = hip.free(buf);
+                // Ownership leaves the pool for HIP; stamp to match.
+                let _ = hip.free(buf.with_origin(BufferOrigin::Direct));
             }
         }
     }
