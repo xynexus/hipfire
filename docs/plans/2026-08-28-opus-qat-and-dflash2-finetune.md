@@ -32,10 +32,10 @@ measured at ~52% recoverable. W4 (the deployed tier) has no number.
 
 ### Two traps that already cost a session — read before running
 
-1. **`DEFAULT_DIR` in the example is stale.** It points at
-   `SupraLabs--Supra-50M-Instruct`, whose local snapshot holds only a `.gguf`.
-   `load_llama_fp32` wants safetensors, so it dies with "no .safetensors files
-   found" *before* touching the GPU. Always pass a model dir.
+1. ~~**`DEFAULT_DIR` in the example is stale.**~~ **FIXED 2026-08-28** — it now
+   points at `Llama-3.2-1B/snapshots/main`, and a safetensors preflight names the
+   reason instead of letting the loader emit a bare "no .safetensors files found"
+   before touching the GPU.
 2. **Llama-3.2-1B has a revision trap** — same shape as the ZAYA one in
    `AGENTS.local.md`. Two snapshots exist and only `snapshots/main` carries
    `model.safetensors`; `snapshots/<hash>/` is empty of weights, so
@@ -51,13 +51,28 @@ measured at ~52% recoverable. W4 (the deployed tier) has no number.
 
 ### Steps
 
-1. Run the sweep `oq8 / oq4 / oq3` on one model and report **held-out** KL
-   before vs after recovery, plus recovered share per tier. Held-out is the
-   honest number; in-sample is not.
-2. Fix `DEFAULT_DIR` to something that actually loads, or make the example fail
-   with the reason rather than a bare loader error.
+1. ✅ **DONE 2026-08-28** — results in
+   `docs/experiments/2026-08-28-opus-qat-tier-sweep.md`. Held-out recovered
+   share, KV clean, real text, LR 1e-4 warmup+cosine: **W8 ~0%** (nothing to
+   recover — 0.0012 nats/tok), **W4 37.0%** (0.2211 → 0.1392),
+   **W3 65.1%** (1.3768 → 0.4798).
+2. ✅ **DONE** — `DEFAULT_DIR` repointed at `Llama-3.2-1B/snapshots/main` plus a
+   safetensors preflight that names the reason.
 3. Then decide whether light QAT (LoRA only) is enough for W4 or whether the
    base weights need to move.
+
+Three defects had to be fixed before step 1 produced a trustworthy number, all
+detailed in the experiment doc: the dead `DEFAULT_DIR`; a 64-token training set
+that memorised (72.7% in-sample while held-out got *worse*), fixed with a
+32-batch cycled pool over real text via `HIPFIRE_QAT_CORPUS`; and a missing LR
+schedule, fixed with 10-step warmup + cosine and `HIPFIRE_QAT_LR`. Peak 1e-4
+beats 1e-3 at every tier.
+
+⚠️ **The default arm measures KV quantization, not the Opus tier.**
+`HIPFIRE_QAT_KVNOISE` defaults on, and its W8 before-KL is 2.5152 against a
+weight-only W8 loss of 0.0012 — ~2.5 nats/tok of common KVarN-4 floor, larger
+than W3's entire weight-only loss. Pass `HIPFIRE_QAT_KVNOISE=0` to measure a
+weight tier.
 
 ### Stage A2 — QAT the Opus **W4A4** path
 
@@ -89,33 +104,43 @@ Everything needed already exists and has simply never been wired to the QAT loop
 
 Steps:
 
-1. Add an activation-quant arm to `qat_opus_kvarn` — student activations through
-   `a4_simquant` with an STE so gradients survive — gated separately from the
-   weight tier (e.g. `HIPFIRE_QAT_ACT=a16|a8|a4`, default `a16` so Stage A1's
-   numbers do not move).
-2. Sweep **W4A16 / W4A8 / W4A4** with the same LoRA budget and report held-out
-   recovered share. The question is whether light QAT recovers the ~3.5 dB A4
-   costs, or whether A4 needs the base weights to move.
-3. Then add the rotation: A4 is what rotations exist *for* (they Gaussianize
-   activations whose measured kurtosis exceeds 200). Score fixed-FWHT vs learned
-   R1 under QAT.
+1. ✅ **DONE 2026-08-28** — `HIPFIRE_QAT_ACT=a16|a8|a4`, default `a16` (a true
+   no-op: the A16 leg reproduced Stage A1's `oq4` to four decimals). Applied to
+   the FOUR tensors that feed all seven projections (`xn1`, `ctx`, `xn2`, `act`)
+   in `block_forward_inner`, not to `linear_forward` — that funnel also carries
+   `lm_head`, the MoE router and the LoRA B leg whose `K = lora_rank` < GROUP.
+2. ✅ **DONE** — results in `docs/experiments/2026-08-28-opus-qat-tier-sweep.md`.
+   Held-out recovered, weight tier pinned at `oq4`:
+   **A16 37.0%** (0.2211 → 0.1392), **A8 35.2%** (0.2202 → 0.1426),
+   **A4 23.0%** (0.8624 → 0.6637).
+   **Answer: light QAT does NOT absorb A4.** It nearly quadruples the deploy loss
+   (3.90×) and then recovers a *smaller* share of it, leaving a 4.8× worse
+   residual. A4's best point is step 80, not 120 — it turns around, so a longer
+   budget is not the lever either. A8 ≈ A16 is confirmed, which retroactively
+   justifies Stage A1 being weight-only.
+3. **NEXT, and now the live question** — add the rotation: A4 is what rotations
+   exist *for* (they Gaussianize activations whose measured kurtosis exceeds
+   200). Score fixed-FWHT vs learned R1 under QAT, since LoRA alone is ruled out.
 
 ⚠️ **Learned rotations are PREFILL-ONLY.** A previously measured result: the
 learned M wins on prefill, while plain FWHT is best at decode. So a learned-R1
 QAT result does not automatically transfer to the decode path — state which
 phase any number belongs to.
 
-### Known weakness worth fixing early
+### Known weakness — FIXED 2026-08-28, and it was worse than described
 
-The batches are **synthetic random token ids**
-(`(t+1)*2654435761 + (s+salt)*40503 % vocab`), with `SEQ=16`, `N_TRAIN=4`,
-`N_EVAL=4`. Train/eval use disjoint salts so there is no train-on-test, but a
-"recoverable share" measured on uniform-random tokens may not transfer to real
-text — quantization damage concentrates on the activations real text actually
-produces. Consider swapping in a real corpus slice before trusting the numbers
-for a deploy decision. Related: `reference_calib_corpus_construction`, and the
-retracted "budget = −13.6%" result that came from a calib corpus and a KLD ref
-being the same file.
+The batches were **synthetic random token ids** with `SEQ=16`, `N_TRAIN=4`,
+`N_EVAL=4`. Disjoint salts meant no train-on-test, but the real problem was size,
+not realism: `N_TRAIN * SEQ` = **64 training tokens** against 97 trainable
+tensors. The loop memorised them — in-sample KL 2.2430 → 0.6114 (72.7%
+"recovered") while held-out went 2.5152 → **2.9003, 15% worse**.
+
+Fixed by `HIPFIRE_QAT_CORPUS=<text file>`: real text tokenized with the model's
+own `tokenizer.json`, a 32-batch cycled train pool (128 seq) and 32 held-out seq
+drawn from the **opposite half of the file**. Unset still gives the old synthetic
+path, so historical numbers stay reproducible. Related:
+`reference_calib_corpus_construction`, and the retracted "budget = −13.6%" result
+that came from a calib corpus and a KLD ref being the same file.
 
 ---
 
