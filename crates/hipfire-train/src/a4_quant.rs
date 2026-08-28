@@ -19,6 +19,7 @@
 //! [`crate::rotation::rotate_rows`]); so comparing [`snr_db`] across rotations is
 //! a faithful, kernel-free measurement of a rotation's A4 quality.
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// int4 activation group width (matches `Oq4G256`).
@@ -295,6 +296,22 @@ pub fn act_tiers_from_env() -> ActTiers {
 ///
 /// In-place also avoids the alloc/free churn [`crate::kv_noise`] needs —
 /// `GpuTensor` has no `Drop`, and this runs on four tensors per block per step.
+/// The codec's per-256 signed FWHT applied to every row, in place. `inverse`
+/// swaps the sign tables, which is how `signed_fwht` inverts.
+fn fwht_rows(x: &mut [f32], rows: usize, feat: usize, inverse: bool) {
+    let s1 = gen_fwht_signs(42, GROUP);
+    let s2 = gen_fwht_signs(1042, GROUP);
+    let (a, b) = if inverse { (&s2, &s1) } else { (&s1, &s2) };
+    for r in 0..rows {
+        let row = &mut x[r * feat..r * feat + feat];
+        for g in row.chunks_mut(GROUP) {
+            if g.len() == GROUP {
+                cpu_fwht_256(g, a, b);
+            }
+        }
+    }
+}
+
 pub fn maybe_quant_act(
     gpu: &mut Gpu,
     x: &GpuTensor,
@@ -303,8 +320,30 @@ pub fn maybe_quant_act(
     tier: Option<ActTier>,
 ) -> HipResult<()> {
     let Some(tier) = tier else { return Ok(()) };
-    let host = gpu.download_f32(x)?;
-    let q = simquant_outlier(&host, rows, feat, tier.bits, tier.outliers);
+    let mut host = gpu.download_f32(x)?;
+    // Quantize in the basis the GEMM actually runs in. `quantize_act_oq4.hip`
+    // documents its input as "assumed already FWHT-rotated", and
+    // `fused_rmsnorm_mq_rotate_plain.hip` performs that rotation inside RMSNorm,
+    // so the deployed W4A4 path rotates BOTH operands with the codec's per-256
+    // FWHT. Quantizing the raw channel-basis activation models a grid ~6 dB
+    // harsher than anything that ships (measured: a4 15.68 dB vs 22.13 dB
+    // rotated, `examples/two_pass_act_probe.rs`).
+    //
+    // Rotate -> quantize -> inverse-rotate leaves the result in the channel basis
+    // for the rest of the fp32 forward, while the error is the one the rotated
+    // int4 grid actually produces: <Fᵀ Q(Fx), Fᵀ Q(FW)> = <Q(Fx), Q(FW)>.
+    //
+    // HIPFIRE_QAT_ACT_UNROTATED=1 restores the old behaviour to reproduce the
+    // superseded Stage A2/A2b activation arms.
+    let rotate = feat % GROUP == 0
+        && std::env::var("HIPFIRE_QAT_ACT_UNROTATED").ok().as_deref() != Some("1");
+    if rotate {
+        fwht_rows(&mut host, rows, feat, false);
+    }
+    let mut q = simquant_outlier(&host, rows, feat, tier.bits, tier.outliers);
+    if rotate {
+        fwht_rows(&mut q, rows, feat, true);
+    }
     let bytes = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q.len() * 4) };
     gpu.memcpy_htod_auto(&x.buf, bytes)
 }
@@ -358,6 +397,43 @@ mod tests {
             }
         }
         x
+    }
+
+    /// The FWHT must round-trip, and quantizing in the rotated basis must beat
+    /// the channel basis end to end through a weight. If the second half ever
+    /// fails, the deployed W4A4 path's rotation is not buying what it is there
+    /// for and `maybe_quant_act` should stop applying it.
+    #[test]
+    fn rotated_basis_quant_beats_channel_basis() {
+        let (rows, feat, out) = (8usize, GROUP * 2, 16usize);
+        let x = heavy_tailed(rows, feat, 0xF00D);
+
+        // Round-trip: forward then inverse is the identity.
+        let mut rt = x.clone();
+        fwht_rows(&mut rt, rows, feat, false);
+        fwht_rows(&mut rt, rows, feat, true);
+        for (a, b) in x.iter().zip(rt.iter()) {
+            assert!((a - b).abs() < 1e-3, "fwht round-trip drifted: {a} vs {b}");
+        }
+
+        // End to end through a weight, which is the only honest metric here --
+        // raw reconstruction SNR is dominated by the outliers, which quantize
+        // well (see `hadamard_beats_identity_end_to_end`).
+        let w = heavy_tailed(out, feat, 0xBEEF);
+        let y = matmul_t(&x, &w, rows, feat, out);
+
+        let channel = simquant_bits(&x, rows, feat, 4);
+        let mut rot = x.clone();
+        fwht_rows(&mut rot, rows, feat, false);
+        let mut rotated = simquant_bits(&rot, rows, feat, 4);
+        fwht_rows(&mut rotated, rows, feat, true);
+
+        let snr_channel = snr_db(&y, &matmul_t(&channel, &w, rows, feat, out));
+        let snr_rotated = snr_db(&y, &matmul_t(&rotated, &w, rows, feat, out));
+        assert!(
+            snr_rotated > snr_channel,
+            "rotated {snr_rotated} dB did not beat channel {snr_channel} dB"
+        );
     }
 
     /// The per-site grammar must actually override the base, and must leave the

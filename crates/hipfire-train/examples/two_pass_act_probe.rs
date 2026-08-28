@@ -41,6 +41,7 @@ use hipfire_rdna::Gpu;
 use hipfire_train::a4_quant::{simquant_bits, simquant_outlier, snr_db, GROUP};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
+use hipfire_train::oqplus_quant::oqplus_simquant;
 use hipfire_train::rotation::{apply_r1, rotate_rows, Rotation};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -247,46 +248,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Each scheme returns the end-to-end output SNR in dB, higher is better.
+    // BOTH operands quantized. The earlier version of this probe held the weight
+    // at fp32, which made the rotation's effect on the weight -- the side it
+    // exists for -- invisible, and made "no rotation" look like a real option.
+    // It is not: quantize_act_oq4.hip states its input is "assumed already
+    // FWHT-rotated", and fused_rmsnorm_mq_rotate_plain.hip performs that
+    // rotation inside RMSNorm. The deployed W4A4 path rotates BOTH operands with
+    // the codec's per-256 FWHT, always.
+    //
+    // Everything below is therefore expressed in the codec's F basis, where the
+    // GEMM actually happens. F is orthonormal, so <Fx, FW> = <x, W> and
+    // rotate_rows(oqplus_simquant(w), F) recovers exactly the int4 weight the
+    // codec stores.
     let mut sums: Vec<(String, f32)> = vec![
-        ("a4  (uniform, no rotation)".to_string(), 0.0),
-        ("a4  + Hadamard".to_string(), 0.0),
-        ("a4  + codec block-FWHT".to_string(), 0.0),
-        (format!("a4o{n_out} (promote, no rotation)"), 0.0),
-        (format!("a4o{n_out} + Hadamard"), 0.0),
-        (format!("a4o{n_out} + codec block-FWHT"), 0.0),
         (
-            format!("2-pass: int8 top-{n_out} pre-rot, a4 residual post-rot"),
+            "W4A16  (weight quantized, activation exact)".to_string(),
             0.0,
         ),
-        ("a8  (uniform, no rotation) [ceiling]".to_string(), 0.0),
+        (
+            "W4A4   deployed: a4 on the rotated activation".to_string(),
+            0.0,
+        ),
+        (
+            format!("W4A4 + promote o{n_out} in the F basis (deployable)"),
+            0.0,
+        ),
+        (
+            format!("W4A4 + promote o{n_out} in the CHANNEL basis [needs unrotated W]"),
+            0.0,
+        ),
+        (
+            format!("W4A4   2-pass: int8 top-{n_out} channel-basis + a4 residual in F"),
+            0.0,
+        ),
+        (
+            "W4A8   deployed (a8 on the rotated activation)".to_string(),
+            0.0,
+        ),
     ];
     for (_, x, w, k, out) in cap.iter() {
         let (k, out) = (*k, *out);
-        let y = matmul_t(x, w, SEQ, k, out);
-        let (had, bf) = &rots[&k];
-        let xr = rotate_rows(x, had, SEQ);
-        let wr = rotate_rows(w, had, out);
-        let xb = rotate_rows(x, bf, SEQ);
-        let wb = rotate_rows(w, bf, out);
-        let snr = |xq: &[f32], wu: &[f32]| snr_db(&y, &matmul_t(xq, wu, SEQ, k, out));
+        let (_had, bf) = &rots[&k];
+        let y = matmul_t(x, w, SEQ, k, out); // fp32 reference
+        let x_f = rotate_rows(x, bf, SEQ); // activation in the codec basis
+        let w_hat = oqplus_simquant(w); // codec-quantized weight, channel basis
+        let w_hat_f = rotate_rows(&w_hat, bf, out); // ... same weight, F basis
+        let snr_f = |xq: &[f32]| snr_db(&y, &matmul_t(xq, &w_hat_f, SEQ, k, out));
 
-        sums[0].1 += snr(&simquant_bits(x, SEQ, k, 4), w);
-        sums[1].1 += snr(&simquant_bits(&xr, SEQ, k, 4), &wr);
-        sums[2].1 += snr(&simquant_bits(&xb, SEQ, k, 4), &wb);
-        sums[3].1 += snr(&simquant_outlier(x, SEQ, k, 4, n_out), w);
-        sums[4].1 += snr(&simquant_outlier(&xr, SEQ, k, 4, n_out), &wr);
-        sums[5].1 += snr(&simquant_outlier(&xb, SEQ, k, 4, n_out), &wb);
-
-        // Two-pass: sparse int8 in the channel basis, int4 residual in the
-        // rotated basis. y ≈ s·Wᵀ + Q4(r Rᵀ)·(W Rᵀ)ᵀ — two GEMMs, two bases.
-        let s = sparse_top_k_int8(x, SEQ, k, n_out);
-        let r_rot = rotate_rows(&sub(x, &s), had, SEQ);
-        let y_lo = matmul_t(&s, w, SEQ, k, out);
-        let y_hi = matmul_t(&simquant_bits(&r_rot, SEQ, k, 4), &wr, SEQ, k, out);
+        sums[0].1 += snr_f(&x_f);
+        sums[1].1 += snr_f(&simquant_bits(&x_f, SEQ, k, 4));
+        sums[2].1 += snr_f(&simquant_outlier(&x_f, SEQ, k, 4, n_out));
+        // Promotion in the CHANNEL basis, where the outliers are actually sparse.
+        // Needs the weight unrotated, so it is a numerical ceiling, not a config.
+        sums[3].1 += snr_db(
+            &y,
+            &matmul_t(&simquant_outlier(x, SEQ, k, 4, n_out), &w_hat, SEQ, k, out),
+        );
+        // Two-pass: sparse int8 against the unrotated weight, int4 residual
+        // against the rotated one. Two bases -> two weight copies.
+        let sp = sparse_top_k_int8(x, SEQ, k, n_out);
+        let r_f = rotate_rows(&sub(x, &sp), bf, SEQ);
+        let y_lo = matmul_t(&sp, &w_hat, SEQ, k, out);
+        let y_hi = matmul_t(&simquant_bits(&r_f, SEQ, k, 4), &w_hat_f, SEQ, k, out);
         let y2: Vec<f32> = y_lo.iter().zip(&y_hi).map(|(a, b)| a + b).collect();
-        sums[6].1 += snr_db(&y, &y2);
+        sums[4].1 += snr_db(&y, &y2);
 
-        sums[7].1 += snr(&simquant_bits(x, SEQ, k, 8), w);
+        sums[5].1 += snr_f(&simquant_bits(&x_f, SEQ, k, 8));
     }
     let n = cap.len() as f32;
     println!("  ── end-to-end output SNR through the real weight (dB, higher better) ──");

@@ -156,6 +156,17 @@ readback rather than assumed.
 
 # Stage A2 — the W4**A4** path
 
+> ⚠️ **SUPERSEDED IN PART — see Stage A2d.** Every activation-tier number in
+> Stage A2 and A2b quantized the **raw channel-basis** activation. The deployed
+> W4A4 path rotates the activation with the codec's per-256 FWHT first
+> (`quantize_act_oq4.hip` documents its input as "assumed already FWHT-rotated";
+> `fused_rmsnorm_mq_rotate_plain.hip` performs that rotation inside RMSNorm).
+> Rotating is worth **+6.45 dB** on its own, so these arms describe a grid far
+> harsher than anything that ships and the A4 loss figures are pessimistic. The
+> weight-tier results (Stage A1, and the compact-grid section) are unaffected —
+> `oqplus_simquant` always applied the FWHT. `maybe_quant_act` now quantizes in
+> the rotated basis; these arms need re-running.
+
 Plan §"Stage A2". Same day, same model and harness, weight tier pinned at `oq4`
 (W4), KV clean, real text, LR 1e-4 warmup+cosine, 120 steps. **Only the
 activation width moves**, so the sweep isolates it.
@@ -450,3 +461,72 @@ conclusion did not change" is only reassuring if you check.
   loss-level measurement.
 - Nothing here prices the runtime mask against `iu4x2`'s second activation plane,
   which is the actual A8-vs-promotion decision.
+
+
+---
+
+# Stage A2d — which basis does the deployed W4A4 actually quantize in?
+
+Prompted by a correction: the earlier two-pass probe (Stage A2c) held the
+**weight at fp32**, so it scored the rotation on the activation operand only —
+while the rotation's main job is making the *weight* quantization work. And it
+treated "no rotation" as a baseline, which the serving path cannot express.
+
+## Ground truth
+
+- `kernels/src/quantize_act_oq4.hip` — `X : [B, K] f32 activations` **"(assumed
+  already FWHT-rotated / SmoothQuant'd)"**.
+- `kernels/src/fused_rmsnorm_mq_rotate_plain.hip` — Phase 2 *is* the FWHT
+  rotation, fused into RMSNorm; it emits both `x_rot` and `x_plain`.
+
+**The deployed W4A4 path rotates BOTH operands with the codec's per-256 FWHT,
+always.** "Unrotated" is not a configuration.
+
+## Corrected comparison, both operands quantized, in the codec basis
+
+Since F is orthonormal, `<Fx, FW> = <x, W>`, and
+`rotate_rows(oqplus_simquant(w), F)` recovers exactly the int4 weight the codec
+stores. End-to-end output SNR (dB), 64 (act, weight) pairs, real text:
+
+| scheme | n_out=8 | n_out=16 |
+|---|---|---|
+| W4A16 — weight quantized, activation exact | **22.00** | 22.00 |
+| W4A4 deployed — a4 on the rotated activation | 18.80 | 18.80 |
+| **W4A4 + promote in the F basis (deployable)** | **20.12** | **20.53** |
+| W4A4 + promote in the channel basis (needs unrotated W) | 20.07 | 20.74 |
+| W4A4 2-pass (channel-basis int8 + F-basis a4 residual) | 19.85 | 20.23 |
+| W4A8 deployed | 21.98 | 21.98 |
+
+Three conclusions, two of which correct Stage A2c:
+
+1. **W4A16 = 22.00 is the ceiling.** Once the weight is int4, no activation
+   scheme can pass it, and W4A8 (21.98) already reaches it. The entire activation
+   budget is the 3.2 dB from 18.80 to 22.00.
+2. **Promotion works equally well in the rotated basis** — 20.12 vs 20.07 at k=8,
+   20.53 vs 20.74 at k=16. It **composes with** the rotation rather than
+   substituting for it. Stage A2c's "rotation and promotion are substitutes" was
+   an artifact of scoring only the activation operand.
+3. **Two-pass is moot, not merely losing.** It trails single-pass F-basis
+   promotion (19.85 vs 20.12), but the real point is that there is no longer any
+   reason to want the channel basis — which also makes the 30–49% static-mask
+   coverage irrelevant, since that only ever mattered for a channel-basis sparse
+   term needing unrotated weight columns.
+
+Deployable promotion buys **+1.32 dB** at n_out=8 and **+1.73 dB** at n_out=16 on
+top of today's W4A4, closing 41% / 54% of the gap to W4A16 — with no second
+weight copy and no change of basis.
+
+## Consequence for the QAT arms
+
+`maybe_quant_act` quantized the raw channel-basis activation, so every A4 figure
+in Stage A2/A2b is measured on a grid ~6 dB harsher than deployment. It now
+rotates → quantizes → inverse-rotates, which reproduces the deployed error
+exactly (`<Fᵀ Q(Fx), Fᵀ Q(FW)> = <Q(Fx), Q(FW)>`) while leaving the tensor in the
+channel basis for the rest of the fp32 forward.
+`HIPFIRE_QAT_ACT_UNROTATED=1` restores the old behaviour for reproducing the
+superseded arms.
+
+**The A2/A2b activation sweep should be re-run before any of its numbers are used
+for a deploy decision.** Expected direction: the A4 penalty shrinks substantially
+and the recovered-share ordering may change, since the earlier "A4 destroys
+recoverability" finding was measured on the harsher grid.
