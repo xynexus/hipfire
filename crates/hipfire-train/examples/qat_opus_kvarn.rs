@@ -31,7 +31,9 @@ use hipfire_train::model::{
 };
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_train::oqplus_quant::{oq3_simquant, oq8_simquant, oqplus_simquant};
+use hipfire_train::oqplus_quant::{
+    oq3_simquant, oq4_mixed_simquant, oq8_simquant, oqplus_simquant,
+};
 use std::path::Path;
 
 /// Default model. Must be a `model_type: llama` snapshot holding **safetensors** —
@@ -77,6 +79,11 @@ enum Tier {
     Oq3,
     Oq4,
     Oq8,
+    /// Magnitude-tiered ("compact") W4: bulk int4 with `n_out` of each 256-group
+    /// promoted to int8 on one shared scale. Effective width `4 + n_out/64`, so
+    /// `oq4.25` is `n_out = 16`. This is the grid the mixed packers actually
+    /// deploy; plain `Oq4` is uniform int4 and carries strictly more damage.
+    Oq4Mixed(usize),
 }
 
 impl Tier {
@@ -90,7 +97,24 @@ impl Tier {
             "oq3" | "w3" => Tier::Oq3,
             "oq8" | "w8" => Tier::Oq8,
             "oq4" | "w4" | "oqplus" | "oq+" => Tier::Oq4,
-            other => panic!("HIPFIRE_QAT_TIER: unknown tier {other:?} (want oq3|oq4|oq8)"),
+            // `oq4.<frac>`: mixed-precision widths carry a decimal place, per the
+            // repo's artifact-naming rule. n_out = frac * 64 (int8 costs 4 extra
+            // bits over int4, spread across the 256-group).
+            other if other.starts_with("oq4.") => {
+                let bits: f32 = other[2..]
+                    .parse()
+                    .unwrap_or_else(|_| panic!("HIPFIRE_QAT_TIER: bad width in {other:?}"));
+                let n_out = ((bits - 4.0) * 64.0).round() as i64;
+                assert!(
+                    (1..256).contains(&n_out),
+                    "HIPFIRE_QAT_TIER: {other:?} implies n_out {n_out}, want 1..256 \
+                     (oq4.25 = 16, oq4.5 = 32)"
+                );
+                Tier::Oq4Mixed(n_out as usize)
+            }
+            other => {
+                panic!("HIPFIRE_QAT_TIER: unknown tier {other:?} (want oq3|oq4|oq8|oq4.<frac>)")
+            }
         }
     }
 
@@ -99,23 +123,34 @@ impl Tier {
             Tier::Oq3 => oq3_simquant(w),
             Tier::Oq4 => oqplus_simquant(w),
             Tier::Oq8 => oq8_simquant(w),
+            Tier::Oq4Mixed(n_out) => oq4_mixed_simquant(w, n_out),
         }
     }
 
     /// Short deploy label, e.g. "W4".
-    fn width(self) -> &'static str {
+    fn width(self) -> String {
         match self {
-            Tier::Oq3 => "W3",
-            Tier::Oq4 => "W4",
-            Tier::Oq8 => "W8",
+            Tier::Oq3 => "W3".to_string(),
+            Tier::Oq4 => "W4".to_string(),
+            Tier::Oq8 => "W8".to_string(),
+            Tier::Oq4Mixed(n) => {
+                // n/64 is a dyadic fraction, so 4 places is always exact; trim the
+                // trailing zeros so `oq4.25` reports `W4.25`, not `W4.2500`.
+                let w = format!("{:.4}", 4.0 + n as f32 / 64.0);
+                w.trim_end_matches('0').trim_end_matches('.').to_string()
+            }
         }
     }
 
-    fn describe(self) -> &'static str {
+    fn describe(self) -> String {
         match self {
-            Tier::Oq3 => "Oq3 (W3, sym-int3 + FWHT-256)",
-            Tier::Oq4 => "OQ+ (W4, sym-int4 + FWHT-256, clip-searched)",
-            Tier::Oq8 => "Oq8 (W8, sym-int8 + FWHT-256)",
+            Tier::Oq3 => "Oq3 (W3, sym-int3 + FWHT-256)".to_string(),
+            Tier::Oq4 => "OQ+ (W4, sym-int4 + FWHT-256, clip-searched)".to_string(),
+            Tier::Oq8 => "Oq8 (W8, sym-int8 + FWHT-256)".to_string(),
+            Tier::Oq4Mixed(n) => format!(
+                "OQ+ mixed (bulk int4 + top-{n}/256 int8 on one shared scale, \
+                 FWHT-256, joint clip-search) — the grid the compact packers deploy"
+            ),
         }
     }
 }
@@ -443,7 +478,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pct = |a: f32, b: f32| if a > 1e-6 { 100.0 * (a - b) / a } else { 0.0 };
     println!(
-        "\n  ── {}{}{} recovery-FT ──",
+        "\n  ── {} {}{} recovery-FT ──",
         tier.width(),
         act_tiers.label(),
         if kvnoise { "+KVarN" } else { "" }

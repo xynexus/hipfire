@@ -258,3 +258,106 @@ else, and is re-read per block so the teacher precompute stays clean.
    arm. This is now the open question, since LoRA alone is ruled out.
    ⚠️ learned rotations are PREFILL-ONLY; state which phase any number belongs to.
 2. Only if rotations also fall short, revisit moving the base weights.
+
+---
+
+# Stage A2b — mixed precision: per-group outlier promotion
+
+Same harness and settings (Llama-3.2-1B, KV clean, real text, LR 1e-4
+warmup+cosine, 120 steps). Two sweeps, one variable moved at a time.
+
+## Activation policies, weight tier pinned at uniform `oq4`
+
+| activation policy | held-out before | after | **recovered** | best | extra bits/value |
+|---|---|---|---|---|---|
+| `a16` | 0.2211 | 0.1392 | **37.0%** | @120 | — |
+| `a8` | 0.2202 | 0.1426 | **35.2%** | @120 | +4.0 |
+| `a4o16` | 0.2803 | 0.1713 | **38.9%** | @120 | +0.25 |
+| `a4o8` | 0.3037 | 0.1921 | **36.8%** | 0.1889 @100 | +0.125 |
+| `a4,act=a8,ctx=a8` | 0.4580 | 0.3873 | 15.5% | 0.3514 @40 | +2.0 |
+| `a4` | 0.8624 | 0.6637 | 23.0% | 0.6460 @80 | 0 |
+
+**Per-group promotion beats per-site promotion, and it is not close.** Promoting
+8 of every 256 activations (3.1%, an eighth of a bit) reaches 0.3037; promoting
+two entire projections to int8 — 16× the extra bits — only reaches 0.4580. The
+damage is not concentrated in particular projections, it is concentrated in a few
+outlier channels *within every group*, which a per-group top-N catches and a
+per-tensor tier structurally cannot.
+
+**Promotion saturates fast.** 0 → 8 outliers cuts the pre-recovery loss 0.8624 →
+0.3037 (−65%); 8 → 16 buys a further −7.7% only. `n_out = 8` is the knee.
+
+**Outliers destroy RECOVERABILITY, not just accuracy — this is the real finding.**
+Uniform A4 recovers 23.0% and peaks at step 80; the per-site arm recovers 15.5%
+and peaks at step 40. Both `a4o8` (36.8%) and `a4o16` (38.9%) recover at the
+**A16 rate** (37.0%) and peak at step 100/120 like the healthy arm. So Stage A2's
+conclusion needs narrowing:
+
+> Light QAT cannot absorb A4 **on a uniform grid**. Promote ~8 values per 256 and
+> it recovers exactly as well as it does at A16.
+
+A single outlier inflates its group's absmax and coarsens all 256 codes, and that
+coarsening is what LoRA cannot compensate. Remove it and the optimizer behaves
+normally again — the same mechanism rotations target, which makes the rotation
+arm more interesting, not less, since a rotation achieves it with no mask.
+
+## Weight grid: uniform int4 vs the compact grid that actually ships
+
+`oqplus_simquant` models `quantize_oq4g256` — **uniform** int4. The mixed packers
+(`oqplus_tiered_ldlq_pack`, compact qt=36) deploy bulk int4 with the top-`w8_frac`
+of each group at int8 on **one shared scale**, outliers chosen by int8-upgrade
+gain (`err4² − err8²`) via the joint clip search in `codecs::mixed_clipsearch`.
+`oq4_mixed_simquant` mirrors that; `oq4.25` is `n_out = 16` (`4 + n_out/64` bits).
+
+At A16:
+
+| weight grid | deploy loss (LoRA=0) | after QAT | **recovered** |
+|---|---|---|---|
+| `oq4` uniform int4 | 0.2211 | 0.1392 | 37.0% |
+| `oq4.25` compact | **0.1367** | **0.0675** | **50.6%** |
+
+⚠️ **Stage A1's W4 numbers describe a harsher grid than deploys.** Real deploy
+loss is 0.1367, not 0.2211 (overstated 1.62×), and light QAT recovers 50.6%, not
+37.0%. Both remain valid statements about `oq4+`; neither describes `oq4.25`.
+
+Note the symmetry with the activation result: promoting 16/256 **weights** lifts
+recoverability 37.0% → 50.6%, exactly as promoting 8–16/256 **activations** lifts
+it 23.0% → 37%. Outliers wreck QAT recoverability on *both* operands, and a
+per-group top-N fixes both.
+
+Both figures are still conservative: this models `oq4.25+` (clip-search tier).
+The shipped `oq4.25++` adds LDLQ error feedback, and per that packer's header the
+int8 positions carry ~zero residual, so OBS spends its whole budget on the int4
+bulk.
+
+## At A4 the activation grid dominates — fix it first
+
+| weight grid | activation | before | after | recovered |
+|---|---|---|---|---|
+| `oq4` uniform | `a4` | 0.8624 | 0.6637 | 23.0% (best 0.6460 @80) |
+| `oq4.25` compact | `a4` | 0.7753 | 0.6637 | 14.4% (best 0.5715 @40) |
+
+A better weight grid buys −38% at A16 but only **−10% at A4**, and both arms land
+on the same final residual. The two traces differ throughout (step 0: 0.7718 vs
+0.8273; step 40: 0.5715 vs 0.6748) and only coincide at step 120, so this is
+convergence to a shared activation-noise floor, not a tier that failed to apply
+— though landing on 0.6637 to four decimals is a striking coincidence given how
+much both traces bounce.
+
+**Practical ordering: fix the activation outliers first.** Weight-grid refinement
+is second-order until you do.
+
+## Caveats specific to this section
+
+- **`simquant_outlier` uses TWO scales** (a shrunken bulk scale plus a separate
+  outlier scale), whereas the deployed weight packer shares one with a wider
+  clamp. The `a4o*` rows are therefore an **upper bound** on what promotion can
+  buy. That was the right first experiment — if even the upper bound had lost to
+  uniform `a8`, promotion would be dead and no kernel needed — but the follow-up
+  is whether the cheaper shared-scale form keeps the win.
+- **The remaining gap to A8 is an engineering question, not an accuracy one.**
+  `a4o16` sits at 1.20× A8's residual for 1/16 of the extra bits. Whether that
+  wins depends on the per-group position mask versus `iu4x2`'s second activation
+  plane over the same weight tile — which costs nothing in weight traffic.
+- Same standing caveats as Stage A1/A2: 1B dense model, 120-step budget,
+  LoRA(q/v)+norm only.

@@ -113,19 +113,44 @@ Steps:
    Held-out recovered, weight tier pinned at `oq4`:
    **A16 37.0%** (0.2211 → 0.1392), **A8 35.2%** (0.2202 → 0.1426),
    **A4 23.0%** (0.8624 → 0.6637).
-   **Answer: light QAT does NOT absorb A4.** It nearly quadruples the deploy loss
-   (3.90×) and then recovers a *smaller* share of it, leaving a 4.8× worse
-   residual. A4's best point is step 80, not 120 — it turns around, so a longer
-   budget is not the lever either. A8 ≈ A16 is confirmed, which retroactively
-   justifies Stage A1 being weight-only.
-3. **NEXT, and now the live question** — add the rotation: A4 is what rotations
-   exist *for* (they Gaussianize activations whose measured kurtosis exceeds
-   200). Score fixed-FWHT vs learned R1 under QAT, since LoRA alone is ruled out.
+   **Answer, NARROWED by Stage A2b below: light QAT does not absorb A4 _on a
+   uniform grid_.** Uniform A4 nearly quadruples the deploy loss (3.90×) and
+   recovers a smaller share of it. But promoting ~8 values per 256-group to int8
+   (`a4o8`, +0.125 bits/value) restores recovery to the A16 rate — 36.8% vs
+   37.0%. A8 ≈ A16 is confirmed, which retroactively justifies Stage A1 being
+   weight-only.
+3. ✅ **Mixed precision measured (Stage A2b)** — `HIPFIRE_QAT_ACT` takes a
+   per-site policy and a per-group outlier tier (`a4o8`). Per-group promotion
+   beats per-site decisively: 8/256 promoted (+0.125 bits) reaches 0.3037 held-out
+   while promoting two whole projections (+2 bits) only reaches 0.4580. Damage
+   lives in outlier channels *within every group*, not in particular projections.
+   The knee is `n_out = 8`; 8→16 buys a further −7.7% only.
+4. **NEXT** — add the rotation: A4 is what rotations exist *for*, and Stage A2b
+   makes the case stronger, since a rotation buys the same de-outliering with **no
+   mask at runtime**. Score fixed-FWHT vs learned R1 under QAT.
+
+   ⚠️ Three things the seam map found that this step needs (see the rotation
+   scouting notes): `apply_r1` must run BEFORE `quantize_linears` or the int4 grid
+   never sees the rotated basis; R4 (`act` → down_proj) cannot be baked because
+   SwiGLU is elementwise, so it needs real runtime work; and the weight and
+   activation sim-quants sit in **different bases** (`oqplus_simquant` applies the
+   codec FWHT, `a4_simquant` does not), so no single baked R aligns both —
+   `bake_for_oq4_recipe` picks the weight side, passing `M` directly picks the
+   activation side.
 
 ⚠️ **Learned rotations are PREFILL-ONLY.** A previously measured result: the
 learned M wins on prefill, while plain FWHT is best at decode. So a learned-R1
 QAT result does not automatically transfer to the decode path — state which
 phase any number belongs to.
+
+### ⚠️ The Stage A1 weight numbers describe `oq4+`, not the compact grid
+
+`oqplus_simquant` models `quantize_oq4g256` — uniform int4. The mixed packers
+deploy bulk int4 + top-`w8_frac` at int8 on one shared scale. Measured at A16:
+`oq4` uniform is 0.2211 deploy loss / 37.0% recovered, `oq4.25` compact is
+**0.1367 / 50.6%**. So Stage A1 overstates the W4 deploy loss by 1.62× relative
+to what ships. `HIPFIRE_QAT_TIER=oq4.25` selects the compact grid
+(`oq4_mixed_simquant`); it models the `+` tier, not `++` (no LDLQ).
 
 ### Known weakness — FIXED 2026-08-28, and it was worse than described
 
