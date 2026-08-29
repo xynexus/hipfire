@@ -4092,6 +4092,59 @@ pub fn load_dspark_state(
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft
 /// weights/config/scratch, the hidden-state ring buffer + verify scratch, and
 /// (when `HIPFIRE_DDTREE_BUDGET` is set) the DDTree tree-verify side state.
+/// Build the target-side speculative state for n-gram decode with NO drafter.
+///
+/// Every field here comes from the TARGET — verify scratch, the DeltaNet
+/// snapshot and the GDN tape are what the verify step needs regardless of where
+/// the draft came from. The four drafter fields are None, which makes
+/// `spec_step_dflash` skip the drafter branch, the per-layer hidden extraction
+/// on every verify, and the staging that feeds the next drafter cycle.
+///
+/// `max_spine` sizes the verify buffers the way `draft_cfg.block_size` does for
+/// DFlash: one slot for the seed plus the longest spine n-gram can supply.
+pub fn ngram_only_state(
+    max_spine: usize,
+    ctx_capacity: usize,
+    target_config: &qwen35::Qwen35Config,
+    target_dn: &DeltaNetState,
+    lm_head_k: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<DflashState, String> {
+    let scratch_max_n = max_spine.max(1) + 1;
+    let target_snap =
+        DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
+    let gdn_tape = GdnTape::new_for_config(gpu, target_config, scratch_max_n)
+        .map_err(|e| format!("gdn_tape: {e}"))?;
+    let verify_scratch = VerifyScratch::with_prefill(
+        gpu,
+        scratch_max_n,
+        target_config.dim,
+        target_config.vocab_size,
+        lm_head_k,
+        target_config,
+    )
+    .map_err(|e| format!("verify_scratch: {e}"))?;
+    Ok(DflashState {
+        draft_config: None,
+        draft_weights: None,
+        draft_scratch: None,
+        hidden_rb: None,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        // Only the drafter reads the host hidden shadow.
+        target_hidden_host: Vec::new(),
+        ctx_capacity,
+        block_size: max_spine.max(1),
+        // Adaptive-B tunes a DRAFTER's block; the spine length is n-gram's.
+        adaptive_b: false,
+        // DDTree is a tree over a drafter's candidates.
+        ddtree: None,
+        ngram: None,
+        ngram_live: None,
+    })
+}
+
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,

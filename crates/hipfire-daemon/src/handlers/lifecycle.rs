@@ -715,23 +715,75 @@ pub(crate) fn load(
             if let Some(df) = m.dflash.as_mut() {
                 df.adaptive_b = adaptive_b;
                 df.ngram = ngram_setup;
-            } else if ngram_setup.is_some() {
-                // `ngram_spec` is documented as "drafter-free", but the n-gram
-                // spine is consumed inside `generate_dflash`, which unwraps
-                // `m.dflash` — so with no DFlash drafter the setup built just
-                // above is dropped here and nothing speculates.
+            } else if let Some(setup) = ngram_setup {
+                // The server's continuous-batching runner decides eligibility
+                // from `batch_eligible(arch)` + env vars, so it cannot see that
+                // this model now carries a speculative-decode state. It
+                // dispatches, `generate_batch_prefill` refuses the state, and
+                // the runner turns that into `fail_all` for the whole cycle
+                // rather than falling back. So building the state under the
+                // default (runner on) would trade "n-gram silently does
+                // nothing" for "every request fails", which is worse.
                 //
-                // Say so. Silently discarding it is what made this expensive to
-                // find: `ngram_spec=true` produced no log line, no store on
-                // disk, and decode timings identical to the feature being off,
-                // with nothing anywhere admitting it had not run.
-                tracing::warn!(
-                    "ngram_spec is on but {} has no DFlash drafter, and the n-gram spine is \
-                     consumed inside the DFlash decode path — n-gram speculative decode will \
-                     NOT run for this model. Attach a DFlash sidecar, or turn ngram_spec off \
-                     to stop expecting it.",
-                    m.model_path
+                // Build it only with the runner off, and say why otherwise.
+                // Lifting this needs the runner to route by loaded-model state
+                // instead of env vars — the same gap that breaks a DFlash
+                // drafter found by sibling discovery.
+                let batch_runner_on = !matches!(
+                    std::env::var("HIPFIRE_SERVER_PREFILL_BATCH")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "0" | "off" | "false" | "no"
                 );
+                if batch_runner_on {
+                    tracing::warn!(
+                        "ngram_spec is on, but the continuous-batching runner cannot route \
+                         around a speculative-decode state and would fail every request. \
+                         n-gram speculative decode is NOT active. Set \
+                         HIPFIRE_SERVER_PREFILL_BATCH=0 to use it."
+                    );
+                } else {
+                    // Drafter-free n-gram spec decode, which is what `ngram_spec`
+                    // has always advertised. The spine comes from the n-gram
+                    // tables, so the state carries only the TARGET half — no
+                    // drafter weights, no hidden-state ring, and therefore no
+                    // per-layer extraction on any verify.
+                    //
+                    // Until this existed the setup built just above was dropped on
+                    // the floor here, because the only place it could be stored was
+                    // inside a DFlash state that requires a drafter.
+                    match (m.q35_config.as_ref(), m.q35_weights.as_ref(), m.dn_state()) {
+                        (Some(config), Some(weights), Some(dn)) => {
+                            match hipfire_serving_core::load::ngram_only_state(
+                                ngram_max_spine as usize,
+                                m.max_seq,
+                                config,
+                                dn,
+                                weights.output.k,
+                                &mut daemon_state.gpu,
+                            ) {
+                                Ok(mut state) => {
+                                    state.ngram = Some(setup);
+                                    m.dflash = Some(state);
+                                    tracing::info!(
+                                        "n-gram speculative decode active (no drafter): \
+                                     max_spine={ngram_max_spine} orders={ngram_orders:?}"
+                                    );
+                                }
+                                Err(err) => tracing::warn!(
+                                    "ngram_spec is on but its state could not be built ({err}); \
+                                 decoding without speculation"
+                                ),
+                            }
+                        }
+                        _ => tracing::warn!(
+                            "ngram_spec is on but this model is not a Qwen3.5/3.6 target; \
+                         n-gram speculative decode supports that family only"
+                        ),
+                    }
+                }
             }
             daemon_state
                 .resource_reservations
