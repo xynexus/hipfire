@@ -40,6 +40,27 @@ pub enum RestartImpact {
     ReconnectClients,
 }
 
+/// What must already be on disk for a [`ConfigType::Path`] value to be usable.
+///
+/// Checked at startup and by `doctor`, never in the resolver: the resolver is
+/// pure and runs in tests and the settings editor, where touching the
+/// filesystem would be both wrong and slow. Existence is also TOCTOU — it says
+/// the path was there at boot, not that it will be there at use — which is why
+/// a failure here is a warning and never fatal.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathExistence {
+    /// An input: the path itself must already exist. A missing one is a typo or
+    /// an unmounted volume, and finding out at load time means finding out
+    /// after the expensive part.
+    Exists,
+    /// An output: hipfire creates the path on first use, so it need not exist —
+    /// but its PARENT must, because nothing here creates a directory tree. A
+    /// root under a parent that does not exist fails on first write, long after
+    /// the config was read.
+    ParentExists,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigType {
@@ -51,7 +72,9 @@ pub enum ConfigType {
     I32,
     F64,
     String,
-    Path,
+    Path {
+        existence: PathExistence,
+    },
     Enum {
         values: &'static [&'static str],
     },
@@ -267,7 +290,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "models_dir",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
@@ -276,7 +301,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "models_network_dir",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
@@ -667,7 +694,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
             ConfigType::Enum {
                 values: NGRAM_STORE_ROOT_RAM,
             },
-            ConfigType::Path,
+            ConfigType::Path {
+                existence: PathExistence::ParentExists,
+            },
         ]),
         Requirement::Optional,
         Some(""),
@@ -811,7 +840,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "cask_sidecar",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::RequiredWhen("cask == true && cask_auto_attach == false"),
         None,
         GLOBAL_MODEL_RUNTIME,
@@ -963,7 +994,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "prefill_drafter",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::RequiredWhen("prefill_compression != 'off' && prefill_drafter_device >= 0"),
         None,
         GLOBAL_MODEL_RUNTIME,

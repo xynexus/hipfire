@@ -25,8 +25,8 @@ pub use resolve::{
     ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
-    config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
-    RestartImpact, NGRAM_STORE_ROOT_RAM,
+    config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, PathExistence,
+    Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM,
 };
 
 fn default_host() -> String {
@@ -1082,6 +1082,78 @@ fn materialize_config(
     }
 }
 
+/// Which [`PathExistence`] a value is actually subject to, if any.
+///
+/// A union resolves to whichever arm ACCEPTS the value, so
+/// `ngram_store_root: "ram"` takes the sentinel arm and is not a path at all,
+/// while `"/var/lib/hipfire/ngram"` takes the Path arm and is. Asking the type
+/// alone would get both wrong.
+fn path_existence_for(value: &Value, ty: &ConfigType) -> Option<PathExistence> {
+    match ty {
+        ConfigType::Path { existence } => Some(*existence),
+        ConfigType::OneOf(arms) => arms
+            .iter()
+            .find(|arm| validate_resolved_value(value, arm).is_ok())
+            .and_then(|arm| path_existence_for(value, arm)),
+        _ => None,
+    }
+}
+
+/// Warn about configured paths that are not on disk.
+///
+/// Separate from [`domain_diagnostics`] because this one does I/O. The resolver
+/// is pure and runs in tests and the settings editor; a filesystem probe there
+/// would be wrong and slow. Callers run this once, at startup or from `doctor`.
+///
+/// Always a warning. A network models dir may be mounted after the daemon
+/// starts, and existence is TOCTOU regardless — it says the path was there at
+/// boot, not that it will be there at use. Refusing to start would trade a
+/// visible warning for an outage.
+pub fn path_existence_diagnostics(config: &HipfireConfig) -> Vec<ConfigDiagnostic> {
+    let values = config_value_map(config);
+    let mut out = Vec::new();
+    for field in config_schema() {
+        let Some(value) = values.get(field.key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else { continue };
+        let trimmed = text.trim();
+        // An empty path is "unset", not "missing"; Requirement covers that.
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(existence) = path_existence_for(value, &field.ty) else {
+            continue;
+        };
+        // A malformed path is domain_diagnostics' finding, not ours — do not
+        // report the same value twice under two headings.
+        if resolve::validate_path(trimmed).is_err() {
+            continue;
+        }
+        let path = std::path::Path::new(trimmed);
+        let message = match existence {
+            PathExistence::Exists if !path.exists() => {
+                format!("config key `{}` = {trimmed} does not exist", field.key)
+            }
+            PathExistence::ParentExists => match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => format!(
+                    "config key `{}` = {trimmed} will be created on first use, but its parent \
+                     directory {} does not exist and nothing here creates one",
+                    field.key,
+                    parent.display()
+                ),
+                _ => continue,
+            },
+            PathExistence::Exists => continue,
+        };
+        out.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            message,
+        });
+    }
+    out
+}
+
 /// Warn about resolved values that violate their field's declared domain.
 ///
 /// `resolve_field` takes a file value verbatim, so until now nothing checked
@@ -1553,6 +1625,61 @@ mod tests {
                     .any(|d| d.message.contains("ngram_store_root")),
                 "`{raw}` is a valid arm but was reported: {:?}",
                 resolved.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_input_path_is_reported_and_a_present_one_is_not() {
+        let mut config = HipfireConfig::default();
+        config.cask_sidecar = Some("/definitely/not/here/x.hfq".to_string());
+        assert!(
+            path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("cask_sidecar") && d.message.contains("does not exist")),
+            "a missing input file must be reported"
+        );
+
+        config.cask_sidecar = Some("/etc/hostname".to_string());
+        assert!(
+            !path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("cask_sidecar")),
+            "a present input file must be silent"
+        );
+    }
+
+    #[test]
+    fn an_output_path_needs_only_its_parent() {
+        let mut config = HipfireConfig::default();
+        // Created on first use, parent exists: silent.
+        config.ngram_store_root = "/tmp/hipfire-ngram-does-not-exist-yet".to_string();
+        assert!(
+            path_existence_diagnostics(&config).is_empty(),
+            "an output path whose parent exists must not be reported: {:?}",
+            path_existence_diagnostics(&config)
+        );
+
+        // Parent missing: nothing here builds a directory tree, so warn.
+        config.ngram_store_root = "/definitely/not/here/ngram".to_string();
+        assert!(
+            path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("parent directory")),
+            "an output path with no parent directory must be reported"
+        );
+    }
+
+    #[test]
+    fn a_ram_sentinel_is_never_treated_as_a_path() {
+        // The union arm decides: "ram" took the sentinel arm, so no I/O check
+        // applies to it however unlike a path it looks.
+        for sentinel in NGRAM_STORE_ROOT_RAM {
+            let mut config = HipfireConfig::default();
+            config.ngram_store_root = sentinel.to_string();
+            assert!(
+                path_existence_diagnostics(&config).is_empty(),
+                "sentinel {sentinel:?} was checked as a path"
             );
         }
     }
