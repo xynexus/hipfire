@@ -542,7 +542,7 @@ pub(crate) fn load(
         },
     ));
     let _qwen_residency_env =
-        qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
+        model_load_env_guards(protocol_load.as_ref().map(|req| &req.params));
     let planned_resource_usage = daemon_state
         .resource_reservations
         .planned_usage_for_load(path, protocol_load.as_ref().map(|req| &req.params));

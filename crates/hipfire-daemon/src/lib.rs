@@ -401,7 +401,14 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
+/// Install the load-time policy knobs the arch loaders read from the environment,
+/// scoped to a single `load_model` call.
+///
+/// This is the established seam for "config value the arch loader consumes as an
+/// env var": the loaders take `&Gpu` + `HfqFile` and deliberately do not receive
+/// `ModelLoadParams`, so a knob reaches them through a scoped env guard rather
+/// than a signature change across the arch boundary.
+fn model_load_env_guards(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
     let mut guards = Vec::new();
     let Some(params) = params else {
         return guards;
@@ -418,6 +425,28 @@ fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> V
             "HIPFIRE_QWEN35_EXPERT_CACHE_BYTES",
             bytes.to_string(),
         ));
+    }
+    // `gpu_slab_load` was a first-class config field with a schema entry, a
+    // default and declared scopes — and NO reader. `gpu_slab_load_enabled`
+    // (qwen35/loading.rs) consults only `HIPFIRE_GPU_SLAB_LOAD`, and
+    // `from_hipfire_config` never forwarded the field, so the config value was
+    // inert.
+    //
+    // The env var stays the OVERRIDE and wins when set: `hipfire-eval`'s tinyquant
+    // executor and `tests/fixture-golden-gate.sh` both pin
+    // `HIPFIRE_GPU_SLAB_LOAD=0` on daemons they spawn to force the non-slab path,
+    // and a config saying `on` must not flip those gates onto the slab loader.
+    //
+    // `from_hipfire_config` maps the `auto` default to `None`, so a default config
+    // installs nothing and behaviour is byte-identical to before.
+    if let Some(policy) = params
+        .gpu_slab_load
+        .as_deref()
+        .filter(|policy| !policy.is_empty())
+    {
+        if std::env::var_os("HIPFIRE_GPU_SLAB_LOAD").is_none() {
+            guards.push(ScopedEnvVar::set("HIPFIRE_GPU_SLAB_LOAD", policy));
+        }
     }
     guards
 }
