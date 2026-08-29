@@ -7,8 +7,8 @@ already-known-or-intentional), majority rule, no finding kept on one vote.
 ## Results
 
 **13 confirmed defects**, plus 3 gate/CI defects found and fixed by hand.
-**10 of the 13 are now fixed; 3 remain open** (status column below; the two
-`OPEN — decision` rows are not patches, they are product/correctness calls).
+**12 of the 13 are now fixed; 1 remains open** (status column below). The two
+rows previously marked `OPEN — decision` have since been decided and fixed.
 
 | # | severity | where | status | doc |
 |---|---|---|---|---|
@@ -18,11 +18,11 @@ already-known-or-intentional), majority rule, no finding kept on one vote.
 | 4 | high | routed KVarN attention hardcoded to 4-bit | FIXED | [`kvarn-routed-attention-4bit-stride`](2026-08-29-kvarn-routed-attention-4bit-stride.md) |
 | 5 | high | `compose_hfq` logical vs physical extent | FIXED | [`compose-hfq-logical-extent`](2026-08-29-compose-hfq-logical-extent.md) |
 | 6 | high | `run_batch_cycle` leaks sessions on early exit | FIXED | [`serving-lifecycle-defects`](2026-08-29-serving-lifecycle-defects.md) |
-| 7 | high | image workloads starve (`aging_ms = 0`) | **OPEN — decision** | same |
+| 7 | high | image workloads starve (`aging_ms = 0`) | FIXED (restart cap) | same |
 | 8 | high | flow-match img2img uses additive noise | FIXED | [`diffusion-img2img-and-samplers`](2026-08-29-diffusion-img2img-and-samplers.md) |
 | 9 | high | img2img reuses sigma-scaled latents as noise | FIXED | same |
 | 10 | medium | executor v2 swaps two clients' answers | FIXED | [`serving-lifecycle-defects`](2026-08-29-serving-lifecycle-defects.md) |
-| 11 | medium | "Euler a" runs deterministic Euler | **OPEN — decision** | [`diffusion-img2img-and-samplers`](2026-08-29-diffusion-img2img-and-samplers.md) |
+| 11 | medium | "Euler a" runs deterministic Euler | FIXED (refused + un-advertised) | [`diffusion-img2img-and-samplers`](2026-08-29-diffusion-img2img-and-samplers.md) |
 | 12 | low | `selected_prefill_requests` grows unbounded | FIXED | [`serving-lifecycle-defects`](2026-08-29-serving-lifecycle-defects.md) |
 | 13 | low | DSpark `--resume` restarts the LR schedule | OPEN (example-only) | below |
 | — | — | doc-freshness gates + 92 unrun tests | FIXED | [`doc-freshness-gate-one-way`](2026-08-29-doc-freshness-gate-one-way.md) |

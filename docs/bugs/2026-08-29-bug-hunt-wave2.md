@@ -4,7 +4,7 @@ Master `0c9e3d252`, nix1. Same method as
 [wave 1](2026-08-29-bug-hunt-summary.md): subsystem finders, then every candidate
 judged by three independent lenses, majority rule.
 
-**21 candidates → 19 confirmed, 2 refuted. 7 fixed so far; 12 still open.** Wave 1 had searched only 4 of 12
+**21 candidates → 19 confirmed, 2 refuted. 16 fixed; 3 still open** (all three spec-decode, each with an executable plan — see the end of this doc). Wave 1 had searched only 4 of 12
 planned dimensions; this pass covered the other eight (kernels, quant, arch-specs,
 specdecode, hotpath, unsafe, silent-drop, recent).
 
@@ -24,6 +24,10 @@ separate confirmations of the same class.
 | high | AR decode destroyed every multi-byte codepoint BPE splits across two tokens (U+FFFD before EosFilter could buffer) | test asserts both directions |
 | medium | DeepSeek V4 ignored its parsed `routed_scaling_factor`, hardcoding 2.2 — and the `OnceLock` made the first model's value stick for every later load | fixture pinned at 1.5 |
 | medium | `hipfire serve` claimed `serve.pid` **before** binding, orphaning the live server from `stop`/`status` | write moved after `TcpListener` bind |
+| high | AWQ sidecar dropped for every `FwhtG128` weight; `qt 52` mis-tagged as `Oq8G256`; Opus lm_head rotated with the wrong FWHT | all three now REFUSE (no G128 AWQ kernel, no `Oq8G128` dtype, no batched G128 rotation exists to wire) |
+| high | oq4 ragged-K guard present at only 2 of NINE call sites | new invariant test, which found the last two itself |
+| low | 33 `WeightRef` literals hardcoding `row_stride: 0` | guarded at the single consumer (`gemv_q8hfq`) instead of triaged |
+| low | `gpu_slab_load` config key inert | threaded via the daemon's existing scoped-env seam |
 
 ### The prevention that came out of it
 
@@ -85,12 +89,15 @@ both launch styles: `kernargs![…]` and the raw `params: Vec<*mut c_void>`.
   arms below rotate `x` themselves), so a field added later cannot be dropped here
   again.
 
-  **Follow-up, not yet triaged:** 33 OTHER hand-rolled `WeightRef` literals still
-  hardcode `row_stride: 0` — mostly `qwen35/mod.rs` GDN paths (qkvza/z/beta/alpha)
-  plus `deepseek4/forward.rs:139`, `dspark_core.rs:357` and
-  `dispatch/model_ext/deepseek4.rs:40`. Each is a bug only if a stride-carrying
-  dtype can reach it, which needs per-site analysis. Listed here so the sweep is
-  on record rather than implied.
+  **Follow-up: RESOLVED, by guarding the consumer instead of the constructors.**
+  33 other hand-rolled `WeightRef` literals still hardcode `row_stride: 0`, and
+  triaging each for "can a stride-carrying dtype reach it" was the obvious next
+  step. It is not needed: `WeightRef.row_stride` is read by exactly ONE dispatch
+  arm, `K::GemvQ8HFQ` (`families/gemv.rs:493`), so `gemv_q8hfq` now rejects a
+  stride that does not match the Q8HFQ layout. Any caller that loses the value
+  fails loudly with the remedy named, whichever literal it came from. The layout
+  became one definition (`hipfire_gpu_types::q8hfq_row_stride`) instead of a
+  formula copy-pasted into both loaders that produce a Q8HFQ `WeightTensor`.
 
 - **SWA scores LDS capped at 1024 columns** — `kernels/src/attention_swa_gqa_batched.hip:59`.
   **The reported mechanism was REFUTED by the recovered reachability lens, and a
@@ -163,13 +170,18 @@ both launch styles: `kernargs![…]` and the raw `params: Vec<*mut c_void>`.
   the record and orphaned the running one from `stop`/`status`. Both entry points
   (`hipfire serve` and the child `hipfire start` spawns) funnel through that bind,
   so the pid is now written exactly once, by the process that owns the port.
-- `gpu_slab_load` config key is registered, documented and validated but has **no
-  reader** (`hipfire-config/src/lib.rs:361`). `gpu_slab_load_enabled`
-  (`qwen35/loading.rs:2450`) consults only `HIPFIRE_GPU_SLAB_LOAD`. **Left open
-  deliberately:** wiring it means threading the resolved value through
-  `ModelLoadParams` and several loader hops into an arch crate, and the
-  alternative — deleting a documented public config key — is a product call.
-  Needs a decision, not a patch.
+- ~~`gpu_slab_load` config key registered, documented and validated with no
+  reader~~ — **FIXED.** It is now threaded through `ModelLoadParams` and installed
+  as a scoped `HIPFIRE_GPU_SLAB_LOAD` guard for the duration of the load. No
+  arch-loader signature change was needed after all: the daemon already uses
+  exactly this seam for two qwen35 knobs (`qwen_residency_load_env`, renamed
+  `model_load_env_guards`), because the arch loaders take `&Gpu` + `HfqFile` and
+  deliberately do not receive `ModelLoadParams`. Set unconditionally, like both
+  siblings — an "only if the env var is absent" gate would have inverted
+  precedence against them for no gain, since the places pinning
+  `HIPFIRE_GPU_SLAB_LOAD=0` set it on the standalone `tiny_quant_probe`, which
+  never reaches these guards. `non_auto_value` maps the `auto` default to `None`,
+  so a default config is byte-identical to before.
 
 ## Refuted — do not re-file
 
@@ -177,6 +189,10 @@ both launch styles: `kernargs![…]` and the raw `params: Vec<*mut c_void>`.
 - **MiniMax lowered decode gating on layer 0 only** (`hipfire-arch-minimax/src/forward.rs:230`).
 
 ## Still open after the fixing pass
+
+Three from this wave, plus DSpark carried over from wave 1. Across BOTH waves:
+**32 confirmed, 28 fixed, 4 open** — wave 1 is 12 of 13, wave 2 is 16 of 19.
+
 
 Three need work I could not validate here, and one is a deliberate refusal:
 
@@ -203,9 +219,11 @@ Three need work I could not validate here, and one is a deliberate refusal:
   gather-by-slot for the MTP-accepted hidden row; GPU work.
 - **Gemma3 rejected draft K/V in the SWA ring** (medium) — needs a per-local-layer
   staging buffer, mirroring deepseek4.
-- **`gpu_slab_load` has no reader** (low) — wiring it means threading through
-  `ModelLoadParams` and several loader hops into an arch crate; deleting a
-  documented public config key is a product call. Left for a decision.
 - **DSpark `--resume`** (low, example-only) — a correct resume needs the DSCK
   format to carry epochs-completed AND `best_eval_loss`; it currently stores only
   the best epoch. `hipfire-train` has no `[[bin]]`, so nothing shipping can hit it.
+
+All three spec-decode items above now have adversarially-checked, executable
+plans in [`2026-08-29-remaining-three-plans.md`](2026-08-29-remaining-three-plans.md).
+Read each plan's "why the obvious fix is wrong" section first — in ALL THREE the
+approach this document originally suggested turns out to be wrong.

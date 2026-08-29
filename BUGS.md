@@ -47,9 +47,9 @@ library crates are NOT orphaned. Only bin-only crates fall through.
 ## Wave-2 hunt: 19 confirmed defects across the 8 unsearched subsystems
 
 **Found 2026-08-29 on master `0c9e3d252`. 21 candidates, 19 confirmed 3-lens,
-2 refuted. 14 FIXED; 5 still open** — see the doc's "Still open after the fixing
-pass", which records three dead ends for the DDTree one so the next person does
-not re-walk them.
+2 refuted. 16 FIXED; 3 still open** — all three spec-decode, each with an
+adversarially-checked executable plan in
+`docs/bugs/2026-08-29-remaining-three-plans.md`.
 
 Full list, evidence and refutations: `docs/bugs/2026-08-29-bug-hunt-wave2.md`.
 
