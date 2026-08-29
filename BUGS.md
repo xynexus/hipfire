@@ -32,6 +32,38 @@ boundaries, not context length.
   so it is not accumulated drift, and the MoE gate reads 0.000e0.
 - Not a drafter problem: tau is measured against the verifier's own argmax.
 - Full evidence: `docs/bugs/2026-08-27-spec-decode-ar-divergence.md`.
+## zaya's tiny-quant KLD cells measure NOTHING — deliberately left unrecorded (medium)
+
+Found 2026-08-30 while recording the 128 missing gfx1151 tiny-quant baselines.
+
+Every zaya KLD cell reports `mean_kld=0` — at **oq4**, a 4-bit weight quant:
+
+    [pass] tiny:zaya:kld:oq4  mean_kld=0 max_kld=0.0001 n_scored=20
+    [pass] tiny:zaya:kld:oq8  mean_kld=0 max_kld=0.0001 n_scored=20
+
+The cells DO run — `n_scored=20`, `ldlq_attempts=22` on the ++ arms, and
+`zaya/collect` passes with n_tensors=54 — so this is not a plumbing skip. The
+model's output distribution simply does not move when its weights are quantized
+to 4 bits. For contrast, on the same run:
+
+    llama oq4  0.00829894      qwen3_5 oq4  0.25935006
+    zaya  oq4  0.00002298      <- 45x below the next-smallest (nemotron_h 1.04e-3)
+
+and zaya's `+` and `++` values are byte-identical to each other (0.00003716 for
+both oq4 arms), where every healthy family separates them.
+
+This is the failure mode #375 documents: a cell that PASSES without measuring
+anything. So the seven zaya KLD baselines were NOT recorded — the gate keeps
+reporting "no committed baseline" for them, which is honest, instead of a
+recorded 0 that reads as coverage.
+
+Likely causes, untested: the tiny zaya fixture's logits are dominated by a tensor
+that stays at source precision (a tied embedding or the head), or the fixture is
+degenerate enough that its output is near-uniform regardless of the weights.
+Whichever it is, the fixture needs fixing before a baseline here means anything.
+
+Do NOT close this by running `--record`.
+
 ## [RESOLVED 2026-08-29 — re-recorded on halo] 8 gfx1151 baselines are stale — `qwen3_5_moe_indexed` fixture changed shape
 
 **Created 2026-08-27 by #379 (merged). CLEARED 2026-08-29** — recorded on halo,
