@@ -760,7 +760,21 @@ impl DiffusionPipeline {
         };
         let mut latents = denoise_init_latents.clone();
         if !schedule.timesteps.is_empty() {
-            let noise = plan.latents;
+            // `plan.latents` is stored PRE-SCALED by `initial_noise_sigma()`
+            // (pipeline_plan.rs:133) because its primary role is the txt2img
+            // starting point. As forward-noising noise it has to be unit variance
+            // again: reusing the scaled buffer inflates the noise term by that
+            // factor — 14.6x on an SDXL-class Euler schedule — which drowns the
+            // init image and makes `denoising_strength` meaningless. No-op for
+            // flow-match, whose `input_scaling` is None and sigma is 1.0.
+            let mut noise = plan.latents;
+            let init_sigma = plan.schedule.initial_noise_sigma();
+            if (init_sigma - 1.0).abs() > f32::EPSILON {
+                let inv = 1.0 / init_sigma;
+                for value in &mut noise.data {
+                    *value *= inv;
+                }
+            }
             if request.refine_sigma.is_some() {
                 // Flow-match interpolation noising: the re-encoded super-resolved
                 // image is a clean x0, so inject (1 - sigma) * x0 + sigma * noise.

@@ -126,6 +126,22 @@ impl SchedulerSolver {
                 set_alpha_to_one: config.set_alpha_to_one.unwrap_or(true),
             });
         }
+        // Ancestral Euler is NOT deterministic Euler: it splits each step into
+        // sigma_down/sigma_up and injects a fresh seeded noise draw. Nothing here
+        // implements that, and `DiffusionSchedule` carries no `class_name` field
+        // (see its definition), so the distinction was destroyed at construction
+        // and the two produced BIT-IDENTICAL output for the same seed — while the
+        // response reported the ancestral sampler back to the caller.
+        //
+        // Refuse rather than silently substitute, matching how an unsupported
+        // `algorithm_type` is handled just below. `GET /sdapi/v1/samplers` no
+        // longer advertises it either, so the refusal and the advertisement agree.
+        if config.class_name == "EulerAncestralDiscreteScheduler" {
+            return Err(DiffusionError::InvalidMetadata(
+                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it                  needs a per-step sigma_up/sigma_down split with a seeded noise draw,                  and running plain Euler instead would silently return a different                  sampler than requested. Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
+                    .to_string(),
+            ));
+        }
         if config.class_name != "DPMSolverMultistepScheduler" {
             return Ok(Self::Euler);
         }
@@ -524,6 +540,17 @@ impl DiffusionSchedule {
                 "scheduler steps must be greater than zero".to_string(),
             ));
         }
+        // Refuse ancestral Euler HERE as well as in `SchedulerSolver::from_config`:
+        // the two `Self::linear(steps)` early-returns below (missing or invalid
+        // beta params) hardcode `solver: Euler` and never consult the solver
+        // resolver at all, so a guard confined to `from_config` would let this
+        // degrade silently through the other route.
+        if config.class_name == "EulerAncestralDiscreteScheduler" {
+            return Err(DiffusionError::InvalidMetadata(
+                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it                  needs a per-step sigma_up/sigma_down split with a seeded noise draw.                  Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
+                    .to_string(),
+            ));
+        }
         if config.class_name == "FlowMatchEulerDiscreteScheduler" {
             return Self::flow_match_euler_with_image_seq_len(config, steps, image_seq_len);
         }
@@ -838,6 +865,22 @@ impl DiffusionSchedule {
                 noise.len(),
                 latents.data.len()
             )));
+        }
+        // Flow matching INTERPOLATES between data and noise: x = (1-s)*x0 + s*n.
+        // Both epsilon forms below keep x0 at weight 1 and only ADD noise, which
+        // for a flow-match model leaves the init image at (1+sigma)*x0 after
+        // ideal-velocity integration — amplified, and out of distribution for the
+        // DiT. `add_flow_match_refine_noise` is this same formula pinned to step 0;
+        // dispatching here instead fixes img2img, hires-fix and the masked path
+        // together, rather than one call site at a time.
+        if self.solver == SchedulerSolver::FlowMatchEuler {
+            let sigma = *self.sigmas.get(step).ok_or_else(|| {
+                DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
+            })?;
+            for (latent, noise) in latents.data.iter_mut().zip(noise) {
+                *latent = (1.0 - sigma) * *latent + sigma * *noise;
+            }
+            return Ok(());
         }
         if let Some(timestep) = self.train_timesteps.get(step).copied() {
             let alpha = self.scheduler_alpha(timestep)?;
@@ -1591,6 +1634,146 @@ mod flow_match_dynamic_tests {
             max_image_seq_len: Some(4096),
             ..SchedulerConfig::default()
         }
+    }
+
+    /// Flow matching noises by INTERPOLATION, not by adding epsilon. img2img,
+    /// hires-fix and the masked path all funnel through `add_noise_to_latents`,
+    /// and it used to apply the epsilon form to flow-match schedules — leaving
+    /// the init image at (1+sigma)*x0 instead of (1-sigma)*x0.
+    ///
+    /// The A/B is exact: one schedule, cloned, with only `solver` flipped. A
+    /// flow-match schedule has empty `train_timesteps`, so the Euler arm takes
+    /// the additive branch and the two differ by construction.
+    #[test]
+    fn flow_match_noising_interpolates_where_euler_adds() {
+        let fm = DiffusionSchedule::flow_match_euler_with_image_seq_len(
+            &dynamic_config(),
+            4,
+            Some(256),
+        )
+        .unwrap();
+        assert_eq!(fm.solver, SchedulerSolver::FlowMatchEuler);
+        let s = fm.sigmas[1];
+        assert!(s > 0.0 && s < 1.0, "sigma {s} must be interior to discriminate");
+
+        let latents = |d: Vec<f32>| LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 2,
+            data: d,
+        };
+        // x0 = 1 for both lanes; noise = 1 then 0.
+        let noise = [1.0f32, 0.0];
+
+        let mut got = latents(vec![1.0, 1.0]);
+        fm.add_noise_to_latents(&mut got, &noise, 1).unwrap();
+        // (1-s)*x0 + s*n
+        assert!((got.data[0] - 1.0).abs() < 1e-6, "interp with n=x0 is a no-op, got {}", got.data[0]);
+        assert!((got.data[1] - (1.0 - s)).abs() < 1e-6, "expected {}, got {}", 1.0 - s, got.data[1]);
+
+        // Same schedule, epsilon solver: x0 + s*n. Guards against routing the
+        // non-flow-match families through the new branch.
+        let mut eps_sched = fm.clone();
+        eps_sched.solver = SchedulerSolver::Euler;
+        let mut eps = latents(vec![1.0, 1.0]);
+        eps_sched.add_noise_to_latents(&mut eps, &noise, 1).unwrap();
+        assert!((eps.data[0] - (1.0 + s)).abs() < 1e-6, "expected {}, got {}", 1.0 + s, eps.data[0]);
+        assert!((eps.data[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// `DiffusionRunPlan::latents` is stored pre-scaled by `initial_noise_sigma()`
+    /// for use as the txt2img starting point, so every forward-noising consumer
+    /// has to divide it back out (pipeline_generate.rs, the img2img noise site).
+    /// Pin both halves of what that correction assumes: the scaling is a plain
+    /// multiply that inverts exactly, and it is a no-op for flow-match.
+    /// `"Euler a"` used to resolve to deterministic Euler and produce
+    /// BIT-IDENTICAL output to `"Euler"` for the same seed, while the response
+    /// reported the ancestral sampler. It must now be refused — and refused on
+    /// BOTH routes, because the `Self::linear(steps)` early-returns never consult
+    /// `SchedulerSolver::from_config` at all.
+    #[test]
+    fn ancestral_euler_is_refused_on_both_routes() {
+        let ancestral = |beta: bool| SchedulerConfig {
+            class_name: "EulerAncestralDiscreteScheduler".into(),
+            beta_start: beta.then_some(0.00085),
+            beta_end: beta.then_some(0.012),
+            num_train_timesteps: beta.then_some(1000),
+            ..SchedulerConfig::default()
+        };
+
+        // Route 1: full beta params -> the normal resolver.
+        let err = DiffusionSchedule::from_config_with_image_seq_len(&ancestral(true), 20, None)
+            .expect_err("ancestral Euler must be refused, not silently run as Euler");
+        assert!(matches!(err, DiffusionError::InvalidMetadata(_)), "got {err:?}");
+
+        // Route 2: no beta params -> the `linear()` early-return, which hardcodes
+        // `solver: Euler` and would otherwise degrade silently.
+        let err = DiffusionSchedule::from_config_with_image_seq_len(&ancestral(false), 20, None)
+            .expect_err("the linear() route must refuse it too");
+        assert!(matches!(err, DiffusionError::InvalidMetadata(_)), "got {err:?}");
+
+        // Plain Euler is unaffected on both routes.
+        let plain = |beta: bool| SchedulerConfig {
+            class_name: "EulerDiscreteScheduler".into(),
+            beta_start: beta.then_some(0.00085),
+            beta_end: beta.then_some(0.012),
+            num_train_timesteps: beta.then_some(1000),
+            ..SchedulerConfig::default()
+        };
+        for beta in [true, false] {
+            let sched = DiffusionSchedule::from_config_with_image_seq_len(&plain(beta), 20, None)
+                .expect("plain Euler must still resolve");
+            assert_eq!(sched.solver, SchedulerSolver::Euler);
+        }
+    }
+
+    #[test]
+    fn initial_noise_scaling_inverts_and_is_a_noop_for_flow_match() {
+        let euler = DiffusionSchedule::from_config_with_image_seq_len(
+            &SchedulerConfig {
+                class_name: "EulerDiscreteScheduler".into(),
+                beta_start: Some(0.00085),
+                beta_end: Some(0.012),
+                beta_schedule: Some("scaled_linear".into()),
+                num_train_timesteps: Some(1000),
+                ..SchedulerConfig::default()
+            },
+            20,
+            None,
+        )
+        .unwrap();
+        let sigma = euler.initial_noise_sigma();
+        assert!(sigma > 1.0, "Euler must scale its initial latents, got {sigma}");
+
+        let original: Vec<f32> = (0..8).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let mut latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 4,
+            data: original.clone(),
+        };
+        euler.scale_initial_latents(&mut latents);
+        assert!(
+            (latents.data[7] - original[7] * sigma).abs() < 1e-4,
+            "scaling must be a plain multiply"
+        );
+        for value in &mut latents.data {
+            *value *= 1.0 / sigma;
+        }
+        for (got, want) in latents.data.iter().zip(&original) {
+            assert!((got - want).abs() < 1e-4, "unscale must invert: {got} != {want}");
+        }
+
+        // Flow match does not scale, so the correction must not perturb it.
+        let fm = DiffusionSchedule::flow_match_euler_with_image_seq_len(
+            &dynamic_config(),
+            4,
+            Some(256),
+        )
+        .unwrap();
+        assert_eq!(fm.initial_noise_sigma(), 1.0);
     }
 
     #[test]
