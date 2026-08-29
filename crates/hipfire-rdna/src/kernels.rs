@@ -3897,6 +3897,9 @@ pub const QSA_BLOCK_PREPARE_SRC: &str = include_str!("../../../kernels/src/qsa_b
 
 pub const VISION_OPS_SRC: &str = include_str!("../../../kernels/src/vision_ops.hip");
 
+pub const DN_STATE_PRECISION_SRC: &str =
+    include_str!("../../../kernels/src/dn_state_precision.hip");
+
 pub const HC_APPLY_ALPHA_SRC: &str = include_str!("../../../kernels/src/hc_apply_alpha.hip");
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");

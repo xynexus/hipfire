@@ -2775,7 +2775,7 @@ nothing else moved.
 last touched by `d36f2081f`, BEFORE `f5b32ea32` flipped the DeltaNet default, so
 they are stale in the same way and will drift on the next gfx1103 run.
 
-## [DIAGNOSED 2026-08-29] The fp16 DeltaNet state narrows once per LAUNCH, so per-token prefill rounds n times
+## [FIXED 2026-08-29] The fp16 DeltaNet state narrows once per LAUNCH, so per-token prefill rounds n times
 
 Two beliefs were wrong and both are now measured, not argued.
 
@@ -2832,7 +2832,53 @@ stated purpose (breaking correlated bias on a recurrent accumulator, where drift
 was measured superlinear), but it trades that against batched-vs-per-token
 agreement. Previously undocumented.
 
-**Fixing it properly — two options, neither implemented, both real work:**
+**FIXED by (a): an FP32 shadow across the per-token fallback.**
+
+`DnFp32Shadow` (prefill_batch.rs) holds S in f32 for the duration of the
+per-token prefill loop and rounds only where the BATCHED path rounds — every
+`PREFILL_MAX_BATCH` tokens, plus once at the end. Measured at the DeltaNet layer:
+
+    n        before     after      fp32-state floor
+    8        1.15e-3    2.23e-7    2.23e-7
+    32       1.63e-3    2.23e-7    2.23e-7
+    128      2.36e-3    2.44e-7    2.44e-7
+
+i.e. FP16 now reproduces the FP32 trajectory exactly, ~4 orders of magnitude
+better. Downstream, `tiny-prefill-gate` goes from fail=1 to fail=0: the
+qwen3_5_moe_indexed kvarn cell drops 1.06e-1 -> 3.31e-4 and q8 1.04e-2 -> 1.06e-3,
+both the fp32-state figures. `tiny-state-gate` still PASSes 18/18.
+
+Four things that had to be right, each of which would have left the cadence
+fixed and the numbers still wrong:
+
+  * The narrow must reproduce `f32_to_f16_dither` INCLUDING its index derivation
+    — the element's offset within its HEAD xor `head << 19`, not a flat global
+    index. A flat index dithers every head but head 0 differently.
+  * The shadow must be seeded by WIDENING, never zeroing: prefill runs
+    mid-sequence (DFlash FullPrefill rollback replays a committed prefix), so a
+    zeroed shadow destroys live state on exactly the path this helps.
+  * It must round at the batched path's chunk boundaries, not just once at the
+    end — batched narrows per `PREFILL_MAX_BATCH` chunk, so "narrow once" would
+    have been MORE accurate than batched and still different from it. The
+    boundary does narrow-then-widen, injecting exactly the batched rounding.
+  * Restore on the error path. Every call in the loop uses `?`; leaving
+    `s_matrices` on f32 buffers under a FP16 tag makes the next decode read f32
+    bytes as `_Float16*`, and `free_gpu` frees the wrong buffers.
+
+SCOPE, deliberately narrow: only the per-token fallback, which is the one
+un-chunked token loop with a single exit. There is NO general prefill begin/end
+hook — prefill is chunked at three nested levels and the march executor parks the
+session between bands — so a shadow spanning "a prefill" would have nowhere to
+hang and would have to survive `suspend`. The persistent state stays FP16, so the
+~149 MB -> ~75 MB per-session win (19/64 vs 64/64 concurrent sessions at 27B) is
+untouched outside the fallback.
+
+STILL OPEN: the multi-session fused prefill path passes state via device pointer
+tables (`dn_s_ptrs`) and is not covered; and `prefill_lowered.rs`'s
+`use_gdn_per_token` loop (Q8-GDN verify) still narrows per token. Both are
+separate entry points, not regressions introduced here.
+
+**The alternative that was NOT taken:**
 
   a) Keep S in FP32 for the duration of a multi-token prefill and narrow once at
      the end. The PERSISTENT state stays fp16, so the memory win the fp16 default

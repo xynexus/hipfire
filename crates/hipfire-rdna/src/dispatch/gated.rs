@@ -755,6 +755,70 @@ impl Gpu {
     /// function of its input and the snapshot property above still holds. That
     /// is the difference from the Q8 path's stochastic rounding, which was
     /// removed precisely because it broke it.
+    /// Widen the f16 DeltaNet S state into an f32 shadow. Exact.
+    ///
+    /// `n` counts ELEMENTS. The f16 state is allocated as `DType::Raw` with the
+    /// shape in elements and 2 bytes each (state.rs), so `buf.size() / 2` is the
+    /// only safe element count — `shape * 4` mis-sizes it by 2x.
+    #[cfg(feature = "deltanet")]
+    pub fn dn_state_widen_f16_f32(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dn_state_widen_f16_f32",
+            kernels::DN_STATE_PRECISION_SRC,
+            "dn_state_widen_f16_f32",
+        )?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let nn = n as i32;
+        self.launch_kernargs(
+            "dn_state_widen_f16_f32",
+            [n.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr sp, ptr dp, i32 nn],
+        )
+    }
+
+    /// Narrow an f32 DeltaNet S shadow back into the persistent f16 state,
+    /// reproducing `gated_delta_net_f16`'s own narrowing bit-for-bit.
+    ///
+    /// Uses the same dither setting as the kernels (`fp16_state_dither()`), and
+    /// the same head-relative index derivation. Getting either wrong fixes the
+    /// rounding CADENCE and still leaves the paths numerically apart.
+    #[cfg(feature = "deltanet")]
+    pub fn dn_state_narrow_f32_f16(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+        elems_per_head: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dn_state_narrow_f32_f16",
+            kernels::DN_STATE_PRECISION_SRC,
+            "dn_state_narrow_f32_f16",
+        )?;
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let nn = n as i32;
+        let eph = elems_per_head as i32;
+        let sr = fp16_state_dither() as i32;
+        self.launch_kernargs(
+            "dn_state_narrow_f32_f16",
+            [n.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr sp, ptr dp, i32 nn, i32 eph, i32 sr],
+        )
+    }
+
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_f16_batch_seq(
