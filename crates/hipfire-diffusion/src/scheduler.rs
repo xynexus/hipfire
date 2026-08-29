@@ -1646,15 +1646,15 @@ mod flow_match_dynamic_tests {
     /// the additive branch and the two differ by construction.
     #[test]
     fn flow_match_noising_interpolates_where_euler_adds() {
-        let fm = DiffusionSchedule::flow_match_euler_with_image_seq_len(
-            &dynamic_config(),
-            4,
-            Some(256),
-        )
-        .unwrap();
+        let fm =
+            DiffusionSchedule::flow_match_euler_with_image_seq_len(&dynamic_config(), 4, Some(256))
+                .unwrap();
         assert_eq!(fm.solver, SchedulerSolver::FlowMatchEuler);
         let s = fm.sigmas[1];
-        assert!(s > 0.0 && s < 1.0, "sigma {s} must be interior to discriminate");
+        assert!(
+            s > 0.0 && s < 1.0,
+            "sigma {s} must be interior to discriminate"
+        );
 
         let latents = |d: Vec<f32>| LatentBatch {
             batch: 1,
@@ -1669,8 +1669,17 @@ mod flow_match_dynamic_tests {
         let mut got = latents(vec![1.0, 1.0]);
         fm.add_noise_to_latents(&mut got, &noise, 1).unwrap();
         // (1-s)*x0 + s*n
-        assert!((got.data[0] - 1.0).abs() < 1e-6, "interp with n=x0 is a no-op, got {}", got.data[0]);
-        assert!((got.data[1] - (1.0 - s)).abs() < 1e-6, "expected {}, got {}", 1.0 - s, got.data[1]);
+        assert!(
+            (got.data[0] - 1.0).abs() < 1e-6,
+            "interp with n=x0 is a no-op, got {}",
+            got.data[0]
+        );
+        assert!(
+            (got.data[1] - (1.0 - s)).abs() < 1e-6,
+            "expected {}, got {}",
+            1.0 - s,
+            got.data[1]
+        );
 
         // Same schedule, epsilon solver: x0 + s*n. Guards against routing the
         // non-flow-match families through the new branch.
@@ -1678,7 +1687,12 @@ mod flow_match_dynamic_tests {
         eps_sched.solver = SchedulerSolver::Euler;
         let mut eps = latents(vec![1.0, 1.0]);
         eps_sched.add_noise_to_latents(&mut eps, &noise, 1).unwrap();
-        assert!((eps.data[0] - (1.0 + s)).abs() < 1e-6, "expected {}, got {}", 1.0 + s, eps.data[0]);
+        assert!(
+            (eps.data[0] - (1.0 + s)).abs() < 1e-6,
+            "expected {}, got {}",
+            1.0 + s,
+            eps.data[0]
+        );
         assert!((eps.data[1] - 1.0).abs() < 1e-6);
     }
 
@@ -1705,13 +1719,19 @@ mod flow_match_dynamic_tests {
         // Route 1: full beta params -> the normal resolver.
         let err = DiffusionSchedule::from_config_with_image_seq_len(&ancestral(true), 20, None)
             .expect_err("ancestral Euler must be refused, not silently run as Euler");
-        assert!(matches!(err, DiffusionError::InvalidMetadata(_)), "got {err:?}");
+        assert!(
+            matches!(err, DiffusionError::InvalidMetadata(_)),
+            "got {err:?}"
+        );
 
         // Route 2: no beta params -> the `linear()` early-return, which hardcodes
         // `solver: Euler` and would otherwise degrade silently.
         let err = DiffusionSchedule::from_config_with_image_seq_len(&ancestral(false), 20, None)
             .expect_err("the linear() route must refuse it too");
-        assert!(matches!(err, DiffusionError::InvalidMetadata(_)), "got {err:?}");
+        assert!(
+            matches!(err, DiffusionError::InvalidMetadata(_)),
+            "got {err:?}"
+        );
 
         // Plain Euler is unaffected on both routes.
         let plain = |beta: bool| SchedulerConfig {
@@ -1744,7 +1764,10 @@ mod flow_match_dynamic_tests {
         )
         .unwrap();
         let sigma = euler.initial_noise_sigma();
-        assert!(sigma > 1.0, "Euler must scale its initial latents, got {sigma}");
+        assert!(
+            sigma > 1.0,
+            "Euler must scale its initial latents, got {sigma}"
+        );
 
         let original: Vec<f32> = (0..8).map(|i| i as f32 * 0.25 - 1.0).collect();
         let mut latents = LatentBatch {
@@ -1763,16 +1786,16 @@ mod flow_match_dynamic_tests {
             *value *= 1.0 / sigma;
         }
         for (got, want) in latents.data.iter().zip(&original) {
-            assert!((got - want).abs() < 1e-4, "unscale must invert: {got} != {want}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "unscale must invert: {got} != {want}"
+            );
         }
 
         // Flow match does not scale, so the correction must not perturb it.
-        let fm = DiffusionSchedule::flow_match_euler_with_image_seq_len(
-            &dynamic_config(),
-            4,
-            Some(256),
-        )
-        .unwrap();
+        let fm =
+            DiffusionSchedule::flow_match_euler_with_image_seq_len(&dynamic_config(), 4, Some(256))
+                .unwrap();
         assert_eq!(fm.initial_noise_sigma(), 1.0);
     }
 

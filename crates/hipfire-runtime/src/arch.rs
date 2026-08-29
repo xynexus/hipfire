@@ -1477,8 +1477,9 @@ mod tests {
         let mut vocab = serde_json::Map::new();
         let mut n = 0u32;
         for b in 0u32..256 {
-            let printable =
-                (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+            let printable = (0x21..=0x7E).contains(&b)
+                || (0xA1..=0xAC).contains(&b)
+                || (0xAE..=0xFF).contains(&b);
             let ch = if printable {
                 char::from_u32(b).unwrap()
             } else {
@@ -1497,7 +1498,11 @@ mod tests {
         let tok = Tokenizer::from_hf_json(&json).unwrap();
 
         // The fixture is what we think it is: the two tokens ARE "é".
-        assert_eq!(tok.decode_bytes(&[0xC3, 0xA9]), "é".as_bytes(), "fixture broken");
+        assert_eq!(
+            tok.decode_bytes(&[0xC3, 0xA9]),
+            "é".as_bytes(),
+            "fixture broken"
+        );
 
         // The old path: each token decoded alone loses the codepoint entirely.
         let per_token: String = [0xC3u32, 0xA9].iter().map(|&t| tok.decode(&[t])).collect();

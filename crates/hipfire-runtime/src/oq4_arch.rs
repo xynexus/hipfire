@@ -154,7 +154,9 @@ mod tests {
     #[test]
     fn every_oq4_arch_load_call_site_pre_checks_ragged_k() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -178,7 +180,9 @@ mod tests {
             if f.ends_with("oq4_arch.rs") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&f) else { continue };
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
             let lines: Vec<&str> = text.lines().collect();
             for (i, line) in lines.iter().enumerate() {
                 if !line.contains("oq4_arch_load(") || line.contains("fn oq4_arch_load") {

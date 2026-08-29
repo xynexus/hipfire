@@ -174,15 +174,24 @@ fn top_level_entries(text: &str) -> usize {
         }
     }
     // A trailing comma leaves an empty final entry.
-    if t.ends_with(',') { n - 1 } else { n }
+    if t.ends_with(',') {
+        n - 1
+    } else {
+        n
+    }
 }
 
 /// `self.launch_kernargs("NAME", ..., &kernargs![...])` — the kernel name is the
 /// call's own first argument, so attribution here is exact rather than heuristic.
 /// This is the majority path (478 sites) and is where a `bits`/`row_offset`
 /// regression actually slipped through once.
-fn scan_kernargs(text: &str, arity: &HashMap<String, HashSet<usize>>, file: &str,
-                 checked: &mut usize, mismatches: &mut Vec<String>) {
+fn scan_kernargs(
+    text: &str,
+    arity: &HashMap<String, HashSet<usize>>,
+    file: &str,
+    checked: &mut usize,
+    mismatches: &mut Vec<String>,
+) {
     let mut from = 0usize;
     while let Some(rel) = text[from..].find("launch_kernargs(") {
         let call = from + rel;
@@ -197,9 +206,13 @@ fn scan_kernargs(text: &str, arity: &HashMap<String, HashSet<usize>>, file: &str
             continue;
         }
         let q1 = rest.len() - head.len();
-        let Some(q2rel) = rest[q1 + 1..].find('"') else { continue };
+        let Some(q2rel) = rest[q1 + 1..].find('"') else {
+            continue;
+        };
         let name = &rest[q1 + 1..q1 + 1 + q2rel];
-        let Some(karg) = rest.find("kernargs![") else { continue };
+        let Some(karg) = rest.find("kernargs![") else {
+            continue;
+        };
         // Only accept a kernargs! that belongs to THIS call, not a later one.
         if let Some(next_call) = rest.find("launch_kernargs(") {
             if next_call < karg {
@@ -217,7 +230,9 @@ fn scan_kernargs(text: &str, arity: &HashMap<String, HashSet<usize>>, file: &str
             }
             j += 1;
         }
-        let Some(declared) = arity.get(name) else { continue };
+        let Some(declared) = arity.get(name) else {
+            continue;
+        };
         let passed = top_level_entries(&text[open..j.saturating_sub(1)]);
         *checked += 1;
         if !declared.contains(&passed) {
@@ -261,13 +276,21 @@ fn raw_kernel_launches_match_their_hip_arity() {
         let lines: Vec<&str> = text.lines().collect();
 
         // Function spans, so a kernel name never leaks across a `fn` boundary.
-        let mut bounds: Vec<usize> = (0..lines.len()).filter(|&i| is_fn_start(lines[i])).collect();
+        let mut bounds: Vec<usize> = (0..lines.len())
+            .filter(|&i| is_fn_start(lines[i]))
+            .collect();
         bounds.push(lines.len());
         let mut ambiguous = vec![false; lines.len()];
         for w in bounds.windows(2) {
             let (a, b) = (w[0], w[1]);
-            let names: HashSet<String> = lines[a..b].iter().filter_map(|l| kernel_name_on(l)).collect();
-            let vecs = lines[a..b].iter().filter(|l| l.contains(PARAMS_DECL)).count();
+            let names: HashSet<String> = lines[a..b]
+                .iter()
+                .filter_map(|l| kernel_name_on(l))
+                .collect();
+            let vecs = lines[a..b]
+                .iter()
+                .filter(|l| l.contains(PARAMS_DECL))
+                .count();
             // More than one kernel, or more than one params vec: which feeds which
             // is not statically decidable (the kernel may be picked at runtime).
             if names.len() > 1 || vecs > 1 {
