@@ -187,10 +187,82 @@ fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
                 Err(format!("want one of {}", values.join("|")))
             }
         }
-        ConfigType::String | ConfigType::Path => Ok(Value::String(raw.to_string())),
+        ConfigType::String => Ok(Value::String(raw.to_string())),
+        ConfigType::Path => {
+            validate_path(raw)?;
+            Ok(Value::String(raw.to_string()))
+        }
         ConfigType::Json => {
             serde_json::from_str::<Value>(raw).map_err(|err| format!("want valid JSON ({err})"))
         }
+        // First arm that accepts wins; see `ConfigType::OneOf` on why order is
+        // semantic. On total failure report every arm's expectation, not just
+        // the last one's — "want a path" alone would hide the sentinels.
+        ConfigType::OneOf(arms) => {
+            let mut wants = Vec::new();
+            for arm in *arms {
+                match parse_env_value(raw, arm) {
+                    Ok(value) => return Ok(value),
+                    Err(want) => wants.push(want),
+                }
+            }
+            Err(wants.join("; or "))
+        }
+    }
+}
+
+/// Reject a path that no filesystem could name. Deliberately NOT an existence
+/// check: a store root is created on first use, and requiring it to exist would
+/// refuse a valid config on a fresh host.
+///
+/// This catches malformed input, not wrong input. A bare relative name is a
+/// legal path, so a sentinel typo (`"rma"` for `"ram"`) still resolves as a
+/// path — only the filesystem can say it was not meant.
+pub fn validate_path(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("want a path (got blank)".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("want a path (contains a NUL byte)".to_string());
+    }
+    Ok(())
+}
+
+/// Check an already-typed JSON value (from a config FILE, not the environment)
+/// against its declared type.
+///
+/// `resolve_field` takes file values verbatim, so before this nothing checked
+/// them: only env went through `parse_env_value`, and the later
+/// `from_value::<HipfireConfig>` catches a Rust type mismatch but never a
+/// domain one — `kv_cache: "kvarnn"` is a perfectly good String.
+///
+/// Reports, never rejects. A value that is wrong here still resolves exactly as
+/// it did before; the operator gets told. Refusing would turn a warning into an
+/// outage on configs that are running today.
+pub fn validate_resolved_value(value: &Value, ty: &ConfigType) -> Result<(), String> {
+    match (value, ty) {
+        (_, ConfigType::Json) => Ok(()),
+        (Value::String(text), _) => parse_env_value(text, ty).map(|_| ()),
+        (Value::Bool(_), ConfigType::Bool) => Ok(()),
+        (
+            Value::Number(_),
+            ConfigType::U8 | ConfigType::U16 | ConfigType::U32 | ConfigType::U64,
+        ) if value.as_u64().is_some() => Ok(()),
+        (Value::Number(_), ConfigType::I32) if value.as_i64().is_some() => Ok(()),
+        (Value::Number(_), ConfigType::F64) => Ok(()),
+        (_, ConfigType::OneOf(arms)) => {
+            let mut wants = Vec::new();
+            for arm in *arms {
+                match validate_resolved_value(value, arm) {
+                    Ok(()) => return Ok(()),
+                    Err(want) => wants.push(want),
+                }
+            }
+            Err(wants.join("; or "))
+        }
+        // Anything else is a shape mismatch the typed materialize step reports
+        // with its own message; do not double-report it here.
+        _ => Ok(()),
     }
 }
 

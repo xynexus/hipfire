@@ -170,10 +170,19 @@ pub fn apply_config_edit(
 
 pub fn encode_editor_value(field: &ConfigField, raw: &Value) -> Result<Value, String> {
     match field.ty {
-        ConfigType::String | ConfigType::Path => match raw {
+        ConfigType::String => match raw {
             Value::String(value) => Ok(Value::String(value.clone())),
             other => Ok(Value::String(value_to_editor_string(other))),
         },
+        ConfigType::Path => {
+            let value = raw
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value_to_editor_string(raw));
+            crate::resolve::validate_path(&value)
+                .map_err(|want| format!("{} {want}", field.key))?;
+            Ok(Value::String(value))
+        }
         ConfigType::Enum { values } => {
             let value = raw
                 .as_str()
@@ -218,6 +227,18 @@ pub fn encode_editor_value(field: &ConfigField, raw: &Value) -> Result<Value, St
             Value::String(value) => serde_json::from_str(value).or_else(|_| Ok(raw.clone())),
             other => Ok(other.clone()),
         },
+        // Same first-arm-wins rule as the parser; see `ConfigType::OneOf`.
+        ConfigType::OneOf(arms) => {
+            let mut errors = Vec::new();
+            for arm in arms {
+                let probe = ConfigField { ty: *arm, ..*field };
+                match encode_editor_value(&probe, raw) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => errors.push(error),
+                }
+            }
+            Err(errors.join("; or "))
+        }
     }
 }
 

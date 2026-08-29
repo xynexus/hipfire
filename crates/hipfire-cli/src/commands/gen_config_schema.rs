@@ -187,6 +187,13 @@ fn type_label(ty: ConfigType) -> String {
         ConfigType::Path => "path".to_string(),
         ConfigType::Enum { values } => format!("enum({})", values.join("|")),
         ConfigType::Json => "json".to_string(),
+        ConfigType::OneOf(arms) => format!(
+            "one_of({})",
+            arms.iter()
+                .map(|arm| type_label(*arm))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
     }
 }
 

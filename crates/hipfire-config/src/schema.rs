@@ -52,9 +52,26 @@ pub enum ConfigType {
     F64,
     String,
     Path,
-    Enum { values: &'static [&'static str] },
+    Enum {
+        values: &'static [&'static str],
+    },
     Json,
+    /// A value that may be any ONE of several domains — a closed set of
+    /// sentinels OR an open one, e.g. `ngram_store_root`'s "ram"/"none"/"off"
+    /// or a directory path.
+    ///
+    /// Arms are tried in order and the first that accepts wins, so ORDER IS
+    /// SEMANTIC: an open arm (`String`, `Path`, `Json`) accepts nearly
+    /// anything, so it must come last or it swallows the sentinels behind it.
+    OneOf(&'static [ConfigType]),
 }
+
+/// Sentinel values of [`NGRAM_STORE_ROOT_RAM`] meaning "keep tables in RAM".
+///
+/// Declared here so the domain has ONE home. It used to live only in
+/// `NgramSetup::persists()` and in this field's prose description, with nothing
+/// binding the two.
+pub const NGRAM_STORE_ROOT_RAM: &[&str] = &["", "ram", "none", "off"];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "condition", rename_all = "snake_case")]
@@ -646,7 +663,12 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "ngram_store_root",
-        ConfigType::String,
+        ConfigType::OneOf(&[
+            ConfigType::Enum {
+                values: NGRAM_STORE_ROOT_RAM,
+            },
+            ConfigType::Path,
+        ]),
         Requirement::Optional,
         Some(""),
         GLOBAL_MODEL_RUNTIME,
