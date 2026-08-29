@@ -2673,7 +2673,7 @@ upstream — exact, at five sequence lengths straddling the dense-below boundary
 
 Found 2026-08-29 while wiring the GPU QSA block.
 
-## tiny-prefill's hidden-state probe only runs if a stale binary is lying around (medium)
+## [FIXED 2026-08-29] tiny-prefill's hidden-state probe only runs if a stale binary is lying around
 
 `tests/tiny-prefill-gate.sh:184` gates its hidden-state divergence check on
 
@@ -2697,10 +2697,28 @@ one CI never runs. Same shape as the `$HOME/.hipfire/bin/hipfire` staleness in
 a gate reading through whatever happens to be on disk rather than building what
 it means to test.
 
-Fix: build the example in the gate, or fail loudly when it is absent instead of
-skipping silently. Do NOT simply raise the ceiling — the divergence it reports
-is real, and its own comment says the ceiling "does not claim the current
-divergence is acceptable, only that it must not grow."
+**FIXED.** The gate now builds `-p hipfire-runtime --example
+compare_prefill_hidden_paths` alongside its other targets, and a missing binary
+is an infra error (exit 2) rather than a skip.
+
+A SECOND silent-skip in the same block was found while fixing it. The probe
+emits one of two mutually exclusive summary lines:
+
+    FIRST DIVERGING LAYER: 0   (worst overall 1.06e-1)
+    IDENTICAL across all layers (worst 3.31e-4)
+
+The parser matched only `worst overall`, so the GOOD case produced an empty
+string and was dropped by `[ -n "$wq" ] || continue`. A measurement that did not
+happen was indistinguishable from one that passed — including for the fp32
+INVARIANT arm, the positive control that is supposed to prove the probe can see
+anything at all. Both shapes are parsed now, and an unparseable summary FAILS.
+
+What that made visible immediately, on cells that previously printed nothing:
+
+    hidden fp32:  0.00e0  (invariant, now actually asserted — 3 families)
+    qwen3_5_moe   q8 0.00e0   kvarn 0.00e0
+
+The ceiling was NOT raised. See the entry below for the one cell that fails.
 
 ## [RESOLVED 2026-08-29] The 4 drifted gfx1151 tiny-state cells: root-caused, both causes benign
 
@@ -2757,7 +2775,38 @@ nothing else moved.
 last touched by `d36f2081f`, BEFORE `f5b32ea32` flipped the DeltaNet default, so
 they are stale in the same way and will drift on the next gfx1103 run.
 
-## [RESOLVED 2026-08-29 for state+quant; prefill still open] Three tiny-gate cells are already failing on origin/master
+## The DeltaNet fp16 default raises MoE hidden-state divergence 320x (medium, OPEN)
+
+Newly visible once `tiny-prefill`'s hidden-state probe was made to actually run
+(entry above). Measured 2026-08-29 on halo, `qwen3_5_moe_indexed` fixture, the
+batched-vs-per-token hidden states a DFlash drafter consumes:
+
+    DN state   kvarn divergence
+    fp32       3.31e-4   IDENTICAL across all layers
+    fp16       1.06e-1   FIRST DIVERGING LAYER: 0     <- 320x, over the 5e-2 ceiling
+
+Cause is `f5b32ea32 feat(deltanet): default the DeltaNet state to fp16`. That
+commit's evidence was token-level — "Generation is BYTE-IDENTICAL to fp32" — and
+this probe exists precisely because token equality does NOT imply hidden-state
+equality: the block's own header says "batched vs per-token hidden states diverge
+under QUANTISED KV while greedy token output stays byte-identical". So the
+commit's claim and this measurement are both true and not in conflict.
+
+Why it matters: KVarN is the DEFAULT KV mode, its FA layers take the per-token
+fallback (`fa_kv_ok` fails for KVarN), and a drafter reads these hidden states.
+The q8 arm moved too, 1.06e-3 -> 1.04e-2, but stays under the ceiling.
+
+NOT fixed here, because the options are a judgement call, not a cleanup:
+  a) revert the fp16 default (costs the measured tau gain, 3.682 -> 4.103),
+  b) keep fp16 but fix the KVarN per-token write path the probe warns about
+     ("the per-token fallback is MEASURED to emit a different token stream than
+     the batched path on qwen3.5 MoE"), or
+  c) accept it with a raised, justified ceiling — but the ceiling's own comment
+     says it "does not claim the current divergence is acceptable".
+
+Do NOT resolve this by raising the ceiling without picking one of these.
+
+## [RESOLVED 2026-08-29 for state+quant; prefill open — see the entry above] Three tiny-gate cells are already failing on origin/master
 
 Confirmed 2026-08-29 by running each gate in a clean `git worktree` at
 `origin/master` (0c9e3d252) and comparing to a working branch — the observed
