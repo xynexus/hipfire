@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-qwen4exp-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline spec for Qwen3.8-Flash-Next (qwen4_exp): arch identity + the Ingest quant-policy. Deps only hipfire-arch-api (CPU-only, the quantizer links this)."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

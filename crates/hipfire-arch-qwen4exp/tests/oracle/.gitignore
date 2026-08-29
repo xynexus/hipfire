@@ -1,0 +1,3 @@
+# Regenerate with scripts/qwen4exp_oracle.py (see its header).
+*.bin
+*.json
