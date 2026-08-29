@@ -37,15 +37,29 @@ use std::process::Command;
 /// `git check-ignore` exits 0 when ignored, 1 when not, 128 with no repo. Only a
 /// clean 0 skips, so a missing or broken git keeps the old strict behavior.
 pub(crate) fn is_git_ignored(path: &Path) -> bool {
-    let Some(name) = path.file_name() else {
-        return false;
+    // Run from the nearest ANCESTOR THAT EXISTS, passing the path unchanged.
+    //
+    // `check-ignore` is a pattern query — it answers for paths that do not exist,
+    // which is the case that matters: in CI `/man/` is absent entirely, and the
+    // whole point is to recognise it as ignored anyway. An earlier version ran
+    // `git -C <path's parent>`, which exits 128 ("cannot change to 'man'") when
+    // that parent is missing, so every man page was reported NOT ignored and the
+    // freshness gate failed on a fresh clone. That is the same local-vs-CI
+    // asymmetry this helper exists to remove, reintroduced by the helper itself.
+    let mut dir = path.parent().unwrap_or(Path::new("."));
+    while !dir.as_os_str().is_empty() && !dir.is_dir() {
+        dir = dir.parent().unwrap_or(Path::new("."));
+    }
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
     };
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     Command::new("git")
         .arg("-C")
-        .arg(dir.unwrap_or(Path::new(".")))
+        .arg(dir)
         .args(["check-ignore", "-q", "--"])
-        .arg(name)
+        .arg(path)
         .output()
         .is_ok_and(|out| out.status.code() == Some(0))
 }
@@ -81,6 +95,22 @@ mod tests {
         assert!(
             !is_git_ignored(&dir.join("docs/CLI.md")),
             "a committable output must still be checked"
+        );
+
+        // THE CI CASE, and the one that escaped a first version of this helper:
+        // a fresh clone has no `/man/` at all. `check-ignore` is a pattern query
+        // and answers for paths that do not exist, so an ignored output must be
+        // recognised as ignored even when its directory is missing. Running git
+        // from the path's own parent made this exit 128 and report NOT ignored,
+        // which failed the docs gate on every fresh clone while passing locally.
+        std::fs::remove_dir_all(dir.join("man")).unwrap();
+        assert!(
+            is_git_ignored(&dir.join("man/hipfire.1")),
+            "an ignored output must be recognised even when its directory is absent"
+        );
+        assert!(
+            is_git_ignored(&dir.join("man/deeper/nested.1")),
+            "…including through several missing levels"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

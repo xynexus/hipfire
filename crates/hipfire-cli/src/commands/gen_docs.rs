@@ -147,6 +147,12 @@ fn check_file(path: std::path::PathBuf, expected: impl AsRef<[u8]>, stale: &mut 
     }
     match std::fs::read(&path) {
         Ok(got) if got == expected.as_ref() => {}
+        // A generated output that is ABSENT is not drift. CI clones fresh and has
+        // no `/man/` at all, and `docs/CLI.md` is tracked so it is always present
+        // — meaning this forgiveness costs no real enforcement while removing a
+        // second way for the gate to fail only in CI. `gen_env_docs::check_file`
+        // has always had exactly this arm.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => stale.push(path.display().to_string()),
     }
 }
