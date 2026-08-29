@@ -298,16 +298,23 @@ fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
             break;
         }
         let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-        for j in 0..16 {
+        // GGML packs element `j` in the LOW nibble of byte `j` and element
+        // `j + 16` in the HIGH nibble — NOT an adjacent pair. `dequantize_row_q4_0`
+        // is `y[j] = lo*d; y[j + qk/2] = hi*d`. Writing `j*2` / `j*2+1` here
+        // permuted 30 of every 32 weights, silently, since a permutation loses
+        // nothing that a later check could notice. `dequant_q4_k` below always
+        // used the correct split.
+        let half = block_size / 2;
+        for j in 0..half {
             let byte = data[off + 2 + j];
             let lo = (byte & 0x0F) as i32 - 8;
             let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            let idx = b * block_size + j * 2;
+            let idx = b * block_size + j;
             if idx < n {
                 out[idx] = lo as f32 * scale;
             }
-            if idx + 1 < n {
-                out[idx + 1] = hi as f32 * scale;
+            if idx + half < n {
+                out[idx + half] = hi as f32 * scale;
             }
         }
     }
@@ -423,8 +430,13 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
             let m_odd = dmin * mins[sb_odd] as f32;
             for l in 0..32 {
                 let byte = ql[group * 32 + l];
-                let hbit = ((qh[l] >> group) & 1) as u8;
-                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
+                // The reference walks the qh bit pair two positions per 64-element
+                // group (`u1 = 1, u2 = 2`, then `u1 <<= 2; u2 <<= 2`), so group g
+                // uses bits 2g and 2g+1. Using `group` / `group + 4` read the wrong
+                // bit in 6 of the 8 sub-blocks — only g0-low (bit 0) and g3-high
+                // (bit 7) coincided — putting those weights off by 16 * scale.
+                let hbit = ((qh[l] >> (2 * group)) & 1) as u8;
+                let hbit2 = ((qh[l] >> (2 * group + 1)) & 1) as u8;
                 let idx_even = b * block_size + group * 64 + l;
                 let idx_odd = idx_even + 32;
                 if idx_even < n {
@@ -702,5 +714,158 @@ pub fn mv_to_json(v: &MetaValue) -> serde_json::Value {
         // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
         // serialize them as JSON arrays so the engine side can re-parse.
         MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
+    }
+}
+
+#[cfg(test)]
+mod dequant_layout_tests {
+    //! Pin each GGML block layout against a reference written from the upstream
+    //! `dequantize_row_*` formulas, not from the decoders below it.
+    //!
+    //! This exists because `dequant_q4_0` and `dequant_q5_k` were both wrong in
+    //! ways nothing could notice: Q4_0's was a pure permutation, and Q5_K's put
+    //! half the weights off by one high bit. The crate had no tests at all, so a
+    //! decoder could disagree with GGML forever. Q4_K/Q6_K/Q8_0 were already
+    //! correct and are covered here too — they are what makes this test
+    //! trustworthy rather than a restatement of whatever the code happens to do.
+
+    use super::{dequant_q4_0, dequant_q4_k, dequant_q5_k, dequant_q6_k, dequant_q8_0};
+
+    /// f16 bit patterns for exact values, so no float conversion is needed.
+    const F16_ONE: u16 = 0x3C00; // 1.0
+    const F16_HALF: u16 = 0x3800; // 0.5
+
+    /// Deterministic filler; any fixed byte stream exercises the layout.
+    fn lcg(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Q4_K / Q5_K share this 6-bit packed scales+mins layout.
+    fn unpack_k_scales(sc: &[u8]) -> ([u8; 8], [u8; 8]) {
+        let (mut scales, mut mins) = ([0u8; 8], [0u8; 8]);
+        for i in 0..4 {
+            scales[i] = sc[i] & 63;
+            mins[i] = sc[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc[8 + i] & 0xF) | ((sc[i] >> 6) << 4);
+            mins[4 + i] = (sc[8 + i] >> 4) | ((sc[4 + i] >> 6) << 4);
+        }
+        (scales, mins)
+    }
+
+    #[test]
+    fn q4_0_splits_the_byte_across_j_and_j_plus_16() {
+        let qs = lcg(16, 7);
+        let mut blk = F16_ONE.to_le_bytes().to_vec();
+        blk.extend_from_slice(&qs);
+
+        // ggml: y[j] = (qs[j] & 0xF) - 8; y[j + qk/2] = (qs[j] >> 4) - 8
+        let mut want = vec![0.0f32; 32];
+        for j in 0..16 {
+            want[j] = ((qs[j] & 0x0F) as i32 - 8) as f32;
+            want[j + 16] = ((qs[j] >> 4) as i32 - 8) as f32;
+        }
+        assert_eq!(dequant_q4_0(&blk, 32), want);
+    }
+
+    #[test]
+    fn q8_0_is_sequential() {
+        let qs = lcg(32, 11);
+        let mut blk = F16_HALF.to_le_bytes().to_vec();
+        blk.extend_from_slice(&qs);
+
+        let want: Vec<f32> = qs.iter().map(|&q| q as i8 as f32 * 0.5).collect();
+        assert_eq!(dequant_q8_0(&blk, 32), want);
+    }
+
+    #[test]
+    fn q4_k_low_nibble_leads_high_nibble_by_32() {
+        let sc = lcg(12, 13);
+        let qs = lcg(128, 17);
+        let mut blk = F16_ONE.to_le_bytes().to_vec();
+        blk.extend_from_slice(&F16_HALF.to_le_bytes());
+        blk.extend_from_slice(&sc);
+        blk.extend_from_slice(&qs);
+
+        let (scales, mins) = unpack_k_scales(&sc);
+        let mut want = vec![0.0f32; 256];
+        for g in 0..4 {
+            let (d1, m1) = (scales[2 * g] as f32, mins[2 * g] as f32 * 0.5);
+            let (d2, m2) = (scales[2 * g + 1] as f32, mins[2 * g + 1] as f32 * 0.5);
+            for l in 0..32 {
+                let b = qs[g * 32 + l];
+                want[g * 64 + l] = (b & 0x0F) as f32 * d1 - m1;
+                want[g * 64 + 32 + l] = (b >> 4) as f32 * d2 - m2;
+            }
+        }
+        assert_eq!(dequant_q4_k(&blk, 256), want);
+    }
+
+    #[test]
+    fn q5_k_advances_the_qh_bit_pair_two_per_group() {
+        let sc = lcg(12, 19);
+        let qh = lcg(32, 23);
+        let ql = lcg(128, 29);
+        let mut blk = F16_ONE.to_le_bytes().to_vec();
+        blk.extend_from_slice(&F16_HALF.to_le_bytes());
+        blk.extend_from_slice(&sc);
+        blk.extend_from_slice(&qh);
+        blk.extend_from_slice(&ql);
+
+        let (scales, mins) = unpack_k_scales(&sc);
+        // ggml: u1 = 1, u2 = 2; after each 64-element group, u1 <<= 2, u2 <<= 2.
+        let (mut u1, mut u2) = (1u8, 2u8);
+        let mut want = vec![0.0f32; 256];
+        for g in 0..4 {
+            let (d1, m1) = (scales[2 * g] as f32, mins[2 * g] as f32 * 0.5);
+            let (d2, m2) = (scales[2 * g + 1] as f32, mins[2 * g + 1] as f32 * 0.5);
+            for l in 0..32 {
+                let b = ql[g * 32 + l];
+                let h1 = if qh[l] & u1 != 0 { 16u32 } else { 0 };
+                let h2 = if qh[l] & u2 != 0 { 16u32 } else { 0 };
+                want[g * 64 + l] = ((b & 0x0F) as u32 + h1) as f32 * d1 - m1;
+                want[g * 64 + 32 + l] = ((b >> 4) as u32 + h2) as f32 * d2 - m2;
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        assert_eq!(dequant_q5_k(&blk, 256), want);
+    }
+
+    #[test]
+    fn q6_k_interleaves_four_quarters_per_half() {
+        let ql = lcg(128, 31);
+        let qh = lcg(64, 37);
+        let sc = lcg(16, 41);
+        let mut blk = ql.clone();
+        blk.extend_from_slice(&qh);
+        blk.extend_from_slice(&sc);
+        blk.extend_from_slice(&F16_ONE.to_le_bytes());
+
+        let mut want = vec![0.0f32; 256];
+        for half in 0..2 {
+            let (qlh, qhh, sch) = (&ql[half * 64..], &qh[half * 32..], &sc[half * 8..]);
+            for l in 0..32 {
+                let is = l / 16;
+                let q = |v: i32| v as f32;
+                let base = half * 128;
+                want[base + l] =
+                    sch[is] as i8 as f32 * q(((qlh[l] & 0xF) | ((qhh[l] & 3) << 4)) as i32 - 32);
+                want[base + 32 + l] = sch[is + 2] as i8 as f32
+                    * q(((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32);
+                want[base + 64 + l] = sch[is + 4] as i8 as f32
+                    * q(((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32);
+                want[base + 96 + l] = sch[is + 6] as i8 as f32
+                    * q(((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32);
+            }
+        }
+        assert_eq!(dequant_q6_k(&blk, 256), want);
     }
 }
