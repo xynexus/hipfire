@@ -298,7 +298,45 @@ pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
     serve_loaded(LoadedConfig::from_config(config)).await
 }
 
+/// Log what config resolution already worked out.
+///
+/// `LoadedConfig` has carried `diagnostics` and `resolution.unknown_keys` all
+/// along and nothing read them: they were reachable only by fetching
+/// `/admin/config/resolved` with the admin secret. So a daemon would start on a
+/// misspelled key, an override that applied to nothing, or a models dir that is
+/// not there, and say nothing at all — the checks existed, the telling did not.
+///
+/// Warnings only. Every one of these resolves to something usable; the point is
+/// that the operator finds out at boot instead of from behaviour.
+fn report_config_diagnostics(config: &LoadedConfig) {
+    for diagnostic in &config.diagnostics {
+        match diagnostic.severity {
+            hipfire_config::ConfigDiagnosticSeverity::Error => {
+                tracing::error!("config: {}", diagnostic.message)
+            }
+            hipfire_config::ConfigDiagnosticSeverity::Warning => {
+                tracing::warn!("config: {}", diagnostic.message)
+            }
+        }
+    }
+    for unknown in &config.resolution.unknown_keys {
+        let source = match unknown.source.id.as_deref() {
+            Some(id) => format!("{:?}:{id}", unknown.source.kind),
+            None => format!("{:?}", unknown.source.kind),
+        };
+        tracing::warn!(
+            "config: unknown key `{}` in {source} — it is not a schema field and does nothing",
+            unknown.key
+        );
+    }
+    // Does I/O, so it is not part of resolution; see `path_existence_diagnostics`.
+    for diagnostic in hipfire_config::path_existence_diagnostics(&config.config) {
+        tracing::warn!("config: {}", diagnostic.message);
+    }
+}
+
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
+    report_config_diagnostics(&config);
     let auth_policy =
         api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
     let auth_mode = config.config.api_auth_mode;

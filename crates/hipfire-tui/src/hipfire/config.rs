@@ -559,7 +559,7 @@ fn config_type_kind(ty: &hipfire_config::ConfigType) -> String {
         hipfire_config::ConfigType::I32 => "i32",
         hipfire_config::ConfigType::F64 => "f64",
         hipfire_config::ConfigType::String => "string",
-        hipfire_config::ConfigType::Path => "path",
+        hipfire_config::ConfigType::Path { .. } => "path",
         hipfire_config::ConfigType::Enum { .. } => "enum",
         hipfire_config::ConfigType::Json => "json",
         hipfire_config::ConfigType::OneOf(_) => unreachable!("handled above"),

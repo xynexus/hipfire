@@ -184,7 +184,7 @@ fn type_label(ty: ConfigType) -> String {
         ConfigType::I32 => "i32".to_string(),
         ConfigType::F64 => "f64".to_string(),
         ConfigType::String => "string".to_string(),
-        ConfigType::Path => "path".to_string(),
+        ConfigType::Path { existence } => format!("path({existence:?})"),
         ConfigType::Enum { values } => format!("enum({})", values.join("|")),
         ConfigType::Json => "json".to_string(),
         ConfigType::OneOf(arms) => format!(

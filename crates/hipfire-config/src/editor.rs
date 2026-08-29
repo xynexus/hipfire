@@ -174,7 +174,7 @@ pub fn encode_editor_value(field: &ConfigField, raw: &Value) -> Result<Value, St
             Value::String(value) => Ok(Value::String(value.clone())),
             other => Ok(Value::String(value_to_editor_string(other))),
         },
-        ConfigType::Path => {
+        ConfigType::Path { .. } => {
             let value = raw
                 .as_str()
                 .map(str::to_string)

@@ -188,7 +188,7 @@ fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
             }
         }
         ConfigType::String => Ok(Value::String(raw.to_string())),
-        ConfigType::Path => {
+        ConfigType::Path { .. } => {
             validate_path(raw)?;
             Ok(Value::String(raw.to_string()))
         }
