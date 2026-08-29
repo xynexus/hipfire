@@ -515,6 +515,8 @@ pub fn generate_dflash(
     // has no chat_template). Threaded rather than read from a global — see
     // `effective_raw` for the cross-request leak that motivated it.
     raw_override: Option<bool>,
+    // Per-request identity for n-gram table scoping; see NgramRequestScope.
+    ngram_scope: Option<crate::model::NgramRequestScope<'_>>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -775,6 +777,94 @@ pub fn generate_dflash(
 
     let t_prefill = Instant::now();
 
+    // Opt-in drafter-free n-gram spec decode. Strictly additive: it supplies a
+    // spine through the existing `pld_spine` seam, and on a miss that seam gets
+    // `None` and `spec_step_dflash` runs its own drafter exactly as before.
+    // Scope key: a different user or session type must not inherit the previous
+    // request's tables or hot state.
+    let ngram_key = {
+        let sc = ngram_scope.unwrap_or_default();
+        format!(
+            "{}\u{1}{}",
+            sc.user_id.unwrap_or(""),
+            sc.session_type.unwrap_or("")
+        )
+    };
+    // Reuse the live state when this request has the same scope; otherwise drop
+    // the old one (persisting what it staged) and build fresh.
+    let carried = match df.ngram_live.take() {
+        Some((k, prev)) if k == ngram_key => Some(prev),
+        Some((_, mut prev)) => {
+            let _ = prev.merge();
+            None
+        }
+        None => None,
+    };
+    let mut ngram = carried.or_else(|| {
+        df.ngram.clone().map(|setup| {
+            use crate::model::NgramWriteTarget as Wt;
+            use hipfire_specdecode_ngram::WriteTarget;
+            let cfg = hipfire_specdecode_ngram::NgramConfig {
+                orders: setup.orders.clone(),
+                chain_floor: setup.chain_floor,
+                max_spine: setup.max_spine,
+                promote_count: setup.promote_count,
+                write_target: match setup.write_target {
+                    Wt::User => WriteTarget::User,
+                    Wt::Topic => WriteTarget::Topic,
+                    Wt::None => WriteTarget::None,
+                },
+                ..Default::default()
+            };
+            let mut ng = hipfire_specdecode_ngram::NgramSpec::new(cfg);
+            if setup.persists() {
+                let layout = hipfire_specdecode_ngram::ScopeLayout::new(&setup.store_root);
+                let vocab = target.config.vocab_size;
+                // The writable table belongs to one user. With no request identity
+                // the daemon is single-tenant, so everything shares `local` — which
+                // is correct there and unsafe the moment it is not, because
+                // `next`/`next2` are plaintext and a shared writable table is a
+                // continuation oracle.
+                let scope = ngram_scope.unwrap_or_default();
+                let user = scope.user_id.unwrap_or("local");
+                if let Some(p) = layout.user(&setup.scope, user) {
+                    if let Err(e) = ng.attach_user(&p, vocab, setup.blocks) {
+                        eprintln!("[ngram] user store unavailable ({}): {e}", p.display());
+                    }
+                }
+                // A topic table lives *under the user*, so it is private and may be
+                // written. A topic table shared across users would need to be
+                // read-only for the same reason the base one is.
+                if let Some(t) = scope.session_type {
+                    if let Some(p) = layout.topic(&setup.scope, t, Some(user)) {
+                        // Writable because it lives under the user, so it is
+                        // private. A topic table shared across users would have to
+                        // be read-only, like the base tier.
+                        if let Err(e) = ng.attach_topic(&p, vocab, setup.blocks, true) {
+                            eprintln!("[ngram] topic store unavailable ({}): {e}", p.display());
+                        }
+                    }
+                }
+                if let Some(p) = layout.base(&setup.scope) {
+                    if p.exists() {
+                        if let Err(e) = ng.attach_base(&p) {
+                            eprintln!("[ngram] base store unavailable ({}): {e}", p.display());
+                        }
+                    }
+                }
+            }
+            ng
+        })
+    });
+    // Seed from the prompt: prompt-echo is where a training-free drafter earns
+    // most of its acceptance. `reset()` drops the previous request's rolling
+    // history without touching the learned tables.
+    if let Some(ng) = ngram.as_mut() {
+        ng.reset_sequence();
+        ng.observe(&prompt_tokens);
+        ng.observe(&[first_token]);
+    }
+
     // Decode loop — spec_step_dflash returns a committed batch per cycle.
     let mut emitted: Vec<u32> = vec![first_token];
     let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -891,11 +981,35 @@ pub fn generate_dflash(
         }
     };
 
+    // Adaptive block sizing (scope doc item 3): the dspark cost-model
+    // controller, driven with per-window accept depth + wall time. Chain mode
+    // only (the DDTree steps take no block override). max_block is clamped to
+    // the trained block so every scratch stays validly sized (item 4 — sizing
+    // for B above trained — is not landed); an explicit HIPFIRE_DFLASH_BLOCK
+    // pin wins over the controller.
+    let mut block_controller = if df.adaptive_b
+        && df.ddtree.is_none()
+        && dflash_block_override().is_none()
+        && df.block_size > 2
+    {
+        Some(
+            hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
+                df.block_size,
+                2,
+                df.block_size,
+                0.18, // dormant cost prior; live window timing replaces it
+            ),
+        )
+    } else {
+        None
+    };
+
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while !first_filter_stop && !first_token_is_eos && generated < max_tokens {
         if position + df.block_size >= ctx_capacity {
             break;
         }
+        let window_started = Instant::now();
 
         // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
         // at startup), route through `spec_step_ddtree_batched`. Otherwise
@@ -904,6 +1018,9 @@ pub fn generate_dflash(
         // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
         // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
         let path_c_mode = path_c_mode_owned;
+        // Spine the n-gram tier proposed this cycle, if any. Kept alive across
+        // the step call so `pld_spine` can borrow it.
+        let mut ngram_spine: Option<Vec<u32>> = None;
         let step_result = if let Some(dd) = df.ddtree.as_mut() {
             if path_c_mode == Some("phase1") || path_c_mode == Some("phase2") {
                 let phase2_snaps = if path_c_mode == Some("phase2") {
@@ -954,6 +1071,10 @@ pub fn generate_dflash(
                 )
             }
         } else {
+            // n-gram first: a hit shrinks the verify batch to the spine and
+            // skips the drafter forward entirely; a miss leaves this `None`
+            // and the drafter runs.
+            ngram_spine = ngram.as_mut().and_then(|n| n.draft().map(|sp| sp.to_vec()));
             spec_step_dflash(
                 gpu,
                 &mut target,
@@ -970,11 +1091,12 @@ pub fn generate_dflash(
                 Some(&mut df.gdn_tape),
                 0.0_f32, // temperature
                 &mut rng_state,
-                dflash_block_override(), // block_size override
-                None,                    // ngram_cache
+                // Block override: env pin, else the adaptive controller.
+                dflash_block_override().or_else(|| block_controller.as_ref().map(|c| c.block())),
+                None, // ngram_cache
                 &emitted,
                 0.0_f32, // cactus_delta
-                None,    // pld_spine
+                ngram_spine.as_deref(),
                 1.0_f32, // repeat_penalty (off)
                 0,       // repeat_window
             )
@@ -995,7 +1117,24 @@ pub fn generate_dflash(
         // committed = committed.len(). (`committed` includes the seed, length
         // accept+2.)
         spec_metrics.record_window(step.drafted.len(), step.accepted, step.committed.len());
+        // Attribute only when the n-gram tier actually supplied the draft;
+        // otherwise `step.accepted` belongs to the DFlash drafter.
+        if ngram_spine.is_some() {
+            if let Some(n) = ngram.as_mut() {
+                n.record_acceptance(step.accepted);
+            }
+        }
+        if let Some(c) = block_controller.as_mut() {
+            // Full-window wall time (draft+verify), the controller's calibration
+            // signal; n_verify = 1 + drafted block, matching its indexing.
+            let t_window_ms = window_started.elapsed().as_secs_f32() * 1000.0;
+            c.observe_timing(t_window_ms, step.drafted.len() + 1);
+            c.observe(step.accepted, step.drafted.len());
+        }
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+        if let Some(n) = ngram.as_mut() {
+            n.observe(&committed_tail);
+        }
 
         let mut hit_eos = false;
         let mut think_cap_hit = false;
@@ -1107,6 +1246,51 @@ pub fn generate_dflash(
         }
     }
 
+    // Snapshot the n-gram telemetry while we still own the state, then hand the
+    // state back to the load so the next request inherits its hot tier and
+    // promotion counters. Both have to happen here: `df` is borrowed from `m`,
+    // and the `m.q35_*` writes below end that borrow.
+    let ngram_ext: Option<serde_json::Value> = ngram.as_ref().map(|n| {
+        use hipfire_specdecode_ngram::Tier;
+        let st = n.stats();
+        let mut by_tier = serde_json::Map::new();
+        for t in Tier::ALL {
+            if st.lookups_by_tier[t.idx()] == 0 && st.drafted_in(t) == 0 && n.store(t).is_none() {
+                continue;
+            }
+            let mut row = serde_json::json!({
+                "lookups": st.lookups_by_tier[t.idx()],
+                "hits": st.hits_by_tier[t.idx()],
+                "drafted": st.drafted_in(t),
+                "accepted": st.accepted_in(t),
+                "marginal_share": st.marginal_share(t),
+            });
+            if let Some(store) = n.store(t) {
+                let (recs, blks) = store.occupancy();
+                row["records"] = serde_json::json!(recs);
+                row["blocks_used"] = serde_json::json!(blks);
+                row["blocks_free"] = serde_json::json!(store.free_blocks());
+                row["read_only"] = serde_json::json!(store.is_read_only());
+            }
+            by_tier.insert(t.name().to_string(), row);
+        }
+        serde_json::json!({
+            "steps": st.steps,
+            "steps_proposed": st.steps_proposed,
+            "coverage": st.coverage(),
+            "drafted": st.drafted,
+            "accepted": st.accepted,
+            "accepted_per_step": st.accepted_per_step(),
+            "verify_efficiency": st.verify_efficiency(),
+            "hot_entries": n.hot_len(),
+            "merge_backlog": n.merge_backlog_len(),
+            "by_tier": by_tier,
+        })
+    });
+    if let Some(n) = ngram {
+        df.ngram_live = Some((ngram_key, n));
+    }
+
     // Put target state back on LoadedModel so the next request sees fresh
     // (reset) state. We zero DN/kv on entry anyway, but we still need the
     // ownership back.
@@ -1158,6 +1342,14 @@ pub fn generate_dflash(
     }
     if let Some(so) = hipfire_arch_qwen35::speculative::read_seed_oracle_stats().to_json() {
         ext["seed_oracle"] = so;
+    }
+    // n-gram spec-decode, when this request ran it. `by_tier` is the whole
+    // point: tiers are probed most-specific first and the first hit wins, so a
+    // tier's accepted count is the marginal value it added over every tier
+    // below it — which answers "does the cold table earn its bytes?" from live
+    // traffic rather than another experiment.
+    if let Some(ng) = ngram_ext {
+        ext["ngram"] = ng;
     }
     emit_spec_done(
         stdout,
@@ -3471,6 +3663,10 @@ pub fn generate_start(
     // `raw_override` is: a stream's sampling must not depend on what else is
     // running beside it.
     sampler_seed: Option<u32>,
+    // Per-request identity for n-gram table scoping. Threaded for the same
+    // reason as `sampler_seed`, and more urgently: picking the wrong table
+    // would cross-contaminate users' stored text.
+    ngram_scope: Option<crate::model::NgramRequestScope<'_>>,
 ) -> Qwen35Start {
     // No RNG reset here any more. This used to seed a process-global CPU sampler
     // state so a request would not inherit RNG from its predecessor; the global
@@ -3920,6 +4116,7 @@ pub fn generate_start(
             messages_history,
             request_stop_sequences,
             raw_override,
+            ngram_scope,
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
@@ -4924,6 +5121,8 @@ pub fn generate(
         raw_override,
         // Legacy in-crate driver: no stream identity to derive a seed from, so
         // it keeps the process-level behaviour `initial_rng_state()` selects.
+        None,
+        // Same — no request identity here, so n-gram tables stay daemon-local.
         None,
     ) {
         Qwen35Start::Handled => {}
