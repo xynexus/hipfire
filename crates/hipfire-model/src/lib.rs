@@ -2738,6 +2738,13 @@ pub struct ModelLoadParams {
     pub cask_core_frac: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cask_fold_m: Option<u32>,
+    /// Load-time GPU slab policy (`auto` | `off` | `on`), forwarded from
+    /// `HipfireConfig::gpu_slab_load`. The daemon installs it as
+    /// `HIPFIRE_GPU_SLAB_LOAD` for the duration of the load, which is how the
+    /// arch loader already consumes it — see `qwen35::loading::gpu_slab_load_enabled`.
+    /// `None` means "auto", i.e. leave the loader's UMA auto-detect alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_slab_load: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mmq_screen: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2787,6 +2794,7 @@ impl ModelLoadParams {
         );
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.dflash_adaptive_b = Some(config.dflash_adaptive_b);
+        params.gpu_slab_load = non_auto_value(&config.gpu_slab_load);
         params.mmq_screen = Some(config.mmq_screen != "off");
         params.mmq_screen_threshold = Some(config.mmq_screen_threshold);
         if params.cask_sidecar.is_some() {

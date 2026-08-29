@@ -1192,6 +1192,8 @@ impl Gpu {
         max_seq: usize,
         max_ctx_len: usize,
         batch_size: usize,
+        bits: usize,
+        row_offset: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1200,7 +1202,15 @@ impl Gpu {
             "attention_kvarn_routed_batched",
         )?;
         const GROUP: usize = 128;
-        let rec_bytes = (head_dim * GROUP).div_ceil(2) + head_dim * 2 * 2 + GROUP * 2;
+        // MUST agree with KvCache::kvarn_k_record_bytes_bits — this used to pin
+        // `cpb` to 2, i.e. bits=4, so the flush wrote 17152-byte records at
+        // kvarn8 while this strode 8960 through them.
+        assert!(
+            bits == 2 || bits == 4 || bits == 8,
+            "attention_kvarn_routed_batched: bits must be 2, 4 or 8, got {bits}"
+        );
+        let cpb = 8 / bits;
+        let rec_bytes = (head_dim * GROUP).div_ceil(cpb) + head_dim * 2 * 2 + GROUP * 2;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let q_ptr = q.buf.as_ptr();
         let rec_ptrs_ptr = rec_ptrs.buf.as_ptr();
@@ -1223,6 +1233,8 @@ impl Gpu {
             .min(256);
         let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
         let win_f16_i = i32::from(window_f16);
+        let bits_i = bits as i32;
+        let row_offset_i = row_offset as i32;
         self.launch_kernargs(
             "attention_kvarn_routed_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -1232,7 +1244,7 @@ impl Gpu {
                 ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
                 ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
                 i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
-                i32 win_f16_i
+                i32 win_f16_i, i32 bits_i, i32 row_offset_i
             ],
         )
     }
@@ -3974,6 +3986,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let mut is_causal = 0i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -3985,6 +3998,15 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            // `attention_dflash_wmma_f32` takes ELEVEN parameters; the last is
+            // `int is_causal`, added when the causal sibling below was written.
+            // HIP takes the argument count from the code object's metadata, not
+            // from this Vec, so omitting it made hipModuleLaunchKernel read one
+            // slot past the allocation and copy whatever heap word followed into
+            // the kernarg — a nondeterministic causal mask on an attention that
+            // must be bidirectional, or a host-side fault. This path is
+            // non-causal, hence 0.
+            &mut is_causal as *mut _ as *mut c_void,
         ];
 
         let q_tiles = (b + 15) / 16;
@@ -5558,6 +5580,24 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
+        // The window IS the block dimension, so it inherits HIP's 1024-thread cap
+        // (`swa_visibility_stage_batched.hip` states the precondition in its own
+        // header). Without this, an oversized window surfaces as a bare
+        // `hipModuleLaunchKernel ... invalid argument` from inside the runtime,
+        // which four separate callers would each have to decode.
+        //
+        // NOT clamped on purpose: silently attending over 1024 keys when the model
+        // asked for 4096 changes output quality with no signal. A model whose
+        // config wants a larger window has to be dealt with explicitly — see the
+        // cohere2 entry in BUGS.md.
+        if swa_window > 1024 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "swa_visibility_stage_batched: sliding window {swa_window} exceeds                      the 1024-thread block limit (the window is the block dimension).                      This model's config declares a window this large; serving it                      needs either a chunked staging kernel or an explicit,                      quality-affecting decision to reduce the window."
+                ),
+            ));
+        }
         unsafe {
             self.hip.launch_kernel(
                 func,

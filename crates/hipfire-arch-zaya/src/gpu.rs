@@ -51,6 +51,10 @@ fn linear_dtype(qt: u8) -> Option<DType> {
 /// `oq4_arch_load`. Both resolve to a generic iu8/iu4 GEMM dtype — no zaya-local
 /// expansion, so a new OQ code lights up here for free.
 fn oq_repack(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    // oq4-ragged-guarded-by-caller: this returns `Option`, so it cannot carry the
+    // ragged-K error, and a `None` here would fall through to `linear_dtype` and
+    // upload raw OQ4 blocks under the wrong dtype. `load_linear` pre-checks
+    // instead. See `every_oq4_arch_load_call_site_pre_checks_ragged_k`.
     oq8_arch_load(qt, data, m, k)
         .or_else(|| oq4_arch_load(qt, data, m, k).map(|(bytes, dt)| (bytes.into_owned(), dt)))
 }
@@ -246,6 +250,18 @@ fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight,
         .ok_or_else(|| format!("zaya gpu: no data for {name:?}"))?;
     // OQ-family (33/34/35/36/37) repacks on load; the verbatim formats upload as-is
     // (no clone — the large Q8 embedding uploads straight from `data`).
+    // A ragged K is an NPU-targeted artifact reaching a GPU loader, and
+    // `oq4_pack_arch_combined` asserts on it — aborting the process. The guard
+    // belongs HERE rather than inside `oq_repack`: that returns `Option`, and a
+    // `None` would fall through to the `linear_dtype` arm below, which uploads the
+    // raw OQ4 blocks tagged as a different dtype — silently wrong instead of loud.
+    if qt == hipfire_runtime::oq4_arch::OQ4_CANONICAL_QT
+        || qt == hipfire_runtime::oq4_arch::OQ4_ARCH_PACKED_QT
+    {
+        if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+            return Err(format!("zaya {name}: {why}"));
+        }
+    }
     let buf_dtype: Option<(GpuTensor, DType)> =
         if let Some((bytes, dtype)) = oq_repack(qt, &data, m, k) {
             let buf = gpu

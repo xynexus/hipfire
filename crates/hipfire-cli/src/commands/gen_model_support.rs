@@ -650,8 +650,22 @@ fn render_projections(spec: &Spec) -> String {
          and is if anything more integrated than the modes this table marks batchable. \
          Confirmed end to end: `kv_mode=kvarn` on `Qwen3.6-35B-A3B--oq4` loads, reports \
          `KV cache: kvarn`, and generates coherent tokens.\n\n\
-         Also worth knowing before pruning modes: the **default** KV mode resolved for \
-         that artifact is `fp32`, not kvarn.\n\n",
+         **Default — corrected 2026-08-29 (`7b2c9d2`): the resolved default is now kvarn, \
+         not fp32.** The earlier note here recorded the symptom (\"the default KV mode \
+         resolved for that artifact is `fp32`, not kvarn\") without a cause, and the cause \
+         was not in the KV match at all. `kv_cache` defaults to `\"auto\"`, but \
+         `non_auto_value` (`hipfire-model/src/lib.rs:2849`) maps `\"auto\"` -> `None` before \
+         it becomes a load param, so `kv_mode` arrived at `load_model` empty and fell \
+         through to a hardcoded `\"fp32\"`. The `\"auto\"` arm in the KV match was therefore \
+         dead for every config-driven load — the only way to reach it was a literal \
+         per-request `params.kv_cache=\"auto\"`. `load.rs` now resolves `\"auto\"`/unset -> \
+         `\"kvarn\"` at the point `kv_mode` is first computed, so `cap_gemma3_stopgap_max_seq` \
+         (which exempts kvarn from its context cap) and `triattn_can_evict_kv_mode`'s \
+         decline message see the resolved mode rather than `\"\"`. fp32 KV remains available \
+         as an oracle/debug mode via an explicit `kv_cache=fp32`; it is not a production \
+         path. Verified across six local artifacts — all report `session KV: mode=kvarn`; \
+         `ZAYA1--8b` prefill dropped 23s -> 9s on the batched-prefill eligibility this \
+         section describes.\n\n",
     );
     s.push_str("| KV mode | Batched prefill |\n|---|---|\n");
     for (label, mode) in [

@@ -329,6 +329,20 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bind = bind::BindInfo::capture(listener.local_addr()?);
     tracing::info!("hipfire listening on http://{addr}");
+    // Claim serve.pid only now that the listener is actually bound. The CLI used
+    // to write it before calling in, so a `serve` that then failed to bind — a
+    // second instance racing the live one for the port, most obviously — still
+    // overwrote the record and orphaned the running server from `stop`/`status`.
+    // Both entry points (`hipfire serve` and the child `hipfire start` spawns)
+    // funnel through here, so the pid is written exactly once, by the process
+    // that owns the port.
+    {
+        let root = hipfire_config::hipfire_dir();
+        let _ = std::fs::create_dir_all(&root);
+        if let Err(e) = std::fs::write(root.join("serve.pid"), std::process::id().to_string()) {
+            tracing::warn!("could not record serve.pid: {e}");
+        }
+    }
     log_api_auth_posture(&bind, auth_mode, auth_policy);
     *state.bind.lock().expect("bind lock") = Some(bind);
     spawn_deferred_prewarm(state.clone());

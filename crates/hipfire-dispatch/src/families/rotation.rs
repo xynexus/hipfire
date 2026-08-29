@@ -80,6 +80,23 @@ impl RotationFamily {
                 )
             }
             RotationVariant::PlainG128 => {
+                // No G128 AWQ rotation kernel exists — `rotate_x_mq_awq` is the
+                // 256-point transform (seeds 42/1042), and G128 weights carry the
+                // 128-point one (43/1043). This arm used to ignore `awq_scale`
+                // entirely while `RotationVariant::Plain` below has all four
+                // (awq x batched) arms: the compact-resident AWQ fix landed on
+                // OqCompactG256 and never reached G128.
+                //
+                // The quantizer stores AWQ-calibrated weights PRE-SCALED (W*s), so
+                // silently skipping the matching division of x is a wrong answer
+                // with no error — exactly the class this codebase keeps producing.
+                // Fail loudly instead until a G128 AWQ kernel exists.
+                if has_awq {
+                    return Err(HipError::new(
+                        0,
+                        "OqCompactG128 (FwhtG128) cannot apply its AWQ sidecar: no                          128-point AWQ rotation kernel exists, and the 256-point one                          does not cancel the weights' 128-point rotation. The weights                          are stored pre-scaled, so proceeding would silently compute                          a wrong result. Re-quantize this artifact without --awq, use                          an OqCompactG256 (256-group) artifact, or add a G128 AWQ                          rotation kernel.",
+                    ));
+                }
                 self.registry
                     .resolve(KernelKey::RotateMqG128, ctx, None)
                     .map_err(he)?;

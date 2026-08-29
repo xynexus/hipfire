@@ -533,10 +533,33 @@ fn oq8_arch_load_inner(
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
         c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
-        // G=128 expands through the same path at a 128-element group; the result
-        // is the identical combined Oq8G256 layout, so only the decode differs.
+        // G=128 does NOT expand to an Oq8G256-compatible layout, despite what the
+        // comment here used to claim. Two things differ, either one fatal:
+        //
+        //   1. Scale plane size. The expansion allocates `m*k + m*(k/group)*4`,
+        //      so at group=128 the plane holds TWICE the scales an Oq8G256
+        //      consumer computes (`ng = k/256`) — every consumer slices
+        //      `sub_offset(m*k, m*ng*4)` and reads the wrong region.
+        //   2. Rotation order. G128 weights carry the 128-point FWHT (seeds
+        //      43/1043); every Oq8G256 consumer rotates the activation with the
+        //      256-point transform (42/1042), so the two do not cancel.
+        //
+        // Tagging it `Oq8G256` therefore produced a silent wrong answer on every
+        // arch that does not decode compact natively (i.e. everything but
+        // qwen35). There is no correct expansion: merging two 128-groups into one
+        // 256-group scale needs requantization, and that still leaves the
+        // rotation mismatched. Refuse until an `Oq8G128` dtype exists with its own
+        // `RotationPlan::FwhtG128` and consumer arms.
         c if c == QuantType::OqPlusCompactG128.code() => {
-            oqplus_compact_to_oq8_combined_g(data, m, k, 128)
+            hipfire_rdna::kernel_trace::record_fallback(
+                "oq load: REFUSED OqPlusCompactG128 expansion — no Oq8G128 dtype",
+                &format!(
+                    "qt={qt} m={m} k={k}: expanding G128 yields a {}-group scale plane                      and 128-point-FWHT weights, which the Oq8G256 consumers misread                      as {}-group / 256-point. Load this artifact on an arch with                      native compact decode (qwen35), or re-quantize at G256.",
+                    k / 128,
+                    k / 256,
+                ),
+            );
+            return None;
         }
         c if c == QuantType::Oq3G256.code() => oq3_to_oq8_combined(data, m, k),
         _ => return None,
@@ -550,8 +573,14 @@ mod tests {
 
     /// The reason G=128 exists. K=896 (7*128) is a real shape — Qwen2-0.5B's
     /// hidden size — and 896 % 256 == 128, so the G=256 compact format cannot
-    /// represent it at all: the group must divide K. G=128 can, and expands to
-    /// the same combined Oq8G256 layout, so nothing downstream changes.
+    /// represent it at all: the group must divide K. G=128 can.
+    ///
+    /// It does NOT, however, expand to an `Oq8G256`-compatible buffer, which this
+    /// comment used to claim and `oq8_arch_load_inner` used to act on. The length
+    /// asserted below is the proof: the scale plane is `M * (K/128) * 4`, twice
+    /// what an Oq8G256 consumer computes from `ng = K/256`. (The rotation order
+    /// differs too — 128-point FWHT vs 256-point — which no length check can
+    /// show.) The load path now refuses the expansion rather than mislabelling it.
     #[test]
     fn g128_covers_a_k_that_g256_cannot_divide() {
         const K: usize = 896;
@@ -584,6 +613,18 @@ mod tests {
 
         let combined = oqplus_compact_to_oq8_combined_g(&data, M, K, group);
         assert_eq!(combined.len(), M * K + M * ng * 4);
+        // Spelled out: this is NOT the Oq8G256 layout. An Oq8G256 consumer would
+        // compute ng = K/256 and slice a scale plane half this size.
+        assert_ne!(
+            combined.len(),
+            M * K + M * (K / 256) * 4,
+            "G128 expansion must not be mistakable for an Oq8G256 buffer"
+        );
+        // And the load path must refuse rather than hand it out as Oq8G256.
+        assert!(
+            oq8_arch_load(QuantType::OqPlusCompactG128.code(), &data, M, K).is_none(),
+            "expanding G128 to Oq8G256 is a silent wrong answer; load must refuse"
+        );
         // Bulk nibbles: low then high of 0x21 sign-extended = 1, 2. Position 1 is
         // bulk; position 0 is NOT, because overlay s=0 has index 0 and overrides
         // it — which is the precedence the format requires.

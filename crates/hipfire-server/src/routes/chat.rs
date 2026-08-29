@@ -1633,6 +1633,40 @@ fn scheduler_worker_key(
     }
 }
 
+/// Unwinds a prefill-queue wait if the caller's future is dropped mid-loop.
+///
+/// Several routes await `wait_for_prefill_scheduler_turn` INLINE in the axum
+/// handler — non-streaming `/v1/responses` and the sdapi text fallback — so a
+/// client disconnect cancels the future between iterations. The spawned routes
+/// (`/v1/chat/completions`) cancel cooperatively and are unaffected.
+///
+/// Without this the abandoned session stays queued, a later concurrent
+/// `next_prefill_batch` selects it, and its id is inserted into
+/// `selected_prefill_requests` with nothing left to remove it — the set grows for
+/// the life of the process. `CancelWorkerOnDrop` already covers the engine side;
+/// this covers the queue side.
+struct PrefillWaitGuard {
+    state: SharedState,
+    req_id: String,
+    armed: bool,
+}
+
+impl Drop for PrefillWaitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is sync and both maps are behind async mutexes, so hand the
+        // cleanup to the runtime rather than blocking here.
+        let state = self.state.clone();
+        let req_id = std::mem::take(&mut self.req_id);
+        tokio::spawn(async move {
+            state.selected_prefill_requests.lock().await.remove(&req_id);
+            state.prefill_scheduler.lock().await.cancel(&req_id);
+        });
+    }
+}
+
 pub(crate) async fn wait_for_prefill_scheduler_turn(
     state: &SharedState,
     req_id: &str,
@@ -1673,10 +1707,18 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     }
     state.prefill_notify.notify_waiters();
 
+    // Armed from here: the session is queued and only this loop retires it.
+    let mut guard = PrefillWaitGuard {
+        state: state.clone(),
+        req_id: req_id.to_string(),
+        armed: true,
+    };
+
     loop {
         {
             let mut selected = state.selected_prefill_requests.lock().await;
             if selected.remove(req_id) {
+                guard.armed = false;
                 return Ok(());
             }
         }
@@ -1686,6 +1728,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
             {
                 let mut selected = state.selected_prefill_requests.lock().await;
                 if selected.remove(req_id) {
+                    guard.armed = false;
                     return Ok(());
                 }
             }

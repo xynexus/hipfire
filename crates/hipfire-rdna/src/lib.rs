@@ -11,6 +11,8 @@ pub mod feature_flags;
 pub mod gdn_chunk;
 pub mod generic_warn;
 pub mod gtt_share;
+#[cfg(test)]
+mod kernel_arity;
 pub mod kernel_trace;
 mod kernels;
 pub mod pool;
@@ -21,8 +23,8 @@ pub mod profiler;
 pub use compiler::KernelCompiler;
 pub use dispatch::lmhead_twostage;
 pub use dispatch::{
-    gen_fwht_signs, ActivationCapture, DType, Gpu, GpuTensor, OpusNpuIoLayout, OwnedTensor,
-    LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
+    gen_fwht_signs, q8hfq_row_stride, ActivationCapture, DType, Gpu, GpuTensor, OpusNpuIoLayout,
+    OwnedTensor, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
 pub use gtt_share::{ImportedTensor, SharedGttBuffer};

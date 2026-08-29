@@ -12,7 +12,7 @@ use crate::kernels;
 // Re-exported here so `dispatch::{GpuTensor, DType}` — and the crate-root
 // re-export in lib.rs — keep resolving, and bare references in this module work.
 use hip_bridge::{BufferOrigin, DeviceBuffer, HipResult, HipRuntime, Rocblas};
-pub use hipfire_gpu_types::{DType, GpuTensor};
+pub use hipfire_gpu_types::{q8hfq_row_stride, DType, GpuTensor};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;

@@ -1500,13 +1500,21 @@ pub fn compose_hfq_with_config_keys_options(
                             format!("duplicate stored entry {stored_name:?}"),
                         ));
                     }
+                    // `pkg.tensors()` is the LOGICAL view: a losslessly recoded
+                    // Bf16Huff/Bf16Lut3 tensor reports its EXPANDED length against
+                    // its PACKED offset. Copy the packed bytes and record the
+                    // packed encoding, so the bundle is byte-identical and the
+                    // reader expands it exactly as it would the standalone file.
+                    let (stored_qt, stored_len) = pkg
+                        .stored_encoding(&entry.name)
+                        .unwrap_or((entry.quant_type, entry.data_size));
                     let stream_index = stream_entries.len();
                     stream_entries.push(HfqStreamEntry {
                         name: stored_name.clone(),
-                        quant_type: entry.quant_type,
+                        quant_type: stored_qt,
                         shape: entry.shape.clone(),
                         group_size: entry.group_size,
-                        data_len: entry.data_size as u64,
+                        data_len: stored_len as u64,
                     });
                     stream_sources.push(StreamSource::HfqmTensor {
                         component: component_index,
@@ -1516,10 +1524,13 @@ pub fn compose_hfq_with_config_keys_options(
                         base_stream_entry_by_name.insert(entry.name.clone(), stream_index);
                     }
                     original_names.push(entry.name.clone());
+                    let (stored_off, _) = pkg
+                        .physical_extent(&entry.name)
+                        .unwrap_or((entry.data_offset, entry.data_size));
                     stored_entries.push(ComposeStoredEntry {
                         stored_name,
                         original_name: entry.name.clone(),
-                        original_offset: entry.data_offset as u64,
+                        original_offset: stored_off as u64,
                     });
                 }
 
@@ -1528,7 +1539,11 @@ pub fn compose_hfq_with_config_keys_options(
                 let mut cursor = 0u64;
                 let mut stored_segments = Vec::new();
                 for entry in order {
-                    let offset = entry.data_offset as u64;
+                    // Physical extents, not the logical index view — see (1).
+                    let (phys_off, phys_len) = pkg
+                        .physical_extent(&entry.name)
+                        .unwrap_or((entry.data_offset, entry.data_size));
+                    let offset = phys_off as u64;
                     if offset < cursor {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -1570,7 +1585,7 @@ pub fn compose_hfq_with_config_keys_options(
                             length,
                         });
                     }
-                    cursor = offset.checked_add(entry.data_size as u64).ok_or_else(|| {
+                    cursor = offset.checked_add(phys_len as u64).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "HFQM tensor range overflow")
                     })?;
                 }
@@ -1748,16 +1763,20 @@ pub fn compose_hfq_with_config_keys_options(
                     let info = pkg
                         .find_tensor_info(name)
                         .expect("manifest tensor must exist in source package");
+                    // Packed extent — the index's data_size is the expanded length.
+                    let (src_off, src_len) = pkg
+                        .physical_extent(name)
+                        .unwrap_or((info.data_offset, info.data_size));
                     let mut file = File::open(pkg.path())?;
-                    file.seek(SeekFrom::Start(info.data_offset as u64))?;
-                    let copied = io::copy(&mut file.take(info.data_size as u64), w)?;
-                    pkg.drop_pages_range(info.data_offset, info.data_size);
-                    if copied != info.data_size as u64 {
+                    file.seek(SeekFrom::Start(src_off as u64))?;
+                    let copied = io::copy(&mut file.take(src_len as u64), w)?;
+                    pkg.drop_pages_range(src_off, src_len);
+                    if copied != src_len as u64 {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             format!(
                                 "read {copied} of {} bytes for tensor {name:?} from {}",
-                                info.data_size,
+                                src_len,
                                 pkg.path().display()
                             ),
                         ));
