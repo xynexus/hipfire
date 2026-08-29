@@ -56,6 +56,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::System => draw_system(frame, app, root[1]),
     }
     draw_footer(frame, app, root[2]);
+    if app.show_help {
+        draw_help(frame, app, area);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -147,26 +150,71 @@ fn draw_gpu_bar(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// Keys that work on every tab. Shared by the footer and the `?` overlay so the
+/// two cannot drift apart — a binding added here shows up in both.
+const GLOBAL_KEYS: &[(&str, &str)] = &[
+    ("?  /  F1", "show this help"),
+    ("Tab / Shift+Tab", "next / previous tab"),
+    ("r", "refresh the current tab from disk"),
+    ("q  /  Esc", "quit"),
+    ("Ctrl+C", "quit (refuses while a chat stream is running)"),
+];
+
+/// Per-tab bindings, in footer order. `(keys, what it does)`.
+fn tab_keys(tab: Tab) -> &'static [(&'static str, &'static str)] {
+    match tab {
+        Tab::Home => &[
+            ("s / x / t", "start / stop / restart the background server"),
+            ("c", "toggle the user chat endpoint"),
+            ("d", "toggle the admin console endpoint"),
+            ("click", "activate a Control-pane button"),
+        ],
+        Tab::Chat => &[
+            ("Enter", "send the message (starts serve if it is offline)"),
+            ("Ctrl+O", "insert a newline instead of sending"),
+            ("Up / Down", "scroll the transcript"),
+            ("Esc", "leave the input box"),
+        ],
+        Tab::Models => &[
+            ("Up / Down", "select a model"),
+            ("Enter", "expand / select"),
+            ("Left / Right", "fold / unfold the entry"),
+        ],
+        Tab::Runtime => &[("r", "refresh health, kernels, and locks")],
+        Tab::Logs => &[("r", "refresh the log tails")],
+        Tab::Training => &[("Up / Down", "select a run")],
+        Tab::Settings => &[
+            ("e", "easy view"),
+            ("a", "advanced view"),
+            ("Up / Down", "select a setting"),
+        ],
+        Tab::System => &[],
+    }
+}
+
+/// Compact one-line rendering of the tab bindings for the footer.
+fn footer_hint(tab: Tab) -> String {
+    let mut parts = vec!["Tab switch".to_string()];
+    parts.extend(
+        tab_keys(tab)
+            .iter()
+            .map(|(keys, what)| format!("{} {}", keys.replace(' ', ""), short(what))),
+    );
+    parts.push("? help".into());
+    parts.push("q quit".into());
+    parts.join("  ")
+}
+
+/// First clause of a description — the footer has one line, the overlay has room
+/// for the whole sentence.
+fn short(what: &str) -> &str {
+    what.split(" (").next().unwrap_or(what)
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let help = match app.tab {
-        Tab::Chat => {
-            "Tab switch  Enter send/start serve  Ctrl+O newline  Up/Down scroll  Esc blur/quit"
-        }
-        Tab::Models => {
-            "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
-        }
-        Tab::Training => "Tab switch  Up/Down select run  r refresh  q quit",
-        Tab::Runtime => "Tab switch  r refresh health/kernels/locks  q quit",
-        Tab::Logs => "Tab switch  r refresh log tails  q quit",
-        Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
-        Tab::Home => {
-            "Tab switch  s/x/t serve start/stop/restart  c chat  d admin  click controls  r refresh  q quit"
-        }
-        _ => "Tab switch  r refresh  q quit",
-    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(help, Style::default().fg(MUTED)),
+            Span::styled(footer_hint(app.tab), Style::default().fg(MUTED)),
             Span::styled(
                 format!("    {}", app.last_reload),
                 Style::default().fg(Color::DarkGray),
@@ -174,6 +222,99 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ]))
         .style(Style::default().bg(BG)),
         area,
+    );
+}
+
+/// Centred rect `pct_x` x `pct_y` of `area`, for modal overlays.
+fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v[1])[1]
+}
+
+/// The `?` overlay: global keys plus the bindings for the tab underneath.
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let key_w = GLOBAL_KEYS
+        .iter()
+        .chain(tab_keys(app.tab))
+        .map(|(keys, _)| keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let row = |(keys, what): &(&str, &str)| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {keys:key_w$}  "),
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled((*what).to_string(), Style::default().fg(TEXT)),
+        ])
+    };
+    let heading = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    let mut lines = vec![heading("Everywhere")];
+    lines.extend(GLOBAL_KEYS.iter().map(row));
+    let tab_bindings = tab_keys(app.tab);
+    if !tab_bindings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(heading(&format!("{} tab", app.tab.title())));
+        lines.extend(tab_bindings.iter().map(row));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Command line: `hipfire --help` for the full CLI; `hipfire list` for local models.",
+        Style::default().fg(MUTED),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Any key closes this help.",
+        Style::default().fg(MUTED),
+    )));
+
+    // Size the box to the content so short tabs do not get a mostly-empty modal.
+    let want_h = (lines.len() as u16).saturating_add(2).min(area.height);
+    let want_w = lines
+        .iter()
+        .map(|line| line.width() as u16 + 4)
+        .max()
+        .unwrap_or(40)
+        .min(area.width);
+    let mut rect = centered(area, 80, 80);
+    rect.x = rect.x + rect.width.saturating_sub(want_w) / 2;
+    rect.y = rect.y + rect.height.saturating_sub(want_h) / 2;
+    rect.width = want_w.min(rect.width.max(want_w));
+    rect.height = want_h.min(rect.height.max(want_h));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(Span::styled(
+                        " hipfire — keys ",
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .style(Style::default().bg(PANEL)),
+        rect,
     );
 }
 

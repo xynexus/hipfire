@@ -10,8 +10,8 @@ use std::ffi::OsString;
     name = "hipfire",
     version = hipfire_build_info::VERSION,
     about = "hipfire LLM inference CLI",
-    long_about = "hipfire runs the local operator TUI, OpenAI-compatible HTTP server, model chat, eval, benchmark, diagnostics, and artifact tools.",
-    after_help = "Examples:\n  hipfire                         Open the operator TUI\n  hipfire help                    Show the command summary\n  hipfire start                   Start the background server\n  hipfire status                  Show background server status\n  hipfire chat Qwen3.5-30B-A3B \"hello\"\n  hipfire bench --model Qwen3.5-30B-A3B\n\nUse `hipfire <command> help` or `hipfire <command> --help` for detailed command help."
+    long_about = "hipfire runs the local operator TUI, background inference server, model inventory, eval, benchmark, diagnostics, and artifact tools.\n\nRunning `hipfire` with no command opens the operator TUI; press `?` there for the in-app key reference.",
+    after_help = "Examples:\n  hipfire                         Open the operator TUI (`?` for keys)\n  hipfire help                    Show the command summary\n  hipfire start                   Start the background server\n  hipfire status --json           Machine-readable server status\n  hipfire list                    Local models, sizes, and capabilities\n  hipfire bench --model Qwen3.5-30B-A3B\n\n`--json` is available on start, stop, restart, status, list, and inspect.\nUse `hipfire <command> help` or `hipfire <command> --help` for detailed command help."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -20,9 +20,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Open the local operator TUI
-    #[command(alias = "ui")]
-    Tui,
     /// Start the background hipfire server
     Start(commands::daemon::StartArgs),
     /// Stop the background hipfire server
@@ -32,15 +29,21 @@ enum Command {
     /// Show background server status
     Status(commands::daemon::StatusArgs),
     /// Start the hipfire HTTP server (OpenAI-compatible)
+    #[command(hide = true)]
     Serve(commands::serve::ServeArgs),
     /// Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
     Daemon(commands::daemon::DaemonRunArgs),
     /// Load a model and generate a response (one-shot)
+    #[command(hide = true)]
     Chat(commands::chat::ChatArgs),
     /// List locally available models
     #[command(alias = "models")]
-    List,
+    List(commands::list::ListArgs),
     /// Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+    ///
+    /// Diffusion containers are detected automatically and additionally report
+    /// their pipeline summary (class, components, weight format, runtime
+    /// support) — what `hipfire diffusion inspect` used to print separately.
     Inspect(commands::inspect::InspectArgs),
     /// Quantize a model artefact
     Quantize(commands::quantize::QuantizeArgs),
@@ -66,6 +69,7 @@ enum Command {
     /// Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
     Doctor(commands::doctor::DoctorArgs),
     /// List the environment variables hipfire reads, with descriptions
+    #[command(hide = true)]
     Env(commands::env::EnvArgs),
     /// Measure host, GPU-copy, and model storage bandwidth
     HostProfile(commands::forward::HostProfileArgs),
@@ -78,6 +82,7 @@ enum Command {
     /// into one container, or split a bundle back into its component files.
     Model(commands::model::ModelArgs),
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
+    #[command(hide = true)]
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
     /// Run observational coherence detectors over a captured token stream
@@ -86,8 +91,12 @@ enum Command {
     /// `AR tokens: [..]` line) and emits a JSON verdict with `ok` / `soft_warn`.
     /// Front-end for the `hipfire-detect` DetectorBank; replaces the Path-A
     /// token-attractor Python heredocs in the coherence gates.
+    #[command(hide = true)]
     Detect(commands::detect::DetectArgs),
-    /// Import and inspect diffusion models stored as .hfq artifacts
+    /// Import, generate, and quantize diffusion models stored as .hfq artifacts
+    ///
+    /// Inspection is not here: `hipfire inspect <artefact>` autodetects a
+    /// diffusion container and prints its pipeline summary.
     ///
     /// Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP
     /// tokenization as host-side setup. `txt2img`, `img2img`, and `smoke` can
@@ -239,7 +248,7 @@ fn main() -> anyhow::Result<()> {
         None if hipfire_runtime::logging::stderr_is_journal() => {
             rt()?.block_on(commands::serve::run(Default::default(), loaded_config))
         }
-        None | Some(Command::Tui) => hipfire_tui::run(),
+        None => hipfire_tui::run(),
         Some(Command::Start(args)) => rt()?.block_on(commands::daemon::start(args, loaded_config)),
         Some(Command::Stop(args)) => rt()?.block_on(commands::daemon::stop(args, loaded_config)),
         Some(Command::Restart(args)) => {
@@ -251,10 +260,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Serve(args)) => rt()?.block_on(commands::serve::run(args, loaded_config)),
         Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
         Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
-        Some(Command::List) => {
-            commands::list::run(loaded_config);
-            Ok(())
-        }
+        Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),
         Some(Command::Convert { command }) => commands::quantize::run_convert(command),
