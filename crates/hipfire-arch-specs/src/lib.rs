@@ -36,6 +36,7 @@ use hipfire_arch_minimax_spec as _;
 use hipfire_arch_nemotron_spec as _;
 use hipfire_arch_qwen2_spec as _;
 use hipfire_arch_qwen35_spec as _;
+use hipfire_arch_qwen4exp_spec as _;
 use hipfire_arch_qwenimage_spec as _;
 use hipfire_arch_zaya_spec as _;
 
@@ -49,7 +50,7 @@ mod tests {
         // Every migrated arch id must be reachable with an Ingest policy through the
         // bundle (the path the quantizer uses).
         for id in [
-            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25,
+            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25, 26,
         ] {
             let a = reg
                 .get(ArchId(id))

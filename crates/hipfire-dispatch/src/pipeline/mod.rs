@@ -999,27 +999,10 @@ fn run_moe_decode_cpu_fallback(
     // ── 1+2. softmax → CPU top-K + renorm (verbatim from master) ──────────────
     hip!(gpu.softmax_f32(p.router_logits))?;
     let probs = hip!(gpu.download_f32(p.router_logits))?;
-    let mut indices: Vec<usize> = (0..n_exp).collect();
-    indices.select_nth_unstable_by(k - 1, |&a, &b| {
-        probs[b]
-            .partial_cmp(&probs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-    topk_indices.sort_by(|&a, &b| {
-        probs[b]
-            .partial_cmp(&probs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-    if p.norm_topk_prob {
-        let sum: f32 = topk_weights.iter().sum();
-        if sum > 0.0 {
-            for w in topk_weights.iter_mut() {
-                *w /= sum;
-            }
-        }
-    }
+    // Extracted to `families::moe::cpu_topk_select` so the k != 8 routing path
+    // has unit coverage without a GPU — see the tests there.
+    let (topk_indices, topk_weights) =
+        crate::families::moe::cpu_topk_select(&probs[..n_exp], k, p.norm_topk_prob);
     // Feed the shared router histogram. The verbatim port of
     // `moe_ffn_decode_impl` dropped this, so expert-balance telemetry was blank
     // for every model routed through this executor — which is every MoE whose

@@ -60,7 +60,7 @@ use hipfire_arch_api::{
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
     ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
     ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
-    ARCH_ID_ZAYA,
+    ARCH_ID_QWEN4EXP, ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
@@ -11331,8 +11331,19 @@ pub fn main() {
         // gemma4 win looks worth having and the minimax regression needs a cause
         // before anyone widens this — see
         // docs/plans/2026-08-05-opus-across-model-families.md.
-        let honour_source_precision =
-            use_deepseek4_source_precision || arch_id == ARCH_ID_DEEPSEEK4_FLASH;
+        //
+        // qwen4_exp opts in for the same reason and with the same containment: the
+        // class is arch-KEYED, so this cannot reach minimax or any other family.
+        // Its spec declares `SourcePrecision` for tensors whose failure mode is
+        // categorical rather than a small numeric perturbation — the hashed n-gram
+        // table (a row gather that is 41% of the model's parameters and cannot be
+        // calibrated, since any corpus touches well under 1% of its 320 M rows),
+        // the sparse-attention indexer (which chooses WHICH tokens attention sees,
+        // so its error is unbounded rather than local), and the per-branch scalars
+        // of the gated residual. Without this the n-gram table ships at 8 bits.
+        let honour_source_precision = use_deepseek4_source_precision
+            || arch_id == ARCH_ID_DEEPSEEK4_FLASH
+            || arch_id == ARCH_ID_QWEN4EXP;
         if (honour_source_precision
             && precision_class_via_ingest(arch_id, name)
                 == Some(hipfire_arch_api::PrecisionClass::SourcePrecision)

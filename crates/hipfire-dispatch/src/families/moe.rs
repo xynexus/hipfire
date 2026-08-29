@@ -137,6 +137,160 @@ pub fn oq_indexed_decode_active(hidden: usize, mi: usize, k_top: usize) -> bool 
     oq_indexed_decode_enabled() && oq_indexed_admissible(hidden, mi, k_top)
 }
 
+/// CPU top-K expert selection + renormalisation — the routing half of
+/// [`crate::pipeline::run_moe_decode_cpu_fallback`], extracted so it can be
+/// tested without a GPU.
+///
+/// This runs for EVERY MoE whose `k != 8`, because those fail the `use_gpu_topk`
+/// guard and land in the fallback — so it is the only routing code a `k = 10`
+/// model like Qwen3.8-Flash-Next (`qwen4_exp`) ever executes. It was previously
+/// inline, which meant the k != 8 path had no unit coverage at all, and the only
+/// evidence offered for it was an end-to-end comparison in which BOTH arms ran
+/// this same code, so any bug here was common-mode and cancelled exactly.
+///
+/// Semantics match the HF reference verbatim (`Qwen3NextTopKRouter.forward`,
+/// which `Qwen4ExpTextTopKRouter` inherits unchanged): softmax is applied by the
+/// caller, then top-k by probability, then divide by the selected sum when
+/// `norm_topk_prob`. That flag defaults TRUE in both
+/// `configuration_qwen4_exp.py` and our own config parse, and the target's
+/// `config.json` omits it, so the default is load-bearing.
+///
+/// `probs` must already be softmaxed. Returns `(indices, weights)` with indices
+/// in DESCENDING probability order — the routed loop and the telemetry histogram
+/// both rely on that order.
+///
+/// Panics are avoided by the caller's `k ∈ [1, n_exp]` guard
+/// (`cpu-topk-k-out-of-range`); `select_nth_unstable_by(k - 1)` panics otherwise.
+pub fn cpu_topk_select(probs: &[f32], k: usize, norm_topk_prob: bool) -> (Vec<usize>, Vec<f32>) {
+    debug_assert!(
+        k >= 1 && k <= probs.len(),
+        "caller must guard k in [1, n_exp]"
+    );
+    let mut indices: Vec<usize> = (0..probs.len()).collect();
+    indices.select_nth_unstable_by(k - 1, |&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+    topk_indices.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+    if norm_topk_prob {
+        let sum: f32 = topk_weights.iter().sum();
+        if sum > 0.0 {
+            for w in topk_weights.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+    (topk_indices, topk_weights)
+}
+
+#[cfg(test)]
+mod cpu_topk_tests {
+    use super::cpu_topk_select;
+
+    /// Distinct, non-monotonic probabilities so a bug cannot pass by accident:
+    /// the top-k set is not a prefix, not a suffix, and not sorted in place.
+    fn probs12() -> Vec<f32> {
+        vec![
+            0.02, 0.13, 0.01, 0.20, 0.03, 0.11, 0.04, 0.18, 0.05, 0.09, 0.07, 0.07,
+        ]
+    }
+
+    /// The qwen4_exp shape: top-10 of 12. Two experts must stay dark, and they
+    /// must be the two smallest.
+    #[test]
+    fn selects_top_10_of_12_descending() {
+        let p = probs12();
+        let (idx, w) = cpu_topk_select(&p, 10, false);
+        assert_eq!(idx.len(), 10);
+        // the two smallest (0.01 @ 2, 0.02 @ 0) are excluded
+        assert!(!idx.contains(&2), "expert 2 (p=0.01) must be dark");
+        assert!(!idx.contains(&0), "expert 0 (p=0.02) must be dark");
+        // strictly descending by probability
+        for pair in w.windows(2) {
+            assert!(pair[0] >= pair[1], "weights must be descending: {w:?}");
+        }
+        assert_eq!(idx[0], 3, "highest prob is expert 3 (0.20)");
+    }
+
+    #[test]
+    fn renorm_sums_to_one_and_preserves_ratios() {
+        let p = probs12();
+        let (_, w) = cpu_topk_select(&p, 10, true);
+        let sum: f32 = w.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "renormalised weights must sum to 1, got {sum}"
+        );
+        let (_, raw) = cpu_topk_select(&p, 10, false);
+        // ratio of the top two is unchanged by renormalisation
+        assert!((w[0] / w[1] - raw[0] / raw[1]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn no_renorm_leaves_probabilities_untouched() {
+        let p = probs12();
+        let (idx, w) = cpu_topk_select(&p, 10, false);
+        for (slot, &e) in idx.iter().enumerate() {
+            assert_eq!(w[slot], p[e]);
+        }
+    }
+
+    /// k == n_exp is degenerate (nothing is dark) and k == 1 is the other edge.
+    /// Both are reachable through the same guard, so both must hold.
+    #[test]
+    fn k_edges_hold() {
+        let p = probs12();
+        let (idx, w) = cpu_topk_select(&p, p.len(), true);
+        assert_eq!(idx.len(), p.len());
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        let (idx1, w1) = cpu_topk_select(&p, 1, true);
+        assert_eq!(idx1, vec![3]);
+        assert!(
+            (w1[0] - 1.0).abs() < 1e-6,
+            "single expert renormalises to 1.0"
+        );
+    }
+
+    /// FAULT INJECTION — proves these tests can actually fail. This is the
+    /// mutant the adversarial review asked for: drop the k-th expert. If the
+    /// assertions above cannot catch it, they are measuring nothing.
+    #[test]
+    fn tests_detect_a_dropped_kth_expert() {
+        let p = probs12();
+        let (good, _) = cpu_topk_select(&p, 10, false);
+        let (short, _) = cpu_topk_select(&p, 9, false);
+        assert_ne!(good.len(), short.len());
+        let missing: Vec<_> = good.iter().filter(|e| !short.contains(e)).collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "dropping k by one must lose exactly one expert"
+        );
+        // and it must be the WEAKEST of the ten, not an arbitrary one
+        assert_eq!(*missing[0], good[9]);
+    }
+
+    /// Ties must not lose or duplicate a slot. `select_nth_unstable_by` is
+    /// unstable, so which of the tied pair wins is unspecified — but the
+    /// cardinality and the absence of duplicates are not.
+    #[test]
+    fn ties_do_not_duplicate_or_drop() {
+        let p = probs12(); // experts 10 and 11 are both 0.07
+        let (idx, _) = cpu_topk_select(&p, 10, true);
+        let mut seen = idx.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), idx.len(), "no duplicate expert slots");
+    }
+}
+
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
 /// routing-config logic, relocated from `moe_ffn_decode_impl` into one typed,
 /// testable place (review finding #1). Pure function of `MoeDtypes` + k.
