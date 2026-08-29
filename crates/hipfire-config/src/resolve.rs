@@ -211,19 +211,38 @@ fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
     }
 }
 
-/// Reject a path that no filesystem could name. Deliberately NOT an existence
-/// check: a store root is created on first use, and requiring it to exist would
-/// refuse a valid config on a fresh host.
+/// A config path must be ABSOLUTE.
 ///
-/// This catches malformed input, not wrong input. A bare relative name is a
-/// legal path, so a sentinel typo (`"rma"` for `"ram"`) still resolves as a
-/// path — only the filesystem can say it was not meant.
+/// Deliberately NOT an existence check: a store root is created on first use,
+/// and requiring it to exist would refuse a valid config on a fresh host.
+///
+/// Absoluteness is what makes a sentinel typo catchable. A bare relative name
+/// like `"rma"` (for `"ram"`) is a legal path, so with relatives allowed it
+/// resolved silently as a directory and only the filesystem could say it was
+/// not meant. It is also the right rule on its own terms: a config file is read
+/// from a daemon whose working directory is not the operator's, so a relative
+/// path means something different depending on how the daemon was started.
+///
+/// `~` is NOT accepted. Nothing in the config path expands it, so allowing it
+/// would create a literal `~` directory — worse than refusing it.
 pub fn validate_path(raw: &str) -> Result<(), String> {
-    if raw.trim().is_empty() {
-        return Err("want a path (got blank)".to_string());
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("want an absolute path (got blank)".to_string());
     }
     if raw.contains('\0') {
-        return Err("want a path (contains a NUL byte)".to_string());
+        return Err("want an absolute path (contains a NUL byte)".to_string());
+    }
+    if trimmed.starts_with('~') {
+        return Err(
+            "want an absolute path (`~` is not expanded here; write the full path)".to_string(),
+        );
+    }
+    if !trimmed.starts_with('/') {
+        return Err(format!(
+            "want an absolute path (`{trimmed}` is relative; it would resolve against the \
+             daemon's working directory, not yours)"
+        ));
     }
     Ok(())
 }
