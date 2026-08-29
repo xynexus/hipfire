@@ -10,8 +10,9 @@
 //! `--check` it renders to memory and diffs against what is on disk instead of
 //! writing, exiting non-zero on drift — the freshness gate `tests/no-gpu-ci.sh`
 //! runs so the docs can't silently fall out of sync with the code. Only
-//! `docs/CLI.md` is tracked; `/man/` is gitignored, so its absence is not drift.
-//! See `check_file`.
+//! `docs/CLI.md` is tracked; `/man/` is gitignored, so it is skipped outright —
+//! neither its absence nor its staleness is drift, because no commit can carry
+//! the fix. See `check_file`.
 
 use std::path::Path;
 
@@ -42,19 +43,15 @@ pub fn run(args: GenDocsArgs) -> anyhow::Result<()> {
         check_file(
             Path::new(&args.docs_dir).join("CLI.md"),
             &markdown,
-            true,
             &mut stale,
         );
-        // `/man/` is gitignored, so a clean checkout has no man pages at all.
-        // Requiring them made this gate unsatisfiable off a developer's own
-        // tree; drift detection rides on the tracked `docs/CLI.md` above.
+        // `/man/` is gitignored, so a clean checkout has no man pages at all
+        // and a warm one keeps whatever it last generated. Requiring them made
+        // this gate unsatisfiable off a developer's own tree; `is_git_ignored`
+        // in `check_file` now skips them either way. Drift detection rides on
+        // the tracked `docs/CLI.md` above, which CI actually has.
         for (name, bytes) in &man_pages {
-            check_file(
-                Path::new(&args.man_dir).join(name),
-                bytes,
-                false,
-                &mut stale,
-            );
+            check_file(Path::new(&args.man_dir).join(name), bytes, &mut stale);
         }
         if !stale.is_empty() {
             anyhow::bail!(
@@ -133,20 +130,23 @@ fn trim_trailing_line_ws(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
 
 /// Record `path` as stale unless it matches freshly generated `expected`.
 ///
-/// `required` separates the two outputs. `docs/CLI.md` is tracked, so a missing
-/// file is real drift. The man pages under `/man/` are generated and gitignored,
-/// so their absence is the normal state of a clean checkout — but one that is
-/// present still has to match, or a stale local copy would quietly mislead
-/// whoever read it. Only `NotFound` is forgiven; an unreadable file still fails.
-fn check_file(
-    path: std::path::PathBuf,
-    expected: impl AsRef<[u8]>,
-    required: bool,
-    stale: &mut Vec<String>,
-) {
+/// Gitignored outputs are skipped outright — see `super::is_git_ignored` for
+/// why comparing them can only ever produce a local false alarm. That covers
+/// every man page under `/man/`, so in practice only `docs/CLI.md` reaches the
+/// comparison below.
+///
+/// Everything that survives the skip is tracked, so absence is drift too and
+/// there is nothing left to forgive. That retires the `required` bool this took:
+/// it existed to excuse a missing man page, which the skip now handles earlier,
+/// and a bool with one live value is a trap, not a feature.
+fn check_file(path: std::path::PathBuf, expected: impl AsRef<[u8]>, stale: &mut Vec<String>) {
+    // A gitignored output cannot be committed, so "stale" here is unfixable by
+    // any commit and invisible to CI. See `super::is_git_ignored`.
+    if super::is_git_ignored(&path) {
+        return;
+    }
     match std::fs::read(&path) {
         Ok(got) if got == expected.as_ref() => {}
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
         _ => stale.push(path.display().to_string()),
     }
 }
