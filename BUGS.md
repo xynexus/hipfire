@@ -2460,3 +2460,265 @@ the runtime refuses outright. Guarded for `OqPlusCompact` as of `224acb1cb`;
 `Oq4`/`Oq8` still lack it.
 
 → `docs/bugs/2026-08-27-mixed-bpw-ignored-off-hfq.md`
+
+## `*_k8_indexed*` MoE kernels are named for a `k` they do not hardcode
+
+**Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo. Low priority —
+naming/doc only, no wrong output. Cost a scoping pass an XL estimate.**
+
+Every indexed routed-expert GEMV takes `K_TOP` as a **runtime kernel argument**
+and uses it only as a grid dimension and a stride:
+
+- `gemv_oq4g256_moe_down_k8_indexed_batched_expanded.hip:28` — `int M, int K, int K_TOP`
+- `gemv_oq8g256_moe_down_k8_indexed_batched_expanded.hip:21` — same
+- `gemv_oq4g256_moe_gate_up_indexed_batched.hip:25` — same
+- `moe_down_combine_k8_batched.hip:26` — `int M, int K_TOP`
+
+Nothing in those bodies requires `K_TOP == 8`. The `k8` is inherited from the
+kernel they were ported from. The only genuine compile-time `k` is in the
+top-k SELECTION kernels, which are a different and much smaller surface:
+
+- `moe_softmax_topk_k8.hip:27` — `#define K_TOP 8`
+- `moe_topk_renorm_k8.hip:21` — `#define K_TOP 8`
+
+Consequence: reading the file names suggests supporting `k != 8` means writing a
+new expert-GEMV family (XL). It does not — the expert compute path is already
+k-generic, and the work is the two selection kernels plus threading `k` through
+`INDEXED_MOE_K_TOP` / `oq_indexed_admissible` / `use_gpu_topk` / the loader
+repack so they keep agreeing. Rename to `_indexed_` (dropping `k8`), or add a
+one-line header note on each, so the next reader does not re-derive this.
+
+## `K % 256 != 0` splits one MoE layer across THREE quant families, and drops calibration
+
+**Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo. Reproduces on a tiny fixture
+in ~2 s, no GPU. Verified at the byte level; the calibration half is the serious part.**
+
+`--format oq4`, exit 0, no warning. Two fixtures differing only in `moe_intermediate_size`:
+
+```
+qwen3_5_moe_indexed   (mi 512)   shared.down [256,256] Oq4G256   gate_up Oq4G256   down [256,512] Oq4G256
+qwen3_5_moe_mi640_k10 (mi 640)   shared.down [512,640] Q8F16     gate_up Oq4G256   down [512,640] HFQ4G128
+```
+
+At mi=640 **one layer holds three families**, and two tensors of *identical shape* `[512,640]`
+get different answers, because there are two independent fallback policies:
+
+- stacked routed experts fall to `quantize_hfq4g128` — `cli.rs:11183`, the terminal `else`;
+- the generic 2D path falls to `Q8F16` — the `k % 256 != 0` arms around `cli.rs:4547/4566/4626`.
+
+**The serious consequence is loss of calibration, not the wrong kernel family.**
+`supports_g256 = inner_k % 256 == 0` (`cli.rs:10841`) gates the Opus arm at `cli.rs:11081`
+(`stacked_oq_format.filter(|_| supports_g256)`). That arm is the only route into
+`quantize_hfq_source_tensor`, which its own comment says "applies AWQ/LDLQ and contributes to
+strict Hessian validation". At mi=640 every routed `down_proj` skips it and lands on plain RTN
+— and unlike the MQ4 branch just above it, the terminal `else` does **not** call
+`awq_pre_scale_weights`. So `--format oq4++ --hessian` silently ships uncalibrated,
+un-AWQ'd routed down-weights and exits 0. A random-init fixture can never surface this.
+
+**Second consequence: batched prefill is excluded permanently.** The mixed gate_up/down pair
+forces `profile=Invalid` (`qwen35/mod.rs:1655`), and `HFQ4G128` is not in the
+`moe_prefill_quant_family` ladder at all (`qwen35/mod.rs:2597-2628`, instrumented `_` arm).
+The `Q8F16` shared down is an *independent* second decline, so fixing only the routed pair
+leaves it standing. At 512 experts that turns prefill throughput into decode throughput, and
+under daemon-default KVarN it trips the runtime's own "Output from this point is not
+trustworthy" warning.
+
+Repro:
+
+```sh
+hipfire-quantize --emit-fixture qwen3_5_moe_mi640_k10 --out /tmp/fx
+hipfire-quantize --input /tmp/fx --output /tmp/fx.hfq --format oq4
+hipfire inspect /tmp/fx.hfq --tensors | grep 'layers.0.mlp'
+```
+
+Fixture preset: `Qwen35Tiny::moe_mi640_k10_preset`
+(`crates/hipfire-arch-qwen35-spec/src/lib.rs`), the probe for the Qwen3.8-Flash-Next geometry
+— see `docs/plans/2026-08-29-qwen4exp-flash-next-scope.md` §3.1.
+
+**A warning is NOT the fix.** An earlier draft of this entry said "the fallback should at
+minimum be loud"; that is wrong, because an `eprintln!` restores neither calibration coverage
+nor batched-prefill admission. The fix is to make the two fallback policies agree and to keep
+the calibrated path reachable at `K % 256 != 0` — which needs a group size that divides K.
+Note `640 = 2^7 * 5`, so the largest power of two dividing it is 128, and since the Opus rotate
+is an FWHT the group must be a power of two — 128 is the only option, not "128 or 160".
+
+Unrelated observation from the same run, do not chase it as part of this: the summary prints
+`Mean quant error: 0.00000000` for **both** presets, so that metric reads 0 on the known-good
+path too and is not evidence about this bug.
+
+## Load admission under-estimates routed-expert GTT by 26 GB — estimator rounds per TENSOR, pager allocates per MODULE
+
+**Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo. Arithmetic on the two
+functions, cross-checked against a real artifact's module table. Not yet reproduced as a
+failed load — the model that would show it is not converted yet.**
+
+The two sides of expert residency use the same `gtt_alloc_cost` at different granularity:
+
+- `estimated_module_resident_bytes` (`weight_pager.rs:929`) — `for tensor in &module.tensors
+  { resident += gtt_alloc_cost(len) }`, i.e. **per tensor**. This is what feeds
+  `check_load_headroom`.
+- `ensure_expert_module_resident` (`weight_pager.rs:1573`) — `gtt_alloc_cost(
+  module_resident_len(&module))`, i.e. **once per module**, and its comment says so
+  deliberately ("One allocation per module (gate_up + down contiguous), so the GTT rounding
+  applies once to the whole module rather than per tensor").
+
+Both are individually correct. They disagree because they land in different regimes of
+`gtt_alloc_cost`, and for a mid-sized expert the per-tensor split rounds *better* than the
+real per-module allocation:
+
+```
+Qwen3.8-Flash-Next, oq4, hidden 2560 / mi 640, 512 experts x 49 layers:
+  gate_up 1,689,600 B -> 2,097,152   (512 KiB..2 MiB regime: next power of two)
+  down      870,400 B -> 1,048,576   (same regime)
+  per-tensor sum                       3,145,728  = 3 MiB
+  module  2,560,000 B -> 4,194,304   (>2 MiB regime: next 2 MiB multiple)
+  per-module                           4,194,304  = 4 MiB
+
+  raw                    64.2 GB
+  estimator  (admission) 78.9 GB   1.229x
+  pager      (actual)   105.2 GB   1.638x
+  SHORTFALL              26.3 GB
+```
+
+So admission can pass on 78.9 GB and the pager then needs 105.2 GB. The failure would land
+mid-load, and per the GTT notes it surfaces as a `page allocation failure`, not an OOM kill,
+with RSS showing nothing.
+
+**Why no existing fixture catches it:** on the tiny MoE fixtures every expert tensor is under
+512 KiB, where `gtt_alloc_cost` is page-granular and the two formulas agree exactly (measured:
+1.006x both, on `qwen3_5_moe_mi640_k10`). The divergence needs tensors in the
+512 KiB..2 MiB band with a module over 2 MiB — a shape no fixture currently has.
+
+Fix direction: make the estimator ask `module_resident_len` and round once, matching the
+pager. Note that grouped/slab expert allocation (see
+`docs/plans/2026-08-29-qwen4exp-flash-next-scope.md` §3.1a) would shrink BOTH numbers and
+largely close the gap, but it does not remove the need for the two to agree.
+
+
+## `gtt_alloc_cost`'s 512 KiB..2 MiB regime over-estimates by ~1.6%
+
+**Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo gfx1151. Measured with the
+function's own harness. Low priority — it errs on the safe side.**
+
+`gtt_alloc_cost` (`hipfire-runtime/src/weight_pager.rs:842-880`) models three regimes, and its
+doc says they are measured. The >2 MiB regime reproduces exactly; the middle one does not.
+
+`cargo run --release -p hipfire-rdna --example gtt_granularity -- <bytes> 64`:
+
+```
+requested   predicted (next pow2)   actual      delta
+1,689,600   2,097,152               2,064,384   -32,768
+  870,400   1,048,576               1,015,808   -32,768
+```
+
+Both land 32 KiB under the next power of two, so the real granule in that band is finer than
+`next_power_of_two()`. The >2 MiB cases are exact (2,560,000 -> 4,194,304; 5,120,000 ->
+6,291,456; 10,240,000 -> 10,485,760), as is the model's central claim that the granule there
+is a flat 2 MiB rather than a power of two.
+
+Consequence is small and in the safe direction — the estimator reserves slightly more than the
+driver takes. It does NOT rescue the estimator-vs-pager divergence filed above: recomputing
+that with measured values gives 77.3 GB of admission estimate against 105.2 GB of actual pager
+allocation, so the shortfall is ~28 GB rather than ~26 GB.
+
+Worth correcting the doc comment either way, since it presents all three regimes as measured
+and one of them no longer is.
+
+## `__shfl_xor` at offset 32 silently doubles a reduction on gfx1151 (wave32)
+
+**Found 2026-08-29 writing `qsa_block_score.hip`. Not a bug in shipped code — the new
+kernel was wrong and a negative control caught it — but the failure mode is worth recording
+because it is silent and the arithmetic looks right.**
+
+A 64-thread block with the usual `for (o = LANES/2; o > 0; o >>= 1) dot += __shfl_xor(dot, o)`
+reduction is correct on wave64 and WRONG on wave32. gfx1151 is wave32, so the `o = 32` step
+crosses a wave boundary, where `__shfl_xor` returns the caller's own value — the step becomes
+`dot += dot` and the result is exactly **2x** too large.
+
+It does not error, does not produce NaN, and the doubling is uniform, so a tolerance-based
+check with a loose bound passes. It was caught only because the control asserted an exact
+expected value: `got 0.88388, want 0.44194`.
+
+Existing kernels are fine — `gated_norm_f32` and the other wave-reduction kernels launch 32
+threads and reduce from offset 16, which is the shape to copy. The trap is writing a NEW
+kernel with a 64-lane block out of habit.
+
+Worth a one-line note near the reduction idiom in `kernels/README` or in a shared header, so
+the next kernel author does not re-derive it from a wrong answer.
+
+## qsa_block_score cannot express the reference's block-key pipeline (low)
+
+`kernels/src/qsa_block_score.hip` mean-pools each block's keys and scores them in
+the same launch. The reference does two more things between those steps:
+
+    pooled = mean(raw_keys[block])
+    pooled = k_layernorm(pooled)                       # not expressible
+    blockk = rope(pooled, at the block's FIRST position)  # nor this
+    score  = sum_h relu(q_h . blockk) / sqrt(head_dim)
+
+so a QSA indexer built on that kernel scores un-normalised, un-rotated keys and
+selects the wrong blocks. Not a wrong-numbers bug in the kernel itself — it
+computes what it says — but it is unusable for the indexer as written.
+
+Fixed by splitting: `qsa_pool_norm_blocks` + `qsa_score_prepared`
+(`kernels/src/qsa_block_prepare.hip`), with the rotation applied between them via
+the normal batched RoPE path. `qsa_block_score` is kept for the pool-and-score
+case it was written for. Verified by
+`hipfire-arch-qwen4exp/examples/parity_indexer_gpu_vs_cpu`, which differences the
+selected token set against the CPU indexer that `reference_oracle.rs` pins to
+upstream — exact, at five sequence lengths straddling the dense-below boundary.
+
+Found 2026-08-29 while wiring the GPU QSA block.
+
+## tiny-prefill's hidden-state probe only runs if a stale binary is lying around (medium)
+
+`tests/tiny-prefill-gate.sh:184` gates its hidden-state divergence check on
+
+    HID="./target/release/examples/compare_prefill_hidden_paths"
+
+existing. Nothing builds it — the gate builds `hipfire-eval` and the fixtures,
+not that example. So on a CLEAN checkout the probe silently does not run, and
+the gate reports `fail=0`; on a developer tree that happens to have built it in
+some earlier session it runs and reports `fail=1`.
+
+Measured 2026-08-29 on gfx1151, same commit (`origin/master` 0c9e3d252), same
+`HIPFIRE_TINYQUANT_FAMILIES=qwen3_5,qwen3_5_moe,qwen3_5_moe_indexed`:
+
+    without the binary built:  ran=4 fail=0 skip=2   (no `hidden ...` lines at all)
+    with it built:             ran=4 fail=1 skip=2
+                               FAIL hidden-state divergence kvarn = 1.06e-1 (ceiling 5e-2)
+
+So the check most likely to catch a drafter-visible regression is exactly the
+one CI never runs. Same shape as the `$HOME/.hipfire/bin/hipfire` staleness in
+`tests/qwen4exp-gate.sh` (fixed there by building and using the in-tree binary):
+a gate reading through whatever happens to be on disk rather than building what
+it means to test.
+
+Fix: build the example in the gate, or fail loudly when it is absent instead of
+skipping silently. Do NOT simply raise the ceiling — the divergence it reports
+is real, and its own comment says the ceiling "does not claim the current
+divergence is acceptable, only that it must not grow."
+
+## Three tiny-gate cells are already failing on origin/master (medium)
+
+Confirmed 2026-08-29 by running each gate in a clean `git worktree` at
+`origin/master` (0c9e3d252) and comparing to a working branch — the observed
+hashes and KLD numbers are byte-identical, so none of it is branch-local:
+
+* `tiny-state`: 4 cells drift — `qwen3_5/fp16`, `qwen3_5_vl/fp16`,
+  `qwen3_5_moe/fp16`, `qwen3_5_moe_indexed/fp16`. e.g. qwen3_5/fp16 observes
+  `0xed48922801655d8b/0xbccf1d6a241a4482` against a baseline of
+  `0xdb7f521096082900/0x1187a5029a78ab92`.
+* `tiny-quant`: 6 `qwen3_5_moe_indexed` KLD cells drift (oq4, oq8, oq4+, oq4++,
+  oq8+, oq8++); oq4 reads 0.067886 against a 0.052557 baseline.
+* `tiny-prefill`: the divergence above, when its probe is actually built.
+
+Likely the same class as "8 gfx1151 baselines stale after the #379 fixture
+shape change" (e47b6c7aa) — a fixture change that moved the numbers without the
+baselines being re-recorded. Worth confirming that before re-recording, because
+if it is NOT a fixture change then these are real quality regressions and
+re-recording would bury them.
+
+Consequence today: `tiny-affected-gate` fails for every commit that touches a
+covered path, escalates to the coherence battery, and that battery only fails on
+hard errors — so the tripwire is permanently tripped and no longer discriminates.
