@@ -874,6 +874,21 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 session_id.unwrap_or(id),
                 id,
             )),
+            // Per-request identity for n-gram table scoping. `user_id` owns the
+            // writable table, so it must be the real caller — a wrong or shared
+            // value hands one user's stored text to another. `session_type` is
+            // a subject label ("python-coding") selecting a topic table under
+            // that same user, so it stays private.
+            Some(hipfire_serving_core::model::NgramRequestScope {
+                user_id: msg
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()),
+                session_type: msg
+                    .get("session_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()),
+            }),
         );
         let Qwen35Start::Ready(mut generation) = started else {
             // Served by another route (spec-decode, VL, llama) or already

@@ -2402,6 +2402,14 @@ impl Gpu {
     /// mailbox — in particular `alloc_tensor` does not — so a view borrowed
     /// mid-forward stays valid until the next boundary reclaim. Call at forward /
     /// decode-turn boundaries; safe to call unconditionally (it self-gates).
+    /// Snapshot GPU pool accounting, plus how many `OwnedTensor` buffers are
+    /// still queued on the deferred-free mailbox. For leak hunting: see
+    /// [`crate::pool::GpuPoolStats`] for how to read the numbers.
+    pub fn pool_stats(&self) -> (crate::pool::GpuPoolStats, usize) {
+        let mailbox = self.free_mailbox.lock().map(|q| q.len()).unwrap_or(0);
+        (self.pool.stats(), mailbox)
+    }
+
     pub fn reclaim_pending(&mut self) {
         // Pure pool/host work: pool.free pushes to a free-list and needs no
         // device binding, so this method stays infallible.

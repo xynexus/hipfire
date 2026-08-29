@@ -1150,12 +1150,31 @@ pub struct Qwen35PrefillBatchResult {
     pub sessions: Vec<Qwen35PrefillSessionResult>,
 }
 
+/// `checkpoint_id` is `None` when no Final checkpoint was minted
+/// (`qwen35_final_checkpoints` off, the default). The handle then advertises
+/// no `checkpoint_id`/`checkpoint_runtime_state` at all rather than naming one
+/// that was never created — the same shape boundary checkpoints already use
+/// when absent. Everything else in the handle stays true: the session itself
+/// is resident.
 pub fn qwen35_generate_batch_prefill_session_done_json(
     envelope: &GenerateBatchPrefillEnvelope,
     session: &Qwen35PrefillSessionResult,
-    checkpoint_id: &str,
+    checkpoint_id: Option<&str>,
     result: &Qwen35PrefillBatchResult,
 ) -> serde_json::Value {
+    let mut state_handle = serde_json::json!({
+        "kind": "qwen35_session",
+        "runtime_state": "resident",
+        "session_id": session.id,
+        "logical_position": session.logical_position,
+        "cached_prefix_tokens": session.cached_prefix_tokens,
+        "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
+        "prefix_len": session.prefix_hash.prefix_len,
+    });
+    if let Some(checkpoint_id) = checkpoint_id {
+        state_handle["checkpoint_id"] = serde_json::Value::String(checkpoint_id.to_string());
+        state_handle["checkpoint_runtime_state"] = serde_json::Value::String("attachable".into());
+    }
     let mut line = serde_json::json!({
         "type": "generate_batch_prefill_session_done",
         "id": envelope.id,
@@ -1164,17 +1183,7 @@ pub fn qwen35_generate_batch_prefill_session_done_json(
         "prefill_tokens": session.prefill_tokens,
         "logical_position": session.logical_position,
         "cached_prefix_tokens": session.cached_prefix_tokens,
-        "state_handle": {
-            "kind": "qwen35_session",
-            "runtime_state": "resident",
-            "session_id": session.id,
-            "checkpoint_id": checkpoint_id,
-            "checkpoint_runtime_state": "attachable",
-            "logical_position": session.logical_position,
-            "cached_prefix_tokens": session.cached_prefix_tokens,
-            "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
-            "prefix_len": session.prefix_hash.prefix_len,
-        },
+        "state_handle": state_handle,
         "mode": result.mode,
         "plan": result.plan.as_str(),
         "backend": result.backend.as_str(),
@@ -2381,7 +2390,7 @@ mod tests {
             qwen35_generate_batch_prefill_session_done_json(
                 &envelope,
                 &session,
-                "qwen35-checkpoint:batch-1:req-1:12",
+                Some("qwen35-checkpoint:batch-1:req-1:12"),
                 &result,
             ),
             serde_json::json!({
@@ -2429,6 +2438,27 @@ mod tests {
                 "debug_sample_token": 42
             })
         );
+
+        // No Final checkpoint (the default): the handle must not advertise one.
+        // Naming a checkpoint that was never created would send a client
+        // chasing an id that cannot be attached.
+        let without =
+            qwen35_generate_batch_prefill_session_done_json(&envelope, &session, None, &result);
+        let handle = &without["state_handle"];
+        assert!(
+            handle.get("checkpoint_id").is_none(),
+            "checkpoint_id must be ABSENT when no checkpoint was minted, got {handle:?}"
+        );
+        assert!(
+            handle.get("checkpoint_runtime_state").is_none(),
+            "checkpoint_runtime_state must be absent alongside it, got {handle:?}"
+        );
+        // The session itself is still resident, and boundary checkpoints are
+        // independent of the Final one.
+        assert_eq!(handle["runtime_state"], "resident");
+        assert_eq!(handle["session_id"], "req-1");
+        assert_eq!(handle["logical_position"], 12);
+        assert!(without["state_handle"]["prefix_checkpoints"].is_array());
     }
 
     #[test]

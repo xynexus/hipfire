@@ -11,6 +11,7 @@ arch-lfm2moe = ["hipfire-arch-lfm2moe"]
 deltanet = ["hipfire-rdna/deltanet"]
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-archs = { path = "../hipfire-archs" }
 hipfire-evidence = { path = "../hipfire-evidence" }
@@ -27,6 +28,7 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-specdecode = { path = "../hipfire-specdecode" }
 hipfire-specdecode-dspark = { path = "../hipfire-specdecode-dspark" }
+hipfire-specdecode-ngram = { path = "../hipfire-specdecode-ngram" }
 hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }

@@ -36,6 +36,7 @@ hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-scheduler = { path = "../hipfire-scheduler" }
 hipfire-serving-core = { path = "../hipfire-serving-core" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-npu = { path = "../hipfire-npu" }
