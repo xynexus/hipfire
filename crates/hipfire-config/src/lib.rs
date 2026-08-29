@@ -1558,6 +1558,32 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_path_is_reported() {
+        // The point of absolute-only: a sentinel typo is a legal relative path,
+        // so until this rule `rma` resolved silently as a directory.
+        for raw in ["rma", "./tables", "../ngram", "~/ngram", "tables"] {
+            let resolved = resolve_typed_config_document(
+                &serde_json::json!({ "ngram_store_root": raw }),
+                None,
+            );
+            let message = resolved
+                .diagnostics
+                .iter()
+                .find(|d| d.message.contains("ngram_store_root"))
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| panic!("`{raw}` is relative and must be reported"));
+            assert!(
+                message.contains("absolute"),
+                "the report must say what is wrong: {message}"
+            );
+            assert_eq!(
+                resolved.config.ngram_store_root, raw,
+                "reporting must not change what resolves"
+            );
+        }
+    }
+
+    #[test]
     fn a_union_reports_every_arms_expectation_not_just_the_last() {
         // A NUL byte fails the sentinel arm AND the path arm, so neither
         // accepts and the operator should see both domains, not "want a path".
