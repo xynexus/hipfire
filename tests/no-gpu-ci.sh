@@ -33,6 +33,12 @@ cargo test -p hipfire-arch-template-spec --lib
 cargo test -p hipfire-arch-template --lib
 cargo test -p hipfire-archs --lib
 cargo test -p hipfire-arch-llama --lib caps
+# hipfire-cli is BIN-ONLY (`[[bin]] name = "hipfire"`, no src/lib.rs), so its 92
+# unit tests need `--bin hipfire`. The workspace gate in .github/workflows/ci.yml
+# runs `cargo test --lib --workspace`, which selects zero targets here and skips
+# the crate in silence — the same trap the hipfire-daemon note above describes,
+# still live for this crate. If you change the target layout, re-check the COUNT.
+cargo test -p hipfire-cli --bin hipfire
 
 echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
 bash tests/fixture-roundtrip-nogpu.sh

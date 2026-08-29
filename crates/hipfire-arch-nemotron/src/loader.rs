@@ -225,6 +225,11 @@ pub fn load_linear_hfq(
     // that needs the arch-combined repack; qt=37 is already arch-packed. Both
     // dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched prefill
     // via `hipfire_runtime::weights::weight_gemm`). Mirrors the hfq.rs LLaMA loader.
+    // A ragged K is an NPU-targeted artifact reaching a GPU loader, not corruption
+    // — and `oq4_pack_arch_combined`'s assert would abort the whole process.
+    if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+        return Err(format!("nemotron hfq oq4 {name}: {why}"));
+    }
     if let Some((packed, gpu_dtype)) = hipfire_runtime::hfq::oq4_arch_load(qt, &data, m, k) {
         let buf = gpu
             .upload_raw(&packed, &[packed.len()])

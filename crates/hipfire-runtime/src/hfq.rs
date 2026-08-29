@@ -1827,6 +1827,19 @@ impl HfqFile {
         })
     }
 
+    /// The tensor's extent AS STORED ON DISK: `(data_offset, byte_len)`.
+    ///
+    /// For a losslessly recoded tensor (`Bf16Huff` / `Bf16Lut3`) the index
+    /// reports the EXPANDED length against the PACKED offset, because
+    /// `expand_bf16_index` deliberately presents a logical view to readers that
+    /// want plain BF16. Anything doing FILE-RANGE arithmetic — copying bytes,
+    /// checking that tensor ranges tile the file — must use this instead, or it
+    /// computes overlapping ranges for a perfectly well-formed file and blames
+    /// the artifact. That is exactly what `compose_hfq` did.
+    pub fn physical_extent(&self, name: &str) -> Option<(usize, usize)> {
+        self.resolve_idx(name).map(|i| self.physical_range(i))
+    }
+
     pub fn is_bf16_expanded(&self, name: &str) -> bool {
         self.resolve_idx(name)
             .is_some_and(|i| self.bf16_packed[i].is_some())
@@ -2416,9 +2429,7 @@ fn load_weight_tensor(
         }
         5 => {
             // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
-            let n_groups = k / 32;
-            let raw_row = n_groups * 2 + k;
-            let row_stride = (raw_row + 127) & !127;
+            let row_stride = hipfire_rdna::q8hfq_row_stride(k);
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,

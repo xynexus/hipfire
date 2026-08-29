@@ -189,6 +189,23 @@ fn dflash_gemm_opus_lmhead(
         None
     };
 
+    // The weights' rotation order must match the activation's. `group` above is
+    // 128 for OqCompactG128, but `ensure_mq_signs` / `rotate_x_mq_batched` below
+    // are the 256-point FWHT (seeds 42/1042) while G128 weights carry the
+    // 128-point one (43/1043) — the two do not cancel, so the GEMM sees an
+    // activation in the wrong basis. There is no BATCHED 128-point rotation
+    // (`rotate_x_mq_128` is single-row), and this helper also backs
+    // `dflash_enqueue_verify_lm_head`, so the error is output-affecting rather
+    // than merely a worse draft. Refuse instead of computing it wrongly.
+    //
+    // Upgrade path: add a batched `rotate_x_mq_128` (or loop the single-row one
+    // over the n rows) and select the transform by `group` here.
+    if matches!(w_out.gpu_dtype, hipfire_rdna::DType::OqCompactG128) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "opus lm_head: OqCompactG128 needs the 128-point FWHT for its              activation, but only the 256-point batched rotation exists. The two              rotations do not cancel, so this would silently compute in the wrong              basis. Use an OqCompactG256 lm_head, or add a batched 128-point              rotation and select it by group.",
+        ));
+    }
     gpu.ensure_mq_signs()?;
     let rot = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::F32)?;
     let xq = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::Raw)?;

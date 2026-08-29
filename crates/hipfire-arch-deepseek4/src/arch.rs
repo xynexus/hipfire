@@ -124,6 +124,13 @@ impl DeepseekV4 {
         if shape.len() == 2 {
             let (m, k) = (shape[0], shape[1]);
             if info.quant_type == OQ4_CANONICAL_QT || info.quant_type == OQ4_ARCH_PACKED_QT {
+                // A ragged K is an NPU-targeted artifact reaching a GPU loader, not
+                // corruption — and `oq4_pack_arch_combined`'s assert would abort the whole
+                // process. Same pre-check the hfq.rs and qwen35 loaders already carry;
+                // commit 3883204a1 added it to those two and missed the other five.
+                if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+                    return Err(why);
+                }
                 let (packed, dtype) = oq4_arch_load(info.quant_type, &bytes, m, k)
                     .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
                 let mut t = gpu
