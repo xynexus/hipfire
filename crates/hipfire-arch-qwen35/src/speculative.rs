@@ -7444,7 +7444,7 @@ pub fn spec_step_dflash(
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
-    // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply sampler::apply_ngram_block to every
+    // HIPFIRE_DFLASH_NO_REPEAT_NGRAM=1: apply sampler::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
     // token after any 3/4/5/6-gram repeat (NEG_INFINITY logit). Matches the
     // production-path defense in daemon/run/infer for the AR sampler.
@@ -7452,7 +7452,7 @@ pub fn spec_step_dflash(
     // cycle); off-by-default for that reason.
     static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ngram_block_env = *NGRAM_BLOCK_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1"));
+        .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM").ok().as_deref() == Some("1"));
     let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();

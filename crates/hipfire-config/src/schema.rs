@@ -89,6 +89,30 @@ pub enum ConfigType {
     OneOf(&'static [ConfigType]),
 }
 
+/// Config keys that have been renamed, as `(old, new)`.
+///
+/// An old key is honoured and reported, not dropped. Dropping is what this
+/// codebase keeps getting wrong — a setting that reads fine and does nothing is
+/// worse than one that errors, because nothing ever says so.
+///
+/// The n-gram family took the `ngram_spec_` prefix of its own enable flag, so
+/// the speculative-decode knobs are greppable as one group. `dflash_ngram_block`
+/// became `dflash_no_repeat_ngram`: it BANS the token after a repeated n-gram
+/// (`sampler::apply_ngram_block`), the opposite of what the `ngram_spec` family
+/// does with n-grams, and "block" everywhere else here means the block of B
+/// speculative tokens.
+pub const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("ngram_store_root", "ngram_spec_store_root"),
+    ("ngram_scope", "ngram_spec_scope"),
+    ("ngram_store_mb", "ngram_spec_store_mb"),
+    ("ngram_orders", "ngram_spec_orders"),
+    ("ngram_chain_floor", "ngram_spec_chain_floor"),
+    ("ngram_max_spine", "ngram_spec_max_spine"),
+    ("ngram_promote_count", "ngram_spec_promote_count"),
+    ("ngram_write_target", "ngram_spec_write_target"),
+    ("dflash_ngram_block", "dflash_no_repeat_ngram"),
+];
+
 /// Sentinel values of [`NGRAM_STORE_ROOT_RAM`] meaning "keep tables in RAM".
 ///
 /// Declared here so the domain has ONE home. It used to live only in
@@ -689,7 +713,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Opt-in drafter-free n-gram speculative decode."
     ),
     field!(
-        "ngram_store_root",
+        "ngram_spec_store_root",
         ConfigType::OneOf(&[
             ConfigType::Enum {
                 values: NGRAM_STORE_ROOT_RAM,
@@ -705,7 +729,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only."
     ),
     field!(
-        "ngram_scope",
+        "ngram_spec_scope",
         ConfigType::String,
         Requirement::Optional,
         Some(""),
@@ -714,7 +738,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Tokenizer scope name for n-gram tables; empty = derive from model file."
     ),
     field!(
-        "ngram_store_mb",
+        "ngram_spec_store_mb",
         ConfigType::U32,
         Requirement::Optional,
         Some("256"),
@@ -723,7 +747,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Size in MiB of a newly created n-gram table; this is the fixed budget."
     ),
     field!(
-        "ngram_orders",
+        "ngram_spec_orders",
         ConfigType::String,
         Requirement::Optional,
         Some("8,7,6,5,4,3,2"),
@@ -732,7 +756,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "n-gram probe orders, longest first, comma-separated."
     ),
     field!(
-        "ngram_chain_floor",
+        "ngram_spec_chain_floor",
         ConfigType::U8,
         Requirement::Optional,
         Some("8"),
@@ -741,7 +765,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Minimum winning order to keep extending an n-gram chain; 0 disables."
     ),
     field!(
-        "ngram_max_spine",
+        "ngram_spec_max_spine",
         ConfigType::U32,
         Requirement::Optional,
         Some("16"),
@@ -750,7 +774,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Maximum n-gram draft spine length."
     ),
     field!(
-        "ngram_promote_count",
+        "ngram_spec_promote_count",
         ConfigType::U16,
         Requirement::Optional,
         Some("3"),
@@ -759,7 +783,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Observations before an n-gram is persisted; gates writes, not drafting."
     ),
     field!(
-        "ngram_write_target",
+        "ngram_spec_write_target",
         ConfigType::Enum {
             values: &["user", "topic", "none"]
         },
@@ -770,7 +794,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Which n-gram store the write path feeds."
     ),
     field!(
-        "dflash_ngram_block",
+        "dflash_no_repeat_ngram",
         ConfigType::Json,
         Requirement::Optional,
         Some("\"auto\""),
