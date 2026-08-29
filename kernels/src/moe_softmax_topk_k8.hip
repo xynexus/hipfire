@@ -24,22 +24,27 @@
 
 #define BLOCK_SIZE 256
 #define MAX_NEXP   1024
-#define K_TOP      8
+// Top-K is a RUNTIME argument. It was `#define K_TOP 8`, which is fine for the
+// families that ship k=8 but excludes Qwen3.8-Flash-Next, whose router is top-10
+// of 512. Only the shared-array bound is compile-time now.
+#define MAX_K      16
 
 extern "C" __launch_bounds__(BLOCK_SIZE, 2)
-__global__ void moe_softmax_topk_renorm_k8(
+__global__ void moe_softmax_topk_renorm(
     const float* __restrict__ logits_in,   // [n_exp]
-    int*         __restrict__ topk_idx,    // [8]
-    float*       __restrict__ topk_w,      // [8]
+    int*         __restrict__ topk_idx,    // [k_top]
+    float*       __restrict__ topk_w,      // [k_top]
     int n_exp,
-    int norm_topk                           // 0 = keep raw probs, 1 = renormalize
+    int norm_topk,                          // 0 = keep raw probs, 1 = renormalize
+    int k_top                               // clamped to [1, MAX_K]
 ) {
+    const int K_TOP = (k_top < 1) ? 1 : ((k_top > MAX_K) ? MAX_K : k_top);
     __shared__ float smem_v[MAX_NEXP];
     __shared__ int   smem_i[MAX_NEXP];
     __shared__ float reduce_v[BLOCK_SIZE];
     __shared__ int   reduce_i[BLOCK_SIZE];
-    __shared__ int   picked_idx[K_TOP];
-    __shared__ float picked_w[K_TOP];
+    __shared__ int   picked_idx[MAX_K];
+    __shared__ float picked_w[MAX_K];
 
     const int tid = threadIdx.x;
 
@@ -88,7 +93,7 @@ __global__ void moe_softmax_topk_renorm_k8(
     }
     __syncthreads();
 
-    // ── 3. Iterative top-K: 8 rounds of argmax + mask ──
+    // ── 3. Iterative top-K: k_top rounds of argmax + mask ──
     for (int k = 0; k < K_TOP; k++) {
         // Per-thread partial argmax over this thread's slice of smem_v.
         float best_v = -INFINITY;
@@ -129,7 +134,7 @@ __global__ void moe_softmax_topk_renorm_k8(
         __syncthreads();
     }
 
-    // ── 4. Optional renormalize of the 8 picked probs ──
+    // ── 4. Optional renormalize of the picked probs ──
     if (tid == 0) {
         float s = 0.0f;
         for (int k = 0; k < K_TOP; k++) s += picked_w[k];

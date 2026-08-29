@@ -784,6 +784,1041 @@ impl Gpu {
             )
         }
     }
+    /// Expand a QSA block selection to a per-token mask at CACHE positions.
+    ///
+    /// `token_mask` must be zeroed by the caller. The ragged tail past the last
+    /// complete block is always set, independently of `block_mask`.
+    #[allow(clippy::too_many_arguments)]
+    /// Block mask -> ascending cache-position slot list + count (`out_count[0]`).
+    ///
+    /// Single workgroup: the scan carries across chunks, and the output must be
+    /// ascending so the downstream flash sum is run-to-run identical.
+    pub fn qsa_select_indices(
+        &mut self,
+        block_mask: &GpuTensor,
+        visible: &GpuTensor,
+        out_idx: &GpuTensor,
+        out_count: &GpuTensor,
+        n_visible: i32,
+        n_blocks: i32,
+        compress_ratio: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_select_indices",
+            kernels::QSA_GATHER_SLOTS_SRC,
+            "qsa_select_indices",
+        )?;
+        let func = &self.functions["qsa_select_indices"];
+        let bp = block_mask.buf.as_ptr();
+        let vp = visible.buf.as_ptr();
+        let op = out_idx.buf.as_ptr();
+        let cp = out_count.buf.as_ptr();
+        let (mut nv, mut nb, mut cr) = (n_visible, n_blocks, compress_ratio);
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Gather selected cache positions into slot-major f32 — the layout
+    /// [`Self::attention_cold_slots`] reads with `k_layout`/`v_layout` = 0.
+    pub fn qsa_gather_kv(
+        &mut self,
+        cache: &GpuTensor,
+        slot_idx: &GpuTensor,
+        out: &GpuTensor,
+        n_kv_heads: i32,
+        n_slots: i32,
+        head_dim: i32,
+        cache_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_gather_kv",
+            kernels::QSA_GATHER_SLOTS_SRC,
+            "qsa_gather_kv",
+        )?;
+        let func = &self.functions["qsa_gather_kv"];
+        let cp = cache.buf.as_ptr();
+        let sp = slot_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let (mut nkv, mut ns, mut hd, mut cs) = (n_kv_heads, n_slots, head_dim, cache_stride);
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+        ];
+        let threads = head_dim.clamp(32, 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_slots as u32, n_kv_heads as u32, 1],
+                [threads, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn qsa_expand_mask(
+        &mut self,
+        block_mask: &GpuTensor,
+        visible: &GpuTensor,
+        token_mask: &GpuTensor,
+        n_visible: i32,
+        n_blocks: i32,
+        compress_ratio: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_expand_mask",
+            kernels::QSA_EXPAND_MASK_SRC,
+            "qsa_expand_mask",
+        )?;
+        let func = &self.functions["qsa_expand_mask"];
+        let bp = block_mask.buf.as_ptr();
+        let vp = visible.buf.as_ptr();
+        let tp = token_mask.buf.as_ptr();
+        let (mut nv, mut nb, mut cr) = (n_visible, n_blocks, compress_ratio);
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n_visible + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Exact top-k over QSA block scores, written as a `[n_blocks]` u32 mask.
+    ///
+    /// One launch: the threshold search runs inside a single block. Ties resolve
+    /// to the lowest block index, matching
+    /// `hipfire_arch_qwen4exp::qsa::topk_by_threshold`.
+    pub fn qsa_topk_mask(
+        &mut self,
+        scores: &GpuTensor,
+        mask: &GpuTensor,
+        n_blocks: i32,
+        k: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("qsa_topk_mask", kernels::QSA_TOPK_MASK_SRC, "qsa_topk_mask")?;
+        let func = &self.functions["qsa_topk_mask"];
+        let sp = scores.buf.as_ptr();
+        let mp = mask.buf.as_ptr();
+        let (mut n, mut kk) = (n_blocks, k);
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &mp as *const _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// qwen4_exp QSA block scoring: one score per micro-block of `compress_ratio`
+    /// cached tokens, from mean-pooled raw K and a per-head ReLU-before-sum.
+    ///
+    /// `visible` is the causally-legal cache positions in increasing order, so a
+    /// block's tokens need not be contiguous.
+    #[allow(clippy::too_many_arguments)]
+    /// Mean-pool + per-block RMSNorm, emitting each block's first position.
+    ///
+    /// Separated from scoring because the reference normalises and ROTATES the
+    /// pooled key before scoring it — see `qsa_block_prepare.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_pool_norm_blocks(
+        &mut self,
+        keys: &GpuTensor,
+        visible: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        starts: &GpuTensor,
+        n_blocks: i32,
+        compress_ratio: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_pool_norm_blocks",
+            kernels::QSA_BLOCK_PREPARE_SRC,
+            "qsa_pool_norm_blocks",
+        )?;
+        let func = &self.functions["qsa_pool_norm_blocks"];
+        let (kp, vp, wp, op, sp) = (
+            keys.buf.as_ptr(),
+            visible.buf.as_ptr(),
+            weight.buf.as_ptr(),
+            out.buf.as_ptr(),
+            starts.buf.as_ptr(),
+        );
+        let (mut nb, mut cr, mut hd, mut e) = (n_blocks, compress_ratio, head_dim, eps);
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks.max(1) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Score prepared block keys: `sum_h relu(q_h . k_b) / sqrt(head_dim)`.
+    pub fn qsa_score_prepared(
+        &mut self,
+        q: &GpuTensor,
+        block_keys: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        n_blocks: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_score_prepared",
+            kernels::QSA_BLOCK_PREPARE_SRC,
+            "qsa_score_prepared",
+        )?;
+        let func = &self.functions["qsa_score_prepared"];
+        let (qp, bp, sp) = (q.buf.as_ptr(), block_keys.buf.as_ptr(), scores.buf.as_ptr());
+        let (mut nh, mut hd, mut nb) = (n_heads, head_dim, n_blocks);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks.max(1) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn qsa_block_score(
+        &mut self,
+        q: &GpuTensor,
+        keys: &GpuTensor,
+        visible: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        compress_ratio: i32,
+        n_blocks: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_block_score",
+            kernels::QSA_BLOCK_SCORE_SRC,
+            "qsa_block_score",
+        )?;
+        let func = &self.functions["qsa_block_score"];
+        let qp = q.buf.as_ptr();
+        let kp = keys.buf.as_ptr();
+        let vp = visible.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let (mut nh, mut hd, mut cr) = (n_heads, head_dim, compress_ratio);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Gated RMSNorm with a SIGMOID output gate — qwen4_exp's Gated DeltaNet
+    /// delta from Qwen3.5/3.8, which gate with silu.
+    ///
+    /// The norm weight is applied PLAIN (ones-initialised), unlike this family's
+    /// other RMSNorm which carries a `+1`. The two are not interchangeable.
+    pub fn gated_norm_sigmoid_f32(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        batch: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_norm_sigmoid_f32",
+            kernels::GATED_NORM_SIGMOID_SRC,
+            "gated_norm_sigmoid_f32",
+        )?;
+        let func = &self.functions["gated_norm_sigmoid_f32"];
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let (mut nh, mut hd, mut e) = (n_heads, head_dim, eps);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// qwen4_exp PLE short conv: one decode step of a depthwise causal conv
+    /// DILATED by `dilation`, then SiLU. `state` is `[channels, state_len]`,
+    /// oldest first, advanced in place.
+    #[allow(clippy::too_many_arguments)]
+    /// PLE per-stream signed-sqrt value gate. Grid is one block per stream.
+    pub fn rms_norm_heads_shared_w(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        head_dim: i32,
+        n_heads: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rms_norm_heads_shared_w",
+            kernels::QSA_ATTN_PREP_SRC,
+            "rms_norm_heads_shared_w",
+        )?;
+        let func = &self.functions["rms_norm_heads_shared_w"];
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut nh = n_heads;
+        let mut e = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Write one token's K or V into a `[n_kv, max_seq, head_dim]` cache at `pos`.
+    /// `acc += weights[slot] * src` — one expert's contribution.
+    /// Linear WITH bias over `n_rows` rows: `out = x @ w^T + b`.
+    pub fn vision_linear_bias(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        b: Option<&GpuTensor>,
+        out: &GpuTensor,
+        n_rows: i32,
+        n_in: i32,
+        n_out: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vision_linear_bias",
+            kernels::VISION_OPS_SRC,
+            "vision_linear_bias",
+        )?;
+        let func = &self.functions["vision_linear_bias"];
+        let (xp, wp, op) = (x.buf.as_ptr(), w.buf.as_ptr(), out.buf.as_ptr());
+        let bp = b.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let (mut nr, mut ni, mut no) = (n_rows, n_in, n_out);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut no as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_out as u32, n_rows as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Rotate the Q and K spans of a fused `[N, 3*hidden]` qkv, in place.
+    pub fn vision_rope_qkv(
+        &mut self,
+        qkv: &GpuTensor,
+        cos: &GpuTensor,
+        sin: &GpuTensor,
+        n: i32,
+        hidden: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vision_rope_qkv",
+            kernels::VISION_OPS_SRC,
+            "vision_rope_qkv",
+        )?;
+        let func = &self.functions["vision_rope_qkv"];
+        let (qp, cp, sp) = (qkv.buf.as_ptr(), cos.buf.as_ptr(), sin.buf.as_ptr());
+        let (mut nn, mut h, mut nh, mut hd) = (n, hidden, num_heads, head_dim);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let total = n * 2 * num_heads * (head_dim / 2);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((total + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Exact erf GELU — the merger's activation, distinct from `gelu_tanh_f32`.
+    pub fn vision_gelu_erf(&mut self, x: &GpuTensor, out: &GpuTensor, n: i32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vision_gelu_erf",
+            kernels::VISION_OPS_SRC,
+            "vision_gelu_erf",
+        )?;
+        let func = &self.functions["vision_gelu_erf"];
+        let (xp, op) = (x.buf.as_ptr(), out.buf.as_ptr());
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn moe_accum_scaled(
+        &mut self,
+        acc: &GpuTensor,
+        src: &GpuTensor,
+        weights: &GpuTensor,
+        slot: i32,
+        n: i32,
+        accumulate: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_accum_scaled",
+            kernels::QSA_ATTN_PREP_SRC,
+            "moe_accum_scaled",
+        )?;
+        let func = &self.functions["moe_accum_scaled"];
+        let (ap, sp, wp) = (acc.buf.as_ptr(), src.buf.as_ptr(), weights.buf.as_ptr());
+        let (mut sl, mut nn) = (slot, n);
+        let mut acc_flag = i32::from(accumulate);
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut acc_flag as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `out = a * sigmoid(g[0])` — the shared expert's scalar gate.
+    pub fn moe_shared_gate(
+        &mut self,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        out: &GpuTensor,
+        n: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_shared_gate",
+            kernels::QSA_ATTN_PREP_SRC,
+            "moe_shared_gate",
+        )?;
+        let func = &self.functions["moe_shared_gate"];
+        let (ap, gp, op) = (a.buf.as_ptr(), g.buf.as_ptr(), out.buf.as_ptr());
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn qsa_cache_write(
+        &mut self,
+        src: &GpuTensor,
+        cache: &GpuTensor,
+        pos: i32,
+        n_kv: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_cache_write",
+            kernels::QSA_ATTN_PREP_SRC,
+            "qsa_cache_write",
+        )?;
+        let func = &self.functions["qsa_cache_write"];
+        let (sp, cp) = (src.buf.as_ptr(), cache.buf.as_ptr());
+        let (mut p, mut nk, mut hd, mut ms) = (pos, n_kv, head_dim, max_seq);
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n_kv * head_dim + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn qsa_split_query_gate(
+        &mut self,
+        qg: &GpuTensor,
+        query: &GpuTensor,
+        gate: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_split_query_gate",
+            kernels::QSA_ATTN_PREP_SRC,
+            "qsa_split_query_gate",
+        )?;
+        let func = &self.functions["qsa_split_query_gate"];
+        let gp = qg.buf.as_ptr();
+        let qp = query.buf.as_ptr();
+        let gap = gate.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &gap as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n_heads * head_dim + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn qsa_apply_output_gate(
+        &mut self,
+        ctx: &GpuTensor,
+        gate: &GpuTensor,
+        out: &GpuTensor,
+        n: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qsa_apply_output_gate",
+            kernels::QSA_ATTN_PREP_SRC,
+            "qsa_apply_output_gate",
+        )?;
+        let func = &self.functions["qsa_apply_output_gate"];
+        let cp = ctx.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn ple_stream_gate(
+        &mut self,
+        key: &GpuTensor,
+        query: &GpuTensor,
+        value: &GpuTensor,
+        out: &GpuTensor,
+        hc_count: i32,
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "ple_stream_gate",
+            kernels::PLE_STREAM_GATE_SRC,
+            "ple_stream_gate",
+        )?;
+        let func = &self.functions["ple_stream_gate"];
+        let (kp, qp, vp, op) = (
+            key.buf.as_ptr(),
+            query.buf.as_ptr(),
+            value.buf.as_ptr(),
+            out.buf.as_ptr(),
+        );
+        let mut h = hidden;
+        let mut inv = 1.0f32 / (hidden as f32).sqrt();
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut inv as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [hc_count as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn ple_dilated_conv_silu(
+        &mut self,
+        state: &GpuTensor,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        channels: i32,
+        state_len: i32,
+        kernel: i32,
+        dilation: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "ple_dilated_conv_silu",
+            kernels::PLE_DILATED_CONV_SILU_SRC,
+            "ple_dilated_conv_silu",
+        )?;
+        let func = &self.functions["ple_dilated_conv_silu"];
+        let sp = state.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let (mut c, mut sl, mut k, mut d) = (channels, state_len, kernel, dilation);
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((channels + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `out[i] = silu(x[i] * inv_scale)`. The scale is applied BEFORE the
+    /// activation, matching the reference's `silu(down(x) / hc_count)`.
+    pub fn hc_scaled_silu(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        n: i32,
+        inv_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_scaled_silu",
+            kernels::HC_GATE_ACTIVATIONS_SRC,
+            "hc_scaled_silu",
+        )?;
+        let func = &self.functions["hc_scaled_silu"];
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nn = n;
+        let mut sc = inv_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `out[i] = sigmoid(x[i])`.
+    pub fn hc_sigmoid(&mut self, x: &GpuTensor, out: &GpuTensor, n: i32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_sigmoid", kernels::HC_GATE_ACTIVATIONS_SRC, "hc_sigmoid")?;
+        let func = &self.functions["hc_sigmoid"];
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// `streams[s, d] += inject[s] * block_out[d]`, in place on the RAW streams.
+    /// Write-side stream gate: `2 * sigmoid(x * inv_scale)`, range (0, 2).
+    pub fn hc_inject_gate(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        n: i32,
+        inv_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_inject_gate",
+            kernels::HC_GATE_ACTIVATIONS_SRC,
+            "hc_inject_gate",
+        )?;
+        let func = &self.functions["hc_inject_gate"];
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nn = n;
+        let mut sc = inv_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((n + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    pub fn hc_residual_inject(
+        &mut self,
+        streams: &GpuTensor,
+        block_out: &GpuTensor,
+        inject: &GpuTensor,
+        hidden: i32,
+        hc_mult: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_residual_inject",
+            kernels::HC_GATE_ACTIVATIONS_SRC,
+            "hc_residual_inject",
+        )?;
+        let func = &self.functions["hc_residual_inject"];
+        let sp = streams.buf.as_ptr();
+        let bp = block_out.buf.as_ptr();
+        let ip = inject.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, hc_mult as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Grouped RMSNorm for qwen4_exp's widened residual: normalise each of
+    /// `n_groups` streams independently over `group`, then scale by
+    /// `1.0 + weight`.
+    ///
+    /// The `+ 1.0` is not a convenience — the checkpoint's norm parameter is
+    /// zero-initialised, so `weight * normed` collapses the stream.
+    pub fn hc_grouped_rmsnorm(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        group: i32,
+        n_groups: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_grouped_rmsnorm",
+            kernels::HC_GROUPED_RMSNORM_SRC,
+            "hc_grouped_rmsnorm",
+        )?;
+        let func = &self.functions["hc_grouped_rmsnorm"];
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut g = group;
+        let mut n = n_groups;
+        let mut e = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut g as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_groups as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Per-channel gated-residual read side for qwen4_exp:
+    /// `x_out[d] = mean_s(mix[s, d] * streams[s, d])`.
+    ///
+    /// Distinct from [`Self::hc_input_map_4stream`] on both counts that matter:
+    /// the gate is a `[hc_mult, hidden]` plane rather than four scalars, and the
+    /// collapse is a mean rather than a sum. `mix` must already be sigmoid'd and
+    /// `streams` already grouped-RMSNorm'd.
+    pub fn hc_input_map_perchannel(
+        &mut self,
+        mix: &GpuTensor,
+        streams: &GpuTensor,
+        x_out: &GpuTensor,
+        hidden: i32,
+        hc_mult: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_input_map_perchannel",
+            kernels::HC_INPUT_MAP_PERCHANNEL_SRC,
+            "hc_input_map_perchannel",
+        )?;
+        let func = &self.functions["hc_input_map_perchannel"];
+        let mp = mix.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let op = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut c = hc_mult;
+        let mut params: Vec<*mut c_void> = vec![
+            &mp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase A5 — Batched HC input mapping. Per batch position b:
     /// `x_out[b, d] = sum_s(a_vec[b, s] * streams[b, s, d])`.
     /// At batch_size == 1, byte-identical to hc_input_map_4stream.

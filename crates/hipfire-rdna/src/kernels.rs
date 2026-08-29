@@ -1243,8 +1243,7 @@ pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str =
 /// Reads [n_exp] logits, writes [k] indices and [k] weights to device
 /// buffers. Eliminates the per-layer D2H sync the CPU-side top-K used
 /// to need — required for hipGraph capture of MoE decode.
-pub const MOE_SOFTMAX_TOPK_K8_SRC: &str =
-    include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
+pub const MOE_SOFTMAX_TOPK_SRC: &str = include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
 
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32
@@ -3841,6 +3840,62 @@ pub const HC_SINKHORN_4X4_SRC: &str = include_str!("../../../kernels/src/hc_sink
 pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4stream.hip");
 
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
+
+/// Per-channel gated-residual read side for qwen4_exp. Sibling of
+/// [`HC_INPUT_MAP_SRC`], which is DeepSeek V4's: that one sums four SCALAR
+/// stream weights, this one takes a `[hc_mult, hidden]` per-channel gate plane
+/// and takes the MEAN. Differenced against the CPU oracle in
+/// `hipfire-arch-qwen4exp::hc`.
+pub const HC_INPUT_MAP_PERCHANNEL_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map_perchannel.hip");
+
+/// Grouped RMSNorm over the widened residual for qwen4_exp: each of the
+/// `hc_count` streams normalises independently over `hidden`, scaled by
+/// `1.0 + weight`. Differenced against `hipfire_arch_qwen4exp::hc`.
+pub const HC_GROUPED_RMSNORM_SRC: &str =
+    include_str!("../../../kernels/src/hc_grouped_rmsnorm.hip");
+
+/// The elementwise stages of qwen4_exp's gated residual: the low-rank mix's
+/// `silu(v / hc_count)` and `sigmoid`, plus the per-stream residual write-back.
+/// The matmuls either side are stock `gemv_f32`.
+pub const HC_GATE_ACTIVATIONS_SRC: &str =
+    include_str!("../../../kernels/src/hc_gate_activations.hip");
+
+/// qwen4_exp's PLE short convolution: depthwise, causal, DILATED by `ngram_size`,
+/// then SiLU. Distinct from `conv1d_silu_split` (the DeltaNet mixer's undilated
+/// 3-slot conv) in the same model.
+pub const PLE_DILATED_CONV_SILU_SRC: &str =
+    include_str!("../../../kernels/src/ple_dilated_conv_silu.hip");
+
+/// Gated RMSNorm with a SIGMOID output gate — qwen4_exp's Gated DeltaNet delta.
+/// Identical to `gated_norm_f32` apart from the gate activation; kept separate so
+/// the shipping Qwen3.5/3.8 path keeps its signature.
+pub const GATED_NORM_SIGMOID_SRC: &str =
+    include_str!("../../../kernels/src/gated_norm_sigmoid.hip");
+
+/// qwen4_exp Qwen Sparse Attention block scoring: mean-pool each micro-block of
+/// raw cached K, then `sum_h relu(q_h . key_b) / sqrt(head_dim)`. No learned
+/// per-head weight, unlike DeepSeek V4's indexer.
+pub const QSA_BLOCK_SCORE_SRC: &str = include_str!("../../../kernels/src/qsa_block_score.hip");
+
+/// Exact top-k over QSA block scores by in-kernel threshold search, emitted as a
+/// block mask. Replaces the O(N*K) serial / O(N^2) batched selection the existing
+/// indexer kernels use, which do not scale past N ~ 2048.
+pub const QSA_TOPK_MASK_SRC: &str = include_str!("../../../kernels/src/qsa_topk_mask.hip");
+
+/// Expand a QSA block selection into a per-token attention mask, including the
+/// unconditionally-visible ragged tail past the last complete block.
+pub const QSA_EXPAND_MASK_SRC: &str = include_str!("../../../kernels/src/qsa_expand_mask.hip");
+
+pub const QSA_GATHER_SLOTS_SRC: &str = include_str!("../../../kernels/src/qsa_gather_slots.hip");
+
+pub const PLE_STREAM_GATE_SRC: &str = include_str!("../../../kernels/src/ple_stream_gate.hip");
+
+pub const QSA_ATTN_PREP_SRC: &str = include_str!("../../../kernels/src/qsa_attn_prep.hip");
+
+pub const QSA_BLOCK_PREPARE_SRC: &str = include_str!("../../../kernels/src/qsa_block_prepare.hip");
+
+pub const VISION_OPS_SRC: &str = include_str!("../../../kernels/src/vision_ops.hip");
 
 pub const HC_APPLY_ALPHA_SRC: &str = include_str!("../../../kernels/src/hc_apply_alpha.hip");
 

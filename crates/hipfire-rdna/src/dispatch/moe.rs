@@ -142,38 +142,41 @@ impl Gpu {
     /// MoE router GPU softmax + top-K + (optional) renormalize. One
     /// workgroup, no D2H sync. Writes [k_top] i32 indices and [k_top]
     /// f32 weights to device buffers. Hardcoded k_top=8 to match A3B.
-    pub fn moe_softmax_topk_renorm_k8(
+    /// Router softmax + top-`k_top` + optional renorm, in one launch.
+    ///
+    /// `k_top` is a runtime argument (capped at the kernel's `MAX_K`), not the
+    /// compile-time 8 this was written with — Qwen3.8-Flash-Next routes top-10
+    /// of 512.
+    pub fn moe_softmax_topk_renorm(
         &mut self,
         logits: &GpuTensor,
         topk_idx: &GpuTensor, // i32 [k_top]
         topk_w: &GpuTensor,   // f32 [k_top]
         n_exp: usize,
         norm_topk: bool,
+        k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "moe_softmax_topk_k8",
-            kernels::MOE_SOFTMAX_TOPK_K8_SRC,
-            "moe_softmax_topk_renorm_k8",
+            "moe_softmax_topk",
+            kernels::MOE_SOFTMAX_TOPK_SRC,
+            "moe_softmax_topk_renorm",
         )?;
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
-        let bytes = n_exp * 4 + 8 * 8;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "elementwise",
-            "moe_softmax_topk_renorm_k8",
-            bytes,
-        );
+        let kt = k_top as i32;
+        let bytes = n_exp * 4 + k_top * 8;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_softmax_topk_renorm", bytes);
         let result = self.launch_kernargs(
-            "moe_softmax_topk_renorm_k8",
+            "moe_softmax_topk_renorm",
             [1, 1, 1],
             [256, 1, 1],
             0,
-            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr],
+            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr, i32 kt],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
