@@ -10,7 +10,7 @@ pub mod schema;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 pub use editor::{
@@ -912,7 +912,8 @@ pub fn resolve_typed_config_layers(
     layers: &[ConfigLayer],
     model_overrides: HashMap<String, Value>,
 ) -> ResolvedTypedConfig {
-    let resolution = resolve_config_layers(config_schema(), layers);
+    let mut resolution = resolve_config_layers(config_schema(), layers);
+    unknown_keys_in_unapplied_overrides(layers, &model_overrides, &mut resolution);
     let mut diagnostics = Vec::new();
     let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
     ResolvedTypedConfig {
@@ -1076,6 +1077,67 @@ fn materialize_config(
             }
             serde_json::from_value::<HipfireConfig>(Value::Object(accepted))
                 .unwrap_or_else(|_| HipfireConfig::default())
+        }
+    }
+}
+
+/// Report unknown field names inside `model_overrides` entries that did NOT
+/// become a layer.
+///
+/// `resolve_config_layers` can only inspect layers, and a `model_overrides`
+/// entry becomes one only when its key matches the tag being resolved
+/// (`config_layers_from_documents`). So a typo'd field in an entry for any
+/// OTHER model was never schema-checked — and neither was the entry whose key
+/// itself was misspelled, since that key matches no tag and so contributes no
+/// layer at all. Such an entry was silent twice over: it applied nothing, and
+/// nothing said its contents were unreadable.
+///
+/// Entries that DID become a layer are skipped; `resolve_config_layers` has
+/// already reported those, and re-reporting would double every finding.
+///
+/// This only names fields the schema does not define. Whether an override KEY
+/// matches a real model needs the model listing, which this crate does not
+/// have.
+fn unknown_keys_in_unapplied_overrides(
+    layers: &[ConfigLayer],
+    model_overrides: &HashMap<String, Value>,
+    resolution: &mut ConfigResolution,
+) {
+    let applied = layers
+        .iter()
+        .filter(|layer| {
+            matches!(
+                layer.kind,
+                ConfigLayerKind::Model | ConfigLayerKind::ModelHost
+            )
+        })
+        .filter_map(|layer| layer.id.as_deref())
+        .collect::<BTreeSet<_>>();
+
+    let known = config_schema()
+        .iter()
+        .map(|field| field.key)
+        .collect::<BTreeSet<_>>();
+
+    let mut tags = model_overrides.keys().collect::<Vec<_>>();
+    tags.sort();
+    for tag in tags {
+        if applied.contains(tag.as_str()) {
+            continue;
+        }
+        let Some(object) = model_overrides[tag].as_object() else {
+            continue;
+        };
+        for key in object.keys() {
+            if !known.contains(key.as_str()) {
+                resolution.unknown_keys.push(UnknownConfigKey {
+                    key: key.clone(),
+                    source: ConfigValueSource {
+                        kind: ConfigLayerKind::Model,
+                        id: Some(tag.clone()),
+                    },
+                });
+            }
         }
     }
 }
@@ -1420,6 +1482,60 @@ mod tests {
                 .any(|d| d.message.contains("resource_lock_npus")),
             "the malformed key must be NAMED — being unnamed is what made this \
              invisible for so long"
+        );
+    }
+
+    #[test]
+    fn a_typo_in_an_unmatched_model_override_is_still_reported() {
+        // Two failures that used to be silent together: the entry's KEY names no
+        // model being resolved, so it contributes no layer — and because it
+        // contributes no layer, the misspelled FIELD inside it was never
+        // schema-checked either.
+        let raw = serde_json::json!({
+            "model_overrides": {
+                "MiniCPM5-1B.oq4.25++": { "kv_cach": "q8", "thinking": "on" },
+            },
+        });
+
+        let resolved = resolve_typed_config_document(&raw, Some("MiniCPM5--1B.oq4.25++"));
+
+        let unknown = &resolved.resolution.unknown_keys;
+        assert!(
+            unknown.iter().any(|k| k.key == "kv_cach"),
+            "the misspelled field in an unapplied override went unreported: {unknown:?}"
+        );
+        assert!(
+            unknown
+                .iter()
+                .any(|k| k.key == "kv_cach"
+                    && k.source.id.as_deref() == Some("MiniCPM5-1B.oq4.25++")),
+            "the report must name WHICH override entry it came from: {unknown:?}"
+        );
+        assert!(
+            !unknown.iter().any(|k| k.key == "thinking"),
+            "`thinking` is a real schema field and must not be reported: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn an_applied_model_override_is_not_reported_twice() {
+        let raw = serde_json::json!({
+            "model_overrides": {
+                "some-model": { "kv_cach": "q8" },
+            },
+        });
+
+        let resolved = resolve_typed_config_document(&raw, Some("some-model"));
+
+        assert_eq!(
+            resolved
+                .resolution
+                .unknown_keys
+                .iter()
+                .filter(|k| k.key == "kv_cach")
+                .count(),
+            1,
+            "the matched override is checked as a layer; checking it again double-reports"
         );
     }
 }
