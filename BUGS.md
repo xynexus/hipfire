@@ -57,10 +57,33 @@ anything. So the seven zaya KLD baselines were NOT recorded — the gate keeps
 reporting "no committed baseline" for them, which is honest, instead of a
 recorded 0 that reads as coverage.
 
-Likely causes, untested: the tiny zaya fixture's logits are dominated by a tensor
-that stays at source precision (a tied embedding or the head), or the fixture is
-degenerate enough that its output is near-uniform regardless of the weights.
-Whichever it is, the fixture needs fixing before a baseline here means anything.
+**ROOT CAUSE, found 2026-08-30 by inspecting the artifact — zaya's `oq4` cell is
+not testing 4-bit attention.** Under `--format oq4` its whole attention stack
+lands at Q8F16 (8-bit), not Oq4:
+
+    zaya  oq4 artifact:  22 Oq4G256   12 Q8F16   44 F16   1 Bf16Lut3
+    llama oq4 artifact:  15 Oq4G256    0 Q8F16    5 F16   1 Bf16Lut3
+
+The 12 Q8F16 are q_proj, k_proj, v_proj_current, v_proj_delayed, o_proj and
+router_mlp.out_proj on both layers. llama has ZERO tensors promoted that way.
+Coverage is otherwise fine — of zaya's 44 F16, 42 are 1-D norms and the other two
+are `[384, 2]` depthwise convs, both correctly left alone.
+
+So zaya's "oq4" and "oq8" cells measure NEARLY THE SAME MODEL, which is exactly
+why their KLDs are within 6x of each other (2.3e-5 vs 3.9e-6) where llama's differ
+by 135x. The cell is not broken so much as mislabelled: it reports 4-bit coverage
+for a model whose sensitive weights are 8-bit.
+
+Not a zaya-spec policy: `hipfire-arch-zaya-spec` uses plain
+`default_importance(self.role(tensor))` with no family override, so the promotion
+comes from the generic importance/K-map path. WHICH rule promotes them is still
+open — the shapes are all K=256 and therefore 256-aligned, so it is not the
+`k % 256 != 0 -> Q8` fallback at cli.rs:11639.
+
+⚠️ Training the tiny zaya would NOT diagnose this, and would hide it: the promotion
+is visible statically in the artifact and has nothing to do with the weights being
+random. Fix the cell (make it exercise 4-bit attention, or rename it for what it
+measures) before recording a baseline.
 
 Do NOT close this by running `--record`.
 
