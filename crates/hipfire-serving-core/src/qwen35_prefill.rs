@@ -2077,6 +2077,20 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         let _ = stdout.flush();
     }
 
+    // Bound the resident set. One-shot requests release their own session, so
+    // this is normally a no-op; it catches the sessions nothing releases —
+    // parked by cooperative preemption, or stranded by a prefill error.
+    match crate::session::qwen35_evict_sessions_over_limit(
+        m,
+        gpu,
+        crate::session::qwen35_resident_session_limit_value(),
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!("evicted {n} resident session(s) over the limit"),
+        // Eviction is a safety net, never a reason to fail a served request.
+        Err(e) => tracing::warn!("resident-session eviction failed: {e}"),
+    }
+
     {
         // Pool accounting, per prefill. This is what located the DeltaNet FP16
         // strand: `free_buffers`/`free_bytes` climbing every request while

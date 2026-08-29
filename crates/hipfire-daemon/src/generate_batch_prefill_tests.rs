@@ -737,10 +737,9 @@ fn model_worker_runtime_view_json_reports_state_page_descriptors() {
     assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
     assert_eq!(json["state_arena_owns_pages"], true);
     assert_eq!(json["state_allocator"]["page_ownership"], "backend_wrapped");
-    assert_eq!(
-        json["state_allocator"]["eviction_policy"],
-        "manual_release_only"
-    );
+    // qwen35_wrapped has a release path, so its sessions are evictable and the
+    // resident set is bounded rather than unbounded.
+    assert_eq!(json["state_allocator"]["eviction_policy"], "lru_checkpoint");
     assert_eq!(json["state_allocator"]["spill_target"], "disabled");
     assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
     assert_eq!(

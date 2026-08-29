@@ -33,12 +33,13 @@ use hipfire_runtime::kv;
 use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_state::{
     describe_sequence_state_descriptors, model_worker_runtime_view_json,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
-    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
-    validate_checkpoint_source_resident, DescribedSequenceState, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateArenaOperation,
-    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStateHandle,
-    SequenceStatePageDescriptor, SequenceStatePageKind, SequenceStatePrefixHash,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, qwen35_state_handle_kind,
+    select_lru_sequence_state_eviction_candidates, validate_checkpoint_logical_position,
+    validate_checkpoint_prefix_hash, validate_checkpoint_source_resident, DescribedSequenceState,
+    ModelWorkerRuntimeView, ParsedSequenceStateHandle, SequenceStateArenaBackend,
+    SequenceStateArenaOperation, SequenceStateCheckpointRequest, SequenceStateEvictionCandidate,
+    SequenceStateForkRequest, SequenceStateHandle, SequenceStatePageDescriptor,
+    SequenceStatePageKind, SequenceStatePrefixHash,
 };
 
 use crate::events::write_error;
@@ -2278,6 +2279,115 @@ pub fn ensure_sequence_state_arena_backend_supported(
     arena_backend.require_supported(m.arch_id, m.pp, op)
 }
 
+/// Ceiling on resident qwen35 sessions before the oldest are evicted.
+///
+/// Honours the scheduler's own `HIPFIRE_SCHED_RESIDENT_STATE_MAX` so there is
+/// one knob, not two — `resident_state_limit` in `/health` reports the same
+/// value. Reading the env directly avoids a `hipfire-scheduler` dependency here
+/// for a single integer.
+pub fn qwen35_resident_session_limit_value() -> usize {
+    qwen35_resident_session_limit()
+}
+
+/// Which sessions to evict to get back to `limit`, oldest first.
+///
+/// Split out from [`qwen35_evict_sessions_over_limit`] so the choice is
+/// testable without a GPU or a loaded model — the exclusions and the
+/// how-many-to-take arithmetic are where this can go wrong, not the release.
+///
+/// `sessions` is `(session_id, allocation_epoch)`. The active session and the
+/// legacy slot are never candidates: the first is in use, the second is the
+/// fallback the model returns to after a release.
+fn qwen35_eviction_victims(
+    sessions: &[(String, u64)],
+    active: Option<&str>,
+    limit: usize,
+) -> Vec<String> {
+    let candidates: Vec<SequenceStateEvictionCandidate> = sessions
+        .iter()
+        .filter(|(id, _)| id != QWEN35_LEGACY_SESSION_ID && active != Some(id.as_str()))
+        .map(|(id, epoch)| SequenceStateEvictionCandidate {
+            handle: SequenceStateHandle {
+                id: id.clone(),
+                kind: qwen35_state_handle_kind(id).to_string(),
+                generation: *epoch,
+            },
+            // Not consulted: the selection is count-based, so costing each
+            // session would add a descriptor walk per prefill for nothing.
+            resident_bytes: 0,
+            last_touched_ms: *epoch,
+        })
+        .collect();
+    if candidates.len() <= limit {
+        return Vec::new();
+    }
+    let over = candidates.len() - limit;
+    // `target_bytes: 0` means "every candidate, oldest first" — reuse the tested
+    // ordering (epoch, then bytes, then id/generation) rather than sorting here.
+    select_lru_sequence_state_eviction_candidates(candidates, 0)
+        .into_iter()
+        .take(over)
+        .map(|c| c.handle.id)
+        .collect()
+}
+
+fn qwen35_resident_session_limit() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_SCHED_RESIDENT_STATE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 64)
+    })
+}
+
+/// Evict the oldest parked sessions until at most `limit` remain, freeing their
+/// device memory. Returns how many were evicted.
+///
+/// One-shot requests release their own session, so in the steady state there is
+/// nothing here to evict. This bounds the paths that *don't* release: a session
+/// parked by cooperative preemption whose client never comes back, and the
+/// prefill-error path that skips the release. Without it those accumulate with
+/// nothing to stop them — `resident_state_limit` was reported but never
+/// enforced anywhere.
+///
+/// Never evicts the active session or the legacy slot.
+///
+/// ponytail: ordered by `allocation_epoch` (creation), not last use — so this is
+/// FIFO, which coincides with LRU exactly as long as nothing re-activates a
+/// parked session. Nothing does today: no production caller sets a
+/// `session_id`, so every session is created, used once and dropped. Give
+/// `Qwen35RequestSessionState` a touch timestamp and feed that in instead the
+/// moment multi-turn session reuse becomes reachable.
+pub fn qwen35_evict_sessions_over_limit(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    limit: usize,
+) -> Result<usize, String> {
+    if !is_qwen35_family_arch_id(m.arch_id) || m.pp != 1 {
+        return Ok(0);
+    }
+    let active = m.q35_registry.active_session_id.clone();
+    let sessions: Vec<(String, u64)> = m
+        .q35_registry
+        .sessions
+        .iter()
+        .map(|(id, session)| (id.clone(), session.allocation_epoch))
+        .collect();
+    let victims = qwen35_eviction_victims(&sessions, active.as_deref(), limit);
+    if victims.is_empty() {
+        return Ok(0);
+    }
+    tracing::debug!(
+        "evicting {} resident qwen35 session(s) over limit {}: {:?}",
+        victims.len(),
+        limit,
+        victims
+    );
+    qwen35_release_sessions(m, gpu, &victims)
+}
+
 pub fn sequence_state_arena_resident_session_count(
     arena_backend: SequenceStateArenaBackend,
     m: &LoadedModel,
@@ -2603,5 +2713,65 @@ impl SessionServingBackend for LoadedModel {
             self.arch_id,
             "checkpoint_session_state",
         ))
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::{qwen35_eviction_victims, QWEN35_LEGACY_SESSION_ID};
+
+    fn s(id: &str, epoch: u64) -> (String, u64) {
+        (id.to_string(), epoch)
+    }
+
+    #[test]
+    fn nothing_is_evicted_at_or_under_the_limit() {
+        let sessions = vec![s("a", 1), s("b", 2)];
+        assert!(qwen35_eviction_victims(&sessions, None, 2).is_empty());
+        assert!(qwen35_eviction_victims(&sessions, None, 8).is_empty());
+        assert!(qwen35_eviction_victims(&[], None, 8).is_empty());
+    }
+
+    #[test]
+    fn evicts_only_the_overflow_oldest_first() {
+        // Deliberately out of insertion order: the epoch decides, not the order
+        // the registry happened to yield.
+        let sessions = vec![s("newest", 40), s("oldest", 10), s("mid", 20), s("new", 30)];
+        assert_eq!(
+            qwen35_eviction_victims(&sessions, None, 2),
+            vec!["oldest".to_string(), "mid".to_string()],
+            "exactly the two oldest, leaving the limit resident"
+        );
+    }
+
+    #[test]
+    fn the_active_session_is_never_evicted_even_when_oldest() {
+        let sessions = vec![s("active", 1), s("b", 2), s("c", 3)];
+        // 'active' is excluded from the candidate set entirely, so only b and c
+        // can be chosen and only one is over a limit of 1.
+        assert_eq!(
+            qwen35_eviction_victims(&sessions, Some("active"), 1),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_legacy_slot_is_never_evicted() {
+        // The legacy session is what a release falls back to; evicting it would
+        // free state the model is about to re-activate.
+        let sessions = vec![s(QWEN35_LEGACY_SESSION_ID, 1), s("b", 2), s("c", 3)];
+        let victims = qwen35_eviction_victims(&sessions, None, 1);
+        assert!(
+            !victims.iter().any(|v| v == QWEN35_LEGACY_SESSION_ID),
+            "legacy slot must never be a victim, got {victims:?}"
+        );
+        assert_eq!(victims, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn a_limit_of_zero_evicts_every_eligible_session() {
+        let sessions = vec![s("a", 1), s(QWEN35_LEGACY_SESSION_ID, 2), s("c", 3)];
+        let victims = qwen35_eviction_victims(&sessions, None, 0);
+        assert_eq!(victims, vec!["a".to_string(), "c".to_string()]);
     }
 }
