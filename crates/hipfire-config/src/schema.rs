@@ -86,7 +86,9 @@ pub enum ConfigType {
     /// Arms are tried in order and the first that accepts wins, so ORDER IS
     /// SEMANTIC: an open arm (`String`, `Path`, `Json`) accepts nearly
     /// anything, so it must come last or it swallows the sentinels behind it.
-    OneOf(&'static [ConfigType]),
+    OneOf {
+        arms: &'static [ConfigType],
+    },
 }
 
 /// Config keys that have been renamed, as `(old, new)`.
@@ -714,14 +716,16 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "ngram_spec_store_root",
-        ConfigType::OneOf(&[
-            ConfigType::Enum {
-                values: NGRAM_STORE_ROOT_RAM,
-            },
-            ConfigType::Path {
-                existence: PathExistence::ParentExists,
-            },
-        ]),
+        ConfigType::OneOf {
+            arms: &[
+                ConfigType::Enum {
+                    values: NGRAM_STORE_ROOT_RAM,
+                },
+                ConfigType::Path {
+                    existence: PathExistence::ParentExists,
+                },
+            ],
+        },
         Requirement::Optional,
         Some(""),
         GLOBAL_MODEL_RUNTIME,

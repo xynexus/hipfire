@@ -228,7 +228,7 @@ pub fn encode_editor_value(field: &ConfigField, raw: &Value) -> Result<Value, St
             other => Ok(other.clone()),
         },
         // Same first-arm-wins rule as the parser; see `ConfigType::OneOf`.
-        ConfigType::OneOf(arms) => {
+        ConfigType::OneOf { arms } => {
             let mut errors = Vec::new();
             for arm in arms {
                 let probe = ConfigField { ty: *arm, ..*field };

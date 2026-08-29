@@ -1133,7 +1133,7 @@ fn apply_renamed_keys(layers: &[ConfigLayer]) -> (Vec<ConfigLayer>, Vec<ConfigDi
 fn path_existence_for(value: &Value, ty: &ConfigType) -> Option<PathExistence> {
     match ty {
         ConfigType::Path { existence } => Some(*existence),
-        ConfigType::OneOf(arms) => arms
+        ConfigType::OneOf { arms } => arms
             .iter()
             .find(|arm| validate_resolved_value(value, arm).is_ok())
             .and_then(|arm| path_existence_for(value, arm)),

@@ -187,7 +187,7 @@ fn type_label(ty: ConfigType) -> String {
         ConfigType::Path { existence } => format!("path({existence:?})"),
         ConfigType::Enum { values } => format!("enum({})", values.join("|")),
         ConfigType::Json => "json".to_string(),
-        ConfigType::OneOf(arms) => format!(
+        ConfigType::OneOf { arms } => format!(
             "one_of({})",
             arms.iter()
                 .map(|arm| type_label(*arm))

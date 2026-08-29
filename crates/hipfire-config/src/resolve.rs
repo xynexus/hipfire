@@ -198,7 +198,7 @@ fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
         // First arm that accepts wins; see `ConfigType::OneOf` on why order is
         // semantic. On total failure report every arm's expectation, not just
         // the last one's — "want a path" alone would hide the sentinels.
-        ConfigType::OneOf(arms) => {
+        ConfigType::OneOf { arms } => {
             let mut wants = Vec::new();
             for arm in *arms {
                 match parse_env_value(raw, arm) {
@@ -269,7 +269,7 @@ pub fn validate_resolved_value(value: &Value, ty: &ConfigType) -> Result<(), Str
         ) if value.as_u64().is_some() => Ok(()),
         (Value::Number(_), ConfigType::I32) if value.as_i64().is_some() => Ok(()),
         (Value::Number(_), ConfigType::F64) => Ok(()),
-        (_, ConfigType::OneOf(arms)) => {
+        (_, ConfigType::OneOf { arms }) => {
             let mut wants = Vec::new();
             for arm in *arms {
                 match validate_resolved_value(value, arm) {

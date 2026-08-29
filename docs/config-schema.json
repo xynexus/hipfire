@@ -182,7 +182,8 @@
   {
     "key": "cask_sidecar",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "required_when",
@@ -320,7 +321,7 @@
     "env": []
   },
   {
-    "key": "dflash_ngram_block",
+    "key": "dflash_no_repeat_ngram",
     "type": {
       "kind": "json"
     },
@@ -714,7 +715,8 @@
   {
     "key": "models_dir",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "optional"
@@ -735,7 +737,8 @@
   {
     "key": "models_network_dir",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "optional"
@@ -803,116 +806,6 @@
     "env": []
   },
   {
-    "key": "ngram_chain_floor",
-    "type": {
-      "kind": "u8"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "8",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Minimum winning order to keep extending an n-gram chain; 0 disables.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "ngram_max_spine",
-    "type": {
-      "kind": "u32"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "16",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Maximum n-gram draft spine length.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "ngram_orders",
-    "type": {
-      "kind": "string"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "8,7,6,5,4,3,2",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "n-gram probe orders, longest first, comma-separated.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "ngram_promote_count",
-    "type": {
-      "kind": "u16"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "3",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Observations before an n-gram is persisted; gates writes, not drafting.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "ngram_scope",
-    "type": {
-      "kind": "string"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Tokenizer scope name for n-gram tables; empty = derive from model file.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
     "key": "ngram_spec",
     "type": {
       "kind": "bool"
@@ -935,7 +828,117 @@
     "env": []
   },
   {
-    "key": "ngram_store_mb",
+    "key": "ngram_spec_chain_floor",
+    "type": {
+      "kind": "u8"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Minimum winning order to keep extending an n-gram chain; 0 disables.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_max_spine",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "16",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Maximum n-gram draft spine length.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_orders",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8,7,6,5,4,3,2",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "n-gram probe orders, longest first, comma-separated.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_promote_count",
+    "type": {
+      "kind": "u16"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "3",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Observations before an n-gram is persisted; gates writes, not drafting.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_scope",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Tokenizer scope name for n-gram tables; empty = derive from model file.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_store_mb",
     "type": {
       "kind": "u32"
     },
@@ -957,9 +960,24 @@
     "env": []
   },
   {
-    "key": "ngram_store_root",
+    "key": "ngram_spec_store_root",
     "type": {
-      "kind": "string"
+      "kind": "one_of",
+      "arms": [
+        {
+          "kind": "enum",
+          "values": [
+            "",
+            "ram",
+            "none",
+            "off"
+          ]
+        },
+        {
+          "kind": "path",
+          "existence": "parent_exists"
+        }
+      ]
     },
     "requirement": {
       "kind": "optional"
@@ -979,7 +997,7 @@
     "env": []
   },
   {
-    "key": "ngram_write_target",
+    "key": "ngram_spec_write_target",
     "type": {
       "kind": "enum",
       "values": [
@@ -1122,7 +1140,8 @@
   {
     "key": "prefill_drafter",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "required_when",

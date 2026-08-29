@@ -10,13 +10,13 @@
 | `cask_budget` | `u32` | optional | `512` | `global`, `model`, `runtime` | `load_time` | `none` | CASK token or block budget. |
 | `cask_core_frac` | `f64` | optional | `0.5` | `global`, `model`, `runtime` | `load_time` | `none` | Fraction of CASK core candidates to keep. |
 | `cask_fold_m` | `u32` | optional | `2` | `global`, `model`, `runtime` | `load_time` | `none` | CASK fold factor. |
-| `cask_sidecar` | `path` | required when `cask == true && cask_auto_attach == false` | - | `global`, `model`, `runtime` | `load_time` | `none` | Explicit CASK/TriAttention sidecar path. |
+| `cask_sidecar` | `path(Exists)` | required when `cask == true && cask_auto_attach == false` | - | `global`, `model`, `runtime` | `load_time` | `none` | Explicit CASK/TriAttention sidecar path. |
 | `cors_allowed_origins` | `json` | optional | `[]` | `global`, `runtime` | `static` | `none` | Browser origins allowed to call the HTTP API cross-origin. Empty disables CORS (same-origin only); ["*"] allows any origin; otherwise an explicit allowlist such as ["http://localhost:8080"]. |
 | `default_model` | `string` | optional | - | `global`, `runtime` | `load_time` | `none` | Model tag, alias, or path to use when a request omits the model. |
 | `deltanet_state_precision` | `enum(fp16|fp32)` | optional | `fp16` | `global`, `model`, `runtime` | `load_time` | `none` | Storage dtype for the Gated DeltaNet recurrent state (the S matrices). Defaults to fp16 as of 2026-08-27. Measured on Qwen3.8-27B--oq4.25++: generation is BYTE-IDENTICAL to fp32 across code/prose/numbers/JSON prompts, and spec-decode acceptance IMPROVES — tau 3.682 -> 4.103 (+11.4%), decode 14.5-16.8 -> 18.9-19.1 tok/s. tau is deterministic and reproduced exactly across repeats, so that is signal, not run noise. Plain AR decode is flat, so the win is specific to speculative decode: the drafter sees the verify path's hidden states and agrees with the fp16 ones more often, while the verifier's committed tokens are unchanged. fp32 remains available as the diffing oracle — losing the ability to compare against it is how quantised state hid for months. NOTE fp16 narrows once per LAUNCH, so a batched call is not identical to the same tokens issued one at a time; fp32 has no narrowing and is identical either way. That asymmetry is real but was MEASURED not to drive the spec-decode/AR divergence (docs/bugs/2026-08-27-spec-decode-ar-divergence.md). |
 | `dflash_adaptive_b` | `bool` | optional | `true` | `global`, `model`, `runtime` | `load_time` | `none` | Whether DFlash may adapt draft batch size. |
 | `dflash_mode` | `enum(off|auto|on)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | DFlash speculative decode mode. |
-| `dflash_ngram_block` | `json` | optional | `"auto"` | `global`, `model`, `runtime` | `load_time` | `none` | DFlash n-gram blocking policy; accepts boolean or auto. |
+| `dflash_no_repeat_ngram` | `json` | optional | `"auto"` | `global`, `model`, `runtime` | `load_time` | `none` | DFlash n-gram blocking policy; accepts boolean or auto. |
 | `flash_mode` | `enum(auto|always|never)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Flash-attention selection policy. |
 | `gpu_slab_load` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | GPU slab loading policy for model weights. |
 | `host` | `string` | optional | `127.0.0.1` | `global`, `runtime` | `static` | `none` | Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces. |
@@ -32,25 +32,25 @@
 | `mmq_screen_threshold` | `f64` | optional | `0.10` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ screening rejection threshold. |
 | `model_overrides` | `json` | optional | `{}` | `global`, `model` | `load_time` | `reload_model` | Sparse per-model override map layered on top of global config. |
 | `model_residency_mode` | `enum(auto|full|qwen_moe_modules)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Model residency strategy selected by the scheduler. |
-| `models_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Primary local model root. When unset, Hipfire uses ~/.hipfire/models. |
-| `models_network_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to models_dir. Unset by default; local CLI/eval callers are unaffected. |
+| `models_dir` | `path(Exists)` | optional | - | `global`, `runtime` | `static` | `none` | Primary local model root. When unset, Hipfire uses ~/.hipfire/models. |
+| `models_network_dir` | `path(Exists)` | optional | - | `global`, `runtime` | `static` | `none` | Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to models_dir. Unset by default; local CLI/eval callers are unaffected. |
 | `mtp_k` | `u32` | optional | `3` | `global`, `model`, `runtime` | `load_time` | `none` | Number of MTP candidate tokens to consider. |
 | `mtp_mode` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Multi-token prediction sidecar mode. |
-| `ngram_chain_floor` | `u8` | optional | `8` | `global`, `model`, `runtime` | `load_time` | `none` | Minimum winning order to keep extending an n-gram chain; 0 disables. |
-| `ngram_max_spine` | `u32` | optional | `16` | `global`, `model`, `runtime` | `load_time` | `none` | Maximum n-gram draft spine length. |
-| `ngram_orders` | `string` | optional | `8,7,6,5,4,3,2` | `global`, `model`, `runtime` | `load_time` | `none` | n-gram probe orders, longest first, comma-separated. |
-| `ngram_promote_count` | `u16` | optional | `3` | `global`, `model`, `runtime` | `load_time` | `none` | Observations before an n-gram is persisted; gates writes, not drafting. |
-| `ngram_scope` | `string` | optional | `` | `global`, `model`, `runtime` | `load_time` | `none` | Tokenizer scope name for n-gram tables; empty = derive from model file. |
 | `ngram_spec` | `bool` | optional | `false` | `global`, `model`, `runtime` | `load_time` | `none` | Opt-in drafter-free n-gram speculative decode. |
-| `ngram_store_mb` | `u32` | optional | `256` | `global`, `model`, `runtime` | `load_time` | `none` | Size in MiB of a newly created n-gram table; this is the fixed budget. |
-| `ngram_store_root` | `string` | optional | `` | `global`, `model`, `runtime` | `load_time` | `none` | Root directory for persistent n-gram tables; empty/ram/none/off = RAM only. |
-| `ngram_write_target` | `enum(user|topic|none)` | optional | `user` | `global`, `model`, `runtime` | `load_time` | `none` | Which n-gram store the write path feeds. |
+| `ngram_spec_chain_floor` | `u8` | optional | `8` | `global`, `model`, `runtime` | `load_time` | `none` | Minimum winning order to keep extending an n-gram chain; 0 disables. |
+| `ngram_spec_max_spine` | `u32` | optional | `16` | `global`, `model`, `runtime` | `load_time` | `none` | Maximum n-gram draft spine length. |
+| `ngram_spec_orders` | `string` | optional | `8,7,6,5,4,3,2` | `global`, `model`, `runtime` | `load_time` | `none` | n-gram probe orders, longest first, comma-separated. |
+| `ngram_spec_promote_count` | `u16` | optional | `3` | `global`, `model`, `runtime` | `load_time` | `none` | Observations before an n-gram is persisted; gates writes, not drafting. |
+| `ngram_spec_scope` | `string` | optional | `` | `global`, `model`, `runtime` | `load_time` | `none` | Tokenizer scope name for n-gram tables; empty = derive from model file. |
+| `ngram_spec_store_mb` | `u32` | optional | `256` | `global`, `model`, `runtime` | `load_time` | `none` | Size in MiB of a newly created n-gram table; this is the fixed budget. |
+| `ngram_spec_store_root` | `one_of(enum(|ram|none|off) | path(ParentExists))` | optional | `` | `global`, `model`, `runtime` | `load_time` | `none` | Root directory for persistent n-gram tables; empty/ram/none/off = RAM only. |
+| `ngram_spec_write_target` | `enum(user|topic|none)` | optional | `user` | `global`, `model`, `runtime` | `load_time` | `none` | Which n-gram store the write path feeds. |
 | `oq_compact_multicol_wide` | `bool` | optional | `false` | `global`, `model`, `runtime` | `load_time` | `none` | Wide (8-lane, dwordx4) compact multicol decode GEMV. Needs K % 1024 == 0; the narrow kernel is the fallback where that does not hold. Measured 24.3 -> 55.5 tok/s on Qwen3.8-27B (gfx1151), which makes it the single largest decode lever on that model — and it defaults OFF while it is proven against the narrow kernel on more shapes. Was reachable only as HIPFIRE_OQ_COMPACT_MULTICOL_WIDE, so the engine's headline throughput depended on knowing an env var. |
 | `port` | `u16` | optional | `11435` | `global`, `runtime` | `static` | `none` | Bind port for the OpenAI-compatible HTTP server. |
 | `prefill_alpha` | `f64` | optional | `0.85` | `global`, `model`, `runtime` | `load_time` | `none` | Prefill compression scoring alpha. |
 | `prefill_block` | `u32` | optional | `128` | `global`, `model`, `runtime` | `load_time` | `none` | Block size used by prefill compression. |
 | `prefill_compression` | `enum(off|auto|on)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | Long-context prefill compression mode. |
-| `prefill_drafter` | `path` | required when `prefill_compression != 'off' && prefill_drafter_device >= 0` | - | `global`, `model`, `runtime` | `load_time` | `none` | Optional drafter artifact for prefill compression. |
+| `prefill_drafter` | `path(Exists)` | required when `prefill_compression != 'off' && prefill_drafter_device >= 0` | - | `global`, `model`, `runtime` | `load_time` | `none` | Optional drafter artifact for prefill compression. |
 | `prefill_drafter_device` | `i32` | optional | `-1` | `global`, `host`, `node`, `model` | `load_time` | `none` | Preferred accelerator device for the prefill drafter. |
 | `prefill_keep_ratio` | `f64` | optional | `0.05` | `global`, `model`, `runtime` | `load_time` | `none` | Fraction of prefill blocks to keep under compression. |
 | `prefill_min_keep` | `u32` | optional | `2048` | `global`, `model`, `runtime` | `load_time` | `none` | Minimum tokens or blocks retained during prefill compression. |

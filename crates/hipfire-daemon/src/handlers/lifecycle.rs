@@ -312,11 +312,22 @@ pub(crate) fn load(
             .and_then(|v| v.as_u64())
             .unwrap_or(d)
     };
-    let ngram_store_mb = ngram_u64("ngram_spec_store_mb", ngram_cfg.ngram_spec_store_mb as u64).max(1);
-    let ngram_chain_floor = ngram_u64("ngram_spec_chain_floor", ngram_cfg.ngram_spec_chain_floor as u64);
-    let ngram_max_spine = ngram_u64("ngram_spec_max_spine", ngram_cfg.ngram_spec_max_spine as u64).max(1);
-    let ngram_promote_count =
-        ngram_u64("ngram_spec_promote_count", ngram_cfg.ngram_spec_promote_count as u64).max(1);
+    let ngram_store_mb =
+        ngram_u64("ngram_spec_store_mb", ngram_cfg.ngram_spec_store_mb as u64).max(1);
+    let ngram_chain_floor = ngram_u64(
+        "ngram_spec_chain_floor",
+        ngram_cfg.ngram_spec_chain_floor as u64,
+    );
+    let ngram_max_spine = ngram_u64(
+        "ngram_spec_max_spine",
+        ngram_cfg.ngram_spec_max_spine as u64,
+    )
+    .max(1);
+    let ngram_promote_count = ngram_u64(
+        "ngram_spec_promote_count",
+        ngram_cfg.ngram_spec_promote_count as u64,
+    )
+    .max(1);
     let ngram_write_target = msg
         .get("params")
         .and_then(|p| p.get("ngram_spec_write_target"))

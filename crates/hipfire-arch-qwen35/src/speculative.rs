@@ -7451,8 +7451,12 @@ pub fn spec_step_dflash(
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
     static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ngram_block_env = *NGRAM_BLOCK_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM").ok().as_deref() == Some("1"));
+    let ngram_block_env = *NGRAM_BLOCK_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
