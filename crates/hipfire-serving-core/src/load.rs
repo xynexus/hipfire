@@ -849,6 +849,13 @@ pub fn load_model(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // `auto` (the config default) and unset both mean "the loader chooses".
+    // KVarN: ~8x smaller K than fp32 with no token dropped, and batched-prefill
+    // eligible. fp32 is an oracle/debug mode, not a production path — ask for it
+    // explicitly (kv_cache=fp32) if you want it.
+    if kv_mode.is_empty() || kv_mode == "auto" {
+        kv_mode = "kvarn".to_string();
+    }
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let compose_manifest = compose_manifest_from_metadata(&hfq.metadata_json)
         .map_err(|error| format!("embedded component manifest: {error}"))?;
@@ -948,17 +955,14 @@ pub fn load_model(
     //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
-    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    //     to the per-token path. That flip is done: the default is now KVarN.
     // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
     // models, including BF16-dominant ones. Default to fp32 only when the
     // caller left it unspecified. (Previously BF16-dominant artifacts were
     // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
-    // — that silently discarded the requested KV quant. fp32 remains the
-    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // — that silently discarded the requested KV quant. fp32 is reserved for
+    // oracle/debug runs; quantizing KV under bf16 weights is an opt-in the
     // operator owns.)
-    if kv_mode.is_empty() {
-        kv_mode = "fp32".to_string();
-    }
     reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -2739,7 +2743,7 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped(
+            "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -3786,6 +3790,13 @@ pub fn load_model_pp(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // `auto` (the config default) and unset both mean "the loader chooses".
+    // KVarN: ~8x smaller K than fp32 with no token dropped, and batched-prefill
+    // eligible. fp32 is an oracle/debug mode, not a production path — ask for it
+    // explicitly (kv_cache=fp32) if you want it.
+    if kv_mode.is_empty() || kv_mode == "auto" {
+        kv_mode = "kvarn".to_string();
+    }
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
@@ -3797,17 +3808,14 @@ pub fn load_model_pp(
     //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
-    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    //     to the per-token path. That flip is done: the default is now KVarN.
     // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
     // models, including BF16-dominant ones. Default to fp32 only when the
     // caller left it unspecified. (Previously BF16-dominant artifacts were
     // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
-    // — that silently discarded the requested KV quant. fp32 remains the
-    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // — that silently discarded the requested KV quant. fp32 is reserved for
+    // oracle/debug runs; quantizing KV under bf16 weights is an opt-in the
     // operator owns.)
-    if kv_mode.is_empty() {
-        kv_mode = "fp32".to_string();
-    }
     reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -3904,7 +3912,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped_multi(
+        "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
