@@ -1556,8 +1556,9 @@ pub fn main() {
              Reads JSON requests from stdin and writes JSON events to stdout.\n\
              \n\
              Options:\n\
-               --listen [PATH]     serve on a unix socket instead of stdin/stdout\n\
-                                   (default ~/.hipfire/daemon.sock, mode 0600)\n\
+               --listen [PATH]     ALSO serve on a unix socket, so other clients\n\
+                                   can share this daemon; stdin/stdout keep\n\
+                                   working (default ~/.hipfire/daemon.sock, 0600)\n\
                --precompile        compile/cache kernels for the current GPU and exit\n\
                --version, -V       print the build version and exit\n\
                --help, -h          print this help"
@@ -1675,19 +1676,27 @@ pub fn main() {
     // talks over pipes is unaffected. `--listen` is the shared-service mode: the
     // listener outlives any one client, so the daemon keeps serving across
     // disconnects rather than exiting with its only pipe.
-    let inbound = match listen_path {
-        None => transport::spawn_stdin_reader(),
-        Some(path) => match transport::spawn_socket_listener(&path) {
-            Ok(inbound) => {
+    // stdio is always served; `--listen` ADDS a socket rather than replacing it,
+    // so a daemon spawned by `hipfire serve` keeps answering its parent over the
+    // pipe while `chat`/`bench`/`eval` attach to the same daemon over the socket.
+    let inbound = match transport::spawn_readers(listen_path.as_deref()) {
+        Ok(inbound) => {
+            if let Some(path) = &listen_path {
                 tracing::info!("hipfire daemon listening on {}", path.display());
-                inbound
             }
-            // `fatal_startup_error` diverges — it emits a fatal frame and exits.
-            Err(error) => hipfire_daemon_adapter::fatal_startup_error(
-                &format!("failed to listen on {}: {error}", path.display()),
-                None,
+            inbound
+        }
+        // `fatal_startup_error` diverges — it emits a fatal frame and exits.
+        Err(error) => hipfire_daemon_adapter::fatal_startup_error(
+            &format!(
+                "failed to listen on {}: {error}",
+                listen_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("-"))
+                    .display()
             ),
-        },
+            None,
+        ),
     };
 
     // Drain whatever has arrived, then run whichever pending frame the queue picks.
@@ -1785,7 +1794,7 @@ pub fn main() {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            transport::Payload::Malformed(_) => String::new(),
+            transport::Payload::Malformed(_) | transport::Payload::OwnerHungUp => String::new(),
         };
 
         // Drop any stop that arrived too late for its target. An abort names the
@@ -1802,6 +1811,12 @@ pub fn main() {
 
         let msg = match payload {
             transport::Payload::Request(msg) => msg,
+            // The pipe that spawned us closed. Reached only after every frame
+            // queued ahead of it has run, so the in-flight request completed.
+            transport::Payload::OwnerHungUp => {
+                tracing::info!("stdio owner hung up; shutting down");
+                break;
+            }
             transport::Payload::Malformed(error) => {
                 // Reported here rather than in the reader so every write stays on
                 // this thread and keeps its place relative to real responses. The
