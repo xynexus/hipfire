@@ -20,12 +20,13 @@ pub use editor::{
 };
 pub use resolve::{
     config_layer_from_env, config_layer_from_env_with, config_layers_from_document,
-    config_layers_from_documents, env_var_name_for_key, resolve_config_layers, ConfigLayer,
-    ConfigLayerKind, ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
+    config_layers_from_documents, env_var_name_for_key, resolve_config_layers,
+    validate_resolved_value, ConfigLayer, ConfigLayerKind, ConfigResolution, ConfigValueSource,
+    ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
     config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
-    RestartImpact,
+    RestartImpact, NGRAM_STORE_ROOT_RAM,
 };
 
 fn default_host() -> String {
@@ -914,7 +915,7 @@ pub fn resolve_typed_config_layers(
 ) -> ResolvedTypedConfig {
     let mut resolution = resolve_config_layers(config_schema(), layers);
     unknown_keys_in_unapplied_overrides(layers, &model_overrides, &mut resolution);
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = domain_diagnostics(&resolution);
     let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
     ResolvedTypedConfig {
         config,
@@ -1079,6 +1080,58 @@ fn materialize_config(
                 .unwrap_or_else(|_| HipfireConfig::default())
         }
     }
+}
+
+/// Warn about resolved values that violate their field's declared domain.
+///
+/// `resolve_field` takes a file value verbatim, so until now nothing checked
+/// one: only the environment went through `parse_env_value`, and the typed
+/// materialize step catches a Rust type mismatch but never a domain one —
+/// `kv_cache: "kvarnn"` is a perfectly good String and reached the KV match as
+/// an unrecognized mode.
+///
+/// Warning, not error, and the value still resolves as it always did. These are
+/// configs already running; naming a bad value is the fix, refusing to boot on
+/// it is not.
+fn domain_diagnostics(resolution: &ConfigResolution) -> Vec<ConfigDiagnostic> {
+    let by_key = config_schema()
+        .iter()
+        .map(|field| (field.key, field))
+        .collect::<BTreeMap<_, _>>();
+    resolution
+        .values
+        .iter()
+        .filter(|resolved| {
+            // Only what someone actually WROTE. A compiled default that fails
+            // its own domain is a schema bug, and reporting it to the operator
+            // would be noise they cannot act on.
+            !matches!(
+                resolved.source.as_ref().map(|source| source.kind),
+                None | Some(ConfigLayerKind::CompiledDefault)
+            )
+        })
+        .filter_map(|resolved| {
+            let field = by_key.get(resolved.key.as_str())?;
+            let value = resolved.value.as_ref()?;
+            let want = validate_resolved_value(value, &field.ty).err()?;
+            let source = resolved
+                .source
+                .as_ref()
+                .map(|source| match source.id.as_deref() {
+                    Some(id) => format!("{:?}:{id}", source.kind),
+                    None => format!("{:?}", source.kind),
+                })
+                .unwrap_or_default();
+            Some(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                message: format!(
+                    "config key `{}` = {value} (from {source}) is outside its declared \
+                     domain: {want}. It was kept as written.",
+                    resolved.key
+                ),
+            })
+        })
+        .collect()
 }
 
 /// Report unknown field names inside `model_overrides` entries that did NOT
@@ -1482,6 +1535,74 @@ mod tests {
                 .any(|d| d.message.contains("resource_lock_npus")),
             "the malformed key must be NAMED — being unnamed is what made this \
              invisible for so long"
+        );
+    }
+
+    #[test]
+    fn a_union_field_accepts_every_arm() {
+        for raw in ["", "ram", "none", "off", "/var/lib/hipfire/ngram"] {
+            let resolved = resolve_typed_config_document(
+                &serde_json::json!({ "ngram_store_root": raw }),
+                None,
+            );
+            assert_eq!(resolved.config.ngram_store_root, raw);
+            assert!(
+                !resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("ngram_store_root")),
+                "`{raw}` is a valid arm but was reported: {:?}",
+                resolved.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_reports_every_arms_expectation_not_just_the_last() {
+        // A NUL byte fails the sentinel arm AND the path arm, so neither
+        // accepts and the operator should see both domains, not "want a path".
+        let raw = serde_json::json!({ "ngram_store_root": "bad\0path" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        let message = resolved
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("ngram_store_root"))
+            .map(|d| d.message.clone())
+            .expect("a value matching no arm must be reported");
+        assert!(
+            message.contains("ram") && message.contains("path"),
+            "the report must name every arm's expectation: {message}"
+        );
+    }
+
+    #[test]
+    fn a_bad_enum_value_from_a_file_is_reported() {
+        // The gap this closes: resolve_field takes file values verbatim, so
+        // `kvarnn` used to reach the KV match as an unrecognized mode with
+        // nothing said at config level.
+        let raw = serde_json::json!({ "kv_cache": "kvarnn" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("kv_cache")),
+            "an out-of-domain enum value went unreported: {:?}",
+            resolved.diagnostics
+        );
+        assert_eq!(
+            resolved.config.kv_cache, "kvarnn",
+            "reporting must not change what resolves — this warns, never rejects"
+        );
+    }
+
+    #[test]
+    fn a_compiled_default_is_never_reported() {
+        let resolved = resolve_typed_config_document(&serde_json::json!({}), None);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "an untouched config must be silent: {:?}",
+            resolved.diagnostics
         );
     }
 

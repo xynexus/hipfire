@@ -192,10 +192,15 @@ pub struct NgramSetup {
 
 impl NgramSetup {
     /// Whether tables should be written to disk at all.
+    ///
+    /// The RAM sentinels come from the `ngram_store_root` schema field
+    /// (`NGRAM_STORE_ROOT_RAM`) rather than a list repeated here. They used to
+    /// be written twice — once in that field's prose description and once as a
+    /// `matches!` in this function — with nothing keeping them in step.
     pub fn persists(&self) -> bool {
         let raw = self.store_root.as_os_str().to_string_lossy();
-        let t = raw.trim();
-        !t.is_empty() && !matches!(t.to_ascii_lowercase().as_str(), "ram" | "none" | "off")
+        let t = raw.trim().to_ascii_lowercase();
+        !hipfire_config::NGRAM_STORE_ROOT_RAM.contains(&t.as_str())
     }
 }
 
@@ -608,6 +613,30 @@ impl LoadedModel {
 #[cfg(test)]
 mod ngram_setup_tests {
     use super::*;
+
+    /// `persists()` reads the `ngram_store_root` schema field's arm rather than
+    /// its own list, so the two cannot drift. This is what binds them: a
+    /// sentinel added to the schema and not handled here fails the build's
+    /// tests, not a user's config.
+    #[test]
+    fn every_schema_sentinel_means_ram() {
+        for sentinel in hipfire_config::NGRAM_STORE_ROOT_RAM {
+            let setup = NgramSetup {
+                store_root: std::path::PathBuf::from(sentinel),
+                scope: "s".into(),
+                blocks: 1,
+                orders: vec![2],
+                chain_floor: 0,
+                max_spine: 1,
+                promote_count: 1,
+                write_target: NgramWriteTarget::User,
+            };
+            assert!(
+                !setup.persists(),
+                "schema declares {sentinel:?} a RAM sentinel but persists() disagrees"
+            );
+        }
+    }
 
     /// The RAM-only case has to be expressible as a *value*, not just as "leave
     /// the field blank" — a settings UI cannot distinguish an unset field from
