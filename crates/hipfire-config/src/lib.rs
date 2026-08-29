@@ -127,6 +127,15 @@ fn default_oq_compact_multicol_wide() -> bool {
 fn default_qwen35_paged_experts() -> bool {
     false
 }
+/// Off. Prefill mints a Final checkpoint — a deep clone of the whole session
+/// state — for every request, and nothing can attach to it: the reuse path is
+/// gated on a `runtime_state_handle` no production caller ever sets. Releasing
+/// the request session does not free the clone, so each request retained a
+/// second session's worth of KV until the host ran out. Boundary checkpoints
+/// were already opt-in; this makes Final match them.
+fn default_qwen35_final_checkpoints() -> bool {
+    false
+}
 /// Matches the historical `HIPFIRE_QWEN35_EXPERT_CACHE_MB` fallback.
 fn default_qwen35_expert_cache_mb() -> u64 {
     8192
@@ -366,6 +375,11 @@ pub struct HipfireConfig {
     /// resident. The env var `HIPFIRE_QWEN35_PAGED_EXPERTS` still overrides.
     #[serde(default = "default_qwen35_paged_experts")]
     pub qwen35_paged_experts: bool,
+    /// Mint a Final checkpoint per prefilled session. Off by default — the
+    /// attach path that would consume it is unreachable, and the clone is never
+    /// freed. The env var `HIPFIRE_QWEN35_FINAL_CHECKPOINTS` still overrides.
+    #[serde(default = "default_qwen35_final_checkpoints")]
+    pub qwen35_final_checkpoints: bool,
     /// Resident budget for the paged-expert cache, in MiB. Only meaningful with
     /// `qwen35_paged_experts`.
     #[serde(default = "default_qwen35_expert_cache_mb")]
@@ -567,6 +581,7 @@ impl Default for HipfireConfig {
             deltanet_state_precision: default_deltanet_state_precision(),
             oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
             qwen35_paged_experts: default_qwen35_paged_experts(),
+            qwen35_final_checkpoints: default_qwen35_final_checkpoints(),
             qwen35_expert_cache_mb: default_qwen35_expert_cache_mb(),
             load_mem_check: default_load_mem_check(),
             load_mem_reserve_gib: default_load_mem_reserve_gib(),

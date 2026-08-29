@@ -493,6 +493,23 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         env: ["HIPFIRE_QWEN35_PAGED_EXPERTS"]
     ),
     field!(
+        "qwen35_final_checkpoints",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Mint a Final checkpoint for every prefilled qwen3.5 session. OFF by \
+         default: the checkpoint is a deep clone of the session state, nothing \
+         can attach to it (the reuse path needs a runtime_state_handle no \
+         production caller sets), and releasing the request session does not \
+         free it — so every request retained a second session's worth of KV \
+         until the host ran out. Semantic boundary checkpoints were already \
+         opt-in; this makes Final consistent with them. Turn on only when \
+         developing state-handle reuse.",
+        env: ["HIPFIRE_QWEN35_FINAL_CHECKPOINTS"]
+    ),
+    field!(
         "qwen35_expert_cache_mb",
         ConfigType::U32,
         Requirement::Optional,

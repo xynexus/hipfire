@@ -123,6 +123,31 @@ pub struct Qwen35RequestSessionState {
 }
 
 impl Qwen35RequestSessionState {
+    /// Return this session's device memory to the pool.
+    ///
+    /// Dropping the session frees nothing: `KvCache`, `DeltaNetState` and
+    /// `GpuTensor` have no `Drop` (a `Drop` cannot reach `&mut Gpu`), so the
+    /// codebase frees explicitly through `free_gpu(self, gpu)` — the same idiom
+    /// `layered_kv`, `dflash`, `cask` and `moe::grouped` use. Every buffer here
+    /// is owned by this session alone: `fork_from` deep-clones via
+    /// `clone_kv_cache`/`clone_dn_state`/`clone_gpu_tensor`, and
+    /// `take_from_loaded` moves the active state out, so nothing aliases.
+    ///
+    /// The buffers go back to the pool's free lists, so the next session reuses
+    /// them and resident memory plateaus; `gpu.drain_pool()` is what would hand
+    /// them back to the driver.
+    pub fn free_gpu(self, gpu: &mut hipfire_rdna::Gpu) {
+        if let Some(kv) = self.sequence_state.kv {
+            kv.free_gpu(gpu);
+        }
+        if let Some(recurrent) = self.sequence_state.recurrent {
+            if let Ok(dn) = recurrent.into_any().downcast::<DeltaNetState>() {
+                dn.free_gpu(gpu);
+            }
+        }
+        let _ = gpu.free_tensor(self.logits);
+    }
+
     /// The session's KV cache (a qwen35 session always has one). For single
     /// reads/mutations; sites needing KV **and** DeltaNet simultaneously must
     /// use the disjoint `sequence_state.kv` / `sequence_state.recurrent` fields
@@ -1624,7 +1649,10 @@ pub fn qwen35_release_sessions(
         if m.q35_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             qwen35_save_active_session(m, gpu)?;
         }
-        if m.q35_registry.sessions.remove(session_id).is_some() {
+        if let Some(state) = m.q35_registry.sessions.remove(session_id) {
+            // Removing the entry only drops the handle; the device memory has to
+            // be handed back explicitly or it leaks for the model's lifetime.
+            state.free_gpu(gpu);
             released += 1;
         }
     }
@@ -1954,7 +1982,10 @@ pub fn lfm2_release_sessions(
         if m.lfm2_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             lfm2_save_active_session(m)?;
         }
-        if m.lfm2_registry.sessions.remove(session_id).is_some() {
+        if let Some(session) = m.lfm2_registry.sessions.remove(session_id) {
+            // Same contract as the qwen35 path: dropping the entry frees no
+            // device memory, so hand the state back explicitly.
+            session.state.free_gpu(gpu);
             released += 1;
         }
     }
