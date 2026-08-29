@@ -26,7 +26,7 @@ pub use resolve::{
 };
 pub use schema::{
     config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, PathExistence,
-    Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM,
+    Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM, RENAMED_KEYS,
 };
 
 fn default_host() -> String {
@@ -171,31 +171,31 @@ fn default_dflash_adaptive_b() -> bool {
 fn default_ngram_spec() -> bool {
     false
 }
-fn default_ngram_store_root() -> String {
+fn default_ngram_spec_store_root() -> String {
     String::new()
 }
-fn default_ngram_scope() -> String {
+fn default_ngram_spec_scope() -> String {
     String::new()
 }
-fn default_ngram_store_mb() -> u32 {
+fn default_ngram_spec_store_mb() -> u32 {
     256
 }
-fn default_ngram_orders() -> String {
+fn default_ngram_spec_orders() -> String {
     "8,7,6,5,4,3,2".to_string()
 }
-fn default_ngram_chain_floor() -> u8 {
+fn default_ngram_spec_chain_floor() -> u8 {
     8
 }
-fn default_ngram_max_spine() -> u32 {
+fn default_ngram_spec_max_spine() -> u32 {
     16
 }
-fn default_ngram_promote_count() -> u16 {
+fn default_ngram_spec_promote_count() -> u16 {
     3
 }
-fn default_ngram_write_target() -> String {
+fn default_ngram_spec_write_target() -> String {
     "user".to_string()
 }
-fn default_dflash_ngram_block() -> serde_json::Value {
+fn default_dflash_no_repeat_ngram() -> serde_json::Value {
     serde_json::Value::String("auto".to_string())
 }
 fn default_mtp_mode() -> String {
@@ -427,8 +427,8 @@ pub struct HipfireConfig {
     pub dflash_mode: String,
     #[serde(default = "default_dflash_adaptive_b")]
     pub dflash_adaptive_b: bool,
-    #[serde(default = "default_dflash_ngram_block")]
-    pub dflash_ngram_block: serde_json::Value,
+    #[serde(default = "default_dflash_no_repeat_ngram")]
+    pub dflash_no_repeat_ngram: serde_json::Value,
     /// Opt-in drafter-free n-gram speculative decode. Drafts from token
     /// statistics; on a miss the DFlash drafter runs unchanged.
     #[serde(default = "default_ngram_spec")]
@@ -439,41 +439,41 @@ pub struct HipfireConfig {
     /// RAM, nothing written to disk. The word forms exist so the RAM case is
     /// expressible as a value: in a settings UI an empty string is
     /// indistinguishable from a field nobody has touched.
-    #[serde(default = "default_ngram_store_root")]
-    pub ngram_store_root: String,
+    #[serde(default = "default_ngram_spec_store_root")]
+    pub ngram_spec_store_root: String,
     /// Scope name identifying the *tokenizer* these tables belong to. Empty =
     /// derive from the model filename, which never wrongly shares a table.
     /// Set two models to the same scope only when they share a tokenizer —
     /// records are token ids and mean nothing across tokenizers.
-    #[serde(default = "default_ngram_scope")]
-    pub ngram_scope: String,
+    #[serde(default = "default_ngram_spec_scope")]
+    pub ngram_spec_scope: String,
     /// Size of a newly created per-scope table, in MiB. This *is* the budget:
     /// the file is allocated in full and never grows, so a full block evicts
     /// rather than expanding. 256 MiB = 65536 blocks of 4 KiB.
-    #[serde(default = "default_ngram_store_mb")]
-    pub ngram_store_mb: u32,
+    #[serde(default = "default_ngram_spec_store_mb")]
+    pub ngram_spec_store_mb: u32,
     /// Probe orders, longest first. Measured on 1M tokens of Rust: going past
     /// quad keeps paying on code (2..5 -> 1.80 accepted/step, 2..8 -> 2.11),
     /// and is flat on prose.
-    #[serde(default = "default_ngram_orders")]
-    pub ngram_orders: String,
+    #[serde(default = "default_ngram_spec_orders")]
+    pub ngram_spec_orders: String,
     /// After the first drafted token, only extend the chain while the winning
     /// order is at least this. The load-bearing knob: without it the chain pads
     /// to `max_spine` and burns verify width (floor 0 -> 16.0 drafted/step at
     /// 20.6% efficiency; floor 8 -> 6.94 at 37.9%). 0 disables the gate.
-    #[serde(default = "default_ngram_chain_floor")]
-    pub ngram_chain_floor: u8,
-    #[serde(default = "default_ngram_max_spine")]
-    pub ngram_max_spine: u32,
+    #[serde(default = "default_ngram_spec_chain_floor")]
+    pub ngram_spec_chain_floor: u8,
+    #[serde(default = "default_ngram_spec_max_spine")]
+    pub ngram_spec_max_spine: u32,
     /// Observations before a gram is worth a disk write. Gates persistence
     /// only, never drafting — precision is flat across counts, and requiring a
     /// count to draft measurably hurts (1.80 accepted/step at 1, 0.75 at 9).
-    #[serde(default = "default_ngram_promote_count")]
-    pub ngram_promote_count: u16,
+    #[serde(default = "default_ngram_spec_promote_count")]
+    pub ngram_spec_promote_count: u16,
     /// Which store the write path feeds: `user`, `topic`, or `none`. Only a
     /// store private to its scope may be written; a shared one is read-only.
-    #[serde(default = "default_ngram_write_target")]
-    pub ngram_write_target: String,
+    #[serde(default = "default_ngram_spec_write_target")]
+    pub ngram_spec_write_target: String,
     #[serde(default = "default_mtp_mode")]
     pub mtp_mode: String,
     #[serde(default = "default_mtp_k")]
@@ -663,15 +663,15 @@ impl Default for HipfireConfig {
             dflash_mode: default_dflash_mode(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
             ngram_spec: default_ngram_spec(),
-            ngram_store_root: default_ngram_store_root(),
-            ngram_scope: default_ngram_scope(),
-            ngram_store_mb: default_ngram_store_mb(),
-            ngram_orders: default_ngram_orders(),
-            ngram_chain_floor: default_ngram_chain_floor(),
-            ngram_max_spine: default_ngram_max_spine(),
-            ngram_promote_count: default_ngram_promote_count(),
-            ngram_write_target: default_ngram_write_target(),
-            dflash_ngram_block: default_dflash_ngram_block(),
+            ngram_spec_store_root: default_ngram_spec_store_root(),
+            ngram_spec_scope: default_ngram_spec_scope(),
+            ngram_spec_store_mb: default_ngram_spec_store_mb(),
+            ngram_spec_orders: default_ngram_spec_orders(),
+            ngram_spec_chain_floor: default_ngram_spec_chain_floor(),
+            ngram_spec_max_spine: default_ngram_spec_max_spine(),
+            ngram_spec_promote_count: default_ngram_spec_promote_count(),
+            ngram_spec_write_target: default_ngram_spec_write_target(),
+            dflash_no_repeat_ngram: default_dflash_no_repeat_ngram(),
             mtp_mode: default_mtp_mode(),
             mtp_k: default_mtp_k(),
             thinking: default_thinking(),
@@ -913,9 +913,11 @@ pub fn resolve_typed_config_layers(
     layers: &[ConfigLayer],
     model_overrides: HashMap<String, Value>,
 ) -> ResolvedTypedConfig {
+    let (layers, mut diagnostics) = apply_renamed_keys(layers);
+    let layers = layers.as_slice();
     let mut resolution = resolve_config_layers(config_schema(), layers);
     unknown_keys_in_unapplied_overrides(layers, &model_overrides, &mut resolution);
-    let mut diagnostics = domain_diagnostics(&resolution);
+    diagnostics.extend(domain_diagnostics(&resolution));
     let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
     ResolvedTypedConfig {
         config,
@@ -1082,10 +1084,50 @@ fn materialize_config(
     }
 }
 
+/// Move values written under a renamed key onto the key that replaced it.
+///
+/// The old key is HONOURED, not dropped, and the operator is told what to write
+/// instead. Dropping it would be the failure mode this whole area keeps
+/// producing: a setting that parses, applies to nothing, and says nothing.
+///
+/// If both names are present the new one wins and the old is reported as
+/// ignored, because guessing which the operator meant is worse than saying they
+/// disagree.
+fn apply_renamed_keys(layers: &[ConfigLayer]) -> (Vec<ConfigLayer>, Vec<ConfigDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let mut out = layers.to_vec();
+    for layer in &mut out {
+        for (old, new) in RENAMED_KEYS {
+            let Some(value) = layer.values.remove(*old) else {
+                continue;
+            };
+            if layer.values.contains_key(*new) {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    message: format!(
+                        "config key `{old}` was renamed to `{new}`, and both are set — the \
+                         value of `{old}` is ignored. Remove it."
+                    ),
+                });
+                continue;
+            }
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                message: format!(
+                    "config key `{old}` was renamed to `{new}`; the value was applied, but \
+                     rename it — the old name will stop working."
+                ),
+            });
+            layer.values.insert((*new).to_string(), value);
+        }
+    }
+    (out, diagnostics)
+}
+
 /// Which [`PathExistence`] a value is actually subject to, if any.
 ///
 /// A union resolves to whichever arm ACCEPTS the value, so
-/// `ngram_store_root: "ram"` takes the sentinel arm and is not a path at all,
+/// `ngram_spec_store_root: "ram"` takes the sentinel arm and is not a path at all,
 /// while `"/var/lib/hipfire/ngram"` takes the Path arm and is. Asking the type
 /// alone would get both wrong.
 fn path_existence_for(value: &Value, ty: &ConfigType) -> Option<PathExistence> {
@@ -1328,7 +1370,7 @@ mod tests {
         assert_eq!(cfg.flash_mode, "auto");
         assert_eq!(cfg.dflash_mode, "off");
         assert!(cfg.dflash_adaptive_b);
-        assert_eq!(cfg.dflash_ngram_block, serde_json::json!("auto"));
+        assert_eq!(cfg.dflash_no_repeat_ngram, serde_json::json!("auto"));
         assert_eq!(cfg.mtp_mode, "auto");
         assert_eq!(cfg.mtp_k, 3);
         assert_eq!(cfg.thinking, "off");
@@ -1560,7 +1602,7 @@ mod tests {
         assert_eq!(resolved.max_tokens, 64);
         assert_eq!(resolved.kv_cache, "q8");
         assert_eq!(resolved.kv_adaptive, "balanced");
-        assert_eq!(resolved.dflash_ngram_block, serde_json::json!(true));
+        assert_eq!(resolved.dflash_no_repeat_ngram, serde_json::json!(true));
         assert!(resolved.cask);
         assert_eq!(resolved.cask_budget, 1024);
         assert_eq!(resolved.prefill_compression, "auto");
@@ -1614,19 +1656,64 @@ mod tests {
     fn a_union_field_accepts_every_arm() {
         for raw in ["", "ram", "none", "off", "/var/lib/hipfire/ngram"] {
             let resolved = resolve_typed_config_document(
-                &serde_json::json!({ "ngram_store_root": raw }),
+                &serde_json::json!({ "ngram_spec_store_root": raw }),
                 None,
             );
-            assert_eq!(resolved.config.ngram_store_root, raw);
+            assert_eq!(resolved.config.ngram_spec_store_root, raw);
             assert!(
                 !resolved
                     .diagnostics
                     .iter()
-                    .any(|d| d.message.contains("ngram_store_root")),
+                    .any(|d| d.message.contains("ngram_spec_store_root")),
                 "`{raw}` is a valid arm but was reported: {:?}",
                 resolved.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn a_renamed_key_is_honoured_and_reported() {
+        let raw = serde_json::json!({ "ngram_store_root": "/tmp", "ngram_orders": "4,3,2" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert_eq!(
+            resolved.config.ngram_spec_store_root, "/tmp",
+            "the old key's value must still apply — dropping it silently is the bug"
+        );
+        assert_eq!(resolved.config.ngram_spec_orders, "4,3,2");
+        for (old, new) in [
+            ("ngram_store_root", "ngram_spec_store_root"),
+            ("ngram_orders", "ngram_spec_orders"),
+        ] {
+            assert!(
+                resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains(old) && d.message.contains(new)),
+                "the rename must name BOTH the old and new key: {:?}",
+                resolved.diagnostics
+            );
+        }
+        assert!(
+            resolved.resolution.unknown_keys.is_empty(),
+            "a renamed key is not an unknown key: {:?}",
+            resolved.resolution.unknown_keys
+        );
+    }
+
+    #[test]
+    fn the_new_key_wins_when_both_are_set() {
+        let raw = serde_json::json!({
+            "ngram_store_root": "/old", "ngram_spec_store_root": "/new",
+        });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert_eq!(resolved.config.ngram_spec_store_root, "/new");
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("both are set")),
+            "a disagreement between the two names must be reported, not guessed"
+        );
     }
 
     #[test]
@@ -1653,7 +1740,7 @@ mod tests {
     fn an_output_path_needs_only_its_parent() {
         let mut config = HipfireConfig::default();
         // Created on first use, parent exists: silent.
-        config.ngram_store_root = "/tmp/hipfire-ngram-does-not-exist-yet".to_string();
+        config.ngram_spec_store_root = "/tmp/hipfire-ngram-does-not-exist-yet".to_string();
         assert!(
             path_existence_diagnostics(&config).is_empty(),
             "an output path whose parent exists must not be reported: {:?}",
@@ -1661,7 +1748,7 @@ mod tests {
         );
 
         // Parent missing: nothing here builds a directory tree, so warn.
-        config.ngram_store_root = "/definitely/not/here/ngram".to_string();
+        config.ngram_spec_store_root = "/definitely/not/here/ngram".to_string();
         assert!(
             path_existence_diagnostics(&config)
                 .iter()
@@ -1676,7 +1763,7 @@ mod tests {
         // applies to it however unlike a path it looks.
         for sentinel in NGRAM_STORE_ROOT_RAM {
             let mut config = HipfireConfig::default();
-            config.ngram_store_root = sentinel.to_string();
+            config.ngram_spec_store_root = sentinel.to_string();
             assert!(
                 path_existence_diagnostics(&config).is_empty(),
                 "sentinel {sentinel:?} was checked as a path"
@@ -1690,13 +1777,13 @@ mod tests {
         // so until this rule `rma` resolved silently as a directory.
         for raw in ["rma", "./tables", "../ngram", "~/ngram", "tables"] {
             let resolved = resolve_typed_config_document(
-                &serde_json::json!({ "ngram_store_root": raw }),
+                &serde_json::json!({ "ngram_spec_store_root": raw }),
                 None,
             );
             let message = resolved
                 .diagnostics
                 .iter()
-                .find(|d| d.message.contains("ngram_store_root"))
+                .find(|d| d.message.contains("ngram_spec_store_root"))
                 .map(|d| d.message.clone())
                 .unwrap_or_else(|| panic!("`{raw}` is relative and must be reported"));
             assert!(
@@ -1704,7 +1791,7 @@ mod tests {
                 "the report must say what is wrong: {message}"
             );
             assert_eq!(
-                resolved.config.ngram_store_root, raw,
+                resolved.config.ngram_spec_store_root, raw,
                 "reporting must not change what resolves"
             );
         }
@@ -1714,12 +1801,12 @@ mod tests {
     fn a_union_reports_every_arms_expectation_not_just_the_last() {
         // A NUL byte fails the sentinel arm AND the path arm, so neither
         // accepts and the operator should see both domains, not "want a path".
-        let raw = serde_json::json!({ "ngram_store_root": "bad\0path" });
+        let raw = serde_json::json!({ "ngram_spec_store_root": "bad\0path" });
         let resolved = resolve_typed_config_document(&raw, None);
         let message = resolved
             .diagnostics
             .iter()
-            .find(|d| d.message.contains("ngram_store_root"))
+            .find(|d| d.message.contains("ngram_spec_store_root"))
             .map(|d| d.message.clone())
             .expect("a value matching no arm must be reported");
         assert!(

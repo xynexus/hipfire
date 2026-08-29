@@ -182,7 +182,7 @@ impl DaemonSpawnEnv {
     fn from_resolved_config(cfg: &HipfireConfig, model_arg: &str) -> Self {
         Self {
             prompt_normalize: cfg.prompt_normalize,
-            dflash_ngram_block: resolve_dflash_ngram_block(&cfg.dflash_ngram_block, model_arg),
+            dflash_ngram_block: resolve_dflash_ngram_block(&cfg.dflash_no_repeat_ngram, model_arg),
         }
     }
 
@@ -192,9 +192,9 @@ impl DaemonSpawnEnv {
             if self.prompt_normalize { "1" } else { "0" },
         );
         if self.dflash_ngram_block {
-            std::env::set_var("HIPFIRE_DFLASH_NGRAM_BLOCK", "1");
+            std::env::set_var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM", "1");
         } else {
-            std::env::remove_var("HIPFIRE_DFLASH_NGRAM_BLOCK");
+            std::env::remove_var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM");
         }
     }
 }

@@ -284,7 +284,7 @@ pub(crate) fn load(
         .unwrap_or(false);
 
     // Opt-in n-gram spec decode. Per-load param wins, else the config default
-    // (off). An empty `ngram_store_root` keeps it RAM-only: nothing is written
+    // (off). An empty `ngram_spec_store_root` keeps it RAM-only: nothing is written
     // to disk, so nothing outlives the request.
     let ngram_cfg = hipfire_config::load_config_bundle().config;
     let ngram_spec = msg
@@ -294,16 +294,16 @@ pub(crate) fn load(
         .unwrap_or(ngram_cfg.ngram_spec);
     let ngram_store_root = msg
         .get("params")
-        .and_then(|p| p.get("ngram_store_root"))
+        .and_then(|p| p.get("ngram_spec_store_root"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_store_root);
+        .unwrap_or(ngram_cfg.ngram_spec_store_root);
     let ngram_scope = msg
         .get("params")
-        .and_then(|p| p.get("ngram_scope"))
+        .and_then(|p| p.get("ngram_spec_scope"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_scope);
+        .unwrap_or(ngram_cfg.ngram_spec_scope);
     // Tuning knobs: per-load param wins, else the config value. Defaults are
     // the measured operating point (see the replay-sweep devlog).
     let ngram_u64 = |k: &str, d: u64| -> u64 {
@@ -312,26 +312,26 @@ pub(crate) fn load(
             .and_then(|v| v.as_u64())
             .unwrap_or(d)
     };
-    let ngram_store_mb = ngram_u64("ngram_store_mb", ngram_cfg.ngram_store_mb as u64).max(1);
-    let ngram_chain_floor = ngram_u64("ngram_chain_floor", ngram_cfg.ngram_chain_floor as u64);
-    let ngram_max_spine = ngram_u64("ngram_max_spine", ngram_cfg.ngram_max_spine as u64).max(1);
+    let ngram_store_mb = ngram_u64("ngram_spec_store_mb", ngram_cfg.ngram_spec_store_mb as u64).max(1);
+    let ngram_chain_floor = ngram_u64("ngram_spec_chain_floor", ngram_cfg.ngram_spec_chain_floor as u64);
+    let ngram_max_spine = ngram_u64("ngram_spec_max_spine", ngram_cfg.ngram_spec_max_spine as u64).max(1);
     let ngram_promote_count =
-        ngram_u64("ngram_promote_count", ngram_cfg.ngram_promote_count as u64).max(1);
+        ngram_u64("ngram_spec_promote_count", ngram_cfg.ngram_spec_promote_count as u64).max(1);
     let ngram_write_target = msg
         .get("params")
-        .and_then(|p| p.get("ngram_write_target"))
+        .and_then(|p| p.get("ngram_spec_write_target"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_write_target);
+        .unwrap_or(ngram_cfg.ngram_spec_write_target);
     // Orders: comma-separated, longest-first is enforced downstream. A value
     // that parses to nothing usable falls back to the default rather than
     // leaving the drafter with an empty ladder.
     let ngram_orders_raw = msg
         .get("params")
-        .and_then(|p| p.get("ngram_orders"))
+        .and_then(|p| p.get("ngram_spec_orders"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_orders);
+        .unwrap_or(ngram_cfg.ngram_spec_orders);
     let mut ngram_orders: Vec<u8> = ngram_orders_raw
         .split(',')
         .filter_map(|t| t.trim().parse::<u8>().ok())
@@ -340,7 +340,7 @@ pub(crate) fn load(
     if ngram_orders.is_empty() {
         if ngram_spec {
             tracing::warn!(
-                "ngram_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
+                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
             );
         }
         ngram_orders = vec![8, 7, 6, 5, 4, 3, 2];
