@@ -308,3 +308,75 @@ tiny-state gate — where a token hash is arch-independent and gave a genuine
 cross-arch confirmation before recording — KLD values legitimately differ
 between architectures, so there is no equivalent free cross-check. Recording
 them needs its own justification and is deliberately not bundled here.
+
+## Round 3 — 2026-08-29, nix2 (gfx1103)
+
+The gate was red again, with **9 crashed cells and 5 stale-baseline failures**.
+The two halves have nothing to do with each other.
+
+### The 9 crashes were the gate reading the developer's config
+
+    HipError(0): unsupported moe.decode-routed-dtype-unsupported-no-fallback
+
+Every `qwen3_5_moe*` cell died before producing a number, including `collect`,
+which then cascaded into five `no calib artifact` skips per family.
+
+`qwen35_paged_experts` defaults **off**, but this machine's
+`~/.hipfire/config.json` sets it **on**, and `qwen35_paged_experts_enabled`
+reads the ambient config. So the tiny MoE fixtures took the paged path, where
+`MoeParams::routed_experts` is empty by design, and `check_moe_decode_supported`
+refused exactly as it should. The refusal (added in the 2026-08-29 bug hunt) is
+correct; routing a resident-expert fixture through the paged path is what was
+wrong.
+
+That is not a MoE bug, it is a hermeticity bug: **a tripwire whose numbers move
+with the developer's config is not a tripwire.** `executor_tinyquant.rs` now
+pins `PROBE_BASE_ENV` on every probe invocation (joining `HIPFIRE_GPU_SLAB_LOAD`,
+which was already pinned for the same reason) and clears
+`HIPFIRE_QWEN35_RESIDENCY_MODE`, which is checked *before* the paged-experts var
+and would otherwise win.
+
+This is why the bug-hunt PR reported 3 red cells while this machine saw 14: same
+commit, different `config.json`.
+
+### The 5 failures were stale baselines, all in the good direction
+
+Re-recorded surgically, per `b7e513bfa` — never `--record`, which rewrites a
+whole family and would bake the *wrong*-way drifts (`qwen3_5_moe/oq4.25++` is
++11.9% and passing only on the 0.25 relative tolerance) in as the new normal.
+
+| cell | was | now |
+|---|---|---|
+| `qwen3_5_moe/kld:oq8` | 0.02028731 | 0.00280627 |
+| `qwen3_5_moe/kld:oq8+(calib)` | 0.00567748 | 0.00236909 |
+| `qwen3_5_moe/kld:oq8++(calib)` | 0.00567748 | 0.00236909 |
+| `qwen3_legacy/kld:oq4.25++(calib)` | 0.00597894 | 0.00436862 |
+| `zaya/kld:oq4.25++(calib)` | 0.00003639 | 0.00002664 |
+
+**None of it came from the bug hunt.** Built `69b1ced9b` (the pre-merge commit)
+in a scratch worktree and re-measured: every one of these numbers is
+byte-identical there. The improvements predate the merge and were simply never
+re-recorded. An early guess that the Q8HFQ `row_stride` fix explained the oq8
+jump was **wrong** — `GemvQ8HFQ` is a different kernel from the Opus-8 path, and
+the pre-merge measurement settles it.
+
+### `zaya/kld:oq4.25++` is bimodal, and that is why it flaked
+
+Four runs gave `0.00002261, 0.00002664, 0.00002664, 0.00002261` — it alternates,
+so it is not the "first-run position effect" noted in `b7e513bfa`. The 17.8%
+spread was wider than the ±0.25 relative budget allowed against the old
+baseline, so the cell failed on some runs and passed on others: it is what made
+one full-gate run report 5 failures and the next report 4.
+
+Recording either observed mode fixes it, because the budget is relative to the
+baseline: at 0.00002664 the budget is ±0.00000666 and the other mode sits
+0.00000403 away, using 61% of it. The higher mode was recorded for that
+headroom. **The bimodality itself is not fixed** — it is a real
+nondeterminism in the tiny zaya oq4.25++ path, now merely inside tolerance. If
+this cell starts flaking again, the spread is the thing to chase, not the
+baseline.
+
+### Result
+
+187 pass, 0 fail, twice in a row, with `qwen35_paged_experts` left ON in
+`config.json` — which is the point of the pinning.

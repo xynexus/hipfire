@@ -327,6 +327,35 @@ fn families() -> &'static [FamilyPlan] {
     ]
 }
 
+/// Environment every tiny-quant probe runs under, whatever the developer's
+/// `~/.hipfire/config.json` happens to say.
+///
+/// A tripwire whose numbers move with ambient config is not a tripwire. These
+/// fixtures are toys chosen to exercise one code path each, so any config that
+/// reroutes them silently changes what the gate measures — or, as here, stops
+/// it measuring at all.
+const PROBE_BASE_ENV: &[(&str, &str)] = &[
+    // Disable the O_DIRECT slab loader (fails on the tiny file on some FS /
+    // integrated GPUs; the mmap path handles every arch).
+    ("HIPFIRE_GPU_SLAB_LOAD", "0"),
+    // Keep routed experts RESIDENT.
+    //
+    // `qwen35_paged_experts` defaults off but is switched on in real
+    // deployments, and this executor reads the developer's config. With it on,
+    // the tiny MoE fixtures take the paged path, where `MoeParams::routed_experts`
+    // is empty BY DESIGN -- so `check_moe_decode_supported` correctly refuses
+    // with `moe.decode-routed-dtype-unsupported-no-fallback` and every
+    // `qwen3_5_moe*` cell dies before producing a number. The refusal is right;
+    // routing a resident-expert fixture through the paged path is what is wrong.
+    ("HIPFIRE_QWEN35_PAGED_EXPERTS", "0"),
+];
+
+/// Vars that would override [`PROBE_BASE_ENV`] if the developer has them set.
+/// `HIPFIRE_QWEN35_RESIDENCY_MODE` is checked BEFORE `HIPFIRE_QWEN35_PAGED_EXPERTS`
+/// in `qwen35_paged_experts_enabled`, so pinning the latter is not enough on a
+/// shell that exports the former.
+const PROBE_ENV_REMOVE: &[&str] = &["HIPFIRE_QWEN35_RESIDENCY_MODE"];
+
 /// `target/release/hipfire-quantize` (or debug), honoring an env override.
 fn resolve_quantize_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HIPFIRE_QUANTIZE_BIN") {
@@ -567,9 +596,10 @@ fn run_kld(
         .arg(KLD_LEN.to_string())
         .arg("--warmup")
         .arg(KLD_WARMUP.to_string())
-        // Disable the O_DIRECT slab loader (fails on the tiny file on some FS /
-        // integrated GPUs; the mmap path handles every arch).
-        .env("HIPFIRE_GPU_SLAB_LOAD", "0");
+        .envs(PROBE_BASE_ENV.iter().copied());
+    for key in PROBE_ENV_REMOVE {
+        cmd.env_remove(key);
+    }
     cmd.envs(probe_env.iter().copied());
     let out = cmd.output().map_err(|e| format!("spawn probe kld: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -808,7 +838,8 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
         let mut have_calib = false;
         if !plan.calibrated.is_empty() {
             // ── collect: generate a tiny Hessian/imatrix (.calib.hfq) ──
-            let collect = Command::new(&probe)
+            let mut collect_cmd = Command::new(&probe);
+            collect_cmd
                 .arg("collect")
                 .arg("--arch")
                 .arg(fam)
@@ -818,9 +849,11 @@ pub(crate) fn tiny_quant_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<Eva
                 .arg(&calib)
                 .arg("--len")
                 .arg(KLD_LEN.to_string())
-                .env("HIPFIRE_GPU_SLAB_LOAD", "0")
-                .envs(plan.probe_env.iter().copied())
-                .output();
+                .envs(PROBE_BASE_ENV.iter().copied());
+            for key in PROBE_ENV_REMOVE {
+                collect_cmd.env_remove(key);
+            }
+            let collect = collect_cmd.envs(plan.probe_env.iter().copied()).output();
             match collect {
                 Ok(o) if o.status.success() => {
                     let so = String::from_utf8_lossy(&o.stdout);
