@@ -2693,6 +2693,13 @@ pub fn load_model(
         // be smaller than max_seq; the server reloads a larger worker when a
         // request needs more physical rows.
         let is_kv_layer = crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
+        // Only the full-attention layers carry KV on these hybrids (16 of 64 on
+        // Qwen3.8-27B); the rest are linear-attention and get a 1-element
+        // placeholder. Every mode with a `_capped_filtered` constructor uses it —
+        // the unfiltered ones allocated `n_layers` real buffers, ~4x what the
+        // model can address. asym2/asym4/fwht* have a `_filtered` but no
+        // `_capped_filtered`, so they still over-allocate; they are deprecated in
+        // favour of kvarn (see the kv_cache schema field), so that is left alone.
         let kv = match kv_mode.as_str() {
             "fp32" | "f32" => kv::KvCache::new_gpu_capped_filtered(
                 gpu,
@@ -2705,9 +2712,9 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             "q8" => {
                 tracing::info!("KV cache: Q8");
-                kv::KvCache::new_gpu_q8_capped(
+                kv::KvCache::new_gpu_q8_capped_filtered(
                     gpu,
-                    config.n_layers,
+                    &is_kv_layer,
                     config.n_kv_heads,
                     config.head_dim,
                     max_seq,
@@ -2724,16 +2731,18 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                physical_cap,
-                kvarn_bits_from_mode(m),
-            )
-            .map_err(|e| format!("{e}"))?,
+            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => {
+                kv::KvCache::new_gpu_kvarn_capped_filtered(
+                    gpu,
+                    &is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                    physical_cap,
+                    kvarn_bits_from_mode(m),
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
                 gpu,
                 config.n_layers,
@@ -2743,9 +2752,9 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped(
+            "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 max_seq,
@@ -2754,9 +2763,9 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             other => {
                 tracing::warn!("KV cache: unrecognized '{other}', defaulting to asym3");
-                kv::KvCache::new_gpu_asym3_capped(
+                kv::KvCache::new_gpu_asym3_capped_filtered(
                     gpu,
-                    config.n_layers,
+                    &is_kv_layer,
                     config.n_kv_heads,
                     config.head_dim,
                     max_seq,
