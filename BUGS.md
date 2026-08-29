@@ -4,6 +4,312 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+The 2026-08-29 multi-agent hunt is summarized in
+`docs/bugs/2026-08-29-bug-hunt-summary.md` — including one finding it REFUTED and
+the eight search dimensions that never ran.
+
+## Hunt coverage gaps — what the method could NOT reach
+
+**Written 2026-08-29 by the completeness critic (planned for wave 1, died with its
+session limit, finally ran after both waves).** All 12 planned dimensions have now
+been searched; this is about the classes no static lens can see.
+
+Full ranking and the mechanical sweeps: `docs/bugs/2026-08-29-hunt-coverage-gaps.md`.
+
+Highest value, all zero-to-cheap:
+
+- **521 wave64/is_cdna branch sites and 349 gfx906 / 72 gfx1201 references have
+  never executed** — every hunt ran on nix1 (gfx1103). The fleet already has halo
+  (gfx1151) and medusa (gfx906 + gfx1201), and the gates already exist. Zero
+  authoring cost.
+- **20 files parse `b"HFQM"`; 12 have no `version >= 2` branch.** The confirmed
+  `compose_hfq` bug and the recorded HFQ v2 embedded-offset bug are the same class,
+  structurally replicated.
+- **46 `X` / `X_batched` kernel sibling pairs in `kernels/src`** — "fixed one path,
+  not its sibling" was the most common confirmed shape in both waves; this is the
+  mechanical version of that hunt.
+- **`HFQ_MAGIC`/`HFQ_VERSION` is redeclared in 8 files with the value disagreeing.**
+  Every copied constant is a sibling that can drift.
+- ~~**`/srv/hipfire/kldrefs` bf16 refs are known bad**~~ — **DONE 2026-08-29.**
+  All refs selftested; 8 damaged files (18.4 GB) deleted from the real location
+  (`/srv/Public/sadara/.hipfire/kldrefs/`, not `/srv/hipfire/kldrefs` which is
+  empty). `qwen3.5-9b` proved HEALTHY and was kept; `qwen3.6-27b` is unverifiable
+  (metadata missing `scoring_start`, selftest panics) and was kept. A fourth ref,
+  `qwen3.6-35b-a3b`, was found damaged by a different defect (0% agreement on
+  every chunk) and deleted.
+
+**Correction to an earlier entry of mine:** I wrote that hipfire-cli's 92 unit
+tests "never run anywhere". True for that crate (bin-only, so `--lib --workspace`
+selects nothing), but it must not be generalized — `.github/workflows/ci.yml` does
+run `cargo test --lib --workspace --locked` on every push, so the ~1900 tests in
+library crates are NOT orphaned. Only bin-only crates fall through.
+
+## Wave-2 hunt: 19 confirmed defects across the 8 unsearched subsystems
+
+**Found 2026-08-29 on master `0c9e3d252`. 21 candidates, 19 confirmed 3-lens,
+2 refuted. 14 FIXED; 5 still open** — see the doc's "Still open after the fixing
+pass", which records three dead ends for the DDTree one so the next person does
+not re-walk them.
+
+Full list, evidence and refutations: `docs/bugs/2026-08-29-bug-hunt-wave2.md`.
+
+**Fixed:** `attention_dflash_wmma_f32` passed 10 args to an 11-arg kernel
+(critical — HIP takes the count from the code object, so `is_causal` came from
+adjacent heap bytes); `gemv_mq4g256` passed 7 to a 5-arg kernel (M and K bound
+from sign-pointer bits); and the uncompilable `attention_kvarn_routed_batched`.
+A new `--lib` test, `crates/hipfire-rdna/src/kernel_arity.rs`, now cross-checks
+**516 launch sites** against the `.hip` signatures and catches this whole class
+without a GPU.
+
+**FIXED since:** AWQ-dropped-for-`FwhtG128` and the `qt 52` `Oq8G256` mis-tag
+(both now REFUSE rather than compute silently wrong — no G128 AWQ kernel and no
+`Oq8G128` dtype exist to wire); the DFlash/DDTree Opus lm_head FWHT mismatch (also
+refuses); `weight_gemv`'s `row_stride: 0`; AR-decode codepoint destruction;
+DeepSeek's ignored `routed_scaling_factor`; `serve.pid`-before-bind; `"Euler a"`
+silently running plain Euler (now refused AND un-advertised); the image-workload
+starvation (restart cap); and the oq4 ragged-K guard — which was **2 of NINE** call
+sites, not 2 of 4, the last two found by a new invariant test rather than by grep.
+
+**Still open, highest severity first:**
+
+- `crates/hipfire-arch-qwen35/src/speculative.rs:12527` — DDTree replays a GDN
+  tape the verify forward never wrote when the batched path is declined.
+  **Deliberately not patched.** `GdnTape` has no populated-marker;
+  `set_base_position` looks like one and is NOT (it is called unconditionally at
+  the top of `verify_dflash_block_*`); and the non-tape fallback is snapshot-based
+  rewind, so skipping the replay is also wrong. Correct fix: a `captured_rows`
+  counter set at the real capture site and checked inside `replay_gdn` — one
+  chokepoint for DFlash, all three DDTree steps and MTP.
+- `crates/hipfire-arch-qwen35/src/mtp_compose.rs:1276` — MTP scatters
+  `accept_dflash + 1` hidden rows but advances position by
+  `accept_dflash + accept_mtp + 1`. Needs gather-by-slot; GPU work.
+- `crates/hipfire-arch-gemma3/src/spec_impl.rs:298` — rejected draft K/V left in
+  the SWA ring; needs a per-local-layer staging buffer, mirroring deepseek4.
+- **33 other hand-rolled `WeightRef` literals still hardcode `row_stride: 0`** —
+  qwen35 GDN paths, deepseek4, dspark. Each is a bug only if a stride-carrying
+  dtype can reach it. Untriaged.
+- `crates/hipfire-config/src/lib.rs:361` — `gpu_slab_load` registered, documented
+  and validated with no reader. Wire it or delete it; that is a product call.
+
+Recurring shape, again: **a fix applied to one path and not its sibling.**
+
+## [High] cohere2 with `sliding_window > 1024` cannot serve — every sliding layer fails its first staging launch
+
+**Found 2026-08-29 on master `0c9e3d252`, nix1. Confirmed by source trace plus an
+empirical HIP check on gfx1103. PARTIALLY ADDRESSED — the constraint is now stated
+once at the shared dispatch with an actionable message instead of an opaque HIP
+error. NOT clamped: silently attending over 1024 keys when the model asked for
+4096 changes output quality with no signal, which is precisely the bug class this
+hunt kept finding. Serving cohere2 at its declared window still needs a chunked
+staging kernel or an explicit quality decision.**
+
+Surfaced while recovering a verification lens for a *different* reported bug (the
+`attention_swa_gqa_batched` LDS bound, which was REFUTED — see below). This is the
+real defect in that area.
+
+- `crates/hipfire-arch-cohere2/src/config.rs:188` clamps the window only to
+  `max_seq` (`window: self.sliding_window.min(max_seq)`), and
+  `crates/hipfire-runtime/src/layered_kv.rs:151-155` validates only `1..=max_seq`.
+  **No 1024 cap anywhere.** `crates/hipfire-arch-cohere2/src/arch.rs:159-171`
+  yields a default `logical_max` of 2048.
+- A real on-disk artifact hits it: `/srv/hipfire/models/BLS-Mini-Code-1.0--bf16.hfq`
+  (HFQM v2, arch_id 25 = cohere2_moe) carries `"sliding_window": 4096`, so the plan
+  window is 2048.
+- `Gpu::swa_visibility_stage_batched` launches with `block = [swa_window, 1, 1]`
+  (`dispatch/attention.rs:5587`), and HIP caps a block at 1024 threads. Verified
+  empirically on gfx1103: `hipModuleLaunchKernel` returns `hipErrorInvalidValue (1)`
+  **synchronously** for block=2048 and never runs the kernel. The kernel's own
+  header states the precondition (`swa_visibility_stage_batched.hip:27`: "assumes
+  swa_window <= 1024").
+- Result: every sliding layer fails at `calibration_stream.rs:1062` with an opaque
+  `hipModuleLaunchKernel ... invalid argument`. A hard load/serve-time failure, not
+  silent corruption. Four callers route through the same staging launch (cohere2,
+  gemma3 decode, gemma3 batched prefill, gemma4).
+- **Why it is not a one-line fix:** clamping to 1024 at `config.rs:188` makes the
+  model attend over a 1024-key window instead of the 4096 its config asks for. That
+  is a quality change, not a guard. Someone has to decide whether cohere2 should be
+  clamped, chunked, or refused with a clear message.
+- Cheap improvement either way: state the constraint once in
+  `Gpu::swa_visibility_stage_batched` (`window <= 1024`, with a message naming the
+  cause) instead of letting all four callers discover it as an opaque HIP error.
+- **The originally reported mechanism is REFUTED and should not be re-filed:** the
+  LDS overflow in `attention_swa_gqa_batched.hip:59` cannot occur, because the
+  staging launch above rejects the oversized window one kernel earlier, on every
+  path. Full trace: `docs/bugs/2026-08-29-bug-hunt-wave2.md`.
+
+## tiny-quant is RED on master: 3 `qwen3_5_moe` oq8 cells, all BETTER than baseline
+
+**Found 2026-08-29 on master `0c9e3d252`, nix1 (`gfx1103`). Pre-existing —
+reproduced at unmodified HEAD in a scratch worktree with byte-identical numbers,
+so it is NOT caused by any in-flight work.**
+
+| cell | measured | baseline | budget |
+|---|---|---|---|
+| `qwen3_5_moe/kld:oq8` | 0.002806 | 0.020287 | ±0.005072 |
+| `qwen3_5_moe/kld:oq8+(calib)` | 0.002369 | 0.005677 | ±0.001419 |
+| `qwen3_5_moe/kld:oq8++(calib)` | 0.002369 | 0.005677 | ±0.001419 |
+
+- All three breach on the **GOOD** side — `oq8` measures **7x lower KLD** than its
+  baseline. That is a quality improvement the 25% relative tolerance reads as a
+  failure, so the gate is red for a good reason to celebrate.
+- Scoped to oq8: `oq4`, `oq4+`, `oq4++`, `oq4.25++` and `mq3` on the same family
+  all pass, and `qwen3_5_moe_indexed/kld:oq8` passes.
+- Almost certainly a stale baseline rather than a live defect, but **what moved
+  the number has not been identified** — do not re-record until it is. Recording
+  a 7x improvement without knowing its cause would bake in whatever produced it.
+- Separately, `tiny-state` is INCONCLUSIVE on this host for an unrelated reason:
+  baselines are keyed by HIP version and were recorded at `hip=7.13.26154`, while
+  nix1 now runs `hip=7.14.60850`, so 10 cells have no baseline to compare against.
+
+## [FIXED 2026-08-29] Routed KVarN prefill: rows in a wrapped block attend to FUTURE tokens
+
+**Found and fixed 2026-08-29 on master `0c9e3d252`. Confirmed 3/3 by kernel read.**
+Fixed by attending per segment: the kernel gained a `row_offset` argument and both
+call sites moved inside the segment loop. `parity_kvarn_routed` passes unchanged at
+max-abs-err 3.73e-8. **Owed: a >=129-token fused-vs-serial A/B that would FAIL
+before the fix** — no such test exists, so this is verified as non-regressive, not
+as curing a measured divergence. Was unreachable until the same-day uncompilable-
+kernel fix below.
+
+- `crates/hipfire-arch-qwen35/src/qwen35/prefill_batch.rs:3015` (dense) and
+  `:4479` (grouped MoE) attend **once after** the window-segment loop. The window
+  is a 128-slot ring, so by then it holds only the LAST segment's tokens.
+- `kernels/src/attention_kvarn_routed_batched.hip:56-58` derives `win_base` from
+  `positions[b]` — **per row** — and its header says so at `:14-15`. The only mask
+  is `t < seq_len`; nothing masks against what the window currently holds.
+- Row at position 100 of a 300-token prefill: `win_base = 0`, so all of t=0..100
+  read the window and get tokens 256..299 and 172..228. **All future.**
+- Triggers at >=129 tokens in one launch. For a 2048-token prefill ~94% of rows
+  are affected. Default KV mode (`kvarn`), fused multi-session prefill.
+- **The single-session path already has the fix** (`8ea5a303e`): it passes the
+  block count as a launch argument and attends INSIDE the segment loop
+  (`crates/hipfire-rdna/src/dispatch/kv.rs:1817-1836`). Not carried across.
+- The 2026-08-11 "wrong basis" re-verification could not have caught this: it
+  compared cache CONTENTS on 19-25 token prompts, under one 128-token group.
+- Full evidence: `docs/bugs/2026-08-29-kvarn-routed-prefill-window-wrap.md`.
+
+## [FIXED 2026-08-29] `hipfire model compose` is broken for every default bf16-codec artifact
+
+**Found and fixed 2026-08-29 on master `0c9e3d252`. Confirmed 3/3 and REPRODUCED on
+a real 477 MB artifact.** Fixed by a new `HfqFile::physical_extent` accessor that
+all four arithmetic sites now use. Verified by composing a real artifact with 110
+`Bf16Huff` tensors: the bundle carries 137.19 MB packed (not 207.14 MB expanded)
+and re-inspects at the same 1.510x ratio. Reverting only the coverage loop
+reproduces the original error.
+
+- `crates/hipfire-hfq-tooling/src/lib.rs:1509/1522/1573/1753` mix a **packed**
+  `data_offset` with an **expanded** `data_size`, because `expand_bf16_index`
+  (`hipfire-runtime/src/hfq.rs:1017-1078`) presents a logical view and compose
+  never consults `stored_recoding`. Every tensor appears to overrun the next.
+- Aborts with `contains overlapping tensor ranges` — **naming a corruption that
+  does not exist**. Replaying the loop on a real index: 135 overlaps logical, 0
+  stored. `--check` passes first, which makes it look artifact-specific.
+- `--bf16-codec` defaults to `huff` (`hipfire-quantize/src/cli.rs:7787`) and
+  applies to BF16 tensors in ANY format, so `--format mq4` is hit too. Essentially
+  every artifact built since that default cannot be composed. `hipfire induct`
+  fails at its final fold-in step for the same reason.
+- The finder's "silent corrupt weight" sub-case is NOT reachable (a second guard
+  at `lib.rs:1608-1612` fires first, and nothing is written after the last
+  payload). Recorded so nobody re-derives it.
+- Full evidence: `docs/bugs/2026-08-29-compose-hfq-logical-extent.md`.
+
+## [3 of 4 FIXED 2026-08-29] Four serving-path lifecycle defects
+
+**Found 2026-08-29 on master `0c9e3d252`. All four confirmed 3/3.**
+FIXED: `run_batch_cycle`'s two leaking exits; the executor-v2 answer swap (now
+stashes only into the stream the frame actually admitted); `selected_prefill_requests`
+(drop guard). **STILL OPEN: the `aging_ms = 0` image-workload starvation** — the
+finder's proposed fix is wrong and would starve text instead; it needs a restart cap
+or resume-from-`completed_steps`, which is a design decision.
+Verification corrected the scenario in every case; see the doc for the corrected
+version, not the finder's.
+
+- `crates/hipfire-server/src/batch_runner.rs:1165` and `:979` — both early exits
+  skip the only `release_sessions` call, leaking sessions for the life of the
+  loaded worker. Contradicts the invariant of `5250ac25a` and the comment at
+  `:1026`. The prefill-error exit leaks **all N** sessions of the batch.
+- `crates/hipfire-server/src/state.rs:294` — `aging_ms = 0` makes `next_seed`'s
+  aged-oldest override dead code, so priority-128 image work starves behind chat.
+  **Do not apply the finder's fix**: `aging_ms > 0` does not cure it and starves
+  text instead. Cap consecutive restarts, or resume from `completed_steps`.
+- `crates/hipfire-daemon/src/handlers/generate.rs:901` — a refused stream
+  admission still overwrites the live stream's generation, so client A receives
+  B's answer and B hangs. Gated on `HIPFIRE_DAEMON_EXECUTOR=v2` (default off).
+- `crates/hipfire-server/src/routes/chat.rs:1701` — `selected_prefill_requests`
+  never removes ids whose future is dropped. Live by default. The leaking routes
+  are non-streaming `/v1/responses` and the sdapi text fallback — **not**
+  `/v1/chat/completions`, which the finder named.
+- Full evidence: `docs/bugs/2026-08-29-serving-lifecycle-defects.md`.
+
+## [2 of 3 FIXED 2026-08-29] Diffusion img2img noise is wrong on BOTH scheduler families
+
+**Found 2026-08-29 on master `0c9e3d252`. All three confirmed 3/3.**
+FIXED: the flow-match epsilon-vs-interpolation noise form (dispatched inside
+`add_noise_to_latents` so every call site is fixed at once), and the 14.6x
+sigma-scaled-latents-reused-as-noise. Both pinned by tests. **STILL OPEN: `"Euler a"`
+runs deterministic Euler** — fixing it means either implementing the ancestral step
+or failing loudly on a sampler the server currently advertises. Product decision.
+
+- `crates/hipfire-diffusion/src/pipeline_generate.rs:770` — flow-match img2img and
+  hires-fix inject noise with the epsilon form `x0 + sigma*n` instead of the
+  interpolation form `(1-sigma)*x0 + sigma*n`, amplifying the init image
+  (`(1+sigma)*x0`) and handing the DiT an out-of-distribution input.
+- `crates/hipfire-diffusion/src/pipeline_generate.rs:763` — the plan latents were
+  already scaled by `initial_noise_sigma()` and are reused as unit noise, so the
+  noise term is inflated **14.6x** on SDXL-class Euler. Hits a bare
+  `hipfire diffusion img2img` with no flags (`--scheduler` defaults to Automatic).
+- `crates/hipfire-diffusion/src/scheduler.rs:129` — `"Euler a"` resolves to plain
+  deterministic Euler; output is **provably bit-identical** to Euler since
+  `DiffusionSchedule` carries no `class_name`. The sampler is advertised by
+  `GET /sdapi/v1/samplers` and `docs/CLI.md`.
+- Full evidence: `docs/bugs/2026-08-29-diffusion-img2img-and-samplers.md`.
+
+## [FIXED 2026-08-29] GGUF import silently scrambles Q4_0 and mis-decodes Q5_K
+
+**Found and fixed 2026-08-29 on master `0c9e3d252`.** Confirmed by source read plus
+an arithmetic reproduction, then fixed and pinned by `dequant_layout_tests` — five
+tests written from the upstream `dequantize_row_*` formulas. Re-introducing either
+defect fails exactly the two corresponding tests while Q4_K/Q6_K/Q8_0 keep passing,
+which is what makes the test trustworthy rather than a restatement of the code.
+
+- `crates/hipfire-gguf/src/lib.rs:305` — `dequant_q4_0` writes the nibble pair to
+  `j*2` / `j*2+1`; GGML packs element `j` and `j+16` in one byte. **30 of 32
+  elements per block land in the wrong slot.** A permutation, so nothing is lost
+  and nothing downstream notices.
+- `crates/hipfire-gguf/src/lib.rs:425-426` — `dequant_q5_k` selects the `qh` high
+  bit with `>> group` / `>> (group+4)`; the reference advances by 2 per group.
+  **6 of 8 sub-blocks read the wrong bit**, putting those elements off by
+  `16 * scale` — half the range.
+- `dequant_q4_k` and `dequant_q6_k` in the same file are correct, so this is a
+  local mistake, not a house convention.
+- Reachable with no flag: `hipfire-coexistence import gguf` → `run_gguf_pipeline`
+  → `tensor_to_f32`. The artifact loads and generates fluent text; only KLD or
+  perplexity against the source would show it.
+- Full evidence: `docs/bugs/2026-08-29-gguf-dequant-q4_0-q5_k.md`.
+
+## [FIXED 2026-08-29] Routed KVarN attention is hardcoded to 4-bit — `kvarn8` / `kvarn2` read garbage
+
+**Found and fixed 2026-08-29 on master `0c9e3d252`. Confirmed at dispatch and kernel
+level.** Fixed by threading `bits` through both — the value was already in scope as
+`KvarnBatchFlushContext::bits`, the same one the flush writes with. The dispatch also
+gained an assert that `bits` is 2/4/8. `parity_kvarn_routed` passes unchanged at
+3.73e-8, proving the default 4-bit path is byte-for-byte unaffected.
+
+- `crates/hipfire-rdna/src/dispatch/attention.rs:1203` recomputes the KVarN K
+  record size with `cpb` pinned to 2 instead of calling
+  `KvCache::kvarn_k_record_bytes_bits(head_dim, bits)`. At `head_dim=128`:
+  real 17152 B at `kvarn8` and 4864 B at `kvarn2` vs 8960 B assumed. `kvarn4` is
+  correct **by coincidence**, which is why the default hides it.
+- `kernels/src/attention_kvarn_routed_batched.hip:98` unpacks two codes per byte
+  unconditionally, so even record 0 decodes wrong at 2 or 8 bits.
+- The sibling `attention_flash_kvarn_tile_batched.hip:118-126` takes `bits` as a
+  runtime parameter and derives `cpb`/`codemask` correctly — the tree has both a
+  bits-aware and a bits-blind KVarN attention kernel.
+- **The write side had this exact bug and was fixed; the read side was not.**
+  `kvarn_batch_bits` (`qwen35/prefill_batch.rs:853`) carries the repair and its
+  doc comment describes the identical failure, one call earlier.
+- Full evidence: `docs/bugs/2026-08-29-kvarn-routed-attention-4bit-stride.md`.
+
 ## Spec-decode output is not byte-identical to plain AR decode
 
 **Found 2026-08-27 on master, halo gfx1151. Qwen3.8-27B--oq4.25++ + dflash2.**
@@ -2231,10 +2537,42 @@ reproduction and the reasoning that led to the real cause are still useful.
 - Note: The sibling `forward.rs` chunk/ring path is NOT affected — its
   non-aligned-with-compress-events case returns an explicit `Err`.
 
-## [High] bf16 KLD reference artifacts contain chunk 0 replicated 1175×
+## [RESOLVED 2026-08-29 — damaged artifacts deleted] bf16 KLD reference artifacts contain chunk 0 replicated 1175×
+
+**Re-verified and cleaned up 2026-08-29.** All refs were re-run through
+`kldref_selftest`; **8 verified-damaged files (18.4 GB) were deleted** and the
+healthy one was kept. Corrections to this entry's original scope:
+
+- **The path here is wrong.** `/srv/hipfire/kldrefs/` is EMPTY and always was in
+  this cleanup. The artifacts actually live at
+  `/srv/Public/sadara/.hipfire/kldrefs/`.
+- **It is not "the bf16 refs" — one is healthy.** `qwen3.5-9b-bf16` passes cleanly
+  (`chunk1 blocks identical to chunk0: 0/1023`, best-match at the correct position
+  3073, per-chunk agreement 47–55%). It was KEPT. Deleting by the `bf16` label
+  would have destroyed a good reference.
+- **A fourth ref is damaged, by a DIFFERENT defect.** `qwen3.6-35b-a3b-bf16` is not
+  replicated (`identical: 0/1023`) but scores **0.0% agreement on every chunk,
+  including chunk 0**, with 1021/1023 targets outside top-256 (PPL 1917.9). Same
+  corpus slice and md5, same `n_vocab`/`top_k` as the healthy 9b, so it is not a
+  corpus or vocab artifact — and `kldref_selftest` scores blocks against the ref's
+  OWN stored token blob, so 0% is internal inconsistency. Deleted.
+- **`qwen3.6-27b-bf16` could NOT be classified and was KEPT.** Its metadata is
+  missing `scoring_start`/`scored_per_chunk`, so `kldref_selftest` panics at
+  `examples/kldref_selftest.rs:34` before measuring. That is its own (unfixed)
+  defect: a ref whose metadata the readers cannot consume. Treat as unverified.
+- **All `.json` sidecars were kept** — kilobytes each, and they carry the
+  regeneration recipe (producer, `source_model_sha256`, corpus slice + md5).
+  Note `qwen3.6-35b-a3b`'s sidecar has a null `source_model_sha256`.
+
+Deleted: `qwen3.5-{0.8b,2b,4b}` and `qwen3.6-35b-a3b`, each `.kldref.hfq` plus its
+`.arch0.bak.hfq` twin (the twins were separately selftested and show identical
+numbers, not assumed).
+
+Original report follows.
+
 - Category: Correctness / Evidence tooling
-- Location: `/srv/hipfire/kldrefs/qwen3.5-{0.8b,2b,4b}-bf16.kldref.hfq`
-  (and the `.arch0.bak` copy under `/srv/Public`); produced 2026-06-05 by
+- Location: `/srv/Public/sadara/.hipfire/kldrefs/qwen3.5-{0.8b,2b,4b}-bf16.kldref.hfq`
+  (and the `.arch0.bak` twins); produced 2026-06-05 by
   `build_kld_ref_hipfire` (hipfire 0.2.0). That producer is no longer in the
   tree — only the artifacts remain.
 - Summary: `kldref.tokens` is correct (1175 contiguous 2048-token windows of the
