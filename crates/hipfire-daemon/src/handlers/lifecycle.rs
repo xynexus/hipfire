@@ -286,7 +286,30 @@ pub(crate) fn load(
     // Opt-in n-gram spec decode. Per-load param wins, else the config default
     // (off). An empty `ngram_spec_store_root` keeps it RAM-only: nothing is written
     // to disk, so nothing outlives the request.
+    //
+    // The params are the channel. `ModelLoadParams::from_hipfire_config` fills
+    // this family from the config the SERVER resolved, which went through
+    // `resolve_for_model` — so the CLI layer and any `model_overrides` for this
+    // model are already folded in.
+    //
+    // The disk read below is a fallback for callers that send no params (the
+    // adapter's `ModelLoadParams::default()`, tests, standalone tools). It is
+    // NOT equivalent: `load_config_bundle` resolves with no additional layers
+    // and no model tag, so a `--flag` override and every `model_overrides`
+    // entry are invisible to it. That silent inequivalence is why this family
+    // ignored per-model settings; say so rather than paper over it.
+    let ngram_params_present = msg
+        .get("params")
+        .and_then(|p| p.get("ngram_spec"))
+        .is_some();
     let ngram_cfg = hipfire_config::load_config_bundle().config;
+    if !ngram_params_present && ngram_cfg.ngram_spec {
+        tracing::warn!(
+            "ngram_spec is on in config.json but this load carried no ngram params, so the \
+             values come from a re-read of the file: no CLI overrides, no model_overrides. \
+             Send them as load params to get the resolved values."
+        );
+    }
     let ngram_spec = msg
         .get("params")
         .and_then(|p| p.get("ngram_spec"))

@@ -2781,6 +2781,29 @@ pub struct ModelLoadParams {
     pub residency_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_vram_budget_bytes: Option<u64>,
+    // n-gram speculative decode. These travel as load params like every other
+    // resolved setting; without them the daemon's load handler fell back to
+    // re-reading config.json from disk, which resolves with no CLI layer and no
+    // model tag — so `--flag` overrides and model_overrides were invisible to
+    // this whole family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_store_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_store_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_orders: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_chain_floor: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_max_spine: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_promote_count: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_write_target: Option<String>,
 }
 
 impl ModelLoadParams {
@@ -2792,6 +2815,15 @@ impl ModelLoadParams {
             &config.dflash_mode,
             config.cask_sidecar.as_deref(),
         );
+        params.ngram_spec = Some(config.ngram_spec);
+        params.ngram_spec_store_root = Some(config.ngram_spec_store_root.clone());
+        params.ngram_spec_scope = Some(config.ngram_spec_scope.clone());
+        params.ngram_spec_store_mb = Some(config.ngram_spec_store_mb);
+        params.ngram_spec_orders = Some(config.ngram_spec_orders.clone());
+        params.ngram_spec_chain_floor = Some(config.ngram_spec_chain_floor);
+        params.ngram_spec_max_spine = Some(config.ngram_spec_max_spine);
+        params.ngram_spec_promote_count = Some(config.ngram_spec_promote_count);
+        params.ngram_spec_write_target = Some(config.ngram_spec_write_target.clone());
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.dflash_adaptive_b = Some(config.dflash_adaptive_b);
         params.gpu_slab_load = non_auto_value(&config.gpu_slab_load);
