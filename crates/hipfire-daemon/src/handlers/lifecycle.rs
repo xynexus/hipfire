@@ -681,6 +681,23 @@ pub(crate) fn load(
             if let Some(df) = m.dflash.as_mut() {
                 df.adaptive_b = adaptive_b;
                 df.ngram = ngram_setup;
+            } else if ngram_setup.is_some() {
+                // `ngram_spec` is documented as "drafter-free", but the n-gram
+                // spine is consumed inside `generate_dflash`, which unwraps
+                // `m.dflash` — so with no DFlash drafter the setup built just
+                // above is dropped here and nothing speculates.
+                //
+                // Say so. Silently discarding it is what made this expensive to
+                // find: `ngram_spec=true` produced no log line, no store on
+                // disk, and decode timings identical to the feature being off,
+                // with nothing anywhere admitting it had not run.
+                tracing::warn!(
+                    "ngram_spec is on but {} has no DFlash drafter, and the n-gram spine is \
+                     consumed inside the DFlash decode path — n-gram speculative decode will \
+                     NOT run for this model. Attach a DFlash sidecar, or turn ngram_spec off \
+                     to stop expecting it.",
+                    m.model_path
+                );
             }
             daemon_state
                 .resource_reservations
