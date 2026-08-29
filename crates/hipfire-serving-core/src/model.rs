@@ -106,10 +106,14 @@ impl Eviction {
 /// `generate` fast path when temperature == 0 — falls back to AR sampling
 /// otherwise (DFlash is greedy-only in this integration).
 pub struct DflashState {
-    pub draft_config: DflashConfig,
-    pub draft_weights: DflashWeights,
-    pub draft_scratch: DflashScratch,
-    pub hidden_rb: HiddenStateRingBuffer,
+    // The DRAFTER. `None` when this state exists only to carry n-gram
+    // speculative decode, which drafts from statistics and needs no drafter
+    // model: `spec_step_dflash` takes all four as Option and skips the drafter
+    // branch, the hidden-state extraction and the staging that feeds it.
+    pub draft_config: Option<DflashConfig>,
+    pub draft_weights: Option<DflashWeights>,
+    pub draft_scratch: Option<DflashScratch>,
+    pub hidden_rb: Option<HiddenStateRingBuffer>,
     pub verify_scratch: VerifyScratch,
     pub target_snap: DeltaNetSnapshot,
     pub gdn_tape: GdnTape,

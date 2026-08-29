@@ -2907,9 +2907,9 @@ pub fn load_model(
             tracing::info!(
                 "DFlash draft loaded: source={} layers={} hidden={} block={}",
                 source.label(),
-                state.draft_config.n_layers,
-                state.draft_config.hidden,
-                state.draft_config.block_size,
+                state.draft_config.as_ref().map_or(0, |c| c.n_layers),
+                state.draft_config.as_ref().map_or(0, |c| c.hidden),
+                state.draft_config.as_ref().map_or(0, |c| c.block_size),
             );
             Some(state)
         } else {
@@ -3742,9 +3742,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     // and (optional) DDTree state must each be returned to the pool — otherwise a
     // mid-session load/unload cycle strands them until daemon exit.
     if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
-        df.hidden_rb.free_gpu(gpu);
+        // The drafter half is absent on an n-gram-only load; the target-side
+        // buffers below are always present and always need returning.
+        if let Some(draft_weights) = df.draft_weights {
+            draft_weights.free_gpu(gpu);
+        }
+        if let Some(draft_scratch) = df.draft_scratch {
+            draft_scratch.free_gpu(gpu);
+        }
+        if let Some(hidden_rb) = df.hidden_rb {
+            hidden_rb.free_gpu(gpu);
+        }
         df.verify_scratch.free_gpu(gpu);
         df.target_snap.free_gpu(gpu);
         df.gdn_tape.free_gpu(gpu);
@@ -4316,10 +4324,10 @@ fn load_dflash_state_source(
     };
 
     Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
+        draft_config: Some(draft_config),
+        draft_weights: Some(draft_weights),
+        draft_scratch: Some(draft_scratch),
+        hidden_rb: Some(hidden_rb),
         verify_scratch,
         target_snap,
         gdn_tape,

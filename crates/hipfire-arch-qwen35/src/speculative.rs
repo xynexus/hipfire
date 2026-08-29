@@ -12881,10 +12881,16 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
+/// Prefill the prompt, optionally extracting target hidden states for a drafter.
+///
+/// `hidden_rb: None` is the drafter-free case: the prompt is still prefilled —
+/// KV and DeltaNet state are what the target needs regardless — but no hidden
+/// states are extracted and nothing is downloaded, because only a drafter ever
+/// reads them.
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     target_hidden_host: &mut Vec<f32>,
     prompt_tokens: &[u32],
 ) -> HipResult<()> {
@@ -12906,14 +12912,17 @@ pub fn seed_target_hidden_from_prompt(
         &mut target.kv_cache,
         &mut target.dn_state,
         &target.scratch,
-        Some(hidden_rb),
+        hidden_rb.as_deref_mut(),
         None,
         None,
         None,
     )?;
-    // Gather the just-written rows from the ring buffer.
-    let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
-    target_hidden_host.extend_from_slice(&block);
+    // Gather the just-written rows from the ring buffer. Only a drafter reads
+    // them, so with no ring there is nothing to gather.
+    if let Some(hidden_rb) = hidden_rb.as_deref() {
+        let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
+        target_hidden_host.extend_from_slice(&block);
+    }
     Ok(())
 }
 

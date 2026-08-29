@@ -45,7 +45,11 @@ use crate::generate_arch::{
     generate_deepseek4, generate_gemma3, generate_gemma3_vl_text, generate_llama, generate_minimax,
     generate_nemotron, generate_registered_backend, generate_zaya,
 };
-use crate::model::{effective_raw, LoadedModel};
+use crate::model::{effective_raw, DflashState, LoadedModel};
+
+/// DDTree is a tree-verify over a DRAFTER's candidates: `df.ddtree` is only
+/// populated for a load that has one, so these arms cannot be reached without.
+const DDTREE_NEEDS_DRAFTER: &str = "ddtree state exists without a drafter";
 use crate::output_filter::chat_output_filter;
 use crate::output_filter::{chat_output_filter_from_profile, loop_guard_from_runtime_config};
 use crate::request::ThinkMode;
@@ -626,7 +630,9 @@ pub fn generate_dflash(
     let chat_template_profile = m.chat_template_profile.clone();
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
-    df.draft_scratch.reset_upload_tracking();
+    if let Some(draft_scratch) = df.draft_scratch.as_mut() {
+        draft_scratch.reset_upload_tracking();
+    }
 
     // Assemble a transient ModelSlot for the spec helpers — they both take
     // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
@@ -715,7 +721,7 @@ pub fn generate_dflash(
     if let Err(e) = speculative::seed_target_hidden_from_prompt(
         gpu,
         &mut target,
-        &mut df.hidden_rb,
+        df.hidden_rb.as_mut(),
         &mut df.target_hidden_host,
         &prompt_tokens,
     ) {
@@ -732,18 +738,24 @@ pub fn generate_dflash(
     }
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
     // first spec step can skip the CPU→GPU upload of the whole context.
-    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-        gpu,
-        &df.hidden_rb,
-        &df.draft_scratch.target_hidden,
-        0,
-        prompt_tokens.len(),
-        prompt_tokens.len(),
-    ) {
-        tracing::warn!("scatter failed: {e} — falling back to per-cycle upload");
+    // Priming exists to save the drafter's first upload; with no drafter there
+    // is no buffer to prime and nothing reads the positions.
+    if let (Some(hidden_rb), Some(draft_scratch)) =
+        (df.hidden_rb.as_ref(), df.draft_scratch.as_mut())
+    {
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            0,
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        ) {
+            tracing::warn!("scatter failed: {e} — falling back to per-cycle upload");
+        }
+        draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+        draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
     }
-    df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    df.draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -905,20 +917,33 @@ pub fn generate_dflash(
             );
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
-                let _ = speculative::apply_eviction_retain_to_draft(
-                    gpu,
-                    &mut df.draft_scratch,
-                    &res.retain_mask,
-                    df.draft_config.num_extract(),
-                    df.draft_config.hidden,
-                    pre_phys,
-                );
-                speculative::compact_target_hidden_host(
-                    &mut df.target_hidden_host,
-                    &res.retain_mask,
-                    df.draft_config.num_extract(),
-                    df.draft_config.hidden,
-                );
+                // Mirrors the retain set into the DRAFT's hidden cache, so it is
+                // meaningful only when there is a drafter to read it. Destructured
+                // so the scratch and the host shadow borrow disjointly.
+                let DflashState {
+                    draft_scratch,
+                    draft_config,
+                    target_hidden_host,
+                    ..
+                } = &mut *df;
+                if let (Some(draft_scratch), Some(draft_config)) =
+                    (draft_scratch.as_mut(), draft_config.as_ref())
+                {
+                    let _ = speculative::apply_eviction_retain_to_draft(
+                        gpu,
+                        draft_scratch,
+                        &res.retain_mask,
+                        draft_config.num_extract(),
+                        draft_config.hidden,
+                        pre_phys,
+                    );
+                    speculative::compact_target_hidden_host(
+                        target_hidden_host,
+                        &res.retain_mask,
+                        draft_config.num_extract(),
+                        draft_config.hidden,
+                    );
+                }
             }
         }
     }
@@ -1034,10 +1059,10 @@ pub fn generate_dflash(
                 spec_step_ddtree_path_c(
                     gpu,
                     &mut target,
-                    &df.draft_weights,
-                    &df.draft_config,
-                    &mut df.draft_scratch,
-                    &mut df.hidden_rb,
+                    df.draft_weights.as_ref().expect(DDTREE_NEEDS_DRAFTER),
+                    df.draft_config.as_ref().expect(DDTREE_NEEDS_DRAFTER),
+                    df.draft_scratch.as_mut().expect(DDTREE_NEEDS_DRAFTER),
+                    df.hidden_rb.as_mut().expect(DDTREE_NEEDS_DRAFTER),
                     &mut df.target_hidden_host,
                     &mut df.target_snap,
                     &mut df.gdn_tape,
@@ -1053,10 +1078,10 @@ pub fn generate_dflash(
                 spec_step_ddtree_batched(
                     gpu,
                     &mut target,
-                    &df.draft_weights,
-                    &df.draft_config,
-                    &mut df.draft_scratch,
-                    &mut df.hidden_rb,
+                    df.draft_weights.as_ref().expect(DDTREE_NEEDS_DRAFTER),
+                    df.draft_config.as_ref().expect(DDTREE_NEEDS_DRAFTER),
+                    df.draft_scratch.as_mut().expect(DDTREE_NEEDS_DRAFTER),
+                    df.hidden_rb.as_mut().expect(DDTREE_NEEDS_DRAFTER),
                     &mut df.target_hidden_host,
                     &mut df.target_snap,
                     &mut dd.post_seed_snap,
@@ -1078,10 +1103,10 @@ pub fn generate_dflash(
             spec_step_dflash(
                 gpu,
                 &mut target,
-                Some(&df.draft_weights),
-                Some(&df.draft_config),
-                Some(&mut df.draft_scratch),
-                Some(&mut df.hidden_rb),
+                df.draft_weights.as_ref(),
+                df.draft_config.as_ref(),
+                df.draft_scratch.as_mut(),
+                df.hidden_rb.as_mut(),
                 &mut df.target_hidden_host,
                 &mut df.target_snap,
                 &df.verify_scratch,
@@ -1224,20 +1249,33 @@ pub fn generate_dflash(
                 let pre_phys = position;
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
-                    let _ = speculative::apply_eviction_retain_to_draft(
-                        gpu,
-                        &mut df.draft_scratch,
-                        &res.retain_mask,
-                        df.draft_config.num_extract(),
-                        df.draft_config.hidden,
-                        pre_phys,
-                    );
-                    speculative::compact_target_hidden_host(
-                        &mut df.target_hidden_host,
-                        &res.retain_mask,
-                        df.draft_config.num_extract(),
-                        df.draft_config.hidden,
-                    );
+                    // Mirrors the retain set into the DRAFT's hidden cache, so it is
+                    // meaningful only when there is a drafter to read it. Destructured
+                    // so the scratch and the host shadow borrow disjointly.
+                    let DflashState {
+                        draft_scratch,
+                        draft_config,
+                        target_hidden_host,
+                        ..
+                    } = &mut *df;
+                    if let (Some(draft_scratch), Some(draft_config)) =
+                        (draft_scratch.as_mut(), draft_config.as_ref())
+                    {
+                        let _ = speculative::apply_eviction_retain_to_draft(
+                            gpu,
+                            draft_scratch,
+                            &res.retain_mask,
+                            draft_config.num_extract(),
+                            draft_config.hidden,
+                            pre_phys,
+                        );
+                        speculative::compact_target_hidden_host(
+                            target_hidden_host,
+                            &res.retain_mask,
+                            draft_config.num_extract(),
+                            draft_config.hidden,
+                        );
+                    }
                 }
             }
         }
