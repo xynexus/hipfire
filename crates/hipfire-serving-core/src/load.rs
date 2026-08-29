@@ -4776,6 +4776,9 @@ fn load_dflash_state_source(
         // trained (scope doc item 4) and the search space contains a win.
         adaptive_b: false,
         ddtree,
+        // Opt-in; the daemon fills this in from `ngram_spec` after load.
+        ngram: None,
+        ngram_live: None,
     })
 }
 

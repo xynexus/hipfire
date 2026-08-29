@@ -636,6 +636,89 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Whether DFlash may adapt draft batch size."
     ),
     field!(
+        "ngram_spec",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Opt-in drafter-free n-gram speculative decode."
+    ),
+    field!(
+        "ngram_store_root",
+        ConfigType::String,
+        Requirement::Optional,
+        Some(""),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only."
+    ),
+    field!(
+        "ngram_scope",
+        ConfigType::String,
+        Requirement::Optional,
+        Some(""),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Tokenizer scope name for n-gram tables; empty = derive from model file."
+    ),
+    field!(
+        "ngram_store_mb",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("256"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Size in MiB of a newly created n-gram table; this is the fixed budget."
+    ),
+    field!(
+        "ngram_orders",
+        ConfigType::String,
+        Requirement::Optional,
+        Some("8,7,6,5,4,3,2"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "n-gram probe orders, longest first, comma-separated."
+    ),
+    field!(
+        "ngram_chain_floor",
+        ConfigType::U8,
+        Requirement::Optional,
+        Some("8"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Minimum winning order to keep extending an n-gram chain; 0 disables."
+    ),
+    field!(
+        "ngram_max_spine",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("16"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Maximum n-gram draft spine length."
+    ),
+    field!(
+        "ngram_promote_count",
+        ConfigType::U16,
+        Requirement::Optional,
+        Some("3"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Observations before an n-gram is persisted; gates writes, not drafting."
+    ),
+    field!(
+        "ngram_write_target",
+        ConfigType::Enum {
+            values: &["user", "topic", "none"]
+        },
+        Requirement::Optional,
+        Some("user"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Which n-gram store the write path feeds."
+    ),
+    field!(
         "dflash_ngram_block",
         ConfigType::Json,
         Requirement::Optional,

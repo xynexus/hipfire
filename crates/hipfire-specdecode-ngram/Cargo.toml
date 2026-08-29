@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-specdecode-ngram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "drafter-free n-gram speculative-decode strategy (hot RAM tier + fixed-size cold block store)"
+
+[dependencies]
+memmap2.workspace = true
+
+# Only the replay example needs a tokenizer; the library itself stays
+# dependency-free and GPU-free.
+[dev-dependencies]
+hipfire-model = { path = "../hipfire-model" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+serde_json = "1"

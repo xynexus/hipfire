@@ -167,6 +167,33 @@ fn default_dflash_mode() -> String {
 fn default_dflash_adaptive_b() -> bool {
     true
 }
+fn default_ngram_spec() -> bool {
+    false
+}
+fn default_ngram_store_root() -> String {
+    String::new()
+}
+fn default_ngram_scope() -> String {
+    String::new()
+}
+fn default_ngram_store_mb() -> u32 {
+    256
+}
+fn default_ngram_orders() -> String {
+    "8,7,6,5,4,3,2".to_string()
+}
+fn default_ngram_chain_floor() -> u8 {
+    8
+}
+fn default_ngram_max_spine() -> u32 {
+    16
+}
+fn default_ngram_promote_count() -> u16 {
+    3
+}
+fn default_ngram_write_target() -> String {
+    "user".to_string()
+}
 fn default_dflash_ngram_block() -> serde_json::Value {
     serde_json::Value::String("auto".to_string())
 }
@@ -401,6 +428,51 @@ pub struct HipfireConfig {
     pub dflash_adaptive_b: bool,
     #[serde(default = "default_dflash_ngram_block")]
     pub dflash_ngram_block: serde_json::Value,
+    /// Opt-in drafter-free n-gram speculative decode. Drafts from token
+    /// statistics; on a miss the DFlash drafter runs unchanged.
+    #[serde(default = "default_ngram_spec")]
+    pub ngram_spec: bool,
+    /// Root directory for the persistent n-gram tables, or a RAM-only sentinel.
+    ///
+    /// Empty, `ram`, `none` or `off` all mean hot tier only — session-local
+    /// RAM, nothing written to disk. The word forms exist so the RAM case is
+    /// expressible as a value: in a settings UI an empty string is
+    /// indistinguishable from a field nobody has touched.
+    #[serde(default = "default_ngram_store_root")]
+    pub ngram_store_root: String,
+    /// Scope name identifying the *tokenizer* these tables belong to. Empty =
+    /// derive from the model filename, which never wrongly shares a table.
+    /// Set two models to the same scope only when they share a tokenizer —
+    /// records are token ids and mean nothing across tokenizers.
+    #[serde(default = "default_ngram_scope")]
+    pub ngram_scope: String,
+    /// Size of a newly created per-scope table, in MiB. This *is* the budget:
+    /// the file is allocated in full and never grows, so a full block evicts
+    /// rather than expanding. 256 MiB = 65536 blocks of 4 KiB.
+    #[serde(default = "default_ngram_store_mb")]
+    pub ngram_store_mb: u32,
+    /// Probe orders, longest first. Measured on 1M tokens of Rust: going past
+    /// quad keeps paying on code (2..5 -> 1.80 accepted/step, 2..8 -> 2.11),
+    /// and is flat on prose.
+    #[serde(default = "default_ngram_orders")]
+    pub ngram_orders: String,
+    /// After the first drafted token, only extend the chain while the winning
+    /// order is at least this. The load-bearing knob: without it the chain pads
+    /// to `max_spine` and burns verify width (floor 0 -> 16.0 drafted/step at
+    /// 20.6% efficiency; floor 8 -> 6.94 at 37.9%). 0 disables the gate.
+    #[serde(default = "default_ngram_chain_floor")]
+    pub ngram_chain_floor: u8,
+    #[serde(default = "default_ngram_max_spine")]
+    pub ngram_max_spine: u32,
+    /// Observations before a gram is worth a disk write. Gates persistence
+    /// only, never drafting — precision is flat across counts, and requiring a
+    /// count to draft measurably hurts (1.80 accepted/step at 1, 0.75 at 9).
+    #[serde(default = "default_ngram_promote_count")]
+    pub ngram_promote_count: u16,
+    /// Which store the write path feeds: `user`, `topic`, or `none`. Only a
+    /// store private to its scope may be written; a shared one is read-only.
+    #[serde(default = "default_ngram_write_target")]
+    pub ngram_write_target: String,
     #[serde(default = "default_mtp_mode")]
     pub mtp_mode: String,
     #[serde(default = "default_mtp_k")]
@@ -589,6 +661,15 @@ impl Default for HipfireConfig {
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
+            ngram_spec: default_ngram_spec(),
+            ngram_store_root: default_ngram_store_root(),
+            ngram_scope: default_ngram_scope(),
+            ngram_store_mb: default_ngram_store_mb(),
+            ngram_orders: default_ngram_orders(),
+            ngram_chain_floor: default_ngram_chain_floor(),
+            ngram_max_spine: default_ngram_max_spine(),
+            ngram_promote_count: default_ngram_promote_count(),
+            ngram_write_target: default_ngram_write_target(),
             dflash_ngram_block: default_dflash_ngram_block(),
             mtp_mode: default_mtp_mode(),
             mtp_k: default_mtp_k(),
