@@ -32,9 +32,12 @@ boundaries, not context length.
   so it is not accumulated drift, and the MoE gate reads 0.000e0.
 - Not a drafter problem: tau is measured against the verifier's own argmax.
 - Full evidence: `docs/bugs/2026-08-27-spec-decode-ar-divergence.md`.
-## 8 gfx1151 baselines are stale — `qwen3_5_moe_indexed` fixture changed shape
+## [RESOLVED 2026-08-29 — re-recorded on halo] 8 gfx1151 baselines are stale — `qwen3_5_moe_indexed` fixture changed shape
 
-**Created 2026-08-27 by #379 (merged). Needs a `--record` run on halo.**
+**Created 2026-08-27 by #379 (merged). CLEARED 2026-08-29** — recorded on halo,
+GPU free. `tiny-quant-gate` for this family: PASS. Confirmed the drift was the
+fixture and not the DeltaNet fp16 default that moved the other cells: with
+`HIPFIRE_DN_STATE_FP16=0` the KLD is unchanged (oq4 0.067658 vs 0.067886).
 
 #379 raised `moe_indexed_preset`'s `shared_inter` 128 → 256 so the shared
 expert's `down_proj` stops being ragged for a 256-wide Opus group. That changes
@@ -2699,7 +2702,62 @@ skipping silently. Do NOT simply raise the ceiling — the divergence it reports
 is real, and its own comment says the ceiling "does not claim the current
 divergence is acceptable, only that it must not grow."
 
-## Three tiny-gate cells are already failing on origin/master (medium)
+## [RESOLVED 2026-08-29] The 4 drifted gfx1151 tiny-state cells: root-caused, both causes benign
+
+**Investigated 2026-08-29 on halo. All 10 failing cells are intended changes
+whose gfx1151 baselines were never re-recorded. Neither is a quality regression.
+Re-recording is the correct action.**
+
+The 10 split into two populations with DIFFERENT causes:
+
+**(a) 3 cells — `qwen3_5`, `qwen3_5_vl`, `qwen3_5_moe` at fp16.** Caused by
+`f5b32ea32 feat(deltanet): default the DeltaNet state to fp16, via config not
+env`, which flipped `deltanet_state_precision` fp32 → fp16 for every DeltaNet
+model. That commit validated with `no-gpu-ci` plus a Qwen3.8-27B generation diff
+and did not run or re-record the tiny GPU gates.
+
+PROOF, not inference — the commit kept `HIPFIRE_DN_STATE_FP16` as an override
+that wins in either direction, so the old default is reachable:
+
+    HIPFIRE_DN_STATE_FP16=0 ./tests/tiny-state-gate.sh
+
+    qwen3_5/fp16      OK  0xdb7f521096082900/0x1187a5029a78ab92
+    qwen3_5_vl/fp16   OK  0x896bcb3ca08b4529/0x7d4becc77df5201e
+    qwen3_5_moe/fp16  OK  0xe74fc5626832105f/0x25975b98e79e8b12
+
+All three match their recorded baselines BYTE-EXACTLY, logit hash included.
+Pinning the old default reproduces the old numbers, so nothing else moved.
+
+⚠️ `qwen3_5`'s drifted token hash `0xbccf1d6a241a4482` is the PRE-FP-contraction-pin
+gfx1103 value, which invites the reading that `cf8ec5c12`'s pin was lost. It was
+not: the pragma is present in all six GDN kernels, and the on-disk kernel cache
+(`~/.hipfire/kernels/gfx1151/*.hip`) is byte-identical to the sources. The
+LOGIT hash is a third value, not the pre-pin one — the token hash coinciding is
+argmax luck, the same coincidence `d36f2081f` called out in the other direction.
+
+**(b) 1 state cell + 6 quant cells — `qwen3_5_moe_indexed`.** The #379 fixture
+shape change, already documented in the entry below. Confirmed independent of
+(a): with `HIPFIRE_DN_STATE_FP16=0` the quant drift is unchanged (oq4 reads
+0.067658 vs 0.067886), and the state cell moves to a THIRD value rather than
+matching.
+
+**CLEARED 2026-08-29** — both populations recorded on halo in one pass:
+
+```sh
+./tests/tiny-state-gate.sh --record
+HIPFIRE_TINYQUANT_FAMILIES=qwen3_5_moe_indexed ./tests/tiny-quant-gate.sh --record
+```
+
+`tiny-state-gate: PASS (18 cells)` and `tiny-quant-gate: PASS`. The recorded
+diff is exactly the 4 state rows and the 7 `qwen3_5_moe_indexed` quant rows —
+the other 14 state rows re-recorded byte-identical, which is itself evidence
+nothing else moved.
+
+⚠️ gfx1103 was NOT re-recorded (different host). Its rows for these cells were
+last touched by `d36f2081f`, BEFORE `f5b32ea32` flipped the DeltaNet default, so
+they are stale in the same way and will drift on the next gfx1103 run.
+
+## [RESOLVED 2026-08-29 for state+quant; prefill still open] Three tiny-gate cells are already failing on origin/master
 
 Confirmed 2026-08-29 by running each gate in a clean `git worktree` at
 `origin/master` (0c9e3d252) and comparing to a working branch — the observed
