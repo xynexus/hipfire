@@ -1286,6 +1286,14 @@ mod tests {
         assert_eq!(raw.index_topk, 512);
         assert_eq!(raw.sliding_window, 128);
         assert_eq!(raw.compress_ratios.len(), 8);
+        // The MoE dispatch hardcoded 2.2 and never read this field, so any model
+        // shipping a different factor was silently scaled wrong. The fixture's
+        // 1.5 is deliberately NOT 2.2 so a regression to a literal fails here.
+        assert_eq!(raw.routed_scaling_factor, 1.5);
+        assert_ne!(
+            raw.routed_scaling_factor, 2.2,
+            "fixture must differ from the old hardcoded default to be a real pin"
+        );
     }
 
     /// Verify the parser handles the actual released DeepSeek V4 config.json

@@ -1,5 +1,5 @@
 use clap::Args;
-use hipfire_config::{hipfire_dir, ConfigLayer, ConfigLayerKind, LoadedConfig};
+use hipfire_config::{ConfigLayer, ConfigLayerKind, LoadedConfig};
 use serde_json::json;
 
 #[derive(Debug, Default, Args)]
@@ -61,11 +61,10 @@ pub async fn run(args: ServeArgs, config: LoadedConfig) -> anyhow::Result<()> {
     if args.debug_chat {
         std::env::set_var("HIPFIRE_DEBUG_CHAT", "1");
     }
-    // A direct `hipfire serve` (not via `hipfire start`) must still record its
-    // pid, or serve.pid keeps whatever the previous server wrote. Same value
-    // `start` writes for its spawned child, so the two paths agree.
-    let root = hipfire_dir();
-    let _ = std::fs::create_dir_all(&root);
-    std::fs::write(root.join("serve.pid"), std::process::id().to_string())?;
+    // serve.pid is recorded by `hipfire_server::serve_loaded` AFTER its listener
+    // binds, not here. Writing it up front meant a serve that never became the
+    // live server — most obviously a second instance losing the race for the
+    // port — still claimed the record and orphaned the running one from
+    // `stop`/`status`.
     hipfire_server::serve_loaded(config.with_additional_layer(cli_layer)).await
 }

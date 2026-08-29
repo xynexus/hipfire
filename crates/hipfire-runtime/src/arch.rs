@@ -1157,6 +1157,8 @@ fn decode_loop_inner(
 
     let mut pos = start_pos;
     let mut committed: Vec<u32> = Vec::new();
+    // Bytes of the decoded `committed` stream already handed to the output filter.
+    let mut bytes_emitted: usize = 0;
     let decode_t0 = Instant::now();
     let mut first_token_ms: Option<f64> = None;
     let mut next = pick_next(
@@ -1251,7 +1253,24 @@ fn decode_loop_inner(
         if committed.len() >= 11 && committed[committed.len() - 11..].iter().all(|&t| t == next) {
             break;
         }
-        let filter_action = output_filter.observe(frag.as_bytes());
+        // Feed the filter the REAL bytes this token contributes, taken as a delta
+        // of the decoded byte stream — not `frag`, which is a single-token lossy
+        // decode. A UTF-8 codepoint whose bytes BPE splits across two tokens
+        // (routine for CJK, emoji and accented text) becomes U+FFFD when each
+        // token is decoded alone, and the raw bytes are gone before `EosFilter`'s
+        // hold-back machinery ever sees them. `decode_bytes` exists for exactly
+        // this ("for incremental UTF-8 streaming", tokenizer.rs) and this loop was
+        // the one place not using it.
+        //
+        // `committed` is pushed/popped rather than reordered: two `break` paths
+        // below exit before the real `committed.push(next)`, and moving it would
+        // change what `pick_next`'s penalties see.
+        committed.push(next);
+        let all_bytes = tok.decode_bytes(&committed);
+        committed.pop();
+        let new_bytes = all_bytes.get(bytes_emitted..).unwrap_or(&[]).to_vec();
+        bytes_emitted = all_bytes.len();
+        let filter_action = output_filter.observe(&new_bytes);
         let stop_after_emit = matches!(
             filter_action,
             FilterAction::Stop | FilterAction::StopEmit(_)
@@ -1438,6 +1457,68 @@ mod tests {
         for _ in 0..60 {
             assert!(!b.observe("answer "));
         }
+    }
+
+    /// A UTF-8 codepoint whose bytes BPE splits across two tokens must survive
+    /// streaming. The AR decode loop used to hand the output filter
+    /// `tok.decode(&[token])` per token, and that path is
+    /// `from_utf8_lossy(decode_bytes(..))` — so half a codepoint became U+FFFD
+    /// before `EosFilter`'s UTF-8 hold-back could ever buffer it. The raw bytes
+    /// were gone; the filter's machinery could not recover them.
+    ///
+    /// The loop now streams the DELTA of `decode_bytes(&committed)`. This pins
+    /// both halves: that the per-token decode really does destroy the codepoint,
+    /// and that the delta really does preserve it.
+    #[test]
+    fn split_codepoint_survives_byte_delta_but_not_per_token_decode() {
+        // GPT-2 byte-level BPE needs all 256 byte symbols present, so build the
+        // standard byte->char map: printable bytes map to themselves, the other
+        // 68 map to U+0100 + sequential offset. Token id == byte value.
+        let mut vocab = serde_json::Map::new();
+        let mut n = 0u32;
+        for b in 0u32..256 {
+            let printable =
+                (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+            let ch = if printable {
+                char::from_u32(b).unwrap()
+            } else {
+                let c = char::from_u32(256 + n).unwrap();
+                n += 1;
+                c
+            };
+            vocab.insert(ch.to_string(), serde_json::json!(b));
+        }
+        let json = serde_json::json!({
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": []
+        })
+        .to_string();
+        let tok = Tokenizer::from_hf_json(&json).unwrap();
+
+        // The fixture is what we think it is: the two tokens ARE "é".
+        assert_eq!(tok.decode_bytes(&[0xC3, 0xA9]), "é".as_bytes(), "fixture broken");
+
+        // The old path: each token decoded alone loses the codepoint entirely.
+        let per_token: String = [0xC3u32, 0xA9].iter().map(|&t| tok.decode(&[t])).collect();
+        assert_ne!(per_token, "é");
+        assert!(
+            per_token.contains('\u{FFFD}'),
+            "expected the lossy decode to produce U+FFFD, got {per_token:?}"
+        );
+
+        // The fix: stream the delta of the decoded byte stream.
+        let mut committed: Vec<u32> = Vec::new();
+        let mut bytes_emitted = 0usize;
+        let mut streamed: Vec<u8> = Vec::new();
+        for token in [0xC3u32, 0xA9] {
+            committed.push(token);
+            let all = tok.decode_bytes(&committed);
+            streamed.extend_from_slice(all.get(bytes_emitted..).unwrap_or(&[]));
+            bytes_emitted = all.len();
+        }
+        assert_eq!(streamed, "é".as_bytes());
+        assert_eq!(String::from_utf8(streamed).unwrap(), "é");
     }
 
     #[test]

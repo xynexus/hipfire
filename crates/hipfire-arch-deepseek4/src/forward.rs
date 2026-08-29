@@ -3743,15 +3743,17 @@ fn ffn_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    // Route-scale: rarely-overridden; one-shot env read at first call.
-    use std::sync::OnceLock;
-    static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
-    let route_scale_override: f32 = *ROUTE_SCALE.get_or_init(|| {
-        std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2.2)
-    });
+    // Route-scale: the env var is a DEBUG OVERRIDE; the artifact's own
+    // `routed_scaling_factor` is the default. It was hardcoded to 2.2 here while
+    // being parsed from config and never read, so any model shipping a different
+    // factor was silently scaled wrong.
+    //
+    // The `OnceLock` had to go with it: caching made the FIRST model's factor
+    // stick for every model loaded afterwards in the same process.
+    let route_scale_override: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(cfg.routed_scaling_factor);
 
     // Gate on the PTR TABLES, not the blob. The dispatch below reads only
     // `expert_gate_up_ptrs` / `expert_w2_ptrs`; the blob merely owns the memory
@@ -3942,7 +3944,7 @@ fn ffn_hash_routed(
     let route_scale_override: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2.2);
+        .unwrap_or(cfg.routed_scaling_factor);
     let k_top = k;
 
     // Lazy-alloc moe scratch (shared with ffn_routed via state).
@@ -7658,7 +7660,7 @@ fn ffn_batched(
     let route_scale: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2.2);
+        .unwrap_or(cfg.routed_scaling_factor);
 
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
     gemv_auto_batched_wmma(

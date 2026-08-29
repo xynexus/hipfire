@@ -1884,7 +1884,7 @@ pub fn main() {
                 // `None` means the session already had a live stream. It still
                 // runs: refusing would be user-visible, which M3a must not be.
                 let admitted = stream::admit_generate(&mut daemon_state, &msg);
-                handlers::generate::text(&mut daemon_state, &msg);
+                handlers::generate::text(&mut daemon_state, &msg, admitted);
                 if let Some(id) = admitted {
                     // Retire here only on the INLINE path. Under the executor
                     // flag the handler stashed a generation on this stream and
