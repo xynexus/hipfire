@@ -31,6 +31,9 @@ pub struct StartArgs {
     /// Seconds to wait for /health before returning. Default 0 returns immediately.
     #[arg(long, default_value_t = 0)]
     pub wait_secs: u64,
+    /// Emit a machine-readable JSON object instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -39,6 +42,9 @@ pub struct StopArgs {
     /// Skip the graceful wait and send SIGKILL immediately.
     #[arg(long, short)]
     pub force: bool,
+    /// Emit a machine-readable JSON object instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -59,11 +65,29 @@ pub struct RestartArgs {
     /// Seconds to wait for /health before returning. Default 0 returns immediately.
     #[arg(long, default_value_t = 0)]
     pub wait_secs: u64,
+    /// Emit a machine-readable JSON object instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
 #[command(after_help = "Examples:\n  hipfire status\n")]
-pub struct StatusArgs {}
+pub struct StatusArgs {
+    /// Emit a machine-readable JSON object instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Print either the JSON object or the human block. `--json` output is a single
+/// line so `hipfire status --json | jq` and shell `read` both work unchanged.
+fn emit(json: bool, value: serde_json::Value, text: impl FnOnce() -> String) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", text());
+    }
+    Ok(())
+}
 
 pub async fn start(args: StartArgs, loaded: LoadedConfig) -> Result<()> {
     let paths = DaemonPaths::new()?;
@@ -75,11 +99,11 @@ pub async fn start(args: StartArgs, loaded: LoadedConfig) -> Result<()> {
     );
     let status = current_status(&paths, &effective).await;
     if status.pid_alive || status.health_ok {
-        println!(
-            "{}",
-            status.render("Hipfire server is already running.", &paths, &effective)
+        return emit(
+            args.json,
+            status.to_json("already-running", &paths, &effective),
+            || status.render("Hipfire server is already running.", &paths, &effective),
         );
-        return Ok(());
     }
 
     fs::create_dir_all(&paths.root)?;
@@ -111,38 +135,55 @@ pub async fn start(args: StartArgs, loaded: LoadedConfig) -> Result<()> {
         .stderr(Stdio::from(log_err));
     detach_process_group(&mut command);
 
+    let json_out = args.json;
     let child = command.spawn().context("spawn `hipfire serve`")?;
     fs::write(&paths.serve_pid, child.id().to_string())
         .with_context(|| format!("write {}", paths.serve_pid.display()))?;
 
     if args.wait_secs == 0 {
-        println!("{}", render_start_summary(child.id(), &paths, &effective));
-        return Ok(());
+        let pid = child.id();
+        return emit(
+            json_out,
+            json!({
+                "action": "started",
+                "status": "starting",
+                "pid": pid,
+                "address": address_label(&effective).primary,
+                "health": "not checked",
+                "model": effective.config.default_model,
+                "pid_file": paths.serve_pid,
+                "log": paths.serve_log,
+            }),
+            || render_start_summary(pid, &paths, &effective),
+        );
     }
 
     match wait_for_health(&effective, Duration::from_secs(args.wait_secs)).await {
         Ok(()) => {
             let status = current_status(&paths, &effective).await;
-            println!(
-                "{}",
-                status.render("Hipfire server is ready.", &paths, &effective)
-            );
-            Ok(())
+            emit(
+                json_out,
+                status.to_json("started", &paths, &effective),
+                || status.render("Hipfire server is ready.", &paths, &effective),
+            )
         }
         Err(err) => {
             let status = current_status(&paths, &effective).await;
-            let mut output = status.render(
-                "Hipfire server started, but is not ready yet.",
-                &paths,
-                &effective,
-            );
-            let _ = write!(
-                output,
-                "\n\n  Wait error  {err}\n  Next step   tail -f {}",
-                human_path(&paths.serve_log)
-            );
-            println!("{output}");
-            Ok(())
+            let mut value = status.to_json("started", &paths, &effective);
+            value["wait_error"] = json!(err.to_string());
+            emit(json_out, value, || {
+                let mut output = status.render(
+                    "Hipfire server started, but is not ready yet.",
+                    &paths,
+                    &effective,
+                );
+                let _ = write!(
+                    output,
+                    "\n\n  Wait error  {err}\n  Next step   tail -f {}",
+                    human_path(&paths.serve_log)
+                );
+                output
+            })
         }
     }
 }
@@ -151,20 +192,29 @@ pub async fn stop(args: StopArgs, loaded: LoadedConfig) -> Result<()> {
     let paths = DaemonPaths::new()?;
     let status = current_status(&paths, &loaded).await;
     let Some(pid) = status.pid else {
-        println!("hipfire is not running: no {}", paths.serve_pid.display());
-        return Ok(());
+        return emit(
+            args.json,
+            json!({"action": "noop", "running": false, "pid_file": paths.serve_pid}),
+            || format!("hipfire is not running: no {}", paths.serve_pid.display()),
+        );
     };
     if !pid_alive(pid) {
-        println!("hipfire serve pid {pid} is not alive; removing stale pid file");
         let _ = fs::remove_file(&paths.serve_pid);
-        return Ok(());
+        return emit(
+            args.json,
+            json!({"action": "cleared-stale-pid", "running": false, "pid": pid}),
+            || format!("hipfire serve pid {pid} is not alive; removing stale pid file"),
+        );
     }
 
     if args.force {
         signal(pid, libc::SIGKILL)?;
         let _ = fs::remove_file(&paths.serve_pid);
-        println!("sent SIGKILL to hipfire serve pid {pid}");
-        return Ok(());
+        return emit(
+            args.json,
+            json!({"action": "killed", "pid": pid, "signal": "SIGKILL"}),
+            || format!("sent SIGKILL to hipfire serve pid {pid}"),
+        );
     }
 
     signal(pid, libc::SIGTERM)?;
@@ -172,19 +222,37 @@ pub async fn stop(args: StopArgs, loaded: LoadedConfig) -> Result<()> {
     while Instant::now() < deadline {
         if !pid_alive(pid) {
             let _ = fs::remove_file(&paths.serve_pid);
-            println!("stopped hipfire serve pid {pid}");
-            return Ok(());
+            return emit(
+                args.json,
+                json!({"action": "stopped", "pid": pid, "signal": "SIGTERM"}),
+                || format!("stopped hipfire serve pid {pid}"),
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     signal(pid, libc::SIGKILL)?;
     let _ = fs::remove_file(&paths.serve_pid);
-    println!("sent SIGKILL to hipfire serve pid {pid} after graceful stop timed out");
-    Ok(())
+    emit(
+        args.json,
+        json!({
+            "action": "killed",
+            "pid": pid,
+            "signal": "SIGKILL",
+            "graceful_timeout": true,
+        }),
+        || format!("sent SIGKILL to hipfire serve pid {pid} after graceful stop timed out"),
+    )
 }
 
 pub async fn restart(args: RestartArgs, loaded: LoadedConfig) -> Result<()> {
-    stop(StopArgs { force: false }, loaded.clone()).await?;
+    stop(
+        StopArgs {
+            force: false,
+            json: args.json,
+        },
+        loaded.clone(),
+    )
+    .await?;
     start(
         StartArgs {
             host: args.host,
@@ -192,17 +260,19 @@ pub async fn restart(args: RestartArgs, loaded: LoadedConfig) -> Result<()> {
             model: args.model,
             debug_chat: args.debug_chat,
             wait_secs: args.wait_secs,
+            json: args.json,
         },
         loaded,
     )
     .await
 }
 
-pub async fn status(_args: StatusArgs, loaded: LoadedConfig) -> Result<()> {
+pub async fn status(args: StatusArgs, loaded: LoadedConfig) -> Result<()> {
     let paths = DaemonPaths::new()?;
     let status = current_status(&paths, &loaded).await;
-    println!("{}", status.render("Hipfire server", &paths, &loaded));
-    Ok(())
+    emit(args.json, status.to_json("status", &paths, &loaded), || {
+        status.render("Hipfire server", &paths, &loaded)
+    })
 }
 
 #[derive(Clone)]
@@ -230,8 +300,24 @@ struct ServeStatus {
     health_text: Option<String>,
 }
 
+/// The derived, presentation-ready view of a [`ServeStatus`]. Extracted so the
+/// human block (`render`) and the `--json` object (`to_json`) cannot drift:
+/// both read the same labels, and a fix to the worker-down or bind logic lands
+/// in both at once.
+struct StatusView {
+    status: String,
+    address: String,
+    reachable: Option<String>,
+    process: String,
+    health: String,
+    version: Option<String>,
+    api_auth: Option<String>,
+    model: Option<String>,
+    note: Option<String>,
+}
+
 impl ServeStatus {
-    fn render(&self, title: &str, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
+    fn view(&self, paths: &DaemonPaths, loaded: &LoadedConfig) -> StatusView {
         let health = self
             .health_text
             .as_deref()
@@ -242,63 +328,96 @@ impl ServeStatus {
             h.get("worker_alive") == Some(&serde_json::Value::Bool(false))
                 || h.get("status").and_then(serde_json::Value::as_str) == Some("degraded")
         });
-        let status_label = if worker_down {
-            "degraded".to_string()
-        } else {
-            self.state_label().to_string()
-        };
-        let health_label = if worker_down {
-            "degraded (inference worker down)".to_string()
-        } else {
-            self.health_label().to_string()
-        };
         // Real bind + API-auth posture reported by the server (#192).
         let reported = health.as_ref().and_then(health_bind);
+        let field = |key: &str| -> Option<String> {
+            health
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        StatusView {
+            status: if worker_down {
+                "degraded".to_string()
+            } else {
+                self.state_label().to_string()
+            },
+            address: reported
+                .clone()
+                .unwrap_or_else(|| address_label(loaded))
+                .primary,
+            reachable: reported.as_ref().and_then(|bind| bind.reachable.clone()),
+            process: self.process_label(),
+            health: if worker_down {
+                "degraded (inference worker down)".to_string()
+            } else {
+                self.health_label().to_string()
+            },
+            version: field("version"),
+            api_auth: field("api_auth"),
+            model: health
+                .as_ref()
+                .and_then(health_model)
+                .map(ToString::to_string),
+            note: if worker_down {
+                Some(format!(
+                    "The HTTP front-end is up but the inference worker has exited; \
+                     requests fail until it respawns. See {}.",
+                    human_path(&paths.root.join("daemon.log"))
+                ))
+            } else {
+                self.note(paths, loaded)
+            },
+        }
+    }
+
+    fn to_json(
+        &self,
+        action: &str,
+        paths: &DaemonPaths,
+        loaded: &LoadedConfig,
+    ) -> serde_json::Value {
+        let view = self.view(paths, loaded);
+        json!({
+            "action": action,
+            "status": view.status,
+            "address": view.address,
+            "reachable": view.reachable,
+            "pid": self.pid,
+            "pid_alive": self.pid_alive,
+            "health": view.health,
+            "health_ok": self.health_ok,
+            "version": view.version,
+            "api_auth": view.api_auth,
+            "model": view.model,
+            "pid_file": paths.serve_pid,
+            "log": paths.serve_log,
+            "note": view.note,
+        })
+    }
+
+    fn render(&self, title: &str, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
+        let view = self.view(paths, loaded);
         let mut fields = vec![
-            ("Status", status_label),
-            (
-                "Address",
-                reported
-                    .clone()
-                    .unwrap_or_else(|| address_label(loaded))
-                    .primary,
-            ),
-            ("Process", self.process_label()),
-            ("Health", health_label),
+            ("Status", view.status),
+            ("Address", view.address),
+            ("Process", view.process),
+            ("Health", view.health),
         ];
-        if let Some(reachable) = reported.as_ref().and_then(|bind| bind.reachable.clone()) {
-            fields.push(("Reachable", reachable));
-        }
-        if let Some(version) = health
-            .as_ref()
-            .and_then(|value| value.get("version"))
-            .and_then(serde_json::Value::as_str)
-        {
-            fields.push(("Version", version.to_string()));
-        }
-        if let Some(auth) = health
-            .as_ref()
-            .and_then(|value| value.get("api_auth"))
-            .and_then(serde_json::Value::as_str)
-        {
-            fields.push(("API auth", auth.to_string()));
-        }
-        if let Some(model) = health.as_ref().and_then(health_model) {
-            fields.push(("Model", model.to_string()));
+        for (label, value) in [
+            ("Reachable", view.reachable),
+            ("Version", view.version),
+            ("API auth", view.api_auth),
+            ("Model", view.model),
+        ] {
+            if let Some(value) = value {
+                fields.push((label, value));
+            }
         }
         fields.push(("PID file", human_path(&paths.serve_pid)));
         fields.push(("Log", human_path(&paths.serve_log)));
-
-        let note = if worker_down {
-            Some(format!(
-                "The HTTP front-end is up but the inference worker has exited; \
-                 requests fail until it respawns. See {}.",
-                human_path(&paths.root.join("daemon.log"))
-            ))
-        } else {
-            self.note(paths, loaded)
-        };
-        render_block(title, &fields, note.as_deref())
+        render_block(title, &fields, view.note.as_deref())
     }
 
     fn state_label(&self) -> &'static str {

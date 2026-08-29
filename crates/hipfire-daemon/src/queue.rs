@@ -156,6 +156,7 @@ mod tests {
         match &frame.payload {
             Payload::Request(v) => v["tag"].as_str().unwrap_or_default().to_string(),
             Payload::Malformed(_) => "<malformed>".to_string(),
+            Payload::OwnerHungUp => "<owner-hung-up>".to_string(),
         }
     }
 

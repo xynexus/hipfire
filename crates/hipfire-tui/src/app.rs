@@ -82,6 +82,8 @@ pub struct App {
     pub active_model: String,
     pub tab: Tab,
     pub settings_easy: bool,
+    /// `?` / F1 key-reference overlay. Drawn over the active tab; any key closes it.
+    pub show_help: bool,
     pub settings_selected: usize,
     pub chat: ChatState,
     pub last_reload: String,
@@ -114,6 +116,7 @@ impl App {
             active_model,
             tab: Tab::Home,
             settings_easy: true,
+            show_help: false,
             settings_selected: 0,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),

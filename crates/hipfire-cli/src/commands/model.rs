@@ -58,6 +58,9 @@ enum ModelCommand {
     /// Interactive wizard: bring an external model (HuggingFace repo or local
     /// safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars.
     Induct(crate::commands::induct::InductArgs),
+    /// Detail the contents of a `.hfq` container. Alias of top-level
+    /// `hipfire inspect`; same arguments, same output.
+    Inspect(crate::commands::inspect::InspectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -112,6 +115,7 @@ pub fn run(args: ModelArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         ModelCommand::Compose(a) => run_compose(a, &loaded),
         ModelCommand::Decompose(a) => run_decompose(a, &loaded),
         ModelCommand::Induct(a) => crate::commands::induct::run_induct(a, loaded),
+        ModelCommand::Inspect(a) => crate::commands::inspect::run(a, loaded),
     }
 }
 
