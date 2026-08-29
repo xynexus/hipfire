@@ -31,17 +31,6 @@ pub fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> Mode
     }
 }
 
-/// Artifact memory for a non-HFQ / unparsed model: file size only, weight bytes
-/// reported as 0 (unknown) rather than guessed.
-pub fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
-    ModelArtifactMemory {
-        model_file_bytes: std::fs::metadata(path)
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or(0),
-        model_weight_bytes: 0,
-    }
-}
-
 /// Device-buffer byte size of one GPU tensor.
 pub fn tensor_bytes(tensor: &hipfire_rdna::GpuTensor) -> usize {
     tensor.buf.size()
