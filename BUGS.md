@@ -2775,36 +2775,80 @@ nothing else moved.
 last touched by `d36f2081f`, BEFORE `f5b32ea32` flipped the DeltaNet default, so
 they are stale in the same way and will drift on the next gfx1103 run.
 
-## The DeltaNet fp16 default raises MoE hidden-state divergence 320x (medium, OPEN)
+## [DIAGNOSED 2026-08-29] The fp16 DeltaNet state narrows once per LAUNCH, so per-token prefill rounds n times
 
-Newly visible once `tiny-prefill`'s hidden-state probe was made to actually run
-(entry above). Measured 2026-08-29 on halo, `qwen3_5_moe_indexed` fixture, the
-batched-vs-per-token hidden states a DFlash drafter consumes:
+Two beliefs were wrong and both are now measured, not argued.
 
-    DN state   kvarn divergence
-    fp32       3.31e-4   IDENTICAL across all layers
-    fp16       1.06e-1   FIRST DIVERGING LAYER: 0     <- 320x, over the 5e-2 ceiling
+**1. The KVarN per-token WRITE path is NOT broken. It was fixed.**
 
-Cause is `f5b32ea32 feat(deltanet): default the DeltaNet state to fp16`. That
-commit's evidence was token-level — "Generation is BYTE-IDENTICAL to fp32" — and
-this probe exists precisely because token equality does NOT imply hidden-state
-equality: the block's own header says "batched vs per-token hidden states diverge
-under QUANTISED KV while greedy token output stays byte-identical". So the
-commit's claim and this measurement are both true and not in conflict.
+With an FP32 DeltaNet state — i.e. both prefill paths fed identical inputs —
+batched and per-token agree under KVarN at 3.31e-4, FLAT:
 
-Why it matters: KVarN is the DEFAULT KV mode, its FA layers take the per-token
-fallback (`fa_kv_ok` fails for KVarN), and a drafter reads these hidden states.
-The q8 arm moved too, 1.06e-3 -> 1.04e-2, but stays under the ceiling.
+    n =  32  127  128  129  200   ->  3.31e-4 every time
 
-NOT fixed here, because the options are a judgement call, not a cleanup:
-  a) revert the fp16 default (costs the measured tau gain, 3.682 -> 4.103),
-  b) keep fp16 but fix the KVarN per-token write path the probe warns about
-     ("the per-token fallback is MEASURED to emit a different token stream than
-     the batched path on qwen3.5 MoE"), or
-  c) accept it with a raised, justified ceiling — but the ceiling's own comment
-     says it "does not claim the current divergence is acceptable".
+including straight through the 128-token flush boundary that used to step
+(`n=127 2.29e-2, n=128 3.90e-2`, recorded when the bug was live). The
+segment-then-flush ordering in `kvarn_attend` is what fixed it.
 
-Do NOT resolve this by raising the ceiling without picking one of these.
+The runtime warning in `prefill_batch.rs` still said "the per-token fallback is
+MEASURED to emit a different token stream ... Use --kv-mode q8 (or f32) until the
+KVarN per-token write path is fixed", which steered users off the DEFAULT KV mode
+for a bug that no longer exists. Corrected. The `fa_kv_ok` comment in
+`tests/tiny-prefill-gate.sh` was stale the same way: it claimed KVarN fails that
+test and takes the per-token fallback, but `fa_kv_ok` gained
+`|| kv_cache.quant_kvarn` as a perf fix (54 -> 301 tok/s), so KVarN takes the
+BATCHED arm exactly as Q8 does. Corrected.
+
+**2. There is no "f16 math" losing precision. The kernel already computes in f32.**
+
+`gated_delta_net_f16.hip` keeps `S_tile` as an FP32 working copy in LDS for the
+whole launch. The ONLY f16 is S's storage BETWEEN launches, narrowed once at the
+end of each launch. So:
+
+    batched prefill   1 launch for n tokens   -> 1 narrowing
+    per-token prefill n launches              -> n narrowings
+
+That is the entire mechanism. Measured at the DeltaNet layer (layer 0, no KV
+involved, identical under q8 and KVarN):
+
+    n =    8     16     32     64    128
+        1.15e-3 1.15e-3 1.63e-3 1.63e-3 2.36e-3
+
+Growing sublinearly with n, consistent with accumulated rounding — 1.63e-3 at
+n=32 is close to the random-walk estimate sqrt(32) * 2^-11 = 2.8e-3.
+
+KVarN is the AMPLIFIER, not the source: the same 1.63e-3 layer-0 split reaches
+1.04e-2 by the next layer under q8 and 1.06e-1 under KVarN.
+
+**3. The dither makes path agreement WORSE, while helping long-run drift.**
+
+    dither on   L0 1.63e-3   L1 1.04e-2
+    dither off  L0 1.27e-3   L1 6.61e-3
+
+`f32_to_f16_dither` keys on the VALUE'S OWN BITS, so two paths whose values
+already differ slightly make DIFFERENT rounding decisions; round-to-nearest is
+correlated across paths and tracks better. The dither is still right for its
+stated purpose (breaking correlated bias on a recurrent accumulator, where drift
+was measured superlinear), but it trades that against batched-vs-per-token
+agreement. Previously undocumented.
+
+**Fixing it properly — two options, neither implemented, both real work:**
+
+  a) Keep S in FP32 for the duration of a multi-token prefill and narrow once at
+     the end. The PERSISTENT state stays fp16, so the memory win the fp16 default
+     bought (~149 MB -> ~75 MB on a 27B) is kept; only a transient prefill-time
+     shadow is fp32. Makes per-token match batched exactly, because both then
+     narrow once.
+
+  b) Store S as fp16 PLUS an int8 residual of the discarded mantissa bits: 3
+     bytes/element against fp32's 4, recovering ~8 mantissa bits, so per-narrowing
+     error drops from ~2^-11 to ~2^-19 (~256x). Cheaper than fp32 but gives back a
+     third of the memory win, and the residual has to join the spec-decode
+     snapshot or the kernel's documented restore-exactly property breaks.
+
+(a) is the better trade unless the state is being narrowed often outside prefill.
+
+Do NOT "fix" this by raising the tiny-prefill ceiling.
 
 ## [RESOLVED 2026-08-29 for state+quant; prefill open — see the entry above] Three tiny-gate cells are already failing on origin/master
 

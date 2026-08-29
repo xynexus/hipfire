@@ -96,13 +96,19 @@ PREFILL="${HIPFIRE_TINYPREFILL_PREFILL:-64}"
 DECODE="${HIPFIRE_TINYPREFILL_DECODE:-4}"
 TOL="${HIPFIRE_TINYPREFILL_TOL:-1e-4}"
 SEED="${HIPFIRE_TINYPREFILL_SEED:-42}"
-# Both KV modes, because they select DIFFERENT FA arms and each leaves the other
-# untested. `fa_kv_ok` (prefill_chunk.rs:2313) holds for Q8, so FA layers take the
-# BATCHED arm; KVarN is `quantized` but none of q8/asym{2,3,4}, so it fails that
-# test and FA layers take the PER-TOKEN FALLBACK. KVarN is also the default KV
-# mode, so that fallback is production code. Verified by instrumentation, not
-# assumed: a temporary print inside the fallback fired 0 times under q8 and once
-# under kvarn.
+# Both KV modes, because they exercise DIFFERENT attention implementations and
+# each leaves the other untested. KVarN is also the default KV mode.
+#
+# ⚠️ This comment used to say KVarN failed `fa_kv_ok` and sent FA layers down the
+# per-token fallback. That is STALE: `fa_kv_ok` (prefill_chunk.rs) now includes
+# `|| kv_cache.quant_kvarn`, added as a perf fix (54 -> 301 tok/s on a 27B with
+# 16 FA layers), so KVarN takes the BATCHED arm exactly as Q8 does.
+#
+# What the two modes actually separate here is SENSITIVITY. Given the same
+# perturbed input, KVarN attention amplifies it ~10x more than Q8: measured
+# 2026-08-29, a 1.63e-3 split at the DeltaNet layer reaches 1.04e-2 under q8 and
+# 1.06e-1 under kvarn. With an FP32 DeltaNet state — i.e. no input split at all —
+# both agree at 3.31e-4, flat across the 128-token flush boundary.
 IFS=',' read -r -a kv_modes <<<"${HIPFIRE_TINYPREFILL_KV:-q8,kvarn}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"

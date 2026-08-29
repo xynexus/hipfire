@@ -6484,8 +6484,34 @@ pub fn forward_prefill_batch_with_pbs_opts(
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // RE-MEASURED 2026-08-29. The earlier text here blamed the KVarN
+                // per-token WRITE path and told people to leave the default KV
+                // mode. Both were wrong:
+                //
+                //   * With an FP32 DeltaNet state, batched and per-token agree at
+                //     3.31e-4 under KVarN, FLAT across n=32/127/128/129/200 —
+                //     straight through the 128-token flush boundary that used to
+                //     step (n=127 2.29e-2, n=128 3.90e-2). That write path is
+                //     fixed; the segment-then-flush ordering in `kvarn_attend`
+                //     is what fixed it.
+                //   * The divergence that remains is the FP16 DeltaNet state.
+                //     It is narrowed once per LAUNCH, so batched (1 launch for n
+                //     tokens) rounds once where per-token rounds n times. Layer 0
+                //     — a DeltaNet layer, no KV involved — splits 1.15e-3 at n=8
+                //     rising to 2.36e-3 at n=128, identically under q8 and KVarN.
+                //
+                // KVarN is the AMPLIFIER, not the source: the same layer-0 split
+                // reaches 1.04e-2 by the next layer under q8 and 1.06e-1 under
+                // KVarN. So the lever is the DN state precision, not the KV mode.
                 eprintln!(
-                    "[prefill] WARNING: batched prefill declined and KV is KVarN ({} bit) —                      the per-token fallback is MEASURED to emit a different token stream than                      the batched path on qwen3.5 MoE, while f32 and q8 KV agree between the two.                      Output from this point is not trustworthy. Use --kv-mode q8 (or f32) until                      the KVarN per-token write path is fixed.                      (base={pbs_eligible_base} kv_f32={kv_f32} n={n} arch={arch} dn_quant={:?})",
+                    "[prefill] WARNING: batched prefill declined and KV is KVarN ({} bit). \
+                     The per-token fallback rounds the FP16 DeltaNet state once per token \
+                     where the batched path rounds once per chunk, so hidden states will \
+                     differ (~1e-3 at the DeltaNet layer, amplified ~65x by KVarN attention). \
+                     A drafter reads those. Token output is usually unaffected. \
+                     To reproduce the batched path exactly, set HIPFIRE_DN_STATE_FP16=0; \
+                     the KV mode is not the lever. \
+                     (base={pbs_eligible_base} kv_f32={kv_f32} n={n} arch={arch} dn_quant={:?})",
                     kv_cache.kvarn_bits, dn_state.quant,
                 );
             }
