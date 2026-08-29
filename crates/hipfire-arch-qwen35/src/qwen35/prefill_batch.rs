@@ -804,6 +804,14 @@ pub fn prefill_session_batch_attention_kvarn_layer(
     max_seq: usize,
     max_ctx_len: usize,
     row_count: usize,
+    // K code width from the cache — `KvarnBatchFlushContext::bits`, the same
+    // value the flush writes with. Assuming 4 here is what made kvarn2/kvarn8
+    // read records at the wrong stride and unpack them at the wrong width.
+    bits: usize,
+    // Absolute index of the first row this launch covers. The caller attends
+    // one window SEGMENT at a time, so this is the segment start and
+    // `row_count` is that segment's length.
+    row_offset: usize,
 ) -> HipResult<()> {
     if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
         return Err(hip_bridge::HipError::new(
@@ -831,6 +839,8 @@ pub fn prefill_session_batch_attention_kvarn_layer(
         max_seq,
         max_ctx_len,
         row_count,
+        bits,
+        row_offset,
     )
 }
 
@@ -1442,6 +1452,23 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
             ));
         }
         if signature.dn_quant != StateQuant::FP32 {
+            // f5b32ea32 flipped the family default to FP16 DeltaNet state without
+            // widening this contract, so the dense fused prefix went dark for every
+            // dense Qwen3.5 model and quietly fell back to serial. The grouped-MoE
+            // sibling (below) accepts FP32 | FP16 because it HAS an FP16 arm
+            // (`grouped_moe_prefill_session_batch_gated_delta_net_f16_layer`); the
+            // dense path does not, so accepting FP16 here would run FP16 state
+            // through FP32 code — a wrong answer instead of a slow one.
+            //
+            // Keep refusing, but say so where the operator can see it: this is a
+            // silent throughput cliff, not a config error on their part.
+            hipfire_rdna::kernel_trace::record_fallback(
+                "dense fused prefill DISABLED: DeltaNet state is not FP32",
+                &format!(
+                    "row {idx} dn_quant={:?}; the family default became FP16 at                      f5b32ea32 and the dense fused path has no FP16 arm, so prefill                      runs serial. Set deltanet_state_precision=fp32 to re-enable it,                      or add the dense FP16 arm.",
+                    signature.dn_quant,
+                ),
+            );
             return Err(format!(
                 "dense session fused prefix row {idx} has {:?} DeltaNet state; first fused target is FP32 DeltaNet state",
                 signature.dn_quant,
@@ -3010,22 +3037,36 @@ fn forward_dense_session_batch_layers_full_precision(
                                 config.head_dim,
                             )?;
                         }
+                        // Attend THIS segment's rows here, not after the loop.
+                        // The window is a `group`-slot ring, and the attention
+                        // kernel derives each row's window base from its OWN
+                        // position — so it assumes the window still holds that
+                        // row's own trailing partial block. Attending once at the
+                        // end broke that for every row a later segment wrapped:
+                        // those rows read whatever tokens now occupy the slots,
+                        // which are in the FUTURE relative to the row. The
+                        // single-session path has attended inside its segment loop
+                        // for exactly this reason since 8ea5a303e.
+                        if seg_rows > 0 {
+                            prefill_session_batch_attention_kvarn_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_q_batch,
+                                &pbs.fa_attn_out_batch,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                max_ctx_len,
+                                max_ctx_len,
+                                seg_rows,
+                                kvarn.bits,
+                                seg_start,
+                            )?;
+                        }
                         seg_start = split;
                     }
-                    prefill_session_batch_attention_kvarn_layer(
-                        gpu,
-                        device_tables,
-                        route_shape,
-                        layer_idx,
-                        &pbs.fa_q_batch,
-                        &pbs.fa_attn_out_batch,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        max_ctx_len,
-                        max_ctx_len,
-                        row_count,
-                    )?;
                 } else if kv_q8 {
                     // Plain-Q8 KV: the routed write/attention helpers are shared
                     // with the grouped-MoE fused path — they are FFN-agnostic and
@@ -4472,24 +4513,36 @@ fn forward_grouped_moe_session_batch_layers(
                                 config.head_dim,
                             )?;
                         }
+                        // Attend THIS segment's rows here, not after the loop.
+                        // The window is a `group`-slot ring, and the attention
+                        // kernel derives each row's window base from its OWN
+                        // position — so it assumes the window still holds that
+                        // row's own trailing partial block. Attending once at the
+                        // end broke that for every row a later segment wrapped:
+                        // those rows read whatever tokens now occupy the slots,
+                        // which are in the FUTURE relative to the row. The
+                        // single-session path has attended inside its segment loop
+                        // for exactly this reason since 8ea5a303e.
+                        if seg_rows > 0 {
+                            prefill_session_batch_attention_kvarn_layer(
+                                gpu,
+                                device_tables,
+                                route_shape,
+                                layer_idx,
+                                &pbs.fa_q_batch,
+                                &pbs.fa_attn_out_batch,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                max_ctx_len,
+                                max_ctx_len,
+                                seg_rows,
+                                kvarn.bits,
+                                seg_start,
+                            )?;
+                        }
                         seg_start = split;
                     }
-                    // Attention reads records + window together, so it runs once
-                    // over the whole batch after every segment has landed.
-                    prefill_session_batch_attention_kvarn_layer(
-                        gpu,
-                        device_tables,
-                        route_shape,
-                        layer_idx,
-                        &pbs.fa_q_batch,
-                        &pbs.fa_attn_out_batch,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        max_ctx_len,
-                        max_ctx_len,
-                        row_count,
-                    )?;
                 } else if kv_q8 {
                     prefill_session_batch_write_q8_kv_layer(
                         gpu,

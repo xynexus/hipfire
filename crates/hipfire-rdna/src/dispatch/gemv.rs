@@ -1422,15 +1422,19 @@ impl Gpu {
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
     }
-    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
-    /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
+    /// MagnumQuant GEMV: HFQ4-G256 against an ALREADY FWHT-rotated `x`.
+    ///
+    /// The kernel takes five parameters — `A, x_rot, y, M, K` — and does no
+    /// rotation itself; rotate with `rotate_x_mq` first. It used to take the two
+    /// FWHT sign tables and rotate internally, and this dispatch went on passing
+    /// them after the kernel stopped accepting them. HIP takes the argument count
+    /// from the code object, so `M` and `K` were bound from the low 32 bits of the
+    /// two sign POINTERS instead of from `m`/`k`.
     pub fn gemv_mq4g256(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
-        signs1: &GpuTensor,
-        signs2: &GpuTensor,
         m: usize,
         k: usize,
     ) -> HipResult<()> {
@@ -1440,16 +1444,12 @@ impl Gpu {
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
-        let mut s1_ptr = signs1.buf.as_ptr();
-        let mut s2_ptr = signs2.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
             &mut y_ptr as *mut _ as *mut c_void,
-            &mut s1_ptr as *mut _ as *mut c_void,
-            &mut s2_ptr as *mut _ as *mut c_void,
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];

@@ -11,6 +11,8 @@ pub mod feature_flags;
 pub mod gdn_chunk;
 pub mod generic_warn;
 pub mod gtt_share;
+#[cfg(test)]
+mod kernel_arity;
 pub mod kernel_trace;
 mod kernels;
 pub mod pool;
