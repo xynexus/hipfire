@@ -11,7 +11,7 @@ use crate::kernels;
 // GpuTensor + DType now live in the leaf hipfire-gpu-types crate (review 3.11b).
 // Re-exported here so `dispatch::{GpuTensor, DType}` — and the crate-root
 // re-export in lib.rs — keep resolving, and bare references in this module work.
-use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
+use hip_bridge::{BufferOrigin, DeviceBuffer, HipResult, HipRuntime, Rocblas};
 pub use hipfire_gpu_types::{DType, GpuTensor};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -507,6 +507,13 @@ pub trait ActivationCapture: Send + Sync {
 /// count, and only the count explains an OOM at 11.6 GiB of payload.
 pub static UPLOAD_RAW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UPLOAD_RAW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count of non-owning buffers that reached [`Gpu::dispose`], and a latch so the
+/// warning is printed once rather than per teardown. Process-wide rather than a
+/// `Gpu` field so no constructor has to thread it, matching `kernel_trace`'s
+/// `WARNED` precedent.
+static NON_OWNING_DISPOSES: AtomicUsize = AtomicUsize::new(0);
+static NON_OWNING_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn upload_raw_census(len: usize) {
     // Resolved once: this is called per weight tensor, ~20k times on a 256-expert
@@ -2339,9 +2346,61 @@ impl Gpu {
         })
     }
 
+    /// Return one buffer to whichever allocator owns it.
+    ///
+    /// The ONLY place [`BufferOrigin`] is read. Every free path routes through
+    /// here, so the pooled/direct/non-owning decision exists once instead of at
+    /// each of the ~1500 `free_tensor` call sites — which is the whole point of
+    /// tagging the buffer. Infallible: a failing `hipFree` at teardown is worth
+    /// a warning, not an unwind through a Drop or a mailbox drain.
+    fn dispose(&mut self, buf: DeviceBuffer) {
+        match buf.origin() {
+            BufferOrigin::Pooled => self.pool.free(buf),
+            BufferOrigin::Direct => {
+                if let Err(e) = self.hip.free(buf) {
+                    eprintln!("  warning: hipFree failed during dispose: {e:?}");
+                }
+            }
+            BufferOrigin::NonOwning => {
+                // Correct disposal for a view is NEITHER allocator, so doing
+                // nothing here is right. Arriving at all is not: it means a
+                // caller handed us memory it does not own. Today that is
+                // harmless; before the tag it was #262, where the alias went to
+                // the pool and came back as scratch over live weights.
+                debug_assert!(
+                    false,
+                    "dispose() on a non-owning buffer ({:p}, {} B) — aliasing bug",
+                    buf.as_ptr(),
+                    buf.size()
+                );
+                NON_OWNING_DISPOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !NON_OWNING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "  warning: dispose() on a non-owning buffer ({:p}, {} B) — an alias \
+                         is being freed as if owned. Harmless, but it is an ownership bug; see \
+                         docs/todo/free-tensor-provenance.md. Further occurrences are counted \
+                         (Gpu::non_owning_disposes), not logged.",
+                        buf.as_ptr(),
+                        buf.size()
+                    );
+                }
+                // `buf` drops here. `DeviceBuffer` has no `Drop`, so nothing is
+                // released — which is exactly the disposal a view needs.
+            }
+        }
+    }
+
+    /// How many times a non-owning buffer reached [`Gpu::dispose`] this process.
+    ///
+    /// Non-zero means an alias is being freed as if it were owned somewhere.
+    /// The target is zero; debug builds assert on the first one.
+    pub fn non_owning_disposes(&self) -> usize {
+        NON_OWNING_DISPOSES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.pool.free(tensor.buf);
+        self.dispose(tensor.buf);
         Ok(())
     }
 
@@ -2421,8 +2480,15 @@ impl Gpu {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => return,
         };
+        if !pending.is_empty() {
+            // `upload_raw_owned` puts a DIRECT buffer in the mailbox, and
+            // disposing of one is a `hipFree` — a device call, unlike the
+            // `pool.free` this used to be. Bind once for the batch. Still
+            // infallible: `bind_thread_or_warn` warns rather than returning.
+            self.bind_thread_or_warn();
+        }
         for buf in pending {
-            self.pool.free(buf);
+            self.dispose(buf);
         }
     }
 
@@ -2439,7 +2505,7 @@ impl Gpu {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default();
         for buf in pending {
-            self.pool.free(buf);
+            self.dispose(buf);
         }
         self.pool.drain(&self.hip);
     }
