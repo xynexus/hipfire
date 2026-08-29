@@ -296,6 +296,20 @@ pub fn act_tiers_from_env() -> ActTiers {
 ///
 /// In-place also avoids the alloc/free churn [`crate::kv_noise`] needs —
 /// `GpuTensor` has no `Drop`, and this runs on four tensors per block per step.
+/// Whether activation sim-quant runs in the codec's FWHT basis — the basis the
+/// deployed W4A4 GEMM actually uses. True unless `HIPFIRE_QAT_ACT_UNROTATED=1`.
+///
+/// Public so callers can REPORT it. A quantization basis visible only inside this
+/// function is exactly the kind of knob that silently invalidates a sweep: it
+/// already did, when every Stage A2 activation arm was measured in the raw
+/// channel basis and nothing in the output said so.
+///
+/// This is the env-level answer; a tensor whose feature width is not a multiple
+/// of [`GROUP`] is left unrotated regardless.
+pub fn act_rotate_from_env() -> bool {
+    std::env::var("HIPFIRE_QAT_ACT_UNROTATED").ok().as_deref() != Some("1")
+}
+
 /// The codec's per-256 signed FWHT applied to every row, in place. `inverse`
 /// swaps the sign tables, which is how `signed_fwht` inverts.
 fn fwht_rows(x: &mut [f32], rows: usize, feat: usize, inverse: bool) {
@@ -335,8 +349,7 @@ pub fn maybe_quant_act(
     //
     // HIPFIRE_QAT_ACT_UNROTATED=1 restores the old behaviour to reproduce the
     // superseded Stage A2/A2b activation arms.
-    let rotate = feat % GROUP == 0
-        && std::env::var("HIPFIRE_QAT_ACT_UNROTATED").ok().as_deref() != Some("1");
+    let rotate = feat % GROUP == 0 && act_rotate_from_env();
     if rotate {
         fwht_rows(&mut host, rows, feat, false);
     }

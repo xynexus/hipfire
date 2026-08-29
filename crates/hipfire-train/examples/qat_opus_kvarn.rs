@@ -361,6 +361,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Student runs the requested weight tier + activation tier + (optionally)
     // KVarN. Whatever we train with, we eval with.
+    // Report the quantization BASIS, not just the width. The deployed W4A4 GEMM
+    // runs in the codec's FWHT basis; quantizing in the raw channel basis models
+    // a far harsher grid, which is exactly how the first Stage A2 sweep went
+    // wrong while its output looked identical.
+    let act_basis = if hipfire_train::a4_quant::act_rotate_from_env() {
+        "codec FWHT basis (deployed)"
+    } else {
+        "RAW CHANNEL BASIS — NOT what deploys"
+    };
     if act_tiers.is_noop() {
         println!(
             "student activations: A16 (unquantized; set HIPFIRE_QAT_ACT=a8|a4, or a \
@@ -369,8 +378,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         std::env::set_var("HIPFIRE_QAT_ACT", &act_tier);
         println!(
-            "student activations: {} (per-group symmetric, GROUP=256, absmax) — forward-only STE",
-            act_tiers.label()
+            "student activations: {} (per-group symmetric, GROUP=256, absmax) in the {} \
+             — forward-only STE",
+            act_tiers.label(),
+            act_basis
         );
     }
     if kvnoise {
@@ -478,9 +489,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pct = |a: f32, b: f32| if a > 1e-6 { 100.0 * (a - b) / a } else { 0.0 };
     println!(
-        "\n  ── {} {}{} recovery-FT ──",
+        "\n  ── {} {}{}{} recovery-FT ──",
         tier.width(),
         act_tiers.label(),
+        // Carried into the summary line too: this is the line that gets grepped
+        // into results tables, so the basis must travel with the number.
+        match (
+            act_tiers.is_noop(),
+            hipfire_train::a4_quant::act_rotate_from_env()
+        ) {
+            (true, _) => "",
+            (false, true) => "/F",
+            (false, false) => "/RAW",
+        },
         if kvnoise { "+KVarN" } else { "" }
     );
     println!(
