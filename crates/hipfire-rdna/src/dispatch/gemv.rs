@@ -4788,6 +4788,24 @@ impl Gpu {
         k: usize,
         row_stride: usize,
     ) -> HipResult<()> {
+        // The ONLY GEMV whose addressing depends on a caller-supplied stride:
+        // `row_base = A + row * row_stride`. A wrong value — 0 above all, the
+        // default a hand-rolled `WeightRef` literal carries — makes every output
+        // row dot WEIGHT ROW 0 and still return success. Validate here, at the one
+        // place that consumes it, rather than auditing every literal that builds a
+        // `WeightRef`.
+        let expected = hipfire_gpu_types::q8hfq_row_stride(k);
+        if row_stride != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemv_q8hfq: row_stride={row_stride} but the Q8HFQ layout for \
+                     K={k} is {expected} bytes/row — the caller lost the weight's \
+                     stride. Build the WeightRef from WeightTensor::dispatch_ref \
+                     instead of a literal."
+                ),
+            ));
+        }
         self.bind_thread()?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();

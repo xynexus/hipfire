@@ -113,6 +113,19 @@ pub enum DType {
     Raw, // raw bytes, no element interpretation
 }
 
+/// Byte stride of one `Q8HFQ` weight row: `[f16 scale x K/32 | int8 value x K]`
+/// padded up to a 128-byte boundary.
+///
+/// The single definition of that layout. `Q8HFQ` is the ONLY dtype whose GEMV
+/// kernel indexes with a caller-supplied row stride (`row_base = A + row *
+/// row_stride`, `kernels/src/gemv_q8hfq*.hip`), so a caller that guesses the
+/// value — or leaves it 0, the default a hand-rolled `WeightRef` literal
+/// carries — makes every output row dot weight row 0 and still returns success.
+/// The loaders and the dispatch guard both derive it here so they cannot drift.
+pub const fn q8hfq_row_stride(k: usize) -> usize {
+    ((k / 32) * 2 + k + 127) & !127
+}
+
 impl DType {
     pub fn size(self) -> usize {
         match self {
@@ -313,6 +326,20 @@ impl GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len_elems * self.dtype.size()) },
             shape: vec![len_elems],
             dtype: self.dtype,
+        }
+    }
+}
+
+#[cfg(test)]
+mod q8hfq_layout_tests {
+    #[test]
+    fn q8hfq_row_stride_pads_scales_plus_values_to_128b() {
+        assert_eq!(super::q8hfq_row_stride(4096), 4352);
+        assert_eq!(super::q8hfq_row_stride(896), 1024);
+        for k in [256usize, 896, 1024, 4096, 8192] {
+            let s = super::q8hfq_row_stride(k);
+            assert_eq!(s % 128, 0, "K={k} stride {s} must be 128B-aligned");
+            assert!(s >= (k / 32) * 2 + k, "K={k} stride {s} must hold the row");
         }
     }
 }

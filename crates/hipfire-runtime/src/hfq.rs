@@ -2429,9 +2429,7 @@ fn load_weight_tensor(
         }
         5 => {
             // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
-            let n_groups = k / 32;
-            let raw_row = n_groups * 2 + k;
-            let row_stride = (raw_row + 127) & !127;
+            let row_stride = hipfire_rdna::q8hfq_row_stride(k);
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
