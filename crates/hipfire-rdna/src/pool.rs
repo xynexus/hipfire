@@ -22,7 +22,48 @@ pub struct GpuPool {
     pub total_new: usize,
 }
 
+/// A snapshot of pool accounting, for leak hunting.
+///
+/// The discriminating pair is `total_new` against `free_buffers`: a workload
+/// that allocates and returns the same shapes every iteration should see
+/// `total_new` go flat once warm. `total_new` climbing while `free_buffers`
+/// stays put means buffers are being allocated and never handed back — a
+/// `GpuTensor` dropped without `free_tensor` leaks exactly that way, since it
+/// has no `Drop`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuPoolStats {
+    /// Buffers served from a free list.
+    pub total_reused: usize,
+    /// Buffers that required a fresh `hipMalloc`.
+    pub total_new: usize,
+    /// Bytes ever freshly allocated (cumulative, never decremented).
+    pub total_allocated: usize,
+    /// Buffers currently parked on the free lists, and their bytes.
+    pub free_buffers: usize,
+    pub free_bytes: usize,
+    /// How many distinct power-of-2 buckets have free lists.
+    pub buckets: usize,
+}
+
 impl GpuPool {
+    /// Snapshot the pool counters plus the live free-list occupancy.
+    pub fn stats(&self) -> GpuPoolStats {
+        let mut free_buffers = 0usize;
+        let mut free_bytes = 0usize;
+        for list in self.free_lists.values() {
+            free_buffers += list.len();
+            free_bytes += list.iter().map(|b| b.size()).sum::<usize>();
+        }
+        GpuPoolStats {
+            total_reused: self.total_reused,
+            total_new: self.total_new,
+            total_allocated: self.total_allocated,
+            free_buffers,
+            free_bytes,
+            buckets: self.free_lists.len(),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             free_lists: HashMap::new(),

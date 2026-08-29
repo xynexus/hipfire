@@ -122,6 +122,36 @@ fn default_lmhead_twostage() -> String {
 fn default_oq_compact_multicol_wide() -> bool {
     false
 }
+/// Off: a routed-expert model keeps every expert resident unless asked
+/// otherwise, which is the behaviour every existing deployment already has.
+fn default_qwen35_paged_experts() -> bool {
+    false
+}
+/// Off. Prefill mints a Final checkpoint — a deep clone of the whole session
+/// state — for every request, and nothing can attach to it: the reuse path is
+/// gated on a `runtime_state_handle` no production caller ever sets. Releasing
+/// the request session does not free the clone, so each request retained a
+/// second session's worth of KV until the host ran out. Boundary checkpoints
+/// were already opt-in; this makes Final match them.
+fn default_qwen35_final_checkpoints() -> bool {
+    false
+}
+/// Matches the historical `HIPFIRE_QWEN35_EXPERT_CACHE_MB` fallback.
+fn default_qwen35_expert_cache_mb() -> u64 {
+    8192
+}
+/// On. The check is what turns an over-large load into a refusal instead of an
+/// OOM reaping unrelated processes on a UMA host.
+fn default_load_mem_check() -> bool {
+    true
+}
+/// Slack left for the rest of the system after a load. Not a KV estimate: the
+/// KV cache is sized after the model config is parsed, well past the check. 4
+/// GiB is enough to keep the session's supervisor processes alive so a
+/// too-large load fails as a refusal instead of as a reaping.
+fn default_load_mem_reserve_gib() -> u32 {
+    4
+}
 fn default_kv_window_precision() -> String {
     "auto".to_string()
 }
@@ -136,6 +166,33 @@ fn default_dflash_mode() -> String {
 }
 fn default_dflash_adaptive_b() -> bool {
     true
+}
+fn default_ngram_spec() -> bool {
+    false
+}
+fn default_ngram_store_root() -> String {
+    String::new()
+}
+fn default_ngram_scope() -> String {
+    String::new()
+}
+fn default_ngram_store_mb() -> u32 {
+    256
+}
+fn default_ngram_orders() -> String {
+    "8,7,6,5,4,3,2".to_string()
+}
+fn default_ngram_chain_floor() -> u8 {
+    8
+}
+fn default_ngram_max_spine() -> u32 {
+    16
+}
+fn default_ngram_promote_count() -> u16 {
+    3
+}
+fn default_ngram_write_target() -> String {
+    "user".to_string()
 }
 fn default_dflash_ngram_block() -> serde_json::Value {
     serde_json::Value::String("auto".to_string())
@@ -341,6 +398,26 @@ pub struct HipfireConfig {
     pub deltanet_state_precision: String,
     #[serde(default = "default_oq_compact_multicol_wide")]
     pub oq_compact_multicol_wide: bool,
+    /// Stream routed experts from host memory instead of keeping every expert
+    /// resident. The env var `HIPFIRE_QWEN35_PAGED_EXPERTS` still overrides.
+    #[serde(default = "default_qwen35_paged_experts")]
+    pub qwen35_paged_experts: bool,
+    /// Mint a Final checkpoint per prefilled session. Off by default — the
+    /// attach path that would consume it is unreachable, and the clone is never
+    /// freed. The env var `HIPFIRE_QWEN35_FINAL_CHECKPOINTS` still overrides.
+    #[serde(default = "default_qwen35_final_checkpoints")]
+    pub qwen35_final_checkpoints: bool,
+    /// Resident budget for the paged-expert cache, in MiB. Only meaningful with
+    /// `qwen35_paged_experts`.
+    #[serde(default = "default_qwen35_expert_cache_mb")]
+    pub qwen35_expert_cache_mb: u64,
+    /// Refuse a load that would not fit in `MemAvailable`. Turning this off on a
+    /// unified-memory host lets an over-large load invoke the OOM killer.
+    #[serde(default = "default_load_mem_check")]
+    pub load_mem_check: bool,
+    /// GiB of headroom the load check leaves for the rest of the system.
+    #[serde(default = "default_load_mem_reserve_gib")]
+    pub load_mem_reserve_gib: u32,
     #[serde(default = "default_lmhead_twostage")]
     pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
@@ -351,6 +428,51 @@ pub struct HipfireConfig {
     pub dflash_adaptive_b: bool,
     #[serde(default = "default_dflash_ngram_block")]
     pub dflash_ngram_block: serde_json::Value,
+    /// Opt-in drafter-free n-gram speculative decode. Drafts from token
+    /// statistics; on a miss the DFlash drafter runs unchanged.
+    #[serde(default = "default_ngram_spec")]
+    pub ngram_spec: bool,
+    /// Root directory for the persistent n-gram tables, or a RAM-only sentinel.
+    ///
+    /// Empty, `ram`, `none` or `off` all mean hot tier only — session-local
+    /// RAM, nothing written to disk. The word forms exist so the RAM case is
+    /// expressible as a value: in a settings UI an empty string is
+    /// indistinguishable from a field nobody has touched.
+    #[serde(default = "default_ngram_store_root")]
+    pub ngram_store_root: String,
+    /// Scope name identifying the *tokenizer* these tables belong to. Empty =
+    /// derive from the model filename, which never wrongly shares a table.
+    /// Set two models to the same scope only when they share a tokenizer —
+    /// records are token ids and mean nothing across tokenizers.
+    #[serde(default = "default_ngram_scope")]
+    pub ngram_scope: String,
+    /// Size of a newly created per-scope table, in MiB. This *is* the budget:
+    /// the file is allocated in full and never grows, so a full block evicts
+    /// rather than expanding. 256 MiB = 65536 blocks of 4 KiB.
+    #[serde(default = "default_ngram_store_mb")]
+    pub ngram_store_mb: u32,
+    /// Probe orders, longest first. Measured on 1M tokens of Rust: going past
+    /// quad keeps paying on code (2..5 -> 1.80 accepted/step, 2..8 -> 2.11),
+    /// and is flat on prose.
+    #[serde(default = "default_ngram_orders")]
+    pub ngram_orders: String,
+    /// After the first drafted token, only extend the chain while the winning
+    /// order is at least this. The load-bearing knob: without it the chain pads
+    /// to `max_spine` and burns verify width (floor 0 -> 16.0 drafted/step at
+    /// 20.6% efficiency; floor 8 -> 6.94 at 37.9%). 0 disables the gate.
+    #[serde(default = "default_ngram_chain_floor")]
+    pub ngram_chain_floor: u8,
+    #[serde(default = "default_ngram_max_spine")]
+    pub ngram_max_spine: u32,
+    /// Observations before a gram is worth a disk write. Gates persistence
+    /// only, never drafting — precision is flat across counts, and requiring a
+    /// count to draft measurably hurts (1.80 accepted/step at 1, 0.75 at 9).
+    #[serde(default = "default_ngram_promote_count")]
+    pub ngram_promote_count: u16,
+    /// Which store the write path feeds: `user`, `topic`, or `none`. Only a
+    /// store private to its scope may be written; a shared one is read-only.
+    #[serde(default = "default_ngram_write_target")]
+    pub ngram_write_target: String,
     #[serde(default = "default_mtp_mode")]
     pub mtp_mode: String,
     #[serde(default = "default_mtp_k")]
@@ -530,10 +652,24 @@ impl Default for HipfireConfig {
             kv_window_precision: default_kv_window_precision(),
             deltanet_state_precision: default_deltanet_state_precision(),
             oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
+            qwen35_paged_experts: default_qwen35_paged_experts(),
+            qwen35_final_checkpoints: default_qwen35_final_checkpoints(),
+            qwen35_expert_cache_mb: default_qwen35_expert_cache_mb(),
+            load_mem_check: default_load_mem_check(),
+            load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
+            ngram_spec: default_ngram_spec(),
+            ngram_store_root: default_ngram_store_root(),
+            ngram_scope: default_ngram_scope(),
+            ngram_store_mb: default_ngram_store_mb(),
+            ngram_orders: default_ngram_orders(),
+            ngram_chain_floor: default_ngram_chain_floor(),
+            ngram_max_spine: default_ngram_max_spine(),
+            ngram_promote_count: default_ngram_promote_count(),
+            ngram_write_target: default_ngram_write_target(),
             dflash_ngram_block: default_dflash_ngram_block(),
             mtp_mode: default_mtp_mode(),
             mtp_k: default_mtp_k(),

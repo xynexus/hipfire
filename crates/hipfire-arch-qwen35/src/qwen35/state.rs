@@ -366,13 +366,18 @@ impl DeltaNetState {
                     // kernels widen on load — there is no f16 DType at this
                     // layer, and labelling it F32 would make every downstream
                     // size calculation wrong.
-                    let buf = gpu.hip.malloc(s_size * 2)?;
-                    gpu.hip.memset(&buf, 0, s_size * 2)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size],
-                        dtype: DType::Raw,
-                    });
+                    //
+                    // Allocated through the POOL, not `hip.malloc`: `free_gpu`
+                    // returns these via `free_tensor`, which pushes to the
+                    // pool's free list. An unpooled alloc paired with a pooled
+                    // free is a one-way street — every session parked ~48
+                    // buffers the allocator would never look at again, so
+                    // device memory grew ~75 MB per request and never came
+                    // back. Ask for the byte count as `Raw` (size() == 1), then
+                    // restore the `[s_size]` shape the kernels index by.
+                    let mut t = gpu.zeros(&[s_size * 2], DType::Raw)?;
+                    t.shape = vec![s_size];
+                    s_matrices.push(t);
                     // f16 needs no scales (per-element exponent); the vector
                     // survives only because callers still index it.
                     s_scales.push(gpu.zeros(&[n_heads], DType::F32)?);
@@ -485,13 +490,12 @@ impl DeltaNetState {
                     s_scales.push(g.zeros(&[n_heads], DType::F32)?);
                 }
                 StateQuant::FP16 => {
-                    let buf = g.hip.malloc(s_size * 2)?;
-                    g.hip.memset(&buf, 0, s_size * 2)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size],
-                        dtype: DType::Raw,
-                    });
+                    // Pooled, for the same reason as the single-GPU path above:
+                    // `free_gpu` returns these through the pool, so allocating
+                    // around it strands the buffer permanently.
+                    let mut t = g.zeros(&[s_size * 2], DType::Raw)?;
+                    t.shape = vec![s_size];
+                    s_matrices.push(t);
                     s_scales.push(g.zeros(&[n_heads], DType::F32)?);
                 }
             }

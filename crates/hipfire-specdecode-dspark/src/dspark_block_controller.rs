@@ -24,7 +24,11 @@
 //! the ramp the argmax takes over for the remainder of the request.
 
 /// Cost-model draft-block controller for the DSpark drafter.
-pub(crate) struct BlockController {
+///
+/// Also driven by serving-core's DFlash decode loop (it is pure and
+/// drafter-agnostic: everything it needs is per-window accept depth,
+/// proposal count, and wall time).
+pub struct BlockController {
     block: usize,
     default_block: usize,
     min_block: usize,
@@ -72,12 +76,7 @@ const TIMING_WARMUP: u32 = 16;
 const RAMP_HOLD: u32 = 2;
 
 impl BlockController {
-    pub(crate) fn new(
-        default_block: usize,
-        min_block: usize,
-        max_block: usize,
-        p_star: f32,
-    ) -> Self {
+    pub fn new(default_block: usize, min_block: usize, max_block: usize, p_star: f32) -> Self {
         let default_block = default_block.clamp(min_block, max_block);
         Self {
             block: default_block,
@@ -101,11 +100,11 @@ impl BlockController {
         }
     }
 
-    pub(crate) fn block(&self) -> usize {
+    pub fn block(&self) -> usize {
         self.block
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         // Reset only request-specific state. Calibration (dt, t_ar, cost_ready,
         // timing_samples, t_window_by_n, calibrated) is a thermal-invariant hardware
         // cost — calibrate once, reuse across requests.
@@ -124,7 +123,7 @@ impl BlockController {
     /// which case the argmax should be free to climb toward the acceptance depth
     /// rather than be blocked by phantom marginal cost. Only a clearly-too-steep fit
     /// (Δt > t_ar/2, i.e. a thermal spike) is rejected. Preserved across reset().
-    pub(crate) fn observe_timing(&mut self, t_window_ms: f32, n_verify: usize) {
+    pub fn observe_timing(&mut self, t_window_ms: f32, n_verify: usize) {
         if (2..10).contains(&n_verify) && t_window_ms > 0.0 {
             let slot = &mut self.t_window_by_n[n_verify];
             *slot = if *slot == 0.0 {
@@ -170,7 +169,7 @@ impl BlockController {
     /// cost-model argmax. During the ramp phase (post-warmup, pre-ramp_end) the block
     /// sweeps min→max to seed the window-cost calibration and the survival estimate.
     /// After ramp_end the argmax drives the block for the remainder of the request.
-    pub(crate) fn observe(&mut self, accept_len: usize, n_proposed: usize) {
+    pub fn observe(&mut self, accept_len: usize, n_proposed: usize) {
         // Accumulate survival counts ONLY for depths we actually drafted (k ≤
         // n_proposed): for those k, `accept_len ≥ k` is a real observation. Depths above
         // n_proposed are unobservable this window, so their counts don't grow — S(k)

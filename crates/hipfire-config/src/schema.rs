@@ -480,6 +480,74 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          depended on knowing an env var."
     ),
     field!(
+        "qwen35_paged_experts",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Stream qwen3.5-MoE routed experts from host memory instead of keeping \
+         every expert resident. Lets a routed-expert artifact larger than the \
+         host's headroom load at all; costs a host-to-GPU fetch on an expert \
+         cache miss. Defaults OFF so existing deployments keep full residency.",
+        env: ["HIPFIRE_QWEN35_PAGED_EXPERTS"]
+    ),
+    field!(
+        "qwen35_final_checkpoints",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Mint a Final checkpoint for every prefilled qwen3.5 session. OFF by \
+         default: the checkpoint is a deep clone of the session state, nothing \
+         can attach to it (the reuse path needs a runtime_state_handle no \
+         production caller sets), and releasing the request session does not \
+         free it — so every request retained a second session's worth of KV \
+         until the host ran out. Semantic boundary checkpoints were already \
+         opt-in; this makes Final consistent with them. Turn on only when \
+         developing state-handle reuse.",
+        env: ["HIPFIRE_QWEN35_FINAL_CHECKPOINTS"]
+    ),
+    field!(
+        "qwen35_expert_cache_mb",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("8192"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Resident budget in MiB for the paged routed-expert cache. Only \
+         meaningful with qwen35_paged_experts. Larger trades host memory for \
+         fewer expert fetches.",
+        env: ["HIPFIRE_QWEN35_EXPERT_CACHE_MB"]
+    ),
+    field!(
+        "load_mem_check",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("true"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Refuse a load whose estimated resident size will not fit in \
+         MemAvailable. On a unified-memory host an over-large load does not \
+         fail the loader — it invokes the OOM killer on whatever else is \
+         running, so turn this off only when the estimate is known to \
+         over-count (e.g. paged experts, which it does not model).",
+        env: ["HIPFIRE_LOAD_MEM_CHECK"]
+    ),
+    field!(
+        "load_mem_reserve_gib",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("4"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "GiB the load check leaves free for the rest of the system. Enough to \
+         keep the session's supervisor processes alive so a too-large load \
+         fails as a refusal rather than a reaping.",
+        env: ["HIPFIRE_LOAD_MEM_RESERVE_GIB"]
+    ),
+    field!(
         "deltanet_state_precision",
         ConfigType::Enum {
             values: &["fp16", "fp32"]
@@ -566,6 +634,89 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
         "Whether DFlash may adapt draft batch size."
+    ),
+    field!(
+        "ngram_spec",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Opt-in drafter-free n-gram speculative decode."
+    ),
+    field!(
+        "ngram_store_root",
+        ConfigType::String,
+        Requirement::Optional,
+        Some(""),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only."
+    ),
+    field!(
+        "ngram_scope",
+        ConfigType::String,
+        Requirement::Optional,
+        Some(""),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Tokenizer scope name for n-gram tables; empty = derive from model file."
+    ),
+    field!(
+        "ngram_store_mb",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("256"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Size in MiB of a newly created n-gram table; this is the fixed budget."
+    ),
+    field!(
+        "ngram_orders",
+        ConfigType::String,
+        Requirement::Optional,
+        Some("8,7,6,5,4,3,2"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "n-gram probe orders, longest first, comma-separated."
+    ),
+    field!(
+        "ngram_chain_floor",
+        ConfigType::U8,
+        Requirement::Optional,
+        Some("8"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Minimum winning order to keep extending an n-gram chain; 0 disables."
+    ),
+    field!(
+        "ngram_max_spine",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("16"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Maximum n-gram draft spine length."
+    ),
+    field!(
+        "ngram_promote_count",
+        ConfigType::U16,
+        Requirement::Optional,
+        Some("3"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Observations before an n-gram is persisted; gates writes, not drafting."
+    ),
+    field!(
+        "ngram_write_target",
+        ConfigType::Enum {
+            values: &["user", "topic", "none"]
+        },
+        Requirement::Optional,
+        Some("user"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Which n-gram store the write path feeds."
     ),
     field!(
         "dflash_ngram_block",
