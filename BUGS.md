@@ -88,8 +88,31 @@ sites, not 2 of 4, the last two found by a new invariant test rather than by gre
 - **33 other hand-rolled `WeightRef` literals still hardcode `row_stride: 0`** —
   qwen35 GDN paths, deepseek4, dspark. Each is a bug only if a stride-carrying
   dtype can reach it. Untriaged.
-- `crates/hipfire-config/src/lib.rs:361` — `gpu_slab_load` registered, documented
-  and validated with no reader. Wire it or delete it; that is a product call.
+FIXED since: `gpu_slab_load` is now honoured (threaded via the same scoped-env
+seam the daemon already uses for two qwen35 knobs), and the `row_stride: 0`
+literals no longer need triage — `gemv_q8hfq`, the ONLY consumer of
+`WeightRef.row_stride`, now rejects a stride that does not match the Q8HFQ
+layout, so any caller that loses it fails loudly instead of dotting weight row 0.
+
+**The three spec-decode bugs above now have adversarially-checked, executable
+plans: `docs/bugs/2026-08-29-remaining-three-plans.md`.** Read the "why the
+obvious fix is wrong" section of each first — in ALL THREE the approach the
+original report suggested is wrong:
+
+- DDTree: mirroring `spec_step_dflash`'s eligibility predicate fails in both
+  directions. Eligibility is n-dependent and each DDTree verify uses a different
+  n; the tree verify needs a `kv_asym2_tree` term the DFlash predicate lacks; and
+  `forward_prefill_batch_single_chunk_captured_opts` writes the tape WITHOUT
+  consulting the predicate at all. The fix is a `captured_rows` counter — a record
+  of what actually happened — plus the `FullPrefill` fallback `spec_step_dflash`
+  already has. It also fixes two sibling bugs of the same class for free
+  (`mtp_spec.rs:2727`, `mtp_compose.rs:503/1161`).
+- MTP: `rows_to_keep = accept_dflash + accept_mtp + 1` on the contiguous scatter
+  copies the token the target just REJECTED. The accepted MTP child lives at tree
+  slot `b + (s-1)*mtp_k + k`, so the scatter must gather BY SLOT.
+- Gemma3: copying deepseek4's `lo = accepted_len + 1` verbatim leaves exactly one
+  rejected draft's K/V in the ring, because gemma3's `accept_len` excludes the
+  bonus while deepseek4's includes it.
 
 Recurring shape, again: **a fix applied to one path and not its sibling.**
 
