@@ -2873,10 +2873,34 @@ hang and would have to survive `suspend`. The persistent state stays FP16, so th
 ~149 MB -> ~75 MB per-session win (19/64 vs 64/64 concurrent sessions at 27B) is
 untouched outside the fallback.
 
-STILL OPEN: the multi-session fused prefill path passes state via device pointer
-tables (`dn_s_ptrs`) and is not covered; and `prefill_lowered.rs`'s
-`use_gdn_per_token` loop (Q8-GDN verify) still narrows per token. Both are
-separate entry points, not regressions introduced here.
+⚠️ **RETRACTED 2026-08-30: neither "still open" item was real.** I wrote that the
+fused multi-session prefill and the `use_gdn_per_token` loop still narrow per
+token. Checked both:
+
+* **Fused multi-session prefill already narrows once per LAUNCH.**
+  `gated_delta_net_f16_routed_batch_seq.hip` widens S once at :112, loops
+  `for (int b = 0; b < batch_rows; b++)` filtering by session at :115, and
+  narrows once at :176. Its caller
+  (`grouped_moe_prefill_session_batch_gated_delta_net_f16_layer`,
+  prefill_batch.rs:1019) is invoked once per DeltaNet layer with `row_count`, NOT
+  inside a token loop, and the entry point bounds rows by `pbs.max_batch` —
+  `build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)` and
+  an explicit error if `multi_state_prefix_rows > pbs.max_batch`. So a fused
+  launch covers at most PREFILL_MAX_BATCH rows: the SAME cadence as batched
+  prefill and as the fixed fallback. Nothing to change.
+  (The mapping note this came from actually said that path "keeps the per-launch
+  narrowing" — I misread it as a defect.)
+
+* **`prefill_lowered.rs`'s `use_gdn_per_token` loop is deliberate and opt-in.**
+  Gated on `force_q8_gdn_per_token || (gdn_tape.is_some() &&
+  q8_gdn_verify_per_token_enabled())`, and the latter reads
+  `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN`, default OFF (prefill_batch.rs:5491). Its own
+  comment gives the reason: for f16, per-token and batched differ, and a verify
+  arm must reproduce what DECODE will do — which is per token. Making it batched
+  would defeat its purpose.
+
+So all three live prefill paths now narrow once per <=PREFILL_MAX_BATCH unit and
+agree with each other.
 
 **The alternative that was NOT taken:**
 
