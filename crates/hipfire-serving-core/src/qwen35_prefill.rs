@@ -2077,6 +2077,26 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         let _ = stdout.flush();
     }
 
+    {
+        // Pool accounting, per prefill. This is what located the DeltaNet FP16
+        // strand: `free_buffers`/`free_bytes` climbing every request while
+        // `total_new` sat frozen means buffers are being returned to a pool that
+        // never allocated them — an unpooled alloc paired with a pooled free.
+        // Debug level: useful the next time residency drifts, silent otherwise.
+        let (p, mailbox) = gpu.pool_stats();
+        tracing::debug!(
+            "pool after batch prefill: new={} reused={} allocated={:.1}MB free_buffers={} \
+             free={:.1}MB buckets={} mailbox={}",
+            p.total_new,
+            p.total_reused,
+            p.total_allocated as f64 / 1e6,
+            p.free_buffers,
+            p.free_bytes as f64 / 1e6,
+            p.buckets,
+            mailbox,
+        );
+    }
+
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let worker = loaded_model_worker_runtime_view(m);
     let done = qwen35_generate_batch_prefill_done_json(
