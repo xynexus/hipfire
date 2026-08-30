@@ -32,6 +32,10 @@
 //   The win is not from fewer waves; it is from each B-fragment load
 //   being amortized across 8 warps instead of 1.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

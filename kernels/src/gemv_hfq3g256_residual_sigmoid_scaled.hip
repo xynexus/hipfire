@@ -1,3 +1,7 @@
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 
 // HFQ3/MQ3-G256 batched GEMV with fused sigmoid-scaled residual add:

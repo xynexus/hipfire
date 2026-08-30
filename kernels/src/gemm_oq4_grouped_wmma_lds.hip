@@ -42,6 +42,10 @@
 // wave64 quantizer would need group % 128 == 0. So the sizes that fit BOTH wave
 // widths are the multiples of 128: 128, 256, 512.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

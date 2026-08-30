@@ -10,6 +10,10 @@
 // traffic, so halving it should move the (roofline-)memory-bound iu4 GEMM toward
 // compute-bound. bf16 (not f16) keeps f32's exponent range for activation outliers.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

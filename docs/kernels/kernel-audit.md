@@ -130,12 +130,50 @@ prefill GEMMs … +26-33% AR prefill, default-on"_. The **feature is live** — 
 via the non-`_bt` gfx12 overlays; these `_bt` sources are the superseded
 first cut, not the shipped path. Nothing here suggests a regression.
 
-**Recommendation:** confirm with a `kernel_trace` run (none of the eight should
-appear), then either delete the source + its const, or, if kept as a staged
+**Recommendation:** delete the source + its const, or, if kept as a staged
 next-gen variant, wire a selector arm behind a feature flag and add a coherence
 gate — a source with neither a caller nor a gate rots silently. This is the
 recurring hazard the config area names elsewhere: something that compiles,
 applies to nothing, and says nothing.
+
+#### F1 — empirical confirmation (kernel_trace, 2026-08-30)
+
+`ensure_kernel` records every dispatched `func_name` under
+`HIPFIRE_KERNEL_TRACE=1` (`kernel_trace.rs`). A foreground-daemon run on nix2
+(gfx1103) over MiniCPM5-1B.oq4.25++ validated the mechanism and traced a clean
+gfx1103 llama path — `gemm_oq8_grouped_wmma_mw`, `quantize_act_oq8`,
+`rotate_x_mq_awq`, `rmsnorm_f32_gfx1103`, `attention_causal_batched_gfx1103`,
+… 12 kernels, none of the eight orphans among them.
+
+Two facts bound what that trace can prove for these specific orphans, and both
+point back to the static analysis as authoritative:
+
+1. **Arch coverage is blocked.** Six orphans are gfx12/RDNA4-only and two are
+   DS4-WMMA (also gfx12). None can be *selected* on the reachable gfx1103 (nix2)
+   or gfx1151 (halo) hosts. The only gfx12 host on the fleet, medusa (gfx1201),
+   is currently unreachable ("no route to host"), so a positive gfx12 trace
+   could not be produced.
+2. **A func-name trace can't attribute one of them anyway.** The gfx12
+   `gemm_hfq4g256_residual_mmq.gfx12.hip` orphan **exports the same
+   `__global__` names** as the *live* portable `gemm_hfq4g256_residual_mmq.hip`
+   (const `GEMM_HFQ4G256_RESIDUAL_MMQ_SRC`, loaded at three sites in
+   `dispatch/gemm_hfq.rs`). A histogram keyed on func-name therefore cannot
+   distinguish "gfx12 orphan ran" from "portable sibling ran". The other seven
+   orphans carry **unique** names (`…_gfx12_bt`, `attention_dflash_wmma_*_gfx12`,
+   `…swa_topk_*_wmma`) and would be trace-distinguishable on a gfx12 host.
+
+The decisive proof for orphanhood is thus **static, at the const level**: the
+eight `*_GFX12_SRC` / `*_BT_SRC` / `V4F_*_WMMA_SRC` consts have no load site and
+no selector reference (re-verified). And since `ensure_kernel` is the only path
+that could record a launch, a re-audit of dynamic dispatch confirms nothing can
+build these names at runtime: only **3** of 838 `ensure_kernel` call sites
+construct `func_name` dynamically, all three are the gfx906 MMQ
+`format!("{}_x{}", base_name, mmq_x)` sites (`overlays/gfx906.rs`), and none can
+yield a gfx12/DS4 name. So `kernel_trace` cannot record any of the eight on any
+host **by construction** — the trace's role was to catch a missed dynamic
+dispatch, and there is none. A gfx12-host trace remains the belt-and-suspenders
+check for the seven uniquely-named ones once medusa is back; the mmq orphan is
+provable only statically.
 
 ### F2 — gfx1103/gfx11 LDS + barrier surface
 

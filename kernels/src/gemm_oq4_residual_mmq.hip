@@ -16,6 +16,10 @@
 // path on gfx1103 (mq4 MMQ 1606 vs f16 1060 tok/s prefill). LDS use matches
 // mq4's proven-on-gfx1103 footprint (no wedge).
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>

@@ -23,6 +23,10 @@
 // of the A fragment (its row of the 16×16 tile). Same wave-32 WMMA
 // duplication semantics as gemm_f16_x_f16_wmma.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

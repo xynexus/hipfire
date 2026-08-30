@@ -10,6 +10,10 @@
 // Same grid/block layout as gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.
 // Output byte-identical (same arithmetic, different memory schedule).
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
