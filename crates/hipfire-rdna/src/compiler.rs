@@ -96,7 +96,32 @@ pub struct KernelCompiler {
     compiled: HashMap<String, PathBuf>,
     precompiled_dir: Option<PathBuf>,
     has_hipcc: bool,
+    /// `hipcc --version` verbatim, or empty when hipcc is unavailable.
+    ///
+    /// Part of the cache key. Two hipcc installs can coexist on one host
+    /// (issue #381: HIP 7.13.26154 under a venv and 7.13.26176 under
+    /// /opt/rocm), and which one compiles a kernel depends on ambient
+    /// PATH/ROCM_PATH. Keying on source+arch alone let a blob built by either
+    /// toolchain validate as current, so a reboot that changed the ambient PATH
+    /// silently served code objects from the other compiler — that is how the
+    /// pre-FP-contraction-pin token stream came back on gfx1103.
+    ///
+    /// The output carries the HIP version, the clang version and git hash, and
+    /// `InstalledDir`, so it separates two builds of the same version too.
+    toolchain_id: String,
     pub extra_flags: String,
+}
+
+/// The cache-key hash itself, free-standing so every component can be varied in
+/// a test without constructing a compiler (which probes the filesystem and
+/// spawns hipcc).
+fn kernel_cache_key(source: &str, arch: &str, toolchain_id: &str, extra_flags: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    arch.hash(&mut hasher);
+    toolchain_id.hash(&mut hasher);
+    extra_flags.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 impl KernelCompiler {
@@ -301,14 +326,22 @@ impl KernelCompiler {
         }
         let precompiled_dir = effective_precompiled;
 
-        // Probe for hipcc once at init, not per-kernel
-        let has_hipcc = Command::new("hipcc")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        // Probe for hipcc once at init, not per-kernel. The output is kept
+        // rather than discarded: it is the toolchain identity that goes into
+        // every cache key (see `toolchain_id`), and this is the same one spawn
+        // the probe already cost.
+        let hipcc_version = Command::new("hipcc").arg("--version").output().ok();
+        let has_hipcc = hipcc_version
+            .as_ref()
+            .map(|out| out.status.success())
             .unwrap_or(false);
+        let toolchain_id = if has_hipcc {
+            hipcc_version
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Ok(Self {
             cache_dir,
@@ -316,6 +349,7 @@ impl KernelCompiler {
             compiled: HashMap::new(),
             precompiled_dir,
             has_hipcc,
+            toolchain_id,
             extra_flags,
         })
     }
@@ -323,6 +357,23 @@ impl KernelCompiler {
     /// Returns a reference to all compiled kernel paths (name → .hsaco path).
     pub fn compiled_kernels(&self) -> &HashMap<String, PathBuf> {
         &self.compiled
+    }
+
+    /// Cache key for one kernel: everything that changes the emitted code
+    /// object.
+    ///
+    /// `source` and `arch` are the obvious two. `toolchain_id` and
+    /// `extra_flags` are here because omitting either lets a blob built under
+    /// different conditions validate as current — the flags reach
+    /// `hipcc_compile` directly, and the toolchain is issue #381's silent
+    /// wrong-code-object path.
+    ///
+    /// Widening the key invalidates every existing `.hash`, so the first run
+    /// after this recompiles the local cache once. Nothing ships a `.hash`
+    /// (`scripts/compile-kernels.sh` writes only `.hsaco`), so a pre-built blob
+    /// still takes the same hash-less path it always did.
+    fn source_hash(&self, source: &str) -> String {
+        kernel_cache_key(source, &self.arch, &self.toolchain_id, &self.extra_flags)
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
@@ -333,10 +384,7 @@ impl KernelCompiler {
         }
 
         // Hash source + arch for cache validation (used by both pre-compiled and runtime paths)
-        let mut hasher = DefaultHasher::new();
-        source.hash(&mut hasher);
-        self.arch.hash(&mut hasher);
-        let src_hash = format!("{:016x}", hasher.finish());
+        let src_hash = self.source_hash(source);
 
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
@@ -577,10 +625,7 @@ impl KernelCompiler {
                 continue;
             }
 
-            let mut hasher = DefaultHasher::new();
-            source.hash(&mut hasher);
-            self.arch.hash(&mut hasher);
-            let src_hash = format!("{:016x}", hasher.finish());
+            let src_hash = self.source_hash(source);
 
             // Check precompiled with valid hash
             if let Some(ref dir) = self.precompiled_dir {
@@ -710,5 +755,37 @@ impl KernelCompiler {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::kernel_cache_key;
+
+    /// Every component must move the key. Issue #381: with only source+arch in
+    /// it, a blob built by a second hipcc on the same host validated as current,
+    /// and the machine silently ran the other toolchain's code object.
+    #[test]
+    fn every_component_changes_the_key() {
+        let base = kernel_cache_key("__global__ void k() {}", "gfx1103", "HIP 7.13.26154", "-O3");
+        let variants = [
+            kernel_cache_key(
+                "__global__ void k() { }",
+                "gfx1103",
+                "HIP 7.13.26154",
+                "-O3",
+            ),
+            kernel_cache_key("__global__ void k() {}", "gfx1151", "HIP 7.13.26154", "-O3"),
+            kernel_cache_key("__global__ void k() {}", "gfx1103", "HIP 7.13.26176", "-O3"),
+            kernel_cache_key("__global__ void k() {}", "gfx1103", "HIP 7.13.26154", "-O2"),
+        ];
+        for (i, variant) in variants.iter().enumerate() {
+            assert_ne!(base, *variant, "component {i} did not reach the cache key");
+        }
+        // Same inputs, same key — the cache still has to hit.
+        assert_eq!(
+            base,
+            kernel_cache_key("__global__ void k() {}", "gfx1103", "HIP 7.13.26154", "-O3")
+        );
     }
 }
