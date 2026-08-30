@@ -155,14 +155,23 @@ vision = "none"
 # What is missing, and why this is not `full`:
 #   - prefill is PER-TOKEN. The trunk has no batched path, and the recurrent
 #     halves (GDN state, PLE conv ring) are sequential by construction.
-#   - no quality evidence on a REAL artifact. Everything above is fixture-scale;
-#     the shipped checkpoint has never been quantised or served, so `full` would
-#     be a claim about a path nobody has walked.
-#   - no VL or MTP wiring, though mRoPE's vision interleave now exists.
+# THE SHIPPED CHECKPOINT NOW SERVES. Restored from the 222 GB `.hfa` to a 336 GB
+# HF directory, quantised to oq4 (169.9 GB, 1658 tensors), loaded in 984 s at ~85
+# GiB resident, prefill 4 tokens in 0.98 s, decode 0.24 s/tok, argmax finite and
+# moving. `examples/serve_real` is that run.
 #
-# The two structural blockers are CLOSED: the 102 GB n-gram table streams row by
-# row (bit-identically to resident), and the routed experts — 97.3% of the trunk —
-# stay natively quantised instead of being dequantised to f32.
+# Still `partial`, and now for the right reasons:
+#   - NO QUALITY EVIDENCE. It produces finite, moving logits; nobody has measured
+#     KLD or run an eval battery against a reference, so "it serves" is not
+#     "it serves well".
+#   - prefill is PER-TOKEN (0.24 s/tok decode is a working number, not a good one).
+#   - no VL or MTP wiring, though mRoPE's vision interleave now exists. MTP stays
+#     out on purpose: upstream drops those weights on load, so there is no
+#     reference forward to difference a speculative head against.
+#
+# The structural blockers are closed: the 102 GB n-gram table streams row by row
+# (bit-identically to resident), and the routed experts — 97.3% of the trunk —
+# stay natively quantised, keeping compact blocks compact.
 ids = [26]
 label = "qwen4-exp"
 prefill = "partial"
