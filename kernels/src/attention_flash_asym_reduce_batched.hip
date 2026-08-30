@@ -48,11 +48,20 @@ __device__ __forceinline__ void asym_reduce_body(
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
     // Per-thread assignment: `dpt` consecutive dims per thread, computed at RUNTIME
-    // from head_dim (32 × dpt == head_dim) exactly like the tile kernel. DPT is only
-    // the register-array bound (MAXDPT). Using the compile-time DPT as the stride
-    // instead assumes head_dim == 32*DPT (256 for DPT=8) and, for smaller heads
-    // (e.g. head_dim=128), makes threads write past the head boundary into the next
+    // from head_dim (32 × dpt == head_dim). DPT is only the register-array bound
+    // (MAXDPT). Using the compile-time DPT as the stride instead assumes
+    // head_dim == 32*DPT (256 for DPT=8) and, for smaller heads (e.g.
+    // head_dim=128), makes threads write past the head boundary into the next
     // head's output — corrupting every head but the first of each kv-group.
+    //
+    // This used to say "exactly like the tile kernel", which is NOT true of every
+    // tile. attention_flash_kvarn_tile_batched derives dpt the same way, and the
+    // asym2/asym4/fwht2/fwht4 tiles cover any head_dim through a
+    // `n_halves = head_dim / 128` loop — but asym3, fwht3, q8_0 and f16k_q8v
+    // still hardcode `d0 = tid * 8` and are 256-only. Their dispatch wrappers
+    // refuse any other head_dim rather than corrupting silently; see
+    // Gpu::require_head_dim_256 and
+    // docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md.
     const int dpt = head_dim / 32;
     const int d_base = tid * dpt;
 

@@ -122,6 +122,25 @@ original report suggested is wrong:
 
 Recurring shape, again: **a fix applied to one path and not its sibling.**
 
+## [GUARDED 2026-08-30] Four batched flash tiles are head_dim=256-only, unchecked
+
+Second never-executed sweep from the coverage-gaps doc ("46 `X`/`X_batched`
+sibling pairs"), ranked by commits touching exactly one side. `asym3`, `fwht3`,
+`q8_0` and `f16k_q8v` batched tiles hardcode `d0 = tid * 8` (32 lanes x 8 dims =
+head_dim 256) while their asym2/asym4/fwht2/fwht4 siblings got a
+`n_halves = head_dim / 128` loop and the kvarn tile derives `dpt` at runtime. At
+head_dim=128 the upper lanes read past the head and write past the partials
+stride into the next tile's slot — silently wrong, no error. The reduce kernel
+was fixed for exactly this and its comment claimed the tiles already agreed.
+
+Live exposure is narrow (three are deprecated KV modes, the fourth has no
+production caller), which is why it survived. Now REFUSED at the four dispatch
+wrappers, with a source-scanning test that fails if the guarded list and the
+kernels disagree. The real fix — runtime `dpt`, mirroring the kvarn tile — is
+arithmetically identical at 256 and needs a GPU only to check the unroll cost.
+
+→ `docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md`
+
 ## [FIXED 2026-08-30] Three HFQM parsers ignored the container version
 
 Found by running one of the never-executed sweeps from the coverage-gaps doc
