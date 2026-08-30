@@ -1147,7 +1147,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
 
     function renderChat() {
       if (!chatMessages.length) {
-        chatTranscriptEl.replaceChildren(issueCard("No messages", "Send a prompt to /v1/chat/completions."));
+        chatTranscriptEl.replaceChildren(issueCard("No messages", "Send a prompt to the loaded model."));
         return;
       }
       chatTranscriptEl.replaceChildren(...chatMessages.map(chatCard));
@@ -1181,11 +1181,11 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = "sending chat";
       chatSendEl.disabled = true;
       try {
-        const resp = await fetch("/v1/chat/completions", {
+        const resp = requireAuthorized(await fetch("/admin/chat/completions", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(body),
-        });
+        }));
         const payload = await resp.json();
         if (!resp.ok || payload.error) {
           throw new Error((payload.error && payload.error.message) || `chat ${resp.status}`);
@@ -1875,6 +1875,15 @@ mod tests {
 
     /// The page is a string constant, so a tab whose panel, loader or handler
     /// got lost in an edit still compiles. Pin the pieces that have to line up.
+    /// The console's chat goes through the admin surface, not `/v1`: the
+    /// session cookie is `Path=/admin`, and a non-loopback bind makes `/v1`
+    /// require an API token the page does not have.
+    #[test]
+    fn admin_index_chats_through_the_admin_surface_not_v1() {
+        assert!(ADMIN_INDEX_HTML.contains("/admin/chat/completions"));
+        assert!(!ADMIN_INDEX_HTML.contains("/v1/chat/completions"));
+    }
+
     #[test]
     fn admin_index_exposes_the_jobs_surface() {
         for needle in [
@@ -1908,7 +1917,7 @@ mod tests {
         assert!(ADMIN_INDEX_HTML.contains("Runtime"));
         assert!(ADMIN_INDEX_HTML.contains("Diagnostics"));
         assert!(ADMIN_INDEX_HTML.contains("Logs"));
-        assert!(ADMIN_INDEX_HTML.contains("/v1/chat/completions"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/chat/completions"));
         assert!(ADMIN_INDEX_HTML.contains("/admin/diagnostics"));
         assert!(ADMIN_INDEX_HTML.contains("/admin/logs"));
         assert!(ADMIN_INDEX_HTML.contains("/admin/models/registry"));
