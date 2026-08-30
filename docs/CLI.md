@@ -28,6 +28,10 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire artifact compare-calibration-stability`↴](#hipfire-artifact-compare-calibration-stability)
 * [`hipfire artifact compare-residuals`↴](#hipfire-artifact-compare-residuals)
 * [`hipfire artifact moe-router-profile`↴](#hipfire-artifact-moe-router-profile)
+* [`hipfire calibrate`↴](#hipfire-calibrate)
+* [`hipfire two-pass`↴](#hipfire-two-pass)
+* [`hipfire npu`↴](#hipfire-npu)
+* [`hipfire npu pair-hfp`↴](#hipfire-npu-pair-hfp)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -110,6 +114,9 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `repack` — Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
 * `lora` — Derive, merge or convert a steering adapter
 * `artifact` — Audit and compare calibration / residual artifacts
+* `calibrate` — Capture activation statistics into a `.calib.hfq`
+* `two-pass` — Calibrate then quantize in one run
+* `npu` — NPU artifact tooling (linux only)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -542,6 +549,101 @@ Report routed-expert activation distribution from a calibration artifact
 
 
 
+## `hipfire calibrate`
+
+Capture activation statistics into a `.calib.hfq`
+
+**Usage:** `hipfire calibrate [OPTIONS] --model <MODEL> --corpus <CORPUS> --output <OUTPUT>`
+
+Defaults, validation and the `auto|N` forms are owned by the
+        calibration parser, not by this command -- so they are applied but not
+        listed here. `hipfire calibrate --help-flags` prints the full reference.
+
+###### **Options:**
+
+* `--model <MODEL>` — Model to calibrate: a safetensors dir or cache root
+* `--corpus <CORPUS>` — Calibration corpus
+* `--output <OUTPUT>` — Destination `.calib.hfq`
+* `--sequences <SEQUENCES>`
+* `--context <CONTEXT>`
+* `--sampling-seed <SAMPLING_SEED>`
+* `--sequence-batch <SEQUENCE_BATCH>` — `auto` or a row count
+* `--time-tile <TIME_TILE>` — `auto` or a tile size
+* `--max-rows <MAX_ROWS>`
+* `--min-expert-activations <MIN_EXPERT_ACTIVATIONS>`
+* `--expert-capture-target <EXPERT_CAPTURE_TARGET>`
+* `--expert-capture-tile-rows <EXPERT_CAPTURE_TILE_ROWS>`
+* `--required-expert-fraction <REQUIRED_EXPERT_FRACTION>`
+* `--expert-coverage-policy <EXPERT_COVERAGE_POLICY>` — `strict` or `preserve-undercovered`
+* `--kldref` — Capture a KLD reference
+* `--no-kldref` — Skip the KLD reference
+* `--kldref-topk <KLDREF_TOPK>`
+* `--kldref-rows <KLDREF_ROWS>`
+* `--layer-prefetch-bytes <LAYER_PREFETCH_BYTES>`
+* `--boundary-ram` — Hold boundary rows in RAM instead of on disk
+* `--boundary-dir <BOUNDARY_DIR>`
+* `--resume` — Resume an interrupted run (the default)
+* `--no-resume` — Start fresh, discarding any spool
+* `--finalize-completed` — Publish an already-complete resumed spool without executing a layer
+* `--pause-after-layers <PAUSE_AFTER_LAYERS>`
+* `--residual-probe-output <RESIDUAL_PROBE_OUTPUT>`
+* `--residual-probe-rows <RESIDUAL_PROBE_ROWS>`
+* `--cask-output <CASK_OUTPUT>` — Also write a CASK (TriAttention centers) sidecar
+* `--cask-only` — CASK only: the calibration artifact is scratch and removed after
+* `--dry-run` — Plan without executing
+* `--help-flags` — Print the calibration parser's own flag reference and exit
+
+
+
+## `hipfire two-pass`
+
+Calibrate then quantize in one run
+
+**Usage:** `hipfire two-pass [OPTIONS] --model <MODEL> --calib <CALIB> --output <OUTPUT> [-- <QUANT_ARGS>...]`
+
+Arguments after `--` are forwarded verbatim to the quantizer.
+
+###### **Arguments:**
+
+* `<QUANT_ARGS>` — Quantizer arguments, after `--`
+
+###### **Options:**
+
+* `--model <MODEL>` — Model to calibrate then quantize
+* `--calib <CALIB>` — Calibration artifact to write or reuse (`.calib.hfq`)
+* `--output <OUTPUT>` — Destination quantized artifact
+* `--format <FORMAT>` — Quant format token
+* `--corpus <CORPUS>` — Calibration corpus
+* `--skip-calib` — Reuse an existing calibration instead of capturing one
+* `--dry-run` — Plan without executing
+
+
+
+## `hipfire npu`
+
+NPU artifact tooling (linux only)
+
+**Usage:** `hipfire npu <COMMAND>`
+
+###### **Subcommands:**
+
+* `pair-hfp` — Pair a whole-scaled `.hfp` into the paired layout (linux only)
+
+
+
+## `hipfire npu pair-hfp`
+
+Pair a whole-scaled `.hfp` into the paired layout (linux only)
+
+**Usage:** `hipfire npu pair-hfp --in <INPUT> --out <OUTPUT>`
+
+###### **Options:**
+
+* `--in <INPUT>` — Source `.hfp`. (Spelled `--in`, matching the existing tool.)
+* `--out <OUTPUT>` — Destination `.hfp`
+
+
+
 ## `hipfire list`
 
 List locally available models
@@ -602,20 +704,6 @@ Examples:
 Convert model artefacts (drafters, MTP heads)
 
 **Usage:** `hipfire convert <COMMAND>`
-
-Also reachable here, forwarded verbatim to the offline conversion tools:
-          artifact   inspect | audit-calibration | compare-calibration | moe-router-profile
-          import     gguf | safetensors
-          export     safetensors
-          repack     <hf_dir> <-> <archive.hfa>, or --check   (NOT `optimize`, which is a layout pass)
-          lora       export | merge | convert
-          calibrate  activation capture -> .calib.hfq
-          two-pass   |  induct  |  npu pair-hfp
-
-        These arrive as an external subcommand, so clap cannot enumerate them and
-        `gen-docs` cannot render them -- this list is the only place they appear.
-        Promote one to a real subcommand (as `hipfire download` now is) and it
-        documents itself.
 
 ###### **Subcommands:**
 

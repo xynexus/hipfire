@@ -39,9 +39,6 @@ pub fn run(_args: QuantizeArgs) -> Result<()> {
 /// because grouping conversion tooling in one place is what AGENTS.md asks for.
 /// Step 6 of the merge plan adds coexistence's offline half here too.
 #[derive(Debug, Subcommand)]
-#[command(
-    after_help = "Also reachable here, forwarded verbatim to the offline conversion tools:\n          artifact   inspect | audit-calibration | compare-calibration | moe-router-profile\n          import     gguf | safetensors\n          export     safetensors\n          repack     <hf_dir> <-> <archive.hfa>, or --check   (NOT `optimize`, which is a layout pass)\n          lora       export | merge | convert\n          calibrate  activation capture -> .calib.hfq\n          two-pass   |  induct  |  npu pair-hfp\n\n        These arrive as an external subcommand, so clap cannot enumerate them and\n        `gen-docs` cannot render them -- this list is the only place they appear.\n        Promote one to a real subcommand (as `hipfire download` now is) and it\n        documents itself."
-)]
 pub enum ConvertCommand {
     /// Build a DFlash drafter sidecar from a model
     Dflash(ToolArgs),
@@ -53,14 +50,6 @@ pub enum ConvertCommand {
     MtpExtract(ToolArgs),
     /// Merge an MTP head into an mq4 artefact
     MtpMerge(ToolArgs),
-    /// Everything hipfire-coexistence dispatches: calibrate, artifact, import,
-    /// export, repack, lora, hub, download, npu, induct, two-pass.
-    ///
-    /// Captured as an external subcommand rather than enumerated, because that
-    /// crate routes on `args[0]`/`args[1]` itself and its flag bags reject any
-    /// token they do not recognise — so the vector has to arrive verbatim.
-    #[command(external_subcommand)]
-    Coexistence(Vec<String>),
 }
 
 #[derive(Debug, Args)]
@@ -76,9 +65,6 @@ pub fn run_convert(cmd: ConvertCommand) -> Result<()> {
     // they cannot simply see the process argv: `hipfire convert mtp-extract`
     // would reach the tool as `unknown arg: convert`. Hand each one the argv it
     // would have had as its own binary — its name, then the forwarded args.
-    if let ConvertCommand::Coexistence(argv) = &cmd {
-        return hipfire_coexistence::cli::run(argv).map_err(|e| anyhow::anyhow!("{e}"));
-    }
     let (name, args, run): (&str, &ToolArgs, fn()) = match &cmd {
         ConvertCommand::Dflash(a) => (
             "dflash_convert",
@@ -103,7 +89,6 @@ pub fn run_convert(cmd: ConvertCommand) -> Result<()> {
             a,
             hipfire_quantize::tools::mq4_merge_mtp::main,
         ),
-        ConvertCommand::Coexistence(_) => unreachable!("handled above"),
     };
     let mut argv = vec![name.to_string()];
     argv.extend(args.args.iter().map(|a| a.to_string_lossy().into_owned()));

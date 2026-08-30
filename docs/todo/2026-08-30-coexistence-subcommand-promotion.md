@@ -32,18 +32,21 @@ promotion is real is that the man page appears without anyone writing it.
 | `hub` | **retired** | was one spelling of `download` + `repack --check` |
 | `lora` | `hipfire lora {export,merge,convert}` | |
 | `artifact` | `hipfire artifact {audit-calibration,compare-calibration,compare-calibration-stability,compare-residuals,moe-router-profile}` | `inspect` folded into `hipfire inspect` |
+| `calibrate` | `hipfire calibrate` | bridged to `CalibrateCommand::parse`, which keeps sole ownership of defaults and cross-flag rules |
+| `two-pass` | `hipfire two-pass` | `--` tail forwarded to the quantizer |
+| `npu` | `hipfire npu pair-hfp` | linux only |
 
 ## Remaining
 
-| group | ops | shape |
-|---|---|---|
-| `calibrate` | one op, ~30 flags | the largest bag by far |
-| `two-pass` | one op | shares `induction/` with `induct` |
-| `npu` | `pair-hfp` | linux-only (`#[cfg(target_os = "linux")]`) |
+**None.** All eleven groups are promoted or retired. `hipfire convert` is back to
+its five drafter tools, and the `external_subcommand` catch-all is gone — so
+every conversion command is now enumerable, `--help`-visible, and rendered by
+`gen-docs` without anyone writing prose for it.
 
-Suggested order: `two-pass`, `npu`, then `calibrate` last — its flag bag is big
-enough that a mechanical transcription is where an argument would silently
-drift.
+One consequence worth stating: `ArgBag` silently ignored unknown flags, so
+`two-pass --typo 1` used to be accepted and dropped. Under clap it is an error.
+That is a behaviour change, and a good one, but it will surface any script that
+was passing a flag the tool never read.
 
 ## Things to decide, not just transcribe
 
