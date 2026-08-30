@@ -1,5 +1,12 @@
 # TODO: one derived layout that serves BOTH qwen4_exp consumers
 
+> **Update 2026-08-31 — this is an OPTIMISATION, not a prerequisite.** Paged
+> qwen4_exp shipped without it: `hipfire-quantize` already emits an HFQM v2
+> module table, so artifacts are pageable as written. What the repacker would buy
+> is a cheaper page-in — pre-split compact planes so `prepare_expert_module` is a
+> memcpy rather than a transform. See
+> `2026-08-31-qwen4exp-paged-experts-via-weight-pager.md`.
+
 **Status:** open (2026-08-31). Design note, written after `--arch-experts` was
 prototyped and BACKED OUT for foreclosing paging.
 

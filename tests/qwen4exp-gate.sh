@@ -235,6 +235,44 @@ else
   fail=1
 fi
 
+step "GPU: PAGED routed experts vs resident, on the same artifact"
+# Routed experts are 97.3% of this trunk, so paging them is what decides whether
+# the shipped model loads at all. Both arms read the SAME file: the only
+# difference is whether the experts came through the weight pager.
+#
+# The budget is deliberately far below the fixture's expert bytes, to force
+# eviction and re-page rather than a load-everything-once path that would never
+# exercise the interesting half. The cold-load/eviction counters are checked
+# because "paged matches resident" proves nothing if nothing was paged — that
+# exact vacuous pass happened while writing this.
+if [ -f "$TMP/fx.oq4.hfq" ]; then
+  res="$(HIPFIRE_QWEN4EXP_PAGED_EXPERTS=0 \
+         ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  pag="$(HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES=524288 \
+         ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  res_am="$(echo "$res" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+  pag_am="$(echo "$pag" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+  evicts="$(echo "$pag" | sed -nE 's/.*, ([0-9]+) evictions.*/\1/p' | head -1)"
+  colds="$(echo "$pag" | sed -nE 's/.*, ([0-9]+) cold loads.*/\1/p' | head -1)"
+  if [ -z "$res_am" ] || [ -z "$pag_am" ]; then
+    echo "qwen4exp-gate: one of the paged/resident arms did not report an argmax"
+    fail=1
+  elif [ "$res_am" != "$pag_am" ]; then
+    echo "qwen4exp-gate: paged argmax $pag_am != resident argmax $res_am"
+    echo "               — the pager's expert layout differs from the loader's"
+    fail=1
+  elif [ "${colds:-0}" -lt 1 ] || [ "${evicts:-0}" -lt 1 ]; then
+    echo "qwen4exp-gate: paged arm did $colds cold loads and $evicts evictions —"
+    echo "               it never actually paged, so the match above proves nothing"
+    fail=1
+  else
+    echo "  paged: argmax $pag_am matches resident, $colds cold loads, $evicts evictions"
+  fi
+else
+  echo "qwen4exp-gate: no oq4 artifact to page"
+  fail=1
+fi
+
 if [ "$CPU_ONLY" = "1" ]; then
   [ "$fail" = "0" ] && echo && echo "qwen4exp-gate: PASS (cpu-only)"
   exit "$fail"
