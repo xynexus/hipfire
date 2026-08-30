@@ -734,21 +734,36 @@ fn append_training_event(run_dir: &Path, event: Value) -> Result<(), String> {
     .map_err(|e| format!("write training event {}: {e}", path.display()))
 }
 
-/// The `hipfire` executable to launch jobs with.
+/// The `hipfire` executable to launch jobs with: `current_exe` first, so a
+/// running server can never shell out to an older build left in
+/// `~/.hipfire/bin` or a stale `target/`, and the bare name on `PATH` only as
+/// a last resort.
 ///
-/// `current_exe` first, so a running server can never shell out to an older
-/// build left in `~/.hipfire/bin` or a stale `target/` — the same rule the
-/// daemon spawn path already follows.
+/// `current_exe` reads `/proc/self/exe`, which for a binary replaced under a
+/// running server comes back as `<path> (deleted)` — exactly what happens when
+/// someone rebuilds while the server is up. Left alone that fails the name
+/// check and falls through to `PATH`, which quietly runs whatever older
+/// hipfire is installed there; the symptom is a job dying on `unrecognized
+/// subcommand`. Strip the suffix instead: that path is where the binary lives,
+/// and after a rebuild it holds the new one.
 fn hipfire_binary() -> String {
-    std::env::current_exe()
-        .ok()
+    live_exe_path()
         .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s == "hipfire")
+            p.exists()
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == "hipfire")
         })
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "hipfire".to_string())
+}
+
+fn live_exe_path() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?;
+    match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(live) => Some(PathBuf::from(live)),
+        None => Some(path),
+    }
 }
 
 /// Path a running job writes its live progress to, and that `hipfire jobs`

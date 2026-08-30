@@ -60,6 +60,7 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resu
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         app.drain_chat_events();
+        app.poll_jobs();
         // Advance the spinner every loop iteration so it animates even while
         // the rest of the page is idle.
         app.tick = app.tick.wrapping_add(1);

@@ -12,17 +12,14 @@
 //! which is the behaviour a download manager should have anyway.
 
 use clap::{Args, Subcommand};
+use hipfire_operator::jobs::{
+    cancel_job, job_log_tail, job_status, list_jobs, CancelOutcome, DONE, FAILED, QUEUED,
+};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-const QUEUED: &str = "queued";
-const RUNNING: &str = "running";
-const DONE: &str = "done";
-const FAILED: &str = "failed";
-const LOGS: &str = "logs";
-
 fn root() -> PathBuf {
-    hipfire_config::hipfire_dir().join("jobs").join("deferred")
+    hipfire_operator::jobs::jobs_dir(&hipfire_config::hipfire_dir())
 }
 
 #[derive(Debug, Args)]
@@ -66,26 +63,8 @@ pub struct OneArgs {
     json: bool,
 }
 
-fn scan(dir: &str) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(root().join(dir))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            name.strip_suffix(".job.json").map(str::to_string)
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// Live status, when a running job has published one.
 fn status_of(id: &str) -> Option<Value> {
-    let p = root().join(LOGS).join(format!("{id}.status.json"));
-    std::fs::read(p)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+    job_status(&root(), id)
 }
 
 fn detail_of(id: &str) -> String {
@@ -104,58 +83,40 @@ pub fn run(args: JobsArgs) -> anyhow::Result<()> {
 }
 
 fn list(args: ListArgs) -> anyhow::Result<()> {
-    let states = [RUNNING, QUEUED, FAILED, DONE];
+    let jobs = list_jobs(&root());
     if args.json {
-        let items: Vec<Value> = states
-            .iter()
-            .flat_map(|s| {
-                scan(s)
-                    .into_iter()
-                    .map(move |id| json!({ "id": id, "state": s, "detail": detail_of(&id) }))
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
     }
-    let rows: Vec<(String, &str, String)> = states
-        .iter()
-        .flat_map(|s| scan(s).into_iter().map(move |id| (id, *s, String::new())))
-        .map(|(id, s, _)| {
-            let d = detail_of(&id);
-            (id, s, d)
-        })
-        .collect();
-    if rows.is_empty() {
+    if jobs.is_empty() {
         println!("no jobs in {}", root().display());
         return Ok(());
     }
-    let w = rows
-        .iter()
-        .map(|(id, ..)| id.len())
-        .max()
-        .unwrap_or(2)
-        .max(2);
-    println!("{:<w$}  {:<8}  {}", "ID", "STATE", "DETAIL");
-    for (id, state, detail) in rows {
-        println!("{id:<w$}  {state:<8}  {detail}");
+    let w = jobs.iter().map(|j| j.id.len()).max().unwrap_or(2).max(2);
+    let k = jobs.iter().map(|j| j.kind.len()).max().unwrap_or(4).max(4);
+    println!("{:<w$}  {:<k$}  {:<8}  {}", "ID", "KIND", "STATE", "DETAIL");
+    for j in jobs {
+        println!(
+            "{:<w$}  {:<k$}  {:<8}  {}",
+            j.id,
+            j.kind,
+            j.state,
+            if j.detail.is_empty() {
+                j.label.clone()
+            } else {
+                j.detail.clone()
+            }
+        );
     }
     Ok(())
 }
 
 fn find_state(id: &str) -> Option<&'static str> {
-    for s in [RUNNING, QUEUED, DONE, FAILED] {
-        if scan(s).iter().any(|j| j == id) {
-            return Some(s);
-        }
-    }
-    None
+    hipfire_operator::jobs::find_state(&root(), id)
 }
 
 fn log_tail(id: &str, lines: usize) -> String {
-    let p = root().join(LOGS).join(format!("{id}.log"));
-    let text = std::fs::read_to_string(p).unwrap_or_default();
-    let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
+    job_log_tail(&root(), id, lines)
 }
 
 fn status(args: OneArgs) -> anyhow::Result<()> {
@@ -211,30 +172,15 @@ fn watch(args: OneArgs) -> anyhow::Result<()> {
 }
 
 fn cancel(args: OneArgs) -> anyhow::Result<()> {
-    let state = find_state(&args.id).ok_or_else(|| anyhow::anyhow!("no such job: {}", args.id))?;
-    match state {
-        // A queued job has not been claimed, so removing its file is the whole
-        // cancellation — nothing is running to signal.
-        QUEUED => {
-            let p = root().join(QUEUED).join(format!("{}.job.json", args.id));
-            std::fs::remove_file(&p).map_err(|e| anyhow::anyhow!("remove {}: {e}", p.display()))?;
-            println!("cancelled queued job {}", args.id);
+    match cancel_job(&root(), &args.id).map_err(|e| anyhow::anyhow!(e))? {
+        CancelOutcome::DroppedQueued => println!("cancelled queued job {}", args.id),
+        CancelOutcome::AskedToStop => println!(
+            "asked job {} to stop (a download resumes if resubmitted)",
+            args.id
+        ),
+        CancelOutcome::AlreadyFinished(state) => {
+            println!("job {} is already {state}; nothing to cancel", args.id)
         }
-        RUNNING => {
-            // A marker, not a signal: the server's runner owns the child, and
-            // this way the CLI needs no privilege over it and no pid record has
-            // to survive a restart.
-            let p = root().join(LOGS).join(format!("{}.cancel", args.id));
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::write(&p, b"1").map_err(|e| anyhow::anyhow!("write {}: {e}", p.display()))?;
-            println!(
-                "asked job {} to stop (a download resumes if resubmitted)",
-                args.id
-            );
-        }
-        other => println!("job {} is already {other}; nothing to cancel", args.id),
     }
     Ok(())
 }
@@ -253,20 +199,4 @@ pub fn submit(kind: Value) -> anyhow::Result<String> {
     let path = dir.join(format!("{id}.job.json"));
     std::fs::write(&path, serde_json::to_vec_pretty(&spec)?)?;
     Ok(id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `log_tail` must not panic on a log shorter than the requested tail —
-    /// the naive `len - n` slice underflows on an empty or one-line file, which
-    /// is exactly the state a job is in for its first second.
-    #[test]
-    fn log_tail_handles_a_log_shorter_than_the_window() {
-        let all: Vec<&str> = vec![];
-        assert_eq!(all[all.len().saturating_sub(20)..].join("\n"), "");
-        let one = vec!["only line"];
-        assert_eq!(one[one.len().saturating_sub(20)..].join("\n"), "only line");
-    }
 }

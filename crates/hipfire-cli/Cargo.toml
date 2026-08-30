@@ -54,6 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 anyhow.workspace = true
 rpassword = "7"
 uuid.workspace = true
+hipfire-operator = { path = "../hipfire-operator" }
 base64.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 libc.workspace = true
