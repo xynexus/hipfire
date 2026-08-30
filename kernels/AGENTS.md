@@ -18,6 +18,31 @@ the current dead-source / LDS-hazard / quant-contract findings, see
 - After kernel edits, run the narrow relevant kernel/unit check if one exists,
   then `./tests/coherence-gate-dflash.sh` for behavior-facing changes.
 
+## Wave-reduction idiom: reduce from offset 16, and pass the width
+
+RDNA is **wave32**. A cross-lane reduction written the wave64 way —
+`for (o = LANES/2; o > 0; o >>= 1) v += __shfl_xor(v, o)` with `LANES = 64` —
+has an `o = 32` step that crosses a wave boundary, where `__shfl_xor` returns the
+caller's own value. The step becomes `v += v` and the result is exactly **2x**
+too large.
+
+It does not error, does not produce NaN, and the doubling is uniform, so a
+tolerance check with a loose bound passes. It was found by a control that
+asserted an exact value (`got 0.88388, want 0.44194`) while writing
+`qsa_block_score.hip`.
+
+Copy the shape every attention kernel here already uses:
+
+```c
+for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_xor(v, offset, 32);
+```
+
+The trailing `32` is the width and is not optional — state it rather than
+inheriting the default. The only kernels that may reduce from offset 32 are
+wave64 ones, which live under `kernels/src/gfx906/` and say `wave64` in the
+filename; `wave_reduction_offsets_are_wave32_safe` in
+`crates/hipfire-rdna/src/kernel_arity.rs` enforces exactly that.
+
 ## Quant activation-basis contract (Opus Quant / Magnum)
 
 - OQ (Opus Quant: `Oq8G256`, `Oq4G256`, …) and MQ (Magnum) weights are quantized

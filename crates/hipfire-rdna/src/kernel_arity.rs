@@ -478,3 +478,74 @@ fn raw_kernel_launches_match_their_hip_arity() {
         mismatches.join("\n  ")
     );
 }
+
+/// A cross-lane reduction that starts at offset 32 is a wave64 idiom. RDNA is
+/// wave32, where the `offset = 32` step crosses a wave boundary and
+/// `__shfl_xor` returns the caller's own value — the step becomes `v += v` and
+/// the result is exactly 2x too large, uniformly, with no error and no NaN.
+///
+/// Recorded in BUGS.md after it was caught in `qsa_block_score.hip` by a control
+/// that asserted an exact value; a tolerance check with a loose bound passes a
+/// doubled answer. The entry asked for a note near the idiom, which is now in
+/// `kernels/AGENTS.md`. This is the half a note cannot do.
+///
+/// Only genuinely wave64 kernels may do it: those live under `kernels/src/gfx906`
+/// and say `wave64` in the filename.
+#[test]
+fn wave_reduction_offsets_are_wave32_safe() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src");
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("hip") {
+                out.push(p);
+            }
+        }
+    }
+    walk(std::path::Path::new(dir), &mut files);
+    files.sort();
+    assert!(
+        files.len() > 300,
+        "found only {} .hip files — the walker is broken, not the kernels",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        let display = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+        // A wave64 kernel is allowed the wave64 idiom, and says so twice: it
+        // lives under gfx906 and carries `wave64` in its name.
+        let is_wave64 = display.contains("gfx906") && display.contains("wave64");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for (i, line) in strip_comments(&raw).lines().enumerate() {
+            let starts_at_32 = line.contains("__shfl")
+                && (line.contains("offset = 32")
+                    || line.contains("off = 32")
+                    || line.contains("o = 32"));
+            // The loop header and the shuffle are often on separate lines.
+            let loop_from_32 = (line.contains("offset = 32")
+                || line.contains("off = 32")
+                || line.contains("o = 32"))
+                && line.contains("for (");
+            if (starts_at_32 || loop_from_32) && !is_wave64 {
+                offenders.push(format!("{display}:{} {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "wave64 reduction idiom in a wave32 kernel ({} site(s)); reduce from \
+         offset 16 with an explicit width of 32, or put the kernel under \
+         kernels/src/gfx906 with `wave64` in its name:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+}

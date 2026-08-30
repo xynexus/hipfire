@@ -2116,6 +2116,17 @@ kernel with a 64-lane block out of habit.
 Worth a one-line note near the reduction idiom in `kernels/README` or in a shared header, so
 the next kernel author does not re-derive it from a wrong answer.
 
+**DONE 2026-08-30.** There is no `kernels/README`, so the note went in
+`kernels/AGENTS.md` beside the other kernel rules, with the correct shape spelled
+out (`offset = 16`, explicit width `32`). A note alone would not stop the next
+author, so `wave_reduction_offsets_are_wave32_safe` in
+`crates/hipfire-rdna/src/kernel_arity.rs` also enforces it: a `__shfl` reduction
+starting at offset 32 fails unless the kernel is genuinely wave64 (under
+`kernels/src/gfx906/` AND `wave64` in the filename). Swept the tree first — the
+only offset-32 reductions today are in `attention_flash_q8_0_dp4a_wave64.gfx906.hip`,
+which is correct; every other kernel already reduces from 16 with an explicit
+width. Verified the test fails on an injected `offset = 32` in `attention.hip`.
+
 ## qsa_block_score cannot express the reference's block-key pipeline (low)
 
 `kernels/src/qsa_block_score.hip` mean-pools each block's keys and scores them in
