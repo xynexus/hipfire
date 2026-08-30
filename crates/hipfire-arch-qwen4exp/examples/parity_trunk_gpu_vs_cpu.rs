@@ -293,7 +293,7 @@ fn main() {
             &mut st,
             &mut sc,
             &embed,
-            Some(&ngram),
+            Some(&hipfire_arch_qwen4exp::ngram_rows::ResidentRows { table: &ngram }),
             &tokens[..=t],
             t,
             eos,

@@ -1801,6 +1801,67 @@ impl HfqFile {
     /// The tensor's real byte extent in the file. For a transparently expanded
     /// BF16L3 tensor this is the compressed range, which is what page-eviction
     /// hints and raw reads need — `info.data_size` is the expanded length.
+    /// Read a BYTE RANGE inside one tensor's payload, without materialising the
+    /// tensor.
+    ///
+    /// This exists for tables too large to hold: qwen4_exp's hashed n-gram
+    /// embedding is 102 GB and one token touches exactly `heads` rows of it, so a
+    /// whole-tensor read is not merely wasteful but impossible. Every other reader
+    /// here returns the entire payload.
+    ///
+    /// Refuses a BF16L3/Huff-recoded tensor rather than returning wrong bytes: those
+    /// are VARIABLE-LENGTH coded, so a logical row offset has no fixed physical
+    /// position and the payload must be decoded whole. Returns `None` for an
+    /// unknown name or a range past the end — never a short read.
+    pub fn tensor_byte_range(&self, name: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
+        let idx = self.resolve_idx(name)?;
+        if self.bf16_packed[idx].is_some() {
+            return None;
+        }
+        let info = &self.tensors[idx];
+        if offset.checked_add(len)? > info.data_size {
+            return None;
+        }
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            let bytes = source.shard_bytes(loc.shard, loc.offset + offset, len)?;
+            return Some(bytes.to_vec());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            let (phys_off, _) = self.physical_range(idx);
+            let start = phys_off + offset;
+            let mut buf = vec![0u8; len];
+            let mut got = 0usize;
+            while got < len {
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf[got..].as_mut_ptr() as *mut libc::c_void,
+                        len - got,
+                        (start + got) as libc::off_t,
+                    )
+                };
+                if n <= 0 {
+                    return None;
+                }
+                got += n as usize;
+            }
+            // Do NOT fadvise here. Unlike a whole-tensor read, these are small and
+            // REPEATED — a hot n-gram row is read again on the next token, and
+            // dropping it every time turns the page cache off for exactly the
+            // access pattern that benefits from it most.
+            Some(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            let (_, all) = self.tensor_data(name)?;
+            all.get(offset..offset + len).map(|s| s.to_vec())
+        }
+    }
+
     fn physical_range(&self, idx: usize) -> (usize, usize) {
         match self.bf16_packed[idx] {
             Some((_, off, len)) => (off, len),

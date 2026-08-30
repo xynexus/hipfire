@@ -159,6 +159,45 @@ fn main() {
     }
     println!("  reset:   same prompt reproduces argmax {am1} ({mx1:.4})");
 
-    Box::new(m).unload(&mut gpu);
+    // 5. The STREAMED n-gram path must agree with the resident one EXACTLY. Force
+    // it with a zero budget so this small fixture takes the same route the 102 GB
+    // model has no choice about. A wrong shard split or row offset still yields a
+    // finite embedding, so only a difference against the resident run detects it.
+    if m.config().ngram.is_some() {
+        m.reset_session(&mut gpu, "serve_fixture")
+            .unwrap_or_else(|e| fail(format!("reset before streamed run: {e}")));
+        let resident = {
+            m.prefill(&mut gpu, &prompt)
+                .unwrap_or_else(|e| fail(format!("prefill: {e}")));
+            gpu.download_f32(m.logits())
+                .unwrap_or_else(|e| fail(format!("download: {e:?}")))
+        };
+        Box::new(m).unload(&mut gpu);
+
+        let mut streamed_m = Qwen4ExpBackend::load_with_ngram_budget(&mut gpu, &mut hfq, 64, 0)
+            .unwrap_or_else(|e| fail(format!("streamed load: {e}")));
+        streamed_m
+            .prefill(&mut gpu, &prompt)
+            .unwrap_or_else(|e| fail(format!("streamed prefill: {e}")));
+        let streamed = gpu
+            .download_f32(streamed_m.logits())
+            .unwrap_or_else(|e| fail(format!("download: {e:?}")));
+
+        let worst = resident
+            .iter()
+            .zip(&streamed)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        if worst != 0.0 {
+            fail(format!(
+                "streamed n-gram rows DIFFER from resident: worst |delta| = {worst:.6e}. The row \
+                 addressing (shard split, row_in_shard, element offset) is wrong."
+            ));
+        }
+        println!("  ngram:   streamed rows are bit-identical to resident");
+        Box::new(streamed_m).unload(&mut gpu);
+    } else {
+        Box::new(m).unload(&mut gpu);
+    }
     println!("serve_fixture: OK");
 }

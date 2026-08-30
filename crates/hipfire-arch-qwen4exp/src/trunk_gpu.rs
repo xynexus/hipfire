@@ -418,7 +418,7 @@ pub fn decode_step_into(
     st: &mut TrunkState,
     s: &mut TrunkScratch,
     embed_table: &[f32],
-    ngram_table: Option<&[f32]>,
+    ngram_rows: Option<&dyn crate::ngram_rows::NgramRows>,
     history: &[u32],
     pos: usize,
     eos: u32,
@@ -438,11 +438,11 @@ pub fn decode_step_into(
         let lw = &w.layers[l];
 
         // PLE is additive on the WIDE stream, before the residual read.
-        if let (Some(pw), Some(ps), Some(n), Some(table)) = (
+        if let (Some(pw), Some(ps), Some(n), Some(src)) = (
             lw.ple.as_ref(),
             st.ple[l].as_mut(),
             cfg.ngram.as_ref(),
-            ngram_table,
+            ngram_rows,
         ) {
             let hasher = NgramHasher::from_config(n, cfg.vocab as u64, eos);
             let hd = n.head_dim();
@@ -452,10 +452,9 @@ pub fn decode_step_into(
             let i = hist.len() - 1;
             let preds: Vec<Option<u32>> = hist[..i].iter().map(|&v| Some(v)).collect();
             let rows = hasher.rows(hist[i], &preds);
-            let emb: Vec<f32> = rows
-                .iter()
-                .flat_map(|&r| table[r as usize * hd..(r as usize + 1) * hd].to_vec())
-                .collect();
+            // `heads_per_ngram` rows, whether they come from a resident slice or a
+            // ranged read of the shard tensors — the trunk does not know which.
+            let emb = src.gather(&rows, hd).map_err(|e| HipError::new(0, &e))?;
             let g_emb = gpu.upload_f32(&emb, &[n.embed_dim])?;
             ple_step(gpu, cfg, pw, ps, &s.wide, &g_emb, &s.ple_out)?;
             gpu.add_inplace_f32(&s.wide, &s.ple_out)?;
@@ -504,7 +503,7 @@ pub fn decode_step(
     st: &mut TrunkState,
     s: &mut TrunkScratch,
     embed_table: &[f32],
-    ngram_table: Option<&[f32]>,
+    ngram_rows: Option<&dyn crate::ngram_rows::NgramRows>,
     history: &[u32],
     pos: usize,
     eos: u32,
@@ -516,7 +515,7 @@ pub fn decode_step(
         st,
         s,
         embed_table,
-        ngram_table,
+        ngram_rows,
         history,
         pos,
         eos,

@@ -111,6 +111,12 @@ impl TensorReader for HfqTensorReader<'_> {
     }
 }
 
+/// Public alias so the streamed n-gram reader shares this exact conversion
+/// rather than growing a second, subtly different one.
+pub fn f16_to_f32_pub(h: u16) -> f32 {
+    f16_to_f32(h)
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;

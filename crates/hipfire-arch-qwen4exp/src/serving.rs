@@ -11,24 +11,30 @@
 //! the prompt one token at a time, which is correct but O(prompt) launches. A
 //! batched path is the obvious next perf item and is NOT a correctness gap.
 //!
-//! ## What this seam does not do yet, and why it refuses rather than degrades
+//! ## The two tables the trunk reads on the host
 //!
-//! Two tables are read on the HOST here, because `decode_step_into` takes them as
-//! `&[f32]`:
+//! `decode_step_into` gathers the token embedding and the PLE n-gram rows from
+//! host memory. They are very different problems:
 //!
-//! * the token embedding — `[vocab, hidden]`, 2.5 GB at the shipped geometry;
-//! * the PLE n-gram table — **102 GB**, 41% of the model's parameters.
+//! * the token embedding is `[vocab, hidden]` — 2.5 GB at the shipped geometry,
+//!   large but holdable, and read once per token;
+//! * the n-gram table is **102 GB**, 41% of the parameters, and one token touches
+//!   exactly `heads_per_ngram` rows of it.
 //!
-//! The n-gram table must never be materialised: `crate::ngram_store` exists to
-//! read single rows out of the sharded file, and the row indices are a pure
-//! function of already-committed token ids, so the reads are issuable before the
-//! forward starts. Until `decode_step_into` consumes that reader, this factory
-//! REFUSES a model whose table exceeds a conservative budget instead of trying
-//! and being OOM-killed. A named refusal at load is debuggable; a 128 GB machine
-//! dying under page pressure is not.
+//! The second is handled by reading rows out of the artifact on demand
+//! ([`crate::ngram_rows`]), chosen by SIZE rather than configuration: a fixture's
+//! table is held, the shipped one is streamed. `examples/serve_fixture` forces the
+//! streamed path on a small artifact and requires BIT-IDENTICAL logits, because a
+//! wrong shard split or row offset yields a perfectly plausible embedding.
+//!
+//! Still outstanding: weights are dequantised to f32 at load, so an oq4 model
+//! costs what an f32 one does. Fitting the shipped checkpoint needs them to stay
+//! quantised behind `hipfire_runtime::weights::WeightTensor`.
 
 use crate::arch::{load_ngram_table, HfqTensorReader, Qwen4Exp};
 use crate::config::Qwen4ExpConfig;
+use crate::ngram::NgramHasher;
+use crate::ngram_rows::{HfqShardRows, NgramRows, ResidentRows};
 use crate::trunk_gpu::{decode_step_into, TensorReader, TrunkScratch, TrunkState, TrunkWeights};
 use hipfire_arch_api::ARCH_ID_QWEN4EXP;
 use hipfire_rdna::{Gpu, GpuTensor};
@@ -40,12 +46,34 @@ use hipfire_runtime::arch::{
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 
-/// Host bytes this bring-up seam is willing to spend on the n-gram table.
+/// Above this, n-gram rows are STREAMED from the artifact instead of held.
 ///
 /// 8 GiB is far above any fixture and far below the shipped 102 GB, so it
-/// separates "small artifact, load it" from "you need the streaming reader"
-/// without needing to know which model this is.
+/// separates the two cases without needing to know which model this is. It is a
+/// performance choice, not a correctness one: both paths are differenced and
+/// produce identical rows.
 const NGRAM_HOST_BUDGET_BYTES: u64 = 8 << 30;
+
+/// How this backend gets n-gram embedding rows.
+///
+/// The choice is made by SIZE, not by configuration: a fixture's table is a few
+/// MB and reading it once is cheaper than a pread per row, while the shipped
+/// model's is 102 GB and holding it is impossible. Both paths produce identical
+/// rows — `examples/serve_fixture` differences them on the same artifact.
+enum NgramSource {
+    /// No PLE block in this model.
+    None,
+    /// The whole table on the host.
+    Resident(Vec<f32>),
+    /// Rows read out of the artifact's shard tensors on demand. Owns its OWN
+    /// `HfqFile` handle: the factory only borrows the caller's, and the loader's
+    /// copy is gone long before the first token.
+    Streamed {
+        hfq: Box<HfqFile>,
+        hasher: Box<NgramHasher>,
+        layer: usize,
+    },
+}
 
 /// A loaded Qwen3.8-Flash-Next model: GPU-resident trunk weights and per-layer
 /// state (KV cache for the sparse-attention layers, DeltaNet recurrent state and
@@ -57,8 +85,9 @@ pub struct Qwen4ExpBackend {
     scratch: TrunkScratch,
     /// `[vocab, hidden]`, host-side — `decode_step_into` gathers one row per step.
     embed: Vec<f32>,
-    /// Present only for artifacts small enough to hold it (see the module note).
-    ngram: Option<Vec<f32>>,
+    /// Where the PLE n-gram rows come from — resident for a small table, streamed
+    /// from the artifact for one that cannot be held.
+    ngram: NgramSource,
     /// Every token committed so far. The trunk takes the full history because the
     /// PLE hash reads an n-gram window, not just the current token.
     history: Vec<u32>,
@@ -70,9 +99,23 @@ impl Qwen4ExpBackend {
     /// wrapper over this, so the daemon path and any direct driver construct the
     /// SAME object — a test that exercises one is exercising the other.
     pub fn load(gpu: &mut Gpu, hfq: &mut HfqFile, max_seq: usize) -> Result<Self, String> {
-        let cfg = Qwen4Exp::config_from_hfq(hfq)?;
-        Self::check_ngram_budget(&cfg)?;
+        Self::load_with_ngram_budget(gpu, hfq, max_seq, NGRAM_HOST_BUDGET_BYTES)
+    }
 
+    /// [`Self::load`] with the resident/streamed threshold overridden.
+    ///
+    /// Exists so a test can force the STREAMED path on a small artifact and
+    /// difference it against the resident one. Without that, the streaming row
+    /// addressing (shard split, row-in-shard, element offset) would only ever run
+    /// on the 102 GB model, where a wrong row is an indistinguishable-looking
+    /// embedding rather than a failure.
+    pub fn load_with_ngram_budget(
+        gpu: &mut Gpu,
+        hfq: &mut HfqFile,
+        max_seq: usize,
+        ngram_host_budget: u64,
+    ) -> Result<Self, String> {
+        let cfg = Qwen4Exp::config_from_hfq(hfq)?;
         let weights = Qwen4Exp::load_weights(hfq, &cfg, gpu)?;
         let max_seq = max_seq.min(cfg.max_position).max(1);
         let state =
@@ -82,9 +125,33 @@ impl Qwen4ExpBackend {
 
         let reader = HfqTensorReader { hfq };
         let embed = reader.read("model.language_model.embed_tokens.weight")?;
+        // Resident when the table fits the host budget, streamed when it does not.
+        // This is what lets the shipped checkpoint load at all: its table is 102 GB.
         let ngram = match cfg.ngram.as_ref() {
-            Some(_) => Some(load_ngram_table(&reader, &cfg)?),
-            None => None,
+            None => NgramSource::None,
+            Some(n) if Self::ngram_bytes(n) <= ngram_host_budget => {
+                NgramSource::Resident(load_ngram_table(&reader, &cfg)?)
+            }
+            Some(n) => {
+                // Re-open the artifact so the backend owns a handle that outlives
+                // the factory's borrow. `HfqShardRows::new` validates the shard
+                // encoding up front, so an unsupported one is refused here rather
+                // than on the first token.
+                let path = hfq.path().to_path_buf();
+                let own = HfqFile::open(&path).map_err(|e| {
+                    format!(
+                        "qwen4_exp: reopening {} for streamed n-gram rows: {e}",
+                        path.display()
+                    )
+                })?;
+                let hasher = NgramHasher::from_config(n, cfg.vocab as u64, cfg.eos_token_id);
+                HfqShardRows::new(&own, &hasher, n.layer_idx)?;
+                NgramSource::Streamed {
+                    hfq: Box::new(own),
+                    hasher: Box::new(hasher),
+                    layer: n.layer_idx,
+                }
+            }
         };
         let eos = cfg.eos_token_id;
         Ok(Self {
@@ -99,31 +166,14 @@ impl Qwen4ExpBackend {
         })
     }
 
-    /// Refuse a model whose n-gram table cannot be held on the host, BEFORE
-    /// allocating anything, and say which table and how big.
-    fn check_ngram_budget(cfg: &Qwen4ExpConfig) -> Result<(), String> {
-        let Some(n) = cfg.ngram.as_ref() else {
-            return Ok(());
-        };
+    /// Host bytes the n-gram table would occupy if held resident.
+    fn ngram_bytes(n: &crate::config::NgramConfig) -> u64 {
         let (_, _, padded) = hipfire_arch_qwen4exp_spec::ngram_head_layout(
             n.vocab_size_base,
             n.heads(),
             n.divisible_by,
         );
-        let bytes = padded * n.head_dim() as u64 * 4;
-        if bytes > NGRAM_HOST_BUDGET_BYTES {
-            return Err(format!(
-                "qwen4_exp: this model's n-gram table is {:.1} GiB at f32 ({padded} rows x {} \
-                 dims), over the {} GiB host budget this bring-up seam allows. It is meant to be \
-                 READ FROM DISK a row at a time (`crate::ngram_store`), which the trunk's decode \
-                 does not consume yet. Serving the shipped checkpoint needs that wiring first — \
-                 see docs/plans/2026-08-29-qwen4exp-flash-next-scope.md.",
-                bytes as f64 / (1u64 << 30) as f64,
-                n.head_dim(),
-                NGRAM_HOST_BUDGET_BYTES >> 30,
-            ));
-        }
-        Ok(())
+        padded * n.head_dim() as u64 * 4
     }
 
     pub fn config(&self) -> &Qwen4ExpConfig {
@@ -131,18 +181,35 @@ impl Qwen4ExpBackend {
     }
 
     /// One trunk step at absolute position `pos`, leaving logits on the GPU.
+    ///
+    /// `self` is destructured so the n-gram provider (which borrows `ngram`) and
+    /// the mutable trunk state are disjoint borrows rather than two of `self`.
     fn step(&mut self, gpu: &mut Gpu, pos: usize) -> Result<(), String> {
+        let Self {
+            cfg,
+            weights,
+            state,
+            scratch,
+            embed,
+            ngram,
+            history,
+            eos,
+        } = self;
+        let resident;
+        let streamed;
+        let rows: Option<&dyn NgramRows> = match ngram {
+            NgramSource::None => None,
+            NgramSource::Resident(t) => {
+                resident = ResidentRows { table: t };
+                Some(&resident)
+            }
+            NgramSource::Streamed { hfq, hasher, layer } => {
+                streamed = HfqShardRows::new(hfq, hasher, *layer)?;
+                Some(&streamed)
+            }
+        };
         decode_step_into(
-            gpu,
-            &self.cfg,
-            &self.weights,
-            &mut self.state,
-            &mut self.scratch,
-            &self.embed,
-            self.ngram.as_deref(),
-            &self.history,
-            pos,
-            self.eos,
+            gpu, cfg, weights, state, scratch, embed, rows, history, pos, *eos,
         )
         .map_err(|e| format!("qwen4_exp decode: {e:?}"))
     }
