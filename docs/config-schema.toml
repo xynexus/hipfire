@@ -291,6 +291,18 @@ restart_impact = "none"
 env = ["HIPFIRE_LOAD_MEM_RESERVE_GIB"]
 
 [[field]]
+key = "max_resident_workers"
+type = "u32"
+requirement = "optional"
+default = "2"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "How many model workers may stay resident at once, counting the active one. Switching models PARKS the previous worker with its weights still on the GPU so switching back is instant; beyond this many, the least-recently-used parked worker is unloaded. This is a COUNT, not a byte budget — two large models can still exhaust the pool, which is why a load that does not fit evicts parked workers regardless of this value. `1` keeps only the active worker (no warm spares); `0` is treated as `1`."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "max_seq"
 type = "u32"
 requirement = "optional"

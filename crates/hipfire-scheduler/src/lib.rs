@@ -115,6 +115,25 @@ pub struct ModelResidencyRequest {
     pub worker_key_id: String,
     pub model_path: String,
     pub requested_mode: ResidencyMode,
+    /// How many workers may stay resident at once, counting the one being
+    /// admitted. `0` means no count limit — only the byte budget applies.
+    ///
+    /// A COUNT bound is not the same as the byte budget below and does not
+    /// replace it: the budget defaults to 0 (unlimited), so without this
+    /// nothing ever evicted and parked workers accumulated until a load OOM'd.
+    /// The budget is still the right tool when it is configured; this bounds
+    /// the common case where it is not.
+    pub max_resident_workers: u32,
+    /// The VRAM budget was DERIVED from detected hardware, not configured.
+    ///
+    /// A derived budget plans evictions and nothing else. It must not refuse a
+    /// load and must not switch residency mode: the operator did not ask for
+    /// either, and the estimate behind it is a file size, which is not what a
+    /// model actually occupies. Forcing module residency on a derived budget
+    /// put a grouped-MoE target onto a prefill path this build does not
+    /// support ("requires grouped GEMM path2 support") — a working model made
+    /// unusable by a heuristic.
+    pub budget_is_advisory: bool,
     pub estimated_full: ResourceUsage,
     pub estimated_qwen_moe_modules: Option<ResourceUsage>,
 }
@@ -193,10 +212,12 @@ pub fn plan_model_residency(
             (ResidencyMode::QwenMoeModules, usage)
         }
         ResidencyMode::Auto => {
-            if usage_fits(
-                budget,
-                add_usage(ledger_usage(resident_workers), request.estimated_full),
-            ) {
+            if request.budget_is_advisory
+                || usage_fits(
+                    budget,
+                    add_usage(ledger_usage(resident_workers), request.estimated_full),
+                )
+            {
                 (ResidencyMode::Full, request.estimated_full)
             } else if let Some(module_usage) = request.estimated_qwen_moe_modules {
                 (ResidencyMode::QwenMoeModules, module_usage)
@@ -206,7 +227,7 @@ pub fn plan_model_residency(
         }
     };
 
-    if !usage_fits(budget, usage) {
+    if !request.budget_is_advisory && !usage_fits(budget, usage) {
         return Err(format!(
             "requested {} residency exceeds configured budget/headroom",
             mode.as_str()
@@ -215,9 +236,28 @@ pub fn plan_model_residency(
 
     let mut current = ledger_usage(resident_workers);
     let mut unload = Vec::new();
+    // Least-recently-used first, and the same order serves both rules below.
+    let mut victims = resident_workers.to_vec();
+    victims.sort_by_key(|worker| worker.last_used_seq);
+    let mut victims = victims.into_iter();
+
+    // Count rule. `+ 1` counts the worker being admitted: the cap is what may
+    // be resident AFTER this load, not before it.
+    if request.max_resident_workers > 0 {
+        let cap = request.max_resident_workers as usize;
+        let mut resident = resident_workers.len() + 1;
+        while resident > cap {
+            let Some(victim) = victims.next() else {
+                break;
+            };
+            current = subtract_usage(current, victim.resource_usage);
+            unload.push(victim.worker_key_id);
+            resident -= 1;
+        }
+    }
+
+    // Byte rule, over whatever the count rule left resident.
     if !usage_fits(budget, add_usage(current, usage)) {
-        let mut victims = resident_workers.to_vec();
-        victims.sort_by_key(|worker| worker.last_used_seq);
         for victim in victims {
             current = subtract_usage(current, victim.resource_usage);
             unload.push(victim.worker_key_id);
@@ -227,7 +267,7 @@ pub fn plan_model_residency(
         }
     }
 
-    if !usage_fits(budget, add_usage(current, usage)) {
+    if !request.budget_is_advisory && !usage_fits(budget, add_usage(current, usage)) {
         return Err("insufficient budget after evicting all eligible resident workers".to_string());
     }
 
@@ -2532,6 +2572,8 @@ mod tests {
             worker_key_id: "worker-new".to_string(),
             model_path: "qwen.hfq".to_string(),
             requested_mode: ResidencyMode::Auto,
+            max_resident_workers: 0,
+            budget_is_advisory: false,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 1_200,
@@ -2545,6 +2587,129 @@ mod tests {
         let plan = plan_model_residency(budget, request, &[]).unwrap();
         assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
         assert_eq!(plan.module_vram_budget_bytes, Some(700));
+    }
+
+    fn ledger(entries: &[(&str, u64)]) -> Vec<ResidentWorkerLedgerEntry> {
+        entries
+            .iter()
+            .map(|(id, seq)| ResidentWorkerLedgerEntry {
+                worker_key_id: (*id).to_string(),
+                model_path: format!("{id}.hfq"),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 10,
+                },
+                last_used_seq: *seq,
+            })
+            .collect()
+    }
+
+    fn count_capped_request(max_resident_workers: u32) -> ModelResidencyRequest {
+        ModelResidencyRequest {
+            worker_key_id: "incoming".to_string(),
+            model_path: "incoming.hfq".to_string(),
+            requested_mode: ResidencyMode::Full,
+            max_resident_workers,
+            budget_is_advisory: false,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 10,
+            },
+            estimated_qwen_moe_modules: None,
+        }
+    }
+
+    /// The byte budget defaults to 0, which means UNLIMITED — so before the
+    /// count rule nothing was ever evicted and parked workers accumulated until
+    /// a load ran out of memory.
+    const NO_BYTE_BUDGET: ResourceBudget = ResourceBudget {
+        system_memory_budget_bytes: 0,
+        system_memory_headroom_bytes: 0,
+        vram_budget_bytes: 0,
+        vram_headroom_bytes: 0,
+    };
+
+    #[test]
+    fn an_advisory_budget_evicts_but_never_refuses_or_switches_mode() {
+        let tight = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 15,
+            vram_headroom_bytes: 0,
+        };
+        let mut request = count_capped_request(0);
+        request.requested_mode = ResidencyMode::Auto;
+        request.estimated_qwen_moe_modules = Some(ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: 5,
+        });
+        request.budget_is_advisory = true;
+
+        // One parked worker at 10 plus an incoming 10 exceeds 15, so the
+        // advisory budget still plans the eviction.
+        let plan = plan_model_residency(tight, request.clone(), &ledger(&[("old", 1)])).unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
+        // But it must NOT switch to module residency. Doing so put a
+        // grouped-MoE target on a prefill path this build cannot run.
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+
+        // And it must not refuse, even when nothing can be evicted to fit.
+        let mut alone = request;
+        alone.estimated_full = ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: 1_000,
+        };
+        let plan = plan_model_residency(tight, alone, &[])
+            .expect("an advisory budget must never refuse a load");
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+    }
+
+    #[test]
+    fn a_count_cap_evicts_least_recently_used_with_no_byte_budget() {
+        // Two parked + one incoming = 3, cap 2, so the oldest goes.
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(2),
+            &ledger(&[("oldest", 1), ("newest", 9)]),
+        )
+        .unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["oldest"]);
+    }
+
+    #[test]
+    fn a_count_cap_of_one_keeps_only_the_incoming_worker() {
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(1),
+            &ledger(&[("a", 1), ("b", 2)]),
+        )
+        .unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_count_cap_that_already_fits_evicts_nothing() {
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(4),
+            &ledger(&[("a", 1), ("b", 2)]),
+        )
+        .unwrap();
+        assert!(plan.unload_worker_key_ids.is_empty());
+    }
+
+    #[test]
+    fn zero_means_no_count_limit() {
+        // Preserves the old behaviour exactly: with no byte budget and no count
+        // cap, nothing is evicted.
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(0),
+            &ledger(&[("a", 1), ("b", 2), ("c", 3)]),
+        )
+        .unwrap();
+        assert!(plan.unload_worker_key_ids.is_empty());
     }
 
     #[test]
@@ -2581,6 +2746,8 @@ mod tests {
             worker_key_id: "incoming".to_string(),
             model_path: "incoming.hfq".to_string(),
             requested_mode: ResidencyMode::Full,
+            max_resident_workers: 0,
+            budget_is_advisory: false,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 600,
