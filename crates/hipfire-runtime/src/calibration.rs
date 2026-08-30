@@ -200,6 +200,31 @@ struct Acc {
     n_tokens: u64,
 }
 
+/// Env-gated capture trace (`HIPFIRE_CALIB_TRACE=1`), for diagnosing
+/// nondeterministic calibration artifacts.
+///
+/// Prints one line per reduction with a hash of the STAGED ROWS that reduction
+/// is about to consume. Diffing two runs' traces finds the first flush whose
+/// input diverged, which separates "the forward fed us different activations"
+/// from "the reduction turned identical input into a different accumulator".
+/// Off by default and costs a device download per flush, so it is a debugging
+/// tool, not a monitoring one.
+pub(crate) fn calib_trace_enabled() -> bool {
+    std::env::var("HIPFIRE_CALIB_TRACE").as_deref() == Ok("1")
+}
+
+/// FNV-1a over the raw f32 bits, so the hash is exact rather than formatted.
+fn calib_trace_hash(values: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in values {
+        for byte in v.to_bits().to_le_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    h
+}
+
 impl Acc {
     /// Reduce the staged rows into the accumulators (one batched launch each),
     /// then reset the buffer. No-op when empty. Imatrix-only tensors (`h` is
@@ -210,6 +235,24 @@ impl Acc {
     fn flush_result(&mut self, gpu: &mut Gpu) -> Result<(), contracts::CalibError> {
         if self.buf_rows == 0 {
             return Ok(());
+        }
+        if calib_trace_enabled() {
+            // Hash exactly the rows this reduction will read. A row the gather
+            // skipped still sits inside `buf_rows` and still contributes, so it
+            // is included here by construction.
+            let staged = gpu
+                .download_f32(&self.buf)
+                .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
+            let n = self.buf_rows * self.k;
+            let nonfinite = staged[..n].iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
+                "[calib-trace] flush names={:?} rows={} k={} staged_hash={:#018x} nonfinite={}",
+                self.output_names,
+                self.buf_rows,
+                self.k,
+                calib_trace_hash(&staged[..n]),
+                nonfinite,
+            );
         }
         if let Some(stats) = self.stats.as_ref() {
             gpu.calib_actstats_reduce_f32(&self.buf, stats, self.buf_rows, self.k)
@@ -696,6 +739,32 @@ impl CalibCollector {
                     "descriptor {} capture staging state diverged from its plan",
                     capture_id.0
                 )));
+            }
+            if calib_trace_enabled() {
+                // The hypothesis under test: `calib_gather_rows_f32` returns
+                // WITHOUT writing any row whose slot index is negative, and the
+                // staging tile is zeroed only once at allocation and reused
+                // across flushes. A negative slot inside `0..rows` would
+                // therefore leave the PREVIOUS tile's values in a row that this
+                // flush still reduces. If this never prints, that path is not
+                // the cause and the divergence is upstream of the gather.
+                let bytes = gpu
+                    .download_raw(sorted_slot_index, sorted_slot_index.byte_size())
+                    .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
+                let slots: Vec<i32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let lo = action.sorted_start.min(slots.len());
+                let hi = (action.sorted_start + action.rows).min(slots.len());
+                let negatives = slots[lo..hi].iter().filter(|s| **s < 0).count();
+                if negatives > 0 {
+                    eprintln!(
+                        "[calib-trace] NEGATIVE SLOTS names={:?} count={negatives}/{} \
+                         sorted_start={lo} dst_row={}",
+                        descriptor.output_names, action.rows, action.destination_row,
+                    );
+                }
             }
             gpu.calib_gather_rows_f32(
                 source,

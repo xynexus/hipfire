@@ -1,6 +1,7 @@
 # Calibration capture is nondeterministic; inference is not
 
-Status: **localized, NOT fixed** — 2026-08-30, nix2 (gfx1103), master `5f6bb9dd6`.
+Status: **localized to layer-0 attention, NOT fixed** — 2026-08-30, nix2 (gfx1103).
+Instrumented and re-measured; the original suspect below is DISPROVEN.
 
 Chasing the flaky `zaya/kld:oq4.25++` tiny-quant cell led to something larger
 than a flaky cell. `tiny_quant_probe collect` — the instrumented forward that
@@ -90,3 +91,68 @@ Production calibration is affected in principle — the same code path, without 
 tolerance. Whether the resulting weight differences matter at real model scale is
 unmeasured; the fixture is random-init and tiny, where a single re-routed token
 is a large fraction of the evidence.
+
+
+## Instrumented follow-up — the gather hypothesis is dead
+
+`HIPFIRE_CALIB_TRACE=1` (added in `calibration.rs`) prints, per reduction, the
+names, row count, and an FNV-1a hash of the exact staged rows that reduction is
+about to consume — plus a line whenever the gather is handed a negative slot
+index.
+
+**12 traced `collect` runs, 3 of which diverged. `NEGATIVE SLOTS` never printed
+once.** The `calib_gather_rows_f32` skip path named above is NOT the cause; the
+staging tile is fully written every tile. That hypothesis is closed.
+
+### Reading the trace correctly
+
+Flush *order* varies between runs even when the resulting artifact is
+byte-identical, because independent accumulators interleave differently. Order
+is therefore not signal. Comparing each tensor's OWN ordered flush sequence is:
+two runs that produced identical calibs show **0** tensors differing, which is
+what makes the method trustworthy.
+
+### Where it actually diverges
+
+On a divergent run, 31 of 35 captured tensors differ. The four that AGREE are
+the decisive ones:
+
+    model.layers.0.self_attn.qkv_proj.q_proj          IDENTICAL
+    model.layers.0.self_attn.qkv_proj.k_proj          IDENTICAL
+    model.layers.0.self_attn.qkv_proj.v_proj_current  IDENTICAL
+    model.layers.0.self_attn.qkv_proj.v_proj_delayed  IDENTICAL
+
+    model.layers.0.self_attn.o_proj    24 rows, DIFFERENT hash   <-- first divergence
+
+Those four capture the *input* to the QKV projections; `o_proj` captures the
+*output* of attention. Identical input, divergent output, same row count.
+
+**Layer-0 attention turns identical inputs into different outputs.** Everything
+downstream — the router MLP, expert routing (which is what shifts expert 2 from
+10 tokens to 9), every later layer, and the tied-embedding capture — inherits it.
+`model.embed_tokens` is the lm_head input, i.e. the final hidden state, so its
+divergence is a consequence and not, as first assumed, an early cause.
+
+### Also ruled out this round
+
+- **Not the token stream.** `synthetic_tokens` is a pure SplitMix64 over
+  `(len, seed)`, seed defaults to 42, and the battery never overrides it.
+- **Not the KVarN scratch.** `gpu.rs` allocates `tiles`, `flash_partials`, and
+  `positions` with `alloc_tensor` (uninitialized) rather than `zeros`, which
+  looked like the answer. It is not: `HIPFIRE_ZAYA_KVARN` is **opt-in** and
+  unset in these runs, so that whole branch is dead code here — the f32 `k_cache`
+  / `v_cache` rings actually used are allocated through the zeroing helper.
+  Switching those three to `zeros` was tried and changed nothing (3 distinct
+  results in 16 runs), consistent with the branch never executing. Reverted.
+
+### Next step
+
+The question is now narrow and does not involve calibration at all: **why does
+zaya layer-0 attention produce a different output for a bit-identical Q/K/V on
+gfx1103?** Worth noting that `ar-hash` (plain greedy decode, no capture armed)
+is bit-exact across 10 runs, so whatever it is, arming the capture is part of
+reproducing it — the capture hooks add allocations and downloads around the same
+kernels, which is the kind of timing/occupancy change that surfaces a latent
+multi-wave or LDS hazard. gfx1103 has a documented one (README "gfx1103 /
+Phoenix LDS status", HIP-719 / CWSR), which makes the attention reduction on this
+arch the first place to look.
