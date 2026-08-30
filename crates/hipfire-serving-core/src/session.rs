@@ -2286,14 +2286,18 @@ pub fn ensure_sequence_state_arena_backend_supported(
     arena_backend.require_supported(m.arch_id, m.pp, op)
 }
 
-/// Ceiling on resident qwen35 sessions before the oldest are evicted.
+/// Ceiling on resident request sessions before the oldest are evicted.
+///
+/// Shared by the qwen35 and LFM2 evictors — it used to be named `qwen35_*`,
+/// which read as a family-specific limit being misapplied once the LFM2 path
+/// started calling it.
 ///
 /// Honours the scheduler's own `HIPFIRE_SCHED_RESIDENT_STATE_MAX` so there is
 /// one knob, not two — `resident_state_limit` in `/health` reports the same
 /// value. Reading the env directly avoids a `hipfire-scheduler` dependency here
 /// for a single integer.
-pub fn qwen35_resident_session_limit_value() -> usize {
-    qwen35_resident_session_limit()
+pub fn resident_session_limit_value() -> usize {
+    resident_session_limit()
 }
 
 /// Which sessions to evict to get back to `limit`, oldest first.
@@ -2339,7 +2343,7 @@ fn eviction_victims(sessions: &[(String, u64)], active: Option<&str>, limit: usi
         .collect()
 }
 
-fn qwen35_resident_session_limit() -> usize {
+fn resident_session_limit() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("HIPFIRE_SCHED_RESIDENT_STATE_MAX")

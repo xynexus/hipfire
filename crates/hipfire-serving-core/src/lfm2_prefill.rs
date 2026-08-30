@@ -675,7 +675,7 @@ pub fn run_generate_batch_prefill_serial_lfm2(
     match crate::session::lfm2_evict_sessions_over_limit(
         m,
         gpu,
-        crate::session::qwen35_resident_session_limit_value(),
+        crate::session::resident_session_limit_value(),
     ) {
         Ok(0) => {}
         Ok(n) => tracing::debug!("evicted {n} resident lfm2 session(s) over the limit"),
