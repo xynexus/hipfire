@@ -1795,6 +1795,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen4exp"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-qwen4exp-spec",
+ "hipfire-quant-format",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-qwen4exp-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-qwenimage-spec"
 version = "0.3.0"
 dependencies = [
@@ -1821,6 +1840,7 @@ dependencies = [
  "hipfire-arch-nemotron-spec",
  "hipfire-arch-qwen2-spec",
  "hipfire-arch-qwen35-spec",
+ "hipfire-arch-qwen4exp-spec",
  "hipfire-arch-qwenimage-spec",
  "hipfire-arch-zaya-spec",
 ]
@@ -2424,6 +2444,7 @@ name = "hipfire-rdna"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-qwen4exp",
  "hipfire-gpu-types",
  "hipfire-kvquant",
  "hipfire-primitives",

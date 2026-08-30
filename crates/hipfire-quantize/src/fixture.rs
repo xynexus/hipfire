@@ -16,6 +16,7 @@
 // this crate keeps the writer (seeded RNG → safetensors + shared tokenizer).
 use hipfire_arch_api::{
     Dt, Init, TensorSpec, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA4, ARCH_ID_LFM2_MOE,
+    ARCH_ID_QWEN4EXP,
 };
 use hipfire_primitives::conv::f32_to_bf16_bits as bf16_bits;
 use std::collections::BTreeMap;
@@ -327,6 +328,20 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         // is excluded from that path by both gates — see `moe_indexed_preset`.
         "qwen3_5_moe_indexed" | "qwen35moe_indexed" => {
             named_toy_fixture_from_registry(6, "indexed", seed)?
+        }
+        // Probe for the qwen4_exp routed-MoE geometry: moe_inter 640 / top-10,
+        // which `oq_indexed_admissible` rejects on both conditions at once.
+        "qwen3_5_moe_mi640_k10" | "qwen35moe_mi640_k10" => {
+            named_toy_fixture_from_registry(6, "mi640-k10", seed)?
+        }
+        // Qwen3.8-Flash-Next. `default` is the architecture fixture (3 DeltaNet +
+        // 1 sparse-attention layer, gated residual, n-gram PLE); `moe-production`
+        // swaps in the real routed geometry the indexed decode path refuses.
+        "qwen4_exp" | "qwen4exp" | "qwen3_8_flash_next" => {
+            toy_fixture_from_registry(ARCH_ID_QWEN4EXP as u16, seed)?
+        }
+        "qwen4_exp_moe" | "qwen4exp_moe_production" => {
+            named_toy_fixture_from_registry(ARCH_ID_QWEN4EXP as u16, "moe-production", seed)?
         }
         "deepseek4" | "deepseek_v4" | "deepseek4_flash" | "deepseek_v4_flash" => {
             toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, seed)?

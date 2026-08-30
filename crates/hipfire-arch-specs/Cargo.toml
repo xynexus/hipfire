@@ -14,6 +14,7 @@ hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
 hipfire-arch-qwen2-spec = { path = "../hipfire-arch-qwen2-spec" }
 hipfire-arch-qwen35-spec = { path = "../hipfire-arch-qwen35-spec" }
+hipfire-arch-qwen4exp-spec = { path = "../hipfire-arch-qwen4exp-spec" }
 hipfire-arch-dots-ocr-spec = { path = "../hipfire-arch-dots-ocr-spec" }
 hipfire-arch-deepseek4-spec = { path = "../hipfire-arch-deepseek4-spec" }
 hipfire-arch-minimax-spec = { path = "../hipfire-arch-minimax-spec" }

@@ -141,6 +141,21 @@ kv = "none"
 vision = "none"
 
 [[arch]]
+# Qwen3.8-Flash-Next. The OFFLINE half is complete — arch/ingest/quant policy,
+# config, weight plan, and a CPU trunk differenced end-to-end against the pinned
+# upstream reference (tokens -> logits, argmax identical; see
+# `crates/hipfire-arch-qwen4exp/tests/reference_oracle.rs`). There is no GPU
+# serving path yet, so every mark below is `none` — this row tracks what can be
+# SERVED, not what has been built or verified.
+ids = [26]
+label = "qwen4-exp"
+prefill = "none"
+dflash = "none"
+mtp = "none"
+kv = "none"
+vision = "none"
+
+[[arch]]
 ids = [7]
 label = "qwen2"
 prefill = "full"

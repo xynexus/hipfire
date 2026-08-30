@@ -1,0 +1,20 @@
+[package]
+name = "hipfire-arch-qwen4exp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.8-Flash-Next (qwen4_exp) serving arch: config, weights, and forward pass."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-qwen4exp-spec = { path = "../hipfire-arch-qwen4exp-spec" }
+serde_json = "1"
+# The GDN layer drives hipfire-rdna kernels directly rather than threading a
+# qwen4_exp flag through qwen35's driver, which has 8 `gated_norm_f32` call sites
+# on shipping Qwen3.5/3.8 hot paths.
+hipfire-rdna = { path = "../hipfire-rdna", features = ["deltanet"] }
+# For the `Architecture` impl and `HfqFile`. Note the direction: `hipfire-runtime`
+# does NOT depend on this crate (the spec crate is what `hipfire-arch-specs` pulls),
+# so this edge does not cycle — same shape as `hipfire-arch-deepseek4`.
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }

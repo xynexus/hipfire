@@ -878,6 +878,77 @@ pub fn gtt_alloc_cost(bytes: usize) -> usize {
     bytes.div_ceil(2 * MIB) * (2 * MIB)
 }
 
+#[cfg(test)]
+mod gtt_granularity_agreement_tests {
+    use super::gtt_alloc_cost;
+
+    /// `estimated_module_resident_bytes` rounds PER TENSOR (`for tensor in
+    /// &module.tensors { resident += gtt_alloc_cost(len) }`) while
+    /// `ensure_expert_module_resident` allocates ONCE PER MODULE
+    /// (`gtt_alloc_cost(module_resident_len(&module))`). Both are individually
+    /// correct; they disagree whenever the two tensors land in the
+    /// 512 KiB..2 MiB power-of-two regime and their sum crosses into the
+    /// >2 MiB multiple-of-2-MiB regime.
+    ///
+    /// Qwen3.8-Flash-Next at oq4 is exactly that shape, and the gap is 26.3 GB
+    /// across its 25,088 routed-expert modules — admission passes on 78.9 GB
+    /// and the pager then needs 105.2 GB. See BUGS.md, "Load admission
+    /// under-estimates routed-expert GTT by 26 GB".
+    ///
+    /// IGNORED because the fix is not obviously safe: the estimator was
+    /// deliberately tuned away from the pager once before (the `compact_resident`
+    /// arm, to stop over-estimating a compact artifact 1.80x and refusing the
+    /// 122B), so tightening it changes admission for every paged MoE and wants a
+    /// real GTT measurement first. Un-ignore when the two are reconciled.
+    #[test]
+    #[ignore = "known divergence, see BUGS.md: estimator rounds per tensor, pager per module"]
+    fn per_tensor_and_per_module_rounding_agree() {
+        // Qwen3.8-Flash-Next routed expert, oq4: gate_up Oq4G256 over K=hidden
+        // 2560, down Oq4G128 over K=mi 640.
+        let gate_up = 1_689_600usize;
+        let down = 870_400usize;
+        let per_tensor = gtt_alloc_cost(gate_up) + gtt_alloc_cost(down);
+        let per_module = gtt_alloc_cost(gate_up + down);
+        assert_eq!(
+            per_tensor, per_module,
+            "admission ({per_tensor}) must not under-count the pager ({per_module})"
+        );
+    }
+
+    /// The divergence is real and this pins its exact shape, so the ignored test
+    /// above cannot be "fixed" by quietly changing the numbers instead of the
+    /// code. Delete this one together with the fix.
+    #[test]
+    fn divergence_is_exactly_three_mib_versus_four() {
+        let (gate_up, down) = (1_689_600usize, 870_400usize);
+        assert_eq!(gtt_alloc_cost(gate_up), 2 << 20, "gate_up rounds to 2 MiB");
+        assert_eq!(gtt_alloc_cost(down), 1 << 20, "down rounds to 1 MiB");
+        assert_eq!(
+            gtt_alloc_cost(gate_up + down),
+            4 << 20,
+            "module rounds to 4 MiB"
+        );
+        // And this is why no tiny fixture can catch it. `qwen3_5_moe_mi640_k10`
+        // at hidden 512 / mi 640 gives gate_up = 1280*(512/256)*132 and
+        // down = 512*(640/128)*68 — the WHOLE MODULE is under 512 KiB, so every
+        // term stays in the page-granular regime where rounding is near-exact.
+        // Measured on the real artifact's module table: 1.006x both ways.
+        let (fx_gu, fx_dn) = (1280 * 2 * 132usize, 512 * 5 * 68usize);
+        assert!(
+            fx_gu + fx_dn <= 512 << 10,
+            "fixture module is page-granular"
+        );
+        let fx_per_tensor = gtt_alloc_cost(fx_gu) + gtt_alloc_cost(fx_dn);
+        let fx_per_module = gtt_alloc_cost(fx_gu + fx_dn);
+        assert!(
+            fx_per_tensor.abs_diff(fx_per_module) * 100 / fx_per_module < 2,
+            "fixture-sized modules agree to within page alignment \
+             ({fx_per_tensor} vs {fx_per_module}) — which is the whole reason \
+             this divergence needs a >2 MiB module to surface"
+        );
+    }
+}
+
 /// Estimated resident device bytes for an artifact's routed-expert modules, and
 /// what those same modules occupy on disk.
 ///

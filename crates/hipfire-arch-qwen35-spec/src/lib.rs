@@ -243,6 +243,51 @@ impl Qwen35Tiny {
         }
     }
 
+    /// The Qwen3.8-Flash-Next (`qwen4_exp`) routed-MoE geometry, scaled down:
+    /// `moe_inter = 640` and `k_top = 10`, which is the shape that
+    /// [`oq_indexed_admissible`] rejects on BOTH of its conditions at once.
+    ///
+    /// This is a PROBE fixture, not a coverage fixture. It exists to pin what
+    /// the quantizer and the decode path actually do with that geometry, since
+    /// the two failures are asymmetric and easy to reason about wrongly:
+    ///
+    /// - `gate_up` has `K = hidden = 256`, a clean multiple of 256, so it is
+    ///   admissible on the shape condition.
+    /// - `down` has `K = moe_inter = 640`, and `640 = 2^7 * 5`, so the largest
+    ///   power of two dividing it is **128**. A G256 group cannot tile it, and
+    ///   since the rotate is an FWHT the group size must be a power of two —
+    ///   which rules out the 160 that "any divisor of 640" would suggest.
+    ///
+    /// 12 experts rather than 10 so top-10 is a real selection with two slots
+    /// dark per token, for the same reason [`Self::moe_indexed_preset`] uses 10
+    /// for top-8: at k-of-k a kernel that ignored `topk_indices` still scores
+    /// clean.
+    ///
+    /// `n_heads = 4` (hidden 512, not the base preset's 256) for the reason
+    /// [`Self::moe_indexed_preset`] gives for `moe_inter = 512`: hidden IS the
+    /// `gate_up` reduction dim, so hidden 256 would be a single G256 group and
+    /// would stop covering multi-group accumulation on the admissible half. The
+    /// target is hidden 2560 — ten groups — so a single-group probe does not
+    /// model it.
+    ///
+    /// `shared_inter` is 640 too, matching the target, which puts the shared
+    /// expert's `down_proj` at the same ragged `K` as the routed one.
+    fn moe_mi640_k10_preset() -> Self {
+        Self {
+            experts: 12,
+            experts_per_tok: 10,
+            moe_inter: 640,
+            shared_inter: 640,
+            layers: 2,
+            full_attn_interval: 2,
+            // hidden = n_heads * head_dim, kept consistent with the base preset.
+            hidden: 512,
+            n_heads: 4,
+            n_kv_heads: 2,
+            ..Self::preset()
+        }
+    }
+
     fn vl_preset() -> Self {
         Self::preset()
     }
@@ -695,13 +740,14 @@ impl ToyModel for Qwen35MoeSpec {
     }
 
     fn fixture_names(&self) -> &'static [&'static str] {
-        &["moe", "indexed"]
+        &["moe", "indexed", "mi640-k10"]
     }
 
     fn fixture_named(&self, name: &str, _seed: u64) -> Option<ToyFixture> {
         let m = match name {
             "default" | "moe" => Qwen35Tiny::moe_preset(),
             "indexed" => Qwen35Tiny::moe_indexed_preset(),
+            "mi640-k10" => Qwen35Tiny::moe_mi640_k10_preset(),
             _ => return None,
         };
         Some(ToyFixture {

@@ -104,6 +104,10 @@ pub const ARCH_ID_GEMMA4: u32 = 24;
 /// Cohere2-MoE text models, including CohereLabs BLS Mini Code 1.0.
 pub const ARCH_ID_COHERE2_MOE: u32 = 25;
 
+/// Qwen3.8-Flash-Next (`qwen4_exp`): hybrid Gated DeltaNet + sparse attention,
+/// 512-expert MoE, a 4-wide gated residual, and a hashed n-gram embedding table.
+pub const ARCH_ID_QWEN4EXP: u32 = 26;
+
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "arch#{}", self.0)

@@ -5246,6 +5246,142 @@ impl PrefillBatchScratch {
 /// on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// A transient FP32 copy of the DeltaNet S state, installed for the duration of
+/// the per-token prefill fallback.
+///
+/// WHY. `gated_delta_net_f16` holds S as an FP32 working copy for a whole launch
+/// and narrows to f16 exactly once, at the end — so narrowings are counted in
+/// LAUNCHES, not tokens. Batched prefill launches once per chunk; the per-token
+/// fallback launches once per token. Measured at the DeltaNet layer, that alone
+/// splits the two paths by 1.15e-3 at n=8 rising to 2.36e-3 at n=128, which the
+/// next layer then amplifies (1.04e-2 under q8 KV, 1.06e-1 under KVarN). A
+/// drafter reads those hidden states.
+///
+/// This holds S in f32 across the fallback loop and rounds on the SAME
+/// boundaries the batched path rounds on, so the two agree.
+///
+/// SCOPE, deliberately narrow:
+/// * Only the per-token fallback in `forward_prefill_batch_with_pbs_opts`, which
+///   is the one un-chunked token loop in the tree with a single exit. There is no
+///   general prefill begin/end hook — prefill is chunked at three nested levels
+///   and the march executor parks the session between bands — so a shadow that
+///   spanned "a prefill" would have nowhere to hang and would have to survive
+///   `suspend`.
+/// * Only when the state is FP16. FP32 already has no narrowing.
+/// * The PERSISTENT state stays FP16: this is allocated at entry and freed at
+///   exit, so the ~149 MB -> ~75 MB per-session win (19/64 vs 64/64 concurrent
+///   sessions at 27B) is untouched outside the fallback.
+struct DnFp32Shadow {
+    /// The real FP16 tensors, parked while the shadow is installed.
+    saved: Vec<GpuTensor>,
+    shadow: Vec<GpuTensor>,
+    /// Element count per layer. The FP16 state is `DType::Raw` with the shape in
+    /// ELEMENTS and 2 bytes each, so `buf.size() / 2` is the only safe source —
+    /// `shape * 4` mis-sizes by 2x.
+    elems: Vec<usize>,
+    elems_per_head: usize,
+}
+
+/// Install the shadow. `Ok(None)` when it does not apply, which is the common case.
+fn install_dn_fp32_shadow(
+    gpu: &mut Gpu,
+    dn_state: &mut DeltaNetState,
+    config: &Qwen35Config,
+) -> HipResult<Option<DnFp32Shadow>> {
+    if dn_state.quant != StateQuant::FP16 || dn_state.s_matrices.is_empty() {
+        return Ok(None);
+    }
+    let elems_per_head = config.linear_key_head_dim * config.linear_key_head_dim;
+    let mut shadow = Vec::with_capacity(dn_state.s_matrices.len());
+    let mut elems = Vec::with_capacity(dn_state.s_matrices.len());
+    for t in &dn_state.s_matrices {
+        let n = t.buf.size() / 2;
+        // `GpuTensor` has no freeing Drop, so a mid-loop failure would leak every
+        // buffer allocated so far. Unwind explicitly. This matters more than usual
+        // here: the shadow is ~144 MiB on a 27B, i.e. exactly the size that fails.
+        let step = gpu.zeros(&[n], DType::F32).and_then(|f32_buf| {
+            // Seed by WIDENING, never by zeroing: prefill runs mid-sequence
+            // (DFlash's FullPrefill rollback replays a committed prefix), where
+            // S is live. A zeroed shadow would silently destroy it.
+            gpu.dn_state_widen_f16_f32(t, &f32_buf, n).map(|()| f32_buf)
+        });
+        match step {
+            Ok(f32_buf) => {
+                shadow.push(f32_buf);
+                elems.push(n);
+            }
+            Err(e) => {
+                for leaked in shadow {
+                    let _ = gpu.free_tensor(leaked);
+                }
+                return Err(e);
+            }
+        }
+    }
+    // `GpuTensor` is not Clone by design. Install NON-OWNING views and keep the
+    // owning tensors in `shadow`, so there is exactly one owner to free. Disposal
+    // of a `BufferOrigin::NonOwning` reaches neither allocator (5184255fe), so a
+    // stray free of an installed view is inert rather than #262.
+    let views: Vec<GpuTensor> = shadow
+        .iter()
+        .zip(&elems)
+        .map(|(t, &n)| t.sub_offset(0, n))
+        .collect();
+    let saved = std::mem::replace(&mut dn_state.s_matrices, views);
+    dn_state.quant = StateQuant::FP32;
+    Ok(Some(DnFp32Shadow {
+        saved,
+        shadow,
+        elems,
+        elems_per_head,
+    }))
+}
+
+/// Round-trip the shadow through f16 at a chunk boundary.
+///
+/// The batched path narrows once per `PREFILL_MAX_BATCH` chunk, so to REPRODUCE it
+/// (rather than merely be more accurate than it) the fallback must take the same
+/// rounding at the same positions. Narrow then widen back, which injects exactly
+/// that rounding and keeps going in f32.
+fn dn_fp32_shadow_chunk_boundary(gpu: &mut Gpu, sh: &DnFp32Shadow) -> HipResult<()> {
+    for i in 0..sh.shadow.len() {
+        gpu.dn_state_narrow_f32_f16(&sh.shadow[i], &sh.saved[i], sh.elems[i], sh.elems_per_head)?;
+        gpu.dn_state_widen_f16_f32(&sh.saved[i], &sh.shadow[i], sh.elems[i])?;
+    }
+    Ok(())
+}
+
+/// Narrow once more, put the real FP16 tensors back, and free the shadow.
+///
+/// Must run on the error path too: leaving `s_matrices` pointing at f32 buffers
+/// while `quant` says FP16 would have the next decode read f32 bytes as
+/// `_Float16*`, and `DeltaNetState::free_gpu` would free the wrong buffers.
+fn finish_dn_fp32_shadow(
+    gpu: &mut Gpu,
+    dn_state: &mut DeltaNetState,
+    sh: DnFp32Shadow,
+) -> HipResult<()> {
+    let mut first_err = None;
+    for i in 0..sh.shadow.len() {
+        if let Err(e) =
+            gpu.dn_state_narrow_f32_f16(&sh.shadow[i], &sh.saved[i], sh.elems[i], sh.elems_per_head)
+        {
+            first_err.get_or_insert(e);
+        }
+    }
+    // Restore BEFORE propagating: the state must be consistent even if a narrow
+    // failed, or the model is left holding f32 buffers under a FP16 tag.
+    dn_state.s_matrices = sh.saved;
+    dn_state.quant = StateQuant::FP16;
+    for t in sh.shadow {
+        let _ = gpu.free_tensor(t);
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 pub(crate) const MOE_GROUPED_BLOCK_M: usize = grouped_moe::GROUPED_MOE_BLOCK_ROWS;
 
 #[inline]
@@ -6537,8 +6673,34 @@ pub fn forward_prefill_batch_with_pbs_opts(
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // RE-MEASURED 2026-08-29. The earlier text here blamed the KVarN
+                // per-token WRITE path and told people to leave the default KV
+                // mode. Both were wrong:
+                //
+                //   * With an FP32 DeltaNet state, batched and per-token agree at
+                //     3.31e-4 under KVarN, FLAT across n=32/127/128/129/200 —
+                //     straight through the 128-token flush boundary that used to
+                //     step (n=127 2.29e-2, n=128 3.90e-2). That write path is
+                //     fixed; the segment-then-flush ordering in `kvarn_attend`
+                //     is what fixed it.
+                //   * The divergence that remains is the FP16 DeltaNet state.
+                //     It is narrowed once per LAUNCH, so batched (1 launch for n
+                //     tokens) rounds once where per-token rounds n times. Layer 0
+                //     — a DeltaNet layer, no KV involved — splits 1.15e-3 at n=8
+                //     rising to 2.36e-3 at n=128, identically under q8 and KVarN.
+                //
+                // KVarN is the AMPLIFIER, not the source: the same layer-0 split
+                // reaches 1.04e-2 by the next layer under q8 and 1.06e-1 under
+                // KVarN. So the lever is the DN state precision, not the KV mode.
                 eprintln!(
-                    "[prefill] WARNING: batched prefill declined and KV is KVarN ({} bit) —                      the per-token fallback is MEASURED to emit a different token stream than                      the batched path on qwen3.5 MoE, while f32 and q8 KV agree between the two.                      Output from this point is not trustworthy. Use --kv-mode q8 (or f32) until                      the KVarN per-token write path is fixed.                      (base={pbs_eligible_base} kv_f32={kv_f32} n={n} arch={arch} dn_quant={:?})",
+                    "[prefill] WARNING: batched prefill declined and KV is KVarN ({} bit). \
+                     The per-token fallback rounds the FP16 DeltaNet state once per token \
+                     where the batched path rounds once per chunk, so hidden states will \
+                     differ (~1e-3 at the DeltaNet layer, amplified ~65x by KVarN attention). \
+                     A drafter reads those. Token output is usually unaffected. \
+                     To reproduce the batched path exactly, set HIPFIRE_DN_STATE_FP16=0; \
+                     the KV mode is not the lever. \
+                     (base={pbs_eligible_base} kv_f32={kv_f32} n={n} arch={arch} dn_quant={:?})",
                     kv_cache.kvarn_bits, dn_state.quant,
                 );
             }
@@ -6567,65 +6729,87 @@ pub fn forward_prefill_batch_with_pbs_opts(
         // hidden row-by-row into the caller's buffer.
         let dim = config.dim;
         let last_idx = tokens.len().saturating_sub(1);
-        for (i, &tok) in tokens.iter().enumerate() {
-            // lm_head (vocab-wide logits) only matters for the FINAL prefill
-            // token — earlier prompt tokens' logits are never read. Computing it
-            // every token was ~37% of prefill time on gfx1103 (rocprof). Skip
-            // lm_head for all non-final tokens via the no-logits forward; the
-            // last token still gets full logits in scratch.logits.
-            let skip_logits = needs_last_token_logits && i != last_idx;
-            // Same rule for both branches. It used to apply only to the
-            // hidden_rb == None arm, so a caller asking for BOTH the ring
-            // buffer and per-token hidden -- i.e. DFlash verify -- always got a
-            // vocab-wide lm_head it never read, then computed the lm_head again
-            // itself from `per_token_hidden_out`. ~1.2 ms/token on
-            // Qwen3.5-35B-A3B, on every verified token.
-            let no_logits =
-                (per_token_hidden_out.is_some() && !needs_last_token_logits) || skip_logits;
-            if let Some(rb) = hidden_rb.as_mut() {
-                forward_scratch_with_hidden_opts(
-                    gpu,
-                    weights,
-                    config,
-                    tok,
-                    start_pos + i,
-                    kv_cache,
-                    dn_state,
-                    scratch,
-                    rb,
-                    !no_logits,
-                )?;
-            } else if no_logits {
-                forward_scratch_no_logits(
-                    gpu,
-                    weights,
-                    config,
-                    tok,
-                    start_pos + i,
-                    kv_cache,
-                    dn_state,
-                    scratch,
-                )?;
-            } else {
-                forward_scratch(
-                    gpu,
-                    weights,
-                    config,
-                    tok,
-                    start_pos + i,
-                    kv_cache,
-                    dn_state,
-                    scratch,
-                )?;
+        // Hold S in f32 for the whole loop and round only where the batched path
+        // rounds. Without this the fallback narrows once per TOKEN against the
+        // batched path's once per chunk, which is the entire measured
+        // hidden-state divergence between them. See `DnFp32Shadow`.
+        let dn_shadow = install_dn_fp32_shadow(gpu, dn_state, config)?;
+        let mut fallback = |gpu: &mut Gpu, dn_state: &mut DeltaNetState| -> HipResult<()> {
+            for (i, &tok) in tokens.iter().enumerate() {
+                // Same rounding positions as the batched path's chunk boundaries.
+                if let Some(sh) = dn_shadow.as_ref() {
+                    if i > 0 && i % PREFILL_MAX_BATCH == 0 {
+                        dn_fp32_shadow_chunk_boundary(gpu, sh)?;
+                    }
+                }
+                // lm_head (vocab-wide logits) only matters for the FINAL prefill
+                // token — earlier prompt tokens' logits are never read. Computing it
+                // every token was ~37% of prefill time on gfx1103 (rocprof). Skip
+                // lm_head for all non-final tokens via the no-logits forward; the
+                // last token still gets full logits in scratch.logits.
+                let skip_logits = needs_last_token_logits && i != last_idx;
+                // Same rule for both branches. It used to apply only to the
+                // hidden_rb == None arm, so a caller asking for BOTH the ring
+                // buffer and per-token hidden -- i.e. DFlash verify -- always got a
+                // vocab-wide lm_head it never read, then computed the lm_head again
+                // itself from `per_token_hidden_out`. ~1.2 ms/token on
+                // Qwen3.5-35B-A3B, on every verified token.
+                let no_logits =
+                    (per_token_hidden_out.is_some() && !needs_last_token_logits) || skip_logits;
+                if let Some(rb) = hidden_rb.as_mut() {
+                    forward_scratch_with_hidden_opts(
+                        gpu,
+                        weights,
+                        config,
+                        tok,
+                        start_pos + i,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                        rb,
+                        !no_logits,
+                    )?;
+                } else if no_logits {
+                    forward_scratch_no_logits(
+                        gpu,
+                        weights,
+                        config,
+                        tok,
+                        start_pos + i,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                    )?;
+                } else {
+                    forward_scratch(
+                        gpu,
+                        weights,
+                        config,
+                        tok,
+                        start_pos + i,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                    )?;
+                }
+                if let Some(dst) = per_token_hidden_out {
+                    // scratch.tmp holds post-output-norm hidden after
+                    // forward_scratch_{with_hidden,layers} — it's the same buffer
+                    // lm_head reads from. Copy into the caller's output.
+                    gpu.hip
+                        .memcpy_dtod_at(&dst.buf, i * dim * 4, &scratch.tmp.buf, 0, dim * 4)?;
+                }
             }
-            if let Some(dst) = per_token_hidden_out {
-                // scratch.tmp holds post-output-norm hidden after
-                // forward_scratch_{with_hidden,layers} — it's the same buffer
-                // lm_head reads from. Copy into the caller's output.
-                gpu.hip
-                    .memcpy_dtod_at(&dst.buf, i * dim * 4, &scratch.tmp.buf, 0, dim * 4)?;
-            }
+            Ok(())
+        };
+        let res = fallback(gpu, dn_state);
+        // Restore on BOTH paths — every call in the loop uses `?`, and an early
+        // return with the shadow still installed leaves f32 buffers under a FP16
+        // tag and leaks them.
+        if let Some(sh) = dn_shadow {
+            finish_dn_fp32_shadow(gpu, dn_state, sh)?;
         }
+        res?;
         return Ok(());
     }
 

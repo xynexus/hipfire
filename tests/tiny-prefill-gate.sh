@@ -96,13 +96,19 @@ PREFILL="${HIPFIRE_TINYPREFILL_PREFILL:-64}"
 DECODE="${HIPFIRE_TINYPREFILL_DECODE:-4}"
 TOL="${HIPFIRE_TINYPREFILL_TOL:-1e-4}"
 SEED="${HIPFIRE_TINYPREFILL_SEED:-42}"
-# Both KV modes, because they select DIFFERENT FA arms and each leaves the other
-# untested. `fa_kv_ok` (prefill_chunk.rs:2313) holds for Q8, so FA layers take the
-# BATCHED arm; KVarN is `quantized` but none of q8/asym{2,3,4}, so it fails that
-# test and FA layers take the PER-TOKEN FALLBACK. KVarN is also the default KV
-# mode, so that fallback is production code. Verified by instrumentation, not
-# assumed: a temporary print inside the fallback fired 0 times under q8 and once
-# under kvarn.
+# Both KV modes, because they exercise DIFFERENT attention implementations and
+# each leaves the other untested. KVarN is also the default KV mode.
+#
+# ⚠️ This comment used to say KVarN failed `fa_kv_ok` and sent FA layers down the
+# per-token fallback. That is STALE: `fa_kv_ok` (prefill_chunk.rs) now includes
+# `|| kv_cache.quant_kvarn`, added as a perf fix (54 -> 301 tok/s on a 27B with
+# 16 FA layers), so KVarN takes the BATCHED arm exactly as Q8 does.
+#
+# What the two modes actually separate here is SENSITIVITY. Given the same
+# perturbed input, KVarN attention amplifies it ~10x more than Q8: measured
+# 2026-08-29, a 1.63e-3 split at the DeltaNet layer reaches 1.04e-2 under q8 and
+# 1.06e-1 under kvarn. With an FP32 DeltaNet state — i.e. no input split at all —
+# both agree at 3.31e-4, flat across the 128-token flush boundary.
 IFS=',' read -r -a kv_modes <<<"${HIPFIRE_TINYPREFILL_KV:-q8,kvarn}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
@@ -120,7 +126,8 @@ fi
 echo "tiny-prefill-gate: building..."
 cargo build --release \
     -p hipfire-quantize --bin hipfire-quantize \
-    -p hipfire-serving-core --example tiny_quant_probe >/dev/null || {
+    -p hipfire-serving-core --example tiny_quant_probe \
+    -p hipfire-runtime --example compare_prefill_hidden_paths >/dev/null || {
     echo "build failed" >&2
     exit 2
 }
@@ -182,30 +189,56 @@ for raw_family in "${families[@]}"; do
     # the current divergence is acceptable, only that it must not grow.
     if [ "${HIPFIRE_TINYPREFILL_SKIP_HIDDEN:-0}" != "1" ]; then
         HID="./target/release/examples/compare_prefill_hidden_paths"
-        if [ -x "$HID" ]; then
-            hid_worst() {
-                "$HID" --model "$2" --n 32 --kv-mode "$1" 2>/dev/null |
-                    grep -oE 'worst overall [0-9.e+-]+' | awk '{print $3}' | tail -1
-            }
-            w32="$(hid_worst fp32 "$hfq")"
-            if [ -n "$w32" ] && [ "$(awk -v a="$w32" 'BEGIN{print (a>0)?1:0}')" = "1" ]; then
-                echo "  FAIL hidden states differ at fp32 KV (worst $w32) — the prefill"
-                echo "       paths must be exactly equivalent absent KV quantisation"
-                fail=$((fail + 1))
-            fi
-            for hkv in "${kv_modes[@]}"; do
-                hkv="$(echo "$hkv" | xargs)"; [ -n "$hkv" ] || continue
-                wq="$(hid_worst "$hkv" "$hfq")"
-                [ -n "$wq" ] || continue
-                if [ "$(awk -v a="$wq" -v c="${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}" 'BEGIN{print (a>c)?1:0}')" = "1" ]; then
-                    echo "  FAIL hidden-state divergence $hkv = $wq exceeds ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}"
-                    echo "       a drafter reads these; see the note above this block"
-                    fail=$((fail + 1))
-                else
-                    echo "  hidden $hkv: worst $wq (ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2})"
-                fi
-            done
+        # The gate BUILDS this above. It used to be `if [ -x ]`, and nothing built
+        # it — so on a clean checkout the whole arm silently did not run and the
+        # gate reported fail=0, while a developer tree that happened to have it
+        # from an earlier session reported fail=1 on the same commit. The check
+        # most likely to catch a drafter-visible regression was the one CI never
+        # ran. Absence is now an infra error, not a skip.
+        if [ ! -x "$HID" ]; then
+            echo "  FAIL $HID missing — it is built above; the hidden-state arm cannot be skipped" >&2
+            exit 2
         fi
+        # The probe reports one of TWO mutually exclusive summary lines:
+        #   FIRST DIVERGING LAYER: 0   (worst overall 1.06e-1)
+        #   IDENTICAL across all layers (worst 3.31e-4)
+        # Both parenthesise the number; the old pattern matched only the first, so
+        # the GOOD case parsed as empty and was skipped by `[ -n ]`. That made a
+        # measurement that did not happen indistinguishable from one that passed.
+        hid_worst() {
+            "$HID" --model "$2" --n 32 --kv-mode "$1" 2>/dev/null |
+                grep -oE '\(worst (overall )?[0-9.eE+-]+\)' |
+                sed -E 's/.*[[:space:]]([0-9.eE+-]+)\)/\1/' | tail -1
+        }
+        w32="$(hid_worst fp32 "$hfq")"
+        if [ -z "$w32" ]; then
+            echo "  FAIL hidden-state probe emitted no parseable summary at fp32 KV —"
+            echo "       treating an unmeasured invariant as a pass is how this arm"
+            echo "       went unnoticed before; fix the probe or this parser"
+            fail=$((fail + 1))
+        elif [ "$(awk -v a="$w32" 'BEGIN{print (a>0)?1:0}')" = "1" ]; then
+            echo "  FAIL hidden states differ at fp32 KV (worst $w32) — the prefill"
+            echo "       paths must be exactly equivalent absent KV quantisation"
+            fail=$((fail + 1))
+        else
+            echo "  hidden fp32: $w32 (invariant: must be exactly 0)"
+        fi
+        for hkv in "${kv_modes[@]}"; do
+            hkv="$(echo "$hkv" | xargs)"; [ -n "$hkv" ] || continue
+            wq="$(hid_worst "$hkv" "$hfq")"
+            if [ -z "$wq" ]; then
+                echo "  FAIL hidden-state probe emitted no parseable summary for $hkv"
+                fail=$((fail + 1))
+                continue
+            fi
+            if [ "$(awk -v a="$wq" -v c="${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}" 'BEGIN{print (a>c)?1:0}')" = "1" ]; then
+                echo "  FAIL hidden-state divergence $hkv = $wq exceeds ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}"
+                echo "       a drafter reads these; see the note above this block"
+                fail=$((fail + 1))
+            else
+                echo "  hidden $hkv: worst $wq (ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2})"
+            fi
+        done
     fi
 
     for kv in "${kv_modes[@]}"; do

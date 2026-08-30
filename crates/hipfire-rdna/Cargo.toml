@@ -17,6 +17,9 @@ libc.workspace = true
 [dev-dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-xdna = { path = "../hipfire-xdna" }
+# CPU oracle for the qwen4_exp gated-residual parity example. Dev-only, so the
+# arch crate stays CPU-side and this crate keeps no runtime dep on it.
+hipfire-arch-qwen4exp = { path = "../hipfire-arch-qwen4exp" }
 
 # The gated-DeltaNet dispatch methods are behind the `deltanet` feature, so these
 # examples cannot build without it. Declaring that here keeps a bare
