@@ -2018,6 +2018,34 @@ k-generic, and the work is the two selection kernels plus threading `k` through
 repack so they keep agreeing. Rename to `_indexed_` (dropping `k8`), or add a
 one-line header note on each, so the next reader does not re-derive this.
 
+## `HfqFile::from_safetensors` cannot open the shipped Qwen3.8-Flash-Next; the quantizer can (medium)
+
+**Found 2026-08-30 on halo, against the restored 336 GB checkpoint.**
+
+Two readers of the same on-disk format disagree about whether this model is
+readable:
+
+    hipfire-quantize --input <dir>      -> "Found 1658 tensors", quantizes fine
+    HfqFile::from_safetensors(<dir>)    -> InvalidData:
+        tensor model.language_model.layers.1.ple.ple_embedding.layer_multipliers
+        has unsupported dtype "I64" (from_safetensors handles bf16/f16/f32 source only)
+
+The three n-gram derived tables — `layer_multipliers`, `ngram_heads_offsets`,
+`ngram_heads_vocab_sizes` — are **I64** in the shipped checkpoint. They are index
+metadata, not weights, and are reproducible from config (the loader's own weight
+plan marks them `Expect::derived`), so nothing needs them to be quantised. But
+`from_safetensors` refuses the WHOLE DIRECTORY on the first one it meets.
+
+Consequence: any path that opens a raw HF directory as an `HfqFile` is closed for
+this family. That includes `examples/manifest_real`, which is what found this — it
+was written to validate the tensor manifest against the real checkpoint rather
+than against the committed shapes list, and cannot.
+
+Fix is probably to pass integer tensors through as opaque bytes (they are already
+`QuantType::OpaqueBytes`-shaped: index data with no numeric interpretation the GPU
+needs) rather than mapping them to a float dtype. Refusing the file is the wrong
+default for a tensor nothing will compute on.
+
 ## [FIXED 2026-08-30 for oq4; oq8 now WARNS] `K % 256 != 0` splits one MoE layer across THREE quant families, and drops calibration
 
 **Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo. Reproduces on a tiny fixture
