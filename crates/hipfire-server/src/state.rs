@@ -86,6 +86,12 @@ pub struct AppState {
     pub loaded_model_max_seq: Mutex<Option<u32>>,
     /// Loaded daemon workers keyed by resolved model path.
     pub loaded_models: Mutex<HashMap<String, LoadedModelState>>,
+    /// Detected VRAM for the selected device, cached after the first probe.
+    /// It does not change while the daemon lives, and residency planning runs
+    /// on every load — probing each time would be a daemon round-trip per
+    /// request. `Some(0)` records "probed, unknown" so a failed probe is not
+    /// retried forever.
+    pub detected_vram_bytes: Mutex<Option<u64>>,
     /// Shared prefill scheduler used by Rust request paths when enabled.
     pub prefill_scheduler: Mutex<PriorityPrefillScheduler>,
     /// Continuous work scheduler: the admission spine the batch runner pulls
@@ -280,6 +286,7 @@ impl AppState {
             loaded_model_cache_capable: Mutex::new(None),
             loaded_model_max_seq: Mutex::new(None),
             loaded_models: Mutex::new(HashMap::new()),
+            detected_vram_bytes: Mutex::new(None),
             prefill_scheduler: Mutex::new(PriorityPrefillScheduler::new(scheduler_env)),
             // Generous capacity: admission is behavior-neutral for now (the
             // scheduler provides priority ordering, microbatch grouping, and
