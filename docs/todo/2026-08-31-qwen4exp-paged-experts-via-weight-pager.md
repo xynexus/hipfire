@@ -1,8 +1,13 @@
 # TODO: page qwen4_exp's routed experts through `weight_pager` (not a second cache)
 
 **Status:** open (2026-08-31). A bespoke lazy-expert cache was written, measured,
-and then REVERTED (02efe522b, reverted here) because it duplicated residency and
-eviction logic that `hipfire_runtime::weight_pager` already owns. The measurements
+and then REVERTED because it duplicated residency and eviction logic that
+`hipfire_runtime::weight_pager` already owns.
+
+⚠️ History note for anyone bisecting: the feature landed in `02efe522b` and the
+revert was swept into `2369b4ef5` ("fix(optimize): stream the derived package"),
+whose message says nothing about removing it — staged changes from the revert were
+picked up by an unrelated commit. `git log -S LazyExperts` finds both. The measurements
 are kept below because they are the reason to do this properly.
 
 ## What the throwaway version proved

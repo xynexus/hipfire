@@ -230,6 +230,35 @@ one-line banner comment on each OQ/MQ GEMV/GEMM entry ("input `x` must be
 FWHT-rotated — see `kernels/AGENTS.md`") would make the contract local to where
 someone edits, and is cheap next time each family is touched.
 
+#### F3 — follow-up: the compact Opus family was missed (2026-08-31)
+
+The banner pass covered 303 kernels. Auditing the `*compact*` family afterwards
+found it largely skipped: of 22 compact sources only 9 mentioned the rotation at
+all, and **none of the iu4/iu4x2 GEMMs did** — including
+`gemm_oq_compact_iu4x2_wmma`, which documents its two-pass
+`x = 16*x_hi + x_lo` activation decomposition in detail while saying nothing about
+the basis its `x` arrives in.
+
+This family matters more than the average gap. Compact split-plane is the only
+Opus layout with a complete kernel set at BOTH batch sizes —
+`gemv_oq_compact_grouped{,_v2,_v3,_mw}` at decode,
+`gemv_oq_compact_moe_indexed` for the indexed path, and
+`gemm_oq_compact_iu4x2_{wmma,tiled,w64}` /
+`gemm_oq_compact_moe_grouped_{wmma,f32}` for prefill — and all 22 are
+**portable** (no arch-tagged variants), so it is the layout an expert path is
+likely to be built on. Those files are where that author reads.
+
+Bannered the 11 that are genuinely weight x activation. Two were deliberately
+skipped because the wording would mislead: `oq_compact_overlay_correct_t`
+transposes activation planes and `lmhead_coarse_compact` selects over precomputed
+scores — both take an activation, neither is a W x A product.
+
+Verified the edits still JIT: `parity_gemm_oq_compact_iu4x2` PASS (worst 1.36e-7).
+
+Remaining uncovered after this pass: the audit counted 371 OQ/MQ/HFQ/HFP
+gemv/gemm files against 303 banners, so ~57 still carry no marker. Worth the same
+treatment the next time each family is touched.
+
 ## Methodology
 
 Reproducible from repo root; intermediate TSVs were built with these:
