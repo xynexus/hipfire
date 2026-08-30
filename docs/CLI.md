@@ -12,6 +12,12 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire daemon`↴](#hipfire-daemon)
 * [`hipfire download`↴](#hipfire-download)
 * [`hipfire induct`↴](#hipfire-induct)
+* [`hipfire import`↴](#hipfire-import)
+* [`hipfire import gguf`↴](#hipfire-import-gguf)
+* [`hipfire import safetensors`↴](#hipfire-import-safetensors)
+* [`hipfire export`↴](#hipfire-export)
+* [`hipfire export safetensors`↴](#hipfire-export-safetensors)
+* [`hipfire repack`↴](#hipfire-repack)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -89,6 +95,9 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `daemon` — Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
 * `download` — Download a model repository (`org/name`) into the local store
 * `induct` — Bring an external model into a named `.hfq` — calibrate, quantize, fold sidecars. Accepts a HuggingFace `org/name` or a local safetensors dir
+* `import` — Import an external checkpoint (GGUF, safetensors) into a `.hfq`
+* `export` — Export a `.hfq` back to an external format
+* `repack` — Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -263,6 +272,105 @@ Bring an external model into a named `.hfq` — calibrate, quantize, fold sideca
 ###### **Options:**
 
 * `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+
+
+
+## `hipfire import`
+
+Import an external checkpoint (GGUF, safetensors) into a `.hfq`
+
+**Usage:** `hipfire import <COMMAND>`
+
+###### **Subcommands:**
+
+* `gguf` — Import a GGUF checkpoint into a `.hfq`
+* `safetensors` — Import a HuggingFace safetensors directory into a `.hfq`
+
+
+
+## `hipfire import gguf`
+
+Import a GGUF checkpoint into a `.hfq`
+
+**Usage:** `hipfire import gguf [OPTIONS] --in <INPUT> --out <OUTPUT> --format <FORMAT>`
+
+###### **Options:**
+
+* `--in <INPUT>` — Source `.gguf`. (Spelled `--in`, not `--input`, to match the existing tool.)
+* `--out <OUTPUT>` — Destination `.hfq`
+* `--format <FORMAT>` — Target quant format token
+* `--no-kmap` — Disable the k-map, quantizing uniformly
+* `--kmap-dense` — Dense k-map
+* `--kmap-mode <KMAP_MODE>` — k-map mode: `full`, `alternating`/`alt`, or `typed`
+
+  Default value: `alternating`
+
+
+
+## `hipfire import safetensors`
+
+Import a HuggingFace safetensors directory into a `.hfq`
+
+**Usage:** `hipfire import safetensors [OPTIONS] --input <INPUT> --output <OUTPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Source HuggingFace directory
+* `--output <OUTPUT>` — Destination `.hfq`
+* `--arch <ARCH>` — Architecture family override
+
+
+
+## `hipfire export`
+
+Export a `.hfq` back to an external format
+
+**Usage:** `hipfire export <COMMAND>`
+
+###### **Subcommands:**
+
+* `safetensors` — Export a `.hfq` back to a HuggingFace safetensors directory
+
+
+
+## `hipfire export safetensors`
+
+Export a `.hfq` back to a HuggingFace safetensors directory
+
+**Usage:** `hipfire export safetensors [OPTIONS] --input <INPUT> --output <OUTPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Source `.hfq`
+* `--output <OUTPUT>` — Destination directory
+* `--arch <ARCH>` — Architecture family override
+* `--shard-size <SHARD_SIZE>` — Shard size, e.g. `5G`
+
+
+
+## `hipfire repack`
+
+Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
+
+NOT `optimize`: that rewrites a `.hfq` into an arch-optimal weight layout. This is the lossless container round-trip.
+
+**Usage:** `hipfire repack [OPTIONS] --input <INPUT>`
+
+Examples:
+  hipfire repack --input <hf_dir> --output <archive.hfa>   # pack, lossless
+  hipfire repack --input <archive.hfa> --output <hf_dir>   # restore, byte-identical
+  hipfire repack --input <archive.hfa> --check             # verify stored checksums
+
+Not to be confused with `hipfire optimize`, which rewrites a .hfq into
+an arch-optimal weight layout.
+
+###### **Options:**
+
+* `--input <INPUT>` — Source: a HuggingFace directory to pack, or a `.hfa` to restore/check
+* `--output <OUTPUT>` — Destination. Omit with `--check`
+* `--verify <VERIFY>` — Verify the restored tree against this directory
+* `--check` — Verify stored checksums without writing anything
+* `--upgrade` — Upgrade an older archive in place
 
 
 

@@ -41,6 +41,15 @@ enum Command {
     /// Bring an external model into a named `.hfq` — calibrate, quantize, fold
     /// sidecars. Accepts a HuggingFace `org/name` or a local safetensors dir.
     Induct(commands::induct::InductArgs),
+    /// Import an external checkpoint (GGUF, safetensors) into a `.hfq`
+    Import(commands::interop::ImportArgs),
+    /// Export a `.hfq` back to an external format
+    Export(commands::interop::ExportArgs),
+    /// Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
+    ///
+    /// NOT `optimize`: that rewrites a `.hfq` into an arch-optimal weight
+    /// layout. This is the lossless container round-trip.
+    Repack(commands::interop::RepackArgs),
     /// List locally available models
     #[command(alias = "models")]
     List(commands::list::ListArgs),
@@ -270,6 +279,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
         Some(Command::Download(args)) => commands::download::run_download(args),
         Some(Command::Induct(args)) => commands::induct::run_induct(args, loaded_config),
+        Some(Command::Import(args)) => commands::interop::run_import(args),
+        Some(Command::Export(args)) => commands::interop::run_export(args),
+        Some(Command::Repack(args)) => commands::interop::run_repack(args),
         Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),

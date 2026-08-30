@@ -14,6 +14,7 @@ pub mod gen_env_docs;
 pub mod gen_model_support;
 pub mod induct;
 pub mod inspect;
+pub mod interop;
 pub mod list;
 pub mod lock;
 pub mod model;

@@ -297,7 +297,7 @@ that invokes them by name broke.
 | 3 induction | **partial** — see below | `89a496736` |
 | 4 eval | done | `5e6ea9815` |
 | 5 the small ones | done | `2b6247d53` |
-| 6 coexistence | done | `78ff76077` |
+| 6 coexistence | **partial** — see below | `78ff76077`, `acec8c2ce` |
 | 7 priv-helper | **redirected** — see below | `39917c9e2` |
 
 **Size, the §7 risk, settled by measurement:** 36.9 → 72.2 MB. It replaces
@@ -363,3 +363,37 @@ its whole chain, and install.sh refuses to suggest installing the policy until
 the helper lives somewhere root owns. The embedding itself still wants the
 security review §6 asked for — it needs a privileged emit target, an embedded
 hash re-verified after write, and `O_EXCL`.
+
+
+### Step 6 — corrected 2026-08-30: a forwarder, not the §4 split
+
+Marked "done" above on the strength of `hipfire convert <group>` reaching every
+coexistence group. It does. But what shipped is one
+`#[command(external_subcommand)]` handing argv verbatim to a crate that still
+routes on its own `args[0]`/`args[1]` — stacked, not merged. §4 of this plan
+asked for something else entirely: induction becoming direct calls,
+safetensors/repack becoming real `hipfire convert` subcommands, everything else
+ordinary subcommands. None of those three happened.
+
+The cost is not aesthetic, and it is what surfaced the error. An
+`external_subcommand` gives clap a bare `Vec<String>`, so:
+
+- `hipfire convert --help` listed five drafter tools and no groups;
+- `gen-docs` rendered the same, leaving `man/hipfire-convert.1` with **zero**
+  mentions of `download`;
+- the CLI-docs freshness gate in `no-gpu-ci` could never catch it, because
+  regenerating faithfully reproduces a definition that omits them.
+
+A user reading `--help` could not discover that downloading a model was
+possible. That is how the question "what happened to `hipfire download`?" gets
+asked about a command that had shipped four days earlier.
+
+**Done 2026-08-30 (`acec8c2ce` and follow-up):** `download`, `induct`, `import`,
+`export` and `repack` are real subcommands. Their man pages now generate
+themselves, which is the whole test of whether a promotion is real. `hub` was
+retired rather than promoted — it was one spelling of two other commands. The
+`repack` alias on `optimize` is gone: they are different operations (container
+round-trip vs arch-optimal layout) that were one alias away from colliding.
+
+**Still forwarded:** `artifact`, `lora`, `calibrate`, `two-pass`, `npu`. Tracked
+in `docs/todo/2026-08-30-coexistence-subcommand-promotion.md`.
