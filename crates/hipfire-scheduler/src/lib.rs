@@ -124,6 +124,16 @@ pub struct ModelResidencyRequest {
     /// The budget is still the right tool when it is configured; this bounds
     /// the common case where it is not.
     pub max_resident_workers: u32,
+    /// The VRAM budget was DERIVED from detected hardware, not configured.
+    ///
+    /// A derived budget plans evictions and nothing else. It must not refuse a
+    /// load and must not switch residency mode: the operator did not ask for
+    /// either, and the estimate behind it is a file size, which is not what a
+    /// model actually occupies. Forcing module residency on a derived budget
+    /// put a grouped-MoE target onto a prefill path this build does not
+    /// support ("requires grouped GEMM path2 support") — a working model made
+    /// unusable by a heuristic.
+    pub budget_is_advisory: bool,
     pub estimated_full: ResourceUsage,
     pub estimated_qwen_moe_modules: Option<ResourceUsage>,
 }
@@ -202,10 +212,12 @@ pub fn plan_model_residency(
             (ResidencyMode::QwenMoeModules, usage)
         }
         ResidencyMode::Auto => {
-            if usage_fits(
-                budget,
-                add_usage(ledger_usage(resident_workers), request.estimated_full),
-            ) {
+            if request.budget_is_advisory
+                || usage_fits(
+                    budget,
+                    add_usage(ledger_usage(resident_workers), request.estimated_full),
+                )
+            {
                 (ResidencyMode::Full, request.estimated_full)
             } else if let Some(module_usage) = request.estimated_qwen_moe_modules {
                 (ResidencyMode::QwenMoeModules, module_usage)
@@ -215,7 +227,7 @@ pub fn plan_model_residency(
         }
     };
 
-    if !usage_fits(budget, usage) {
+    if !request.budget_is_advisory && !usage_fits(budget, usage) {
         return Err(format!(
             "requested {} residency exceeds configured budget/headroom",
             mode.as_str()
@@ -255,7 +267,7 @@ pub fn plan_model_residency(
         }
     }
 
-    if !usage_fits(budget, add_usage(current, usage)) {
+    if !request.budget_is_advisory && !usage_fits(budget, add_usage(current, usage)) {
         return Err("insufficient budget after evicting all eligible resident workers".to_string());
     }
 
@@ -2561,6 +2573,7 @@ mod tests {
             model_path: "qwen.hfq".to_string(),
             requested_mode: ResidencyMode::Auto,
             max_resident_workers: 0,
+            budget_is_advisory: false,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 1_200,
@@ -2598,6 +2611,7 @@ mod tests {
             model_path: "incoming.hfq".to_string(),
             requested_mode: ResidencyMode::Full,
             max_resident_workers,
+            budget_is_advisory: false,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 10,
@@ -2615,6 +2629,41 @@ mod tests {
         vram_budget_bytes: 0,
         vram_headroom_bytes: 0,
     };
+
+    #[test]
+    fn an_advisory_budget_evicts_but_never_refuses_or_switches_mode() {
+        let tight = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 15,
+            vram_headroom_bytes: 0,
+        };
+        let mut request = count_capped_request(0);
+        request.requested_mode = ResidencyMode::Auto;
+        request.estimated_qwen_moe_modules = Some(ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: 5,
+        });
+        request.budget_is_advisory = true;
+
+        // One parked worker at 10 plus an incoming 10 exceeds 15, so the
+        // advisory budget still plans the eviction.
+        let plan = plan_model_residency(tight, request.clone(), &ledger(&[("old", 1)])).unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
+        // But it must NOT switch to module residency. Doing so put a
+        // grouped-MoE target on a prefill path this build cannot run.
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+
+        // And it must not refuse, even when nothing can be evicted to fit.
+        let mut alone = request;
+        alone.estimated_full = ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: 1_000,
+        };
+        let plan = plan_model_residency(tight, alone, &[])
+            .expect("an advisory budget must never refuse a load");
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+    }
 
     #[test]
     fn a_count_cap_evicts_least_recently_used_with_no_byte_budget() {
@@ -2698,6 +2747,7 @@ mod tests {
             model_path: "incoming.hfq".to_string(),
             requested_mode: ResidencyMode::Full,
             max_resident_workers: 0,
+            budget_is_advisory: false,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 600,
