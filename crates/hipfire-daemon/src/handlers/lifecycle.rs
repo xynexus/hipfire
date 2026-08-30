@@ -716,35 +716,11 @@ pub(crate) fn load(
                 df.adaptive_b = adaptive_b;
                 df.ngram = ngram_setup;
             } else if let Some(setup) = ngram_setup {
-                // The server's continuous-batching runner decides eligibility
-                // from `batch_eligible(arch)` + env vars, so it cannot see that
-                // this model now carries a speculative-decode state. It
-                // dispatches, `generate_batch_prefill` refuses the state, and
-                // the runner turns that into `fail_all` for the whole cycle
-                // rather than falling back. So building the state under the
-                // default (runner on) would trade "n-gram silently does
-                // nothing" for "every request fails", which is worse.
-                //
-                // Build it only with the runner off, and say why otherwise.
-                // Lifting this needs the runner to route by loaded-model state
-                // instead of env vars — the same gap that breaks a DFlash
-                // drafter found by sibling discovery.
-                let batch_runner_on = !matches!(
-                    std::env::var("HIPFIRE_SERVER_PREFILL_BATCH")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "0" | "off" | "false" | "no"
-                );
-                if batch_runner_on {
-                    tracing::warn!(
-                        "ngram_spec is on, but the continuous-batching runner cannot route \
-                         around a speculative-decode state and would fail every request. \
-                         n-gram speculative decode is NOT active. Set \
-                         HIPFIRE_SERVER_PREFILL_BATCH=0 to use it."
-                    );
-                } else {
+                // The server routes on `batch_prefill_capable`, which the daemon
+                // answers from this executor's own probe, so a model carrying a
+                // speculative-decode state takes the legacy path instead of
+                // being dispatched into a batched prefill that refuses it.
+                {
                     // Drafter-free n-gram spec decode, which is what `ngram_spec`
                     // has always advertised. The spine comes from the n-gram
                     // tables, so the state carries only the TARGET half — no
@@ -972,6 +948,16 @@ pub(crate) fn load(
                 model_worker_runtime_view_json(&loaded_model_worker_runtime_view(&m));
             let cache_capable =
                 m.arch_id == ARCH_ID_DEEPSEEK4_FLASH || is_qwen35_family_arch_id(m.arch_id);
+            // Ask the executor that would actually run the batched prefill.
+            // The server used to infer this from HIPFIRE_DFLASH_DRAFT, which is
+            // unset for a drafter found by sibling discovery or an embedded
+            // manifest — so such a model was judged eligible, dispatched, and
+            // refused mid-cycle, which `batch_runner` turns into `fail_all` for
+            // every session rather than a fallback.
+            let batch_prefill_capable =
+                hipfire_serving_core::batch_executor::batch_executor_for(m.arch_id)
+                    .map(|ex| ex.probe(&m).is_ok())
+                    .unwrap_or(false);
             let _ = writeln!(
                 daemon_state.out.sink,
                 "{}",
@@ -980,6 +966,7 @@ pub(crate) fn load(
                     "worker_key_id": requested_worker_id,
                     "arch": arch,
                     "cache_capable": cache_capable,
+                    "batch_prefill_capable": batch_prefill_capable,
                     "dim": dim,
                     "layers": layers,
                     "vocab": vocab,

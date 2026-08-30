@@ -313,6 +313,9 @@ pub(crate) struct LoadedModelContext {
     /// `qwen3_5`). Used to resolve the ContinuousBatching capability for
     /// batch-eligibility routing.
     pub(crate) arch: Option<String>,
+    /// The daemon's probe of the LOADED model: can it take the fused batch
+    /// prefill? `None` from a daemon that does not report it.
+    pub(crate) batch_prefill_capable: Option<bool>,
 }
 
 const MAX_REQUEST_TOKENS: u32 = 131_072;
@@ -516,6 +519,7 @@ pub(crate) async fn ensure_model_loaded(
                 worker_key_id: loaded.worker_key_id,
                 cache_capable: loaded.cache_capable,
                 arch: loaded.arch,
+                batch_prefill_capable: loaded.batch_prefill_capable,
             });
         }
     }
@@ -532,6 +536,7 @@ pub(crate) async fn ensure_model_loaded(
                             worker_key_id: loaded.worker_key_id,
                             cache_capable: loaded.cache_capable,
                             arch: loaded.arch,
+                            batch_prefill_capable: loaded.batch_prefill_capable,
                         });
                     }
                     tracing::info!(
@@ -552,6 +557,7 @@ pub(crate) async fn ensure_model_loaded(
                     .map_err(|e| e.to_string())?;
                 let cache_capable = loaded_response_cache_capable(&loaded);
                 let arch = loaded.arch.clone();
+                let batch_prefill_capable = loaded.batch_prefill_capable;
                 let worker_key_id = Some(loaded.worker_key_id);
                 set_loaded_model_state(
                     state,
@@ -561,6 +567,7 @@ pub(crate) async fn ensure_model_loaded(
                         cache_capable,
                         max_seq: params.max_seq,
                         arch: arch.clone(),
+                        batch_prefill_capable,
                     },
                 )
                 .await;
@@ -569,6 +576,7 @@ pub(crate) async fn ensure_model_loaded(
                     worker_key_id,
                     cache_capable,
                     arch,
+                    batch_prefill_capable,
                 });
             }
             Err(e) => {
@@ -597,6 +605,7 @@ pub(crate) async fn ensure_model_loaded(
 
     let cache_capable = loaded_response_cache_capable(&loaded);
     let arch = loaded.arch.clone();
+    let batch_prefill_capable = loaded.batch_prefill_capable;
     let worker_key_id = Some(loaded.worker_key_id);
     set_loaded_model_state(
         state,
@@ -606,6 +615,7 @@ pub(crate) async fn ensure_model_loaded(
             cache_capable,
             max_seq: params.max_seq,
             arch: arch.clone(),
+            batch_prefill_capable,
         },
     )
     .await;
@@ -615,6 +625,7 @@ pub(crate) async fn ensure_model_loaded(
         worker_key_id,
         cache_capable,
         arch,
+        batch_prefill_capable,
     })
 }
 
@@ -1864,7 +1875,7 @@ where
     // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
     // + runtime envelope) — ineligible models fall through to the legacy path.
     if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
-        && crate::batch_runner::batch_eligible(loaded.arch.as_deref())
+        && crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable)
     {
         let controls = {
             let cfg = state.config.lock().await;
@@ -3567,6 +3578,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 1024,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
 
@@ -3589,6 +3601,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 4096,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
         let status = json!({
@@ -3637,6 +3650,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 2048,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
 
@@ -3704,6 +3718,7 @@ mod tests {
             layers: None,
             vocab: None,
             model_worker: None,
+            batch_prefill_capable: None,
             response_id: None,
         };
         assert!(loaded_response_cache_capable(&loaded));

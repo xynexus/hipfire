@@ -2901,6 +2901,14 @@ pub struct ModelLoadedResponse {
     pub layers: Option<u32>,
     pub vocab: Option<u32>,
     pub model_worker: Option<serde_json::Value>,
+    /// Whether this loaded model can take the fused batch-prefill path.
+    ///
+    /// The daemon answers with the batch executor's own probe, so the server
+    /// routes on what the operation will actually accept instead of guessing
+    /// from env vars. `None` from an older daemon means "unknown" and the
+    /// server keeps its previous behaviour.
+    #[serde(default)]
+    pub batch_prefill_capable: Option<bool>,
     #[serde(default)]
     pub response_id: Option<String>,
 }
