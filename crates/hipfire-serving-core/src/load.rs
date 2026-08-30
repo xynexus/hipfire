@@ -1078,17 +1078,22 @@ pub fn load_model(
             // batched across the verify block before admitting it by default makes
             // anyone faster.
             //
-            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work. The drafters on
-            // disk are parked `.parked-slower-than-plain-decode` so sibling
-            // discovery cannot attach one silently; pass `params.draft` explicitly
-            // to measure.
-            let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
+            // That measurement is why the gate existed; it is kept above as the
+            // record of where speculation does NOT pay on this family. It is no
+            // longer a load-time refusal: `dflash_mode` decides whether to try,
+            // and a per-model override picks the drafter.
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
-                // Opt-in while the batched verify body is being bisected; see
-                // the note above. Default stays refused.
-                Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
+                // Opus Quant. Batched lm_head and correctness are both done —
+                // see the note above — and it is measured FASTER here, not
+                // slower: Qwen3.5-9B oq4.25++ on gfx1103, greedy, 13.2 -> 29.8
+                // tok/s repetitive and 12.8 -> 30.2 prose. The old opt-in
+                // generalised a 27B/35B-A3B result to the whole family; those
+                // are MoE and DeltaNet-heavy, where a wider verify batch
+                // amortizes only part of the stack. A dense target is a
+                // different shape.
+                Some(33 | 34 | 35 | 36 | 38 | 52) => true,
                 // Unquantized heads. BF16 (16) resolves to DType::BF16; the
                 // losslessly recoded pair (Bf16Lut3=49, Bf16Huff=50) keeps the
                 // head PACKED as DType::Bf16L3. `dflash_enqueue_verify_lm_head`
@@ -1107,11 +1112,9 @@ pub fn load_model(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
                      ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13), \
-                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50) always; MQ3G256 \
-                     (qt=17) on gfx11 only. Opus oq* (qt=33/34/35/36/38/52) is \
-                     CORRECT now but measured slower than plain decode on this \
-                     family, so it stays behind HIPFIRE_DFLASH_ALLOW_OPUS=1. \
-                     Other dtypes \
+                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50), Opus oq* \
+                     (qt=33/34/35/36/38/52) always; MQ3G256 (qt=17) on gfx11 \
+                     only. Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \

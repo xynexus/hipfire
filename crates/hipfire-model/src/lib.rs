@@ -2815,6 +2815,10 @@ impl ModelLoadParams {
             &config.dflash_mode,
             config.cask_sidecar.as_deref(),
         );
+        // An explicit drafter beats discovery. Rides the same params channel as
+        // every other resolved setting, so `model_overrides` can pin a drafter
+        // per model.
+        params.draft = non_empty_value(&config.dflash_draft);
         params.ngram_spec = Some(config.ngram_spec);
         params.ngram_spec_store_root = Some(config.ngram_spec_store_root.clone());
         params.ngram_spec_scope = Some(config.ngram_spec_scope.clone());

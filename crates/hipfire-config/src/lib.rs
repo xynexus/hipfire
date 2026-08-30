@@ -425,6 +425,9 @@ pub struct HipfireConfig {
     pub flash_mode: String,
     #[serde(default = "default_dflash_mode")]
     pub dflash_mode: String,
+    /// Explicit DFlash drafter path, overriding discovery. Empty = discover.
+    #[serde(default)]
+    pub dflash_draft: String,
     #[serde(default = "default_dflash_adaptive_b")]
     pub dflash_adaptive_b: bool,
     #[serde(default = "default_dflash_no_repeat_ngram")]
@@ -661,6 +664,7 @@ impl Default for HipfireConfig {
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
             dflash_mode: default_dflash_mode(),
+            dflash_draft: String::new(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
             ngram_spec: default_ngram_spec(),
             ngram_spec_store_root: default_ngram_spec_store_root(),

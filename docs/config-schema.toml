@@ -156,6 +156,17 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "dflash_draft"
+type = "path(Exists)"
+requirement = "optional"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Explicit DFlash drafter for this model, overriding sibling discovery and any embedded component. Set it per model under `model_overrides` to attach a drafter the naming convention would not find, or to pin a different one. Unset uses discovery (`~/.hipfire/drafts`, next to the model, the models dir)."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "dflash_mode"
 type = "enum(off|auto|on)"
 requirement = "optional"
@@ -163,7 +174,7 @@ default = "off"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
-description = "DFlash speculative decode mode."
+description = "DFlash speculative decode: `off` never loads a drafter, `auto` uses one if it is found, `on` requires one and fails the load if none is."
 secret = false
 restart_impact = "none"
 

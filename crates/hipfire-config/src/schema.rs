@@ -694,7 +694,23 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         Some("off"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "DFlash speculative decode mode."
+        "DFlash speculative decode: `off` never loads a drafter, `auto` uses one \
+         if it is found, `on` requires one and fails the load if none is."
+    ),
+    field!(
+        "dflash_draft",
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
+        Requirement::Optional,
+        None,
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Explicit DFlash drafter for this model, overriding sibling discovery and \
+         any embedded component. Set it per model under `model_overrides` to \
+         attach a drafter the naming convention would not find, or to pin a \
+         different one. Unset uses discovery (`~/.hipfire/drafts`, next to the \
+         model, the models dir)."
     ),
     field!(
         "dflash_adaptive_b",
