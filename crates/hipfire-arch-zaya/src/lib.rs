@@ -223,7 +223,8 @@ impl ZayaConfig {
             .moe_intermediate_size
             .or(raw.ffn_hidden_size.map(|f| f / 2))
             .ok_or("zaya config: missing moe_intermediate_size / ffn_hidden_size")?;
-        let n_rot = ((raw.head_dim as f32) * raw.partial_rotary_factor).round() as usize;
+        let head_dim = raw.resolved_head_dim()?;
+        let n_rot = ((head_dim as f32) * raw.partial_rotary_factor).round() as usize;
         // Native names it `router_hidden_size`; Megatron carries it as
         // `zaya_mlp_expansion`. Prefer the explicit one.
         let router_hidden_size = raw
@@ -248,7 +249,7 @@ impl ZayaConfig {
             attn: ZayaAttnConfig {
                 num_heads: raw.num_attention_heads,
                 num_kv_heads: raw.num_key_value_heads,
-                head_dim: raw.head_dim,
+                head_dim,
                 n_rot,
                 rope_theta: raw.rope_theta,
                 swa_rope_theta: raw.swa_rope_theta,
@@ -300,7 +301,22 @@ struct RawConfig {
 
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    head_dim: usize,
+    /// Optional because the 120-layer ZAYA1 pretraining bases (`ZAYA1-base`,
+    /// `ZAYA1-reasoning-base`) omit it and ship `kv_channels` instead. Resolved
+    /// by [`Self::resolved_head_dim`].
+    #[serde(default)]
+    head_dim: Option<usize>,
+    /// The Megatron-lineage key. NOT a synonym for `head_dim`, despite looking
+    /// like one: `ZAYA1-74B-preview-legacy` carries BOTH, with `head_dim: 128`
+    /// and `kv_channels: 256` (= hidden/heads). So this is consulted only when
+    /// `head_dim` is absent, never preferred over it.
+    ///
+    /// A `#[serde(alias)]` would be wrong twice over: it makes the two keys the
+    /// same field, so the two legacy configs that carry both fail outright with
+    /// a duplicate-field error, and where it did parse it would silently take
+    /// whichever came last.
+    #[serde(default)]
+    kv_channels: Option<usize>,
     #[serde(default = "default_partial_rotary")]
     partial_rotary_factor: f32,
     #[serde(default = "default_rope_theta")]
@@ -336,6 +352,28 @@ struct RawConfig {
 
     #[serde(default)]
     sliding_window: Option<usize>,
+}
+
+impl RawConfig {
+    /// Attention head width, preferring `head_dim` and falling back to
+    /// `kv_channels` only when it is absent.
+    ///
+    /// The order is not cosmetic. `ZAYA1-74B-preview-legacy` ships both, and
+    /// they DISAGREE -- `head_dim: 128` against `kv_channels: 256` -- so
+    /// preferring `kv_channels`, or letting a serde alias pick whichever key
+    /// parsed last, would silently double the head width on a real checkpoint.
+    /// `head_dim` is the value the non-legacy `ZAYA1-74B-preview` config states
+    /// for the same model, which is what makes it the authority here.
+    ///
+    /// The fallback exists for `ZAYA1-base` / `ZAYA1-reasoning-base`, which omit
+    /// `head_dim` entirely; there `kv_channels: 128` is the only signal, and 128
+    /// is the head width every other ZAYA1 checkpoint declares.
+    fn resolved_head_dim(&self) -> Result<usize, String> {
+        self.head_dim
+            .or(self.kv_channels)
+            .filter(|hd| *hd > 0)
+            .ok_or_else(|| "zaya config declares neither `head_dim` nor `kv_channels`".to_string())
+    }
 }
 
 fn default_eps() -> f32 {
@@ -450,6 +488,52 @@ mod tests {
         assert_eq!(a.conv_depthwise_kernel, 2);
         assert_eq!(a.conv_grouped_kernel, 2);
         assert_eq!(a.conv_state_len(), 2);
+    }
+
+    /// The three head-width shapes real ZAYA1 checkpoints actually ship.
+    /// Regression cover for the `kv_channels` fallback: a `#[serde(alias)]` here
+    /// would fail case 3 outright (duplicate field) and could silently pick 256
+    /// for a model whose head width is 128.
+    #[test]
+    fn head_dim_resolves_across_every_shipped_config_shape() {
+        let parse = |v: serde_json::Value| -> Result<usize, String> {
+            serde_json::from_value::<RawConfig>(v)
+                .map_err(|e| e.to_string())?
+                .resolved_head_dim()
+        };
+        let base = |extra: serde_json::Value| {
+            let mut c = zaya1_8b_config();
+            let obj = c.as_object_mut().unwrap();
+            obj.remove("head_dim");
+            obj.remove("kv_channels");
+            for (k, v) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            c
+        };
+
+        // 1. head_dim only — ZAYA1-8B, -VL-8B, -74B-preview, FP8/MXFP4 experts.
+        assert_eq!(parse(base(serde_json::json!({"head_dim": 128}))), Ok(128));
+
+        // 2. kv_channels only — ZAYA1-base, ZAYA1-reasoning-base. Without the
+        //    fallback these fail to deserialize on a required field.
+        assert_eq!(
+            parse(base(serde_json::json!({"kv_channels": 128}))),
+            Ok(128)
+        );
+
+        // 3. BOTH, disagreeing — ZAYA1-74B-preview-legacy really ships
+        //    head_dim 128 with kv_channels 256. head_dim must win; the
+        //    non-legacy config for the same model states 128.
+        assert_eq!(
+            parse(base(
+                serde_json::json!({"head_dim": 128, "kv_channels": 256})
+            )),
+            Ok(128)
+        );
+
+        // 4. Neither — refuse rather than invent a width.
+        assert!(parse(base(serde_json::json!({}))).is_err());
     }
 
     #[test]
