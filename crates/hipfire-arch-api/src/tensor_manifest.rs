@@ -32,6 +32,10 @@ use std::collections::BTreeMap;
 /// Index placeholders a template may carry.
 pub const LAYER: &str = "{layer}";
 pub const EXPERT: &str = "{expert}";
+/// On-disk shard index. A table too large for one tensor is split at rest and
+/// concatenated at load; qwen4_exp's n-gram embedding is split into
+/// `split_ngram_parts` shards, so the count comes from config like the others.
+pub const SHARD: &str = "{shard}";
 
 /// One tensor-name template plus whether the artifact must carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +104,20 @@ impl TensorPattern {
             layers: LayerScope::Class(class),
         }
     }
+    /// Optional, on the layers the arch registered under `class`.
+    ///
+    /// The combination is what an OPTIONAL COMPONENT needs: qwen4_exp's MTP head
+    /// and vision tower may be absent entirely (so not required), and when
+    /// present they range over their own index set rather than the text layers
+    /// (so class-scoped). Without this, such a component is either falsely
+    /// demanded or its tensors report as unclaimed.
+    pub const fn optional_on_class(class: &'static str, template: &'static str) -> Self {
+        Self {
+            template,
+            required: false,
+            layers: LayerScope::Class(class),
+        }
+    }
 }
 
 /// The extents the placeholders range over, taken from the model config.
@@ -107,6 +125,21 @@ impl TensorPattern {
 pub struct ManifestBounds {
     pub layers: usize,
     pub experts: usize,
+    /// How many on-disk shards a [`SHARD`] template ranges over. `1` for an arch
+    /// that never shards a table, which is also what [`ManifestBounds::new`]
+    /// gives, so a pattern without `{shard}` is unaffected either way.
+    pub shards: usize,
+}
+
+impl ManifestBounds {
+    /// Bounds for an arch that shards nothing.
+    pub const fn new(layers: usize, experts: usize) -> Self {
+        Self {
+            layers,
+            experts,
+            shards: 1,
+        }
+    }
 }
 
 /// An architecture's full tensor expectation.
@@ -143,11 +176,19 @@ fn expand(
     } else {
         1
     };
-    let mut out = Vec::with_capacity(layer_indices.len() * experts);
+    let shards = if template.contains(SHARD) {
+        bounds.shards
+    } else {
+        1
+    };
+    let mut out = Vec::with_capacity(layer_indices.len() * experts * shards);
     for l in layer_indices {
         let with_layer = template.replace(LAYER, &l.to_string());
         for e in 0..experts {
-            out.push(with_layer.replace(EXPERT, &e.to_string()));
+            let with_expert = with_layer.replace(EXPERT, &e.to_string());
+            for sh in 0..shards {
+                out.push(with_expert.replace(SHARD, &sh.to_string()));
+            }
         }
     }
     out
@@ -264,10 +305,7 @@ mod tests {
     fn manifest() -> TensorManifest {
         TensorManifest {
             arch: "test",
-            bounds: ManifestBounds {
-                layers: 2,
-                experts: 2,
-            },
+            bounds: ManifestBounds::new(2, 2),
             patterns: vec![
                 TensorPattern::required("model.embed_tokens.weight"),
                 TensorPattern::required("model.layers.{layer}.self_attn.q_proj.weight"),

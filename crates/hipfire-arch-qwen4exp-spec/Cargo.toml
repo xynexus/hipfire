@@ -7,3 +7,11 @@ description = "Offline spec for Qwen3.8-Flash-Next (qwen4_exp): arch identity + 
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+
+# Test-only. The manifest tests read the fixture's OWN config for its geometry
+# rather than hardcoding it — deriving the layer classes from the tensor names
+# instead would make the validation test circular, and so vacuous. A dev-dep does
+# not change what the quantizer links, so the "deps only hipfire-arch-api"
+# property above still holds.
+[dev-dependencies]
+serde_json = "1"

@@ -1811,6 +1811,7 @@ name = "hipfire-arch-qwen4exp-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]

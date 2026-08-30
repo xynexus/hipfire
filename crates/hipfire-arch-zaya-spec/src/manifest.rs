@@ -79,7 +79,7 @@ const PATTERNS: &[TensorPattern] = &[
 pub fn zaya_manifest(layers: usize, experts: usize) -> TensorManifest {
     TensorManifest {
         arch: "zaya",
-        bounds: ManifestBounds { layers, experts },
+        bounds: ManifestBounds::new(layers, experts),
         patterns: PATTERNS.to_vec(),
         // zaya has one layer kind; every pattern is All or From.
         layer_classes: Default::default(),

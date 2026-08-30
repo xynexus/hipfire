@@ -45,6 +45,8 @@ use hipfire_arch_api::{
 };
 
 /// Qwen3.8-Flash-Next (`qwen4_exp`) header id.
+pub mod manifest;
+
 pub const QWEN4EXP_ARCH_ID: ArchId = ArchId(26);
 
 /// Lean identity marker for the Qwen3.8-Flash-Next offline spec.
