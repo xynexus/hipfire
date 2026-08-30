@@ -88,6 +88,14 @@ pub trait TensorReader {
     fn read_raw(&self, _name: &str) -> Option<(u8, Vec<u8>)> {
         None
     }
+
+    /// The artifact this reader reads, when there is one on disk.
+    ///
+    /// A lazy expert stack reopens it to fetch groups after load returns, so a
+    /// synthetic reader (which has no file) simply cannot be lazy.
+    fn source_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// A reader error is a LOAD FAILURE, not a crash.
@@ -197,9 +205,11 @@ fn up2(
 /// actually be given.
 ///
 /// Reads one expert at a time, so peak host memory is one expert, not the set.
+#[allow(clippy::too_many_arguments)]
 fn stack_experts(
     gpu: &mut Gpu,
     w: &dyn TensorReader,
+    lazy: bool,
     mp: &str,
     which: &str,
     n_exp: usize,
@@ -222,6 +232,48 @@ fn stack_experts(
     // has no single dtype and would need per-expert dispatch, so anything
     // unconvertible falls the whole projection back to the f32 path below rather
     // than producing a stack whose dtype lies about half its contents.
+    // LAZY: upload nothing now; fetch a group the first time one of its experts
+    // is routed to. Needs the artifact on disk (a synthetic reader has none) and a
+    // convertible first expert, so the dtype and stride are known up front rather
+    // than discovered mid-forward.
+    if lazy {
+        if let (Some(path), Some((qt, raw))) = (
+            w.source_path(),
+            w.read_raw(&format!("{mp}.experts.0.{which}.weight")),
+        ) {
+            let conv = hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, &raw, rows, cols)
+                .or_else(|| {
+                    if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(rows, cols).is_some()
+                    {
+                        None
+                    } else {
+                        hipfire_runtime::oq4_arch::oq4_arch_load(qt, &raw, rows, cols)
+                            .map(|(b, d)| (b.into_owned(), d))
+                    }
+                });
+            if let Some((bytes, dtype)) = conv {
+                let hfq = hipfire_runtime::hfq::HfqFile::open(&path).map_err(|e| {
+                    read_err(
+                        mp,
+                        format!("reopening {} for lazy experts: {e}", path.display()),
+                    )
+                })?;
+                return Ok(crate::moe_gpu::ExpertStack::Lazy(Box::new(
+                    crate::moe_gpu::LazyExperts::new(
+                        hfq,
+                        format!("{mp}.experts."),
+                        which.to_string(),
+                        dtype,
+                        rows,
+                        cols,
+                        bytes.len(),
+                        n_exp,
+                    ),
+                )));
+            }
+        }
+    }
+
     if let Some(first) = w.read_raw(&format!("{mp}.experts.0.{which}.weight")) {
         let convert = |qt: u8, bytes: &[u8]| -> Option<(Vec<u8>, DType)> {
             // `_allow_compact` KEEPS compact blocks compact instead of expanding
@@ -271,7 +323,7 @@ fn stack_experts(
             }
             if ok {
                 let buf = gpu.upload_raw(&all, &[all.len()])?;
-                return Ok(crate::moe_gpu::ExpertStack {
+                return Ok(crate::moe_gpu::ExpertStack::Resident {
                     buf,
                     dtype,
                     rows,
@@ -281,7 +333,7 @@ fn stack_experts(
             }
         }
     }
-    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack {
+    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack::Resident {
         buf,
         dtype: DType::F32,
         rows,
@@ -324,6 +376,21 @@ fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> 
 impl TrunkWeights {
     /// Upload from checkpoint-named weights.
     pub fn upload(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, w: &dyn TensorReader) -> HipResult<Self> {
+        Self::upload_with(gpu, cfg, w, false)
+    }
+
+    /// [`Self::upload`] with routed experts left UNRESIDENT until first routed to.
+    ///
+    /// One token touches at most `experts_per_tok` of `num_experts`, so a forward
+    /// needs a few percent of the expert bytes. Uploading all of them to serve a
+    /// short interaction is the waste this avoids — on the shipped model that is
+    /// ~85 GiB and ~65 s of load.
+    pub fn upload_with(
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        w: &dyn TensorReader,
+        lazy_experts: bool,
+    ) -> HipResult<Self> {
         let p = "model.language_model";
         let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
         let width = hc * hidden;
@@ -448,6 +515,7 @@ impl TrunkWeights {
                 gate_up: stack_experts(
                     gpu,
                     w,
+                    lazy_experts,
                     &mp,
                     "gate_up_proj",
                     m.num_experts,
@@ -456,6 +524,7 @@ impl TrunkWeights {
                 down: stack_experts(
                     gpu,
                     w,
+                    lazy_experts,
                     &mp,
                     "down_proj",
                     m.num_experts,

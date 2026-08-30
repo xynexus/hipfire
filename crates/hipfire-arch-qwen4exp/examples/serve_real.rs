@@ -99,6 +99,12 @@ fn main() {
         moved |= a as u32 != tok;
         tok = a as u32;
     }
+    let e1 = m.resident_expert_elems();
+    println!(
+        "  expert elements resident after {} tokens: {e1} ({:.2} GiB)",
+        prompt.len() + steps,
+        e1 as f64 / (1u64 << 30) as f64
+    );
     println!(
         "decode {steps} steps in {:.2}s ({:.2} s/tok), argmax moved: {moved}",
         t2.elapsed().as_secs_f32(),
