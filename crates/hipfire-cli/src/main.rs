@@ -50,6 +50,8 @@ enum Command {
     /// NOT `optimize`: that rewrites a `.hfq` into an arch-optimal weight
     /// layout. This is the lossless container round-trip.
     Repack(commands::interop::RepackArgs),
+    /// Derive, merge or convert a steering adapter
+    Lora(commands::interop::LoraArgs),
     /// List locally available models
     #[command(alias = "models")]
     List(commands::list::ListArgs),
@@ -282,6 +284,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Import(args)) => commands::interop::run_import(args),
         Some(Command::Export(args)) => commands::interop::run_export(args),
         Some(Command::Repack(args)) => commands::interop::run_repack(args),
+        Some(Command::Lora(args)) => commands::interop::run_lora(args),
         Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),

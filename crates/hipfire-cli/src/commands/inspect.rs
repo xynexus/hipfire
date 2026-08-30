@@ -108,6 +108,19 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let diffusion = hipfire_diffusion::is_diffusion_hfq(&path)
         .then(|| inspect_hfq_with_runtime_support(&path).map_err(|e| e.to_string()));
 
+    // `hipfire convert artifact inspect` reported three things this command did
+    // not, and one of them is load-bearing: `artifact_fingerprint` is what
+    // `calibration_audit` records as an artifact's provenance identity.
+    //
+    // It is NOT the same number as `fingerprint` above. Both answer "identify
+    // this artifact's metadata and tensor layout without reading payloads", but
+    // by different algorithms over differently-shaped inputs, so they disagree
+    // by value. Carrying both, each with its scope named, is honest; silently
+    // presenting one as the other would break every recorded provenance check.
+    // Unifying them is a data decision, not a rename -- see
+    // docs/todo/2026-08-30-coexistence-subcommand-promotion.md.
+    let provenance = hipfire_coexistence::artifact::inspect_artifact(&path).ok();
+
     if args.json {
         print_json(
             &args.target,
@@ -118,6 +131,7 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             arch_name,
             &components,
             diffusion,
+            provenance.as_ref(),
         );
     } else {
         print_human(
@@ -129,6 +143,7 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             args.tensors,
             &components,
             diffusion,
+            provenance.as_ref(),
         );
     }
     Ok(())
@@ -577,6 +592,7 @@ fn print_human(
     list_tensors: bool,
     components: &[Value],
     diffusion: Option<Result<DiffusionHfqInspection, String>>,
+    provenance: Option<&Value>,
 ) {
     let name = path
         .file_name()
@@ -596,6 +612,14 @@ fn print_human(
     // Comparable with a calib's `source fp`: that is this value, computed over
     // the artefact the calib was captured from.
     println!("fingerprint {}", hfq.index_fingerprint());
+    if let Some(fp) = provenance
+        .and_then(|p| p.get("artifact_fingerprint"))
+        .and_then(Value::as_str)
+    {
+        // A second, differently-computed identity. Labelled rather than merged:
+        // calibration provenance records THIS one.
+        println!("artifact fp {fp} (provenance)");
+    }
     if calib {
         for (key, label) in [
             ("n_hessian", "hessians"),
@@ -807,6 +831,7 @@ fn print_json(
     arch_name: Option<&str>,
     components: &[Value],
     diffusion: Option<Result<DiffusionHfqInspection, String>>,
+    provenance: Option<&Value>,
 ) {
     let shape: serde_json::Map<String, Value> = SHAPE_FIELDS
         .iter()
@@ -895,6 +920,11 @@ fn print_json(
         "quant_histogram": histogram,
         "totals": { "tensors": total_tensors, "bytes": total_bytes },
         "modules": modules,
+        // From `hipfire_coexistence::artifact` — the provenance identity, kept
+        // under its own names so it is never confused with `fingerprint`.
+        "file_bytes": provenance.and_then(|p| p.get("bytes").cloned()),
+        "artifact_fingerprint": provenance.and_then(|p| p.get("artifact_fingerprint").cloned()),
+        "fingerprint_scope": provenance.and_then(|p| p.get("fingerprint_scope").cloned()),
         "diffusion": diffusion,
         "tensors": tensors,
         "metadata": meta,

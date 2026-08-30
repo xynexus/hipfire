@@ -18,6 +18,10 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire export`↴](#hipfire-export)
 * [`hipfire export safetensors`↴](#hipfire-export-safetensors)
 * [`hipfire repack`↴](#hipfire-repack)
+* [`hipfire lora`↴](#hipfire-lora)
+* [`hipfire lora export`↴](#hipfire-lora-export)
+* [`hipfire lora merge`↴](#hipfire-lora-merge)
+* [`hipfire lora convert`↴](#hipfire-lora-convert)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -98,6 +102,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `import` — Import an external checkpoint (GGUF, safetensors) into a `.hfq`
 * `export` — Export a `.hfq` back to an external format
 * `repack` — Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
+* `lora` — Derive, merge or convert a steering adapter
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -371,6 +376,71 @@ an arch-optimal weight layout.
 * `--verify <VERIFY>` — Verify the restored tree against this directory
 * `--check` — Verify stored checksums without writing anything
 * `--upgrade` — Upgrade an older archive in place
+
+
+
+## `hipfire lora`
+
+Derive, merge or convert a steering adapter
+
+**Usage:** `hipfire lora <COMMAND>`
+
+###### **Subcommands:**
+
+* `export` — Derive a steering adapter from contrastive prompt sets
+* `merge` — Merge an adapter into a base `.hfq`
+* `convert` — Convert an adapter between `.hfq` and `.json` forms
+
+
+
+## `hipfire lora export`
+
+Derive a steering adapter from contrastive prompt sets
+
+**Usage:** `hipfire lora export [OPTIONS] --hfq <HFQ> --data-dir <DATA_DIR> --out <OUT>`
+
+###### **Options:**
+
+* `--hfq <HFQ>` — Base model to derive the adapter against
+* `--data-dir <DATA_DIR>` — Directory holding `good_prompts.txt` and `bad_prompts.txt`
+* `--out <OUT>` — Destination adapter (`.lora.hfq` or `.lora.json`)
+* `--limit <LIMIT>` — Prompts to read from each set
+
+  Default value: `16`
+* `--strength <STRENGTH>` — Steering strength
+
+  Default value: `0.2`
+* `--max-seq <MAX_SEQ>` — Max sequence length during capture
+
+  Default value: `2048`
+* `--no-orthogonalize` — Skip orthogonalisation of the derived directions
+
+
+
+## `hipfire lora merge`
+
+Merge an adapter into a base `.hfq`
+
+**Usage:** `hipfire lora merge --hfq <HFQ> --adapter <ADAPTER> --out <OUT>`
+
+###### **Options:**
+
+* `--hfq <HFQ>` — Base `.hfq`
+* `--adapter <ADAPTER>` — Adapter to merge
+* `--out <OUT>` — Destination merged `.hfq`
+
+
+
+## `hipfire lora convert`
+
+Convert an adapter between `.hfq` and `.json` forms
+
+**Usage:** `hipfire lora convert --in <INPUT> --out <OUT>`
+
+###### **Options:**
+
+* `--in <INPUT>` — Source adapter. (Spelled `--in`, matching the existing tool.)
+* `--out <OUT>` — Destination adapter
 
 
 

@@ -223,3 +223,115 @@ mod tests {
         assert_eq!(argv, vec!["--input", "a", "--upgrade"]);
     }
 }
+
+// ── lora ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct LoraArgs {
+    #[command(subcommand)]
+    command: LoraCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LoraCommand {
+    /// Derive a steering adapter from contrastive prompt sets.
+    Export(LoraExportArgs),
+    /// Merge an adapter into a base `.hfq`.
+    Merge(LoraMergeArgs),
+    /// Convert an adapter between `.hfq` and `.json` forms.
+    Convert(LoraConvertArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LoraExportArgs {
+    /// Base model to derive the adapter against.
+    #[arg(long)]
+    hfq: PathBuf,
+    /// Directory holding `good_prompts.txt` and `bad_prompts.txt`.
+    #[arg(long)]
+    data_dir: PathBuf,
+    /// Destination adapter (`.lora.hfq` or `.lora.json`).
+    #[arg(long)]
+    out: PathBuf,
+    /// Prompts to read from each set.
+    #[arg(long, default_value_t = 16)]
+    limit: usize,
+    /// Steering strength.
+    #[arg(long, default_value_t = 0.2)]
+    strength: f32,
+    /// Max sequence length during capture.
+    #[arg(long, default_value_t = 2048)]
+    max_seq: usize,
+    /// Skip orthogonalisation of the derived directions.
+    #[arg(long)]
+    no_orthogonalize: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LoraMergeArgs {
+    /// Base `.hfq`.
+    #[arg(long)]
+    hfq: PathBuf,
+    /// Adapter to merge.
+    #[arg(long)]
+    adapter: PathBuf,
+    /// Destination merged `.hfq`.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct LoraConvertArgs {
+    /// Source adapter. (Spelled `--in`, matching the existing tool.)
+    #[arg(long = "in")]
+    input: PathBuf,
+    /// Destination adapter.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+pub fn run_lora(args: LoraArgs) -> anyhow::Result<()> {
+    let err = |e: Box<dyn std::error::Error>| anyhow::anyhow!("{e}");
+    let (op, argv) = match args.command {
+        LoraCommand::Export(a) => (
+            "export",
+            to_argv(
+                vec![
+                    ("--hfq", Some(a.hfq.display().to_string())),
+                    ("--data-dir", Some(a.data_dir.display().to_string())),
+                    ("--out", Some(a.out.display().to_string())),
+                    ("--limit", Some(a.limit.to_string())),
+                    ("--strength", Some(a.strength.to_string())),
+                    ("--max-seq", Some(a.max_seq.to_string())),
+                ],
+                vec![("--no-orthogonalize", a.no_orthogonalize)],
+            ),
+        ),
+        LoraCommand::Merge(a) => (
+            "merge",
+            to_argv(
+                vec![
+                    ("--hfq", Some(a.hfq.display().to_string())),
+                    ("--adapter", Some(a.adapter.display().to_string())),
+                    ("--out", Some(a.out.display().to_string())),
+                ],
+                vec![],
+            ),
+        ),
+        LoraCommand::Convert(a) => (
+            "convert",
+            to_argv(
+                vec![
+                    ("--in", Some(a.input.display().to_string())),
+                    ("--out", Some(a.out.display().to_string())),
+                ],
+                vec![],
+            ),
+        ),
+    };
+    // These three entry points are private to coexistence's dispatcher, so they
+    // go through the public `cli::run` with the group tokens rebuilt.
+    let mut full = vec!["lora".to_string(), op.to_string()];
+    full.extend(argv);
+    hipfire_coexistence::cli::run(&full).map_err(err)
+}
