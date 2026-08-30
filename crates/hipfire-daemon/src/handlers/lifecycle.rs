@@ -284,9 +284,32 @@ pub(crate) fn load(
         .unwrap_or(false);
 
     // Opt-in n-gram spec decode. Per-load param wins, else the config default
-    // (off). An empty `ngram_store_root` keeps it RAM-only: nothing is written
+    // (off). An empty `ngram_spec_store_root` keeps it RAM-only: nothing is written
     // to disk, so nothing outlives the request.
+    //
+    // The params are the channel. `ModelLoadParams::from_hipfire_config` fills
+    // this family from the config the SERVER resolved, which went through
+    // `resolve_for_model` — so the CLI layer and any `model_overrides` for this
+    // model are already folded in.
+    //
+    // The disk read below is a fallback for callers that send no params (the
+    // adapter's `ModelLoadParams::default()`, tests, standalone tools). It is
+    // NOT equivalent: `load_config_bundle` resolves with no additional layers
+    // and no model tag, so a `--flag` override and every `model_overrides`
+    // entry are invisible to it. That silent inequivalence is why this family
+    // ignored per-model settings; say so rather than paper over it.
+    let ngram_params_present = msg
+        .get("params")
+        .and_then(|p| p.get("ngram_spec"))
+        .is_some();
     let ngram_cfg = hipfire_config::load_config_bundle().config;
+    if !ngram_params_present && ngram_cfg.ngram_spec {
+        tracing::warn!(
+            "ngram_spec is on in config.json but this load carried no ngram params, so the \
+             values come from a re-read of the file: no CLI overrides, no model_overrides. \
+             Send them as load params to get the resolved values."
+        );
+    }
     let ngram_spec = msg
         .get("params")
         .and_then(|p| p.get("ngram_spec"))
@@ -294,16 +317,16 @@ pub(crate) fn load(
         .unwrap_or(ngram_cfg.ngram_spec);
     let ngram_store_root = msg
         .get("params")
-        .and_then(|p| p.get("ngram_store_root"))
+        .and_then(|p| p.get("ngram_spec_store_root"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_store_root);
+        .unwrap_or(ngram_cfg.ngram_spec_store_root);
     let ngram_scope = msg
         .get("params")
-        .and_then(|p| p.get("ngram_scope"))
+        .and_then(|p| p.get("ngram_spec_scope"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_scope);
+        .unwrap_or(ngram_cfg.ngram_spec_scope);
     // Tuning knobs: per-load param wins, else the config value. Defaults are
     // the measured operating point (see the replay-sweep devlog).
     let ngram_u64 = |k: &str, d: u64| -> u64 {
@@ -312,26 +335,37 @@ pub(crate) fn load(
             .and_then(|v| v.as_u64())
             .unwrap_or(d)
     };
-    let ngram_store_mb = ngram_u64("ngram_store_mb", ngram_cfg.ngram_store_mb as u64).max(1);
-    let ngram_chain_floor = ngram_u64("ngram_chain_floor", ngram_cfg.ngram_chain_floor as u64);
-    let ngram_max_spine = ngram_u64("ngram_max_spine", ngram_cfg.ngram_max_spine as u64).max(1);
-    let ngram_promote_count =
-        ngram_u64("ngram_promote_count", ngram_cfg.ngram_promote_count as u64).max(1);
+    let ngram_store_mb =
+        ngram_u64("ngram_spec_store_mb", ngram_cfg.ngram_spec_store_mb as u64).max(1);
+    let ngram_chain_floor = ngram_u64(
+        "ngram_spec_chain_floor",
+        ngram_cfg.ngram_spec_chain_floor as u64,
+    );
+    let ngram_max_spine = ngram_u64(
+        "ngram_spec_max_spine",
+        ngram_cfg.ngram_spec_max_spine as u64,
+    )
+    .max(1);
+    let ngram_promote_count = ngram_u64(
+        "ngram_spec_promote_count",
+        ngram_cfg.ngram_spec_promote_count as u64,
+    )
+    .max(1);
     let ngram_write_target = msg
         .get("params")
-        .and_then(|p| p.get("ngram_write_target"))
+        .and_then(|p| p.get("ngram_spec_write_target"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_write_target);
+        .unwrap_or(ngram_cfg.ngram_spec_write_target);
     // Orders: comma-separated, longest-first is enforced downstream. A value
     // that parses to nothing usable falls back to the default rather than
     // leaving the drafter with an empty ladder.
     let ngram_orders_raw = msg
         .get("params")
-        .and_then(|p| p.get("ngram_orders"))
+        .and_then(|p| p.get("ngram_spec_orders"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or(ngram_cfg.ngram_orders);
+        .unwrap_or(ngram_cfg.ngram_spec_orders);
     let mut ngram_orders: Vec<u8> = ngram_orders_raw
         .split(',')
         .filter_map(|t| t.trim().parse::<u8>().ok())
@@ -340,7 +374,7 @@ pub(crate) fn load(
     if ngram_orders.is_empty() {
         if ngram_spec {
             tracing::warn!(
-                "ngram_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
+                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
             );
         }
         ngram_orders = vec![8, 7, 6, 5, 4, 3, 2];
@@ -681,6 +715,51 @@ pub(crate) fn load(
             if let Some(df) = m.dflash.as_mut() {
                 df.adaptive_b = adaptive_b;
                 df.ngram = ngram_setup;
+            } else if let Some(setup) = ngram_setup {
+                // The server routes on `batch_prefill_capable`, which the daemon
+                // answers from this executor's own probe, so a model carrying a
+                // speculative-decode state takes the legacy path instead of
+                // being dispatched into a batched prefill that refuses it.
+                {
+                    // Drafter-free n-gram spec decode, which is what `ngram_spec`
+                    // has always advertised. The spine comes from the n-gram
+                    // tables, so the state carries only the TARGET half — no
+                    // drafter weights, no hidden-state ring, and therefore no
+                    // per-layer extraction on any verify.
+                    //
+                    // Until this existed the setup built just above was dropped on
+                    // the floor here, because the only place it could be stored was
+                    // inside a DFlash state that requires a drafter.
+                    match (m.q35_config.as_ref(), m.q35_weights.as_ref(), m.dn_state()) {
+                        (Some(config), Some(weights), Some(dn)) => {
+                            match hipfire_serving_core::load::ngram_only_state(
+                                ngram_max_spine as usize,
+                                m.max_seq,
+                                config,
+                                dn,
+                                weights.output.k,
+                                &mut daemon_state.gpu,
+                            ) {
+                                Ok(mut state) => {
+                                    state.ngram = Some(setup);
+                                    m.dflash = Some(state);
+                                    tracing::info!(
+                                        "n-gram speculative decode active (no drafter): \
+                                     max_spine={ngram_max_spine} orders={ngram_orders:?}"
+                                    );
+                                }
+                                Err(err) => tracing::warn!(
+                                    "ngram_spec is on but its state could not be built ({err}); \
+                                 decoding without speculation"
+                                ),
+                            }
+                        }
+                        _ => tracing::warn!(
+                            "ngram_spec is on but this model is not a Qwen3.5/3.6 target; \
+                         n-gram speculative decode supports that family only"
+                        ),
+                    }
+                }
             }
             daemon_state
                 .resource_reservations
@@ -869,6 +948,16 @@ pub(crate) fn load(
                 model_worker_runtime_view_json(&loaded_model_worker_runtime_view(&m));
             let cache_capable =
                 m.arch_id == ARCH_ID_DEEPSEEK4_FLASH || is_qwen35_family_arch_id(m.arch_id);
+            // Ask the executor that would actually run the batched prefill.
+            // The server used to infer this from HIPFIRE_DFLASH_DRAFT, which is
+            // unset for a drafter found by sibling discovery or an embedded
+            // manifest — so such a model was judged eligible, dispatched, and
+            // refused mid-cycle, which `batch_runner` turns into `fail_all` for
+            // every session rather than a fallback.
+            let batch_prefill_capable =
+                hipfire_serving_core::batch_executor::batch_executor_for(m.arch_id)
+                    .map(|ex| ex.probe(&m).is_ok())
+                    .unwrap_or(false);
             let _ = writeln!(
                 daemon_state.out.sink,
                 "{}",
@@ -877,6 +966,7 @@ pub(crate) fn load(
                     "worker_key_id": requested_worker_id,
                     "arch": arch,
                     "cache_capable": cache_capable,
+                    "batch_prefill_capable": batch_prefill_capable,
                     "dim": dim,
                     "layers": layers,
                     "vocab": vocab,

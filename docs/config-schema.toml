@@ -98,7 +98,7 @@ restart_impact = "none"
 
 [[field]]
 key = "cask_sidecar"
-type = "path"
+type = "path(Exists)"
 requirement = "required when `cask == true && cask_auto_attach == false`"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
@@ -156,19 +156,19 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "dflash_mode"
-type = "enum(off|auto|on)"
+key = "dflash_draft"
+type = "one_of(enum(off|auto|on) | path(Exists))"
 requirement = "optional"
 default = "off"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
-description = "DFlash speculative decode mode."
+description = "DFlash speculative decode. `off` never loads a drafter; `auto` uses one if discovery finds it (`~/.hipfire/drafts`, next to the model, the models dir); `on` requires one and fails the load if none is found. An absolute PATH names the drafter explicitly, overriding discovery and any embedded component — and implies `on`, because naming a drafter is asking for it. Set it per model under `model_overrides` to pin a drafter the naming convention would not find."
 secret = false
 restart_impact = "none"
 
 [[field]]
-key = "dflash_ngram_block"
+key = "dflash_no_repeat_ngram"
 type = "json"
 requirement = "optional"
 default = "\"auto\""
@@ -366,7 +366,7 @@ restart_impact = "none"
 
 [[field]]
 key = "models_dir"
-type = "path"
+type = "path(Exists)"
 requirement = "optional"
 scopes = ["global", "runtime"]
 mutability = "static"
@@ -377,7 +377,7 @@ restart_impact = "none"
 
 [[field]]
 key = "models_network_dir"
-type = "path"
+type = "path(Exists)"
 requirement = "optional"
 scopes = ["global", "runtime"]
 mutability = "static"
@@ -411,66 +411,6 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "ngram_chain_floor"
-type = "u8"
-requirement = "optional"
-default = "8"
-scopes = ["global", "model", "runtime"]
-mutability = "load_time"
-owner = "hipfire-config"
-description = "Minimum winning order to keep extending an n-gram chain; 0 disables."
-secret = false
-restart_impact = "none"
-
-[[field]]
-key = "ngram_max_spine"
-type = "u32"
-requirement = "optional"
-default = "16"
-scopes = ["global", "model", "runtime"]
-mutability = "load_time"
-owner = "hipfire-config"
-description = "Maximum n-gram draft spine length."
-secret = false
-restart_impact = "none"
-
-[[field]]
-key = "ngram_orders"
-type = "string"
-requirement = "optional"
-default = "8,7,6,5,4,3,2"
-scopes = ["global", "model", "runtime"]
-mutability = "load_time"
-owner = "hipfire-config"
-description = "n-gram probe orders, longest first, comma-separated."
-secret = false
-restart_impact = "none"
-
-[[field]]
-key = "ngram_promote_count"
-type = "u16"
-requirement = "optional"
-default = "3"
-scopes = ["global", "model", "runtime"]
-mutability = "load_time"
-owner = "hipfire-config"
-description = "Observations before an n-gram is persisted; gates writes, not drafting."
-secret = false
-restart_impact = "none"
-
-[[field]]
-key = "ngram_scope"
-type = "string"
-requirement = "optional"
-default = ""
-scopes = ["global", "model", "runtime"]
-mutability = "load_time"
-owner = "hipfire-config"
-description = "Tokenizer scope name for n-gram tables; empty = derive from model file."
-secret = false
-restart_impact = "none"
-
-[[field]]
 key = "ngram_spec"
 type = "bool"
 requirement = "optional"
@@ -483,7 +423,67 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "ngram_store_mb"
+key = "ngram_spec_chain_floor"
+type = "u8"
+requirement = "optional"
+default = "8"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Minimum winning order to keep extending an n-gram chain; 0 disables."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_max_spine"
+type = "u32"
+requirement = "optional"
+default = "16"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Maximum n-gram draft spine length."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_orders"
+type = "string"
+requirement = "optional"
+default = "8,7,6,5,4,3,2"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "n-gram probe orders, longest first, comma-separated."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_promote_count"
+type = "u16"
+requirement = "optional"
+default = "3"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Observations before an n-gram is persisted; gates writes, not drafting."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_scope"
+type = "string"
+requirement = "optional"
+default = ""
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Tokenizer scope name for n-gram tables; empty = derive from model file."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_store_mb"
 type = "u32"
 requirement = "optional"
 default = "256"
@@ -495,8 +495,8 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "ngram_store_root"
-type = "string"
+key = "ngram_spec_store_root"
+type = "one_of(enum(|ram|none|off) | path(ParentExists))"
 requirement = "optional"
 default = ""
 scopes = ["global", "model", "runtime"]
@@ -507,7 +507,7 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "ngram_write_target"
+key = "ngram_spec_write_target"
 type = "enum(user|topic|none)"
 requirement = "optional"
 default = "user"
@@ -581,7 +581,7 @@ restart_impact = "none"
 
 [[field]]
 key = "prefill_drafter"
-type = "path"
+type = "path(Exists)"
 requirement = "required when `prefill_compression != 'off' && prefill_drafter_device >= 0`"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"

@@ -516,7 +516,7 @@ pub fn spec_step_dflash_mtp(
         target,
         &composite,
         position,
-        hidden_rb,
+        Some(hidden_rb),
         gdn_tape_opt.as_deref_mut(),
         false, // greedy / temp=0
         verify_scratch,

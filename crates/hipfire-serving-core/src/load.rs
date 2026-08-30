@@ -1078,17 +1078,22 @@ pub fn load_model(
             // batched across the verify block before admitting it by default makes
             // anyone faster.
             //
-            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work. The drafters on
-            // disk are parked `.parked-slower-than-plain-decode` so sibling
-            // discovery cannot attach one silently; pass `params.draft` explicitly
-            // to measure.
-            let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
+            // That measurement is why the gate existed; it is kept above as the
+            // record of where speculation does NOT pay on this family. It is no
+            // longer a load-time refusal: `dflash_mode` decides whether to try,
+            // and a per-model override picks the drafter.
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
-                // Opt-in while the batched verify body is being bisected; see
-                // the note above. Default stays refused.
-                Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
+                // Opus Quant. Batched lm_head and correctness are both done —
+                // see the note above — and it is measured FASTER here, not
+                // slower: Qwen3.5-9B oq4.25++ on gfx1103, greedy, 13.2 -> 29.8
+                // tok/s repetitive and 12.8 -> 30.2 prose. The old opt-in
+                // generalised a 27B/35B-A3B result to the whole family; those
+                // are MoE and DeltaNet-heavy, where a wider verify batch
+                // amortizes only part of the stack. A dense target is a
+                // different shape.
+                Some(33 | 34 | 35 | 36 | 38 | 52) => true,
                 // Unquantized heads. BF16 (16) resolves to DType::BF16; the
                 // losslessly recoded pair (Bf16Lut3=49, Bf16Huff=50) keeps the
                 // head PACKED as DType::Bf16L3. `dflash_enqueue_verify_lm_head`
@@ -1107,11 +1112,9 @@ pub fn load_model(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
                      ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13), \
-                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50) always; MQ3G256 \
-                     (qt=17) on gfx11 only. Opus oq* (qt=33/34/35/36/38/52) is \
-                     CORRECT now but measured slower than plain decode on this \
-                     family, so it stays behind HIPFIRE_DFLASH_ALLOW_OPUS=1. \
-                     Other dtypes \
+                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50), Opus oq* \
+                     (qt=33/34/35/36/38/52) always; MQ3G256 (qt=17) on gfx11 \
+                     only. Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
@@ -2907,9 +2910,9 @@ pub fn load_model(
             tracing::info!(
                 "DFlash draft loaded: source={} layers={} hidden={} block={}",
                 source.label(),
-                state.draft_config.n_layers,
-                state.draft_config.hidden,
-                state.draft_config.block_size,
+                state.draft_config.as_ref().map_or(0, |c| c.n_layers),
+                state.draft_config.as_ref().map_or(0, |c| c.hidden),
+                state.draft_config.as_ref().map_or(0, |c| c.block_size),
             );
             Some(state)
         } else {
@@ -3742,9 +3745,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     // and (optional) DDTree state must each be returned to the pool — otherwise a
     // mid-session load/unload cycle strands them until daemon exit.
     if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
-        df.hidden_rb.free_gpu(gpu);
+        // The drafter half is absent on an n-gram-only load; the target-side
+        // buffers below are always present and always need returning.
+        if let Some(draft_weights) = df.draft_weights {
+            draft_weights.free_gpu(gpu);
+        }
+        if let Some(draft_scratch) = df.draft_scratch {
+            draft_scratch.free_gpu(gpu);
+        }
+        if let Some(hidden_rb) = df.hidden_rb {
+            hidden_rb.free_gpu(gpu);
+        }
         df.verify_scratch.free_gpu(gpu);
         df.target_snap.free_gpu(gpu);
         df.gdn_tape.free_gpu(gpu);
@@ -4084,6 +4095,59 @@ pub fn load_dspark_state(
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft
 /// weights/config/scratch, the hidden-state ring buffer + verify scratch, and
 /// (when `HIPFIRE_DDTREE_BUDGET` is set) the DDTree tree-verify side state.
+/// Build the target-side speculative state for n-gram decode with NO drafter.
+///
+/// Every field here comes from the TARGET — verify scratch, the DeltaNet
+/// snapshot and the GDN tape are what the verify step needs regardless of where
+/// the draft came from. The four drafter fields are None, which makes
+/// `spec_step_dflash` skip the drafter branch, the per-layer hidden extraction
+/// on every verify, and the staging that feeds the next drafter cycle.
+///
+/// `max_spine` sizes the verify buffers the way `draft_cfg.block_size` does for
+/// DFlash: one slot for the seed plus the longest spine n-gram can supply.
+pub fn ngram_only_state(
+    max_spine: usize,
+    ctx_capacity: usize,
+    target_config: &qwen35::Qwen35Config,
+    target_dn: &DeltaNetState,
+    lm_head_k: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<DflashState, String> {
+    let scratch_max_n = max_spine.max(1) + 1;
+    let target_snap =
+        DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
+    let gdn_tape = GdnTape::new_for_config(gpu, target_config, scratch_max_n)
+        .map_err(|e| format!("gdn_tape: {e}"))?;
+    let verify_scratch = VerifyScratch::with_prefill(
+        gpu,
+        scratch_max_n,
+        target_config.dim,
+        target_config.vocab_size,
+        lm_head_k,
+        target_config,
+    )
+    .map_err(|e| format!("verify_scratch: {e}"))?;
+    Ok(DflashState {
+        draft_config: None,
+        draft_weights: None,
+        draft_scratch: None,
+        hidden_rb: None,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        // Only the drafter reads the host hidden shadow.
+        target_hidden_host: Vec::new(),
+        ctx_capacity,
+        block_size: max_spine.max(1),
+        // Adaptive-B tunes a DRAFTER's block; the spine length is n-gram's.
+        adaptive_b: false,
+        // DDTree is a tree over a drafter's candidates.
+        ddtree: None,
+        ngram: None,
+        ngram_live: None,
+    })
+}
+
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
@@ -4316,10 +4380,10 @@ fn load_dflash_state_source(
     };
 
     Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
+        draft_config: Some(draft_config),
+        draft_weights: Some(draft_weights),
+        draft_scratch: Some(draft_scratch),
+        hidden_rb: Some(hidden_rb),
         verify_scratch,
         target_snap,
         gdn_tape,

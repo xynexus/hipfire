@@ -40,6 +40,27 @@ pub enum RestartImpact {
     ReconnectClients,
 }
 
+/// What must already be on disk for a [`ConfigType::Path`] value to be usable.
+///
+/// Checked at startup and by `doctor`, never in the resolver: the resolver is
+/// pure and runs in tests and the settings editor, where touching the
+/// filesystem would be both wrong and slow. Existence is also TOCTOU — it says
+/// the path was there at boot, not that it will be there at use — which is why
+/// a failure here is a warning and never fatal.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathExistence {
+    /// An input: the path itself must already exist. A missing one is a typo or
+    /// an unmounted volume, and finding out at load time means finding out
+    /// after the expensive part.
+    Exists,
+    /// An output: hipfire creates the path on first use, so it need not exist —
+    /// but its PARENT must, because nothing here creates a directory tree. A
+    /// root under a parent that does not exist fails on first write, long after
+    /// the config was read.
+    ParentExists,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigType {
@@ -51,10 +72,77 @@ pub enum ConfigType {
     I32,
     F64,
     String,
-    Path,
-    Enum { values: &'static [&'static str] },
+    Path {
+        existence: PathExistence,
+    },
+    Enum {
+        values: &'static [&'static str],
+    },
     Json,
+    /// A value that may be any ONE of several domains — a closed set of
+    /// sentinels OR an open one, e.g. `ngram_store_root`'s "ram"/"none"/"off"
+    /// or a directory path.
+    ///
+    /// Arms are tried in order and the first that accepts wins, so ORDER IS
+    /// SEMANTIC: an open arm (`String`, `Path`, `Json`) accepts nearly
+    /// anything, so it must come last or it swallows the sentinels behind it.
+    OneOf {
+        arms: &'static [ConfigType],
+    },
 }
+
+/// Split a `dflash_draft` value into (mode, explicit drafter path).
+///
+/// One setting answers both questions, because they were never independent: a
+/// mode with no drafter to apply it to is half a decision, and naming a drafter
+/// while leaving the mode `off` is a contradiction the operator has to notice.
+/// So a PATH implies `on` — naming one is asking for it.
+///
+/// Empty is `off`: an unset string is not a path, and the field's own default
+/// says off.
+pub fn dflash_draft_setting(value: &str) -> (&str, Option<&str>) {
+    match value.trim() {
+        "" | "off" => ("off", None),
+        "auto" => ("auto", None),
+        "on" => ("on", None),
+        path => ("on", Some(path)),
+    }
+}
+
+/// Config keys that have been renamed, as `(old, new)`.
+///
+/// An old key is honoured and reported, not dropped. Dropping is what this
+/// codebase keeps getting wrong — a setting that reads fine and does nothing is
+/// worse than one that errors, because nothing ever says so.
+///
+/// The n-gram family took the `ngram_spec_` prefix of its own enable flag, so
+/// the speculative-decode knobs are greppable as one group. `dflash_ngram_block`
+/// became `dflash_no_repeat_ngram`: it BANS the token after a repeated n-gram
+/// (`sampler::apply_ngram_block`), the opposite of what the `ngram_spec` family
+/// does with n-grams, and "block" everywhere else here means the block of B
+/// speculative tokens.
+pub const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("ngram_store_root", "ngram_spec_store_root"),
+    ("ngram_scope", "ngram_spec_scope"),
+    ("ngram_store_mb", "ngram_spec_store_mb"),
+    ("ngram_orders", "ngram_spec_orders"),
+    ("ngram_chain_floor", "ngram_spec_chain_floor"),
+    ("ngram_max_spine", "ngram_spec_max_spine"),
+    ("ngram_promote_count", "ngram_spec_promote_count"),
+    ("ngram_write_target", "ngram_spec_write_target"),
+    ("dflash_ngram_block", "dflash_no_repeat_ngram"),
+    // `dflash_mode` and `dflash_draft` were one question asked twice: the mode
+    // and the drafter it applies to. The values carry over unchanged, and a path
+    // now says "on" by naming what to use.
+    ("dflash_mode", "dflash_draft"),
+];
+
+/// Sentinel values of [`NGRAM_STORE_ROOT_RAM`] meaning "keep tables in RAM".
+///
+/// Declared here so the domain has ONE home. It used to live only in
+/// `NgramSetup::persists()` and in this field's prose description, with nothing
+/// binding the two.
+pub const NGRAM_STORE_ROOT_RAM: &[&str] = &["", "ram", "none", "off"];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "condition", rename_all = "snake_case")]
@@ -250,7 +338,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "models_dir",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
@@ -259,7 +349,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "models_network_dir",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
@@ -616,15 +708,31 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Flash-attention selection policy."
     ),
     field!(
-        "dflash_mode",
-        ConfigType::Enum {
-            values: &["off", "auto", "on"]
+        "dflash_draft",
+        // Enum arm FIRST: an open arm accepts nearly anything and would swallow
+        // the words behind it. (`off`/`auto`/`on` also fail the Path arm because
+        // a config path must be absolute, but the order is the rule regardless.)
+        ConfigType::OneOf {
+            arms: &[
+                ConfigType::Enum {
+                    values: &["off", "auto", "on"],
+                },
+                ConfigType::Path {
+                    existence: PathExistence::Exists,
+                },
+            ],
         },
         Requirement::Optional,
         Some("off"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "DFlash speculative decode mode."
+        "DFlash speculative decode. `off` never loads a drafter; `auto` uses one \
+         if discovery finds it (`~/.hipfire/drafts`, next to the model, the \
+         models dir); `on` requires one and fails the load if none is found. An \
+         absolute PATH names the drafter explicitly, overriding discovery and any \
+         embedded component — and implies `on`, because naming a drafter is \
+         asking for it. Set it per model under `model_overrides` to pin a \
+         drafter the naming convention would not find."
     ),
     field!(
         "dflash_adaptive_b",
@@ -645,8 +753,17 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Opt-in drafter-free n-gram speculative decode."
     ),
     field!(
-        "ngram_store_root",
-        ConfigType::String,
+        "ngram_spec_store_root",
+        ConfigType::OneOf {
+            arms: &[
+                ConfigType::Enum {
+                    values: NGRAM_STORE_ROOT_RAM,
+                },
+                ConfigType::Path {
+                    existence: PathExistence::ParentExists,
+                },
+            ],
+        },
         Requirement::Optional,
         Some(""),
         GLOBAL_MODEL_RUNTIME,
@@ -654,7 +771,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only."
     ),
     field!(
-        "ngram_scope",
+        "ngram_spec_scope",
         ConfigType::String,
         Requirement::Optional,
         Some(""),
@@ -663,7 +780,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Tokenizer scope name for n-gram tables; empty = derive from model file."
     ),
     field!(
-        "ngram_store_mb",
+        "ngram_spec_store_mb",
         ConfigType::U32,
         Requirement::Optional,
         Some("256"),
@@ -672,7 +789,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Size in MiB of a newly created n-gram table; this is the fixed budget."
     ),
     field!(
-        "ngram_orders",
+        "ngram_spec_orders",
         ConfigType::String,
         Requirement::Optional,
         Some("8,7,6,5,4,3,2"),
@@ -681,7 +798,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "n-gram probe orders, longest first, comma-separated."
     ),
     field!(
-        "ngram_chain_floor",
+        "ngram_spec_chain_floor",
         ConfigType::U8,
         Requirement::Optional,
         Some("8"),
@@ -690,7 +807,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Minimum winning order to keep extending an n-gram chain; 0 disables."
     ),
     field!(
-        "ngram_max_spine",
+        "ngram_spec_max_spine",
         ConfigType::U32,
         Requirement::Optional,
         Some("16"),
@@ -699,7 +816,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Maximum n-gram draft spine length."
     ),
     field!(
-        "ngram_promote_count",
+        "ngram_spec_promote_count",
         ConfigType::U16,
         Requirement::Optional,
         Some("3"),
@@ -708,7 +825,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Observations before an n-gram is persisted; gates writes, not drafting."
     ),
     field!(
-        "ngram_write_target",
+        "ngram_spec_write_target",
         ConfigType::Enum {
             values: &["user", "topic", "none"]
         },
@@ -719,7 +836,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Which n-gram store the write path feeds."
     ),
     field!(
-        "dflash_ngram_block",
+        "dflash_no_repeat_ngram",
         ConfigType::Json,
         Requirement::Optional,
         Some("\"auto\""),
@@ -789,7 +906,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "cask_sidecar",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::RequiredWhen("cask == true && cask_auto_attach == false"),
         None,
         GLOBAL_MODEL_RUNTIME,
@@ -941,7 +1060,9 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "prefill_drafter",
-        ConfigType::Path,
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
         Requirement::RequiredWhen("prefill_compression != 'off' && prefill_drafter_device >= 0"),
         None,
         GLOBAL_MODEL_RUNTIME,
