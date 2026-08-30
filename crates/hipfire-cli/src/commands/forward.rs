@@ -130,7 +130,6 @@ Usage:
     qwen3.5-0.8b-oq4.hfq -> qwen3.5-0.8b-oq4.gfx1103.hfq
 
 The positional model accepts a local name, shorthand, alias, or path.
-(Alias: `hipfire repack`.)
 
 Build runner:
   cargo build --release -p hipfire-runtime --example optimize"#;
