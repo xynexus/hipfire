@@ -291,3 +291,85 @@ pub fn qsa_decode_step(
     gpu.qsa_apply_output_gate(&s.ctx, &s.gate, &s.gated, (nh * hd) as i32)?;
     gpu.gemv_f32(&w.o_proj, &s.gated, out)
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Exhaustive destructures, so a field added later fails to compile until someone
+// decides whether it needs freeing. See the note in `hc_gpu.rs`.
+
+impl QsaWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            ix_qk_proj,
+            ix_q_norm,
+            ix_k_norm,
+        } = self;
+        for t in [
+            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, ix_qk_proj, ix_q_norm, ix_k_norm,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl QsaCache {
+    /// Rewind to an empty cache. Only `len` needs clearing — the K/V and indexer
+    /// key buffers are written before they are read at every position < len, so
+    /// stale bytes past the cursor are never visible.
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            k,
+            v,
+            ix_keys,
+            len: _,
+            max_seq: _,
+        } = self;
+        for t in [k, v, ix_keys] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl QsaScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            qg,
+            query,
+            gate,
+            qn,
+            k,
+            kn,
+            v,
+            ix_qk,
+            ix_q,
+            block_keys,
+            starts,
+            scores,
+            block_mask,
+            slots,
+            count,
+            gath_k,
+            gath_v,
+            ctx,
+            gated,
+            m,
+            l,
+        } = self;
+        for t in [
+            qg, query, gate, qn, k, kn, v, ix_qk, ix_q, block_keys, starts, scores, block_mask,
+            slots, count, gath_k, gath_v, ctx, gated, m, l,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}

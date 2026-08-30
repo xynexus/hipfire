@@ -1896,6 +1896,7 @@ dependencies = [
  "hipfire-arch-api",
  "hipfire-arch-gemma4",
  "hipfire-arch-qwen2",
+ "hipfire-arch-qwen4exp",
  "hipfire-arch-specs",
  "hipfire-arch-template",
  "hipfire-arch-template-spec",

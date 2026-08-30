@@ -114,3 +114,42 @@ pub fn hc_write(
         cfg.gated_residual.count as i32,
     )
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Every `free` below DESTRUCTURES its struct exhaustively rather than naming
+// fields to free. That is deliberate: a field added later fails to compile until
+// someone decides what happens to it, where a `self.a; self.b;` list would just
+// silently leak the new tensor. `unload` on a 360 GB model has no test that would
+// catch that.
+
+impl HcWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            hc_norm,
+            mix_down,
+            mix_up,
+            block_inject,
+        } = self;
+        for t in [Some(hc_norm), Some(mix_down), Some(mix_up), block_inject]
+            .into_iter()
+            .flatten()
+        {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl HcScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            normed,
+            lowrank,
+            mix,
+            inject,
+        } = self;
+        for t in [normed, lowrank, mix, inject] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}

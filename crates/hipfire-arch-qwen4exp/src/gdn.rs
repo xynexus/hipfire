@@ -214,3 +214,88 @@ pub fn gdn_decode_step(
 
     gpu.gemv_f32(&w.out_proj, &s.gated, y)
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Every `free` below DESTRUCTURES its struct exhaustively rather than naming
+// fields to free. That is deliberate: a field added later fails to compile until
+// someone decides what happens to it, where a `self.a; self.b;` list would just
+// silently leak the new tensor. `unload` on a 360 GB model has no test that would
+// catch that.
+
+impl GdnWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_a,
+            in_proj_b,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            out_proj,
+        } = self;
+        for t in [
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_a,
+            in_proj_b,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            out_proj,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl GdnState {
+    /// Zero the recurrent state and the conv ring. A new sequence must not
+    /// inherit the previous one's history — this is the whole state a GDN layer
+    /// carries between tokens.
+    pub fn reset(&self, gpu: &mut Gpu) -> hipfire_rdna::HipResult<()> {
+        // No in-place zero primitive exists, so write host zeros over the
+        // buffers. Both are small (one S matrix and one conv ring per layer) and
+        // this runs once per sequence, not per token.
+        for t in [&self.recurrent, &self.conv] {
+            let zeros = vec![0u8; t.buf.size()];
+            gpu.memcpy_htod_auto(&t.buf, &zeros)?;
+        }
+        Ok(())
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self { recurrent, conv } = self;
+        for t in [recurrent, conv] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl GdnScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            qkv,
+            z,
+            a,
+            b,
+            alpha,
+            beta,
+            q_raw,
+            k_raw,
+            v,
+            q,
+            k,
+            attn,
+            gated,
+        } = self;
+        for t in [
+            qkv, z, a, b, alpha, beta, q_raw, k_raw, v, q, k, attn, gated,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}

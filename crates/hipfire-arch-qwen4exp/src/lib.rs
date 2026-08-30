@@ -29,6 +29,7 @@ pub mod ple;
 pub mod ple_gpu;
 pub mod qsa;
 pub mod rope;
+pub mod serving;
 pub mod trunk;
 pub mod trunk_gpu;
 pub mod vision;

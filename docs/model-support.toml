@@ -141,18 +141,31 @@ kv = "none"
 vision = "none"
 
 [[arch]]
-# Qwen3.8-Flash-Next. The OFFLINE half is complete — arch/ingest/quant policy,
+# Qwen3.8-Flash-Next. The offline half is complete — arch/ingest/quant policy,
 # config, weight plan, and a CPU trunk differenced end-to-end against the pinned
 # upstream reference (tokens -> logits, argmax identical; see
-# `crates/hipfire-arch-qwen4exp/tests/reference_oracle.rs`). There is no GPU
-# serving path yet, so every mark below is `none` — this row tracks what can be
-# SERVED, not what has been built or verified.
+# `crates/hipfire-arch-qwen4exp/tests/reference_oracle.rs`).
+#
+# `partial`, not `full`, and the gap is deliberate rather than unmeasured. What
+# works: a registered ServingFactory (arch 26 resolves by data lookup), factory
+# load, SimpleAr prefill + decode with finite moving logits, and a reset proven
+# total by re-running a prompt — see `examples/serve_fixture`, run by
+# `tests/qwen4exp-gate.sh`.
+#
+# What is missing, and why this is not `full`:
+#   - prefill is PER-TOKEN. The trunk has no batched path, and the recurrent
+#     halves (GDN state, PLE conv ring) are sequential by construction.
+#   - the SHIPPED checkpoint cannot be served yet: its n-gram table is 102 GB and
+#     the trunk still takes it as a host slice, so the factory refuses it by name
+#     rather than being OOM-killed. `ngram_store` is the streaming reader that
+#     closes this.
+#   - no quality evidence on a real artifact, and no VL/MTP wiring.
 ids = [26]
 label = "qwen4-exp"
-prefill = "none"
+prefill = "partial"
 dflash = "none"
 mtp = "none"
-kv = "none"
+kv = "fp32"
 vision = "none"
 
 [[arch]]
@@ -1196,3 +1209,52 @@ vae = "partial"
 t2i = "none"
 quant = "bf16·q4f16·q8f16·hfq4/6·oq4·oq4+·oq4++·oq8"
 note = "Ingest/identity only: MMDiT backbone topology and the Wan-class per-channel VAE are recognized, but NativeDiffusionRuntime builds no Qwen-Image text conditioner, so there is no servable t2i loop"
+
+[[gate]]
+arch = 26
+quant = "oq4"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq4 for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq4+"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq4+ for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq4++"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq4++ for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq4.25++"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq4.25++ for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq8"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq8 for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq8+"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq8+ for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"
+
+[[gate]]
+arch = 26
+quant = "oq8++"
+feature = "prefill"
+support = "none"
+note = "Qwen3.8-Flash-Next serves BF16 only. The quantizer produces oq8++ for the fixture (tests/qwen4exp-gate.sh checks the n-gram shards and indexer stay at source precision), but the trunk's tensor reader accepts float encodings ONLY and returns a NAMED error for any quantised tensor rather than loading a model with holes in it — so nothing downstream of the producer exists yet for this format. Recorded as a gate entry so the coverage requirement states the gap instead of the row being silently exempt. OQ checklist producer=yes loader=no decode=no prefill=no tiny=no golden=no eval=pending artifact=pending"

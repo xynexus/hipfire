@@ -146,3 +146,59 @@ pub fn moe_forward(
     gpu.moe_shared_gate(&s.sout, &s.sgate, &s.sout, hidden as i32)?;
     gpu.add_inplace_f32(out, &s.sout)
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Every `free` below DESTRUCTURES its struct exhaustively rather than naming
+// fields to free. That is deliberate: a field added later fails to compile until
+// someone decides what happens to it, where a `self.a; self.b;` list would just
+// silently leak the new tensor. `unload` on a 360 GB model has no test that would
+// catch that.
+
+impl MoeWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            router,
+            gate_up,
+            down,
+            shared_gate,
+            shared_up,
+            shared_down,
+            shared_expert_gate,
+        } = self;
+        for t in [
+            router,
+            gate_up,
+            down,
+            shared_gate,
+            shared_up,
+            shared_down,
+            shared_expert_gate,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl MoeScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            logits,
+            topk_idx,
+            topk_w,
+            gu,
+            inter,
+            expert_out,
+            sg,
+            su,
+            sinter,
+            sout,
+            sgate,
+        } = self;
+        for t in [
+            logits, topk_idx, topk_w, gu, inter, expert_out, sg, su, sinter, sout, sgate,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}

@@ -359,6 +359,13 @@ impl TrunkState {
 }
 
 impl TrunkScratch {
+    /// The last-position logits buffer, `[vocab]` f32, left populated by
+    /// [`decode_step_into`]. Exposed so the serving seam can sample on the GPU
+    /// instead of paying a `vocab`-wide download every token.
+    pub fn logits(&self) -> &GpuTensor {
+        &self.logits
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
         let width = cfg.gated_residual.count * cfg.hidden;
         Ok(Self {
@@ -381,7 +388,13 @@ impl TrunkScratch {
 /// `history` is the token stream INCLUDING this token; the n-gram window needs it
 /// and it is EOS-segment aware, so a bare "previous two tokens" is not enough.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_step(
+/// One decode step, leaving the last-position logits in `s.logits` ON THE GPU.
+///
+/// This is the serving entry point. [`decode_step`] wraps it and downloads, which
+/// is what the parity examples and tests want but costs a `vocab`-wide transfer
+/// per token — 993 KB at the shipped 248320 vocab, every step, for a sampler that
+/// may only need an argmax.
+pub fn decode_step_into(
     gpu: &mut Gpu,
     cfg: &Qwen4ExpConfig,
     w: &TrunkWeights,
@@ -392,7 +405,7 @@ pub fn decode_step(
     history: &[u32],
     pos: usize,
     eos: u32,
-) -> HipResult<Vec<f32>> {
+) -> HipResult<()> {
     let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
     let tok = history[history.len() - 1] as usize;
 
@@ -462,6 +475,142 @@ pub fn decode_step(
 
     // The mixer's own norm is the LAST normalisation — there is no `model.norm`.
     hc_read(gpu, cfg, &w.mixer, &mut s.hc, &s.wide, &s.collapsed)?;
-    gpu.gemv_f32(&w.lm_head, &s.collapsed, &s.logits)?;
+    gpu.gemv_f32(&w.lm_head, &s.collapsed, &s.logits)
+}
+
+/// [`decode_step_into`] followed by a download of the logits.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_step(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &TrunkWeights,
+    st: &mut TrunkState,
+    s: &mut TrunkScratch,
+    embed_table: &[f32],
+    ngram_table: Option<&[f32]>,
+    history: &[u32],
+    pos: usize,
+    eos: u32,
+) -> HipResult<Vec<f32>> {
+    decode_step_into(
+        gpu,
+        cfg,
+        w,
+        st,
+        s,
+        embed_table,
+        ngram_table,
+        history,
+        pos,
+        eos,
+    )?;
     gpu.download_f32(&s.logits)
+}
+
+// ── GPU teardown and per-sequence reset ─────────────────────────────────────
+//
+// Exhaustive destructures throughout, so a field added later fails to compile
+// until someone decides whether it needs freeing (see the note in `hc_gpu.rs`).
+// An `unload` that silently leaks has no test that would catch it, and this model
+// is 360 GB.
+
+impl TokenMixer {
+    pub fn free(self, gpu: &mut Gpu) {
+        match self {
+            TokenMixer::Gdn(w) => w.free(gpu),
+            TokenMixer::Qsa(w) => w.free(gpu),
+        }
+    }
+}
+
+impl LayerWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            attn_hc,
+            mlp_hc,
+            mixer,
+            moe,
+            ple,
+        } = self;
+        attn_hc.free(gpu);
+        mlp_hc.free(gpu);
+        mixer.free(gpu);
+        moe.free(gpu);
+        if let Some(p) = ple {
+            p.free(gpu);
+        }
+    }
+}
+
+impl TrunkWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            layers,
+            mixer,
+            lm_head,
+        } = self;
+        for l in layers {
+            l.free(gpu);
+        }
+        mixer.free(gpu);
+        let _ = gpu.free_tensor(lm_head);
+    }
+}
+
+impl TrunkState {
+    /// Drop everything carried between sequences.
+    ///
+    /// All three halves matter and they fail differently: a stale GDN recurrent
+    /// state or PLE conv ring silently conditions the next prompt on the last
+    /// one, while a stale KV `len` makes attention read positions the new
+    /// sequence never wrote.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for g in self.gdn.iter().flatten() {
+            g.reset(gpu)?;
+        }
+        for q in self.qsa.iter_mut().flatten() {
+            q.reset();
+        }
+        for p in self.ple.iter().flatten() {
+            p.reset(gpu)?;
+        }
+        Ok(())
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self { gdn, qsa, ple } = self;
+        for g in gdn.into_iter().flatten() {
+            g.free(gpu);
+        }
+        for q in qsa.into_iter().flatten() {
+            q.free(gpu);
+        }
+        for p in ple.into_iter().flatten() {
+            p.free(gpu);
+        }
+    }
+}
+
+impl TrunkScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            hc,
+            gdn,
+            qsa,
+            moe,
+            mixed,
+            block_out,
+            wide,
+            ple_out,
+            collapsed,
+            logits,
+        } = self;
+        hc.free(gpu);
+        gdn.free(gpu);
+        qsa.free(gpu);
+        moe.free(gpu);
+        for t in [mixed, block_out, wide, ple_out, collapsed, logits] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

@@ -165,6 +165,37 @@ else
   fail=1
 fi
 
+step "GPU: serve through the REGISTERED factory"
+# The only check that the SERVING seam is wired, as opposed to the trunk being
+# correct. It fails for four distinct reasons, each of which has happened: arch 26
+# not resolving to a factory (a missing link edge in hipfire-archs), the factory
+# failing to build a backend, a dead forward (finite but frozen logits), and an
+# incomplete reset leaking recurrent state between requests.
+if ! cargo build --quiet --release -p hipfire-arch-qwen4exp \
+     --example serve_fixture 2>&1 | tail -5; then
+  echo "qwen4exp-gate: serve_fixture build FAILED"
+  exit 2
+fi
+if [ -f "$TMP/fx.bf16.hfq" ]; then
+  sv="$(./target/release/examples/serve_fixture "$TMP/fx.bf16.hfq" 2>&1 || true)"
+  echo "$sv" | sed 's/^/  /'
+  case "$sv" in
+    *"serve_fixture: OK"*) ;;
+    *skipped*) ;;
+    *) echo "qwen4exp-gate: serving through the factory FAILED"; fail=1 ;;
+  esac
+  # A frozen argmax is the signature of a dead forward, and it is reported rather
+  # than thrown, so check the line explicitly.
+  case "$sv" in
+    *"argmax moved = false"*)
+      echo "qwen4exp-gate: decode ran but the argmax never moved — dead forward"
+      fail=1 ;;
+  esac
+else
+  echo "qwen4exp-gate: no bf16 artifact to serve"
+  fail=1
+fi
+
 if [ "$CPU_ONLY" = "1" ]; then
   [ "$fail" = "0" ] && echo && echo "qwen4exp-gate: PASS (cpu-only)"
   exit "$fail"

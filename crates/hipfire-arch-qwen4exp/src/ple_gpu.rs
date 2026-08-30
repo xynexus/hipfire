@@ -114,3 +114,58 @@ pub fn ple_step(
     )?;
     gpu.add_f32(&s.gated, &s.conv, out)
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Exhaustive destructures, so a field added later fails to compile until someone
+// decides whether it needs freeing. See the note in `hc_gpu.rs`.
+
+impl PleWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            key_proj,
+            value_proj,
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv_weight,
+        } = self;
+        for t in [
+            key_proj,
+            value_proj,
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv_weight,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl PleScratch {
+    /// Clear the dilated tap history. The rest is written before it is read
+    /// within a step; `conv_state` is the only thing that crosses positions.
+    pub fn reset(&self, gpu: &mut Gpu) -> hipfire_rdna::HipResult<()> {
+        let zeros = vec![0u8; self.conv_state.buf.size()];
+        gpu.memcpy_htod_auto(&self.conv_state.buf, &zeros)
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            key,
+            key_normed,
+            value,
+            query,
+            gated,
+            normed,
+            conv,
+            conv_state,
+        } = self;
+        for t in [
+            key, key_normed, value, query, gated, normed, conv, conv_state,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
