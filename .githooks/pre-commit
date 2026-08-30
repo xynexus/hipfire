@@ -206,6 +206,60 @@ if echo "$CHANGED" | grep -qE 'crates/rdna-compute/src/dispatch\.rs'; then
     echo
 fi
 
+# ── GPU availability preflight ───────────────────────────────────────────
+# Every gate below takes the hip-gpu-0 resource lease. A running `hipfire
+# serve` holds that lease for its ENTIRE LIFETIME, so waiting on it is not
+# contention that resolves — it is a hang. Before this check, committing while
+# serving sat in `[gpu-lock] busy: daemon …` printing every 5s until the
+# gate's own timeout: ~10 minutes of nothing, per gate.
+#
+# Only a LIVE LOCAL daemon short-circuits. Every other holder — a bench, an
+# eval, another gate — does finish, so waiting on those stays correct and is
+# left alone.
+gpu_held_by_local_daemon() {
+    local lock="${HIPFIRE_RESOURCE_LOCK_DIR:-$HOME/.hipfire/locks}/hip-gpu-0.lock"
+    [ -r "$lock" ] || return 1
+    local line
+    line=$(cat "$lock" 2>/dev/null) || return 1
+    # `daemon resource=hip-gpu-0 pid=<pid> host=<host> acquired_epoch=<ms>`;
+    # the `daemon` label is written only by acquire_resource_lease_or_exit.
+    case "$line" in
+        "daemon "*) ;;
+        *) return 1 ;;
+    esac
+    local host=${line##*host=}; host=${host%% *}
+    [ "$host" = "$(hostname)" ] || return 1
+    local pid=${line##*pid=}; pid=${pid%% *}
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    # The holder LINE is file contents, not kernel state, so it outlives its
+    # writer (AGENTS.md). A dead or recycled pid must not read as a live
+    # daemon and silence the gates, so confirm the process really is one.
+    kill -0 "$pid" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'hipfire.*daemon'
+}
+
+GPU_GATES=1
+GPU_HOLDER_PID=""
+if gpu_held_by_local_daemon; then
+    GPU_GATES=0
+    GPU_HOLDER_PID=$(cat "${HIPFIRE_RESOURCE_LOCK_DIR:-$HOME/.hipfire/locks}/hip-gpu-0.lock" 2>/dev/null)
+    GPU_HOLDER_PID=${GPU_HOLDER_PID##*pid=}; GPU_HOLDER_PID=${GPU_HOLDER_PID%% *}
+    echo "========================================================================"
+    echo "GPU GATES SKIPPED: hip-gpu-0 is held by your own hipfire daemon"
+    echo "                   (pid $GPU_HOLDER_PID)."
+    echo "========================================================================"
+    echo
+    echo "A serving daemon holds the GPU until it stops, so these gates cannot"
+    echo "run and would only block the commit while they timed out:"
+    echo "  tiny-affected tripwire · coherence battery · agentic gate"
+    echo "  multi-GPU pp gate      · MQ4 speed gate"
+    echo
+    echo "This commit therefore carries NO GPU regression cover. To get it:"
+    echo "  hipfire stop && git commit ...    # gates run, then \`hipfire start\`"
+    echo "  ./tests/tiny-affected-gate.sh --require-coverage   # or run one by hand"
+    echo
+fi
+
 # ── Tiny affected-model tripwire (git-diff selected front tier) ──────────
 # Use git's staged path list as the dependency/touched-file database. The
 # selector maps changed paths to the smallest covered tiny_quant family set
@@ -220,7 +274,9 @@ fi
 # DFlash/spec-decode uses the same tiny-model front tier; its heavyweight
 # diagnostic is manual-only.
 RUN_COHERENCE=1
-if [ "${HIPFIRE_FORCE_COHERENCE:-0}" = "1" ] || [ "${HIPFIRE_SKIP_TINY_AFFECTED:-0}" = "1" ]; then
+if [ "$GPU_GATES" = 0 ]; then
+    RUN_COHERENCE=0
+elif [ "${HIPFIRE_FORCE_COHERENCE:-0}" = "1" ] || [ "${HIPFIRE_SKIP_TINY_AFFECTED:-0}" = "1" ]; then
     : # tripwire disabled — battery runs unconditionally
 else
     echo "=== Tiny affected-model tripwire ==="
@@ -283,7 +339,7 @@ echo
 # Fires on any HOTSPOT match (same surface as coherence-gate). Skips silently
 # if A3B models absent (CI-safe). Force full battery via
 # HIPFIRE_FORCE_AGENTIC_GATE=1; skip entirely via HIPFIRE_SKIP_AGENTIC_GATE=1.
-if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
+if [ "$GPU_GATES" = 1 ] && [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
     if [ "${HIPFIRE_FORCE_AGENTIC_GATE:-0}" = "1" ]; then
         AGENTIC_FLAG=""
         AGENTIC_NOTE="(forced full: 8 cells, ~5 min)"
@@ -324,7 +380,7 @@ fi
 # Skips silently when fewer than 2 GPU are visible — single-GPU CI and
 # dev boxes don't block on multi-GPU regressions. When 2+ GPU AND a
 # multi_gpu/pp_/peer_access hotspot is touched, run the parity battery.
-if [ "$PP_TOUCHED" -eq 1 ]; then
+if [ "$GPU_GATES" = 1 ] && [ "$PP_TOUCHED" -eq 1 ]; then
     echo "=== Multi-GPU PP Gate ==="
     echo "Multi-GPU code changed. Running pp-gate (skips if <2 GPU)..."
     echo
@@ -346,6 +402,7 @@ if [ "$PP_TOUCHED" -eq 1 ]; then
 fi
 
 # ── Speed gate ────────────────────────────────────────────────────────────
+if [ "$GPU_GATES" = 1 ]; then
 echo "=== MQ4 Speed Gate (fast) ==="
 echo "Running 4B prefill/decode regression check..."
 echo
@@ -373,7 +430,12 @@ if ! ./tests/speed-gate.sh --fast; then
     echo "Do NOT bypass with --no-verify without a plan to restore perf in the same commit."
     exit 1
 fi
+fi  # GPU_GATES
 
 echo
-echo "=== Both gates passed. Proceeding with commit. ==="
+if [ "$GPU_GATES" = 1 ]; then
+    echo "=== Both gates passed. Proceeding with commit. ==="
+else
+    echo "=== Lint gates passed; GPU gates skipped (daemon holds the GPU). ==="
+fi
 exit 0

@@ -82,6 +82,17 @@ pub(crate) enum Payload {
     Request(serde_json::Value),
     /// A line that was not valid JSON, carrying the parse error.
     Malformed(String),
+    /// The stdio owner closed its pipe: the process that spawned this daemon is
+    /// gone, so the daemon should follow it down.
+    ///
+    /// Only produced when a socket is ALSO being served. Without a socket the
+    /// stdin reader is the only sender, so its EOF closes the channel and the
+    /// executor stops on `recv` — no sentinel needed. With a socket the accept
+    /// thread holds a sender forever, so that signal would never arrive and a
+    /// daemon whose parent died would linger as an orphan. Travelling as a frame
+    /// rather than a flag keeps it ORDERED behind work already queued, which is
+    /// what makes shutdown finish the in-flight request instead of dropping it.
+    OwnerHungUp,
 }
 
 /// One thing for the executor to deal with, and where its answer goes.
@@ -136,27 +147,71 @@ pub(crate) fn default_socket_path() -> PathBuf {
     hipfire_daemon_adapter::default_socket_path()
 }
 
-/// Spawn the stdin reader and return the executor's end of the channel.
+/// Start every inbound reader on ONE queue: stdin always, plus a unix socket
+/// when `listen` is set.
 ///
-/// The channel closes when stdin reaches EOF or errors, which is how the executor
-/// learns to shut down — the same condition the old `Err(_) => break` handled.
-pub(crate) fn spawn_stdin_reader() -> Receiver<Inbound> {
+/// Serving both at once is what lets `hipfire serve` keep its stdio transport —
+/// which owns the child process, and is therefore the only transport that can
+/// report worker liveness, signal a cooperative cancel, and die with its parent
+/// — while `chat`, `bench`, and `eval` attach over the socket instead of trying
+/// to spawn a second daemon against the `daemon.pid` flock. One channel, N
+/// connections: each reader already carries its own `ReplySink` and connection
+/// id, so replies route back without the executor knowing which door they came
+/// through.
+pub(crate) fn spawn_readers(listen: Option<&Path>) -> std::io::Result<Receiver<Inbound>> {
     let (tx, rx) = sync_channel(INBOUND_CAPACITY);
+    let shared = match listen {
+        Some(path) => {
+            let listener = bind_listener(path)?;
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name("hipfire-daemon-accept".to_string())
+                .spawn(move || accept_loop(listener, tx))
+                .expect("spawn accept thread");
+            true
+        }
+        None => false,
+    };
+
     let reply = ReplySink::new(std::io::stdout());
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+    // A terminal stdin has no owner to outlive — that is a human running the
+    // daemon by hand, so its EOF is not a death notice.
+    // ponytail: `is_terminal` and not a FIFO check, so `--listen </dev/null`
+    // shuts down immediately; swap in an S_ISFIFO test if that invocation ever
+    // becomes real.
+    let owned = shared && !std::io::IsTerminal::is_terminal(&std::io::stdin());
     std::thread::Builder::new()
         .name("hipfire-daemon-stdin".to_string())
-        .spawn(move || read_frames(std::io::stdin().lock(), &tx, &reply, conn))
+        .spawn(move || read_owned(std::io::stdin().lock(), &tx, &reply, conn, owned))
         .expect("spawn stdin reader thread");
-    rx
+    Ok(rx)
 }
 
-/// Bind the listening socket and spawn the accept loop.
-///
-/// Unlike the stdio path this channel never closes on its own: the listener
-/// outlives any one client, so the daemon keeps serving after a disconnect and
-/// only exits on a signal.
-pub(crate) fn spawn_socket_listener(path: &Path) -> std::io::Result<Receiver<Inbound>> {
+/// Read frames until EOF, then report the hangup when this reader is the one
+/// whose EOF means the owner died. Split out from [`spawn_readers`] so the
+/// shutdown decision is reachable from a test without a real stdin.
+fn read_owned(
+    source: impl BufRead,
+    tx: &SyncSender<Inbound>,
+    reply: &ReplySink,
+    conn: u64,
+    owned: bool,
+) {
+    read_frames(source, tx, reply, conn);
+    if owned {
+        let _ = tx.send(Inbound {
+            payload: Payload::OwnerHungUp,
+            reply: reply.clone(),
+            conn,
+            seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+            priority: hipfire_scheduler::SCHED_PRIORITY_DEFAULT,
+        });
+    }
+}
+
+/// Bind the listening socket, owner-only.
+fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -173,13 +228,7 @@ pub(crate) fn spawn_socket_listener(path: &Path) -> std::io::Result<Receiver<Inb
     // trust model `admin.secret` already uses. This is not an authentication
     // boundary and is not meant to become one.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-
-    let (tx, rx) = sync_channel(INBOUND_CAPACITY);
-    std::thread::Builder::new()
-        .name("hipfire-daemon-accept".to_string())
-        .spawn(move || accept_loop(listener, tx))
-        .expect("spawn accept thread");
-    Ok(rx)
+    Ok(listener)
 }
 
 /// Accept connections forever, giving each its own reader thread.
@@ -279,6 +328,89 @@ mod tests {
         read_frames(std::io::Cursor::new(input.to_string()), &tx, &reply, 0);
         drop(tx);
         rx.into_iter().map(|frame| frame.payload).collect()
+    }
+
+    fn drain_owned(input: &str, owned: bool) -> Vec<Payload> {
+        let (tx, rx) = sync_channel(64);
+        let reply = ReplySink::new(Vec::new());
+        read_owned(
+            std::io::Cursor::new(input.to_string()),
+            &tx,
+            &reply,
+            0,
+            owned,
+        );
+        drop(tx);
+        rx.into_iter().map(|frame| frame.payload).collect()
+    }
+
+    /// The orphan guard. Serving a socket keeps a sender alive forever, so stdin
+    /// EOF no longer closes the channel — without this frame a daemon whose
+    /// parent died would linger holding the GPU.
+    #[test]
+    fn stdin_eof_reports_owner_hangup_only_when_sharing_a_socket() {
+        let shared = drain_owned("{\"type\":\"ping\"}\n", true);
+        assert_eq!(shared.len(), 2, "the request, then the hangup");
+        assert!(matches!(shared[0], Payload::Request(_)));
+        assert!(matches!(shared[1], Payload::OwnerHungUp));
+
+        // Stdio-only: the reader is the sole sender, so its drop already stops
+        // the executor and a sentinel would be a second shutdown path.
+        let solo = drain_owned("{\"type\":\"ping\"}\n", false);
+        assert_eq!(solo.len(), 1);
+        assert!(matches!(solo[0], Payload::Request(_)));
+    }
+
+    /// The whole point of the merge: a socket client and the stdio owner are two
+    /// producers on ONE queue, distinguishable by connection id so the scheduler
+    /// can reorder across them but never within one.
+    #[test]
+    fn socket_and_stdio_share_one_queue_with_distinct_conn_ids() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("hipfire-tport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.sock");
+
+        let listener = bind_listener(&path).unwrap();
+        let (tx, rx) = sync_channel(64);
+        let accept_tx = tx.clone();
+        std::thread::spawn(move || accept_loop(listener, accept_tx));
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        writeln!(client, "{{\"type\":\"from_socket\"}}").unwrap();
+        client.flush().unwrap();
+
+        let reply = ReplySink::new(Vec::new());
+        let stdio_conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        read_frames(
+            std::io::Cursor::new("{\"type\":\"from_stdio\"}\n".to_string()),
+            &tx,
+            &reply,
+            stdio_conn,
+        );
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let frame = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("both readers feed the same channel");
+            let kind = match &frame.payload {
+                Payload::Request(v) => v["type"].as_str().unwrap_or_default().to_string(),
+                _ => "<other>".to_string(),
+            };
+            seen.push((kind, frame.conn));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        seen.sort();
+        assert_eq!(seen[0].0, "from_socket");
+        assert_eq!(seen[1].0, "from_stdio");
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "each connection needs its own id: frames within one are a dependency chain"
+        );
     }
 
     #[test]

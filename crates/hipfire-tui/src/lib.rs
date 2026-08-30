@@ -100,6 +100,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // defaults to true, so `q` never quit outside Chat.)
     let typing_in_chat = app.tab == app::Tab::Chat && app.chat.is_input_focused();
 
+    // The help overlay is modal: it swallows the next key rather than letting it
+    // act on the tab underneath, so dismissing it never fires a hidden action.
+    if app.show_help {
+        app.show_help = false;
+        return false;
+    }
+    if matches!(key.code, KeyCode::F(1)) || (key.code == KeyCode::Char('?') && !typing_in_chat) {
+        app.show_help = true;
+        return false;
+    }
+
     match key.code {
         KeyCode::Char('q') if !typing_in_chat => return true,
         KeyCode::Esc => {

@@ -84,8 +84,6 @@ pub enum DiffusionCommand {
     /// archives or opaque source weight entries when a component cannot be
     /// indexed yet.
     Import(DiffusionImportArgs),
-    /// Inspect a diffusion .hfq artifact and print its server-facing summary
-    Inspect(DiffusionInspectArgs),
     /// Plan HIP diffusion buffers and optionally run a ROCm device preflight
     ///
     /// The preflight command prints a deterministic memory plan for the
@@ -238,12 +236,6 @@ pub struct DiffusionImportArgs {
     /// Import configs/tokenizers only and skip weight indexing for fast planning/inspection.
     #[arg(long)]
     pub metadata_only: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DiffusionInspectArgs {
-    /// Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
-    pub model: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -629,15 +621,6 @@ pub fn run(args: DiffusionArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        DiffusionCommand::Inspect(args) => {
-            let inspection =
-                inspect_hfq_with_runtime_support(resolve_model_path(args.model, &loaded))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&inspection_json(inspection))?
-            );
-            Ok(())
-        }
         DiffusionCommand::Preflight(args) => run_preflight(args, &loaded),
         DiffusionCommand::Txt2Img(args) => run_txt2img(args, &loaded),
         DiffusionCommand::Img2Img(args) => run_img2img(args, &loaded),
@@ -999,7 +982,7 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn inspection_json(inspection: DiffusionHfqInspection) -> serde_json::Value {
+pub(crate) fn inspection_json(inspection: DiffusionHfqInspection) -> serde_json::Value {
     let summary = inspection.summary;
     serde_json::json!({
         "path": summary.path,

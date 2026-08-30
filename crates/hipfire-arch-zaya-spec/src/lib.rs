@@ -64,7 +64,12 @@ impl ZayaTiny {
             vocab: 4096,
             blocks: 2,
             heads: 2,
-            kv_heads: 1,
+            // 2, not 1: the compositional value packs the current token's v in KV
+            // head 0 and the previous token's delayed v in head 1, so a single KV
+            // head has nowhere to put the delayed half -- it aliases the next
+            // token's head 0 and races with it. See the refusal in
+            // `zaya_value_compose_f32`.
+            kv_heads: 2,
             head_dim: 128,
             moe_inter: 256,
             router_hidden: 256,

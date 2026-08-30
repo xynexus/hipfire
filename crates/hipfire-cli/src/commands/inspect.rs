@@ -1,6 +1,12 @@
 //! `hipfire inspect <artefact>` — detail the contents of a `.hfq` (HFQM)
 //! container without touching tensor payload.
 //!
+//! One command for every container kind: a diffusion artefact is autodetected
+//! and additionally reports its pipeline summary, which used to require a
+//! separate `hipfire diffusion inspect`. Detection routes through
+//! `hipfire_diffusion::is_diffusion_hfq`, so `inspect` cannot disagree with the
+//! diffusion runtime about what a diffusion container is.
+//!
 //! Read-only companion to `hipfire model` (compose/decompose). It opens a
 //! container with [`HfqFile::open_index_only`] — pread of the 32-byte header
 //! plus the metadata/index region only, no tensor-payload mmap — so even a
@@ -13,6 +19,7 @@ use std::path::PathBuf;
 use clap::Args;
 use hipfire_arch_api::ArchId;
 use hipfire_config::LoadedConfig;
+use hipfire_diffusion::{inspect_hfq_with_runtime_support, DiffusionHfqInspection};
 use hipfire_hfq_tooling::{
     ComposeManifest, HFQM_COMPOSE_FORMAT, HFQM_COMPOSE_FORMAT_V1, HFQM_COMPOSE_KEY,
 };
@@ -76,9 +83,30 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     // in `source_arch_id`; trusting the header prints "arch: 0 (llama)" for a
     // qwen35 calib, which is not merely uninformative but wrong.
     let arch_id = calib_source_arch_id(&meta).unwrap_or(hfq.arch_id);
-    let arch_name = hipfire_archs::registry()
-        .get(ArchId(arch_id as u16))
-        .map(|a| a.family);
+    // The legacy generic-diffusion marker (0x3046_4944) does not fit the u16 the
+    // registry keys on, so a bare `as u16` truncates it into an unrelated arch.
+    let arch_name = u16::try_from(arch_id)
+        .ok()
+        .and_then(|id| hipfire_archs::registry().get(ArchId(id)))
+        .map(|a| a.family)
+        // The legacy marker is not a registry family, so it would otherwise
+        // print as a bare nine-digit number on the one path that now surfaces
+        // it routinely: a pre-A2 diffusion container.
+        .or_else(|| {
+            (arch_id == hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY)
+                .then_some("diffusion, legacy marker")
+        });
+
+    // Autodetected: a diffusion container gets the pipeline summary that used to
+    // need a separate `hipfire diffusion inspect`. Detection is the canonical
+    // `is_diffusion_hfq` (parsing metadata, else a registered diffusion arch id
+    // in the header), so `inspect` and the diffusion runtime always agree.
+    //
+    // A container the header calls diffusion but whose metadata will not parse
+    // keeps the generic view plus the reason, rather than failing the whole
+    // inspect: a broken artefact is exactly when its tensor index is wanted.
+    let diffusion = hipfire_diffusion::is_diffusion_hfq(&path)
+        .then(|| inspect_hfq_with_runtime_support(&path).map_err(|e| e.to_string()));
 
     if args.json {
         print_json(
@@ -89,6 +117,7 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             arch_id,
             arch_name,
             &components,
+            diffusion,
         );
     } else {
         print_human(
@@ -99,9 +128,39 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             arch_name,
             args.tensors,
             &components,
+            diffusion,
         );
     }
     Ok(())
+}
+
+/// The `pipeline:` block for a diffusion container. Mirrors what `hipfire
+/// diffusion inspect` printed, minus the JSON envelope.
+fn print_diffusion(inspection: &Result<DiffusionHfqInspection, String>) {
+    println!();
+    let inspection = match inspection {
+        Ok(inspection) => inspection,
+        Err(reason) => {
+            println!("pipeline: diffusion container, but its metadata did not parse: {reason}");
+            return;
+        }
+    };
+    let summary = &inspection.summary;
+    println!("pipeline: {}", summary.pipeline_class);
+    for (label, value) in [
+        ("title", summary.title.clone()),
+        ("model", summary.model_name.clone()),
+        ("weights", summary.weight_format.clone()),
+        ("max batch", summary.max_batch.to_string()),
+    ] {
+        println!("  {label:9} {value}");
+    }
+    let support = &inspection.runtime_support;
+    match (&support.runtime_kind, &support.reason) {
+        (Some(kind), _) => println!("  {:9} yes ({})", "runtime", kind.as_str()),
+        (None, Some(reason)) => println!("  {:9} no ({reason})", "runtime"),
+        (None, None) => println!("  {:9} no", "runtime"),
+    }
 }
 
 /// True when the file begins with an HFAR archive magic (`repack.rs`).
@@ -517,6 +576,7 @@ fn print_human(
     arch_name: Option<&str>,
     list_tensors: bool,
     components: &[Value],
+    diffusion: Option<Result<DiffusionHfqInspection, String>>,
 ) {
     let name = path
         .file_name()
@@ -553,6 +613,11 @@ fn print_human(
             println!("source fp (not recorded — artefact predates source fingerprinting)");
         }
         print_calib_coverage(hfq, meta);
+    }
+
+    if let Some(diffusion) = &diffusion {
+        print_diffusion(diffusion);
+        println!();
     }
 
     // Quant family / KV mode / sidecars.
@@ -741,6 +806,7 @@ fn print_json(
     arch_id: u32,
     arch_name: Option<&str>,
     components: &[Value],
+    diffusion: Option<Result<DiffusionHfqInspection, String>>,
 ) {
     let shape: serde_json::Map<String, Value> = SHAPE_FIELDS
         .iter()
@@ -802,6 +868,14 @@ fn print_json(
         })
     };
 
+    // Byte-identical to what `hipfire diffusion inspect` emitted, so a consumer
+    // of that command only has to reach one key deeper after the merge.
+    let diffusion = match diffusion {
+        None => Value::Null,
+        Some(Ok(inspection)) => super::diffusion::inspection_json(inspection),
+        Some(Err(reason)) => json!({ "error": reason }),
+    };
+
     let out = json!({
         "target": target,
         "path": path.display().to_string(),
@@ -821,6 +895,7 @@ fn print_json(
         "quant_histogram": histogram,
         "totals": { "tensors": total_tensors, "bytes": total_bytes },
         "modules": modules,
+        "diffusion": diffusion,
         "tensors": tensors,
         "metadata": meta,
     });

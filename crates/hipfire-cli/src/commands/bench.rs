@@ -53,8 +53,15 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let model_path = find_model(&model, &loaded.config)
         .ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
     let config: HipfireConfig = loaded.resolve_for_model(&model).config;
-    if let Some(url) = running_server_url(&loaded).await {
-        return run_server_bench(args, model, model_path.display().to_string(), url).await;
+    // Prefer the daemon socket over the server's HTTP API. Both reach the same
+    // daemon, but the socket measures it DIRECTLY: no HTTP hop in the number, no
+    // resetting the server's session state to get a clean sample. HTTP remains
+    // the fallback for a server whose daemon predates `--listen` and so exposes
+    // no socket to share.
+    if !hipfire_daemon_adapter::shared_daemon_listening() {
+        if let Some(url) = running_server_url(&loaded).await {
+            return run_server_bench(args, model, model_path.display().to_string(), url).await;
+        }
     }
     let mut load_params = ModelLoadParams::from_hipfire_config(&config);
     let needed_seq = args
@@ -65,9 +72,21 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     load_params.max_seq = load_params.max_seq.max(needed_seq);
 
     let bin = find_daemon_bin_or_error()?;
-    // Spawns a private daemon on purpose: a benchmark must measure the binary it
-    // was pointed at, and a shared daemon would have another model resident.
-    let mut engine = DaemonEngine::spawn(&bin).await?;
+    // Attach to the machine's daemon when one is listening, else spawn a private
+    // one. Spawning unconditionally could not coexist with `hipfire serve` at
+    // all: one daemon per machine holds the `daemon.pid` flock, so benchmarking
+    // while serving simply failed to start.
+    //
+    // The tradeoff this accepts: an attached run measures the daemon that is
+    // ALREADY RUNNING, which may be an older build than the one you just
+    // compiled. `attached_to_shared_daemon` is reported in the result so a
+    // number is never silently attributed to the wrong binary; re-run with the
+    // server stopped to measure a freshly built daemon.
+    let mut engine = DaemonEngine::attach_or_spawn(&bin).await?;
+    let shared = engine.is_attached();
+    if shared {
+        progress("attached to the running daemon (measuring that build, not a fresh spawn)");
+    }
 
     progress(format!("loading {}", model_path.display()));
     let load_start = Instant::now();
@@ -153,6 +172,7 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         model,
         path: model_path.display().to_string(),
         server_url: None,
+        attached_to_shared_daemon: shared,
         load_ms: Some(load_ms),
         pp_target: args.pp_tokens,
         tg_target: args.tg_tokens,
@@ -247,6 +267,8 @@ async fn run_server_bench(
         model,
         path: model_path,
         server_url: Some(server_url),
+        // The server owns the daemon; this path never spawns one.
+        attached_to_shared_daemon: true,
         load_ms: None,
         pp_target: args.pp_tokens,
         tg_target: args.tg_tokens,
@@ -317,6 +339,11 @@ struct BenchReport {
     model: String,
     path: String,
     server_url: Option<String>,
+    /// True when the run measured the daemon that was already running rather
+    /// than a daemon spawned for this benchmark. Recorded because the two can be
+    /// different BUILDS, and a throughput number is worthless if it cannot be
+    /// attributed to a binary.
+    attached_to_shared_daemon: bool,
     load_ms: Option<f64>,
     pp_target: usize,
     tg_target: u32,
@@ -470,6 +497,9 @@ fn stdev_or_zero(v: &[f64]) -> f64 {
 fn print_text_report(report: &BenchReport) {
     println!("model: {}", report.model);
     println!("path: {}", report.path);
+    if report.attached_to_shared_daemon {
+        println!("daemon: attached to the running daemon (not a fresh spawn)");
+    }
     if let Some(url) = &report.server_url {
         println!("server_url: {url}");
         println!("load_ms: n/a (server-owned daemon)");
@@ -515,6 +545,7 @@ fn print_json_report(report: &BenchReport) {
         "model": &report.model,
         "path": &report.path,
         "server_url": &report.server_url,
+        "attached_to_shared_daemon": report.attached_to_shared_daemon,
         "load_ms": report.load_ms,
         "pp_target": report.pp_target,
         "tg_target": report.tg_target,

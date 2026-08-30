@@ -172,9 +172,15 @@ pub(crate) async fn run_daemon_quality_rows_async(
         )]);
     };
 
-    // Spawns a private daemon on purpose: an eval must exercise the build under
-    // test, not whatever happens to be running.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    // Attaches to the machine's daemon when one is listening, else spawns a
+    // private one. Spawning unconditionally could not coexist with `hipfire
+    // serve`: one daemon per machine holds the `daemon.pid` flock, so an eval
+    // during serving failed outright with "daemon already running".
+    //
+    // The tradeoff this accepts: an attached run exercises the daemon ALREADY
+    // RUNNING, which may not be the build under test. Stop the server first when
+    // the evidence has to be attributed to a freshly built binary.
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
     let ref_path = match ref_plan {
         ReferencePlan::Existing(path) => path,
         ReferencePlan::Build {
@@ -417,9 +423,15 @@ pub(crate) async fn load_daemon_eval_session_for_model(
     max_seq: usize,
     model: &str,
 ) -> anyhow::Result<DaemonEvalSession> {
-    // Spawns a private daemon on purpose: an eval must exercise the build under
-    // test, not whatever happens to be running.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    // Attaches to the machine's daemon when one is listening, else spawns a
+    // private one. Spawning unconditionally could not coexist with `hipfire
+    // serve`: one daemon per machine holds the `daemon.pid` flock, so an eval
+    // during serving failed outright with "daemon already running".
+    //
+    // The tradeoff this accepts: an attached run exercises the daemon ALREADY
+    // RUNNING, which may not be the build under test. Stop the server first when
+    // the evidence has to be attributed to a freshly built binary.
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
     let loaded = engine
         .load(model, daemon_model_load_params(config, max_seq))
         .await?;
@@ -1016,7 +1028,15 @@ pub(crate) async fn run_daemon_cask_rows_async(
 ) -> anyhow::Result<Vec<EvalResult>> {
     let longctx = materialize_longctx_prompt(config).map_err(anyhow::Error::msg)?;
     let prompt_text = fs::read_to_string(&longctx.prompt_path)?;
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    // Attaches to the machine's daemon when one is listening, else spawns a
+    // private one. Spawning unconditionally could not coexist with `hipfire
+    // serve`: one daemon per machine holds the `daemon.pid` flock, so an eval
+    // during serving failed outright with "daemon already running".
+    //
+    // The tradeoff this accepts: an attached run exercises the daemon ALREADY
+    // RUNNING, which may not be the build under test. Stop the server first when
+    // the evidence has to be attributed to a freshly built binary.
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
     let loaded = engine
         .load(
             &config.model,
