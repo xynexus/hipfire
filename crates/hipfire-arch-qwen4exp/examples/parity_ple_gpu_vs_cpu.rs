@@ -80,8 +80,10 @@ fn main() {
         }
     };
     let w = PleWeights {
-        key_proj: gpu.upload_f32(&kp, &[width, ed]).unwrap(),
-        value_proj: gpu.upload_f32(&vp, &[hidden, ed]).unwrap(),
+        key_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &kp, &[width, ed])
+            .unwrap(),
+        value_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &vp, &[hidden, ed])
+            .unwrap(),
         norm_key: gpu.upload_f32(&nk, &[width]).unwrap(),
         norm_query: gpu.upload_f32(&nq, &[width]).unwrap(),
         norm_conv: gpu.upload_f32(&nc, &[width]).unwrap(),

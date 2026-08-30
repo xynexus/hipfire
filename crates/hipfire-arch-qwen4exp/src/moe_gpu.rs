@@ -80,18 +80,18 @@ impl ExpertStack {
 
 pub struct MoeWeights {
     /// `[n_experts, hidden]`
-    pub router: GpuTensor,
+    pub router: WeightTensor,
     /// `[n_experts, 2 * mi, hidden]`, gate first.
     pub gate_up: ExpertStack,
     /// `[n_experts, hidden, mi]`.
     pub down: ExpertStack,
     /// `[shared_mi, hidden]` each.
-    pub shared_gate: GpuTensor,
-    pub shared_up: GpuTensor,
+    pub shared_gate: WeightTensor,
+    pub shared_up: WeightTensor,
     /// `[hidden, shared_mi]`
-    pub shared_down: GpuTensor,
+    pub shared_down: WeightTensor,
     /// `[1, hidden]`
-    pub shared_expert_gate: GpuTensor,
+    pub shared_expert_gate: WeightTensor,
 }
 
 pub struct MoeScratch {
@@ -150,7 +150,7 @@ pub fn moe_forward(
     let m = &cfg.moe;
     let (hidden, mi) = (cfg.hidden, m.intermediate);
 
-    gpu.gemv_f32(&w.router, x, &s.logits)?;
+    weight_gemv(gpu, &w.router, x, &s.logits)?;
     gpu.moe_softmax_topk_renorm(
         &s.logits,
         &s.topk_idx,
@@ -189,11 +189,11 @@ pub fn moe_forward(
     }
 
     // The shared expert is always on, gated by a scalar sigmoid.
-    gpu.gemv_f32(&w.shared_gate, x, &s.sg)?;
-    gpu.gemv_f32(&w.shared_up, x, &s.su)?;
+    weight_gemv(gpu, &w.shared_gate, x, &s.sg)?;
+    weight_gemv(gpu, &w.shared_up, x, &s.su)?;
     gpu.silu_mul_f32(&s.sg, &s.su, &s.sinter)?;
-    gpu.gemv_f32(&w.shared_down, &s.sinter, &s.sout)?;
-    gpu.gemv_f32(&w.shared_expert_gate, x, &s.sgate)?;
+    weight_gemv(gpu, &w.shared_down, &s.sinter, &s.sout)?;
+    weight_gemv(gpu, &w.shared_expert_gate, x, &s.sgate)?;
     gpu.moe_shared_gate(&s.sout, &s.sgate, &s.sout, hidden as i32)?;
     gpu.add_inplace_f32(out, &s.sout)
 }
@@ -226,7 +226,7 @@ impl MoeWeights {
             shared_down,
             shared_expert_gate,
         ] {
-            let _ = gpu.free_tensor(t);
+            let _ = gpu.free_tensor(t.buf);
         }
     }
 }

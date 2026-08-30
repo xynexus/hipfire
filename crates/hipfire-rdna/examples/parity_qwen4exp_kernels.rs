@@ -913,8 +913,10 @@ fn main() {
         .expect("shipped config");
         let d = cfg.deltanet;
         // `gemv_f32` reads `shape[1]`, so weight matrices must be uploaded 2-D.
+        // Linear weights are `WeightTensor` now, so the dtype travels with the
+        // weight and `weight_gemv` dispatches on it. Synthetic ones are F32.
         let mat = |g: &mut hipfire_rdna::Gpu, o: usize, i: usize, sd: u32| {
-            g.upload_f32(&seeded(o * i, sd), &[o, i]).unwrap()
+            hipfire_arch_qwen4exp::trunk_gpu::f32_weight(g, &seeded(o * i, sd), &[o, i]).unwrap()
         };
         let vec1 = |g: &mut hipfire_rdna::Gpu, n: usize, sd: u32| {
             g.upload_f32(&seeded(n, sd), &[n]).unwrap()

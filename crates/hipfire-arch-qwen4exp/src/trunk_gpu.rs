@@ -26,6 +26,7 @@ use crate::ngram::NgramHasher;
 use crate::ple_gpu::{ple_step, PleScratch, PleWeights};
 
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipError, HipResult};
+use hipfire_runtime::weights::WeightTensor;
 
 pub enum TokenMixer {
     Gdn(GdnWeights),
@@ -43,7 +44,7 @@ pub struct LayerWeights {
 pub struct TrunkWeights {
     pub layers: Vec<LayerWeights>,
     pub mixer: HcWeights,
-    pub lm_head: GpuTensor,
+    pub lm_head: WeightTensor,
 }
 
 /// Per-sequence state: one recurrent state per Gated DeltaNet layer, one KV cache
@@ -98,6 +99,80 @@ pub trait TensorReader {
 /// only needed to be returned rather than thrown.
 fn read_err(name: &str, e: String) -> HipError {
     HipError::new(0, &format!("qwen4_exp load `{name}`: {e}"))
+}
+
+/// Load a LINEAR weight, keeping its on-disk encoding when we can decode it.
+///
+/// The routed experts are 97.3% of this model, so these are the other 2.7% — the
+/// memory does not turn on them. What does turn on them is consistency: a weight
+/// held as `WeightTensor` dispatches on its own dtype, so an artifact that
+/// quantised a projection is served that way instead of being quietly widened.
+///
+/// Falls back to f32 for anything the arch loaders decline, which includes the
+/// synthetic readers the parity examples use (they implement `read` only).
+fn load_linear(
+    gpu: &mut Gpu,
+    w: &dyn TensorReader,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    if let Some((qt, bytes)) = w.read_raw(name) {
+        let converted = hipfire_runtime::oq8_arch::oq8_arch_load(qt, &bytes, m, k).or_else(|| {
+            // Same ragged-K pre-check as the expert path: `oq4_pack_arch_combined`
+            // asserts, and an assert in a loader aborts the daemon.
+            if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k).is_some() {
+                None
+            } else {
+                hipfire_runtime::oq4_arch::oq4_arch_load(qt, &bytes, m, k)
+                    .map(|(b, d)| (b.into_owned(), d))
+            }
+        });
+        if let Some((bytes, dtype)) = converted {
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+    }
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
+    let mut buf = gpu.upload_f32(&v, &[m, k])?;
+    buf.shape = vec![m, k];
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
+/// Wrap an f32 host array as a `WeightTensor`.
+///
+/// For tests and parity examples, which build synthetic weights rather than
+/// reading an artifact. `m`/`k` come from the shape so a caller cannot set a
+/// weight's logical dims to something its buffer does not have.
+pub fn f32_weight(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> HipResult<WeightTensor> {
+    assert_eq!(shape.len(), 2, "a linear weight is 2-D, got {shape:?}");
+    let mut buf = gpu.upload_f32(data, shape)?;
+    buf.shape = shape.to_vec();
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m: shape[0],
+        k: shape[1],
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
 }
 
 fn up2(
@@ -235,14 +310,14 @@ impl TrunkWeights {
         let hcw = |gpu: &mut Gpu, base: &str, inject: bool| -> HipResult<HcWeights> {
             Ok(HcWeights {
                 hc_norm: up1(gpu, w, &format!("{base}.hc_norm.weight"))?,
-                mix_down: up2(
+                mix_down: load_linear(
                     gpu,
                     w,
                     &format!("{base}.input_mix_weight_down.weight"),
                     lr,
                     width,
                 )?,
-                mix_up: up2(
+                mix_up: load_linear(
                     gpu,
                     w,
                     &format!("{base}.input_mix_weight_up.weight"),
@@ -250,7 +325,7 @@ impl TrunkWeights {
                     lr,
                 )?,
                 block_inject: if inject {
-                    Some(up2(
+                    Some(load_linear(
                         gpu,
                         w,
                         &format!("{base}.block_inject_weight.weight"),
@@ -269,22 +344,28 @@ impl TrunkWeights {
             let mixer = if cfg.layer_types[l] == LayerType::LinearAttention {
                 let la = format!("{lp}.linear_attn");
                 TokenMixer::Gdn(GdnWeights {
-                    in_proj_qkv: up2(
+                    in_proj_qkv: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_qkv.weight"),
                         d.qkv_dim(),
                         hidden,
                     )?,
-                    in_proj_z: up2(gpu, w, &format!("{la}.in_proj_z.weight"), d.z_dim(), hidden)?,
-                    in_proj_a: up2(
+                    in_proj_z: load_linear(
+                        gpu,
+                        w,
+                        &format!("{la}.in_proj_z.weight"),
+                        d.z_dim(),
+                        hidden,
+                    )?,
+                    in_proj_a: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_a.weight"),
                         d.value_heads,
                         hidden,
                     )?,
-                    in_proj_b: up2(
+                    in_proj_b: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_b.weight"),
@@ -301,19 +382,31 @@ impl TrunkWeights {
                     a_log: up1(gpu, w, &format!("{la}.A_log"))?,
                     dt_bias: up1(gpu, w, &format!("{la}.dt_bias"))?,
                     norm_weight: up1(gpu, w, &format!("{la}.norm.weight"))?,
-                    out_proj: up2(gpu, w, &format!("{la}.out_proj.weight"), hidden, d.z_dim())?,
+                    out_proj: load_linear(
+                        gpu,
+                        w,
+                        &format!("{la}.out_proj.weight"),
+                        hidden,
+                        d.z_dim(),
+                    )?,
                 })
             } else {
                 let sa = format!("{lp}.self_attn");
                 let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
                 TokenMixer::Qsa(QsaWeights {
-                    q_proj: up2(gpu, w, &format!("{sa}.q_proj.weight"), nh * hd * 2, hidden)?,
-                    k_proj: up2(gpu, w, &format!("{sa}.k_proj.weight"), nkv * hd, hidden)?,
-                    v_proj: up2(gpu, w, &format!("{sa}.v_proj.weight"), nkv * hd, hidden)?,
-                    o_proj: up2(gpu, w, &format!("{sa}.o_proj.weight"), hidden, nh * hd)?,
+                    q_proj: load_linear(
+                        gpu,
+                        w,
+                        &format!("{sa}.q_proj.weight"),
+                        nh * hd * 2,
+                        hidden,
+                    )?,
+                    k_proj: load_linear(gpu, w, &format!("{sa}.k_proj.weight"), nkv * hd, hidden)?,
+                    v_proj: load_linear(gpu, w, &format!("{sa}.v_proj.weight"), nkv * hd, hidden)?,
+                    o_proj: load_linear(gpu, w, &format!("{sa}.o_proj.weight"), hidden, nh * hd)?,
                     q_norm: up1(gpu, w, &format!("{sa}.q_norm.weight"))?,
                     k_norm: up1(gpu, w, &format!("{sa}.k_norm.weight"))?,
-                    ix_qk_proj: up2(
+                    ix_qk_proj: load_linear(
                         gpu,
                         w,
                         &format!("{sa}.indexer.index_qk_proj.weight"),
@@ -326,7 +419,7 @@ impl TrunkWeights {
             };
             let mp = format!("{lp}.mlp");
             let moe = MoeWeights {
-                router: up2(gpu, w, &format!("{mp}.gate.weight"), m.num_experts, hidden)?,
+                router: load_linear(gpu, w, &format!("{mp}.gate.weight"), m.num_experts, hidden)?,
                 gate_up: stack_experts(
                     gpu,
                     w,
@@ -343,28 +436,28 @@ impl TrunkWeights {
                     m.num_experts,
                     &[m.num_experts, hidden, m.intermediate],
                 )?,
-                shared_gate: up2(
+                shared_gate: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.gate_proj.weight"),
                     m.shared_intermediate,
                     hidden,
                 )?,
-                shared_up: up2(
+                shared_up: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.up_proj.weight"),
                     m.shared_intermediate,
                     hidden,
                 )?,
-                shared_down: up2(
+                shared_down: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.down_proj.weight"),
                     hidden,
                     m.shared_intermediate,
                 )?,
-                shared_expert_gate: up2(
+                shared_expert_gate: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert_gate.weight"),
@@ -376,14 +469,14 @@ impl TrunkWeights {
                 Some(n) => {
                     let pl = format!("{lp}.ple");
                     Some(PleWeights {
-                        key_proj: up2(
+                        key_proj: load_linear(
                             gpu,
                             w,
                             &format!("{pl}.key_proj.weight"),
                             width,
                             n.embed_dim,
                         )?,
-                        value_proj: up2(
+                        value_proj: load_linear(
                             gpu,
                             w,
                             &format!("{pl}.value_proj.weight"),
@@ -416,7 +509,7 @@ impl TrunkWeights {
         Ok(Self {
             layers,
             mixer: hcw(gpu, &format!("{p}.hyper_connection_mixer"), false)?,
-            lm_head: up2(gpu, w, "lm_head.weight", cfg.vocab, hidden)?,
+            lm_head: load_linear(gpu, w, "lm_head.weight", cfg.vocab, hidden)?,
         })
     }
 }
@@ -563,7 +656,7 @@ pub fn decode_step_into(
 
     // The mixer's own norm is the LAST normalisation — there is no `model.norm`.
     hc_read(gpu, cfg, &w.mixer, &mut s.hc, &s.wide, &s.collapsed)?;
-    gpu.gemv_f32(&w.lm_head, &s.collapsed, &s.logits)
+    hipfire_runtime::weights::weight_gemv(gpu, &w.lm_head, &s.collapsed, &s.logits)
 }
 
 /// [`decode_step_into`] followed by a download of the logits.
@@ -641,7 +734,7 @@ impl TrunkWeights {
             l.free(gpu);
         }
         mixer.free(gpu);
-        let _ = gpu.free_tensor(lm_head);
+        let _ = gpu.free_tensor(lm_head.buf);
     }
 }
 

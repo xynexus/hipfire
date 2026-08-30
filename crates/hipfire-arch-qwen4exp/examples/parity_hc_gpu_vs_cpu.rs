@@ -103,9 +103,14 @@ fn main() {
 
             let w = HcWeights {
                 hc_norm: gpu.upload_f32(&hn, &[width]).unwrap(),
-                mix_down: gpu.upload_f32(&md, &[lr, width]).unwrap(),
-                mix_up: gpu.upload_f32(&mu, &[width, lr]).unwrap(),
-                block_inject: with_inject.then(|| gpu.upload_f32(&bi, &[hc, width]).unwrap()),
+                mix_down: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &md, &[lr, width])
+                    .unwrap(),
+                mix_up: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &mu, &[width, lr])
+                    .unwrap(),
+                block_inject: with_inject.then(|| {
+                    hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &bi, &[hc, width])
+                        .unwrap()
+                }),
             };
             let mut s = HcScratch::new(&mut gpu, &cfg).unwrap();
             let gs = gpu.upload_f32(&streams, &[width]).unwrap();
