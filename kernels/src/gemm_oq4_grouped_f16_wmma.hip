@@ -20,6 +20,10 @@
 // The f32 per-group scale is folded into the f16 weight at dequant time (per the
 // loaded A-row), so no epilogue rescale is needed — identical to mq4.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>

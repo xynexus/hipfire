@@ -10,4 +10,8 @@
 #define MMQ_X 32
 #define MMQ_Y 64
 #define KERNEL_NAME gemm_hfq4g256_residual_mmq_x32_y64
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include "gemm_hfq4g256_residual_mmq_body.cuh"

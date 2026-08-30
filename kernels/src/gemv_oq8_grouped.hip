@@ -26,6 +26,10 @@
 //   X  : [K] f32 activation (batch=1, rotated)
 //   Y  : [M] f32
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

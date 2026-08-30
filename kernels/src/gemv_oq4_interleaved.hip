@@ -14,6 +14,10 @@
 //   W : [M, ng*132] interleaved (per group: [f32 scale][128 nibbles]) ;
 //   X : [K] f32 (rotated) ; Y : [M] f32.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

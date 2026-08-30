@@ -9,6 +9,10 @@
 // non-RDNA3 archs). Only the final write differs (+= instead of =).
 // Mirrors gemv_hfq3g256_residual.hip.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

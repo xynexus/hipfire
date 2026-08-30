@@ -6,6 +6,10 @@
 // Per 256-group record is contiguous [f32 scale][128 nibbles] (132 B); one
 // coalesced stream (vs the split layout's two). See gemv_oq4_interleaved. wave32.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

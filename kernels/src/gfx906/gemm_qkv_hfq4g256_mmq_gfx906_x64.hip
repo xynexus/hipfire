@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include "gemm_qkv_hfq4g256_mmq_gfx906_body.cuh"
 
 #define MMQ_X_VAL 64
