@@ -115,6 +115,15 @@ pub struct ModelResidencyRequest {
     pub worker_key_id: String,
     pub model_path: String,
     pub requested_mode: ResidencyMode,
+    /// How many workers may stay resident at once, counting the one being
+    /// admitted. `0` means no count limit — only the byte budget applies.
+    ///
+    /// A COUNT bound is not the same as the byte budget below and does not
+    /// replace it: the budget defaults to 0 (unlimited), so without this
+    /// nothing ever evicted and parked workers accumulated until a load OOM'd.
+    /// The budget is still the right tool when it is configured; this bounds
+    /// the common case where it is not.
+    pub max_resident_workers: u32,
     pub estimated_full: ResourceUsage,
     pub estimated_qwen_moe_modules: Option<ResourceUsage>,
 }
@@ -215,9 +224,28 @@ pub fn plan_model_residency(
 
     let mut current = ledger_usage(resident_workers);
     let mut unload = Vec::new();
+    // Least-recently-used first, and the same order serves both rules below.
+    let mut victims = resident_workers.to_vec();
+    victims.sort_by_key(|worker| worker.last_used_seq);
+    let mut victims = victims.into_iter();
+
+    // Count rule. `+ 1` counts the worker being admitted: the cap is what may
+    // be resident AFTER this load, not before it.
+    if request.max_resident_workers > 0 {
+        let cap = request.max_resident_workers as usize;
+        let mut resident = resident_workers.len() + 1;
+        while resident > cap {
+            let Some(victim) = victims.next() else {
+                break;
+            };
+            current = subtract_usage(current, victim.resource_usage);
+            unload.push(victim.worker_key_id);
+            resident -= 1;
+        }
+    }
+
+    // Byte rule, over whatever the count rule left resident.
     if !usage_fits(budget, add_usage(current, usage)) {
-        let mut victims = resident_workers.to_vec();
-        victims.sort_by_key(|worker| worker.last_used_seq);
         for victim in victims {
             current = subtract_usage(current, victim.resource_usage);
             unload.push(victim.worker_key_id);
@@ -2532,6 +2560,7 @@ mod tests {
             worker_key_id: "worker-new".to_string(),
             model_path: "qwen.hfq".to_string(),
             requested_mode: ResidencyMode::Auto,
+            max_resident_workers: 0,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 1_200,
@@ -2545,6 +2574,93 @@ mod tests {
         let plan = plan_model_residency(budget, request, &[]).unwrap();
         assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
         assert_eq!(plan.module_vram_budget_bytes, Some(700));
+    }
+
+    fn ledger(entries: &[(&str, u64)]) -> Vec<ResidentWorkerLedgerEntry> {
+        entries
+            .iter()
+            .map(|(id, seq)| ResidentWorkerLedgerEntry {
+                worker_key_id: (*id).to_string(),
+                model_path: format!("{id}.hfq"),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 10,
+                },
+                last_used_seq: *seq,
+            })
+            .collect()
+    }
+
+    fn count_capped_request(max_resident_workers: u32) -> ModelResidencyRequest {
+        ModelResidencyRequest {
+            worker_key_id: "incoming".to_string(),
+            model_path: "incoming.hfq".to_string(),
+            requested_mode: ResidencyMode::Full,
+            max_resident_workers,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 10,
+            },
+            estimated_qwen_moe_modules: None,
+        }
+    }
+
+    /// The byte budget defaults to 0, which means UNLIMITED — so before the
+    /// count rule nothing was ever evicted and parked workers accumulated until
+    /// a load ran out of memory.
+    const NO_BYTE_BUDGET: ResourceBudget = ResourceBudget {
+        system_memory_budget_bytes: 0,
+        system_memory_headroom_bytes: 0,
+        vram_budget_bytes: 0,
+        vram_headroom_bytes: 0,
+    };
+
+    #[test]
+    fn a_count_cap_evicts_least_recently_used_with_no_byte_budget() {
+        // Two parked + one incoming = 3, cap 2, so the oldest goes.
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(2),
+            &ledger(&[("oldest", 1), ("newest", 9)]),
+        )
+        .unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["oldest"]);
+    }
+
+    #[test]
+    fn a_count_cap_of_one_keeps_only_the_incoming_worker() {
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(1),
+            &ledger(&[("a", 1), ("b", 2)]),
+        )
+        .unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_count_cap_that_already_fits_evicts_nothing() {
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(4),
+            &ledger(&[("a", 1), ("b", 2)]),
+        )
+        .unwrap();
+        assert!(plan.unload_worker_key_ids.is_empty());
+    }
+
+    #[test]
+    fn zero_means_no_count_limit() {
+        // Preserves the old behaviour exactly: with no byte budget and no count
+        // cap, nothing is evicted.
+        let plan = plan_model_residency(
+            NO_BYTE_BUDGET,
+            count_capped_request(0),
+            &ledger(&[("a", 1), ("b", 2), ("c", 3)]),
+        )
+        .unwrap();
+        assert!(plan.unload_worker_key_ids.is_empty());
     }
 
     #[test]
@@ -2581,6 +2697,7 @@ mod tests {
             worker_key_id: "incoming".to_string(),
             model_path: "incoming.hfq".to_string(),
             requested_mode: ResidencyMode::Full,
+            max_resident_workers: 0,
             estimated_full: ResourceUsage {
                 system_memory_bytes: 0,
                 vram_bytes: 600,

@@ -708,6 +708,21 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Flash-attention selection policy."
     ),
     field!(
+        "max_resident_workers",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("2"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "How many model workers may stay resident at once, counting the active \
+         one. Switching models PARKS the previous worker with its weights still \
+         on the GPU so switching back is instant; beyond this many, the \
+         least-recently-used parked worker is unloaded. This is a COUNT, not a \
+         byte budget — two large models can still exhaust the pool, which is why \
+         a load that does not fit evicts parked workers regardless of this value. \
+         `1` keeps only the active worker (no warm spares); `0` is treated as `1`."
+    ),
+    field!(
         "dflash_draft",
         // Enum arm FIRST: an open arm accepts nearly anything and would swallow
         // the words behind it. (`off`/`auto`/`on` also fail the Path arm because
