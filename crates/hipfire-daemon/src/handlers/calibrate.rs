@@ -452,6 +452,15 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
     }
     let arch_id = m.arch_id;
     let base_model = m.model_path.clone();
+    // KLD scores the FULL next-token distribution, so it cannot run on a
+    // shortlisted lm_head — the two-stage path would hand it -inf for every row
+    // outside K. Publishing this disables that path for the run and logs why;
+    // the convention of "eval just leaves the env unset" does not hold when
+    // `lmhead_twostage` is set in the config file, which applies process-wide.
+    hipfire_runtime::llama::set_lmhead_sampling(hipfire_runtime::llama::LmheadSampling {
+        needs_full_logits: true,
+        ..Default::default()
+    });
     let cfg: hipfire_kld::KldConfig = msg
         .get("config")
         .and_then(|c| serde_json::from_value(c.clone()).ok())

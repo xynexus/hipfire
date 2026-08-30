@@ -40,6 +40,7 @@ pub mod lfm2_prefill;
 pub mod load;
 pub mod memory;
 pub mod model;
+pub mod moe_quality;
 pub mod output_filter;
 pub mod pooling;
 pub mod qwen35_decode;

@@ -93,7 +93,92 @@ fn lmhead_twostage_config() -> Option<&'static String> {
         .as_ref()
 }
 
-fn lmhead_twostage_cfg(compact: bool) -> Option<(usize, usize)> {
+/// Sampling-derived constraints on the two-stage lm_head, published once per
+/// request by whoever resolved the sampler.
+///
+/// The two-stage path `-inf`-masks every vocab row outside its shortlist
+/// (`lmhead_twostage_serve_*` → `fill_f32(logits_out, NEG_INFINITY)`), so K is a
+/// hard truncation of the *sampling support*, not just a speed knob. Anything
+/// that reads more of the distribution than K rows has to be kept off it.
+///
+/// Process-global rather than thread-local on purpose: the executor is serial,
+/// and a thread-local would silently stop applying the moment the forward moved
+/// off the handler's thread — failing open, in the direction that corrupts
+/// output.
+#[derive(Clone, Copy, Debug)]
+pub struct LmheadSampling {
+    /// Sampling temperature. **At `<= 0.0` the sampler returns a plain
+    /// `argmax` and ignores top_k/top_p entirely** (`sampler.rs:590`, `:741`),
+    /// so greedy decode imposes no constraint at all — K only has to cover the
+    /// true argmax's rank, which is the shortlist's original design target.
+    /// Without this field the path would bypass on every model whose generation
+    /// config ships a default top_p below 1.0 (Qwen3.5 ships 0.8), which is
+    /// most of them — disabling two-stage in exactly the greedy case it was
+    /// built for.
+    pub temperature: f32,
+    /// The sampler's top-k. K must be at least this; see `lmhead_twostage_cfg`.
+    pub top_k: usize,
+    /// The sampler's top-p. Below 1.0 the nucleus size is data-dependent and
+    /// unbounded, so no fixed K can serve it — but only when actually sampling.
+    pub top_p: f32,
+    /// Caller needs finite logits for every vocab row (KLD, eval, logprobs).
+    pub needs_full_logits: bool,
+}
+
+impl Default for LmheadSampling {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            needs_full_logits: false,
+        }
+    }
+}
+
+static SAMPLING_TOP_K: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// top_p × 1000, so the policy stays lock-free.
+static SAMPLING_TOP_P_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+/// temperature × 1000, saturating — only the `<= 0` test is load-bearing.
+static SAMPLING_TEMP_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SAMPLING_FULL_LOGITS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the sampling policy for the requests that follow. Every caller that
+/// resolves a sampler should set this — a request that leaves a previous
+/// request's `top_k` in place would size K against the wrong sampler.
+pub fn set_lmhead_sampling(p: LmheadSampling) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SAMPLING_TOP_K.store(p.top_k, Relaxed);
+    SAMPLING_TOP_P_MILLI.store((p.top_p.clamp(0.0, 1.0) * 1000.0).round() as u32, Relaxed);
+    SAMPLING_TEMP_MILLI.store((p.temperature.max(0.0) * 1000.0).round() as u32, Relaxed);
+    SAMPLING_FULL_LOGITS.store(p.needs_full_logits, Relaxed);
+}
+
+/// Restore the permissive default (greedy, full distribution allowed).
+pub fn clear_lmhead_sampling() {
+    set_lmhead_sampling(LmheadSampling::default());
+}
+
+fn lmhead_sampling() -> LmheadSampling {
+    use std::sync::atomic::Ordering::Relaxed;
+    LmheadSampling {
+        temperature: SAMPLING_TEMP_MILLI.load(Relaxed) as f32 / 1000.0,
+        top_k: SAMPLING_TOP_K.load(Relaxed),
+        top_p: SAMPLING_TOP_P_MILLI.load(Relaxed) as f32 / 1000.0,
+        needs_full_logits: SAMPLING_FULL_LOGITS.load(Relaxed),
+    }
+}
+
+// Bypass warnings fire ONCE per process, per reason. They exist because the
+// symptom of getting this wrong — slightly-off sampling, or an eval scoring
+// against `-inf` — looks like a model problem, not a config problem, and costs
+// hours before anyone suspects the lm_head. Per-token logging would be worse
+// than useless at 30+ tok/s.
+static WARNED_TOP_P: std::sync::Once = std::sync::Once::new();
+static WARNED_FULL_LOGITS: std::sync::Once = std::sync::Once::new();
+
+fn lmhead_twostage_cfg(compact: bool) -> Option<(usize, usize, usize)> {
     // Env is the debug override; the user-facing setting is the `lmhead_twostage`
     // config field. Same precedence as everywhere else in the project.
     let v = hipfire_env::LMHEAD_TWOSTAGE
@@ -114,7 +199,168 @@ fn lmhead_twostage_cfg(compact: bool) -> Option<(usize, usize)> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(base_k)
         .max(1);
-    Some((bits, k))
+
+    // Resolve the sampling veto HERE, not at the call sites: both
+    // `lmhead_twostage_applies` (which the lowered pipeline uses to divert) and
+    // `lmhead_project` read this one function, so they cannot disagree about
+    // whether the path is live.
+    let s = lmhead_sampling();
+    let decided = apply_lmhead_sampling(k, s);
+
+    if decided.is_none() && s.needs_full_logits {
+        WARNED_FULL_LOGITS.call_once(|| {
+            tracing::warn!(
+                "lm_head two-stage DISABLED for this run: the caller needs finite logits for \
+                 every vocab row (KLD / eval / logprobs), and the two-stage path -inf-masks \
+                 all but its {k}-row shortlist. Falling back to the exact full-vocab GEMV \
+                 (correct, and slower). This is why `lmhead_twostage` must not be set for \
+                 scoring runs — if you set it in the CONFIG FILE rather than the env it also \
+                 applies here, and the scores would be computed against -inf."
+            );
+        });
+        crate::lmhead_quality::record_bypass(false);
+        return None;
+    }
+
+    if decided.is_none() && s.top_p < 1.0 {
+        WARNED_TOP_P.call_once(|| {
+            tracing::warn!(
+                "lm_head two-stage DISABLED for this request: top_p={:.3} < 1.0. Nucleus \
+                 sampling draws from however many tokens the probability mass requires, which \
+                 is data-dependent and has no static bound, while the two-stage path -inf-masks \
+                 every row outside its {k}-row shortlist — so the nucleus would be silently \
+                 truncated to K. Falling back to the exact full-vocab GEMV (correct, and \
+                 slower). Set top_p=1.0 to use two-stage, or unset `lmhead_twostage`.",
+                s.top_p
+            );
+        });
+        crate::lmhead_quality::record_bypass(true);
+        return None;
+    }
+
+    // K is a hard FLOOR on the candidate set, not a target: `gpu_topk` scans the
+    // histogram top-down until the cumulative count reaches K, so the shortlist
+    // holds at least K rows (bin granularity rounds it up, and the `+512` on top
+    // is buffer slack — unwritten slots are `0xFFFFFFFF` sentinels the fine
+    // gather skips, so they are NOT candidates).
+    //
+    // Therefore `top_k > K` means the sampler silently draws from fewer
+    // candidates than it asked for. RAISE K rather than clamping the sampler:
+    // clamping degrades output with no signal, whereas the fine pass is ~0.4% of
+    // the token at K=256 (the coarse tier is K-independent and ~99% of the cost),
+    // so the margin is close to free. Common model defaults are top_k 40-50,
+    // comfortably under the 128/512 defaults — this only bites a hand-set
+    // `lmhead_twostage=q4:8`, which is exactly the case that used to be silent.
+    decided.map(|k_eff| (bits, k_eff, k))
+}
+
+/// The sampling policy decision, split out of `lmhead_twostage_cfg` so it is
+/// testable without process env or a config bundle.
+///
+/// `None` = bypass two-stage entirely. `Some(k)` = use it, with `k` as the
+/// shortlist floor.
+fn apply_lmhead_sampling(k_cfg: usize, s: LmheadSampling) -> Option<usize> {
+    if s.needs_full_logits {
+        return None;
+    }
+    // Greedy short-circuits before any top_k/top_p filtering (`sampler.rs:590`),
+    // and a `-inf` row can never be the argmax, so neither knob constrains K
+    // here. Checking temperature FIRST is what keeps two-stage usable: most
+    // generation configs ship a default top_p < 1.0 that would otherwise veto
+    // the greedy path it exists to accelerate.
+    if s.temperature <= 0.0 {
+        return Some(k_cfg);
+    }
+    if s.top_p < 1.0 {
+        return None;
+    }
+    // Mirror the sampler's own clamp (`sampler.rs:594`: `if top_k == 0 { 64 }
+    // else { top_k.clamp(1, 64) }`) so the two cannot drift. It bounds the
+    // requirement at 64 no matter what the request asked for, which is why
+    // raising K can never blow up the fine pass.
+    let need = if s.top_k == 0 {
+        64
+    } else {
+        s.top_k.clamp(1, 64)
+    };
+    Some(k_cfg.max(need))
+}
+
+#[cfg(test)]
+mod lmhead_sampling_tests {
+    use super::{apply_lmhead_sampling, LmheadSampling};
+
+    #[test]
+    fn k_is_raised_to_cover_top_k_never_clamped() {
+        // The bug this guards: `lmhead_twostage=q2:8` (K=8) with a sampler
+        // asking for top_k=50 used to hand the sampler 8 finite logits and
+        // 248312 `-inf`, silently. K must come up to meet the sampler.
+        let s = LmheadSampling {
+            temperature: 0.8,
+            top_k: 50,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(8, s), Some(50));
+        // A configured K already above the sampler is left alone — the margin
+        // over the worst observed argmax rank is deliberate.
+        assert_eq!(apply_lmhead_sampling(512, s), Some(512));
+        // top_k is clamped to 64 by the sampler, so the demand is bounded even
+        // when a request asks for something absurd.
+        let huge = LmheadSampling {
+            temperature: 0.8,
+            top_k: 100_000,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(8, huge), Some(64));
+        // top_k == 0 means "sampler default", which is 64 — not "no constraint".
+        let zero = LmheadSampling {
+            temperature: 0.8,
+            top_k: 0,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(8, zero), Some(64));
+    }
+
+    #[test]
+    fn greedy_ignores_top_k_and_top_p() {
+        // Greedy returns argmax before any filtering, and a -inf row cannot win,
+        // so neither knob constrains K. Without this, every model shipping a
+        // default top_p < 1.0 (Qwen3.5 ships 0.8) would bypass two-stage on the
+        // greedy path it was built for — observed live before this was added.
+        let greedy = LmheadSampling {
+            temperature: 0.0,
+            top_k: 100_000,
+            top_p: 0.8,
+            needs_full_logits: false,
+        };
+        assert_eq!(apply_lmhead_sampling(512, greedy), Some(512));
+    }
+
+    #[test]
+    fn nucleus_and_full_logit_consumers_bypass() {
+        // No fixed K can serve top_p while sampling: the nucleus is data-dependent.
+        let nucleus = LmheadSampling {
+            temperature: 0.8,
+            top_p: 0.95,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(512, nucleus), None);
+        // KLD/eval/logprobs need a finite logit for every row — and this one
+        // outranks even greedy, which is otherwise unconstrained.
+        let scoring = LmheadSampling {
+            needs_full_logits: true,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(512, scoring), None);
+        // top_p == 1.0 while sampling is "unrestricted" and must NOT bypass.
+        let open = LmheadSampling {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 40,
+            ..Default::default()
+        };
+        assert_eq!(apply_lmhead_sampling(512, open), Some(512));
+    }
 }
 
 /// True when `lmhead_project` would take the two-stage path for this weight,
@@ -195,7 +441,7 @@ pub fn lmhead_project(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    if let Some((bits, topk)) = lmhead_twostage_cfg(w.gpu_dtype == DType::OqCompactG256) {
+    if let Some((bits, topk, k_cfg)) = lmhead_twostage_cfg(w.gpu_dtype == DType::OqCompactG256) {
         // COMPACT-RESIDENT head. Unlike bf16, the stored weights live in the
         // FWHT-rotated (and AWQ-prescaled) basis, so BOTH tiers have to score
         // the rotated activation — rotate once here and hand the same buffer to
@@ -235,7 +481,9 @@ pub fn lmhead_project(
                     })
                 });
                 let _ = gpu.free_tensor(x_rot);
-                return res;
+                return res.map(|shortlist| {
+                    crate::lmhead_quality::record_token(shortlist, bits, k_cfg, topk);
+                });
             }
         }
         if w.gpu_dtype == DType::BF16 {
@@ -255,6 +503,9 @@ pub fn lmhead_project(
                 let (_, coarse, v, h) = b.as_ref().unwrap();
                 lmhead_twostage_serve_bf16(gpu, &w.buf, coarse, x, y, *v, *h, topk)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))
+                    .map(|shortlist| {
+                        crate::lmhead_quality::record_token(shortlist, bits, k_cfg, topk);
+                    })
             });
         }
     }
