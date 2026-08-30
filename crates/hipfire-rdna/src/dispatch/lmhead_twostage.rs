@@ -148,6 +148,13 @@ pub fn coarse_score(
     Ok(coarse)
 }
 
+/// Buffer slack added on top of the histogram's candidate count. It absorbs the
+/// floor-division mismatch between the host's reconstructed `tau` and the
+/// kernel's binning; the extra slots are `0xFFFFFFFF` sentinels the fine gather
+/// skips, so they are NOT extra candidates. Subtract it to recover the real
+/// shortlist size.
+pub const TOPK_SLACK: usize = 512;
+
 /// Device top-K over `coarse` [V]: min/max → histogram → threshold scan →
 /// compact. Returns `(idx buffer, cap)` where `idx` is `-1`-sentinel-filled
 /// (`0xFFFFFFFF`) `cap` slots holding a SUPERSET of the exact top-`kk` rows (the
@@ -198,9 +205,9 @@ pub fn gpu_topk(
     }
     let range = (hi as u64) - (lo as u64) + 1;
     let tau = (lo as u64 + (boundary as u64) * range / (NBINS as u64)) as u32;
-    let cap = acc + 512; // count == acc up to integer-division rounding; +slack.
-                         // Sentinel-fill idx (0xFFFFFFFF), compact key≥τ rows into it, and let the
-                         // fine gather run over all `cap` slots skipping sentinels.
+    let cap = acc + TOPK_SLACK; // count == acc up to integer-division rounding; +slack.
+                                // Sentinel-fill idx (0xFFFFFFFF), compact key≥τ rows into it, and let the
+                                // fine gather run over all `cap` slots skipping sentinels.
     let idxbuf = gpu
         .zeros(&[cap], DType::F32)
         .map_err(|e| format!("lmhead topk idx alloc: {e:?}"))?;
@@ -230,7 +237,7 @@ pub fn lmhead_twostage_serve_bf16(
     vocab: usize,
     hidden: usize,
     topk: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let kk = topk.min(vocab).max(1);
     let scores = coarse_score(gpu, coarse, fnorm, vocab, hidden)?;
     let (idxbuf, count) = gpu_topk(gpu, &scores, vocab, kk)?;
@@ -246,7 +253,7 @@ pub fn lmhead_twostage_serve_bf16(
         .map_err(|e| format!("lmhead fine gather: {e:?}"))?;
     let _ = gpu.free_tensor(idxbuf);
     let _ = gpu.free_tensor(xb);
-    Ok(())
+    Ok(count.saturating_sub(TOPK_SLACK))
 }
 
 /// Two-stage serving path for a COMPACT-RESIDENT Opus (qt 36) lm_head.
@@ -275,7 +282,7 @@ pub fn lmhead_twostage_serve_compact(
     hidden: usize,
     block_stride: usize,
     topk: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let kk = topk.min(vocab).max(1);
     let scores = coarse_score(gpu, coarse, x_rot, vocab, hidden)?;
     let (idxbuf, count) = gpu_topk(gpu, &scores, vocab, kk)?;
@@ -295,5 +302,5 @@ pub fn lmhead_twostage_serve_compact(
         )
         .map_err(|e| format!("lmhead fine compact gather: {e:?}"));
     let _ = gpu.free_tensor(idxbuf);
-    res
+    res.map(|()| count.saturating_sub(TOPK_SLACK))
 }

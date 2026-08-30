@@ -3035,6 +3035,7 @@ fn qwen35_finish_generation(
     } else {
         0.0
     };
+    let moe_hist;
     if let Some(dir) = evidence_dir {
         write_daemon_runtime_oneshot_evidence(
             dir,
@@ -3047,9 +3048,17 @@ fn qwen35_finish_generation(
             decode_s,
             prefill_s * 1000.0,
         );
-        if let Some(hist) = moe_router_histogram.take() {
-            write_daemon_moe_router_evidence(dir, m, id, hist);
+        moe_hist = moe_router_histogram.take();
+        if let Some(ref hist) = moe_hist {
+            write_daemon_moe_router_evidence(dir, m, id, hist.clone());
         }
+    } else {
+        moe_hist = moe_router_histogram.take();
+    }
+    // Persist the sampled routing profile regardless of whether this was an
+    // evidence run — that gate is what kept expert utilisation off disk.
+    if let Some(ref hist) = moe_hist {
+        crate::moe_quality::record(hist);
     }
     let _ = writeln!(
         stdout,

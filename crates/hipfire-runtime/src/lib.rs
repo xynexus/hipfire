@@ -45,6 +45,7 @@ pub mod layered_kv;
 pub mod llama;
 pub mod llama_calibration;
 pub mod llama_spec;
+pub mod lmhead_quality;
 pub mod load_progress;
 pub mod logging;
 pub mod loop_guard;
