@@ -74,6 +74,19 @@ pub struct TrunkScratch {
 /// resident in host memory at once. Each tensor is read, uploaded, and dropped.
 pub trait TensorReader {
     fn read(&self, name: &str) -> Result<Vec<f32>, String>;
+
+    /// The tensor's ON-DISK encoding and bytes, when the source has them.
+    ///
+    /// [`read`](Self::read) dequantises, which is correct for everything small and
+    /// ruinous for the routed experts: they are 97.3% of this model's trunk, so
+    /// dequantising them to f32 is the difference between ~32 GB and ~258 GB
+    /// resident. This lets the expert loader keep them in their on-disk form.
+    ///
+    /// Defaults to `None`, so a synthetic reader (the parity examples upload f32
+    /// arrays) keeps the dequantised path with no changes.
+    fn read_raw(&self, _name: &str) -> Option<(u8, Vec<u8>)> {
+        None
+    }
 }
 
 /// A reader error is a LOAD FAILURE, not a crash.
@@ -120,6 +133,54 @@ fn stack_experts(
     // is self-contained, so a per-expert view is a single offset.
     let rows = shape[1];
     let cols = shape[2];
+
+    // NATIVE QUANTISED EXPERTS. Try the on-disk bytes first: the routed experts are
+    // 97.3% of this model's trunk, so dequantising them is the difference between
+    // ~32 GB and ~258 GB resident. Each expert is converted to the COMBINED device
+    // form (`[int8 weights | f32 scales]` for the Opus family) and the regions are
+    // concatenated, which keeps one allocation per projection while leaving every
+    // per-expert region self-contained — `weight_gemv` reads a tensor's scales
+    // immediately after its own weights, so the regions cannot share planes.
+    //
+    // All-or-nothing on purpose: a mixed stack (some experts quantised, some not)
+    // has no single dtype and would need per-expert dispatch, so anything
+    // unconvertible falls the whole projection back to the f32 path below rather
+    // than producing a stack whose dtype lies about half its contents.
+    if let Some(first) = w.read_raw(&format!("{mp}.experts.0.{which}.weight")) {
+        let convert = |qt: u8, bytes: &[u8]| -> Option<(Vec<u8>, DType)> {
+            hipfire_runtime::oq8_arch::oq8_arch_load(qt, bytes, rows, cols).or_else(|| {
+                hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
+                    .map(|(b, d)| (b.into_owned(), d))
+            })
+        };
+        if let Some((first_bytes, dtype)) = convert(first.0, &first.1) {
+            let stride = first_bytes.len();
+            let mut all = Vec::with_capacity(n_exp * stride);
+            all.extend_from_slice(&first_bytes);
+            let mut ok = true;
+            for e in 1..n_exp {
+                let name = format!("{mp}.experts.{e}.{which}.weight");
+                match w.read_raw(&name).and_then(|(qt, b)| convert(qt, &b)) {
+                    // A differing stride would silently misalign every later expert.
+                    Some((b, d)) if d == dtype && b.len() == stride => all.extend_from_slice(&b),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let buf = gpu.upload_raw(&all, &[all.len()])?;
+                return Ok(crate::moe_gpu::ExpertStack {
+                    buf,
+                    dtype,
+                    rows,
+                    cols,
+                    stride,
+                });
+            }
+        }
+    }
     let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack {
         buf,
         dtype: DType::F32,

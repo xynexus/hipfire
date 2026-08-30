@@ -26,6 +26,10 @@ pub struct HfqTensorReader<'a> {
 }
 
 impl TensorReader for HfqTensorReader<'_> {
+    fn read_raw(&self, name: &str) -> Option<(u8, Vec<u8>)> {
+        self.hfq.tensor_data_logical(name).ok()
+    }
+
     fn read(&self, name: &str) -> Result<Vec<f32>, String> {
         let (qt, bytes) = self
             .hfq

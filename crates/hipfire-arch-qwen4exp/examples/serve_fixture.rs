@@ -111,6 +111,13 @@ fn main() {
                 })
         };
 
+    // Report what the experts are RESIDENT as, not just that decoding works: a
+    // silent dequantisation to f32 serves identically and costs ~8x the memory.
+    println!(
+        "  experts: routed experts resident as {:?}",
+        m.routed_expert_dtype()
+    );
+
     let (am0, mx0) = argmax_after_prefill(&mut m, &mut gpu);
     println!(
         "  prefill: {} tokens -> argmax {am0} ({mx0:.4}), all finite",

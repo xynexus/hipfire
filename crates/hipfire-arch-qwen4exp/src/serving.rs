@@ -180,6 +180,16 @@ impl Qwen4ExpBackend {
         &self.cfg
     }
 
+    /// Device dtype the ROUTED EXPERTS are resident in.
+    ///
+    /// Worth surfacing because the difference is invisible from the logits: an
+    /// artifact whose experts were dequantised to f32 serves exactly as well and
+    /// costs ~8x the memory. On the shipped geometry the experts are 97.3% of the
+    /// trunk, so this one value decides whether the model fits.
+    pub fn routed_expert_dtype(&self) -> Option<hipfire_rdna::DType> {
+        self.weights.layers.first().map(|l| l.moe.gate_up.dtype)
+    }
+
     /// One trunk step at absolute position `pos`, leaving logits on the GPU.
     ///
     /// `self` is destructured so the n-gram provider (which borrows `ngram`) and

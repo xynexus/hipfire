@@ -1,7 +1,9 @@
 # TODO: keep qwen4_exp's weights quantised on the GPU (the last fit blocker)
 
-**Status:** open (proposed 2026-08-30). This is the ONLY remaining blocker to
-serving the shipped Qwen3.8-Flash-Next checkpoint.
+**Status:** the ROUTED EXPERTS — 97.3% of the trunk, and the whole fit question —
+are DONE as of 2026-08-30. An oq4 artifact now reports `routed experts resident as
+Oq4G256` and `tests/qwen4exp-gate.sh` fails if they ever come back as F32. What
+remains is the other 2.7%, which does not affect whether the model fits.
 
 ## Where the model stands
 
@@ -88,10 +90,21 @@ progress against the actual constraint.
    G128 producer path and now warn loudly instead of failing silently. Until this
    held, any oq4 number on this geometry was measuring an uncalibrated HFQ4G128
    fallback, not a quantisation result.
-2. **Routed experts onto the indexed kernels.** This is the whole job. Thread `k`
-   (10 here) through `INDEXED_MOE_K_TOP` / `oq_indexed_admissible` / the loader
-   repack so they keep agreeing, and replace `moe_gpu::view2d` + `gemv_f32` with
-   the indexed GEMVs.
+2. **Routed experts natively quantised.** DONE 2026-08-30 — and it did NOT need the
+   indexed batched kernels. `moe_forward` already does CPU top-k and loops one
+   expert at a time, so what it needed was a per-expert *weight*, not a batched
+   dispatch: `ExpertStack::expert(e)` yields a `WeightTensor` view and
+   `weight_gemv` dispatches on its dtype. The experts are loaded in their on-disk
+   form via `TensorReader::read_raw` + `oq8_arch_load`/`oq4_arch_load`, converted
+   to the combined `[weights | scales]` device form, and concatenated into ONE
+   allocation per projection (per-expert allocations would pay gfx1151's 2 MiB GTT
+   rounding 512 times per projection per layer).
+
+   The indexed batched kernels remain the PERFORMANCE answer — ten separate GEMV
+   launches per layer per token is not free — but they are no longer on the
+   critical path for fitting, and adopting them would mean generalising
+   `INDEXED_MOE_K_TOP` (currently 8; this model is top-10) and the two selection
+   kernels that hardcode it.
 3. The other linears, whenever. They are 2.7% and can follow at leisure — or never,
    if `weight_gemv` on an f32 `WeightTensor` is not worth the churn.
 

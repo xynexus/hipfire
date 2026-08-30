@@ -214,11 +214,20 @@ if [ -n "${bf16_argmax:-}" ]; then
       *) echo "  $q: FAILED to serve"; echo "$qout" | tail -3 | sed 's/^/    /'; fail=1; continue ;;
     esac
     qam="$(echo "$qout" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
-    if [ "$qam" = "$bf16_argmax" ]; then
-      echo "  $q: serves, argmax $qam matches the bf16 control"
-    else
+    qdt="$(echo "$qout" | sed -nE 's/.*routed experts resident as Some\(([A-Za-z0-9]+)\).*/\1/p' | head -1)"
+    if [ "$qam" != "$bf16_argmax" ]; then
       echo "qwen4exp-gate: $q argmax $qam != bf16 argmax $bf16_argmax — dequant is wrong"
       fail=1
+    # The experts must stay QUANTISED. Falling back to F32 serves identically and
+    # costs ~8x the memory, so it is invisible in the logits — on the shipped
+    # geometry the routed experts are 97.3% of the trunk, which is the whole
+    # difference between ~32 GB and ~258 GB resident.
+    elif [ "$qdt" = "F32" ] || [ -z "$qdt" ]; then
+      echo "qwen4exp-gate: $q serves but its routed experts are resident as '${qdt:-unknown}'"
+      echo "               — they were silently dequantised; the model would not fit"
+      fail=1
+    else
+      echo "  $q: serves, argmax $qam matches bf16, experts resident as $qdt"
     fi
   done
 else
