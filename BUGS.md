@@ -32,7 +32,30 @@ boundaries, not context length.
   so it is not accumulated drift, and the MoE gate reads 0.000e0.
 - Not a drafter problem: tau is measured against the verifier's own argmax.
 - Full evidence: `docs/bugs/2026-08-27-spec-decode-ar-divergence.md`.
-## zaya's tiny-quant KLD cells measure NOTHING — deliberately left unrecorded (medium)
+## zaya's two-stage lm_head fine pass uses plain bf16, not bf16-lut3 (medium)
+
+`lmhead_twostage_serve` (`crates/hipfire-arch-zaya/src/gpu.rs`) coarse-scores all
+V rows at q2/q4, host-selects the top-K, then **rescores those rows at plain
+bf16**. It should rescore from `Bf16Lut3`.
+
+Lut3 is not merely an on-disk codec — it is decoded IN KERNEL. `gemv_bf16l3.hip`,
+`gemm_bf16l3_xf32.hip`, and `bf16_huff_decode.hip` exist, and qwen35 already does
+exactly the right thing: `loading.rs:4619` hands the PACKED bytes to the GPU
+rather than expanding them, with the measurement recorded right there
+(`Bf16Lut3 packed, gemv_bf16l3_xf32  1.95 ms`). So a bf16 lm_head is strictly
+worse than a bf16-lut3 one — same numerics out of the kernel, fewer bytes moved,
+and lm_head is bandwidth-bound.
+
+The storage side is already flexible: keep it lut3 on disk, or keep the smaller
+`Bf16Huff` on disk and transcode to lut3 in memory (`bf16_huff_decode`), then
+decode lut3 → bf16 inside the kernel.
+
+Fix: rescore through the packed path, following qwen35's arm. The zaya two-stage
+head is env-gated (`HIPFIRE_ZAYA_LMHEAD`, off by default), so this is latent
+rather than shipping — but the same reasoning applies anywhere a bf16 lm_head is
+materialized.
+
+## [RESOLVED 2026-08-30] zaya's tiny-quant KLD cells measure NOTHING — the protected set was promoted to deprecated Q8
 
 Found 2026-08-30 while recording the 128 missing gfx1151 tiny-quant baselines.
 
@@ -76,16 +99,76 @@ for a model whose sensitive weights are 8-bit.
 
 Not a zaya-spec policy: `hipfire-arch-zaya-spec` uses plain
 `default_importance(self.role(tensor))` with no family override, so the promotion
-comes from the generic importance/K-map path. WHICH rule promotes them is still
-open — the shapes are all K=256 and therefore 256-aligned, so it is not the
-`k % 256 != 0 -> Q8` fallback at cli.rs:11639.
+comes from the generic importance/K-map path. The rule is the `q8_router` +
+`high_precision_via_ingest` arm in `cli.rs`, which pinned the whole protected set
+— routers, attention, gather tables — to `Q8F16` regardless of `--format`. That
+predates the Q8 deprecation and is the actual defect: Q8 is deprecated, so the
+protected set was being held at a format we no longer ship.
 
 ⚠️ Training the tiny zaya would NOT diagnose this, and would hide it: the promotion
 is visible statically in the artifact and has nothing to do with the weights being
-random. Fix the cell (make it exercise 4-bit attention, or rename it for what it
-measures) before recording a baseline.
+random.
 
-Do NOT close this by running `--record`.
+**FIX (2026-08-30).** The protected set now takes an OQ-family home, chosen so it
+is always strictly better than the bulk — which is what "protected" has to mean:
+
+- bulk coarser than 8-bit (`oq4`/`oq3`/`oq2`/mixed) → `Oq8G256`.
+- bulk already `Oq8G256` (`oq8`/`oq8+`/`oq8++`) → source precision (`BF16`).
+  Promoting to `Oq8G256` here would set protected == bulk and delete the
+  protected set outright. No finer-grouped Opus 8-bit exists to use instead:
+  `Oq8Plain` is the same G256 unrotated, and both `OqPlus` variants are 4-bit.
+- row-gathered tables (`TensorRole::Embed` / `LmHead`) stay `Q8F16`. A RUNTIME
+  gap, not a policy: the gather has per-dtype entry points in
+  `dispatch/embedding.rs` (f32 / q8 / q4k / hfq4g256 / bf16) and no `Oq8G256`
+  one, so promoting `embed.weight [4096, 256]` produced a NON-FINITE KLD on the
+  deepseek4 fixture. Add the gather kernel and that exclusion can go.
+
+⚠️ **Deprecated Q8 is NOT fully gone.** A sweep of all 20 fixture families at
+`oq4` and `oq8` leaves two distinct survivors, only the first of which is the
+deliberate exclusion above:
+
+    deepseek4{,_compressed}/oq4,oq8   embed.weight        <- gather table
+    nemotron_h/oq4,oq8                lm_head.weight      <- gather table
+    gemma4_moe/oq4                    17 tensors          <- K not 256-aligned
+    qwen3_5_moe/oq4                    4 tensors          <- K not 256-aligned
+
+The second group is `expert.*.down_proj` / `shared_expert.down_proj` / one
+`o_proj`: protected by role (`ResidualWriter`), but with K not a multiple of 256,
+so `Oq8G256` is not representable and they fall through to `Q8F16`. They are at
+`Q8F16` today too — this is pre-existing, not a regression. Note they vanish from
+the `oq8` column, because the bulk-is-8-bit arm sends them to `BF16` first.
+
+Finishing the deprecation for that group means sending them to `BF16` as well,
+which DOUBLES them — and for `gemma4_moe` they are 16 expert `down_proj`, a large
+share of a real MoE artifact. That is a size/quality decision, not a cleanup, so
+it is deliberately left open rather than folded into this fix. `OqPlusCompactG128`
+exists precisely for K that is a multiple of 128 but not 256, but it is 4-bit
+(W4A4), so it cannot serve as a protected home above an `oq4` bulk.
+
+The gather test asks the ARCH for the tensor's role rather than matching names.
+Name matching is wrong in both directions here: the shared
+`is_embedding_table_name` misses deepseek4's `embed.weight`, which is how that
+table reached this arm at all, while a widened `ends_with("embed.weight")` would
+also swallow qwen35/qwen4exp's `pos_embed.weight`, a position table.
+
+zaya now emits 0 `Q8F16` at both `oq4` and `oq8`, and its 7 gfx1151 baselines are
+recorded for the first time. ⚠️ Its gfx1103 rows are now STALE — they were
+recorded against the promoted artifact and must be re-recorded on that GPU.
+
+**UPDATE 2026-08-30 — `Oq8G128` is the right home and is now wired, but is not
+yet the default.** Measured reconstruction: Oq8G128 is 21.6% better than the
+`Q8F16` it replaces at FEWER bits (8.125 vs 8.5), and 8.5% better than the
+`Oq8G256` bulk. It serves correctly on gemma4 / nemotron / zaya. It is blocked as
+a default by archs that fuse rmsnorm+rotate: qwen35 rotates the attention input
+ONCE at FWHT-256 and shares it across every projection, so a 128-basis weight
+there needs a G128 fused rmsnorm+rotate plus a split of that shared activation
+(without it, KLD 0.83). The protected set therefore stays at BF16 for now. Full
+detail: `docs/todo/2026-08-30-oq8g128-protected-set.md`.
+
+⚠️ Do not read the resulting baseline moves as quality. The same change made
+`qwen3_5_moe_indexed` `oq8` 6.9× better and `nemotron_h` `oq8` 2× worse; on a
+random-init fixture KLD measures perturbation sensitivity, not quality. See
+`docs/todo/2026-08-30-tiny-fixture-training-and-qat.md`.
 
 ## [RESOLVED 2026-08-29 — re-recorded on halo] 8 gfx1151 baselines are stale — `qwen3_5_moe_indexed` fixture changed shape
 
