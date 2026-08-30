@@ -61,6 +61,8 @@ enum Command {
     TwoPass(commands::interop::TwoPassArgs),
     /// NPU artifact tooling (linux only)
     Npu(commands::interop::NpuArgs),
+    /// Submit, watch and cancel background jobs (downloads, training)
+    Jobs(commands::jobs::JobsArgs),
     /// List locally available models
     #[command(alias = "models")]
     List(commands::list::ListArgs),
@@ -289,6 +291,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
         Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
         Some(Command::Download(args)) => commands::download::run_download(args),
+        Some(Command::Jobs(args)) => commands::jobs::run(args),
         Some(Command::Induct(args)) => commands::induct::run_induct(args, loaded_config),
         Some(Command::Import(args)) => commands::interop::run_import(args),
         Some(Command::Export(args)) => commands::interop::run_export(args),

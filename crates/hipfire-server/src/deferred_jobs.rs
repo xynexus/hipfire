@@ -47,6 +47,48 @@ pub enum DeferredJobKind {
     SdapiImg2img { body: SdGenerationRequest },
     /// Execute a supported in-process POST endpoint.
     HttpPost { endpoint: String, body: Value },
+    /// Fetch a model repository in the background.
+    ///
+    /// Runs `hipfire download` as a SUBPROCESS rather than calling the fetch
+    /// code in-process. Two reasons, both structural: the server must not
+    /// depend on `hipfire-coexistence` (AGENTS.md keeps external-ecosystem
+    /// interop out of the inference binaries, and it does not today), and a
+    /// separate process is what makes cancel a signal rather than a
+    /// cooperative flag threaded through the transfer.
+    ///
+    /// Cancelling is safe to do at any point: the archive is written under a
+    /// `.part` marker with a `.manifest` sidecar, so a resubmitted job resumes
+    /// at the last completed file instead of restarting.
+    Download {
+        repo: String,
+        #[serde(default)]
+        revision: Option<String>,
+        #[serde(default)]
+        include: Option<String>,
+        #[serde(default)]
+        dest: Option<PathBuf>,
+        #[serde(default)]
+        output: Option<PathBuf>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        raw: bool,
+        #[serde(default)]
+        jobs: Option<usize>,
+    },
+    /// Bring an external model into a `.hfq` in the background.
+    ///
+    /// Induction quantizes, so it runs GPU kernels — but `hipfire induct` does
+    /// not self-lock (it shells out to `hipfire-quantize`, and per AGENTS.md
+    /// non-daemon GPU binaries are the caller's job to coordinate). The job
+    /// therefore runs it under `hipfire lock run`, which holds the lock for
+    /// exactly the child's lifetime, so a background induction serialises
+    /// against the daemon instead of racing it.
+    Induct {
+        source: String,
+        #[serde(default)]
+        format: Option<String>,
+    },
     /// Launch a no-shell training command from a local deferred job file.
     ///
     /// This is intentionally file-backed only; no HTTP route creates these jobs.
@@ -354,6 +396,54 @@ async fn execute_deferred_job(
         DeferredJobKind::HttpPost { endpoint, body } => {
             execute_http_post(state, endpoint, body.clone()).await
         }
+        DeferredJobKind::Download {
+            repo,
+            revision,
+            include,
+            dest,
+            output,
+            force,
+            raw,
+            jobs,
+        } => {
+            let mut argv = vec![hipfire_binary(), "download".to_string(), repo.clone()];
+            let mut push = |flag: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    argv.push(flag.to_string());
+                    argv.push(v);
+                }
+            };
+            push("--revision", revision.clone());
+            push("--include", include.clone());
+            push("--dest", dest.as_ref().map(|p| p.display().to_string()));
+            push("--output", output.as_ref().map(|p| p.display().to_string()));
+            push("--jobs", jobs.map(|j| j.to_string()));
+            if *force {
+                argv.push("--force".to_string());
+            }
+            if *raw {
+                argv.push("--raw".to_string());
+            }
+            execute_child_job(root, id, "download", repo, &argv).await
+        }
+        DeferredJobKind::Induct { source, format } => {
+            let bin = hipfire_binary();
+            let mut argv = vec![
+                bin.clone(),
+                "lock".to_string(),
+                "run".to_string(),
+                format!("induct-{id}"),
+                "--".to_string(),
+                bin,
+                "induct".to_string(),
+                source.clone(),
+            ];
+            if let Some(f) = format {
+                argv.push("--format".to_string());
+                argv.push(f.clone());
+            }
+            execute_child_job(root, id, "induct", source, &argv).await
+        }
         DeferredJobKind::TrainingCommand {
             argv,
             cwd,
@@ -644,6 +734,133 @@ fn append_training_event(run_dir: &Path, event: Value) -> Result<(), String> {
     .map_err(|e| format!("write training event {}: {e}", path.display()))
 }
 
+/// The `hipfire` executable to launch jobs with.
+///
+/// `current_exe` first, so a running server can never shell out to an older
+/// build left in `~/.hipfire/bin` or a stale `target/` — the same rule the
+/// daemon spawn path already follows.
+fn hipfire_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s == "hipfire")
+        })
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "hipfire".to_string())
+}
+
+/// Path a running job writes its live progress to, and that `hipfire jobs`
+/// reads. Beside the log so one directory holds everything about a job.
+pub fn job_status_path(root: &Path, id: &str) -> PathBuf {
+    root.join(LOGS_DIR).join(format!("{id}.status.json"))
+}
+
+/// Run `hipfire download` as a child, streaming its stderr to the job log and
+/// publishing a status file the CLI polls.
+///
+/// Cancellation is a file, not a signal from the CLI: `hipfire jobs cancel`
+/// writes `<id>.cancel` beside the log and this loop reaps the child. Doing it
+/// that way means the CLI needs no privilege over the server's children and no
+/// pid bookkeeping survives a server restart.
+/// Run a hipfire subcommand as a child process, tee its stderr into the job
+/// log, publish a status file, and honour a `logs/<id>.cancel` marker.
+///
+/// Cancel is a file, not a signal, so `hipfire jobs cancel` needs no privilege
+/// over the server's children and no pid has to survive a server restart.
+///
+/// The child gets its own process group and cancel signals the whole group:
+/// some jobs run under `hipfire lock run`, where killing only the direct child
+/// would drop the GPU lock and leave the real workload running unlocked.
+async fn execute_child_job(
+    root: &Path,
+    id: &str,
+    kind: &str,
+    label: &str,
+    argv: &[String],
+) -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let log_path = root.join(LOGS_DIR).join(format!("{id}.log"));
+    let cancel_path = root.join(LOGS_DIR).join(format!("{id}.cancel"));
+    let status_path = job_status_path(root, id);
+    let _ = fs::remove_file(&cancel_path);
+
+    let write_status = |state: &str, detail: &str| {
+        let _ = fs::write(
+            &status_path,
+            serde_json::to_vec_pretty(&json!({
+                "id": id,
+                "kind": kind,
+                "label": label,
+                "state": state,
+                "detail": detail,
+                "updated_at": now_secs(),
+            }))
+            .unwrap_or_default(),
+        );
+    };
+    write_status("running", "starting");
+
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+
+    // The fetch reports progress on stderr; tee it to the log and keep the last
+    // line as the status detail so `hipfire jobs` shows something useful
+    // without parsing a bespoke protocol.
+    let stderr = child.stderr.take().ok_or("child stderr")?;
+    let mut lines = BufReader::new(stderr).lines();
+    let mut log = String::new();
+    let mut last = String::new();
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(l)) => {
+                    if !l.trim().is_empty() {
+                        last = l.clone();
+                        write_status("running", &last);
+                    }
+                    log.push_str(&l);
+                    log.push('\n');
+                    let _ = fs::write(&log_path, &log);
+                }
+                Ok(None) => break,
+                Err(e) => return Err(format!("read child stderr: {e}")),
+            },
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if cancel_path.exists() {
+                    if let Some(pid) = child.id() {
+                        // SAFETY: signalling a process group we created above.
+                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+                    }
+                    let _ = child.kill().await;
+                    write_status("cancelled", "cancelled by request");
+                    let _ = fs::write(&log_path, &log);
+                    return Err(format!("{kind} {label} cancelled"));
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("wait: {e}"))?;
+    let _ = fs::write(&log_path, &log);
+    if status.success() {
+        write_status("done", &last);
+        Ok(json!({ "kind": kind, "label": label, "detail": last }))
+    } else {
+        write_status("failed", &last);
+        Err(format!("{kind} {label} exited {status}: {last}"))
+    }
+}
+
 fn write_result(root: &Path, dir: &str, id: &str, value: Value) -> Result<(), String> {
     let path = unique_path(&root.join(dir).join(format!("{id}.result.json")));
     fs::write(
@@ -699,6 +916,8 @@ fn kind_name(kind: &DeferredJobKind) -> &'static str {
         DeferredJobKind::SdapiTxt2img { .. } => "sdapi_txt2img",
         DeferredJobKind::SdapiImg2img { .. } => "sdapi_img2img",
         DeferredJobKind::HttpPost { .. } => "http_post",
+        DeferredJobKind::Download { .. } => "download",
+        DeferredJobKind::Induct { .. } => "induct",
         DeferredJobKind::TrainingCommand { .. } => "training_command",
     }
 }

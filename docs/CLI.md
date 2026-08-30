@@ -32,6 +32,11 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire two-pass`↴](#hipfire-two-pass)
 * [`hipfire npu`↴](#hipfire-npu)
 * [`hipfire npu pair-hfp`↴](#hipfire-npu-pair-hfp)
+* [`hipfire jobs`↴](#hipfire-jobs)
+* [`hipfire jobs list`↴](#hipfire-jobs-list)
+* [`hipfire jobs status`↴](#hipfire-jobs-status)
+* [`hipfire jobs watch`↴](#hipfire-jobs-watch)
+* [`hipfire jobs cancel`↴](#hipfire-jobs-cancel)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -117,6 +122,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `calibrate` — Capture activation statistics into a `.calib.hfq`
 * `two-pass` — Calibrate then quantize in one run
 * `npu` — NPU artifact tooling (linux only)
+* `jobs` — Submit, watch and cancel background jobs (downloads, training)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -275,6 +281,9 @@ leaves <archive>.hfa.part and resumes on the next download.
 * `--jobs <JOBS>` — Parallel connections: whole files in raw mode, ranged windows within a file in archive mode
 
   Default value: `4`
+* `--detach` — Queue the fetch as a background job instead of downloading here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   The job is a file in `~/.hipfire/jobs/deferred/queued`, so this works whether or not the server is running — an unclaimed job simply waits.
 
 
 
@@ -291,6 +300,9 @@ Bring an external model into a named `.hfq` — calibrate, quantize, fold sideca
 ###### **Options:**
 
 * `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+* `--detach` — Queue the induction as a background job instead of running it here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   Both `source` and `--format` are required with this flag: a detached job has no terminal to prompt on.
 
 
 
@@ -641,6 +653,90 @@ Pair a whole-scaled `.hfp` into the paired layout (linux only)
 
 * `--in <INPUT>` — Source `.hfp`. (Spelled `--in`, matching the existing tool.)
 * `--out <OUTPUT>` — Destination `.hfp`
+
+
+
+## `hipfire jobs`
+
+Submit, watch and cancel background jobs (downloads, training)
+
+**Usage:** `hipfire jobs <COMMAND>`
+
+Examples:
+  hipfire download Qwen/Qwen3.5-9B --detach   # submit, return immediately
+  hipfire jobs list
+  hipfire jobs watch <id>
+  hipfire jobs cancel <id>
+
+A cancelled download can be resubmitted: the archive is written under a
+.part marker with a .manifest sidecar, so it resumes rather than restarts.
+
+###### **Subcommands:**
+
+* `list` — List jobs in every state
+* `status` — Show one job, with the tail of its log
+* `watch` — Follow one job until it finishes
+* `cancel` — Ask a running job to stop, or drop a queued one
+
+
+
+## `hipfire jobs list`
+
+List jobs in every state
+
+**Usage:** `hipfire jobs list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of a table
+
+
+
+## `hipfire jobs status`
+
+Show one job, with the tail of its log
+
+**Usage:** `hipfire jobs status [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
+
+
+
+## `hipfire jobs watch`
+
+Follow one job until it finishes
+
+**Usage:** `hipfire jobs watch [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
+
+
+
+## `hipfire jobs cancel`
+
+Ask a running job to stop, or drop a queued one
+
+**Usage:** `hipfire jobs cancel [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
 
 
 
@@ -998,6 +1094,9 @@ Interactive wizard: bring an external model (HuggingFace repo or local safetenso
 ###### **Options:**
 
 * `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+* `--detach` — Queue the induction as a background job instead of running it here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   Both `source` and `--format` are required with this flag: a detached job has no terminal to prompt on.
 
 
 

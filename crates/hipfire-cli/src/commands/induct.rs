@@ -58,6 +58,13 @@ pub struct InductArgs {
     /// prompted from the known list.
     #[arg(long)]
     format: Option<String>,
+    /// Queue the induction as a background job instead of running it here, and
+    /// return its id. Monitor it with `hipfire jobs watch <id>`.
+    ///
+    /// Both `source` and `--format` are required with this flag: a detached job
+    /// has no terminal to prompt on.
+    #[arg(long)]
+    detach: bool,
 }
 
 // ── pure helpers (unit-tested) ─────────────────────────────────────────────
@@ -450,6 +457,19 @@ fn run_tool(bin: &Path, args: &[OsString], build_hint: &str) -> anyhow::Result<(
 // ── wizard ─────────────────────────────────────────────────────────────────
 
 pub fn run_induct(args: InductArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
+    if args.detach {
+        let (Some(source), Some(format)) = (args.source, args.format) else {
+            bail!("--detach needs both a source and --format (a background job cannot prompt)");
+        };
+        let id = crate::commands::jobs::submit(serde_json::json!({
+            "kind": "induct",
+            "source": source,
+            "format": format,
+        }))?;
+        println!("queued induct job {id}");
+        println!("  hipfire jobs watch {id}");
+        return Ok(());
+    }
     println!("hipfire model induct — bring an external model into a named .hfq\n");
 
     // 1. Source → safetensors dir.
