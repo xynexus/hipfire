@@ -162,6 +162,9 @@ fn default_deltanet_state_precision() -> String {
 fn default_flash_mode() -> String {
     "auto".to_string()
 }
+fn default_max_resident_workers() -> u32 {
+    2
+}
 fn default_dflash_draft() -> String {
     "off".to_string()
 }
@@ -423,6 +426,9 @@ pub struct HipfireConfig {
     pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
     pub flash_mode: String,
+    /// Resident model workers allowed at once, counting the active one.
+    #[serde(default = "default_max_resident_workers")]
+    pub max_resident_workers: u32,
     /// `off` / `auto` / `on`, or an absolute drafter path (which implies `on`).
     /// Split with [`dflash_draft_setting`].
     #[serde(default = "default_dflash_draft")]
@@ -662,6 +668,7 @@ impl Default for HipfireConfig {
             load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
+            max_resident_workers: default_max_resident_workers(),
             dflash_draft: default_dflash_draft(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
             ngram_spec: default_ngram_spec(),

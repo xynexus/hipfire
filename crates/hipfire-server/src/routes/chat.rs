@@ -676,6 +676,7 @@ async fn plan_residency_for_load(
             worker_key_id: worker_key_id.to_string(),
             model_path: model_path.to_string(),
             requested_mode,
+            max_resident_workers: cfg.max_resident_workers,
             estimated_full,
             estimated_qwen_moe_modules,
         },
