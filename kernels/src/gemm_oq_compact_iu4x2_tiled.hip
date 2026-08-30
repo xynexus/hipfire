@@ -27,6 +27,10 @@
 //
 // Does NOT apply the sparse overlay -- separate pass, as for both existing twins.
 // Requires K % 256 == 0.
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
