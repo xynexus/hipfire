@@ -10,7 +10,7 @@ pub mod schema;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 pub use editor::{
@@ -20,12 +20,13 @@ pub use editor::{
 };
 pub use resolve::{
     config_layer_from_env, config_layer_from_env_with, config_layers_from_document,
-    config_layers_from_documents, env_var_name_for_key, resolve_config_layers, ConfigLayer,
-    ConfigLayerKind, ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
+    config_layers_from_documents, env_var_name_for_key, resolve_config_layers,
+    validate_resolved_value, ConfigLayer, ConfigLayerKind, ConfigResolution, ConfigValueSource,
+    ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
-    config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, Requirement,
-    RestartImpact,
+    config_schema, dflash_draft_setting, ConfigField, ConfigMutability, ConfigScope, ConfigType,
+    PathExistence, Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM, RENAMED_KEYS,
 };
 
 fn default_host() -> String {
@@ -161,7 +162,7 @@ fn default_deltanet_state_precision() -> String {
 fn default_flash_mode() -> String {
     "auto".to_string()
 }
-fn default_dflash_mode() -> String {
+fn default_dflash_draft() -> String {
     "off".to_string()
 }
 fn default_dflash_adaptive_b() -> bool {
@@ -170,31 +171,31 @@ fn default_dflash_adaptive_b() -> bool {
 fn default_ngram_spec() -> bool {
     false
 }
-fn default_ngram_store_root() -> String {
+fn default_ngram_spec_store_root() -> String {
     String::new()
 }
-fn default_ngram_scope() -> String {
+fn default_ngram_spec_scope() -> String {
     String::new()
 }
-fn default_ngram_store_mb() -> u32 {
+fn default_ngram_spec_store_mb() -> u32 {
     256
 }
-fn default_ngram_orders() -> String {
+fn default_ngram_spec_orders() -> String {
     "8,7,6,5,4,3,2".to_string()
 }
-fn default_ngram_chain_floor() -> u8 {
+fn default_ngram_spec_chain_floor() -> u8 {
     8
 }
-fn default_ngram_max_spine() -> u32 {
+fn default_ngram_spec_max_spine() -> u32 {
     16
 }
-fn default_ngram_promote_count() -> u16 {
+fn default_ngram_spec_promote_count() -> u16 {
     3
 }
-fn default_ngram_write_target() -> String {
+fn default_ngram_spec_write_target() -> String {
     "user".to_string()
 }
-fn default_dflash_ngram_block() -> serde_json::Value {
+fn default_dflash_no_repeat_ngram() -> serde_json::Value {
     serde_json::Value::String("auto".to_string())
 }
 fn default_mtp_mode() -> String {
@@ -422,12 +423,14 @@ pub struct HipfireConfig {
     pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
     pub flash_mode: String,
-    #[serde(default = "default_dflash_mode")]
-    pub dflash_mode: String,
+    /// `off` / `auto` / `on`, or an absolute drafter path (which implies `on`).
+    /// Split with [`dflash_draft_setting`].
+    #[serde(default = "default_dflash_draft")]
+    pub dflash_draft: String,
     #[serde(default = "default_dflash_adaptive_b")]
     pub dflash_adaptive_b: bool,
-    #[serde(default = "default_dflash_ngram_block")]
-    pub dflash_ngram_block: serde_json::Value,
+    #[serde(default = "default_dflash_no_repeat_ngram")]
+    pub dflash_no_repeat_ngram: serde_json::Value,
     /// Opt-in drafter-free n-gram speculative decode. Drafts from token
     /// statistics; on a miss the DFlash drafter runs unchanged.
     #[serde(default = "default_ngram_spec")]
@@ -438,41 +441,41 @@ pub struct HipfireConfig {
     /// RAM, nothing written to disk. The word forms exist so the RAM case is
     /// expressible as a value: in a settings UI an empty string is
     /// indistinguishable from a field nobody has touched.
-    #[serde(default = "default_ngram_store_root")]
-    pub ngram_store_root: String,
+    #[serde(default = "default_ngram_spec_store_root")]
+    pub ngram_spec_store_root: String,
     /// Scope name identifying the *tokenizer* these tables belong to. Empty =
     /// derive from the model filename, which never wrongly shares a table.
     /// Set two models to the same scope only when they share a tokenizer —
     /// records are token ids and mean nothing across tokenizers.
-    #[serde(default = "default_ngram_scope")]
-    pub ngram_scope: String,
+    #[serde(default = "default_ngram_spec_scope")]
+    pub ngram_spec_scope: String,
     /// Size of a newly created per-scope table, in MiB. This *is* the budget:
     /// the file is allocated in full and never grows, so a full block evicts
     /// rather than expanding. 256 MiB = 65536 blocks of 4 KiB.
-    #[serde(default = "default_ngram_store_mb")]
-    pub ngram_store_mb: u32,
+    #[serde(default = "default_ngram_spec_store_mb")]
+    pub ngram_spec_store_mb: u32,
     /// Probe orders, longest first. Measured on 1M tokens of Rust: going past
     /// quad keeps paying on code (2..5 -> 1.80 accepted/step, 2..8 -> 2.11),
     /// and is flat on prose.
-    #[serde(default = "default_ngram_orders")]
-    pub ngram_orders: String,
+    #[serde(default = "default_ngram_spec_orders")]
+    pub ngram_spec_orders: String,
     /// After the first drafted token, only extend the chain while the winning
     /// order is at least this. The load-bearing knob: without it the chain pads
     /// to `max_spine` and burns verify width (floor 0 -> 16.0 drafted/step at
     /// 20.6% efficiency; floor 8 -> 6.94 at 37.9%). 0 disables the gate.
-    #[serde(default = "default_ngram_chain_floor")]
-    pub ngram_chain_floor: u8,
-    #[serde(default = "default_ngram_max_spine")]
-    pub ngram_max_spine: u32,
+    #[serde(default = "default_ngram_spec_chain_floor")]
+    pub ngram_spec_chain_floor: u8,
+    #[serde(default = "default_ngram_spec_max_spine")]
+    pub ngram_spec_max_spine: u32,
     /// Observations before a gram is worth a disk write. Gates persistence
     /// only, never drafting — precision is flat across counts, and requiring a
     /// count to draft measurably hurts (1.80 accepted/step at 1, 0.75 at 9).
-    #[serde(default = "default_ngram_promote_count")]
-    pub ngram_promote_count: u16,
+    #[serde(default = "default_ngram_spec_promote_count")]
+    pub ngram_spec_promote_count: u16,
     /// Which store the write path feeds: `user`, `topic`, or `none`. Only a
     /// store private to its scope may be written; a shared one is read-only.
-    #[serde(default = "default_ngram_write_target")]
-    pub ngram_write_target: String,
+    #[serde(default = "default_ngram_spec_write_target")]
+    pub ngram_spec_write_target: String,
     #[serde(default = "default_mtp_mode")]
     pub mtp_mode: String,
     #[serde(default = "default_mtp_k")]
@@ -659,18 +662,18 @@ impl Default for HipfireConfig {
             load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
-            dflash_mode: default_dflash_mode(),
+            dflash_draft: default_dflash_draft(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
             ngram_spec: default_ngram_spec(),
-            ngram_store_root: default_ngram_store_root(),
-            ngram_scope: default_ngram_scope(),
-            ngram_store_mb: default_ngram_store_mb(),
-            ngram_orders: default_ngram_orders(),
-            ngram_chain_floor: default_ngram_chain_floor(),
-            ngram_max_spine: default_ngram_max_spine(),
-            ngram_promote_count: default_ngram_promote_count(),
-            ngram_write_target: default_ngram_write_target(),
-            dflash_ngram_block: default_dflash_ngram_block(),
+            ngram_spec_store_root: default_ngram_spec_store_root(),
+            ngram_spec_scope: default_ngram_spec_scope(),
+            ngram_spec_store_mb: default_ngram_spec_store_mb(),
+            ngram_spec_orders: default_ngram_spec_orders(),
+            ngram_spec_chain_floor: default_ngram_spec_chain_floor(),
+            ngram_spec_max_spine: default_ngram_spec_max_spine(),
+            ngram_spec_promote_count: default_ngram_spec_promote_count(),
+            ngram_spec_write_target: default_ngram_spec_write_target(),
+            dflash_no_repeat_ngram: default_dflash_no_repeat_ngram(),
             mtp_mode: default_mtp_mode(),
             mtp_k: default_mtp_k(),
             thinking: default_thinking(),
@@ -912,8 +915,11 @@ pub fn resolve_typed_config_layers(
     layers: &[ConfigLayer],
     model_overrides: HashMap<String, Value>,
 ) -> ResolvedTypedConfig {
-    let resolution = resolve_config_layers(config_schema(), layers);
-    let mut diagnostics = Vec::new();
+    let (layers, mut diagnostics) = apply_renamed_keys(layers);
+    let layers = layers.as_slice();
+    let mut resolution = resolve_config_layers(config_schema(), layers);
+    unknown_keys_in_unapplied_overrides(layers, &model_overrides, &mut resolution);
+    diagnostics.extend(domain_diagnostics(&resolution));
     let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
     ResolvedTypedConfig {
         config,
@@ -1080,6 +1086,231 @@ fn materialize_config(
     }
 }
 
+/// Move values written under a renamed key onto the key that replaced it.
+///
+/// The old key is HONOURED, not dropped, and the operator is told what to write
+/// instead. Dropping it would be the failure mode this whole area keeps
+/// producing: a setting that parses, applies to nothing, and says nothing.
+///
+/// If both names are present the new one wins and the old is reported as
+/// ignored, because guessing which the operator meant is worse than saying they
+/// disagree.
+fn apply_renamed_keys(layers: &[ConfigLayer]) -> (Vec<ConfigLayer>, Vec<ConfigDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let mut out = layers.to_vec();
+    for layer in &mut out {
+        for (old, new) in RENAMED_KEYS {
+            let Some(value) = layer.values.remove(*old) else {
+                continue;
+            };
+            if layer.values.contains_key(*new) {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    message: format!(
+                        "config key `{old}` was renamed to `{new}`, and both are set — the \
+                         value of `{old}` is ignored. Remove it."
+                    ),
+                });
+                continue;
+            }
+            diagnostics.push(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                message: format!(
+                    "config key `{old}` was renamed to `{new}`; the value was applied, but \
+                     rename it — the old name will stop working."
+                ),
+            });
+            layer.values.insert((*new).to_string(), value);
+        }
+    }
+    (out, diagnostics)
+}
+
+/// Which [`PathExistence`] a value is actually subject to, if any.
+///
+/// A union resolves to whichever arm ACCEPTS the value, so
+/// `ngram_spec_store_root: "ram"` takes the sentinel arm and is not a path at all,
+/// while `"/var/lib/hipfire/ngram"` takes the Path arm and is. Asking the type
+/// alone would get both wrong.
+fn path_existence_for(value: &Value, ty: &ConfigType) -> Option<PathExistence> {
+    match ty {
+        ConfigType::Path { existence } => Some(*existence),
+        ConfigType::OneOf { arms } => arms
+            .iter()
+            .find(|arm| validate_resolved_value(value, arm).is_ok())
+            .and_then(|arm| path_existence_for(value, arm)),
+        _ => None,
+    }
+}
+
+/// Warn about configured paths that are not on disk.
+///
+/// Separate from [`domain_diagnostics`] because this one does I/O. The resolver
+/// is pure and runs in tests and the settings editor; a filesystem probe there
+/// would be wrong and slow. Callers run this once, at startup or from `doctor`.
+///
+/// Always a warning. A network models dir may be mounted after the daemon
+/// starts, and existence is TOCTOU regardless — it says the path was there at
+/// boot, not that it will be there at use. Refusing to start would trade a
+/// visible warning for an outage.
+pub fn path_existence_diagnostics(config: &HipfireConfig) -> Vec<ConfigDiagnostic> {
+    let values = config_value_map(config);
+    let mut out = Vec::new();
+    for field in config_schema() {
+        let Some(value) = values.get(field.key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else { continue };
+        let trimmed = text.trim();
+        // An empty path is "unset", not "missing"; Requirement covers that.
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(existence) = path_existence_for(value, &field.ty) else {
+            continue;
+        };
+        // A malformed path is domain_diagnostics' finding, not ours — do not
+        // report the same value twice under two headings.
+        if resolve::validate_path(trimmed).is_err() {
+            continue;
+        }
+        let path = std::path::Path::new(trimmed);
+        let message = match existence {
+            PathExistence::Exists if !path.exists() => {
+                format!("config key `{}` = {trimmed} does not exist", field.key)
+            }
+            PathExistence::ParentExists => match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => format!(
+                    "config key `{}` = {trimmed} will be created on first use, but its parent \
+                     directory {} does not exist and nothing here creates one",
+                    field.key,
+                    parent.display()
+                ),
+                _ => continue,
+            },
+            PathExistence::Exists => continue,
+        };
+        out.push(ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Warning,
+            message,
+        });
+    }
+    out
+}
+
+/// Warn about resolved values that violate their field's declared domain.
+///
+/// `resolve_field` takes a file value verbatim, so until now nothing checked
+/// one: only the environment went through `parse_env_value`, and the typed
+/// materialize step catches a Rust type mismatch but never a domain one —
+/// `kv_cache: "kvarnn"` is a perfectly good String and reached the KV match as
+/// an unrecognized mode.
+///
+/// Warning, not error, and the value still resolves as it always did. These are
+/// configs already running; naming a bad value is the fix, refusing to boot on
+/// it is not.
+fn domain_diagnostics(resolution: &ConfigResolution) -> Vec<ConfigDiagnostic> {
+    let by_key = config_schema()
+        .iter()
+        .map(|field| (field.key, field))
+        .collect::<BTreeMap<_, _>>();
+    resolution
+        .values
+        .iter()
+        .filter(|resolved| {
+            // Only what someone actually WROTE. A compiled default that fails
+            // its own domain is a schema bug, and reporting it to the operator
+            // would be noise they cannot act on.
+            !matches!(
+                resolved.source.as_ref().map(|source| source.kind),
+                None | Some(ConfigLayerKind::CompiledDefault)
+            )
+        })
+        .filter_map(|resolved| {
+            let field = by_key.get(resolved.key.as_str())?;
+            let value = resolved.value.as_ref()?;
+            let want = validate_resolved_value(value, &field.ty).err()?;
+            let source = resolved
+                .source
+                .as_ref()
+                .map(|source| match source.id.as_deref() {
+                    Some(id) => format!("{:?}:{id}", source.kind),
+                    None => format!("{:?}", source.kind),
+                })
+                .unwrap_or_default();
+            Some(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                message: format!(
+                    "config key `{}` = {value} (from {source}) is outside its declared \
+                     domain: {want}. It was kept as written.",
+                    resolved.key
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Report unknown field names inside `model_overrides` entries that did NOT
+/// become a layer.
+///
+/// `resolve_config_layers` can only inspect layers, and a `model_overrides`
+/// entry becomes one only when its key matches the tag being resolved
+/// (`config_layers_from_documents`). So a typo'd field in an entry for any
+/// OTHER model was never schema-checked — and neither was the entry whose key
+/// itself was misspelled, since that key matches no tag and so contributes no
+/// layer at all. Such an entry was silent twice over: it applied nothing, and
+/// nothing said its contents were unreadable.
+///
+/// Entries that DID become a layer are skipped; `resolve_config_layers` has
+/// already reported those, and re-reporting would double every finding.
+///
+/// This only names fields the schema does not define. Whether an override KEY
+/// matches a real model needs the model listing, which this crate does not
+/// have.
+fn unknown_keys_in_unapplied_overrides(
+    layers: &[ConfigLayer],
+    model_overrides: &HashMap<String, Value>,
+    resolution: &mut ConfigResolution,
+) {
+    let applied = layers
+        .iter()
+        .filter(|layer| {
+            matches!(
+                layer.kind,
+                ConfigLayerKind::Model | ConfigLayerKind::ModelHost
+            )
+        })
+        .filter_map(|layer| layer.id.as_deref())
+        .collect::<BTreeSet<_>>();
+
+    let known = config_schema()
+        .iter()
+        .map(|field| field.key)
+        .collect::<BTreeSet<_>>();
+
+    let mut tags = model_overrides.keys().collect::<Vec<_>>();
+    tags.sort();
+    for tag in tags {
+        if applied.contains(tag.as_str()) {
+            continue;
+        }
+        let Some(object) = model_overrides[tag].as_object() else {
+            continue;
+        };
+        for key in object.keys() {
+            if !known.contains(key.as_str()) {
+                resolution.unknown_keys.push(UnknownConfigKey {
+                    key: key.clone(),
+                    source: ConfigValueSource {
+                        kind: ConfigLayerKind::Model,
+                        id: Some(tag.clone()),
+                    },
+                });
+            }
+        }
+    }
+}
+
 fn model_overrides_from_documents(raw: &Value, host_local: &Value) -> HashMap<String, Value> {
     let mut overrides = model_overrides_from_single_document(raw);
     for (key, value) in model_overrides_from_single_document(host_local) {
@@ -1139,9 +1370,9 @@ mod tests {
         assert_eq!(cfg.kv_cache, "auto");
         assert_eq!(cfg.kv_adaptive, "off");
         assert_eq!(cfg.flash_mode, "auto");
-        assert_eq!(cfg.dflash_mode, "off");
+        assert_eq!(cfg.dflash_draft, "off");
         assert!(cfg.dflash_adaptive_b);
-        assert_eq!(cfg.dflash_ngram_block, serde_json::json!("auto"));
+        assert_eq!(cfg.dflash_no_repeat_ngram, serde_json::json!("auto"));
         assert_eq!(cfg.mtp_mode, "auto");
         assert_eq!(cfg.mtp_k, 3);
         assert_eq!(cfg.thinking, "off");
@@ -1373,7 +1604,7 @@ mod tests {
         assert_eq!(resolved.max_tokens, 64);
         assert_eq!(resolved.kv_cache, "q8");
         assert_eq!(resolved.kv_adaptive, "balanced");
-        assert_eq!(resolved.dflash_ngram_block, serde_json::json!(true));
+        assert_eq!(resolved.dflash_no_repeat_ngram, serde_json::json!(true));
         assert!(resolved.cask);
         assert_eq!(resolved.cask_budget, 1024);
         assert_eq!(resolved.prefill_compression, "auto");
@@ -1420,6 +1651,317 @@ mod tests {
                 .any(|d| d.message.contains("resource_lock_npus")),
             "the malformed key must be NAMED — being unnamed is what made this \
              invisible for so long"
+        );
+    }
+
+    #[test]
+    fn a_union_field_accepts_every_arm() {
+        for raw in ["", "ram", "none", "off", "/var/lib/hipfire/ngram"] {
+            let resolved = resolve_typed_config_document(
+                &serde_json::json!({ "ngram_spec_store_root": raw }),
+                None,
+            );
+            assert_eq!(resolved.config.ngram_spec_store_root, raw);
+            assert!(
+                !resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("ngram_spec_store_root")),
+                "`{raw}` is a valid arm but was reported: {:?}",
+                resolved.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_dflash_path_implies_on() {
+        assert_eq!(dflash_draft_setting("off"), ("off", None));
+        assert_eq!(dflash_draft_setting(""), ("off", None));
+        assert_eq!(dflash_draft_setting("auto"), ("auto", None));
+        assert_eq!(dflash_draft_setting("on"), ("on", None));
+        // Naming a drafter is asking for it, so the mode follows the path.
+        assert_eq!(
+            dflash_draft_setting("/drafts/x.hfq"),
+            ("on", Some("/drafts/x.hfq"))
+        );
+    }
+
+    #[test]
+    fn dflash_mode_migrates_onto_dflash_draft() {
+        // The two were one question asked twice; the old key's values carry
+        // over unchanged rather than being dropped.
+        for value in ["off", "auto", "on"] {
+            let raw = serde_json::json!({ "dflash_mode": value });
+            let resolved = resolve_typed_config_document(&raw, None);
+            assert_eq!(
+                resolved.config.dflash_draft, value,
+                "dflash_mode={value} must carry over"
+            );
+            assert!(
+                resolved.diagnostics.iter().any(
+                    |d| d.message.contains("dflash_mode") && d.message.contains("dflash_draft")
+                ),
+                "the migration must name both keys: {:?}",
+                resolved.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_dflash_draft_union_accepts_both_arms() {
+        for value in ["off", "auto", "on", "/etc/hostname"] {
+            let raw = serde_json::json!({ "dflash_draft": value });
+            let resolved = resolve_typed_config_document(&raw, None);
+            assert!(
+                !resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("dflash_draft")),
+                "`{value}` is a valid arm but was reported: {:?}",
+                resolved.diagnostics
+            );
+        }
+        // A relative path is neither a keyword nor an absolute path.
+        let raw = serde_json::json!({ "dflash_draft": "drafts/x.hfq" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        let msg = resolved
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("dflash_draft"))
+            .map(|d| d.message.clone())
+            .expect("a value matching no arm must be reported");
+        assert!(
+            msg.contains("off") && msg.contains("absolute"),
+            "the report must name both arms' expectations: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_renamed_key_is_honoured_and_reported() {
+        let raw = serde_json::json!({ "ngram_store_root": "/tmp", "ngram_orders": "4,3,2" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert_eq!(
+            resolved.config.ngram_spec_store_root, "/tmp",
+            "the old key's value must still apply — dropping it silently is the bug"
+        );
+        assert_eq!(resolved.config.ngram_spec_orders, "4,3,2");
+        for (old, new) in [
+            ("ngram_store_root", "ngram_spec_store_root"),
+            ("ngram_orders", "ngram_spec_orders"),
+        ] {
+            assert!(
+                resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains(old) && d.message.contains(new)),
+                "the rename must name BOTH the old and new key: {:?}",
+                resolved.diagnostics
+            );
+        }
+        assert!(
+            resolved.resolution.unknown_keys.is_empty(),
+            "a renamed key is not an unknown key: {:?}",
+            resolved.resolution.unknown_keys
+        );
+    }
+
+    #[test]
+    fn the_new_key_wins_when_both_are_set() {
+        let raw = serde_json::json!({
+            "ngram_store_root": "/old", "ngram_spec_store_root": "/new",
+        });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert_eq!(resolved.config.ngram_spec_store_root, "/new");
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("both are set")),
+            "a disagreement between the two names must be reported, not guessed"
+        );
+    }
+
+    #[test]
+    fn a_missing_input_path_is_reported_and_a_present_one_is_not() {
+        let mut config = HipfireConfig::default();
+        config.cask_sidecar = Some("/definitely/not/here/x.hfq".to_string());
+        assert!(
+            path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("cask_sidecar") && d.message.contains("does not exist")),
+            "a missing input file must be reported"
+        );
+
+        config.cask_sidecar = Some("/etc/hostname".to_string());
+        assert!(
+            !path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("cask_sidecar")),
+            "a present input file must be silent"
+        );
+    }
+
+    #[test]
+    fn an_output_path_needs_only_its_parent() {
+        let mut config = HipfireConfig::default();
+        // Created on first use, parent exists: silent.
+        config.ngram_spec_store_root = "/tmp/hipfire-ngram-does-not-exist-yet".to_string();
+        assert!(
+            path_existence_diagnostics(&config).is_empty(),
+            "an output path whose parent exists must not be reported: {:?}",
+            path_existence_diagnostics(&config)
+        );
+
+        // Parent missing: nothing here builds a directory tree, so warn.
+        config.ngram_spec_store_root = "/definitely/not/here/ngram".to_string();
+        assert!(
+            path_existence_diagnostics(&config)
+                .iter()
+                .any(|d| d.message.contains("parent directory")),
+            "an output path with no parent directory must be reported"
+        );
+    }
+
+    #[test]
+    fn a_ram_sentinel_is_never_treated_as_a_path() {
+        // The union arm decides: "ram" took the sentinel arm, so no I/O check
+        // applies to it however unlike a path it looks.
+        for sentinel in NGRAM_STORE_ROOT_RAM {
+            let mut config = HipfireConfig::default();
+            config.ngram_spec_store_root = sentinel.to_string();
+            assert!(
+                path_existence_diagnostics(&config).is_empty(),
+                "sentinel {sentinel:?} was checked as a path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_reported() {
+        // The point of absolute-only: a sentinel typo is a legal relative path,
+        // so until this rule `rma` resolved silently as a directory.
+        for raw in ["rma", "./tables", "../ngram", "~/ngram", "tables"] {
+            let resolved = resolve_typed_config_document(
+                &serde_json::json!({ "ngram_spec_store_root": raw }),
+                None,
+            );
+            let message = resolved
+                .diagnostics
+                .iter()
+                .find(|d| d.message.contains("ngram_spec_store_root"))
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| panic!("`{raw}` is relative and must be reported"));
+            assert!(
+                message.contains("absolute"),
+                "the report must say what is wrong: {message}"
+            );
+            assert_eq!(
+                resolved.config.ngram_spec_store_root, raw,
+                "reporting must not change what resolves"
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_reports_every_arms_expectation_not_just_the_last() {
+        // A NUL byte fails the sentinel arm AND the path arm, so neither
+        // accepts and the operator should see both domains, not "want a path".
+        let raw = serde_json::json!({ "ngram_spec_store_root": "bad\0path" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        let message = resolved
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("ngram_spec_store_root"))
+            .map(|d| d.message.clone())
+            .expect("a value matching no arm must be reported");
+        assert!(
+            message.contains("ram") && message.contains("path"),
+            "the report must name every arm's expectation: {message}"
+        );
+    }
+
+    #[test]
+    fn a_bad_enum_value_from_a_file_is_reported() {
+        // The gap this closes: resolve_field takes file values verbatim, so
+        // `kvarnn` used to reach the KV match as an unrecognized mode with
+        // nothing said at config level.
+        let raw = serde_json::json!({ "kv_cache": "kvarnn" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("kv_cache")),
+            "an out-of-domain enum value went unreported: {:?}",
+            resolved.diagnostics
+        );
+        assert_eq!(
+            resolved.config.kv_cache, "kvarnn",
+            "reporting must not change what resolves — this warns, never rejects"
+        );
+    }
+
+    #[test]
+    fn a_compiled_default_is_never_reported() {
+        let resolved = resolve_typed_config_document(&serde_json::json!({}), None);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "an untouched config must be silent: {:?}",
+            resolved.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_typo_in_an_unmatched_model_override_is_still_reported() {
+        // Two failures that used to be silent together: the entry's KEY names no
+        // model being resolved, so it contributes no layer — and because it
+        // contributes no layer, the misspelled FIELD inside it was never
+        // schema-checked either.
+        let raw = serde_json::json!({
+            "model_overrides": {
+                "MiniCPM5-1B.oq4.25++": { "kv_cach": "q8", "thinking": "on" },
+            },
+        });
+
+        let resolved = resolve_typed_config_document(&raw, Some("MiniCPM5--1B.oq4.25++"));
+
+        let unknown = &resolved.resolution.unknown_keys;
+        assert!(
+            unknown.iter().any(|k| k.key == "kv_cach"),
+            "the misspelled field in an unapplied override went unreported: {unknown:?}"
+        );
+        assert!(
+            unknown
+                .iter()
+                .any(|k| k.key == "kv_cach"
+                    && k.source.id.as_deref() == Some("MiniCPM5-1B.oq4.25++")),
+            "the report must name WHICH override entry it came from: {unknown:?}"
+        );
+        assert!(
+            !unknown.iter().any(|k| k.key == "thinking"),
+            "`thinking` is a real schema field and must not be reported: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn an_applied_model_override_is_not_reported_twice() {
+        let raw = serde_json::json!({
+            "model_overrides": {
+                "some-model": { "kv_cach": "q8" },
+            },
+        });
+
+        let resolved = resolve_typed_config_document(&raw, Some("some-model"));
+
+        assert_eq!(
+            resolved
+                .resolution
+                .unknown_keys
+                .iter()
+                .filter(|k| k.key == "kv_cach")
+                .count(),
+            1,
+            "the matched override is checked as a layer; checking it again double-reports"
         );
     }
 }

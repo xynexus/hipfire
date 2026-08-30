@@ -73,6 +73,7 @@ pub async fn run(args: DoctorArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 
     let mut ctx = DoctorContext::default();
     check_paths(&mut report, &loaded, args.fix);
+    check_config(&mut report, &loaded);
     check_device_nodes(&mut report);
     check_npu_access(&mut report);
     check_gpu_driver_firmware(&mut report);
@@ -108,6 +109,56 @@ pub async fn run(args: DoctorArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 #[derive(Default)]
 struct DoctorContext {
     arch: Option<String>,
+}
+
+/// Report what config resolution found, plus the on-disk state of every path
+/// the schema declares.
+///
+/// `check_paths` covers the four fixed hipfire directories. This covers the
+/// CONFIGURED ones — `cask_sidecar` and `prefill_drafter` in particular, which
+/// nothing checked before: an explicit sidecar path is taken on trust by
+/// `resolve_component_source`, so a typo failed deep in the model load, after
+/// the weight upload, rather than here.
+///
+/// Warn rather than Fail: these do not stop the daemon, and a network path may
+/// be mounted after boot.
+fn check_config(report: &mut DoctorReport, loaded: &LoadedConfig) {
+    let mut findings = loaded
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    findings.extend(loaded.resolution.unknown_keys.iter().map(|unknown| {
+        format!(
+            "unknown key `{}` is not a schema field and does nothing",
+            unknown.key
+        )
+    }));
+    findings.extend(
+        hipfire_config::path_existence_diagnostics(&loaded.config)
+            .into_iter()
+            .map(|diagnostic| diagnostic.message),
+    );
+
+    report.checks.push(DoctorCheck {
+        id: "config.schema",
+        status: if findings.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        message: if findings.is_empty() {
+            "config matches the schema and every configured path is present".to_string()
+        } else {
+            format!(
+                "{} config issue(s): {}",
+                findings.len(),
+                findings.join("; ")
+            )
+        },
+        details: json!({ "findings": findings }),
+        fix: None,
+    });
 }
 
 fn check_paths(report: &mut DoctorReport, loaded: &LoadedConfig, fix: bool) {
