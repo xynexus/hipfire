@@ -22,6 +22,12 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire lora export`↴](#hipfire-lora-export)
 * [`hipfire lora merge`↴](#hipfire-lora-merge)
 * [`hipfire lora convert`↴](#hipfire-lora-convert)
+* [`hipfire artifact`↴](#hipfire-artifact)
+* [`hipfire artifact audit-calibration`↴](#hipfire-artifact-audit-calibration)
+* [`hipfire artifact compare-calibration`↴](#hipfire-artifact-compare-calibration)
+* [`hipfire artifact compare-calibration-stability`↴](#hipfire-artifact-compare-calibration-stability)
+* [`hipfire artifact compare-residuals`↴](#hipfire-artifact-compare-residuals)
+* [`hipfire artifact moe-router-profile`↴](#hipfire-artifact-moe-router-profile)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -103,6 +109,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `export` — Export a `.hfq` back to an external format
 * `repack` — Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
 * `lora` — Derive, merge or convert a steering adapter
+* `artifact` — Audit and compare calibration / residual artifacts
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -441,6 +448,97 @@ Convert an adapter between `.hfq` and `.json` forms
 
 * `--in <INPUT>` — Source adapter. (Spelled `--in`, matching the existing tool.)
 * `--out <OUT>` — Destination adapter
+
+
+
+## `hipfire artifact`
+
+Audit and compare calibration / residual artifacts
+
+**Usage:** `hipfire artifact <COMMAND>`
+
+###### **Subcommands:**
+
+* `audit-calibration` — Check a `.calib.hfq` for structural and coverage problems
+* `compare-calibration` — Compare two calibration artifacts numerically
+* `compare-calibration-stability` — Compare a lower-capacity calibration against a higher-capacity one
+* `compare-residuals` — Compare two residual-probe artifacts
+* `moe-router-profile` — Report routed-expert activation distribution from a calibration artifact
+
+
+
+## `hipfire artifact audit-calibration`
+
+Check a `.calib.hfq` for structural and coverage problems
+
+**Usage:** `hipfire artifact audit-calibration --input <INPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Calibration artifact to audit
+
+
+
+## `hipfire artifact compare-calibration`
+
+Compare two calibration artifacts numerically
+
+**Usage:** `hipfire artifact compare-calibration [OPTIONS] --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference artifact
+* `--candidate <CANDIDATE>` — Candidate artifact
+* `--atol <ATOL>` — Absolute tolerance
+* `--rtol <RTOL>` — Relative tolerance
+* `--max-reports <MAX_REPORTS>` — Cap on reported mismatches
+* `--allow-unproven-provenance` — Compare even when provenance cannot be proven equal
+
+
+
+## `hipfire artifact compare-calibration-stability`
+
+Compare a lower-capacity calibration against a higher-capacity one
+
+**Usage:** `hipfire artifact compare-calibration-stability --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference (higher-capacity) artifact
+* `--candidate <CANDIDATE>` — Candidate (lower-capacity) artifact
+
+
+
+## `hipfire artifact compare-residuals`
+
+Compare two residual-probe artifacts
+
+**Usage:** `hipfire artifact compare-residuals [OPTIONS] --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference residuals artifact
+* `--candidate <CANDIDATE>` — Candidate residuals artifact
+* `--atol <ATOL>` — Absolute tolerance
+* `--rtol <RTOL>` — Relative tolerance
+* `--max-reports <MAX_REPORTS>` — Cap on reported mismatches
+
+
+
+## `hipfire artifact moe-router-profile`
+
+Report routed-expert activation distribution from a calibration artifact
+
+**Usage:** `hipfire artifact moe-router-profile [OPTIONS] --input <INPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Calibration artifact to profile
+* `--layer <LAYER>` — Restrict to one layer
+* `--top <TOP>` — Report the top N experts
+* `--min-activations <MIN_ACTIVATIONS>` — Ignore experts below this activation count
+* `--tokenizer <TOKENIZER>` — Tokenizer for naming, when available
+* `--json` — Emit JSON instead of a table
 
 
 

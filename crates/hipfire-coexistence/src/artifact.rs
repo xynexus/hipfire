@@ -6,51 +6,28 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn index_identity(hfq: &HfqFile, metadata: Value) -> Value {
-    let tensors = hfq
-        .tensors()
-        .iter()
-        .map(|tensor| {
-            json!({
-                "name": tensor.name,
-                "quant_type": tensor.quant_type,
-                "shape": tensor.shape,
-                "group_size": tensor.group_size,
-                "data_size": tensor.data_size,
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "version": hfq.version,
-        "arch_id": hfq.arch_id,
-        "metadata": metadata,
-        "tensors": tensors,
-    })
-}
-
-pub(crate) fn index_fingerprint(identity: &Value) -> Result<String, serde_json::Error> {
-    Ok(hipfire_hash::stable_hash_bytes(&serde_json::to_vec(
-        identity,
-    )?))
-}
-
-/// Return provenance and an index/metadata fingerprint without reading tensor
-/// payloads. The embedded `quantization_hash`, when present, remains the
-/// payload-integrity identity; this fingerprint identifies the artifact's
-/// metadata and tensor layout for cheap resume checks.
+/// Return provenance and an index fingerprint without reading tensor payloads.
+///
+/// The fingerprint is `HfqFile::index_fingerprint` — the SAME number
+/// `hipfire inspect` reports. It used to be a second, independent hash over a
+/// JSON serialization of the same facts, which meant two algorithms answering
+/// one question and disagreeing by value. One of them had to go; the runtime's
+/// is the one every other caller already used.
+///
+/// The embedded `quantization_hash`, when present, remains the payload-integrity
+/// identity; this fingerprint identifies metadata and tensor layout for cheap
+/// resume checks.
 pub fn inspect_artifact(path: &Path) -> Result<Value, Box<dyn Error>> {
     let hfq = HfqFile::open_index_only(path)?;
     let metadata: Value = serde_json::from_str(&hfq.metadata_json)?;
-    let identity = index_identity(&hfq, metadata);
     Ok(json!({
         "artifact": path,
         "bytes": std::fs::metadata(path)?.len(),
         "version": hfq.version,
         "arch_id": hfq.arch_id,
         "tensor_count": hfq.tensors().len(),
-        "artifact_fingerprint": index_fingerprint(&identity)?,
-        "fingerprint_scope": "hfq_metadata_and_tensor_index_v1",
-        "metadata": identity["metadata"],
+        "artifact_fingerprint": hfq.index_fingerprint(),
+        "metadata": metadata,
     }))
 }
 

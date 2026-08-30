@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Index-only structural audit for native calibration artifacts.
 
-use crate::artifact::{index_fingerprint, index_identity};
 use hipfire_runtime::calibration::contracts::{
     CalibrationJob, ExpertCoveragePolicy, ExpertLayerTelemetry, LayerExpert, SamplePosition,
     SampleSet, CALIBRATION_JOB_SCHEMA_VERSION,
@@ -66,8 +65,8 @@ pub struct CalibrationAuditSummary {
 pub struct CalibrationAuditReport {
     pub schema: &'static str,
     pub artifact: PathBuf,
+    /// `HfqFile::index_fingerprint` — the same number `hipfire inspect` reports.
     pub artifact_fingerprint: String,
-    pub fingerprint_scope: &'static str,
     pub bytes: u64,
     pub version: u32,
     pub arch_id: u32,
@@ -640,7 +639,6 @@ fn validate_kldref(
 pub fn audit_calibration_artifact(path: &Path) -> Result<CalibrationAuditReport, Box<dyn Error>> {
     let hfq = HfqFile::open_index_only(path)?;
     let metadata: Value = serde_json::from_str(&hfq.metadata_json)?;
-    let identity = index_identity(&hfq, metadata.clone());
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut summary = CalibrationAuditSummary::default();
@@ -731,8 +729,7 @@ pub fn audit_calibration_artifact(path: &Path) -> Result<CalibrationAuditReport,
     Ok(CalibrationAuditReport {
         schema: AUDIT_SCHEMA,
         artifact: path.to_path_buf(),
-        artifact_fingerprint: index_fingerprint(&identity)?,
-        fingerprint_scope: "hfq_metadata_and_tensor_index_v1",
+        artifact_fingerprint: hfq.index_fingerprint(),
         bytes: std::fs::metadata(path)?.len(),
         version: hfq.version,
         arch_id: hfq.arch_id,

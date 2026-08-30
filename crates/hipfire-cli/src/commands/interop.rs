@@ -335,3 +335,179 @@ pub fn run_lora(args: LoraArgs) -> anyhow::Result<()> {
     full.extend(argv);
     hipfire_coexistence::cli::run(&full).map_err(err)
 }
+
+// ── artifact ─────────────────────────────────────────────────────────────
+
+/// The five read-only artifact reporters.
+///
+/// `inspect` is deliberately absent: it folded into `hipfire inspect`, which
+/// already reported a superset. The one thing it had that `inspect` did not was
+/// a second, independently-computed fingerprint — since unified, so there is
+/// nothing left to promote.
+#[derive(Debug, Args)]
+pub struct ArtifactArgs {
+    #[command(subcommand)]
+    command: ArtifactCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ArtifactCommand {
+    /// Check a `.calib.hfq` for structural and coverage problems.
+    AuditCalibration(AuditCalibrationArgs),
+    /// Compare two calibration artifacts numerically.
+    CompareCalibration(CompareCalibrationArgs),
+    /// Compare a lower-capacity calibration against a higher-capacity one.
+    CompareCalibrationStability(ComparePairArgs),
+    /// Compare two residual-probe artifacts.
+    CompareResiduals(CompareResidualsArgs),
+    /// Report routed-expert activation distribution from a calibration artifact.
+    MoeRouterProfile(MoeRouterProfileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AuditCalibrationArgs {
+    /// Calibration artifact to audit.
+    #[arg(long)]
+    input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct CompareCalibrationArgs {
+    /// Reference artifact.
+    #[arg(long)]
+    reference: PathBuf,
+    /// Candidate artifact.
+    #[arg(long)]
+    candidate: PathBuf,
+    /// Absolute tolerance.
+    #[arg(long)]
+    atol: Option<f64>,
+    /// Relative tolerance.
+    #[arg(long)]
+    rtol: Option<f64>,
+    /// Cap on reported mismatches.
+    #[arg(long)]
+    max_reports: Option<usize>,
+    /// Compare even when provenance cannot be proven equal.
+    #[arg(long)]
+    allow_unproven_provenance: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ComparePairArgs {
+    /// Reference (higher-capacity) artifact.
+    #[arg(long)]
+    reference: PathBuf,
+    /// Candidate (lower-capacity) artifact.
+    #[arg(long)]
+    candidate: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct CompareResidualsArgs {
+    /// Reference residuals artifact.
+    #[arg(long)]
+    reference: PathBuf,
+    /// Candidate residuals artifact.
+    #[arg(long)]
+    candidate: PathBuf,
+    /// Absolute tolerance.
+    #[arg(long)]
+    atol: Option<f64>,
+    /// Relative tolerance.
+    #[arg(long)]
+    rtol: Option<f64>,
+    /// Cap on reported mismatches.
+    #[arg(long)]
+    max_reports: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct MoeRouterProfileArgs {
+    /// Calibration artifact to profile.
+    #[arg(long)]
+    input: PathBuf,
+    /// Restrict to one layer.
+    #[arg(long)]
+    layer: Option<usize>,
+    /// Report the top N experts.
+    #[arg(long)]
+    top: Option<usize>,
+    /// Ignore experts below this activation count.
+    #[arg(long)]
+    min_activations: Option<u64>,
+    /// Tokenizer for naming, when available.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+pub fn run_artifact(args: ArtifactArgs) -> anyhow::Result<()> {
+    let err = |e: Box<dyn std::error::Error>| anyhow::anyhow!("{e}");
+    let (op, argv) = match args.command {
+        ArtifactCommand::AuditCalibration(a) => (
+            "audit-calibration",
+            to_argv(
+                vec![("--input", Some(a.input.display().to_string()))],
+                vec![],
+            ),
+        ),
+        ArtifactCommand::CompareCalibration(a) => (
+            "compare-calibration",
+            to_argv(
+                vec![
+                    ("--reference", Some(a.reference.display().to_string())),
+                    ("--candidate", Some(a.candidate.display().to_string())),
+                    ("--atol", a.atol.map(|v| v.to_string())),
+                    ("--rtol", a.rtol.map(|v| v.to_string())),
+                    ("--max-reports", a.max_reports.map(|v| v.to_string())),
+                ],
+                vec![("--allow-unproven-provenance", a.allow_unproven_provenance)],
+            ),
+        ),
+        ArtifactCommand::CompareCalibrationStability(a) => (
+            "compare-calibration-stability",
+            to_argv(
+                vec![
+                    ("--reference", Some(a.reference.display().to_string())),
+                    ("--candidate", Some(a.candidate.display().to_string())),
+                ],
+                vec![],
+            ),
+        ),
+        ArtifactCommand::CompareResiduals(a) => (
+            "compare-residuals",
+            to_argv(
+                vec![
+                    ("--reference", Some(a.reference.display().to_string())),
+                    ("--candidate", Some(a.candidate.display().to_string())),
+                    ("--atol", a.atol.map(|v| v.to_string())),
+                    ("--rtol", a.rtol.map(|v| v.to_string())),
+                    ("--max-reports", a.max_reports.map(|v| v.to_string())),
+                ],
+                vec![],
+            ),
+        ),
+        ArtifactCommand::MoeRouterProfile(a) => (
+            "moe-router-profile",
+            to_argv(
+                vec![
+                    ("--input", Some(a.input.display().to_string())),
+                    ("--layer", a.layer.map(|v| v.to_string())),
+                    ("--top", a.top.map(|v| v.to_string())),
+                    (
+                        "--min-activations",
+                        a.min_activations.map(|v| v.to_string()),
+                    ),
+                    ("--tokenizer", a.tokenizer.map(|p| p.display().to_string())),
+                ],
+                vec![("--json", a.json)],
+            ),
+        ),
+    };
+    let mut full = vec!["artifact".to_string(), op.to_string()];
+    full.extend(argv);
+    hipfire_coexistence::cli::run(&full).map_err(err)
+}

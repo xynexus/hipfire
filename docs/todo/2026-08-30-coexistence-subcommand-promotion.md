@@ -31,19 +31,19 @@ promotion is real is that the man page appears without anyone writing it.
 | `repack` | `hipfire repack` | `optimize` lost its colliding `repack` alias |
 | `hub` | **retired** | was one spelling of `download` + `repack --check` |
 | `lora` | `hipfire lora {export,merge,convert}` | |
+| `artifact` | `hipfire artifact {audit-calibration,compare-calibration,compare-calibration-stability,compare-residuals,moe-router-profile}` | `inspect` folded into `hipfire inspect` |
 
 ## Remaining
 
 | group | ops | shape |
 |---|---|---|
-| `artifact` | `audit-calibration`, `compare-calibration`, `compare-calibration-stability`, `compare-residuals`, `moe-router-profile` | five read-only reporters; `inspect` is folded into `hipfire inspect` (see below) |
 | `calibrate` | one op, ~30 flags | the largest bag by far |
 | `two-pass` | one op | shares `induction/` with `induct` |
 | `npu` | `pair-hfp` | linux-only (`#[cfg(target_os = "linux")]`) |
 
-Suggested order: `artifact`'s five non-inspect ops, `two-pass`, `npu`, then
-`calibrate` last — its flag bag is big enough that a mechanical transcription is
-where an argument would silently drift.
+Suggested order: `two-pass`, `npu`, then `calibrate` last — its flag bag is big
+enough that a mechanical transcription is where an argument would silently
+drift.
 
 ## Things to decide, not just transcribe
 
@@ -53,40 +53,27 @@ because scripts already use them. Unifying is a breaking change and wants its
 own decision — a clap `alias` could accept both, at the cost of two documented
 names for one flag.
 
-**`artifact inspect` overlap — RESOLVED 2026-08-30, and it was not what it
-looked like.** `hipfire inspect --json` was already a near-superset, so the
-obvious move was to delete the duplicate. Comparing the outputs on the same
-artifact showed why that would have been wrong: `artifact inspect` reports an
-`artifact_fingerprint` that is **not** the same number as `hipfire inspect`'s
-`fingerprint`, and `calibration_audit` records THAT one as an artifact's
-provenance identity.
+**`artifact inspect` overlap — RESOLVED 2026-08-30, and the duplicate is gone.**
+`hipfire inspect --json` was already a near-superset. The one thing
+`artifact inspect` had that it did not was an `artifact_fingerprint` computed by
+a SECOND algorithm — coexistence hashed a JSON serialization of
+`{version, arch_id, metadata, tensors}` while the runtime FNV-1a's
+`metadata_json + arch_id + per-tensor fields` inline. Same question, two answers,
+different values, and `calibration_audit` recorded the coexistence one as
+provenance.
 
-Both answer "identify this artifact's metadata and tensor layout without reading
-payloads". `hipfire` computes FNV-1a inline over `metadata_json + arch_id +
-per-tensor fields`; coexistence hashes a JSON serialization of
-`{version, arch_id, metadata, tensors}` via `hipfire_hash::stable_hash_bytes`.
-Same purpose, different algorithms, different values.
+Both now use `HfqFile::index_fingerprint`. `crate::artifact::index_identity` and
+`index_fingerprint` are deleted, `fingerprint_scope` is deleted (a scope string
+distinguishes algorithms, and there is only one now), and `hipfire inspect`
+reports a single `fingerprint` plus `file_bytes` — the on-disk size, which is
+genuinely distinct from `totals.bytes`, the tensor payload sum. Verified: the
+audit report and `hipfire inspect` print the same number for the same artifact.
 
-`hipfire inspect` now carries both, each under its own name, plus `file_bytes`
-(on-disk size, distinct from `totals.bytes` which is tensor payload). Verified
-byte-identical to what the coexistence tool reports, so existing provenance
-records stay valid.
-
-**The remaining question is the duplication itself, and it is a DATA decision.**
-Two fingerprint algorithms for one purpose is one too many, but unifying them
-invalidates every recorded `artifact_fingerprint` — calibration provenance and
-resume checks. That needs a migration story (record both during a transition,
-or version the scope string), not a rename. Until then `fingerprint_scope`
-exists precisely so a reader can tell which is which.
-
-`artifact`'s other five ops (`audit-calibration`, `compare-calibration`,
-`compare-calibration-stability`, `compare-residuals`, `moe-router-profile`) have
-no such overlap and are ordinary promotions.
-
-**The `.hfa` inspect gap.** `hipfire inspect` refuses an `.hfa` with a pointer to
-`hipfire-coexistence repack`. That pointer now names a command that no longer
-needs the standalone binary — `hipfire repack` — and the message should be
-updated when `artifact` is settled.
+**This invalidated previously recorded fingerprints, deliberately.** Any
+`artifact_fingerprint` written into an induction manifest or calibration audit
+before this change carries the old algorithm's value and will not match a
+freshly computed one. Accepted rather than migrated: the alternative was
+carrying two hashes indefinitely so that stale records keep verifying.
 
 **Every promotion is a bridge, not a rewrite.** The current commands build an
 argv vector and call the existing `run_cli`. That keeps behaviour identical and
