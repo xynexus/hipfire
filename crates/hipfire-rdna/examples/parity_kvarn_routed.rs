@@ -291,7 +291,7 @@ fn main() {
     gpu.attention_kvarn_routed_batched(
         false, // window_f16: this fixture allocates an f32 window
         &qd, &recp, &winp, &vp, &out_b, &rsid, &posd, 1, 0, N_HEADS, N_KV_HEADS, HEAD_DIM, MAX_SEQ,
-        max_ctx, n_rows,
+        max_ctx, n_rows, 4, 0, // bits = 4-bit K codes; row_offset = whole batch
     )
     .unwrap();
     gpu.device_synchronize().unwrap();

@@ -106,10 +106,14 @@ impl Eviction {
 /// `generate` fast path when temperature == 0 — falls back to AR sampling
 /// otherwise (DFlash is greedy-only in this integration).
 pub struct DflashState {
-    pub draft_config: DflashConfig,
-    pub draft_weights: DflashWeights,
-    pub draft_scratch: DflashScratch,
-    pub hidden_rb: HiddenStateRingBuffer,
+    // The DRAFTER. `None` when this state exists only to carry n-gram
+    // speculative decode, which drafts from statistics and needs no drafter
+    // model: `spec_step_dflash` takes all four as Option and skips the drafter
+    // branch, the hidden-state extraction and the staging that feeds it.
+    pub draft_config: Option<DflashConfig>,
+    pub draft_weights: Option<DflashWeights>,
+    pub draft_scratch: Option<DflashScratch>,
+    pub hidden_rb: Option<HiddenStateRingBuffer>,
     pub verify_scratch: VerifyScratch,
     pub target_snap: DeltaNetSnapshot,
     pub gdn_tape: GdnTape,
@@ -121,11 +125,108 @@ pub struct DflashState {
     pub ctx_capacity: usize,
     /// Block size the draft was trained at.
     pub block_size: usize,
+    /// Adaptive block sizing (cost-model argmax over [2, block_size]) in the
+    /// chain-mode decode loop. Per-load `dflash_adaptive_b` param; default OFF
+    /// (opt-in) — see the load-site comment for the measurement. A
+    /// `HIPFIRE_DFLASH_BLOCK` pin overrides it.
+    pub adaptive_b: bool,
     /// Optional DDTree state. Populated only when `HIPFIRE_DDTREE_BUDGET` is
     /// set to a positive integer at daemon startup. None = DDTree disabled,
     /// the decode loop falls through to `spec_step_dflash` (chain mode).
     /// See `spec_step_ddtree_batched` for the tree-verify path.
     pub ddtree: Option<DdtreeState>,
+    /// Opt-in n-gram speculative decode (`ngram_spec`). `None` = off, and the
+    /// decode loop behaves exactly as before. See `NgramSetup`.
+    pub ngram: Option<NgramSetup>,
+    /// The live n-gram state, kept across requests for the life of the load.
+    ///
+    /// This has to outlive a single request or the feature is decorative: the
+    /// hot tier carries ~95% of the measured value and grams only reach disk
+    /// after `promote_count` observations, so rebuilding per request resets
+    /// every counter and almost nothing is ever promoted. The `String` is the
+    /// scope key (user + session type); a request with a different key swaps
+    /// the state out rather than reading another user's table.
+    pub ngram_live: Option<(String, hipfire_specdecode_ngram::NgramSpec)>,
+}
+
+/// Per-request identity used to pick n-gram tables.
+///
+/// Threaded rather than read from a global, for the same reason `raw_override`
+/// and `sampler_seed` are — and here the stakes are higher than a wrong
+/// sampling seed: `next`/`next2` are stored in plaintext, so a request writing
+/// into the wrong user's table would hand that user's text to whoever reads it
+/// next.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NgramRequestScope<'a> {
+    /// Owner of the writable table. `None` = daemon-local (single-tenant).
+    pub user_id: Option<&'a str>,
+    /// Subject label ("python-coding"). Selects a topic table *under this
+    /// user*, so it stays private.
+    pub session_type: Option<&'a str>,
+}
+
+/// Where a request's n-gram tables live, resolved at load time.
+///
+/// `scope` names the **tokenizer**, not the model: records are token ids, so
+/// every quant variant of one base may share a table and two tokenizers never
+/// can. It defaults to the model filename, which never wrongly shares.
+#[derive(Debug, Clone)]
+pub struct NgramSetup {
+    /// Root directory for the tables, or a RAM-only sentinel.
+    ///
+    /// Empty, `ram`, `none` or `off` (any case) all mean *do not persist*: the
+    /// hot tier still runs, nothing touches disk. The word forms exist because
+    /// "leave this blank" is not expressible in a settings UI — an operator
+    /// cannot tell an unset field from one deliberately set to RAM-only.
+    pub store_root: std::path::PathBuf,
+    pub scope: String,
+    /// Blocks in a newly created store; the file is allocated in full and never
+    /// grows, so this is the budget. 65536 blocks x 4 KiB = 256 MiB.
+    pub blocks: usize,
+    /// Probe orders, longest first.
+    pub orders: Vec<u8>,
+    /// Minimum winning order to keep extending a chain; 0 disables the gate.
+    pub chain_floor: u8,
+    pub max_spine: usize,
+    /// Observations before a gram is persisted. Gates writes, never drafting.
+    pub promote_count: u16,
+    /// Which store the write path feeds.
+    pub write_target: NgramWriteTarget,
+}
+
+impl NgramSetup {
+    /// Whether tables should be written to disk at all.
+    ///
+    /// The RAM sentinels come from the `ngram_store_root` schema field
+    /// (`NGRAM_STORE_ROOT_RAM`) rather than a list repeated here. They used to
+    /// be written twice — once in that field's prose description and once as a
+    /// `matches!` in this function — with nothing keeping them in step.
+    pub fn persists(&self) -> bool {
+        let raw = self.store_root.as_os_str().to_string_lossy();
+        let t = raw.trim().to_ascii_lowercase();
+        !hipfire_config::NGRAM_STORE_ROOT_RAM.contains(&t.as_str())
+    }
+}
+
+/// Which n-gram store the write path feeds. Only a store private to its scope
+/// may be written; a shared one is opened read-only and refuses writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NgramWriteTarget {
+    User,
+    Topic,
+    None,
+}
+
+impl NgramWriteTarget {
+    /// Parse an operator string; anything unrecognised falls back to `User`,
+    /// the safe default (private by construction).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "topic" => Self::Topic,
+            "none" | "off" => Self::None,
+            _ => Self::User,
+        }
+    }
 }
 
 /// Optional DSpark speculative-decoding state for the dense LLaMA/Qwen3 arch
@@ -510,5 +611,78 @@ impl LoadedModel {
             .sequence_state
             .as_mut()
             .and_then(|s| s.recurrent_as_mut::<DeltaNetState>())
+    }
+}
+
+#[cfg(test)]
+mod ngram_setup_tests {
+    use super::*;
+
+    /// `persists()` reads the `ngram_store_root` schema field's arm rather than
+    /// its own list, so the two cannot drift. This is what binds them: a
+    /// sentinel added to the schema and not handled here fails the build's
+    /// tests, not a user's config.
+    #[test]
+    fn every_schema_sentinel_means_ram() {
+        for sentinel in hipfire_config::NGRAM_STORE_ROOT_RAM {
+            let setup = NgramSetup {
+                store_root: std::path::PathBuf::from(sentinel),
+                scope: "s".into(),
+                blocks: 1,
+                orders: vec![2],
+                chain_floor: 0,
+                max_spine: 1,
+                promote_count: 1,
+                write_target: NgramWriteTarget::User,
+            };
+            assert!(
+                !setup.persists(),
+                "schema declares {sentinel:?} a RAM sentinel but persists() disagrees"
+            );
+        }
+    }
+
+    /// The RAM-only case has to be expressible as a *value*, not just as "leave
+    /// the field blank" — a settings UI cannot distinguish an unset field from
+    /// one deliberately set to RAM-only.
+    #[test]
+    fn ram_sentinels_disable_persistence() {
+        let mk = |root: &str| NgramSetup {
+            store_root: std::path::PathBuf::from(root),
+            scope: "s".into(),
+            blocks: 1,
+            orders: vec![2],
+            chain_floor: 0,
+            max_spine: 1,
+            promote_count: 1,
+            write_target: NgramWriteTarget::User,
+        };
+        for off in [
+            "", "  ", "ram", "RAM", "Ram", "none", "NONE", "off", " off ",
+        ] {
+            assert!(!mk(off).persists(), "{off:?} should mean RAM-only");
+        }
+        for on in [
+            "/srv/ngram",
+            "./tables",
+            "/tmp/ram-disk",
+            "ramdisk",
+            "/var/ram",
+        ] {
+            assert!(mk(on).persists(), "{on:?} is a path and must persist");
+        }
+    }
+
+    #[test]
+    fn write_target_parses_and_defaults_to_private() {
+        assert_eq!(NgramWriteTarget::parse("topic"), NgramWriteTarget::Topic);
+        assert_eq!(NgramWriteTarget::parse("none"), NgramWriteTarget::None);
+        assert_eq!(NgramWriteTarget::parse("off"), NgramWriteTarget::None);
+        assert_eq!(NgramWriteTarget::parse("user"), NgramWriteTarget::User);
+        assert_eq!(NgramWriteTarget::parse("USER"), NgramWriteTarget::User);
+        // Anything unrecognised must fall back to the private store, never to a
+        // shared one.
+        assert_eq!(NgramWriteTarget::parse("typo"), NgramWriteTarget::User);
+        assert_eq!(NgramWriteTarget::parse(""), NgramWriteTarget::User);
     }
 }

@@ -488,6 +488,13 @@ fn wt_from_raw(
         // OQ4 canonical (34, repack) / arch-packed (37, verbatim) via the shared
         // decision helper (single source of truth).
         OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            // A ragged K is an NPU-targeted artifact reaching a GPU loader, not
+            // corruption — and `oq4_pack_arch_combined`'s assert would abort the whole
+            // process. Same pre-check the hfq.rs and qwen35 loaders already carry;
+            // commit 3883204a1 added it to those two and missed the other five.
+            if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+                return Err(why);
+            }
             let (bytes, dtype) = oq4_arch_load(qt, data, m, k)
                 .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
             return upload_wt_raw(gpu, &bytes, dtype, m, k);

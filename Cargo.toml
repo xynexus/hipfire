@@ -35,6 +35,7 @@ members = [
     "crates/hipfire-specdecode-ddtree",
     "crates/hipfire-specdecode-mtp",
     "crates/hipfire-specdecode-dspark",
+    "crates/hipfire-specdecode-ngram",
     "crates/hipfire-scheduler",
     "crates/hipfire-state",
     "crates/hipfire-mixer",

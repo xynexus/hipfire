@@ -68,6 +68,9 @@ pub struct LoadedModelState {
     /// Arch tag reported by the daemon load (a registered model_type), cached
     /// for batch-eligibility routing.
     pub arch: Option<String>,
+    /// The daemon's probe of this loaded model: can it take the fused batch
+    /// prefill? Cached alongside `arch` because routing needs both.
+    pub batch_prefill_capable: Option<bool>,
 }
 
 pub struct AppState {

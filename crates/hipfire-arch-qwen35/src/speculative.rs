@@ -189,6 +189,23 @@ fn dflash_gemm_opus_lmhead(
         None
     };
 
+    // The weights' rotation order must match the activation's. `group` above is
+    // 128 for OqCompactG128, but `ensure_mq_signs` / `rotate_x_mq_batched` below
+    // are the 256-point FWHT (seeds 42/1042) while G128 weights carry the
+    // 128-point one (43/1043) — the two do not cancel, so the GEMM sees an
+    // activation in the wrong basis. There is no BATCHED 128-point rotation
+    // (`rotate_x_mq_128` is single-row), and this helper also backs
+    // `dflash_enqueue_verify_lm_head`, so the error is output-affecting rather
+    // than merely a worse draft. Refuse instead of computing it wrongly.
+    //
+    // Upgrade path: add a batched `rotate_x_mq_128` (or loop the single-row one
+    // over the n rows) and select the transform by `group` here.
+    if matches!(w_out.gpu_dtype, hipfire_rdna::DType::OqCompactG128) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "opus lm_head: OqCompactG128 needs the 128-point FWHT for its              activation, but only the 256-point batched rotation exists. The two              rotations do not cancel, so this would silently compute in the wrong              basis. Use an OqCompactG256 lm_head, or add a batched 128-point              rotation and select it by group.",
+        ));
+    }
     gpu.ensure_mq_signs()?;
     let rot = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::F32)?;
     let xq = gpu.alloc_owned(&[n * w_out.k], hipfire_rdna::DType::Raw)?;
@@ -6583,7 +6600,7 @@ pub fn verify_dflash_block(
     target: &mut ModelSlot,
     draft_tokens: &[u32],
     start_pos: usize,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     verify_scratch: &VerifyScratch,
@@ -6606,7 +6623,7 @@ fn verify_dflash_block_with_graph_policy(
     target: &mut ModelSlot,
     draft_tokens: &[u32],
     start_pos: usize,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     graph_policy: VerifyGraphPolicy,
@@ -6654,7 +6671,7 @@ pub fn verify_dflash_block_tree(
         target,
         draft_tokens,
         start_pos,
-        hidden_rb,
+        Some(hidden_rb),
         gdn_tape,
         want_full_logits,
         Some(tree_verify),
@@ -6668,7 +6685,7 @@ fn verify_dflash_block_inner(
     target: &mut ModelSlot,
     draft_tokens: &[u32],
     start_pos: usize,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
@@ -6891,7 +6908,7 @@ fn verify_dflash_block_inner(
                 &mut target.dn_state,
                 &target.scratch,
                 pbs,
-                Some(hidden_rb),
+                hidden_rb.as_deref(),
                 Some(&final_hidden),
                 gdn_tape,
                 tree_verify,
@@ -6919,7 +6936,7 @@ fn verify_dflash_block_inner(
                 &mut target.dn_state,
                 &target.scratch,
                 pbs,
-                Some(hidden_rb),
+                hidden_rb.as_deref(),
                 Some(&final_hidden),
                 gdn_tape,
                 tree_verify,
@@ -6982,7 +6999,7 @@ fn verify_dflash_block_inner(
             &mut target.kv_cache,
             &mut target.dn_state,
             &target.scratch,
-            Some(hidden_rb),
+            hidden_rb.as_deref_mut(),
             Some(&final_hidden),
             gdn_tape,
             tree_verify,
@@ -7000,7 +7017,9 @@ fn verify_dflash_block_inner(
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
     if verify_graph_ok && batch_result.is_ok() {
-        hidden_rb.commit_staging_to_ring(gpu, b)?;
+        if let Some(hidden_rb) = hidden_rb.as_deref_mut() {
+            hidden_rb.commit_staging_to_ring(gpu, b)?;
+        }
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
     // (e.g. budget=60 topk=8 drops 7.0 → 3.3; 9B asym3 2026-04-14). topk=1
@@ -7323,13 +7342,26 @@ pub fn download_hidden_block(
 /// was shorter than inference-time, truncation may help. `None` uses the
 /// full cumulative context (the default, distribution-preserving path).
 #[allow(clippy::too_many_arguments)]
+/// Block size to request for one speculative step.
+///
+/// An explicit override wins, else the drafter's trained block size. With
+/// NEITHER — the drafter-free case where the caller passed no cap — the answer
+/// is 1, which `spec_step_dflash` turns into a plain AR step rather than
+/// speculating with nothing to speculate from.
+pub(crate) fn requested_block_size(
+    block_size_override: Option<usize>,
+    draft_block_size: Option<usize>,
+) -> usize {
+    block_size_override.or(draft_block_size).unwrap_or(1)
+}
+
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
-    draft_weights: &DflashWeights,
-    draft_cfg: &DflashConfig,
-    draft_scratch: &mut DflashScratch,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    draft_weights: Option<&DflashWeights>,
+    draft_cfg: Option<&DflashConfig>,
+    mut draft_scratch: Option<&mut DflashScratch>,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     target_hidden_host: &mut Vec<f32>,
     target_snap: &mut DeltaNetSnapshot,
     verify_scratch: &VerifyScratch,
@@ -7354,7 +7386,17 @@ pub fn spec_step_dflash(
     // When `pld_spine` is Some, shrink b to 1+pld.len() (capped at requested)
     // so we don't run off the end of the PLD continuation. PLD-supplied
     // spines are often shorter than the trained B; the paper caps at 8.
-    let requested_b = block_size_override.unwrap_or(draft_cfg.block_size);
+    // With no drafter there is nothing to draft FROM except a supplied spine.
+    // An n-gram miss hands us `None`, and the honest answer there is "do not
+    // speculate": an empty spine means b=1, which the branch below turns into a
+    // plain AR step. This also makes the drafter branch unreachable when
+    // `draft_weights` is None, which is what lets it unwrap below.
+    let no_drafter_ar_step: [u32; 0] = [];
+    let pld_spine = match (pld_spine, draft_weights.is_some()) {
+        (None, false) => Some(&no_drafter_ar_step[..]),
+        (other, _) => other,
+    };
+    let requested_b = requested_block_size(block_size_override, draft_cfg.map(|c| c.block_size));
     // `.max(1)`, not `.max(2)`: an EMPTY spine means "do not speculate at all".
     // b=1 verifies only the seed and commits the bonus -- one target forward,
     // which is exactly an AR step, with hidden/KV/DeltaNet left coherent because
@@ -7368,10 +7410,14 @@ pub fn spec_step_dflash(
         Some(pld) => (1 + pld.len()).min(requested_b).max(1),
         None => requested_b,
     };
-    let h = draft_cfg.hidden;
-    let ne = draft_cfg.num_extract();
+    // Hidden width is the TARGET's; the drafter merely matches it.
+    let h = draft_cfg.map(|c| c.hidden).unwrap_or(target.config.dim);
+    // Extraction count is a drafter input. With no drafter nothing extracts, and
+    // every use of `ne` sits inside the staging block that is then skipped.
+    let ne = draft_cfg.map(|c| c.num_extract()).unwrap_or(0);
     let vocab = target.config.vocab_size;
-    let mask_token = draft_cfg.mask_token_id;
+    // Only meaningful when a drafter fills the block; unused on the spine path.
+    let mask_token = draft_cfg.map(|c| c.mask_token_id).unwrap_or(0);
 
     // Ensure active_stream is set before any draft/verify work so memset_async
     // and stream-ordered launches have a non-null stream to ride on. Without
@@ -7427,15 +7473,19 @@ pub fn spec_step_dflash(
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
-    // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply sampler::apply_ngram_block to every
+    // HIPFIRE_DFLASH_NO_REPEAT_NGRAM=1: apply sampler::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
     // token after any 3/4/5/6-gram repeat (NEG_INFINITY logit). Matches the
     // production-path defense in daemon/run/infer for the AR sampler.
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
     static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ngram_block_env = *NGRAM_BLOCK_ENV
-        .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1"));
+    let ngram_block_env = *NGRAM_BLOCK_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
@@ -7468,6 +7518,14 @@ pub fn spec_step_dflash(
             }
         }
     } else {
+        // Unreachable without a drafter: the match above forces an empty spine
+        // in that case, which takes the branch overhead.
+        let draft_weights = draft_weights
+            .expect("drafter branch entered without weights; pld_spine forcing above is broken");
+        let draft_cfg = draft_cfg.expect("drafter weights without a drafter config");
+        let draft_scratch = draft_scratch
+            .as_deref_mut()
+            .expect("drafter weights without drafter scratch");
         // ── 2. noise_embedding = target.embed_tokens(block) written directly
         // into draft_scratch.x on GPU (no host round-trip). Target and draft
         // share the same Gpu, so the embedding lookup can target the draft's
@@ -8001,7 +8059,7 @@ pub fn spec_step_dflash(
         target,
         &block,
         position,
-        hidden_rb,
+        hidden_rb.as_deref_mut(),
         gdn_tape_opt.as_deref_mut(),
         use_temp_sampling || host_path_active || trace_this_position, // full target logits needed for rejection sampling, RP, n-gram block, or trace
         verify_scratch,
@@ -8257,39 +8315,48 @@ pub fn spec_step_dflash(
     // pattern which slices the verify's hidden output to accept_len+1
     // rows — NOT accept_len+2.
     let rows_to_keep = accept_len + 1;
-    if ctx_slice.is_some() {
-        // ctx_slice path: CPU shadow still required for the window slice.
-        let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
-    } else {
-        // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
-        // No D2H, no CPU reshape, no next-cycle H2D.
-        //
-        // Verify just wrote B slots to hidden_rb; we want the first
-        // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
-        // scatter function aligns to the verify-block origin, not the
-        // ring tail.
-        scatter_hidden_block_to_interleaved(
-            gpu,
-            hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
-            b,
-            rows_to_keep,
-        )?;
-        // Keep draft_forward's incremental-upload tracker in sync so any future
-        // ctx_slice=Some call in the same session doesn't try to re-upload what
-        // GPU already has; and so the assertion-in-draft path stays coherent.
-        draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
-        // Track the absolute positions of the rows we just appended. These are
-        // the logical positions `position..position+rows_to_keep` plus the
-        // current target KV compact_offset (zero pre-eviction; non-zero after).
-        // Used by the next cycle's `positions_k` construction.
-        let co = target.kv_cache.compact_offset as i32;
-        for p in 0..rows_to_keep {
-            draft_scratch
-                .target_hidden_abs_positions
-                .push(position as i32 + p as i32 + co);
+    // Staging the verify's hidden rows exists ONLY to feed the next drafter
+    // cycle: it scatters into `draft_scratch.target_hidden` and keeps
+    // `draft_forward`'s upload tracker in sync. With no drafter nothing ever
+    // reads it, so the download, the scatter and the bookkeeping are all dead
+    // work — skip them, and `hidden_rb` is None here anyway.
+    if let (Some(hidden_rb), Some(draft_scratch)) =
+        (hidden_rb.as_deref_mut(), draft_scratch.as_deref_mut())
+    {
+        if ctx_slice.is_some() {
+            // ctx_slice path: CPU shadow still required for the window slice.
+            let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
+            target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+        } else {
+            // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
+            // No D2H, no CPU reshape, no next-cycle H2D.
+            //
+            // Verify just wrote B slots to hidden_rb; we want the first
+            // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
+            // scatter function aligns to the verify-block origin, not the
+            // ring tail.
+            scatter_hidden_block_to_interleaved(
+                gpu,
+                hidden_rb,
+                &draft_scratch.target_hidden,
+                position,
+                b,
+                rows_to_keep,
+            )?;
+            // Keep draft_forward's incremental-upload tracker in sync so any future
+            // ctx_slice=Some call in the same session doesn't try to re-upload what
+            // GPU already has; and so the assertion-in-draft path stays coherent.
+            draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
+            // Track the absolute positions of the rows we just appended. These are
+            // the logical positions `position..position+rows_to_keep` plus the
+            // current target KV compact_offset (zero pre-eviction; non-zero after).
+            // Used by the next cycle's `positions_k` construction.
+            let co = target.kv_cache.compact_offset as i32;
+            for p in 0..rows_to_keep {
+                draft_scratch
+                    .target_hidden_abs_positions
+                    .push(position as i32 + p as i32 + co);
+            }
         }
     }
 
@@ -8403,8 +8470,7 @@ pub fn spec_step_dflash(
     } else if dflash_prefix_verify_rollback_replay_from_env() && gdn_tape_opt.is_some() {
         let replay_tokens = &committed[..accept_len + 1];
         let mut prefix_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;
-        let hidden_head_before_prefix_verify = hidden_rb.head;
-        let hidden_written_before_prefix_verify = hidden_rb.written;
+        let hidden_ring_marks = hidden_rb.as_deref().map(|rb| (rb.head, rb.written));
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         // Keep this replacement-candidate diagnostic from testing graph replay
         // state; the normal dense DFlash verify path still defaults graph-on.
@@ -8413,7 +8479,7 @@ pub fn spec_step_dflash(
             target,
             replay_tokens,
             position,
-            hidden_rb,
+            hidden_rb.as_deref_mut(),
             Some(&mut prefix_tape),
             false,
             VerifyGraphPolicy::Disabled,
@@ -8423,8 +8489,10 @@ pub fn spec_step_dflash(
         // accepted rows were already scattered into the draft hidden cache.
         // Keep that diagnostic verify from shifting the ring cursor observed
         // by later DFlash cycles.
-        hidden_rb.head = hidden_head_before_prefix_verify;
-        hidden_rb.written = hidden_written_before_prefix_verify;
+        if let (Some(rb), Some((head, written))) = (hidden_rb.as_deref_mut(), hidden_ring_marks) {
+            rb.head = head;
+            rb.written = written;
+        }
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         prefix_tape.replay_gdn(
             gpu,
@@ -11565,7 +11633,7 @@ pub fn spec_step_ddtree(
             target,
             &verify_block,
             position,
-            hidden_rb,
+            Some(hidden_rb),
             None,
             false, // want_full_logits=false — greedy only for now
             verify_scratch,
@@ -11657,7 +11725,7 @@ pub fn spec_step_ddtree(
         target,
         &tape_block,
         position,
-        hidden_rb,
+        Some(hidden_rb),
         Some(gdn_tape),
         false,
         verify_scratch,
@@ -12278,7 +12346,7 @@ pub fn spec_step_ddtree_batched(
             target,
             &tape_block,
             position,
-            hidden_rb,
+            Some(hidden_rb),
             Some(gdn_tape),
             false,
             verify_scratch,
@@ -12501,7 +12569,7 @@ pub fn spec_step_ddtree_path_c(
         target,
         &verify_tokens,
         position,
-        hidden_rb,
+        Some(hidden_rb),
         Some(gdn_tape),
         false,
         graph_policy,
@@ -12645,7 +12713,7 @@ pub fn spec_step_ddtree_path_c(
                 target,
                 &branch_chain_tokens,
                 branch_start_pos,
-                hidden_rb,
+                Some(hidden_rb),
                 Some(gdn_tape),
                 false,
                 graph_policy,
@@ -12813,10 +12881,16 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
+/// Prefill the prompt, optionally extracting target hidden states for a drafter.
+///
+/// `hidden_rb: None` is the drafter-free case: the prompt is still prefilled —
+/// KV and DeltaNet state are what the target needs regardless — but no hidden
+/// states are extracted and nothing is downloaded, because only a drafter ever
+/// reads them.
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
-    hidden_rb: &mut HiddenStateRingBuffer,
+    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     target_hidden_host: &mut Vec<f32>,
     prompt_tokens: &[u32],
 ) -> HipResult<()> {
@@ -12838,14 +12912,17 @@ pub fn seed_target_hidden_from_prompt(
         &mut target.kv_cache,
         &mut target.dn_state,
         &target.scratch,
-        Some(hidden_rb),
+        hidden_rb.as_deref_mut(),
         None,
         None,
         None,
     )?;
-    // Gather the just-written rows from the ring buffer.
-    let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
-    target_hidden_host.extend_from_slice(&block);
+    // Gather the just-written rows from the ring buffer. Only a drafter reads
+    // them, so with no ring there is nothing to gather.
+    if let Some(hidden_rb) = hidden_rb.as_deref() {
+        let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
+        target_hidden_host.extend_from_slice(&block);
+    }
     Ok(())
 }
 
@@ -12950,6 +13027,20 @@ pub fn compact_target_hidden_host(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_step_with_no_drafter_and_no_cap_does_not_speculate() {
+        // b == 1 is the no-speculation step: verify the seed, commit the bonus,
+        // one target forward. Without this a drafter-free caller that supplied
+        // no spine would ask for a block it has nothing to fill.
+        assert_eq!(requested_block_size(None, None), 1);
+        // A drafter-free caller normally DOES cap it — the n-gram max spine.
+        assert_eq!(requested_block_size(Some(16), None), 16);
+        // With a drafter the trained block size still applies untouched, and an
+        // explicit override still wins over it.
+        assert_eq!(requested_block_size(None, Some(16)), 16);
+        assert_eq!(requested_block_size(Some(4), Some(16)), 4);
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

@@ -483,14 +483,18 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     }
     let ctx = DispatchCtx::new(gpu);
+    // Derive from `dispatch_ref` and override only what this function handles
+    // differently, so a field added to `WeightRef` later cannot be silently
+    // dropped here again. `row_stride` was: this literal hardcoded 0, and Q8HFQ's
+    // kernel computes `row_base = A + row * row_stride`, so every output row of
+    // every q8hfq linear dotted WEIGHT ROW 0 — silently, with no error.
+    //
+    // `rotation`/`awq_scale` stay None on purpose: the arms below rotate `x`
+    // themselves, so carrying a rotation here would apply it twice.
     let wr = WeightRef {
-        buf: &w.buf,
-        dtype: w.gpu_dtype,
-        m: w.m,
-        k: w.k,
-        row_stride: 0,
         rotation: None,
         awq_scale: None,
+        ..w.dispatch_ref()
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {

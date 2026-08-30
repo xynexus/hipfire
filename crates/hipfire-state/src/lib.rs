@@ -553,7 +553,26 @@ impl SequenceStateAllocatorPolicy {
         };
         Self {
             page_ownership,
-            eviction_policy: SequenceStateEvictionPolicy::ManualReleaseOnly,
+            // A backend with an arena can have its sessions released, so the
+            // resident set is bounded by evicting the oldest (see
+            // `qwen35_evict_sessions_over_limit`). `Unsupported` has no release
+            // path, so nothing but an explicit caller can free it.
+            //
+            // This was `ManualReleaseOnly` for every backend, with
+            // `LruCheckpoint` constructed nowhere and
+            // `select_lru_sequence_state_eviction_candidates` called only from a
+            // test — the policy named a manual release that nothing performed.
+            eviction_policy: match backend {
+                SequenceStateArenaBackend::Unsupported => {
+                    SequenceStateEvictionPolicy::ManualReleaseOnly
+                }
+                SequenceStateArenaBackend::BackendOwned
+                | SequenceStateArenaBackend::Qwen35Wrapped => {
+                    SequenceStateEvictionPolicy::LruCheckpoint
+                }
+            },
+            // Evicted state is dropped, not spilled. Track C in
+            // docs/plans/2026-08-29-sequence-state-lru-and-disk-spill.md.
             spill_target: SequenceStateSpillTarget::Disabled,
             copy_on_write_attach: false,
         }
@@ -1893,10 +1912,9 @@ mod tests {
         );
         assert_eq!(json["state_page_descriptors"][0]["handle"]["generation"], 7);
         assert_eq!(json["state_allocator"]["page_ownership"], "arena_owned");
-        assert_eq!(
-            json["state_allocator"]["eviction_policy"],
-            "manual_release_only"
-        );
+        // Arena-owned pages are releasable, so the reported policy is the
+        // evicting one; `manual_release_only` now means "no release path".
+        assert_eq!(json["state_allocator"]["eviction_policy"], "lru_checkpoint");
         assert_eq!(json["state_allocator"]["spill_target"], "disabled");
         assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
     }
@@ -2077,9 +2095,12 @@ mod tests {
             wrapped.page_ownership,
             SequenceStatePageOwnership::BackendWrapped
         );
+        // An arena-backed session can be released, so it is evictable: the
+        // resident set is bounded by dropping the oldest rather than growing
+        // until the host runs out.
         assert_eq!(
             wrapped.eviction_policy,
-            SequenceStateEvictionPolicy::ManualReleaseOnly
+            SequenceStateEvictionPolicy::LruCheckpoint
         );
         assert_eq!(wrapped.spill_target, SequenceStateSpillTarget::Disabled);
         assert!(!wrapped.copy_on_write_attach);
@@ -2108,6 +2129,10 @@ mod tests {
             backend_owned.page_ownership,
             SequenceStatePageOwnership::BackendWrapped
         );
+        assert_eq!(
+            backend_owned.eviction_policy,
+            SequenceStateEvictionPolicy::LruCheckpoint
+        );
 
         let unsupported =
             SequenceStateAllocatorPolicy::for_backend(SequenceStateArenaBackend::Unsupported, &[]);
@@ -2115,6 +2140,8 @@ mod tests {
             unsupported.page_ownership,
             SequenceStatePageOwnership::Unsupported
         );
+        // No arena means no release path, so nothing but an explicit caller can
+        // free it — this one stays ManualReleaseOnly.
         assert_eq!(
             unsupported.eviction_policy,
             SequenceStateEvictionPolicy::ManualReleaseOnly

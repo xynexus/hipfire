@@ -5,14 +5,11 @@ This document contains the help content for the `hipfire` command-line program.
 **Command Overview:**
 
 * [`hipfire`↴](#hipfire)
-* [`hipfire tui`↴](#hipfire-tui)
 * [`hipfire start`↴](#hipfire-start)
 * [`hipfire stop`↴](#hipfire-stop)
 * [`hipfire restart`↴](#hipfire-restart)
 * [`hipfire status`↴](#hipfire-status)
-* [`hipfire serve`↴](#hipfire-serve)
 * [`hipfire daemon`↴](#hipfire-daemon)
-* [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -30,7 +27,6 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire hfq`↴](#hipfire-hfq)
 * [`hipfire bench`↴](#hipfire-bench)
 * [`hipfire doctor`↴](#hipfire-doctor)
-* [`hipfire env`↴](#hipfire-env)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
 * [`hipfire optimize`↴](#hipfire-optimize)
@@ -38,16 +34,9 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire model compose`↴](#hipfire-model-compose)
 * [`hipfire model decompose`↴](#hipfire-model-decompose)
 * [`hipfire model induct`↴](#hipfire-model-induct)
-* [`hipfire lock`↴](#hipfire-lock)
-* [`hipfire lock acquire`↴](#hipfire-lock-acquire)
-* [`hipfire lock release`↴](#hipfire-lock-release)
-* [`hipfire lock status`↴](#hipfire-lock-status)
-* [`hipfire lock kill`↴](#hipfire-lock-kill)
-* [`hipfire lock run`↴](#hipfire-lock-run)
-* [`hipfire detect`↴](#hipfire-detect)
+* [`hipfire model inspect`↴](#hipfire-model-inspect)
 * [`hipfire diffusion`↴](#hipfire-diffusion)
 * [`hipfire diffusion import`↴](#hipfire-diffusion-import)
-* [`hipfire diffusion inspect`↴](#hipfire-diffusion-inspect)
 * [`hipfire diffusion preflight`↴](#hipfire-diffusion-preflight)
 * [`hipfire diffusion txt2img`↴](#hipfire-diffusion-txt2img)
 * [`hipfire diffusion img2img`↴](#hipfire-diffusion-img2img)
@@ -70,30 +59,30 @@ This document contains the help content for the `hipfire` command-line program.
 
 ## `hipfire`
 
-hipfire runs the local operator TUI, OpenAI-compatible HTTP server, model chat, eval, benchmark, diagnostics, and artifact tools.
+hipfire runs the local operator TUI, background inference server, model inventory, eval, benchmark, diagnostics, and artifact tools.
+
+Running `hipfire` with no command opens the operator TUI; press `?` there for the in-app key reference.
 
 **Usage:** `hipfire [COMMAND]`
 
 Examples:
-  hipfire                         Open the operator TUI
+  hipfire                         Open the operator TUI (`?` for keys)
   hipfire help                    Show the command summary
   hipfire start                   Start the background server
-  hipfire status                  Show background server status
-  hipfire chat Qwen3.5-30B-A3B "hello"
+  hipfire status --json           Machine-readable server status
+  hipfire list                    Local models, sizes, and capabilities
   hipfire bench --model Qwen3.5-30B-A3B
 
+`--json` is available on start, stop, restart, status, list, and inspect.
 Use `hipfire <command> help` or `hipfire <command> --help` for detailed command help.
 
 ###### **Subcommands:**
 
-* `tui` — Open the local operator TUI
 * `start` — Start the background hipfire server
 * `stop` — Stop the background hipfire server
 * `restart` — Restart the background hipfire server
 * `status` — Show background server status
-* `serve` — Start the hipfire HTTP server (OpenAI-compatible)
 * `daemon` — Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
-* `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -106,23 +95,12 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `hfq` — Inspect a .hfq artefact (verify, list, extract, meta-get/set, rearch)
 * `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
 * `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
-* `env` — List the environment variables hipfire reads, with descriptions
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `model` — Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one container, or split a bundle back into its component files
-* `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
-* `detect` — Run observational coherence detectors over a captured token stream
-* `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
+* `diffusion` — Import, generate, and quantize diffusion models stored as .hfq artifacts
 * `admin` — Query the running hipfire admin API for scripts and agents
-
-
-
-## `hipfire tui`
-
-Open the local operator TUI
-
-**Usage:** `hipfire tui`
 
 
 
@@ -147,6 +125,7 @@ Examples:
 * `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
 
   Default value: `0`
+* `--json` — Emit a machine-readable JSON object instead of the human summary
 
 
 
@@ -164,6 +143,7 @@ Examples:
 ###### **Options:**
 
 * `-f`, `--force` — Skip the graceful wait and send SIGKILL immediately
+* `--json` — Emit a machine-readable JSON object instead of the human summary
 
 
 
@@ -187,6 +167,7 @@ Examples:
 * `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
 
   Default value: `0`
+* `--json` — Emit a machine-readable JSON object instead of the human summary
 
 
 
@@ -194,35 +175,15 @@ Examples:
 
 Show background server status
 
-**Usage:** `hipfire status`
+**Usage:** `hipfire status [OPTIONS]`
 
 Examples:
   hipfire status
 
 
-
-
-## `hipfire serve`
-
-Start the hipfire HTTP server (OpenAI-compatible)
-
-**Usage:** `hipfire serve [OPTIONS]`
-
-Examples:
-  hipfire serve
-  hipfire serve --host 0.0.0.0 --port 11435
-  hipfire serve --model Qwen3.5-30B-A3B
-
-
 ###### **Options:**
 
-* `--host <HOST>` — Override bind host
-* `-p`, `--port <PORT>` — Override bind port
-* `-m`, `--model <MODEL>` — Default model name, shorthand, alias, or path for requests that omit model
-* `--max-seq <MAX_SEQ>` — Override the startup-resolved maximum sequence length
-* `--max-tokens <MAX_TOKENS>` — Override the startup-resolved maximum generated-token budget
-* `--kv-cache <KV_CACHE>` — Override the startup-resolved KV-cache mode
-* `--debug-chat` — Log full raw chat requests and raw model replies
+* `--json` — Emit a machine-readable JSON object instead of the human summary
 
 
 
@@ -245,42 +206,30 @@ Examples:
 
 
 
-## `hipfire chat`
-
-Load a model and generate a response (one-shot)
-
-**Usage:** `hipfire chat [OPTIONS] <PROMPT>`
-
-Examples:
-  hipfire chat --model Qwen3.5-30B-A3B "Explain ROCm in one paragraph"
-  hipfire chat "hello" --max-tokens 64
-  hipfire chat --attach image.png "describe this image"
-
-
-###### **Arguments:**
-
-* `<PROMPT>` — Prompt text
-
-###### **Options:**
-
-* `-m`, `--model <MODEL>` — Model name, shorthand, alias, or path. Falls back to the `default_model` config value when omitted
-* `--max-tokens <MAX_TOKENS>` — Max tokens to generate
-* `--temperature <TEMPERATURE>` — Sampling temperature
-* `--attach <FILE>` — Attach a file to the prompt (repeatable). The type is detected from the extension. Only images are wired today (PNG/JPEG/WebP/GIF/BMP); text, video, and audio are recognized but not yet supported and will error
-
-
-
 ## `hipfire list`
 
 List locally available models
 
-**Usage:** `hipfire list`
+**Usage:** `hipfire list [OPTIONS]`
+
+Examples:
+  hipfire list
+  hipfire list --json
+  hipfire list --local
+
+
+###### **Options:**
+
+* `--json` — Emit a machine-readable JSON array instead of the table
+* `--local` — Skip the secondary (network) model store even when one is configured
 
 
 
 ## `hipfire inspect`
 
 Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+
+Diffusion containers are detected automatically and additionally report their pipeline summary (class, components, weight format, runtime support) — what `hipfire diffusion inspect` used to print separately.
 
 **Usage:** `hipfire inspect [OPTIONS] <TARGET>`
 
@@ -507,22 +456,6 @@ Examples:
 
 
 
-## `hipfire env`
-
-List the environment variables hipfire reads, with descriptions
-
-**Usage:** `hipfire env [OPTIONS] [FILTER]`
-
-###### **Arguments:**
-
-* `<FILTER>` — Case-insensitive substring filter over name and description
-
-###### **Options:**
-
-* `--all` — Show developer/diagnostic variables too. Default lists only the supported, user-facing ones
-
-
-
 ## `hipfire host-profile`
 
 Measure host, GPU-copy, and model storage bandwidth
@@ -570,6 +503,7 @@ Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one
 * `compose` — Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
 * `decompose` — Split a bundled `.hfq` back into its base + sidecar files
 * `induct` — Interactive wizard: bring an external model (HuggingFace repo or local safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars
+* `inspect` — Detail the contents of a `.hfq` container. Alias of top-level `hipfire inspect`; same arguments, same output
 
 
 
@@ -627,144 +561,28 @@ Interactive wizard: bring an external model (HuggingFace repo or local safetenso
 
 
 
-## `hipfire lock`
+## `hipfire model inspect`
 
-GPU resource lock for multi-agent coordination (acquire/release/status)
+Detail the contents of a `.hfq` container. Alias of top-level `hipfire inspect`; same arguments, same output
 
-**Usage:** `hipfire lock <COMMAND>`
-
-###### **Subcommands:**
-
-* `acquire` — Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
-* `release` — Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
-* `status` — Print lock status: "gpu is free" or "gpu BUSY: <holder>"
-* `kill` — Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
-* `run` — Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
-
-
-
-## `hipfire lock acquire`
-
-Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
-
-**Usage:** `hipfire lock acquire [OPTIONS] <LABEL>`
+**Usage:** `hipfire model inspect [OPTIONS] <TARGET>`
 
 ###### **Arguments:**
 
-* `<LABEL>` — Human label recorded in the lockfile (who/what holds it)
+* `<TARGET>` — Container to inspect: a `.hfq` file path or a local model alias
 
 ###### **Options:**
 
-* `--watch-pid <WATCH_PID>` — Pid whose death auto-releases the lock (default: the calling shell)
-* `--timeout-secs <TIMEOUT_SECS>` — Hard cap in seconds to wait for a busy lock; 0 = wait forever
-
-  Default value: `1800`
-* `--poll-secs <POLL_SECS>` — Cadence of "busy" messages while waiting, in seconds
-
-  Default value: `5`
-
-
-
-## `hipfire lock release`
-
-Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
-
-**Usage:** `hipfire lock release [OPTIONS] [LABEL]`
-
-###### **Arguments:**
-
-* `<LABEL>` — Only release if the recorded holder label matches (safety guard)
-
-###### **Options:**
-
-* `--all` — Release regardless of which label holds the lock
-* `-f`, `--force` — Escalate to SIGKILL for a wedged holder (also ignores the label)
-
-
-
-## `hipfire lock status`
-
-Print lock status: "gpu is free" or "gpu BUSY: <holder>"
-
-**Usage:** `hipfire lock status`
-
-
-
-## `hipfire lock kill`
-
-Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
-
-**Usage:** `hipfire lock kill [OPTIONS]`
-
-###### **Options:**
-
-* `-f`, `--force` — Escalate to SIGKILL instead of SIGTERM
-
-
-
-## `hipfire lock run`
-
-Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
-
-**Usage:** `hipfire lock run [OPTIONS] <LABEL> -- <COMMAND>...`
-
-###### **Arguments:**
-
-* `<LABEL>` — Human label recorded in the lockfile (who/what holds it)
-* `<COMMAND>` — The command (and args) to run under the lock — everything after `--`
-
-###### **Options:**
-
-* `--timeout-secs <TIMEOUT_SECS>` — Hard cap in seconds to wait for a busy lock; 0 = wait forever
-
-  Default value: `1800`
-* `--poll-secs <POLL_SECS>` — Cadence of "busy" messages while waiting, in seconds
-
-  Default value: `5`
-
-
-
-## `hipfire detect`
-
-Run observational coherence detectors over a captured token stream
-
-Reads the demo/daemon stdout on stdin (the `DFlash tokens: [..]` / `AR tokens: [..]` line) and emits a JSON verdict with `ok` / `soft_warn`. Front-end for the `hipfire-detect` DetectorBank; replaces the Path-A token-attractor Python heredocs in the coherence gates.
-
-**Usage:** `hipfire detect [OPTIONS]`
-
-###### **Options:**
-
-* `--source <SOURCE>` — Which `tokens: [..]` line to read when the stream contains both
-
-  Default value: `auto`
-
-  Possible values:
-  - `auto`:
-    Prefer the `DFlash tokens:` line, fall back to `AR tokens:`
-  - `dflash`:
-    Read only the `DFlash tokens:` line
-  - `ar`:
-    Read only the `AR tokens:` line
-
-* `--path-a` — Run the full Path-A token-attractor family (first-128 + last-128 + long-state collapse) instead of just the first-128 window
-* `--exit-code` — Exit non-zero when a hard fail is detected. Off by default so the command is a drop-in for the always-exit-0 Python it replaces
-* `--parity-ar <PARITY_AR>` — Parity mode: file holding the AR-baseline run output (its `AR tokens:` line). Requires --parity-dflash. When both are set the command compares the two streams instead of reading stdin
-* `--parity-dflash <PARITY_DFLASH>` — Parity mode: file holding the DFlash run output (its `DFlash tokens:` line). Requires --parity-ar
-* `--rollback <ROLLBACK>` — Rollback mode: parse a single-line replay/verify stat summary instead of running detectors. Reads `--file` if given, else stdin
-
-  Possible values:
-  - `replay`:
-    Parse the `rollback_parity:` replay-count line
-  - `verify-graph`:
-    Parse the `verify_graph:` count line
-
-* `--file <FILE>` — Input file for `--rollback` mode (defaults to stdin when omitted)
+* `--tensors` — List every tensor (name, quant type, shape, group size, size)
+* `--json` — Emit a machine-readable JSON object (includes the full tensor array and the raw metadata verbatim); ignores `--tensors`
 
 
 
 ## `hipfire diffusion`
 
-Import and inspect diffusion models stored as .hfq artifacts
+Import, generate, and quantize diffusion models stored as .hfq artifacts
+
+Inspection is not here: `hipfire inspect <artefact>` autodetects a diffusion container and prints its pipeline summary.
 
 Runtime note: runnable `.hfq` diffusion artifacts still perform CLIP tokenization as host-side setup. `txt2img`, `img2img`, and `smoke` can opt into `--rocm-device-id` to route currently GPU-backed generation boundaries through ROCm. Diffusers cache discovery also lists transformer-denoiser pipelines such as Flux, Krea, Qwen Image, and Qwen Image Edit so clients can see convertible models, but native serving still requires a runnable `.hfq` artifact and a matching diffusion runtime.
 
@@ -783,7 +601,6 @@ The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, 
 ###### **Subcommands:**
 
 * `import` — Convert a Diffusers snapshot or single-file checkpoint into a Hipfire .hfq artifact
-* `inspect` — Inspect a diffusion .hfq artifact and print its server-facing summary
 * `preflight` — Plan HIP diffusion buffers and optionally run a ROCm device preflight
 * `txt2img` — Generate PNG images directly from a diffusion .hfq artifact
 * `img2img` — Generate PNG images from init images with a diffusion .hfq artifact
@@ -815,18 +632,6 @@ The importer extracts tensors from common Diffusers single-file and sharded safe
 
   Default value: `1`
 * `--metadata-only` — Import configs/tokenizers only and skip weight indexing for fast planning/inspection
-
-
-
-## `hipfire diffusion inspect`
-
-Inspect a diffusion .hfq artifact and print its server-facing summary
-
-**Usage:** `hipfire diffusion inspect <MODEL>`
-
-###### **Arguments:**
-
-* `<MODEL>` — Diffusion .hfq artifact to inspect by name, shorthand, alias, or path
 
 
 

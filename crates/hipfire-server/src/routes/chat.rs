@@ -182,7 +182,7 @@ impl DaemonSpawnEnv {
     fn from_resolved_config(cfg: &HipfireConfig, model_arg: &str) -> Self {
         Self {
             prompt_normalize: cfg.prompt_normalize,
-            dflash_ngram_block: resolve_dflash_ngram_block(&cfg.dflash_ngram_block, model_arg),
+            dflash_ngram_block: resolve_dflash_ngram_block(&cfg.dflash_no_repeat_ngram, model_arg),
         }
     }
 
@@ -192,9 +192,9 @@ impl DaemonSpawnEnv {
             if self.prompt_normalize { "1" } else { "0" },
         );
         if self.dflash_ngram_block {
-            std::env::set_var("HIPFIRE_DFLASH_NGRAM_BLOCK", "1");
+            std::env::set_var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM", "1");
         } else {
-            std::env::remove_var("HIPFIRE_DFLASH_NGRAM_BLOCK");
+            std::env::remove_var("HIPFIRE_DFLASH_NO_REPEAT_NGRAM");
         }
     }
 }
@@ -254,7 +254,11 @@ fn maybe_attach_dflash_draft(
     _model_path: Option<&Path>,
     params: &mut ModelLoadParams,
 ) {
-    if cfg.dflash_mode == "off" {
+    // `dflash_draft` already decided this in `from_hipfire_config`, which is the
+    // resolved, per-model answer. Only the env override is left, and it stays
+    // last so an operator can still pin a drafter for one run.
+    let (mode, _) = hipfire_config::dflash_draft_setting(&cfg.dflash_draft);
+    if mode == "off" {
         return;
     }
     if let Ok(explicit) = std::env::var("HIPFIRE_DFLASH_DRAFT") {
@@ -313,6 +317,9 @@ pub(crate) struct LoadedModelContext {
     /// `qwen3_5`). Used to resolve the ContinuousBatching capability for
     /// batch-eligibility routing.
     pub(crate) arch: Option<String>,
+    /// The daemon's probe of the LOADED model: can it take the fused batch
+    /// prefill? `None` from a daemon that does not report it.
+    pub(crate) batch_prefill_capable: Option<bool>,
 }
 
 const MAX_REQUEST_TOKENS: u32 = 131_072;
@@ -516,6 +523,7 @@ pub(crate) async fn ensure_model_loaded(
                 worker_key_id: loaded.worker_key_id,
                 cache_capable: loaded.cache_capable,
                 arch: loaded.arch,
+                batch_prefill_capable: loaded.batch_prefill_capable,
             });
         }
     }
@@ -532,6 +540,7 @@ pub(crate) async fn ensure_model_loaded(
                             worker_key_id: loaded.worker_key_id,
                             cache_capable: loaded.cache_capable,
                             arch: loaded.arch,
+                            batch_prefill_capable: loaded.batch_prefill_capable,
                         });
                     }
                     tracing::info!(
@@ -552,6 +561,7 @@ pub(crate) async fn ensure_model_loaded(
                     .map_err(|e| e.to_string())?;
                 let cache_capable = loaded_response_cache_capable(&loaded);
                 let arch = loaded.arch.clone();
+                let batch_prefill_capable = loaded.batch_prefill_capable;
                 let worker_key_id = Some(loaded.worker_key_id);
                 set_loaded_model_state(
                     state,
@@ -561,6 +571,7 @@ pub(crate) async fn ensure_model_loaded(
                         cache_capable,
                         max_seq: params.max_seq,
                         arch: arch.clone(),
+                        batch_prefill_capable,
                     },
                 )
                 .await;
@@ -569,6 +580,7 @@ pub(crate) async fn ensure_model_loaded(
                     worker_key_id,
                     cache_capable,
                     arch,
+                    batch_prefill_capable,
                 });
             }
             Err(e) => {
@@ -597,6 +609,7 @@ pub(crate) async fn ensure_model_loaded(
 
     let cache_capable = loaded_response_cache_capable(&loaded);
     let arch = loaded.arch.clone();
+    let batch_prefill_capable = loaded.batch_prefill_capable;
     let worker_key_id = Some(loaded.worker_key_id);
     set_loaded_model_state(
         state,
@@ -606,6 +619,7 @@ pub(crate) async fn ensure_model_loaded(
             cache_capable,
             max_seq: params.max_seq,
             arch: arch.clone(),
+            batch_prefill_capable,
         },
     )
     .await;
@@ -615,6 +629,7 @@ pub(crate) async fn ensure_model_loaded(
         worker_key_id,
         cache_capable,
         arch,
+        batch_prefill_capable,
     })
 }
 
@@ -1633,6 +1648,40 @@ fn scheduler_worker_key(
     }
 }
 
+/// Unwinds a prefill-queue wait if the caller's future is dropped mid-loop.
+///
+/// Several routes await `wait_for_prefill_scheduler_turn` INLINE in the axum
+/// handler — non-streaming `/v1/responses` and the sdapi text fallback — so a
+/// client disconnect cancels the future between iterations. The spawned routes
+/// (`/v1/chat/completions`) cancel cooperatively and are unaffected.
+///
+/// Without this the abandoned session stays queued, a later concurrent
+/// `next_prefill_batch` selects it, and its id is inserted into
+/// `selected_prefill_requests` with nothing left to remove it — the set grows for
+/// the life of the process. `CancelWorkerOnDrop` already covers the engine side;
+/// this covers the queue side.
+struct PrefillWaitGuard {
+    state: SharedState,
+    req_id: String,
+    armed: bool,
+}
+
+impl Drop for PrefillWaitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is sync and both maps are behind async mutexes, so hand the
+        // cleanup to the runtime rather than blocking here.
+        let state = self.state.clone();
+        let req_id = std::mem::take(&mut self.req_id);
+        tokio::spawn(async move {
+            state.selected_prefill_requests.lock().await.remove(&req_id);
+            state.prefill_scheduler.lock().await.cancel(&req_id);
+        });
+    }
+}
+
 pub(crate) async fn wait_for_prefill_scheduler_turn(
     state: &SharedState,
     req_id: &str,
@@ -1673,10 +1722,18 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     }
     state.prefill_notify.notify_waiters();
 
+    // Armed from here: the session is queued and only this loop retires it.
+    let mut guard = PrefillWaitGuard {
+        state: state.clone(),
+        req_id: req_id.to_string(),
+        armed: true,
+    };
+
     loop {
         {
             let mut selected = state.selected_prefill_requests.lock().await;
             if selected.remove(req_id) {
+                guard.armed = false;
                 return Ok(());
             }
         }
@@ -1686,6 +1743,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
             {
                 let mut selected = state.selected_prefill_requests.lock().await;
                 if selected.remove(req_id) {
+                    guard.armed = false;
                     return Ok(());
                 }
             }
@@ -1821,7 +1879,7 @@ where
     // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
     // + runtime envelope) — ineligible models fall through to the legacy path.
     if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
-        && crate::batch_runner::batch_eligible(loaded.arch.as_deref())
+        && crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable)
     {
         let controls = {
             let cfg = state.config.lock().await;
@@ -3249,7 +3307,7 @@ mod tests {
             max_seq: 8192,
             kv_cache: "auto".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "off".to_string(),
+            dflash_draft: "off".to_string(),
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
@@ -3276,7 +3334,7 @@ mod tests {
             max_seq: 4096,
             kv_cache: "asym3".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "auto".to_string(),
+            dflash_draft: "auto".to_string(),
             cask_sidecar: Some(String::new()),
             ..Default::default()
         };
@@ -3296,7 +3354,7 @@ mod tests {
             max_seq: 4096,
             kv_cache: "auto".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "off".to_string(),
+            dflash_draft: "off".to_string(),
             ..Default::default()
         };
         cfg.model_overrides.insert(
@@ -3400,7 +3458,7 @@ mod tests {
         std::fs::write(&draft, "draft").unwrap();
 
         let cfg = HipfireConfig {
-            dflash_mode: "auto".to_string(),
+            dflash_draft: "auto".to_string(),
             ..Default::default()
         };
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
@@ -3524,6 +3582,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 1024,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
 
@@ -3546,6 +3605,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 4096,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
         let status = json!({
@@ -3594,6 +3654,7 @@ mod tests {
                 cache_capable: false,
                 max_seq: 2048,
                 arch: None,
+                batch_prefill_capable: None,
             },
         );
 
@@ -3661,6 +3722,7 @@ mod tests {
             layers: None,
             vocab: None,
             model_worker: None,
+            batch_prefill_capable: None,
             response_id: None,
         };
         assert!(loaded_response_cache_capable(&loaded));

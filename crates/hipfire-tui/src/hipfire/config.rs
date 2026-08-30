@@ -541,6 +541,15 @@ fn values_from_document(document: &Value) -> BTreeMap<String, String> {
 }
 
 fn config_type_kind(ty: &hipfire_config::ConfigType) -> String {
+    // A union shows its arms, so the operator sees "enum|path" rather than a
+    // label that names only one of the domains it accepts.
+    if let hipfire_config::ConfigType::OneOf { arms } = ty {
+        return arms
+            .iter()
+            .map(config_type_kind)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
     match ty {
         hipfire_config::ConfigType::Bool => "bool",
         hipfire_config::ConfigType::U8 => "u8",
@@ -550,9 +559,10 @@ fn config_type_kind(ty: &hipfire_config::ConfigType) -> String {
         hipfire_config::ConfigType::I32 => "i32",
         hipfire_config::ConfigType::F64 => "f64",
         hipfire_config::ConfigType::String => "string",
-        hipfire_config::ConfigType::Path => "path",
+        hipfire_config::ConfigType::Path { .. } => "path",
         hipfire_config::ConfigType::Enum { .. } => "enum",
         hipfire_config::ConfigType::Json => "json",
+        hipfire_config::ConfigType::OneOf { .. } => unreachable!("handled above"),
     }
     .to_string()
 }

@@ -187,10 +187,101 @@ fn parse_env_value(raw: &str, ty: &ConfigType) -> Result<Value, String> {
                 Err(format!("want one of {}", values.join("|")))
             }
         }
-        ConfigType::String | ConfigType::Path => Ok(Value::String(raw.to_string())),
+        ConfigType::String => Ok(Value::String(raw.to_string())),
+        ConfigType::Path { .. } => {
+            validate_path(raw)?;
+            Ok(Value::String(raw.to_string()))
+        }
         ConfigType::Json => {
             serde_json::from_str::<Value>(raw).map_err(|err| format!("want valid JSON ({err})"))
         }
+        // First arm that accepts wins; see `ConfigType::OneOf` on why order is
+        // semantic. On total failure report every arm's expectation, not just
+        // the last one's — "want a path" alone would hide the sentinels.
+        ConfigType::OneOf { arms } => {
+            let mut wants = Vec::new();
+            for arm in *arms {
+                match parse_env_value(raw, arm) {
+                    Ok(value) => return Ok(value),
+                    Err(want) => wants.push(want),
+                }
+            }
+            Err(wants.join("; or "))
+        }
+    }
+}
+
+/// A config path must be ABSOLUTE.
+///
+/// Deliberately NOT an existence check: a store root is created on first use,
+/// and requiring it to exist would refuse a valid config on a fresh host.
+///
+/// Absoluteness is what makes a sentinel typo catchable. A bare relative name
+/// like `"rma"` (for `"ram"`) is a legal path, so with relatives allowed it
+/// resolved silently as a directory and only the filesystem could say it was
+/// not meant. It is also the right rule on its own terms: a config file is read
+/// from a daemon whose working directory is not the operator's, so a relative
+/// path means something different depending on how the daemon was started.
+///
+/// `~` is NOT accepted. Nothing in the config path expands it, so allowing it
+/// would create a literal `~` directory — worse than refusing it.
+pub fn validate_path(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("want an absolute path (got blank)".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("want an absolute path (contains a NUL byte)".to_string());
+    }
+    if trimmed.starts_with('~') {
+        return Err(
+            "want an absolute path (`~` is not expanded here; write the full path)".to_string(),
+        );
+    }
+    if !trimmed.starts_with('/') {
+        return Err(format!(
+            "want an absolute path (`{trimmed}` is relative; it would resolve against the \
+             daemon's working directory, not yours)"
+        ));
+    }
+    Ok(())
+}
+
+/// Check an already-typed JSON value (from a config FILE, not the environment)
+/// against its declared type.
+///
+/// `resolve_field` takes file values verbatim, so before this nothing checked
+/// them: only env went through `parse_env_value`, and the later
+/// `from_value::<HipfireConfig>` catches a Rust type mismatch but never a
+/// domain one — `kv_cache: "kvarnn"` is a perfectly good String.
+///
+/// Reports, never rejects. A value that is wrong here still resolves exactly as
+/// it did before; the operator gets told. Refusing would turn a warning into an
+/// outage on configs that are running today.
+pub fn validate_resolved_value(value: &Value, ty: &ConfigType) -> Result<(), String> {
+    match (value, ty) {
+        (_, ConfigType::Json) => Ok(()),
+        (Value::String(text), _) => parse_env_value(text, ty).map(|_| ()),
+        (Value::Bool(_), ConfigType::Bool) => Ok(()),
+        (
+            Value::Number(_),
+            ConfigType::U8 | ConfigType::U16 | ConfigType::U32 | ConfigType::U64,
+        ) if value.as_u64().is_some() => Ok(()),
+        (Value::Number(_), ConfigType::I32) if value.as_i64().is_some() => Ok(()),
+        (Value::Number(_), ConfigType::F64) => Ok(()),
+        (_, ConfigType::OneOf { arms }) => {
+            let mut wants = Vec::new();
+            for arm in *arms {
+                match validate_resolved_value(value, arm) {
+                    Ok(()) => return Ok(()),
+                    Err(want) => wants.push(want),
+                }
+            }
+            Err(wants.join("; or "))
+        }
+        // Anything else is a shape mismatch the typed materialize step reports
+        // with its own message; do not double-report it here.
+        _ => Ok(()),
     }
 }
 

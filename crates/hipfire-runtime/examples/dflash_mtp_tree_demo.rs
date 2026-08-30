@@ -347,7 +347,7 @@ fn main() {
     speculative::seed_target_hidden_from_prompt(
         &mut gpu,
         &mut target,
-        &mut hidden_rb,
+        Some(&mut hidden_rb),
         &mut target_hidden_host,
         &prompt_tokens,
     )

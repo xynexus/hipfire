@@ -298,7 +298,45 @@ pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
     serve_loaded(LoadedConfig::from_config(config)).await
 }
 
+/// Log what config resolution already worked out.
+///
+/// `LoadedConfig` has carried `diagnostics` and `resolution.unknown_keys` all
+/// along and nothing read them: they were reachable only by fetching
+/// `/admin/config/resolved` with the admin secret. So a daemon would start on a
+/// misspelled key, an override that applied to nothing, or a models dir that is
+/// not there, and say nothing at all — the checks existed, the telling did not.
+///
+/// Warnings only. Every one of these resolves to something usable; the point is
+/// that the operator finds out at boot instead of from behaviour.
+fn report_config_diagnostics(config: &LoadedConfig) {
+    for diagnostic in &config.diagnostics {
+        match diagnostic.severity {
+            hipfire_config::ConfigDiagnosticSeverity::Error => {
+                tracing::error!("config: {}", diagnostic.message)
+            }
+            hipfire_config::ConfigDiagnosticSeverity::Warning => {
+                tracing::warn!("config: {}", diagnostic.message)
+            }
+        }
+    }
+    for unknown in &config.resolution.unknown_keys {
+        let source = match unknown.source.id.as_deref() {
+            Some(id) => format!("{:?}:{id}", unknown.source.kind),
+            None => format!("{:?}", unknown.source.kind),
+        };
+        tracing::warn!(
+            "config: unknown key `{}` in {source} — it is not a schema field and does nothing",
+            unknown.key
+        );
+    }
+    // Does I/O, so it is not part of resolution; see `path_existence_diagnostics`.
+    for diagnostic in hipfire_config::path_existence_diagnostics(&config.config) {
+        tracing::warn!("config: {}", diagnostic.message);
+    }
+}
+
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
+    report_config_diagnostics(&config);
     let auth_policy =
         api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
     let auth_mode = config.config.api_auth_mode;
@@ -329,6 +367,20 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bind = bind::BindInfo::capture(listener.local_addr()?);
     tracing::info!("hipfire listening on http://{addr}");
+    // Claim serve.pid only now that the listener is actually bound. The CLI used
+    // to write it before calling in, so a `serve` that then failed to bind — a
+    // second instance racing the live one for the port, most obviously — still
+    // overwrote the record and orphaned the running server from `stop`/`status`.
+    // Both entry points (`hipfire serve` and the child `hipfire start` spawns)
+    // funnel through here, so the pid is written exactly once, by the process
+    // that owns the port.
+    {
+        let root = hipfire_config::hipfire_dir();
+        let _ = std::fs::create_dir_all(&root);
+        if let Err(e) = std::fs::write(root.join("serve.pid"), std::process::id().to_string()) {
+            tracing::warn!("could not record serve.pid: {e}");
+        }
+    }
     log_api_auth_posture(&bind, auth_mode, auth_policy);
     *state.bind.lock().expect("bind lock") = Some(bind);
     spawn_deferred_prewarm(state.clone());
@@ -408,7 +460,10 @@ async fn spawn_daemon_for_serving(state: &SharedState) -> anyhow::Result<()> {
     // attaching here.
     apply_daemon_startup_env(&cfg);
     let bin = hipfire_daemon_adapter::find_daemon_bin_or_error()?;
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(&bin).await?;
+    // Listening as well as piped: this is the machine's shared daemon, so
+    // `hipfire chat/bench/eval` can attach to it instead of failing on the
+    // `daemon.pid` flock. The stdio half stays the server's own transport.
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn_listening(&bin).await?;
     engine.ping().await?;
     *state.engine.lock().await = Some(engine);
     Ok(())

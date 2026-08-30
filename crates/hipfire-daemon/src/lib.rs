@@ -401,7 +401,14 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
+/// Install the load-time policy knobs the arch loaders read from the environment,
+/// scoped to a single `load_model` call.
+///
+/// This is the established seam for "config value the arch loader consumes as an
+/// env var": the loaders take `&Gpu` + `HfqFile` and deliberately do not receive
+/// `ModelLoadParams`, so a knob reaches them through a scoped env guard rather
+/// than a signature change across the arch boundary.
+fn model_load_env_guards(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
     let mut guards = Vec::new();
     let Some(params) = params else {
         return guards;
@@ -418,6 +425,29 @@ fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> V
             "HIPFIRE_QWEN35_EXPERT_CACHE_BYTES",
             bytes.to_string(),
         ));
+    }
+    // `gpu_slab_load` was a first-class config field with a schema entry, a
+    // default and declared scopes — and NO reader. `gpu_slab_load_enabled`
+    // (qwen35/loading.rs) consults only `HIPFIRE_GPU_SLAB_LOAD`, and
+    // `from_hipfire_config` never forwarded the field, so the config value was
+    // inert.
+    //
+    // Set unconditionally, exactly like the two knobs above: within the daemon,
+    // an explicit config value WINS. The obvious-looking "only if the env var is
+    // absent" guard would invert precedence against its own siblings for no gain
+    // — the places that pin `HIPFIRE_GPU_SLAB_LOAD=0` (hipfire-eval's tinyquant
+    // executor, tests/fixture-golden-gate.sh) set it on the standalone
+    // `tiny_quant_probe` binary, which loads models directly and never reaches
+    // these guards at all.
+    //
+    // `from_hipfire_config` maps the `auto` default to `None`, so a default config
+    // installs nothing and behaviour is byte-identical to before.
+    if let Some(policy) = params
+        .gpu_slab_load
+        .as_deref()
+        .filter(|policy| !policy.is_empty())
+    {
+        guards.push(ScopedEnvVar::set("HIPFIRE_GPU_SLAB_LOAD", policy));
     }
     guards
 }
@@ -1556,8 +1586,9 @@ pub fn main() {
              Reads JSON requests from stdin and writes JSON events to stdout.\n\
              \n\
              Options:\n\
-               --listen [PATH]     serve on a unix socket instead of stdin/stdout\n\
-                                   (default ~/.hipfire/daemon.sock, mode 0600)\n\
+               --listen [PATH]     ALSO serve on a unix socket, so other clients\n\
+                                   can share this daemon; stdin/stdout keep\n\
+                                   working (default ~/.hipfire/daemon.sock, 0600)\n\
                --precompile        compile/cache kernels for the current GPU and exit\n\
                --version, -V       print the build version and exit\n\
                --help, -h          print this help"
@@ -1675,19 +1706,27 @@ pub fn main() {
     // talks over pipes is unaffected. `--listen` is the shared-service mode: the
     // listener outlives any one client, so the daemon keeps serving across
     // disconnects rather than exiting with its only pipe.
-    let inbound = match listen_path {
-        None => transport::spawn_stdin_reader(),
-        Some(path) => match transport::spawn_socket_listener(&path) {
-            Ok(inbound) => {
+    // stdio is always served; `--listen` ADDS a socket rather than replacing it,
+    // so a daemon spawned by `hipfire serve` keeps answering its parent over the
+    // pipe while `chat`/`bench`/`eval` attach to the same daemon over the socket.
+    let inbound = match transport::spawn_readers(listen_path.as_deref()) {
+        Ok(inbound) => {
+            if let Some(path) = &listen_path {
                 tracing::info!("hipfire daemon listening on {}", path.display());
-                inbound
             }
-            // `fatal_startup_error` diverges — it emits a fatal frame and exits.
-            Err(error) => hipfire_daemon_adapter::fatal_startup_error(
-                &format!("failed to listen on {}: {error}", path.display()),
-                None,
+            inbound
+        }
+        // `fatal_startup_error` diverges — it emits a fatal frame and exits.
+        Err(error) => hipfire_daemon_adapter::fatal_startup_error(
+            &format!(
+                "failed to listen on {}: {error}",
+                listen_path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("-"))
+                    .display()
             ),
-        },
+            None,
+        ),
     };
 
     // Drain whatever has arrived, then run whichever pending frame the queue picks.
@@ -1785,7 +1824,7 @@ pub fn main() {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            transport::Payload::Malformed(_) => String::new(),
+            transport::Payload::Malformed(_) | transport::Payload::OwnerHungUp => String::new(),
         };
 
         // Drop any stop that arrived too late for its target. An abort names the
@@ -1802,6 +1841,12 @@ pub fn main() {
 
         let msg = match payload {
             transport::Payload::Request(msg) => msg,
+            // The pipe that spawned us closed. Reached only after every frame
+            // queued ahead of it has run, so the in-flight request completed.
+            transport::Payload::OwnerHungUp => {
+                tracing::info!("stdio owner hung up; shutting down");
+                break;
+            }
             transport::Payload::Malformed(error) => {
                 // Reported here rather than in the reader so every write stays on
                 // this thread and keeps its place relative to real responses. The
@@ -1884,7 +1929,7 @@ pub fn main() {
                 // `None` means the session already had a live stream. It still
                 // runs: refusing would be user-visible, which M3a must not be.
                 let admitted = stream::admit_generate(&mut daemon_state, &msg);
-                handlers::generate::text(&mut daemon_state, &msg);
+                handlers::generate::text(&mut daemon_state, &msg, admitted);
                 if let Some(id) = admitted {
                     // Retire here only on the INLINE path. Under the executor
                     // flag the handler stashed a generation on this stream and

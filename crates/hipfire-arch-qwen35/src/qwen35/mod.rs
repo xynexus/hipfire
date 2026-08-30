@@ -185,12 +185,12 @@ pub(crate) fn qwen35_paged_experts_enabled(num_experts: usize) -> bool {
             "qwen_moe_modules" | "qwen35_moe_modules" | "qwen3.5_moe_modules"
         );
     }
-    matches!(
-        std::env::var("HIPFIRE_QWEN35_PAGED_EXPERTS")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "on" | "yes")
-    )
+    if let Ok(v) = std::env::var("HIPFIRE_QWEN35_PAGED_EXPERTS") {
+        return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+    }
+    hipfire_config::load_config_bundle()
+        .config
+        .qwen35_paged_experts
 }
 
 pub(crate) fn qwen35_expert_cache_budget_bytes() -> u64 {
@@ -203,7 +203,11 @@ pub(crate) fn qwen35_expert_cache_budget_bytes() -> u64 {
     std::env::var("HIPFIRE_QWEN35_EXPERT_CACHE_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(8192)
+        .unwrap_or_else(|| {
+            hipfire_config::load_config_bundle()
+                .config
+                .qwen35_expert_cache_mb
+        })
         .saturating_mul(1024 * 1024)
 }
 

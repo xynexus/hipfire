@@ -187,11 +187,16 @@ struct StdioTransport {
 
 impl StdioTransport {
     async fn spawn(bin: &Path) -> anyhow::Result<Self> {
+        Self::spawn_with(bin, &[]).await
+    }
+
+    async fn spawn_with(bin: &Path, extra: &[&str]) -> anyhow::Result<Self> {
         // Ensure the worker emits a backtrace on panic; an operator-provided
         // value (e.g. `full`) wins so deeper traces can be requested.
         let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
         let mut child = Command::new(bin)
             .args(daemon_argv(bin))
+            .args(extra)
             .env("RUST_BACKTRACE", backtrace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -388,6 +393,17 @@ impl DaemonTransport for SocketTransport {
     }
 }
 
+/// Whether a daemon is actually listening on the shared socket.
+///
+/// A real connect, not a file-exists check: the socket FILE outlives the daemon
+/// that bound it (verified — stopping the server leaves `daemon.sock` behind),
+/// so `exists()` reports a shared daemon that is not there. Callers use this to
+/// choose a transport, and choosing on a stale file means silently skipping the
+/// fallback that would actually have worked.
+pub fn shared_daemon_listening() -> bool {
+    std::os::unix::net::UnixStream::connect(default_socket_path()).is_ok()
+}
+
 /// Where a listening daemon puts its socket. Beside `daemon.pid`, whose flock is
 /// what makes the daemon a singleton — this is the door to that one daemon.
 ///
@@ -404,6 +420,11 @@ pub fn default_socket_path() -> PathBuf {
 pub struct DaemonEngine {
     transport: Box<dyn DaemonTransport>,
     pub worker_key_id: Option<String>,
+    /// True when this engine ATTACHED to a daemon that was already running,
+    /// rather than spawning its own. Measurement commands report it: an attached
+    /// run exercises whatever build is resident, which need not be the one the
+    /// caller just compiled.
+    attached: bool,
 }
 
 pub struct GenerateCollected {
@@ -437,6 +458,26 @@ impl DaemonEngine {
         Ok(Self {
             transport: Box::new(transport),
             worker_key_id: None,
+            attached: false,
+        })
+    }
+
+    /// Spawn a daemon that ALSO listens on the shared socket, and talk to it over
+    /// stdio as usual.
+    ///
+    /// For the long-lived owner of the machine's daemon — `hipfire serve`. It
+    /// keeps the stdio transport deliberately: that is the one that owns the
+    /// child, so it alone can report worker liveness to `/health`, signal a
+    /// cooperative cancel by pid, and take the daemon down with it when the pipe
+    /// closes. The socket is purely an ADDITIONAL door, which is what makes
+    /// [`Self::attach_or_spawn`] actually attach instead of falling through to a
+    /// spawn that then dies on the `daemon.pid` flock.
+    pub async fn spawn_listening(bin: &Path) -> anyhow::Result<Self> {
+        let transport = StdioTransport::spawn_with(bin, &["--listen"]).await?;
+        Ok(Self {
+            transport: Box::new(transport),
+            worker_key_id: None,
+            attached: false,
         })
     }
 
@@ -482,7 +523,13 @@ impl DaemonEngine {
         Ok(Self {
             transport: Box::new(transport),
             worker_key_id: None,
+            attached: true,
         })
+    }
+
+    /// Whether this engine is sharing a daemon someone else started.
+    pub fn is_attached(&self) -> bool {
+        self.attached
     }
 
     /// Share the running daemon if there is one, otherwise start a private one.
@@ -2004,6 +2051,8 @@ mod tests {
                 responses: responses.into(),
             }),
             worker_key_id: None,
+            // A mock owns no daemon, shared or otherwise.
+            attached: false,
         }
     }
 
@@ -2087,6 +2136,7 @@ mod tests {
                 vocab: None,
                 model_worker: None,
                 response_id: Some("stale".to_string()),
+                batch_prefill_capable: None,
             }),
             DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "worker-a".to_string(),
@@ -2097,6 +2147,7 @@ mod tests {
                 vocab: Some(151936),
                 model_worker: None,
                 response_id: None,
+                batch_prefill_capable: None,
             }),
         ]);
 

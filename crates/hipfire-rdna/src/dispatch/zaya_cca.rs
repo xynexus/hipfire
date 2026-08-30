@@ -295,6 +295,32 @@ impl Gpu {
         nkv: usize,
         hd: usize,
     ) -> HipResult<()> {
+        // REFUSE nkv < 2. The kernel writes the composed value as two KV heads --
+        // head 0 the current token's v, head 1 the previous token's delayed v:
+        //
+        //     value[(t*nkv + 0)*hd + d] = v_cur[t*hd + d];
+        //     value[(t*nkv + 1)*hd + d] = v_del[(t-1)*hd + d];
+        //
+        // With nkv == 1 there is no second head, so `(t*1 + 1)*hd` lands on token
+        // t+1's HEAD 0. Thread t then writes v_del[t-1] to the address thread t+1
+        // writes v_cur[t+1] to: same location, different values, winner decided by
+        // scheduling. That is a data race producing nondeterministic output from
+        // bit-identical inputs, and the t = s-1 thread additionally writes one
+        // full head past the end of a `s*nkv*hd` buffer.
+        //
+        // Attention compounds it: `groups = nq/nkv` makes every query head read
+        // value head 0, so the delayed half is never consumed while its write
+        // corrupts the half that is. nkv >= 2 is structural for this design, not
+        // a tuning choice -- so this is a refusal, not a clamp.
+        if nkv < 2 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "zaya_value_compose_f32 requires num_key_value_heads >= 2 \
+                     (compositional value needs a head for the delayed v); got nkv={nkv}"
+                ),
+            ));
+        }
         self.zaya_ensure("zaya_value_compose_f32")?;
         let (vp, cp, dp) = (value.buf.as_ptr(), v_cur.buf.as_ptr(), v_del.buf.as_ptr());
         let (si, nkvi, hdi) = (s as i32, nkv as i32, hd as i32);

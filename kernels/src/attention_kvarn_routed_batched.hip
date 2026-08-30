@@ -16,10 +16,13 @@
 // scores[seq_len] in LDS (same shape/LDS as the q8 routed kernel; same context cap).
 //
 // Record layout (== kvarn_quantize_tile / pack_kvarn_tile), channel-major rows:
-//   [ (head_dim*GROUP+1)/2 ] 4-bit q | [head_dim*2] scale_abs f16 | [head_dim*2] zp_abs f16 | [GROUP*2] s_col f16
+//   [ ceil(head_dim*GROUP/cpb) ] q codes | [head_dim*2] scale_abs f16 | [head_dim*2] zp_abs f16 | [GROUP*2] s_col f16
+// with cpb = 8/bits codes per byte (bits in {2,4,8}); must match
+// KvCache::kvarn_k_record_bytes_bits, which is what the flush writes.
 // Dequant K[d,t] = (q*scale_abs[d] + zp_abs[d]) * s_col[t-in-block].
 //
-// Grid: [n_heads, batch_size, 1].
+// Grid: [n_heads, rows_in_this_launch, 1]; `row_offset` gives the absolute row
+// of blockIdx.y == 0.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
@@ -40,11 +43,23 @@ extern "C" __global__ void attention_kvarn_routed_batched(
     int max_seq,
     float scale_attn,
     int rec_bytes,
-    int group
-,
-    int window_f16                                  // 1 = window holds f16, 0 = f32) {
+    int group,
+    // 1 = the window holds f16, 0 = f32.
+    int window_f16,
+    // K code width in bits: 2, 4 or 8. Sets both the record STRIDE and the
+    // unpack. This used to be assumed to be 4 — correct only by coincidence at
+    // the default `kvarn`/`kvarn4`, and a stride + unpack mismatch at kvarn2 and
+    // kvarn8, which the flush writes at the cache's real width.
+    int bits,
+    // Absolute index of the first row in this launch. The fused prefill writes
+    // the window in SEGMENTS (it is a `group`-slot ring, so a run of rows that
+    // fills it must be drained before the next run wraps it) and now attends per
+    // segment, so `blockIdx.y` is an offset into the segment while q/out/positions
+    // stay indexed by ABSOLUTE row. 0 for a whole-batch launch.
+    int row_offset
+) {
     const int h = blockIdx.x;
-    const int b = blockIdx.y;
+    const int b = blockIdx.y + row_offset;
     if (h >= n_heads) return;
 
     const int session_idx = row_session_indices[b];
@@ -69,7 +84,13 @@ extern "C" __global__ void attention_kvarn_routed_batched(
     const int blocks_per_head = head_dim / 32;
     const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
     const int kv_head_block_start = kv_h * blocks_per_head;
-    const int off_scale = (head_dim * group + 1) / 2;
+    // Same derivation as attention_flash_kvarn_tile_batched: `bits` is a runtime
+    // argument, so give the compiler the shift/mask form rather than a divide.
+    const int cpb = 8 / bits;                                        // codes per byte
+    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);   // log2(cpb)
+    const int cpb_mask = cpb - 1;
+    const int codemask = (1 << bits) - 1;
+    const int off_scale = (head_dim * group + cpb - 1) / cpb;
     const int off_zp = off_scale + head_dim * 2;
     const int off_scol = off_zp + head_dim * 2;
 
@@ -94,9 +115,10 @@ extern "C" __global__ void attention_kvarn_routed_batched(
             const float sc = __half2float(s_col[t_local]);
             for (int d = 0; d < head_dim; d++) {
                 const int idx = d * group + t_local;
-                const uint8_t byte = rec[idx >> 1];
-                const float q4 = (float)((idx & 1) == 0 ? (byte & 0xf) : (byte >> 4));
-                const float k = (q4 * __half2float(scale_abs[d]) + __half2float(zp_abs[d])) * sc;
+                const uint8_t byte = rec[idx >> cpb_shift];
+                const float qv =
+                    (float)((byte >> (bits * (idx & cpb_mask))) & codemask);
+                const float k = (qv * __half2float(scale_abs[d]) + __half2float(zp_abs[d])) * sc;
                 dot += q_shared[d] * k;
             }
         } else {

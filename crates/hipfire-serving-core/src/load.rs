@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Model load / unload: turning an HFQ (or safetensors) path + load-message
+//! Model load / unload: turning an HFQ path + load-message
 //! params into a [`LoadedModel`], and tearing it down.
 //!
-//! Covers the per-arch single-GPU `load_model`, the safetensors path
-//! (`load_model_safetensors`), the multi-GPU pipeline-parallel `load_model_pp`,
+//! Covers the per-arch single-GPU `load_model`, the multi-GPU
+//! pipeline-parallel `load_model_pp`,
 //! `unload_model`, the optional DFlash drafter (`load_dflash_state`), and the
 //! small config/metadata helpers (chat-template resolution, state-quant parsing,
 //! parameter counting, tiny-model bring-up). Extracted verbatim from the former
@@ -33,8 +33,8 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_model::{
     arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
-    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
+    ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -50,7 +50,7 @@ use hipfire_runtime::quant::QuantType;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnArtifact, TriAttnCenters};
 
 use crate::embedding_runtime::{classify_embedding_workload, EmbeddingRuntimeKind};
-use crate::memory::{hfq_model_memory, unknown_model_memory};
+use crate::memory::hfq_model_memory;
 use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::model::Lfm2DflashState;
@@ -649,18 +649,6 @@ pub fn resolve_tiny_model_state(
     q
 }
 
-/// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
-/// detect the arch, parse its config, upload weights and allocate the forward
-/// scratch/KV/state for that family, resolve the chat template and eviction
-/// policy, and wire any optional DFlash drafter. The single-GPU entry point
-/// (multi-GPU goes through [`load_model_pp`]).
-/// Default slack left for the rest of the system after a load, in bytes.
-///
-/// Not a KV estimate: the KV cache is sized after the config is parsed, well
-/// past this point. 4 GiB is enough to keep the session's supervisor processes
-/// alive so a too-large load fails as a refusal instead of as a reaping.
-const LOAD_MEM_RESERVE_BYTES: u64 = 4 << 30;
-
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
 ///
 /// `MemAvailable`, not `MemFree`: reclaimable page cache is genuinely available
@@ -727,6 +715,9 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
     if std::env::var("HIPFIRE_LOAD_MEM_CHECK").as_deref() == Ok("0") {
         return Ok(());
     }
+    if !hipfire_config::load_config_bundle().config.load_mem_check {
+        return Ok(());
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
@@ -750,7 +741,12 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|gib| gib << 30)
-        .unwrap_or(LOAD_MEM_RESERVE_BYTES);
+        .unwrap_or_else(|| {
+            (hipfire_config::load_config_bundle()
+                .config
+                .load_mem_reserve_gib as u64)
+                << 30
+        });
     load_headroom_verdict(need, available, reserve)
 }
 
@@ -788,6 +784,11 @@ mod load_headroom_tests {
     }
 }
 
+/// Load a model from an HFQ path + load-message params into a [`LoadedModel`]:
+/// detect the arch, parse its config, upload weights and allocate the forward
+/// scratch/KV/state for that family, resolve the chat template and eviction
+/// policy, and wire any optional DFlash drafter. The single-GPU entry point
+/// (multi-GPU goes through [`load_model_pp`]).
 pub fn load_model(
     path: &str,
     max_seq: usize,
@@ -848,6 +849,13 @@ pub fn load_model(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // `auto` (the config default) and unset both mean "the loader chooses".
+    // KVarN: ~8x smaller K than fp32 with no token dropped, and batched-prefill
+    // eligible. fp32 is an oracle/debug mode, not a production path — ask for it
+    // explicitly (kv_cache=fp32) if you want it.
+    if kv_mode.is_empty() || kv_mode == "auto" {
+        kv_mode = "kvarn".to_string();
+    }
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let compose_manifest = compose_manifest_from_metadata(&hfq.metadata_json)
         .map_err(|error| format!("embedded component manifest: {error}"))?;
@@ -947,17 +955,14 @@ pub fn load_model(
     //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
-    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    //     to the per-token path. That flip is done: the default is now KVarN.
     // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
     // models, including BF16-dominant ones. Default to fp32 only when the
     // caller left it unspecified. (Previously BF16-dominant artifacts were
     // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
-    // — that silently discarded the requested KV quant. fp32 remains the
-    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // — that silently discarded the requested KV quant. fp32 is reserved for
+    // oracle/debug runs; quantizing KV under bf16 weights is an opt-in the
     // operator owns.)
-    if kv_mode.is_empty() {
-        kv_mode = "fp32".to_string();
-    }
     reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -1073,17 +1078,22 @@ pub fn load_model(
             // batched across the verify block before admitting it by default makes
             // anyone faster.
             //
-            // HIPFIRE_DFLASH_ALLOW_OPUS=1 opts in for that work. The drafters on
-            // disk are parked `.parked-slower-than-plain-decode` so sibling
-            // discovery cannot attach one silently; pass `params.draft` explicitly
-            // to measure.
-            let opus_ok = std::env::var("HIPFIRE_DFLASH_ALLOW_OPUS").as_deref() == Ok("1");
+            // That measurement is why the gate existed; it is kept above as the
+            // record of where speculation does NOT pay on this family. It is no
+            // longer a load-time refusal: `dflash_mode` decides whether to try,
+            // and a per-model override picks the drafter.
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
-                // Opt-in while the batched verify body is being bisected; see
-                // the note above. Default stays refused.
-                Some(33 | 34 | 35 | 36 | 38 | 52) => opus_ok,
+                // Opus Quant. Batched lm_head and correctness are both done —
+                // see the note above — and it is measured FASTER here, not
+                // slower: Qwen3.5-9B oq4.25++ on gfx1103, greedy, 13.2 -> 29.8
+                // tok/s repetitive and 12.8 -> 30.2 prose. The old opt-in
+                // generalised a 27B/35B-A3B result to the whole family; those
+                // are MoE and DeltaNet-heavy, where a wider verify batch
+                // amortizes only part of the stack. A dense target is a
+                // different shape.
+                Some(33 | 34 | 35 | 36 | 38 | 52) => true,
                 // Unquantized heads. BF16 (16) resolves to DType::BF16; the
                 // losslessly recoded pair (Bf16Lut3=49, Bf16Huff=50) keeps the
                 // head PACKED as DType::Bf16L3. `dflash_enqueue_verify_lm_head`
@@ -1102,11 +1112,9 @@ pub fn load_model(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
                      ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13), \
-                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50) always; MQ3G256 \
-                     (qt=17) on gfx11 only. Opus oq* (qt=33/34/35/36/38/52) is \
-                     CORRECT now but measured slower than plain decode on this \
-                     family, so it stays behind HIPFIRE_DFLASH_ALLOW_OPUS=1. \
-                     Other dtypes \
+                     BF16 (qt=16), Bf16Lut3/Bf16Huff (qt=49/50), Opus oq* \
+                     (qt=33/34/35/36/38/52) always; MQ3G256 (qt=17) on gfx11 \
+                     only. Other dtypes \
                      (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
                      through to a per-row GEMV that hangs verify. Reload without a \
                      draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: extend \
@@ -2688,6 +2696,13 @@ pub fn load_model(
         // be smaller than max_seq; the server reloads a larger worker when a
         // request needs more physical rows.
         let is_kv_layer = crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
+        // Only the full-attention layers carry KV on these hybrids (16 of 64 on
+        // Qwen3.8-27B); the rest are linear-attention and get a 1-element
+        // placeholder. Every mode with a `_capped_filtered` constructor uses it —
+        // the unfiltered ones allocated `n_layers` real buffers, ~4x what the
+        // model can address. asym2/asym4/fwht* have a `_filtered` but no
+        // `_capped_filtered`, so they still over-allocate; they are deprecated in
+        // favour of kvarn (see the kv_cache schema field), so that is left alone.
         let kv = match kv_mode.as_str() {
             "fp32" | "f32" => kv::KvCache::new_gpu_capped_filtered(
                 gpu,
@@ -2700,9 +2715,9 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             "q8" => {
                 tracing::info!("KV cache: Q8");
-                kv::KvCache::new_gpu_q8_capped(
+                kv::KvCache::new_gpu_q8_capped_filtered(
                     gpu,
-                    config.n_layers,
+                    &is_kv_layer,
                     config.n_kv_heads,
                     config.head_dim,
                     max_seq,
@@ -2719,16 +2734,18 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                physical_cap,
-                kvarn_bits_from_mode(m),
-            )
-            .map_err(|e| format!("{e}"))?,
+            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => {
+                kv::KvCache::new_gpu_kvarn_capped_filtered(
+                    gpu,
+                    &is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                    physical_cap,
+                    kvarn_bits_from_mode(m),
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
                 gpu,
                 config.n_layers,
@@ -2738,9 +2755,9 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped(
+            "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 max_seq,
@@ -2749,9 +2766,9 @@ pub fn load_model(
             .map_err(|e| format!("{e}"))?,
             other => {
                 tracing::warn!("KV cache: unrecognized '{other}', defaulting to asym3");
-                kv::KvCache::new_gpu_asym3_capped(
+                kv::KvCache::new_gpu_asym3_capped_filtered(
                     gpu,
-                    config.n_layers,
+                    &is_kv_layer,
                     config.n_kv_heads,
                     config.head_dim,
                     max_seq,
@@ -2893,9 +2910,9 @@ pub fn load_model(
             tracing::info!(
                 "DFlash draft loaded: source={} layers={} hidden={} block={}",
                 source.label(),
-                state.draft_config.n_layers,
-                state.draft_config.hidden,
-                state.draft_config.block_size,
+                state.draft_config.as_ref().map_or(0, |c| c.n_layers),
+                state.draft_config.as_ref().map_or(0, |c| c.hidden),
+                state.draft_config.as_ref().map_or(0, |c| c.block_size),
             );
             Some(state)
         } else {
@@ -3306,466 +3323,6 @@ fn embeddinggemma_storage_contract(
     Ok(contract)
 }
 
-/// Load a model from a HuggingFace safetensors directory (ParoQuant, AWQ, etc.).
-pub fn load_model_safetensors(
-    path: &str,
-    max_seq: usize,
-    kv_mode: &str,
-    gpu: &mut hipfire_rdna::Gpu,
-) -> Result<LoadedModel, String> {
-    use hipfire_model::ModelSource;
-    use hipfire_runtime::safetensors_source::SafetensorsSource;
-
-    tracing::info!("opening safetensors directory: {path}");
-    let model_memory = unknown_model_memory(path);
-    let source =
-        SafetensorsSource::open(Path::new(path)).map_err(|e| format!("safetensors open: {e}"))?;
-
-    let arch_id = source.arch_id();
-    let qm = source
-        .quant_config()
-        .map(|q| q.method.as_str())
-        .unwrap_or("none");
-    tracing::info!("arch_id={arch_id}, quant_method={qm}");
-
-    // Tokenizer from tokenizer.json
-    let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
-        hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-            .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
-            .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
-    } else {
-        return Err("no tokenizer.json found in model directory".to_string());
-    };
-
-    // HF safetensors use half-split RoPE convention (rotate_half)
-    // — upstream now defaults to halfsplit, no flag needed
-    let chat_template = source.chat_template();
-
-    if arch_id == ARCH_ID_LLAMA_MISTRAL || arch_id == ARCH_ID_QWEN3_QWEN2_LEGACY {
-        let (chat_template, chat_template_profile) =
-            profile_chat_template(chat_template, Some(&tokenizer));
-        // LLaMA / Qwen3 — standard attention, no DeltaNet
-        let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-            .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
-
-        tracing::info!(
-            "LLaMA/Qwen3: dim={}, layers={}, heads={}, kv_heads={}, head_dim={}, qk_norm={}",
-            config.dim,
-            config.n_layers,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.has_qk_norm
-        );
-
-        let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, gpu)
-            .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-
-        // asym3 K-cache asserts head_dim==256 (Qwen 3.5/3.6 family). Qwen3
-        // dense checkpoints (e.g. shisa-Qwen3-0.6B-PARO, head_dim=128) need
-        // q8 for auto/default selection; explicit "asym3" still routes to
-        // the panicking constructor so caller-misconfigured runs surface.
-        let asym3_auto = matches!(kv_mode, "turbo3" | "turbo" | "auto" | "");
-        let kv = match kv_mode {
-            "q8" => kv::KvCache::new_gpu_q8_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-            ),
-            "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-            ),
-            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-                kvarn_bits_from_mode(m),
-            ),
-            "asym3" => kv::KvCache::new_gpu_asym3_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-            ),
-            _ if asym3_auto && config.head_dim == 256 => kv::KvCache::new_gpu_asym3_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-            ),
-            _ => kv::KvCache::new_gpu_q8_capped(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                max_seq,
-                max_seq,
-            ),
-        }
-        .map_err(|e| format!("KvCache: {e}"))?;
-
-        let scratch = llama::ForwardScratch::new(gpu, &config)
-            .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
-
-        // P3.2: route arch 0/1 through the ServingBackend seam — assemble the
-        // backend (owns config/weights/scratch/kv); the separate llama_* fields
-        // stay None.
-        let llama_backend =
-            hipfire_arch_llama::LlamaBackend::new(arch_id, config, weights, scratch, kv);
-
-        return Ok(LoadedModel {
-            arch_id,
-            registered_backend: None,
-            pp: 1,
-            pp_gpus: None,
-            pp_scratch_set: None,
-            pp_dn_la_to_device: None,
-            q35_config: None,
-            q35_weights: None,
-            q35_scratch: None,
-            qwen2_config: None,
-            qwen2_weights: None,
-            qwen2_state: None,
-            dots_ocr_config: None,
-            dots_ocr_weights: None,
-            q35_kv_mode: None,
-            q35_state_quant: None,
-            q35_registry: SessionRegistry::default(),
-            llama_config: None,
-            llama_weights: None,
-            llama_scratch: None,
-            llama_kv: None,
-            llama_backend: Some(llama_backend),
-            nemotron_backend: None,
-            zaya_backend: None,
-            deepseek4_config: None,
-            deepseek4_weights: None,
-            deepseek4_state: None,
-            deepseek4_pbs: None,
-            deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
-            mtp_weights_present: false,
-            minimax_config: None,
-            minimax_weights: None,
-            minimax_state: None,
-            minimax_eos_tok: 0,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_config: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_weights: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_registry: SessionRegistry::default(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_eos_tok: 0,
-            vision_config: None,
-            vision_weights: None,
-            gemma3_vl: None,
-            gemma3_text: None,
-            embeddinggemma: None,
-            qwen3_embedding: None,
-            tokenizer: Some(tokenizer),
-            active: ResidentSession::default(),
-            max_seq,
-            physical_cap: max_seq,
-            eviction: None,
-            asst_turn_cache: std::collections::HashMap::new(),
-            decoded_vocab: None,
-            model_path: path.to_string(),
-            memory: model_memory,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_dflash: None,
-            dflash: None,
-            dspark: None,
-            chat_template,
-            chat_template_profile,
-        });
-    }
-
-    if arch_id == ARCH_ID_NEMOTRON_H || arch_id == ARCH_ID_MAMBA2 {
-        // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2 are
-        // routed through the same Mamba-capable ServingBackend seam.
-        let (chat_template, chat_template_profile) =
-            profile_chat_template(chat_template, Some(&tokenizer));
-        // The HFQ-compatible metadata wraps config.json under the "config" key.
-        let meta: serde_json::Value = serde_json::from_str(source.metadata_json())
-            .map_err(|e| format!("nemotron metadata parse: {e}"))?;
-        let cfg_json = meta
-            .get("config")
-            .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = if arch_id == ARCH_ID_MAMBA2 {
-            hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
-                .map_err(|e| format!("mamba2 config: {e}"))?
-        } else {
-            hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
-                .map_err(|e| format!("nemotron config: {e}"))?
-        };
-        if arch_id == ARCH_ID_MAMBA2 {
-            if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
-                cfg.eos_token_id = eot;
-            }
-        } else if let Some(im_end) = tokenizer.special_token_id("<|im_end|>") {
-            // Chat serving stops on the ChatML turn delimiter `<|im_end|>`, not
-            // the base `eos_token_id` (`</s>` = 2 for Nano). Resolve it from the
-            // tokenizer; fall back to the config eos if the model isn't ChatML.
-            cfg.eos_token_id = im_end;
-        }
-        tracing::info!(
-            "{}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
-            if arch_id == ARCH_ID_MAMBA2 {
-                "mamba2"
-            } else {
-                "nemotron_h"
-            },
-            cfg.hidden_size,
-            cfg.num_layers,
-            cfg.count(hipfire_arch_nemotron::BlockKind::Mamba2),
-            cfg.count(hipfire_arch_nemotron::BlockKind::Attention),
-            cfg.count(hipfire_arch_nemotron::BlockKind::Mlp),
-            cfg.count(hipfire_arch_nemotron::BlockKind::Moe),
-            cfg.vocab_size,
-            cfg.eos_token_id,
-        );
-        let weights = hipfire_arch_nemotron::loader::load_nemotron_weights(&source, &cfg)?;
-        let model = hipfire_arch_nemotron::model::NemotronModel::new(gpu, cfg, &weights, max_seq)
-            .map_err(|e| format!("mamba-capable NemotronModel::new: {e:?}"))?;
-
-        return Ok(LoadedModel {
-            arch_id,
-            registered_backend: None,
-            pp: 1,
-            pp_gpus: None,
-            pp_scratch_set: None,
-            pp_dn_la_to_device: None,
-            q35_config: None,
-            q35_weights: None,
-            q35_scratch: None,
-            qwen2_config: None,
-            qwen2_weights: None,
-            qwen2_state: None,
-            dots_ocr_config: None,
-            dots_ocr_weights: None,
-            q35_kv_mode: None,
-            q35_state_quant: None,
-            q35_registry: SessionRegistry::default(),
-            llama_config: None,
-            llama_weights: None,
-            llama_scratch: None,
-            llama_kv: None,
-            llama_backend: None,
-            nemotron_backend: Some(model),
-            zaya_backend: None,
-            deepseek4_config: None,
-            deepseek4_weights: None,
-            deepseek4_state: None,
-            deepseek4_pbs: None,
-            deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(),
-            mtp_k: 3,
-            mtp_weights_present: false,
-            minimax_config: None,
-            minimax_weights: None,
-            minimax_state: None,
-            minimax_eos_tok: 0,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_config: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_weights: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_registry: SessionRegistry::default(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_eos_tok: 0,
-            vision_config: None,
-            vision_weights: None,
-            gemma3_vl: None,
-            gemma3_text: None,
-            embeddinggemma: None,
-            qwen3_embedding: None,
-            tokenizer: Some(tokenizer),
-            active: ResidentSession::default(),
-            max_seq,
-            physical_cap: max_seq,
-            eviction: None,
-            asst_turn_cache: std::collections::HashMap::new(),
-            decoded_vocab: None,
-            model_path: path.to_string(),
-            memory: model_memory,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_dflash: None,
-            dflash: None,
-            dspark: None,
-            chat_template,
-            chat_template_profile,
-        });
-    }
-
-    if !is_qwen35_family_arch_id(arch_id) {
-        return Err(format!("safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1) and Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
-    }
-
-    // Parse config (reuse Qwen35's config parser via metadata_json)
-    let config = qwen35::config_from_safetensors(&source)
-        .ok_or("failed to parse Qwen3.5 config from config.json")?;
-
-    tracing::info!(
-        "Qwen3.5/3.6: dim={}, layers={}, heads={}",
-        config.dim,
-        config.n_layers,
-        config.n_heads
-    );
-
-    // Load weights via ParoQuant path
-    let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
-        .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
-
-    // KV cache: default to asym3 (matches the main Qwen35 path)
-    let effective_max_seq = max_seq;
-    let kv_cache = match kv_mode {
-        "q8" => kv::KvCache::new_gpu_q8_capped(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-        "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-        m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-            kvarn_bits_from_mode(m),
-        ),
-        _ => kv::KvCache::new_gpu_asym3_capped(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            max_seq,
-            max_seq,
-        ),
-    }
-    .map_err(|e| format!("KvCache: {e}"))?;
-    let dn_state =
-        DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
-    // Captured before `dn_state` is moved, so the reported metadata matches the
-    // quant actually allocated.
-    let dn_quant_actual = dn_state.quant;
-    let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
-        .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
-    let (chat_template, chat_template_profile) =
-        profile_chat_template(chat_template, Some(&tokenizer));
-
-    let sequence_state = Some(SequenceState::new(
-        crate::session::qwen35_mixer_profile(&config.layer_types),
-        Some(kv_cache),
-        Some(Box::new(dn_state)),
-    ));
-    Ok(LoadedModel {
-        arch_id,
-        registered_backend: None,
-        pp: 1,
-        pp_gpus: None,
-        pp_scratch_set: None,
-        pp_dn_la_to_device: None,
-        q35_config: Some(config),
-        q35_weights: Some(weights),
-        q35_scratch: Some(scratch),
-        qwen2_config: None,
-        qwen2_weights: None,
-        qwen2_state: None,
-        dots_ocr_config: None,
-        dots_ocr_weights: None,
-        q35_kv_mode: Some(kv_mode.to_string()),
-        // Report the quant the state was ACTUALLY built with. This was
-        // hardcoded to Q8 while `DeltaNetState::new` above resolves through the
-        // redundancy gate (FP32 for all current models), so the recorded label
-        // contradicted the allocation.
-        q35_state_quant: Some(dn_quant_actual),
-        q35_registry: SessionRegistry {
-            sessions: std::collections::HashMap::new(),
-            active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
-            allocation_epoch: next_qwen35_state_allocation_epoch(),
-        },
-        llama_config: None,
-        llama_weights: None,
-        llama_scratch: None,
-        llama_kv: None,
-        llama_backend: None,
-        nemotron_backend: None,
-        zaya_backend: None,
-        deepseek4_config: None,
-        deepseek4_weights: None,
-        deepseek4_state: None,
-        deepseek4_pbs: None,
-        deepseek4_eos_tok: 0,
-        mtp_mode: "auto".to_string(),
-        mtp_k: 3,
-        mtp_weights_present: false,
-        minimax_config: None,
-        minimax_weights: None,
-        minimax_state: None,
-        minimax_eos_tok: 0,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2moe_config: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2moe_weights: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_registry: SessionRegistry::default(),
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2moe_eos_tok: 0,
-        vision_config: None,
-        vision_weights: None,
-        gemma3_vl: None,
-        gemma3_text: None,
-        embeddinggemma: None,
-        qwen3_embedding: None,
-        tokenizer: Some(tokenizer),
-        active: ResidentSession {
-            sequence_state,
-            ..Default::default()
-        },
-        max_seq: effective_max_seq,
-        physical_cap: effective_max_seq,
-        eviction: None,
-        asst_turn_cache: std::collections::HashMap::new(),
-        decoded_vocab: None,
-        model_path: path.to_string(),
-        memory: model_memory,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_dflash: None,
-        dflash: None,
-        dspark: None,
-        chat_template,
-        chat_template_profile,
-    })
-}
-
 /// Multi-GPU pipeline-parallel load path (Stage 7 of #58). Refuses VL,
 /// non-Qwen3.5 architectures and (transitively, via the upstream "load"
 /// handler) DFlash, CASK and PFlash. Returns a `LoadedModel` with `pp_gpus`,
@@ -3785,6 +3342,13 @@ pub fn load_model_pp(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // `auto` (the config default) and unset both mean "the loader chooses".
+    // KVarN: ~8x smaller K than fp32 with no token dropped, and batched-prefill
+    // eligible. fp32 is an oracle/debug mode, not a production path — ask for it
+    // explicitly (kv_cache=fp32) if you want it.
+    if kv_mode.is_empty() || kv_mode == "auto" {
+        kv_mode = "kvarn".to_string();
+    }
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
@@ -3796,17 +3360,14 @@ pub fn load_model_pp(
     //     kv_mode; otherwise default to fp32 for now. A quantized KV (q8/asym/
     //     KVarN) makes the model batched-prefill eligible (~32x prefill); the
     //     prior rule wrongly force-fp32'd these via the BF16 norms, locking them
-    //     to the per-token path. Default flips to KVarN once it's a runtime mode.
+    //     to the per-token path. That flip is done: the default is now KVarN.
     // KV precision: respect an explicit kv_mode (config/CLI/JSON) for ALL
     // models, including BF16-dominant ones. Default to fp32 only when the
     // caller left it unspecified. (Previously BF16-dominant artifacts were
     // force-overridden to fp32 even when the operator asked for q8/asym/KVarN
-    // — that silently discarded the requested KV quant. fp32 remains the
-    // safe default; quantizing KV under bf16 weights is now an opt-in the
+    // — that silently discarded the requested KV quant. fp32 is reserved for
+    // oracle/debug runs; quantizing KV under bf16 weights is an opt-in the
     // operator owns.)
-    if kv_mode.is_empty() {
-        kv_mode = "fp32".to_string();
-    }
     reject_deprecated_kv_mode(&kv_mode)?;
     let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -3903,7 +3464,7 @@ pub fn load_model_pp(
             max_seq,
         )
         .map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => kv::KvCache::new_gpu_asym3_capped_multi(
+        "asym3" | "turbo3" | "turbo" => kv::KvCache::new_gpu_asym3_capped_multi(
             &mut gpus,
             config.n_layers,
             config.n_kv_heads,
@@ -4184,9 +3745,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     // and (optional) DDTree state must each be returned to the pool — otherwise a
     // mid-session load/unload cycle strands them until daemon exit.
     if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
-        df.hidden_rb.free_gpu(gpu);
+        // The drafter half is absent on an n-gram-only load; the target-side
+        // buffers below are always present and always need returning.
+        if let Some(draft_weights) = df.draft_weights {
+            draft_weights.free_gpu(gpu);
+        }
+        if let Some(draft_scratch) = df.draft_scratch {
+            draft_scratch.free_gpu(gpu);
+        }
+        if let Some(hidden_rb) = df.hidden_rb {
+            hidden_rb.free_gpu(gpu);
+        }
         df.verify_scratch.free_gpu(gpu);
         df.target_snap.free_gpu(gpu);
         df.gdn_tape.free_gpu(gpu);
@@ -4526,6 +4095,59 @@ pub fn load_dspark_state(
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft
 /// weights/config/scratch, the hidden-state ring buffer + verify scratch, and
 /// (when `HIPFIRE_DDTREE_BUDGET` is set) the DDTree tree-verify side state.
+/// Build the target-side speculative state for n-gram decode with NO drafter.
+///
+/// Every field here comes from the TARGET — verify scratch, the DeltaNet
+/// snapshot and the GDN tape are what the verify step needs regardless of where
+/// the draft came from. The four drafter fields are None, which makes
+/// `spec_step_dflash` skip the drafter branch, the per-layer hidden extraction
+/// on every verify, and the staging that feeds the next drafter cycle.
+///
+/// `max_spine` sizes the verify buffers the way `draft_cfg.block_size` does for
+/// DFlash: one slot for the seed plus the longest spine n-gram can supply.
+pub fn ngram_only_state(
+    max_spine: usize,
+    ctx_capacity: usize,
+    target_config: &qwen35::Qwen35Config,
+    target_dn: &DeltaNetState,
+    lm_head_k: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<DflashState, String> {
+    let scratch_max_n = max_spine.max(1) + 1;
+    let target_snap =
+        DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
+    let gdn_tape = GdnTape::new_for_config(gpu, target_config, scratch_max_n)
+        .map_err(|e| format!("gdn_tape: {e}"))?;
+    let verify_scratch = VerifyScratch::with_prefill(
+        gpu,
+        scratch_max_n,
+        target_config.dim,
+        target_config.vocab_size,
+        lm_head_k,
+        target_config,
+    )
+    .map_err(|e| format!("verify_scratch: {e}"))?;
+    Ok(DflashState {
+        draft_config: None,
+        draft_weights: None,
+        draft_scratch: None,
+        hidden_rb: None,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        // Only the drafter reads the host hidden shadow.
+        target_hidden_host: Vec::new(),
+        ctx_capacity,
+        block_size: max_spine.max(1),
+        // Adaptive-B tunes a DRAFTER's block; the spine length is n-gram's.
+        adaptive_b: false,
+        // DDTree is a tree over a drafter's candidates.
+        ddtree: None,
+        ngram: None,
+        ngram_live: None,
+    })
+}
+
 pub fn load_dflash_state(
     draft_path: &str,
     ctx_capacity: usize,
@@ -4758,17 +4380,26 @@ fn load_dflash_state_source(
     };
 
     Ok(DflashState {
-        draft_config,
-        draft_weights,
-        draft_scratch,
-        hidden_rb,
+        draft_config: Some(draft_config),
+        draft_weights: Some(draft_weights),
+        draft_scratch: Some(draft_scratch),
+        hidden_rb: Some(hidden_rb),
         verify_scratch,
         target_snap,
         gdn_tape,
         target_hidden_host,
         ctx_capacity,
         block_size,
+        // Opt-in (dflash_adaptive_b:true). Measured on gfx1103/Qwen3.8-27B:
+        // with max_block clamped to the trained block the controller has no
+        // upside to find (the trained block IS the in-range optimum) and the
+        // ramp costs ~25% decode. Flip once scratches are sized for B above
+        // trained (scope doc item 4) and the search space contains a win.
+        adaptive_b: false,
         ddtree,
+        // Opt-in; the daemon fills this in from `ngram_spec` after load.
+        ngram: None,
+        ngram_live: None,
     })
 }
 

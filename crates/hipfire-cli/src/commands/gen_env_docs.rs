@@ -27,10 +27,11 @@
 //! now agrees with it. `line_idx` still carries the position internally, where
 //! comment scanning genuinely needs it — it just never reaches the output.
 //!
-//! `--check` therefore verifies two things that cannot churn: the Markdown
-//! matches if present (absent is fine — fresh clones and CI do not have it),
-//! and `coverage_gaps` finds no `HIPFIRE_*` named in AGENTS.md / README.md /
-//! CONTRIBUTING.md that is missing from the table.
+//! `--check` therefore verifies one thing that cannot churn: `coverage_gaps`
+//! finds no `HIPFIRE_*` named in AGENTS.md / README.md / CONTRIBUTING.md that is
+//! missing from the table. The Markdown itself is gitignored and so is skipped
+//! entirely — it used to be compared when present, which meant the check was
+//! dead in CI (fresh clone, no file) and a guaranteed false alarm locally.
 //!
 //! **The output is a pure function of the tracked sources.** It deliberately
 //! does NOT read descriptions back out of `docs/env-vars.md`: that file is
@@ -113,10 +114,12 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
 
     if args.check {
         let mut stale = Vec::new();
-        // `docs/env-vars.md` is generated and gitignored, so a clean checkout
-        // simply does not have it and that is not drift — but a copy that IS
-        // present has to match, or a stale local file quietly misleads whoever
-        // reads it.
+        // `docs/env-vars.md` is generated and gitignored, so `check_file`
+        // skips it: a clean checkout does not have it, and a warm worktree's
+        // copy goes stale on any commit that adds an env var — for a path no
+        // commit can refresh. That made this the only place the gate ever
+        // fired, always as a false alarm. `coverage_gaps` below is the half
+        // with real enforcement, and it reads only tracked docs.
         check_file(&doc_path, markdown.as_bytes(), &mut stale);
         let missing = coverage_gaps(&root, &markdown);
 
@@ -702,15 +705,20 @@ fn render_markdown(docs: &[EnvDoc]) -> String {
 
 /// Record `path` as stale unless it matches freshly generated `expected`.
 ///
-/// The only output left is generated and gitignored, so its absence is the
-/// normal state of a clean checkout — but if it is present it still has to
-/// match, or a stale local copy would quietly mislead whoever read it. Only
-/// `NotFound` is forgiven; an unreadable file is still a failure.
+/// The only output left is generated and gitignored, so `super::is_git_ignored`
+/// skips it and nothing below runs today. The comparison stays for the day an
+/// output here becomes tracked: then absence is still forgiven, but a mismatch
+/// is drift a commit can actually fix.
 ///
 /// The `required` parameter this used to take existed for `env_docs.rs`, which
 /// was tracked and so had to be present. That output is gone; a bool with one
 /// live value is a trap, not a feature.
 fn check_file(path: &Path, expected: &[u8], stale: &mut Vec<String>) {
+    // A gitignored output cannot be committed, so "stale" here is unfixable by
+    // any commit and invisible to CI. See `super::is_git_ignored`.
+    if super::is_git_ignored(path) {
+        return;
+    }
     match std::fs::read(path) {
         Ok(got) if got == expected => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

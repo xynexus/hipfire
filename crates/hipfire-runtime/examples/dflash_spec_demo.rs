@@ -1754,7 +1754,7 @@ fn main() {
         speculative::seed_target_hidden_from_prompt(
             &mut gpu,
             &mut target,
-            &mut hidden_rb,
+            Some(&mut hidden_rb),
             &mut target_hidden_host,
             &prompt_tokens,
         )
@@ -2628,10 +2628,10 @@ fn main() {
                 speculative::spec_step_dflash(
                     &mut gpu,
                     &mut target,
-                    &draft_weights,
-                    &draft_cfg,
-                    &mut draft_scratch,
-                    &mut hidden_rb,
+                    Some(&draft_weights),
+                    Some(&draft_cfg),
+                    Some(&mut draft_scratch),
+                    Some(&mut hidden_rb),
                     &mut target_hidden_host,
                     &mut target_snap,
                     &verify_scratch,

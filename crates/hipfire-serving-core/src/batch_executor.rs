@@ -117,6 +117,28 @@ impl BatchExecutor for Qwen35BatchExecutor {
                 m.pp
             ));
         }
+        // The probe must refuse EVERYTHING the operation refuses. It checked
+        // only `pp`, so a model the prefill itself rejects still probed ready:
+        // the server judged it batch-eligible, dispatched, and the rejection
+        // came back as a hard error that `fail_all`s every session in the cycle
+        // rather than falling back to the legacy per-request path.
+        //
+        // Reachable without any n-gram work: a DFlash drafter found by sibling
+        // discovery or an embedded manifest sets no env var, and
+        // `batch_runner::batch_envelope_ok` looks for HIPFIRE_DFLASH_DRAFT
+        // instead of at the loaded model. Keep in step with
+        // `run_generate_batch_prefill_serial_qwen35`.
+        if m.dflash.is_some() {
+            return Err(
+                "generate_batch_prefill does not support speculative-decode models yet".to_string(),
+            );
+        }
+        if m.eviction.is_some() {
+            return Err(
+                "generate_batch_prefill does not support CASK/TriAttention eviction yet"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 

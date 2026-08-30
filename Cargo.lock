@@ -1867,6 +1867,7 @@ name = "hipfire-arch-zaya"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-zaya-spec",
  "hipfire-dispatch",
  "hipfire-kvquant",
  "hipfire-mixer",
@@ -2063,6 +2064,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-build-info",
+ "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-evidence",
@@ -2593,6 +2595,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-zaya",
  "hipfire-archs",
+ "hipfire-config",
  "hipfire-dispatch",
  "hipfire-evidence",
  "hipfire-generate",
@@ -2605,6 +2608,7 @@ dependencies = [
  "hipfire-runtime",
  "hipfire-specdecode",
  "hipfire-specdecode-dspark",
+ "hipfire-specdecode-ngram",
  "hipfire-state",
  "hipfire-vision-cache",
  "hipfire-xdna",
@@ -2665,6 +2669,16 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-ngram"
+version = "0.3.0"
+dependencies = [
+ "hipfire-model",
+ "hipfire-runtime",
+ "memmap2",
+ "serde_json",
 ]
 
 [[package]]

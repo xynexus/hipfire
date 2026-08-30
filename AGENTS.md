@@ -273,6 +273,46 @@ Notes:
   canonical naming convention as part of the fix.
 - Remove legacy-name fallback whenever you find it
 
+## Config
+
+Every setting is a schema field in `crates/hipfire-config/src/schema.rs`. The
+schema is the only place a setting's name, type, domain, and default are
+declared, and `docs/config-schema.{json,toml,md}` are generated from it — CI
+fails if you change one without regenerating all three.
+
+- Do not read `std::env` for something that should be a setting. Env is a
+  resolution LAYER (`config_layer_from_env`), not a bypass; a direct read
+  silently outranks config and nothing announces it.
+- Do not re-read config deep in the stack. `load_config_bundle()` resolves with
+  no additional layers and no model tag, so it drops CLI overrides and EVERY
+  `model_overrides` entry. Settings reach the daemon through `ModelLoadParams`,
+  built by `from_hipfire_config` from a config already resolved by
+  `resolve_for_model`. A setting missing from that struct is a setting
+  `model_overrides` cannot reach.
+- Renaming a key means adding it to `RENAMED_KEYS`. The old key is honoured and
+  the operator is told what to write instead. Never drop one silently: a setting
+  that parses, applies to nothing, and says nothing is this area's recurring bug.
+- A value that violates its declared domain is WARNED about, not rejected. These
+  are configs already running; naming a bad value is the fix, refusing to boot on
+  it is not.
+
+`ConfigType::OneOf` declares a setting that accepts several domains — a closed
+set of keywords OR an open one. `dflash_draft` (`off`/`auto`/`on`/an absolute
+path) is the worked example.
+
+- Arm ORDER IS SEMANTIC. Arms are tried left to right, first accept wins, so an
+  open arm (`String`, `Path`, `Json`) must come last or it swallows the keywords
+  behind it. Put the `Enum` arm first even when the two happen to be disjoint.
+- Keep the arms one JSON type where you can, so the Rust field stays a `String`
+  and the value is split at the point of use (`dflash_draft_setting`). Arms of
+  DIFFERENT JSON types force the field to be an untagged enum, and serde also
+  tries variants in declaration order — two orderings that must agree, with
+  nothing checking it. Write a round-trip test per arm if you go there.
+- `ConfigType::Path` is absolute-only, and carries a `PathExistence`: `Exists`
+  for an input the operator names, `ParentExists` for an output hipfire creates.
+  Existence is checked at startup and by `doctor`, never in the resolver — that
+  is pure and runs in tests and the settings editor.
+
 ## Local Routing
 
 When a task primarily targets one of these subtrees, read that subtree's

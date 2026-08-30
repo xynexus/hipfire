@@ -290,6 +290,13 @@ impl<'a> TransformerLoader<'a> {
                 self.upload_weight_bytes(gpu, bytes, dtype, m, k)?
             }
             OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+                // A ragged K is an NPU-targeted artifact reaching a GPU loader, not
+                // corruption — and `oq4_pack_arch_combined`'s assert would abort the whole
+                // process. Same pre-check the hfq.rs and qwen35 loaders already carry;
+                // commit 3883204a1 added it to those two and missed the other five.
+                if let Some(why) = crate::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+                    return Err(hip_bridge::HipError::new(0, &why));
+                }
                 let (bytes, dtype) = oq4_arch_load(info.quant_type, &data, m, k)
                     .expect("OQ4 quant type handled by oq4_arch_load");
                 self.upload_weight_bytes(gpu, bytes.into_owned(), dtype, m, k)?

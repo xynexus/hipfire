@@ -182,7 +182,8 @@
   {
     "key": "cask_sidecar",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "required_when",
@@ -293,13 +294,22 @@
     "env": []
   },
   {
-    "key": "dflash_mode",
+    "key": "dflash_draft",
     "type": {
-      "kind": "enum",
-      "values": [
-        "off",
-        "auto",
-        "on"
+      "kind": "one_of",
+      "arms": [
+        {
+          "kind": "enum",
+          "values": [
+            "off",
+            "auto",
+            "on"
+          ]
+        },
+        {
+          "kind": "path",
+          "existence": "exists"
+        }
       ]
     },
     "requirement": {
@@ -313,14 +323,14 @@
     ],
     "mutability": "load_time",
     "owner": "hipfire-config",
-    "description": "DFlash speculative decode mode.",
+    "description": "DFlash speculative decode. `off` never loads a drafter; `auto` uses one if discovery finds it (`~/.hipfire/drafts`, next to the model, the models dir); `on` requires one and fails the load if none is found. An absolute PATH names the drafter explicitly, overriding discovery and any embedded component — and implies `on`, because naming a drafter is asking for it. Set it per model under `model_overrides` to pin a drafter the naming convention would not find.",
     "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []
   },
   {
-    "key": "dflash_ngram_block",
+    "key": "dflash_no_repeat_ngram",
     "type": {
       "kind": "json"
     },
@@ -525,6 +535,52 @@
     "env": []
   },
   {
+    "key": "load_mem_check",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "true",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Refuse a load whose estimated resident size will not fit in MemAvailable. On a unified-memory host an over-large load does not fail the loader — it invokes the OOM killer on whatever else is running, so turn this off only when the estimate is known to over-count (e.g. paged experts, which it does not model).",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_LOAD_MEM_CHECK"
+    ]
+  },
+  {
+    "key": "load_mem_reserve_gib",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "4",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "GiB the load check leaves free for the rest of the system. Enough to keep the session's supervisor processes alive so a too-large load fails as a refusal rather than a reaping.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_LOAD_MEM_RESERVE_GIB"
+    ]
+  },
+  {
     "key": "max_seq",
     "type": {
       "kind": "u32"
@@ -668,7 +724,8 @@
   {
     "key": "models_dir",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "optional"
@@ -689,7 +746,8 @@
   {
     "key": "models_network_dir",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "optional"
@@ -751,6 +809,224 @@
     "mutability": "load_time",
     "owner": "hipfire-config",
     "description": "Multi-token prediction sidecar mode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Opt-in drafter-free n-gram speculative decode.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_chain_floor",
+    "type": {
+      "kind": "u8"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Minimum winning order to keep extending an n-gram chain; 0 disables.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_max_spine",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "16",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Maximum n-gram draft spine length.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_orders",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8,7,6,5,4,3,2",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "n-gram probe orders, longest first, comma-separated.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_promote_count",
+    "type": {
+      "kind": "u16"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "3",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Observations before an n-gram is persisted; gates writes, not drafting.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_scope",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Tokenizer scope name for n-gram tables; empty = derive from model file.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_store_mb",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "256",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Size in MiB of a newly created n-gram table; this is the fixed budget.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_store_root",
+    "type": {
+      "kind": "one_of",
+      "arms": [
+        {
+          "kind": "enum",
+          "values": [
+            "",
+            "ram",
+            "none",
+            "off"
+          ]
+        },
+        {
+          "kind": "path",
+          "existence": "parent_exists"
+        }
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "ngram_spec_write_target",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "user",
+        "topic",
+        "none"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "user",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Which n-gram store the write path feeds.",
     "validation": null,
     "secret": false,
     "restart_impact": "none",
@@ -873,7 +1149,8 @@
   {
     "key": "prefill_drafter",
     "type": {
-      "kind": "path"
+      "kind": "path",
+      "existence": "exists"
     },
     "requirement": {
       "kind": "required_when",
@@ -1113,6 +1390,78 @@
     "secret": false,
     "restart_impact": "none",
     "env": []
+  },
+  {
+    "key": "qwen35_expert_cache_mb",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8192",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Resident budget in MiB for the paged routed-expert cache. Only meaningful with qwen35_paged_experts. Larger trades host memory for fewer expert fetches.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_QWEN35_EXPERT_CACHE_MB"
+    ]
+  },
+  {
+    "key": "qwen35_final_checkpoints",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Mint a Final checkpoint for every prefilled qwen3.5 session. OFF by default: the checkpoint is a deep clone of the session state, nothing can attach to it (the reuse path needs a runtime_state_handle no production caller sets), and releasing the request session does not free it — so every request retained a second session's worth of KV until the host ran out. Semantic boundary checkpoints were already opt-in; this makes Final consistent with them. Turn on only when developing state-handle reuse.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_QWEN35_FINAL_CHECKPOINTS"
+    ]
+  },
+  {
+    "key": "qwen35_paged_experts",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Stream qwen3.5-MoE routed experts from host memory instead of keeping every expert resident. Lets a routed-expert artifact larger than the host's headroom load at all; costs a host-to-GPU fetch on an expert cache miss. Defaults OFF so existing deployments keep full residency.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_QWEN35_PAGED_EXPERTS"
+    ]
   },
   {
     "key": "repeat_penalty",

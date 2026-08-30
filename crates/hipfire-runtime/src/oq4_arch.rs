@@ -139,6 +139,85 @@ pub fn oq4_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Cow<'_,
 mod tests {
     use super::*;
 
+    /// Every `oq4_arch_load` CALL must be preceded by an
+    /// `oq4_arch_unsupported_reason` pre-check.
+    ///
+    /// A ragged K (K % 256 != 0) is a legitimate NPU-targeted artifact reaching a
+    /// GPU loader, and `oq4_pack_arch_combined` asserts on it — which aborts the
+    /// whole daemon. Commit 3883204a1 added the pre-check at two loaders and
+    /// missed five more; they were found and guarded on 2026-08-29.
+    ///
+    /// The guard cannot live inside `oq4_arch_load` itself: it returns `Option`,
+    /// where `None` already means "not an OQ4 quant type, keep your own arms", and
+    /// the seven callers need errors in two different types. So the invariant is
+    /// enforced here instead of being left to memory.
+    #[test]
+    fn every_oq4_arch_load_call_site_pre_checks_ragged_k() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+
+        let (mut checked, mut unguarded) = (0usize, Vec::new());
+        for f in files {
+            // Skip this module (it defines the fn and tests it directly).
+            if f.ends_with("oq4_arch.rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains("oq4_arch_load(") || line.contains("fn oq4_arch_load") {
+                    continue;
+                }
+                checked += 1;
+                let lo = i.saturating_sub(12);
+                // A helper that cannot carry the error may delegate the check to
+                // its caller, but it must SAY SO — an explicit marker, so the
+                // exemption is greppable rather than an accident.
+                let guarded = lines[lo..i].iter().any(|l| {
+                    l.contains("oq4_arch_unsupported_reason")
+                        || l.contains("oq4-ragged-guarded-by-caller")
+                });
+                if !guarded {
+                    unguarded.push(format!(
+                        "{}:{}",
+                        f.strip_prefix(&root).unwrap_or(&f).display(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked >= 5,
+            "found only {checked} oq4_arch_load call sites — the scanner is broken,              not the call sites"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "oq4_arch_load called without an oq4_arch_unsupported_reason pre-check              ({} site(s)):\n  {}\nA ragged K aborts the process there.",
+            unguarded.len(),
+            unguarded.join("\n  ")
+        );
+    }
+
     /// One 256-group canonical block: `[f16 scale (2)][128 nibbles]`.
     fn canonical_block(scale_f16_bits: u16, nibbles: &[u8; 128]) -> Vec<u8> {
         let mut v = Vec::with_capacity(130);

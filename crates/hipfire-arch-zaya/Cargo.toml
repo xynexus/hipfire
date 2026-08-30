@@ -6,6 +6,7 @@ license.workspace = true
 description = "Zyphra ZAYA1 architecture (CCA attention + EDA/MoD-routed MoE, arch_id 16) for hipfire — config + block taxonomy (Z0)"
 
 [dependencies]
+hipfire-arch-zaya-spec = { path = "../hipfire-arch-zaya-spec" }
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-primitives = { path = "../hipfire-primitives" }

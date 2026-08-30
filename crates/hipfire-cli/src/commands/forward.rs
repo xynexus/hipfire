@@ -292,6 +292,18 @@ fn run_forwarded(
 }
 
 fn running_server_env(loaded: &LoadedConfig) -> Vec<(&'static str, String)> {
+    // The daemon socket wins over the server's HTTP API when both are up. Only
+    // the smoke and speed batteries ever honoured this URL; the quality, cask,
+    // and session executors always drove the daemon directly. Preferring the
+    // socket makes one eval measure ONE thing — every battery through the same
+    // daemon — instead of splitting the run across two transports depending on
+    // which battery it was.
+    //
+    // HTTP stays the fallback for a server whose daemon predates `--listen` and
+    // therefore exposes no socket to share.
+    if hipfire_daemon_adapter::shared_daemon_listening() {
+        return Vec::new();
+    }
     let url = configured_server_url(loaded);
     if server_health_ok(&url) {
         vec![("HIPFIRE_EVAL_SERVER_URL", url)]

@@ -55,6 +55,26 @@ use crate::session::{
 /// Emit a `generate_batch_prefill_session_done` checkpoint event for one
 /// session as the batch prefill advances past a semantic boundary (the hook the
 /// prefill kernels call so clients can resume from a cached prefix).
+/// Whether prefill mints a Final checkpoint per session.
+///
+/// Off by default. The checkpoint is a full clone of the session state, and the
+/// only path that could attach to one is gated on a `runtime_state_handle` that
+/// no production caller sets — while releasing the request session does not
+/// free the clone (BUGS.md, "Session release LEAKS its KV and DeltaNet GPU
+/// buffers"). So every request left a second session's worth of KV behind for
+/// nothing. Load-time, so resolving once is correct.
+fn qwen35_final_checkpoints_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if let Ok(v) = std::env::var("HIPFIRE_QWEN35_FINAL_CHECKPOINTS") {
+            return matches!(v.trim(), "1" | "true" | "on" | "yes");
+        }
+        hipfire_config::load_config_bundle()
+            .config
+            .qwen35_final_checkpoints
+    })
+}
+
 pub fn emit_qwen35_prefill_checkpoint(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
@@ -2024,31 +2044,71 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     }
 
     let result = qwen35_prefill_suffix_batch(m, gpu, &envelope.batch_id, &prepared, plan, backend)?;
+    let mint_final_checkpoints = qwen35_final_checkpoints_enabled();
     for session in &result.sessions {
-        let hook = Qwen35PrefillCheckpointHook {
-            batch_id: &envelope.batch_id,
-            session_id: &session.id,
-            source_state_handle: &session.id,
-            logical_position: session.logical_position,
-            kind: Qwen35PrefillCheckpointKind::Final,
-            prefix_hash: &session.prefix_hash,
+        let checkpoint_id = if mint_final_checkpoints {
+            let hook = Qwen35PrefillCheckpointHook {
+                batch_id: &envelope.batch_id,
+                session_id: &session.id,
+                source_state_handle: &session.id,
+                logical_position: session.logical_position,
+                kind: Qwen35PrefillCheckpointKind::Final,
+                prefix_hash: &session.prefix_hash,
+            };
+            let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+            Some(
+                emit_qwen35_prefill_checkpoint(m, gpu, arena_backend, hook).map_err(|e| {
+                    format!(
+                        "generate_batch_prefill session {} failed to create checkpoint {}: {}",
+                        session.id, checkpoint_id_for_error, e
+                    )
+                })?,
+            )
+        } else {
+            None
         };
-        let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
-        let checkpoint_id =
-            emit_qwen35_prefill_checkpoint(m, gpu, arena_backend, hook).map_err(|e| {
-                format!(
-                    "generate_batch_prefill session {} failed to create checkpoint {}: {}",
-                    session.id, checkpoint_id_for_error, e
-                )
-            })?;
         let line = qwen35_generate_batch_prefill_session_done_json(
             envelope,
             session,
-            &checkpoint_id,
+            checkpoint_id.as_deref(),
             &result,
         );
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
+    }
+
+    // Bound the resident set. One-shot requests release their own session, so
+    // this is normally a no-op; it catches the sessions nothing releases —
+    // parked by cooperative preemption, or stranded by a prefill error.
+    match crate::session::qwen35_evict_sessions_over_limit(
+        m,
+        gpu,
+        crate::session::qwen35_resident_session_limit_value(),
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!("evicted {n} resident session(s) over the limit"),
+        // Eviction is a safety net, never a reason to fail a served request.
+        Err(e) => tracing::warn!("resident-session eviction failed: {e}"),
+    }
+
+    {
+        // Pool accounting, per prefill. This is what located the DeltaNet FP16
+        // strand: `free_buffers`/`free_bytes` climbing every request while
+        // `total_new` sat frozen means buffers are being returned to a pool that
+        // never allocated them — an unpooled alloc paired with a pooled free.
+        // Debug level: useful the next time residency drifts, silent otherwise.
+        let (p, mailbox) = gpu.pool_stats();
+        tracing::debug!(
+            "pool after batch prefill: new={} reused={} allocated={:.1}MB free_buffers={} \
+             free={:.1}MB buckets={} mailbox={}",
+            p.total_new,
+            p.total_reused,
+            p.total_allocated as f64 / 1e6,
+            p.free_buffers,
+            p.free_bytes as f64 / 1e6,
+            p.buckets,
+            mailbox,
+        );
     }
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;

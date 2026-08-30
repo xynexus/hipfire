@@ -98,7 +98,7 @@ restart_impact = "none"
 
 [[field]]
 key = "cask_sidecar"
-type = "path"
+type = "path(Exists)"
 requirement = "required when `cask == true && cask_auto_attach == false`"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
@@ -156,19 +156,19 @@ secret = false
 restart_impact = "none"
 
 [[field]]
-key = "dflash_mode"
-type = "enum(off|auto|on)"
+key = "dflash_draft"
+type = "one_of(enum(off|auto|on) | path(Exists))"
 requirement = "optional"
 default = "off"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
-description = "DFlash speculative decode mode."
+description = "DFlash speculative decode. `off` never loads a drafter; `auto` uses one if discovery finds it (`~/.hipfire/drafts`, next to the model, the models dir); `on` requires one and fails the load if none is found. An absolute PATH names the drafter explicitly, overriding discovery and any embedded component — and implies `on`, because naming a drafter is asking for it. Set it per model under `model_overrides` to pin a drafter the naming convention would not find."
 secret = false
 restart_impact = "none"
 
 [[field]]
-key = "dflash_ngram_block"
+key = "dflash_no_repeat_ngram"
 type = "json"
 requirement = "optional"
 default = "\"auto\""
@@ -265,6 +265,32 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "load_mem_check"
+type = "bool"
+requirement = "optional"
+default = "true"
+scopes = ["global", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Refuse a load whose estimated resident size will not fit in MemAvailable. On a unified-memory host an over-large load does not fail the loader — it invokes the OOM killer on whatever else is running, so turn this off only when the estimate is known to over-count (e.g. paged experts, which it does not model)."
+secret = false
+restart_impact = "none"
+env = ["HIPFIRE_LOAD_MEM_CHECK"]
+
+[[field]]
+key = "load_mem_reserve_gib"
+type = "u32"
+requirement = "optional"
+default = "4"
+scopes = ["global", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "GiB the load check leaves free for the rest of the system. Enough to keep the session's supervisor processes alive so a too-large load fails as a refusal rather than a reaping."
+secret = false
+restart_impact = "none"
+env = ["HIPFIRE_LOAD_MEM_RESERVE_GIB"]
+
+[[field]]
 key = "max_seq"
 type = "u32"
 requirement = "optional"
@@ -340,7 +366,7 @@ restart_impact = "none"
 
 [[field]]
 key = "models_dir"
-type = "path"
+type = "path(Exists)"
 requirement = "optional"
 scopes = ["global", "runtime"]
 mutability = "static"
@@ -351,7 +377,7 @@ restart_impact = "none"
 
 [[field]]
 key = "models_network_dir"
-type = "path"
+type = "path(Exists)"
 requirement = "optional"
 scopes = ["global", "runtime"]
 mutability = "static"
@@ -381,6 +407,114 @@ scopes = ["global", "model", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
 description = "Multi-token prediction sidecar mode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Opt-in drafter-free n-gram speculative decode."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_chain_floor"
+type = "u8"
+requirement = "optional"
+default = "8"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Minimum winning order to keep extending an n-gram chain; 0 disables."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_max_spine"
+type = "u32"
+requirement = "optional"
+default = "16"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Maximum n-gram draft spine length."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_orders"
+type = "string"
+requirement = "optional"
+default = "8,7,6,5,4,3,2"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "n-gram probe orders, longest first, comma-separated."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_promote_count"
+type = "u16"
+requirement = "optional"
+default = "3"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Observations before an n-gram is persisted; gates writes, not drafting."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_scope"
+type = "string"
+requirement = "optional"
+default = ""
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Tokenizer scope name for n-gram tables; empty = derive from model file."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_store_mb"
+type = "u32"
+requirement = "optional"
+default = "256"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Size in MiB of a newly created n-gram table; this is the fixed budget."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_store_root"
+type = "one_of(enum(|ram|none|off) | path(ParentExists))"
+requirement = "optional"
+default = ""
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Root directory for persistent n-gram tables; empty/ram/none/off = RAM only."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "ngram_spec_write_target"
+type = "enum(user|topic|none)"
+requirement = "optional"
+default = "user"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Which n-gram store the write path feeds."
 secret = false
 restart_impact = "none"
 
@@ -447,7 +581,7 @@ restart_impact = "none"
 
 [[field]]
 key = "prefill_drafter"
-type = "path"
+type = "path(Exists)"
 requirement = "required when `prefill_compression != 'off' && prefill_drafter_device >= 0`"
 scopes = ["global", "model", "runtime"]
 mutability = "load_time"
@@ -576,6 +710,45 @@ owner = "hipfire-config"
 description = "Whether prompts are normalized before tokenization."
 secret = false
 restart_impact = "none"
+
+[[field]]
+key = "qwen35_expert_cache_mb"
+type = "u32"
+requirement = "optional"
+default = "8192"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Resident budget in MiB for the paged routed-expert cache. Only meaningful with qwen35_paged_experts. Larger trades host memory for fewer expert fetches."
+secret = false
+restart_impact = "none"
+env = ["HIPFIRE_QWEN35_EXPERT_CACHE_MB"]
+
+[[field]]
+key = "qwen35_final_checkpoints"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Mint a Final checkpoint for every prefilled qwen3.5 session. OFF by default: the checkpoint is a deep clone of the session state, nothing can attach to it (the reuse path needs a runtime_state_handle no production caller sets), and releasing the request session does not free it — so every request retained a second session's worth of KV until the host ran out. Semantic boundary checkpoints were already opt-in; this makes Final consistent with them. Turn on only when developing state-handle reuse."
+secret = false
+restart_impact = "none"
+env = ["HIPFIRE_QWEN35_FINAL_CHECKPOINTS"]
+
+[[field]]
+key = "qwen35_paged_experts"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Stream qwen3.5-MoE routed experts from host memory instead of keeping every expert resident. Lets a routed-expert artifact larger than the host's headroom load at all; costs a host-to-GPU fetch on an expert cache miss. Defaults OFF so existing deployments keep full residency."
+secret = false
+restart_impact = "none"
+env = ["HIPFIRE_QWEN35_PAGED_EXPERTS"]
 
 [[field]]
 key = "repeat_penalty"

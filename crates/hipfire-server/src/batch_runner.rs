@@ -39,7 +39,15 @@ fn arch_registry() -> &'static ArchRegistry {
 /// resolved via the arch-specs registry, AND the runtime envelope the daemon's
 /// fused batch path requires. Anything ineligible falls back to the legacy
 /// per-request path — the safe default that always works.
-pub fn batch_eligible(arch: Option<&str>) -> bool {
+pub fn batch_eligible(arch: Option<&str>, batch_prefill_capable: Option<bool>) -> bool {
+    // `batch_prefill_capable` is the daemon's own probe of the LOADED model,
+    // so a state the batched prefill refuses (a speculative-decode drafter,
+    // CASK eviction) routes to the legacy path instead of being dispatched and
+    // failing the whole cycle. `None` is an older daemon that does not report
+    // it; keep the previous behaviour rather than silently disabling batching.
+    if batch_prefill_capable == Some(false) {
+        return false;
+    }
     arch_supports_continuous_batching(arch) && batch_envelope_ok()
 }
 
@@ -57,6 +65,11 @@ fn arch_supports_continuous_batching(arch: Option<&str>) -> bool {
 /// Conservative: DFlash, pipeline-parallel > 1, and hierarchical KV route to the
 /// proven legacy path. (Hierarchical KV would fall to the serial-swap decode
 /// backend inside the batch op; excluded here until validated.)
+///
+/// These read ENV, so they only see a drafter passed as HIPFIRE_DFLASH_DRAFT —
+/// not one found by sibling discovery or carried in an embedded manifest. The
+/// loaded-model answer is `batch_prefill_capable` above; this stays as a
+/// pre-load backstop.
 fn batch_envelope_ok() -> bool {
     let hierarchical = std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1");
     let dflash = std::env::var("HIPFIRE_DFLASH_DRAFT")
@@ -975,6 +988,15 @@ async fn run_batch_cycle(
         let events = match engine.generate_batch_prefill(prefill_req).await {
             Ok(events) => events,
             Err(e) => {
+                // The daemon's activation loop can run to completion for every
+                // session and THEN fail (suffix prefill, or the checkpoint step),
+                // so sessions may already be resident. This exit bypasses the
+                // cycle-end release below, so release them here or they stay
+                // pinned until the model is unloaded. Unknown ids are a no-op.
+                let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
+                let _ = engine
+                    .release_sessions(build_release_request(&worker, &handles))
+                    .await;
                 fail_all(&txs, &format!("batch prefill: {e}"));
                 return CycleOutcome::Completed;
             }
@@ -1022,7 +1044,9 @@ async fn run_batch_cycle(
         // Drop sessions whose client disconnected (response receiver closed):
         // stop decoding, and don't park/resume them. A session that was parked
         // and then abandoned is retired here on its resume cycle. Their KV is
-        // freed with the rest of the batch at cycle end.
+        // freed with the rest of the batch at cycle end — including on the park
+        // exit, which used to return without releasing them at all, pinning every
+        // session that finished or disconnected before the preemption.
         // ponytail: eager per-session release could reclaim KV sooner; the
         // batch-end release is enough until nested-preemption VRAM bites.
         active.retain(|id| txs.get(id).is_some_and(|tx| !tx.is_closed()));
@@ -1153,6 +1177,25 @@ async fn run_batch_cycle(
                         })
                     })
                     .collect();
+                // Parked sessions stay resident on purpose. Everything else this
+                // cycle allocated must be released HERE: sessions that finished
+                // earlier, or whose client disconnected (dropped from `active` at
+                // the retain above), are in no later batch, so the cycle-end
+                // release below never sees them and their KV would be pinned for
+                // the life of the loaded worker.
+                let kept: std::collections::HashSet<&str> =
+                    parked.iter().map(|p| p.spec.id.as_str()).collect();
+                let to_release: Vec<String> = specs
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .filter(|id| !kept.contains(id.as_str()))
+                    .collect();
+                if !to_release.is_empty() {
+                    let _ = engine
+                        .release_sessions(build_release_request(&worker, &to_release))
+                        .await;
+                }
+
                 let mut tel = state.batch_telemetry.lock().await;
                 tel.preemptions += 1;
                 tel.last_chunk_count = last_chunk_count;
@@ -1192,6 +1235,26 @@ async fn run_batch_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_the_prefill_refuses_is_not_batch_eligible() {
+        // The daemon probes the LOADED model and reports the answer. Before
+        // this, eligibility came from `batch_envelope_ok`, which reads
+        // HIPFIRE_DFLASH_DRAFT — unset for a drafter found by sibling
+        // discovery, so such a model was dispatched and then refused
+        // mid-cycle, and `fail_all` took every session down with it.
+        assert!(
+            !batch_eligible(Some("qwen3_5"), Some(false)),
+            "a model the batched prefill refuses must route to the legacy path"
+        );
+        // `None` is a daemon that does not report it: keep the old behaviour
+        // rather than silently disabling batching for everyone.
+        assert_eq!(
+            batch_eligible(Some("qwen3_5"), None),
+            batch_eligible(Some("qwen3_5"), Some(true)),
+            "an unreported capability must not change routing on its own"
+        );
+    }
 
     #[test]
     fn decode_health_exposes_daemon_scheduler_metadata() {

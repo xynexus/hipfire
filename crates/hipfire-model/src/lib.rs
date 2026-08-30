@@ -2744,6 +2744,13 @@ pub struct ModelLoadParams {
     pub cask_core_frac: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cask_fold_m: Option<u32>,
+    /// Load-time GPU slab policy (`auto` | `off` | `on`), forwarded from
+    /// `HipfireConfig::gpu_slab_load`. The daemon installs it as
+    /// `HIPFIRE_GPU_SLAB_LOAD` for the duration of the load, which is how the
+    /// arch loader already consumes it — see `qwen35::loading::gpu_slab_load_enabled`.
+    /// `None` means "auto", i.e. leave the loader's UMA auto-detect alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_slab_load: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mmq_screen: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2780,19 +2787,57 @@ pub struct ModelLoadParams {
     pub residency_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_vram_budget_bytes: Option<u64>,
+    // n-gram speculative decode. These travel as load params like every other
+    // resolved setting; without them the daemon's load handler fell back to
+    // re-reading config.json from disk, which resolves with no CLI layer and no
+    // model tag — so `--flag` overrides and model_overrides were invisible to
+    // this whole family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_store_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_store_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_orders: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_chain_floor: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_max_spine: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_promote_count: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_spec_write_target: Option<String>,
 }
 
 impl ModelLoadParams {
     pub fn from_hipfire_config(config: &hipfire_config::HipfireConfig) -> Self {
+        // One setting, two wire params: the daemon still receives a mode and an
+        // optional drafter path, so the protocol is unchanged.
+        let (dflash_mode, dflash_draft) =
+            hipfire_config::dflash_draft_setting(&config.dflash_draft);
         let mut params = Self::from_common_config_values(
             config.max_seq,
             &config.kv_cache,
             &config.flash_mode,
-            &config.dflash_mode,
+            dflash_mode,
             config.cask_sidecar.as_deref(),
         );
+        params.draft = dflash_draft.map(str::to_string);
+        params.ngram_spec = Some(config.ngram_spec);
+        params.ngram_spec_store_root = Some(config.ngram_spec_store_root.clone());
+        params.ngram_spec_scope = Some(config.ngram_spec_scope.clone());
+        params.ngram_spec_store_mb = Some(config.ngram_spec_store_mb);
+        params.ngram_spec_orders = Some(config.ngram_spec_orders.clone());
+        params.ngram_spec_chain_floor = Some(config.ngram_spec_chain_floor);
+        params.ngram_spec_max_spine = Some(config.ngram_spec_max_spine);
+        params.ngram_spec_promote_count = Some(config.ngram_spec_promote_count);
+        params.ngram_spec_write_target = Some(config.ngram_spec_write_target.clone());
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.dflash_adaptive_b = Some(config.dflash_adaptive_b);
+        params.gpu_slab_load = non_auto_value(&config.gpu_slab_load);
         params.mmq_screen = Some(config.mmq_screen != "off");
         params.mmq_screen_threshold = Some(config.mmq_screen_threshold);
         if params.cask_sidecar.is_some() {
@@ -2867,6 +2912,14 @@ pub struct ModelLoadedResponse {
     pub layers: Option<u32>,
     pub vocab: Option<u32>,
     pub model_worker: Option<serde_json::Value>,
+    /// Whether this loaded model can take the fused batch-prefill path.
+    ///
+    /// The daemon answers with the batch executor's own probe, so the server
+    /// routes on what the operation will actually accept instead of guessing
+    /// from env vars. `None` from an older daemon means "unknown" and the
+    /// server keeps its previous behaviour.
+    #[serde(default)]
+    pub batch_prefill_capable: Option<bool>,
     #[serde(default)]
     pub response_id: Option<String>,
 }
@@ -3770,7 +3823,7 @@ mod tests {
             kv_cache: "asym3".to_string(),
             kv_adaptive: "balanced".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "off".to_string(),
+            dflash_draft: "off".to_string(),
             dflash_adaptive_b: false,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,

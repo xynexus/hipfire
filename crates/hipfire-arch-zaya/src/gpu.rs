@@ -51,6 +51,10 @@ fn linear_dtype(qt: u8) -> Option<DType> {
 /// `oq4_arch_load`. Both resolve to a generic iu8/iu4 GEMM dtype — no zaya-local
 /// expansion, so a new OQ code lights up here for free.
 fn oq_repack(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    // oq4-ragged-guarded-by-caller: this returns `Option`, so it cannot carry the
+    // ragged-K error, and a `None` here would fall through to `linear_dtype` and
+    // upload raw OQ4 blocks under the wrong dtype. `load_linear` pre-checks
+    // instead. See `every_oq4_arch_load_call_site_pre_checks_ragged_k`.
     oq8_arch_load(qt, data, m, k)
         .or_else(|| oq4_arch_load(qt, data, m, k).map(|(bytes, dt)| (bytes.into_owned(), dt)))
 }
@@ -246,6 +250,18 @@ fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight,
         .ok_or_else(|| format!("zaya gpu: no data for {name:?}"))?;
     // OQ-family (33/34/35/36/37) repacks on load; the verbatim formats upload as-is
     // (no clone — the large Q8 embedding uploads straight from `data`).
+    // A ragged K is an NPU-targeted artifact reaching a GPU loader, and
+    // `oq4_pack_arch_combined` asserts on it — aborting the process. The guard
+    // belongs HERE rather than inside `oq_repack`: that returns `Option`, and a
+    // `None` would fall through to the `linear_dtype` arm below, which uploads the
+    // raw OQ4 blocks tagged as a different dtype — silently wrong instead of loud.
+    if qt == hipfire_runtime::oq4_arch::OQ4_CANONICAL_QT
+        || qt == hipfire_runtime::oq4_arch::OQ4_ARCH_PACKED_QT
+    {
+        if let Some(why) = hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k) {
+            return Err(format!("zaya {name}: {why}"));
+        }
+    }
     let buf_dtype: Option<(GpuTensor, DType)> =
         if let Some((bytes, dtype)) = oq_repack(qt, &data, m, k) {
             let buf = gpu
@@ -499,8 +515,42 @@ impl ZayaGpuWeights {
     }
 }
 
+/// Check the artifact against the arch's declared tensor manifest before loading
+/// anything.
+///
+/// MISSING required tensors are fatal, which costs nothing: the load was going
+/// to fail at the first `ok_or_else` anyway. What changes is the message. An
+/// artifact in the upstream Zyphra naming (`ZAYA1-8B--bf16.hfq` in the shared
+/// store is one) previously reported `missing tensor
+/// "model.embed_tokens.weight"` -- one string, with no indication that all ~35
+/// name shapes differ. It now reports the whole set difference and names the
+/// likely cause.
+///
+/// UNCLAIMED tensors only warn, and must not do more. Artifacts legitimately
+/// carry names this manifest does not list: `hipfire model compose` stores
+/// bundled components under a `__hipfire_component/` prefix, and a future
+/// sidecar is not a load error. (Calibrated `.awq_scale.weight` companions ARE
+/// declared, as optional, so the common case stays quiet.)
+fn validate_manifest(hfq: &HfqFile, cfg: &ZayaConfig) -> Result<(), String> {
+    let names: Vec<&str> = hfq.tensors().iter().map(|t| t.name.as_str()).collect();
+    let manifest =
+        hipfire_arch_zaya_spec::manifest::zaya_manifest(cfg.num_blocks, cfg.moe.num_experts);
+    let report = manifest.validate(names);
+    if !report.missing.is_empty() {
+        return Err(report.render("zaya"));
+    }
+    if !report.unclaimed.is_empty() {
+        eprintln!(
+            "[zaya] {} tensor shape(s) present but not declared in the manifest (not an error)",
+            report.unclaimed.len()
+        );
+    }
+    Ok(())
+}
+
 impl ZayaGpuWeights {
     pub fn load(hfq: &HfqFile, gpu: &mut Gpu, cfg: &ZayaConfig) -> Result<Self, String> {
+        validate_manifest(hfq, cfg)?;
         let embed = load_linear(hfq, gpu, "model.embed_tokens.weight")?;
         let in_scale = up(hfq, gpu, "model.input_hidden_states_scale")?;
         let in_bias = up(hfq, gpu, "model.input_hidden_states_bias")?;

@@ -12,7 +12,7 @@ use crate::kernels;
 // Re-exported here so `dispatch::{GpuTensor, DType}` — and the crate-root
 // re-export in lib.rs — keep resolving, and bare references in this module work.
 use hip_bridge::{BufferOrigin, DeviceBuffer, HipResult, HipRuntime, Rocblas};
-pub use hipfire_gpu_types::{DType, GpuTensor};
+pub use hipfire_gpu_types::{q8hfq_row_stride, DType, GpuTensor};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -2461,6 +2461,14 @@ impl Gpu {
     /// mailbox — in particular `alloc_tensor` does not — so a view borrowed
     /// mid-forward stays valid until the next boundary reclaim. Call at forward /
     /// decode-turn boundaries; safe to call unconditionally (it self-gates).
+    /// Snapshot GPU pool accounting, plus how many `OwnedTensor` buffers are
+    /// still queued on the deferred-free mailbox. For leak hunting: see
+    /// [`crate::pool::GpuPoolStats`] for how to read the numbers.
+    pub fn pool_stats(&self) -> (crate::pool::GpuPoolStats, usize) {
+        let mailbox = self.free_mailbox.lock().map(|q| q.len()).unwrap_or(0);
+        (self.pool.stats(), mailbox)
+    }
+
     pub fn reclaim_pending(&mut self) {
         // Pure pool/host work: pool.free pushes to a free-list and needs no
         // device binding, so this method stays infallible.

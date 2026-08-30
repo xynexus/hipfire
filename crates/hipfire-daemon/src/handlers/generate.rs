@@ -154,7 +154,14 @@ fn requested_session_id<'a>(
         })
 }
 
-pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
+/// `admitted` is the stream this frame actually claimed, or `None` when the
+/// session already had a live stream. Under the executor flag it decides where a
+/// parked generation may be stashed — see the executor block below.
+pub(crate) fn text(
+    daemon_state: &mut DaemonState,
+    msg: &serde_json::Value,
+    admitted: Option<crate::stream::StreamId>,
+) {
     // Explicit per-request raw-prompt override (optional `"raw"` bool).
     // Absent → None → auto default (raw iff no chat_template).
     //
@@ -889,6 +896,21 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 session_id.unwrap_or(id),
                 id,
             )),
+            // Per-request identity for n-gram table scoping. `user_id` owns the
+            // writable table, so it must be the real caller — a wrong or shared
+            // value hands one user's stored text to another. `session_type` is
+            // a subject label ("python-coding") selecting a topic table under
+            // that same user, so it stays private.
+            Some(hipfire_serving_core::model::NgramRequestScope {
+                user_id: msg
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()),
+                session_type: msg
+                    .get("session_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()),
+            }),
         );
         let Qwen35Start::Ready(mut generation) = started else {
             // Served by another route (spec-decode, VL, llama) or already
@@ -899,22 +921,29 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         // march loop advances it. Inline drive below is the flag-off path, and
         // also the fallback when admission was refused (a session already live),
         // because refusing to generate would be user-visible.
+        // Stash ONLY into the stream this frame actually admitted. Looking the
+        // stream up by SESSION instead handed a refused frame the live stream of
+        // whoever already held that session: its `request_id` is written once at
+        // admission and never rewritten, so the march loop went on emitting
+        // frames tagged with the FIRST request while carrying this generation's
+        // output — one client received another's answer, and the refused request
+        // was never terminated at all. `None` falls through to the inline drive
+        // below, which is what the flag-off path does anyway.
         if crate::stream::executor_v2_enabled() {
-            // Park immediately, not just after a march step. Two Generate
-            // frames are dispatched back to back before the loop ever runs, so
-            // if this stream keeps the session the NEXT frame's
-            // `generate_start` finds an empty slot and dies with "qwen35
-            // session missing decode state". The invariant is: a stream holds
-            // the session only while it is actually stepping.
-            if generation.park(m, &mut daemon_state.gpu).is_err() {
-                return;
-            }
-            if let Some(s) = daemon_state
-                .streams
-                .by_session_mut(&crate::stream::session_of(msg))
-            {
-                s.generation = Some(generation);
-                return;
+            if let Some(id) = admitted {
+                // Park immediately, not just after a march step. Two Generate
+                // frames are dispatched back to back before the loop ever runs,
+                // so if this stream keeps the session the NEXT frame's
+                // `generate_start` finds an empty slot and dies with "qwen35
+                // session missing decode state". The invariant is: a stream holds
+                // the session only while it is actually stepping.
+                if generation.park(m, &mut daemon_state.gpu).is_err() {
+                    return;
+                }
+                if let Some(s) = daemon_state.streams.get_mut(id) {
+                    s.generation = Some(generation);
+                    return;
+                }
             }
         }
         while generation.should_continue() {

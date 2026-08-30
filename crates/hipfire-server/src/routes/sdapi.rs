@@ -656,6 +656,23 @@ async fn execute_hfq_diffusion_txt2img(
         // Request a GPU turn from the runner, run the diffusion HERE (the route's
         // own spawn_blocking — the proven execution path), release the turn, and
         // restart from the same seed if preempted mid-sampling (byte-identical).
+        // Forward-progress cap. `aging_ms` is 0 where the scheduler is built
+        // (server/src/state.rs), so `next_seed`'s aged-oldest override is dead and
+        // a priority-128 image is never seeded while sub-128 work is queued. Even
+        // when it does win a turn, the abort-and-restart below discards ALL
+        // progress, so under traffic whose inter-arrival gap is shorter than a full
+        // sampling run the image never finishes.
+        //
+        // Raising `aging_ms` does NOT fix that — a freshly-arrived priority-64 chat
+        // still preempts, and once the image ages it wins every turn and starves
+        // the text instead. So bound the restarts: after this many consecutive
+        // preemptions, run to completion uninterruptibly. One image run is bounded
+        // work; unbounded restarts are not.
+        let max_restarts: usize = std::env::var("HIPFIRE_IMAGE_MAX_PREEMPT_RESTARTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let mut restarts: usize = 0;
         loop {
             let req_id = uuid::Uuid::new_v4().to_string();
             let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
@@ -691,7 +708,20 @@ async fn execute_hfq_diffusion_txt2img(
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
                 });
             }
-            let flag = turn.preempt.clone();
+            // Past the cap, hand the sampler a flag nothing sets, so this attempt
+            // cannot be aborted and the request is guaranteed to terminate.
+            let give_up_preemption = restarts >= max_restarts;
+            if give_up_preemption {
+                tracing::warn!(
+                    "image job preempted {restarts}x; running to completion \
+                     uninterruptibly to guarantee forward progress"
+                );
+            }
+            let flag = if give_up_preemption {
+                Arc::new(AtomicBool::new(false))
+            } else {
+                turn.preempt.clone()
+            };
             let run_once = run.clone();
             let out = match tokio::task::spawn_blocking(move || run_once(flag)).await {
                 Ok(result) => result,
@@ -705,7 +735,9 @@ async fn execute_hfq_diffusion_txt2img(
             match out {
                 Err(DiffusionError::Interrupted(_)) => {
                     state.batch_telemetry.lock().await.image_preemptions += 1;
-                    // Loop: re-request a turn and re-run from the same seed.
+                    restarts += 1;
+                    // Loop: re-request a turn and re-run from the same seed. The
+                    // cap above stops this from repeating forever.
                     continue;
                 }
                 other => break other,
@@ -4063,7 +4095,9 @@ pub async fn get_samplers() -> Json<Value> {
             "name": COMPAT_SAMPLER,
             "aliases": [
                 "Euler",
-                "Euler a",
+                // "Euler a" is deliberately NOT advertised: the ancestral step is
+                // not implemented, and the scheduler now refuses it rather than
+                // silently running deterministic Euler under its name.
                 "Euler Karras",
                 "DDIM",
                 "DPM++ 2M",
