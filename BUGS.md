@@ -1250,7 +1250,32 @@ difference presents as 1.7% common prefix.
 Still worth a logit-level check if the fused path is ever leaned on for
 throughput, but it is not a correctness blocker and it is not new.
 
-## [High] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
+## [RESOLVED 2026-08-30 — re-traced, kept for the record] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
+
+**The coupling this entry demanded was honoured and the fix landed.** The entry
+said "the fix is coupled to the kvarn port and should not be applied alone";
+`load.rs:854` now normalises `auto` (and the empty string) to **kvarn** before
+anything else reads it, with the reasoning inline. Re-traced 2026-08-30 while
+fixing issue #386:
+
+- `q35_kv_mode` has exactly ONE producer, `load.rs:2938`, and it is assigned the
+  already-normalised `kv_mode`.
+- `qwen35_allocate_session_state` reads the mode only from `m.q35_kv_mode`, so
+  the literal `"auto"` cannot reach a KV constructor.
+
+Two leftovers, neither reachable but both worth knowing about before someone
+adds a caller: `session.rs:1773`/`:1782` still carry `"auto" | ""` arms that
+build **asym3** (at head_dim 256) or **q8**, and `load.rs:3028` still matches
+`"q8" | "int8" | "auto" | ""`. They predate the normalisation and now disagree
+with it — a new path that hands a raw config value straight to session
+allocation would get a deprecated mode, silently, which is exactly what this
+entry was about. They are commented as such rather than deleted, since removing
+KV construction arms wants a GPU gate.
+
+The original entry follows, unchanged, because its *reasoning* is what sequenced
+the fix correctly.
+
+## [Original, superseded] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
 
 Found 2026-08-11 while auditing the KV deprecation. The deprecation added in this
 branch refuses `q8`/`asym3`/etc **by name**, but the default path never presents a

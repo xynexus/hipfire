@@ -1770,6 +1770,13 @@ pub fn qwen35_allocate_session_state(
             )
             .map_err(|e| format!("{e}"))?
         }
+        // UNREACHABLE, and kept only because removing a KV constructor arm wants a
+        // GPU gate. `load.rs:854` normalises `auto` and `""` to kvarn before
+        // `q35_kv_mode` is assigned (its only producer is `load.rs:2938`), and this
+        // function reads the mode from nowhere else. These two arms predate that
+        // normalisation and now DISAGREE with it: a new caller that hands a raw
+        // config value straight here would silently get a deprecated mode. See the
+        // `kv_cache = "auto"` entry in BUGS.md.
         "auto" | "" if config.head_dim == 256 => kv::KvCache::new_gpu_asym3_capped(
             gpu,
             config.n_layers,
