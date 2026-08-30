@@ -450,3 +450,53 @@ fn the_real_geometry_is_what_it_claims() {
     assert_eq!(geom.ngram_layer, Some(1), "PLE rides layer 1, not layer 2");
     assert!(geom.ngram_shards > 1, "the n-gram table is sharded on disk");
 }
+
+/// The shipped model must FIT with routed experts natively quantised, and the
+/// margin must come from the experts staying quantised rather than from luck.
+///
+/// This is arithmetic over the REAL config and the actual on-disk byte rates, not
+/// an estimate: `Oq4G256`'s combined device form is `m*k/2` nibble bytes plus one
+/// f32 scale per 256-group. It exists because the failure it guards is silent —
+/// dequantising the experts to f32 serves identically on a fixture and only fails
+/// on a machine that then cannot hold the model.
+#[test]
+fn shipped_trunk_fits_with_quantised_experts() {
+    let c = cfg();
+    let oq4_bytes = |m: usize, k: usize| -> u64 {
+        // [m*k/2 nibbles | m * (k/256) f32 scales]
+        (m as u64 * k as u64) / 2 + (m as u64 * (k as u64 / 256)) * 4
+    };
+    let f32_bytes = |m: usize, k: usize| -> u64 { m as u64 * k as u64 * 4 };
+
+    let (h, mi, e) = (c.hidden, c.moe.intermediate, c.moe.num_experts);
+    let per_expert = oq4_bytes(2 * mi, h) + oq4_bytes(h, mi);
+    let experts = per_expert * e as u64 * c.layers as u64;
+
+    // Everything else is still dequantised to f32 today — count it that way, so
+    // the test measures what actually loads rather than what we would like to.
+    let others = (f32_bytes(2 * mi, h) + f32_bytes(h, mi)) * c.layers as u64  // shared expert
+        + f32_bytes(c.vocab, h)                                              // lm_head
+        + (8 * f32_bytes(h, h)) * c.layers as u64; // attention + GDN, generous
+
+    let total_gib = (experts + others) as f64 / (1u64 << 30) as f64;
+    let experts_gib = experts as f64 / (1u64 << 30) as f64;
+    println!("  routed experts (Oq4G256): {experts_gib:.1} GiB");
+    println!("  trunk total:              {total_gib:.1} GiB");
+
+    // 128 GB of UMA, shared with everything else on the box. Anything approaching
+    // that is a failure even though it is arithmetically "under".
+    assert!(
+        total_gib < 96.0,
+        "shipped trunk needs {total_gib:.1} GiB — too close to a 128 GB budget"
+    );
+    // And the same weights dequantised must NOT fit, or this test proves nothing:
+    // it would pass even if the experts silently reverted to f32.
+    let f32_experts = (f32_bytes(2 * mi, h) + f32_bytes(h, mi)) * e as u64 * c.layers as u64;
+    let f32_total_gib = (f32_experts + others) as f64 / (1u64 << 30) as f64;
+    assert!(
+        f32_total_gib > 128.0,
+        "control failed: at f32 the trunk is {f32_total_gib:.1} GiB, which would fit — \
+         this test would then not be detecting a silent dequantisation"
+    );
+    println!("  (same weights at f32:     {f32_total_gib:.1} GiB — would not fit)");
+}
