@@ -54,14 +54,6 @@ use hipfire_runtime::tokenizer::Tokenizer;
 /// produce identical rows.
 const NGRAM_HOST_BUDGET_BYTES: u64 = 8 << 30;
 
-/// Above this, routed experts are fetched on demand rather than uploaded at load.
-///
-/// 16 GiB sits above anything that comfortably fits eagerly and far below the
-/// shipped model's expert set, so it separates the two cases without naming a
-/// model. It is a LOAD-TIME and FOOTPRINT choice, not a correctness one: both
-/// residencies serve identical weights.
-const LAZY_EXPERT_THRESHOLD_BYTES: u64 = 16 << 30;
-
 /// How this backend gets n-gram embedding rows.
 ///
 /// The choice is made by SIZE, not by configuration: a fixture's table is a few
@@ -124,25 +116,7 @@ impl Qwen4ExpBackend {
         ngram_host_budget: u64,
     ) -> Result<Self, String> {
         let cfg = Qwen4Exp::config_from_hfq(hfq)?;
-        // LAZY EXPERTS above a threshold. One token routes to `experts_per_tok` of
-        // `num_experts`, so a short interaction needs a few percent of the expert
-        // bytes; uploading all of them costs ~85 GiB and ~65 s on the shipped model
-        // before the first token exists. Small models stay eager — the fetch
-        // machinery is pure overhead when everything fits anyway.
-        let expert_bytes = Self::routed_expert_bytes(&cfg);
-        let lazy_experts = expert_bytes > LAZY_EXPERT_THRESHOLD_BYTES;
-        if lazy_experts {
-            eprintln!(
-                "[qwen4_exp] routed experts are ~{:.1} GiB — loading them LAZILY \
-                 ({} experts, top-{} per token)",
-                expert_bytes as f64 / (1u64 << 30) as f64,
-                cfg.moe.num_experts,
-                cfg.moe.experts_per_tok,
-            );
-        }
-        let reader0 = HfqTensorReader { hfq };
-        let weights = TrunkWeights::upload_with(gpu, &cfg, &reader0, lazy_experts)
-            .map_err(|e| format!("qwen4_exp: {e:?}"))?;
+        let weights = Qwen4Exp::load_weights(hfq, &cfg, gpu)?;
         let max_seq = max_seq.min(cfg.max_position).max(1);
         let state =
             TrunkState::new(gpu, &cfg, max_seq).map_err(|e| format!("qwen4_exp state: {e:?}"))?;
@@ -192,15 +166,6 @@ impl Qwen4ExpBackend {
         })
     }
 
-    /// Device bytes every routed expert would occupy, at the source encoding's
-    /// own rate — 4-bit Opus is ~0.5 B/weight plus scales, so this is deliberately
-    /// an over-estimate rather than a guess at the codec.
-    fn routed_expert_bytes(cfg: &Qwen4ExpConfig) -> u64 {
-        let (h, mi) = (cfg.hidden as u64, cfg.moe.intermediate as u64);
-        let per_expert = (2 * mi * h + h * mi) / 2; // 4-bit
-        per_expert * cfg.moe.num_experts as u64 * cfg.layers as u64
-    }
-
     /// Host bytes the n-gram table would occupy if held resident.
     fn ngram_bytes(n: &crate::config::NgramConfig) -> u64 {
         let (_, _, padded) = hipfire_arch_qwen4exp_spec::ngram_head_layout(
@@ -222,18 +187,7 @@ impl Qwen4ExpBackend {
     /// costs ~8x the memory. On the shipped geometry the experts are 97.3% of the
     /// trunk, so this one value decides whether the model fits.
     pub fn routed_expert_dtype(&self) -> Option<hipfire_rdna::DType> {
-        self.weights.layers.first().map(|l| l.moe.gate_up.dtype())
-    }
-
-    /// Expert elements actually uploaded so far, across every layer. For a lazy
-    /// model this GROWS as tokens route to new experts, and is the number the
-    /// lazy path exists to keep small.
-    pub fn resident_expert_elems(&self) -> usize {
-        self.weights
-            .layers
-            .iter()
-            .map(|l| l.moe.gate_up.resident_elems() + l.moe.down.resident_elems())
-            .sum()
+        self.weights.layers.first().map(|l| l.moe.gate_up.dtype)
     }
 
     /// One trunk step at absolute position `pos`, leaving logits on the GPU.

@@ -26,10 +26,6 @@ pub struct HfqTensorReader<'a> {
 }
 
 impl TensorReader for HfqTensorReader<'_> {
-    fn source_path(&self) -> Option<std::path::PathBuf> {
-        Some(self.hfq.path().to_path_buf())
-    }
-
     fn read_raw(&self, name: &str) -> Option<(u8, Vec<u8>)> {
         self.hfq.tensor_data_logical(name).ok()
     }
