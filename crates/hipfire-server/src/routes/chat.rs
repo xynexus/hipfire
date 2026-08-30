@@ -254,7 +254,11 @@ fn maybe_attach_dflash_draft(
     _model_path: Option<&Path>,
     params: &mut ModelLoadParams,
 ) {
-    if cfg.dflash_mode == "off" {
+    // `dflash_draft` already decided this in `from_hipfire_config`, which is the
+    // resolved, per-model answer. Only the env override is left, and it stays
+    // last so an operator can still pin a drafter for one run.
+    let (mode, _) = hipfire_config::dflash_draft_setting(&cfg.dflash_draft);
+    if mode == "off" {
         return;
     }
     if let Ok(explicit) = std::env::var("HIPFIRE_DFLASH_DRAFT") {

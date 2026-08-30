@@ -91,6 +91,24 @@ pub enum ConfigType {
     },
 }
 
+/// Split a `dflash_draft` value into (mode, explicit drafter path).
+///
+/// One setting answers both questions, because they were never independent: a
+/// mode with no drafter to apply it to is half a decision, and naming a drafter
+/// while leaving the mode `off` is a contradiction the operator has to notice.
+/// So a PATH implies `on` — naming one is asking for it.
+///
+/// Empty is `off`: an unset string is not a path, and the field's own default
+/// says off.
+pub fn dflash_draft_setting(value: &str) -> (&str, Option<&str>) {
+    match value.trim() {
+        "" | "off" => ("off", None),
+        "auto" => ("auto", None),
+        "on" => ("on", None),
+        path => ("on", Some(path)),
+    }
+}
+
 /// Config keys that have been renamed, as `(old, new)`.
 ///
 /// An old key is honoured and reported, not dropped. Dropping is what this
@@ -113,6 +131,10 @@ pub const RENAMED_KEYS: &[(&str, &str)] = &[
     ("ngram_promote_count", "ngram_spec_promote_count"),
     ("ngram_write_target", "ngram_spec_write_target"),
     ("dflash_ngram_block", "dflash_no_repeat_ngram"),
+    // `dflash_mode` and `dflash_draft` were one question asked twice: the mode
+    // and the drafter it applies to. The values carry over unchanged, and a path
+    // now says "on" by naming what to use.
+    ("dflash_mode", "dflash_draft"),
 ];
 
 /// Sentinel values of [`NGRAM_STORE_ROOT_RAM`] meaning "keep tables in RAM".
@@ -686,31 +708,31 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Flash-attention selection policy."
     ),
     field!(
-        "dflash_mode",
-        ConfigType::Enum {
-            values: &["off", "auto", "on"]
+        "dflash_draft",
+        // Enum arm FIRST: an open arm accepts nearly anything and would swallow
+        // the words behind it. (`off`/`auto`/`on` also fail the Path arm because
+        // a config path must be absolute, but the order is the rule regardless.)
+        ConfigType::OneOf {
+            arms: &[
+                ConfigType::Enum {
+                    values: &["off", "auto", "on"],
+                },
+                ConfigType::Path {
+                    existence: PathExistence::Exists,
+                },
+            ],
         },
         Requirement::Optional,
         Some("off"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "DFlash speculative decode: `off` never loads a drafter, `auto` uses one \
-         if it is found, `on` requires one and fails the load if none is."
-    ),
-    field!(
-        "dflash_draft",
-        ConfigType::Path {
-            existence: PathExistence::Exists,
-        },
-        Requirement::Optional,
-        None,
-        GLOBAL_MODEL_RUNTIME,
-        ConfigMutability::LoadTime,
-        "Explicit DFlash drafter for this model, overriding sibling discovery and \
-         any embedded component. Set it per model under `model_overrides` to \
-         attach a drafter the naming convention would not find, or to pin a \
-         different one. Unset uses discovery (`~/.hipfire/drafts`, next to the \
-         model, the models dir)."
+        "DFlash speculative decode. `off` never loads a drafter; `auto` uses one \
+         if discovery finds it (`~/.hipfire/drafts`, next to the model, the \
+         models dir); `on` requires one and fails the load if none is found. An \
+         absolute PATH names the drafter explicitly, overriding discovery and any \
+         embedded component — and implies `on`, because naming a drafter is \
+         asking for it. Set it per model under `model_overrides` to pin a \
+         drafter the naming convention would not find."
     ),
     field!(
         "dflash_adaptive_b",

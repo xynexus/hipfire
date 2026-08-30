@@ -309,7 +309,7 @@ mod tests {
             max_seq: 8192,
             kv_cache: "asym3".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "off".to_string(),
+            dflash_draft: "off".to_string(),
             cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
             ..Default::default()
         };
@@ -332,7 +332,7 @@ mod tests {
             max_seq: 4096,
             kv_cache: "auto".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "auto".to_string(),
+            dflash_draft: "auto".to_string(),
             cask_sidecar: Some(String::new()),
             ..Default::default()
         };

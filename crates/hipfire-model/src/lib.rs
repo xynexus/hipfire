@@ -2808,17 +2808,18 @@ pub struct ModelLoadParams {
 
 impl ModelLoadParams {
     pub fn from_hipfire_config(config: &hipfire_config::HipfireConfig) -> Self {
+        // One setting, two wire params: the daemon still receives a mode and an
+        // optional drafter path, so the protocol is unchanged.
+        let (dflash_mode, dflash_draft) =
+            hipfire_config::dflash_draft_setting(&config.dflash_draft);
         let mut params = Self::from_common_config_values(
             config.max_seq,
             &config.kv_cache,
             &config.flash_mode,
-            &config.dflash_mode,
+            dflash_mode,
             config.cask_sidecar.as_deref(),
         );
-        // An explicit drafter beats discovery. Rides the same params channel as
-        // every other resolved setting, so `model_overrides` can pin a drafter
-        // per model.
-        params.draft = non_empty_value(&config.dflash_draft);
+        params.draft = dflash_draft.map(str::to_string);
         params.ngram_spec = Some(config.ngram_spec);
         params.ngram_spec_store_root = Some(config.ngram_spec_store_root.clone());
         params.ngram_spec_scope = Some(config.ngram_spec_scope.clone());

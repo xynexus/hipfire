@@ -296,34 +296,20 @@
   {
     "key": "dflash_draft",
     "type": {
-      "kind": "path",
-      "existence": "exists"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": null,
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Explicit DFlash drafter for this model, overriding sibling discovery and any embedded component. Set it per model under `model_overrides` to attach a drafter the naming convention would not find, or to pin a different one. Unset uses discovery (`~/.hipfire/drafts`, next to the model, the models dir).",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "dflash_mode",
-    "type": {
-      "kind": "enum",
-      "values": [
-        "off",
-        "auto",
-        "on"
+      "kind": "one_of",
+      "arms": [
+        {
+          "kind": "enum",
+          "values": [
+            "off",
+            "auto",
+            "on"
+          ]
+        },
+        {
+          "kind": "path",
+          "existence": "exists"
+        }
       ]
     },
     "requirement": {
@@ -337,7 +323,7 @@
     ],
     "mutability": "load_time",
     "owner": "hipfire-config",
-    "description": "DFlash speculative decode: `off` never loads a drafter, `auto` uses one if it is found, `on` requires one and fails the load if none is.",
+    "description": "DFlash speculative decode. `off` never loads a drafter; `auto` uses one if discovery finds it (`~/.hipfire/drafts`, next to the model, the models dir); `on` requires one and fails the load if none is found. An absolute PATH names the drafter explicitly, overriding discovery and any embedded component — and implies `on`, because naming a drafter is asking for it. Set it per model under `model_overrides` to pin a drafter the naming convention would not find.",
     "validation": null,
     "secret": false,
     "restart_impact": "none",

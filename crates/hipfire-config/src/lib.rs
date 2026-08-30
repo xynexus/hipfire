@@ -25,8 +25,8 @@ pub use resolve::{
     ResolvedConfigValue, UnknownConfigKey,
 };
 pub use schema::{
-    config_schema, ConfigField, ConfigMutability, ConfigScope, ConfigType, PathExistence,
-    Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM, RENAMED_KEYS,
+    config_schema, dflash_draft_setting, ConfigField, ConfigMutability, ConfigScope, ConfigType,
+    PathExistence, Requirement, RestartImpact, NGRAM_STORE_ROOT_RAM, RENAMED_KEYS,
 };
 
 fn default_host() -> String {
@@ -162,7 +162,7 @@ fn default_deltanet_state_precision() -> String {
 fn default_flash_mode() -> String {
     "auto".to_string()
 }
-fn default_dflash_mode() -> String {
+fn default_dflash_draft() -> String {
     "off".to_string()
 }
 fn default_dflash_adaptive_b() -> bool {
@@ -423,10 +423,9 @@ pub struct HipfireConfig {
     pub lmhead_twostage: String,
     #[serde(default = "default_flash_mode")]
     pub flash_mode: String,
-    #[serde(default = "default_dflash_mode")]
-    pub dflash_mode: String,
-    /// Explicit DFlash drafter path, overriding discovery. Empty = discover.
-    #[serde(default)]
+    /// `off` / `auto` / `on`, or an absolute drafter path (which implies `on`).
+    /// Split with [`dflash_draft_setting`].
+    #[serde(default = "default_dflash_draft")]
     pub dflash_draft: String,
     #[serde(default = "default_dflash_adaptive_b")]
     pub dflash_adaptive_b: bool,
@@ -663,8 +662,7 @@ impl Default for HipfireConfig {
             load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),
             flash_mode: default_flash_mode(),
-            dflash_mode: default_dflash_mode(),
-            dflash_draft: String::new(),
+            dflash_draft: default_dflash_draft(),
             dflash_adaptive_b: default_dflash_adaptive_b(),
             ngram_spec: default_ngram_spec(),
             ngram_spec_store_root: default_ngram_spec_store_root(),
@@ -1372,7 +1370,7 @@ mod tests {
         assert_eq!(cfg.kv_cache, "auto");
         assert_eq!(cfg.kv_adaptive, "off");
         assert_eq!(cfg.flash_mode, "auto");
-        assert_eq!(cfg.dflash_mode, "off");
+        assert_eq!(cfg.dflash_draft, "off");
         assert!(cfg.dflash_adaptive_b);
         assert_eq!(cfg.dflash_no_repeat_ngram, serde_json::json!("auto"));
         assert_eq!(cfg.mtp_mode, "auto");
@@ -1673,6 +1671,69 @@ mod tests {
                 resolved.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn a_dflash_path_implies_on() {
+        assert_eq!(dflash_draft_setting("off"), ("off", None));
+        assert_eq!(dflash_draft_setting(""), ("off", None));
+        assert_eq!(dflash_draft_setting("auto"), ("auto", None));
+        assert_eq!(dflash_draft_setting("on"), ("on", None));
+        // Naming a drafter is asking for it, so the mode follows the path.
+        assert_eq!(
+            dflash_draft_setting("/drafts/x.hfq"),
+            ("on", Some("/drafts/x.hfq"))
+        );
+    }
+
+    #[test]
+    fn dflash_mode_migrates_onto_dflash_draft() {
+        // The two were one question asked twice; the old key's values carry
+        // over unchanged rather than being dropped.
+        for value in ["off", "auto", "on"] {
+            let raw = serde_json::json!({ "dflash_mode": value });
+            let resolved = resolve_typed_config_document(&raw, None);
+            assert_eq!(
+                resolved.config.dflash_draft, value,
+                "dflash_mode={value} must carry over"
+            );
+            assert!(
+                resolved.diagnostics.iter().any(
+                    |d| d.message.contains("dflash_mode") && d.message.contains("dflash_draft")
+                ),
+                "the migration must name both keys: {:?}",
+                resolved.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn a_dflash_draft_union_accepts_both_arms() {
+        for value in ["off", "auto", "on", "/etc/hostname"] {
+            let raw = serde_json::json!({ "dflash_draft": value });
+            let resolved = resolve_typed_config_document(&raw, None);
+            assert!(
+                !resolved
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("dflash_draft")),
+                "`{value}` is a valid arm but was reported: {:?}",
+                resolved.diagnostics
+            );
+        }
+        // A relative path is neither a keyword nor an absolute path.
+        let raw = serde_json::json!({ "dflash_draft": "drafts/x.hfq" });
+        let resolved = resolve_typed_config_document(&raw, None);
+        let msg = resolved
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("dflash_draft"))
+            .map(|d| d.message.clone())
+            .expect("a value matching no arm must be reported");
+        assert!(
+            msg.contains("off") && msg.contains("absolute"),
+            "the report must name both arms' expectations: {msg}"
+        );
     }
 
     #[test]
