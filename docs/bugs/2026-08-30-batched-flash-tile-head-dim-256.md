@@ -1,6 +1,8 @@
 # Four batched flash tiles are head_dim=256-only, and nothing said so
 
 Status: found 2026-08-30 on master `e4025250f`, nix2. **GUARDED, not fixed** —
+independently confirmed against a hardware repro in a disconnected lineage (see
+below).
 the affected kernels now refuse a `head_dim` they cannot compute instead of
 corrupting silently. Teaching them the runtime `dpt` is the real fix and needs a
 GPU to validate; scope at the end.
@@ -62,7 +64,18 @@ the upper dims are never written — defect 2 verbatim, in its batched mirror.
 `launch_asym_flash_batched` passes `head_dim` straight through and checks
 nothing; neither does any caller in `hipfire-dispatch`.
 
-## Live exposure is narrow, which is why it survived
+## Reachability
+
+`head_dim == 128` is not hypothetical. Both of these are real artifacts in the
+store:
+
+- `qwen3.5-0.8b--oq4++.hfq` — `q_proj [4096, 1024]`, `k_proj [512, 1024]`, i.e.
+  32 heads x 128 and 4 kv-heads x 128. The qwen35 family is the **only** producer
+  of `KvTierInputs` today, so it is exactly the family that reaches these tiles.
+- `BLS-Mini-Code-1.0--bf16.hfq` — arch 25 (cohere2-moe), `head_dim 128` per
+  `hipfire inspect`.
+
+What narrows it is the KV mode, not the model:
 
 - `asym3`, `fwht3` and `q8_0` are all in `DEPRECATED_KV_MODES`, so today they are
   reachable only behind `HIPFIRE_KV_ALLOW_DEPRECATED=1`.
@@ -73,9 +86,39 @@ nothing; neither does any caller in `hipfire-dispatch`.
 - The shipping KV family (kvarn) uses `attention_flash_kvarn_tile_batched`, which
   is correct.
 
-So this is not a live serving corruption today. It is a loaded gun: the guard was
-absent, the constraint was undocumented, and the reduce kernel's comment actively
-asserted the opposite.
+So a default-configured server does not hit it. A `head_dim=128` model with a
+deprecated KV mode and batched prefill does.
+
+## Independent confirmation, and a validated fix, in a lineage we do not merge
+
+`41d597e14` on the **disconnected pre-fork lineage** (it edits
+`crates/rdna-compute/`, which does not exist in this tree, and is NOT an ancestor
+of `origin/master`) hit this exact defect from the other end:
+
+> Fix the head_dim=128 GPU fault. The batched flash tile + asym reduce kernels
+> were hardcoded for head_dim=256 (d0 = tid*8, 8 dims/thread x a 32-lane block =
+> 256 dims, ignoring the head_dim arg), so North-Mini-Code (head_dim 128) drove
+> threads 16..31 out of bounds -> HIP 700 illegal memory access that wedged the
+> stream (presented as a ~27-min "hang"). Parameterize dims-per-thread =
+> head_dim/32 (4@128, 8@256); dpt=8 is byte-identical at head_dim=256, so Qwen is
+> unaffected.
+
+Three things this tells us, none of which change what we merge:
+
+1. **The symptom is a fault, not just wrong numbers.** The Q read past the last
+   head's slice leaves the buffer, so the first observable is HIP 700 wedging the
+   stream. This document originally framed it as silent corruption; the partials
+   overrun is silent, but the Q read is not.
+2. **The diagnosis is confirmed independently**, by someone who reproduced it on
+   hardware rather than by reading the source.
+3. **The fix scoped below is the one that was measured** — `dpt = head_dim / 32`,
+   byte-identical at 256.
+
+Per AGENTS.md `upstream` is disconnected and is not fetched, rebased onto, or
+merged. This is cited as **evidence and as a reference implementation**, not as a
+change to take. On this tree only the reduce kernel and the kvarn tile carry the
+runtime `dpt`; the four tiles here never received it, which is why the reduce
+kernel's comment claims a parity that does not exist.
 
 ## What was done
 

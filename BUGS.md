@@ -133,11 +133,20 @@ head_dim=128 the upper lanes read past the head and write past the partials
 stride into the next tile's slot — silently wrong, no error. The reduce kernel
 was fixed for exactly this and its comment claimed the tiles already agreed.
 
-Live exposure is narrow (three are deprecated KV modes, the fourth has no
-production caller), which is why it survived. Now REFUSED at the four dispatch
-wrappers, with a source-scanning test that fails if the guarded list and the
-kernels disagree. The real fix — runtime `dpt`, mirroring the kvarn tile — is
-arithmetically identical at 256 and needs a GPU only to check the unroll cost.
+`head_dim=128` is real here — `qwen3.5-0.8b--oq4++.hfq` (32x128) and the
+cohere2-moe `BLS-Mini-Code-1.0--bf16.hfq` both have it — but the KV mode narrows
+it: three of the four kernels are deprecated modes and the fourth has no
+production caller, so a default server does not reach them. Now REFUSED at the
+four dispatch wrappers, with a source-scanning test that fails if the guarded
+list and the kernels disagree.
+
+Independently confirmed: `41d597e14`, on the DISCONNECTED pre-fork lineage (not
+an ancestor of origin/master; edits a `crates/rdna-compute/` that does not exist
+here), hit this on hardware — "threads 16..31 out of bounds -> HIP 700 illegal
+memory access that wedged the stream (presented as a ~27-min hang)" — and fixed
+it with exactly the `dpt = head_dim / 32` scoped below, noting it is
+byte-identical at 256. Cited as evidence and a reference only; per AGENTS.md
+upstream is not merged.
 
 → `docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md`
 
