@@ -82,11 +82,38 @@ promoted — but do not spend a hunt wave on "tests nobody runs", that lens is s
 
 ## Mechanical sweeps that would beat more LLM finders
 
-1. Diff the 46 `X`/`X_batched` kernel pairs on the four load-bearing line classes.
-2. Grep the 20 `b"HFQM"` parsers for a `version >= 2` branch; the 12 without one
-   are the list. Same for the other self-defined containers with their own
-   MAGIC+VERSION (`hipfire-kld/src/{archive,hfkseq}.rs`, `train/src/checkpoint.rs`).
-3. **Duplicated-constant and duplicated-helper sweep** — `HFQ_MAGIC`/`HFQ_VERSION`
+**Status 2026-08-30: sweeps 1-4 have now RUN.** Results inline below; the
+write-ups are `docs/bugs/2026-08-30-hfqm-v1-only-parsers.md` and
+`docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md`. Sweeps 5-9 are still
+open, and 5 (run the gates on halo and medusa) remains the highest
+value-per-effort item on this page — it is the only one that executes code
+instead of reading it.
+
+
+1. ~~Diff the 46 `X`/`X_batched` kernel pairs on the four load-bearing line
+   classes.~~ **DONE 2026-08-30.** Diffing 46 pairs by hand is the wrong shape;
+   ranking them by *commits that touched exactly one side* found the real one in
+   minutes. Top hit `attention_flash_q8_0_tile`: three commits on the
+   non-batched file that never reached `_batched`. Four batched flash tiles are
+   head_dim=256-only and unguarded — now refused, with a source-scanning test.
+   Independently confirmed by a hardware repro on the disconnected pre-fork
+   lineage (HIP 700, not silent corruption).
+2. ~~Grep the 20 `b"HFQM"` parsers for a `version >= 2` branch.~~ **DONE
+   2026-08-30.** Three of the twelve were live: `hfq_patch`, `hfq_split`,
+   `draft_to_mq4` read the version into a discarded binding and walked a v1
+   index on v2 files. `hfq_patch` also panicked on a truncated file from a
+   `Result`-returning function. The extension to the other containers found
+   `hipfire-kld`'s HFKREF/HFKSEQ clean and `train/src/checkpoint.rs`'s
+   `read_ckpt` doing `let _ver = ru32(f)?` — harmless at v1, now checked.
+3. **Duplicated-constant and duplicated-helper sweep** — **PARTLY DONE
+   2026-08-30.** The `HFQ_VERSION` half is **REFUTED**: the value really does
+   disagree (2 vs 1 across six files), but the five saying `1` are writers
+   emitting self-consistent v1 containers, and importing the canonical constant
+   would MAKE a bug. The *helper* half was real — `pid_alive` has three copies,
+   and the third (`hipfire-hub/src/cache.rs`) dropped the `EPERM` arm, so
+   another uid's live process read as dead and its in-progress `.part` download
+   was reclaimed. `BUNDLE_TRAILER_MAGIC` and `ELF_MAGIC` are still unchecked.
+   Original text: `HFQ_MAGIC`/`HFQ_VERSION`
    is redeclared in 8 files *with the value disagreeing*; `BUNDLE_TRAILER_MAGIC` in
    2; `ELF_MAGIC` in 2. Every copied constant is a sibling that can drift. Collapse
    into `hipfire-quant-format` and let the compiler enforce agreement.
@@ -95,7 +122,12 @@ promoted — but do not spend a hunt wave on "tests nobody runs", that lens is s
    `hipfire-cli/src/commands/daemon.rs:575` — which is the identical shape, found
    incidentally while fixing the `serve.pid` bug. Grep for duplicate `fn` bodies
    across sibling modules, not just duplicate constants.
-4. Extend `kernel_arity.rs` from count to argument names, and to the other crates.
+4. ~~Extend `kernel_arity.rs` from count to argument names~~ **DONE for types
+   2026-08-30** — `kernargs!` names each argument's kind (ptr/i32/u32/f32/u64)
+   and the `.hip` declares the other side, so pointer/scalar and int/float swaps
+   that keep the count are now caught. Zero mismatches across 372 sites;
+   verified against an injected swap. **Still open: extending it to the other
+   crates** — it only scans `hipfire-rdna/src`.
 5. Run the existing gates on halo and medusa — zero authoring cost, executes 521
    wave64 branch sites that have never run.
 6. **Arch-branch orphan sweep** — only 3 `.gfx12.hip` files exist against 134
