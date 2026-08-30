@@ -702,3 +702,25 @@ impl TrunkScratch {
         }
     }
 }
+
+#[cfg(test)]
+mod expert_load_tests {
+    /// The native-quantised expert path must PRE-CHECK before `oq4_arch_load`.
+    ///
+    /// `oq4_pack_arch_combined` asserts on a ragged K, and an assert in a loader
+    /// aborts the whole daemon rather than failing one model. The fixture here has
+    /// `moe_intermediate_size = 256`, so it never exercises this — but the SHIPPED
+    /// model is 640, meaning every routed `down_proj` in the real checkpoint takes
+    /// the ragged branch. This pins the arithmetic that makes the guard necessary.
+    #[test]
+    fn shipped_down_proj_k_is_ragged_and_must_be_pre_checked() {
+        use hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason;
+        // Routed down_proj on the shipped geometry: [hidden 2560, mi 640].
+        assert!(
+            oq4_arch_unsupported_reason(2560, 640).is_some(),
+            "K=640 is not 256-aligned; without the pre-check this asserts"
+        );
+        // gate_up on the same layer is [2*mi, hidden] — K = hidden, which is fine.
+        assert!(oq4_arch_unsupported_reason(1280, 2560).is_none());
+    }
+}
