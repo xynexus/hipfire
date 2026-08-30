@@ -31,8 +31,35 @@ impl TensorReader for HfqTensorReader<'_> {
             .hfq
             .tensor_data_logical(name)
             .map_err(|e| format!("qwen4_exp: reading `{name}`: {e:?}"))?;
-        // F16 = 1, F32 = 2, BF16 = 16 (`hipfire_quant_format::QuantType`).
+
+        // Element count from the artifact's own index, not inferred from the
+        // byte length — a packed format's bytes do not determine `n`.
+        let info = self
+            .hfq
+            .tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| format!("qwen4_exp: `{name}` has no index entry"))?;
+        let dims: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
+        let n: usize = dims.iter().product();
+
+        // Float encodings pass through; quantised ones are DEQUANTISED to f32.
+        //
+        // ⚠️ This makes a quantised artifact LOADABLE, not memory-cheap: the
+        // weights land on the GPU as f32, so an oq4 model costs the same resident
+        // bytes as an f32 one. That is the right trade for a fixture and for
+        // quality evidence (it is what lets arch 26 into the tiny-quant battery),
+        // and the WRONG one for the shipped 360 GB checkpoint, which needs the
+        // weights to STAY quantised behind `hipfire_runtime::weights::WeightTensor`
+        // so the iu4/iu8 kernels read them directly. Both are tracked in
+        // docs/model-support.toml.
+        //
+        // A format with no arm returns a NAMED error. A model that loads with
+        // holes in it, or with a tensor silently read as the wrong layout, is far
+        // worse to debug than one that refuses.
+        use hipfire_runtime::quant as dq;
         match qt {
+            // F32 / F16 / BF16.
             2 => Ok(bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -45,10 +72,40 @@ impl TensorReader for HfqTensorReader<'_> {
                 .chunks_exact(2)
                 .map(|c| f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16))
                 .collect()),
+            // Lossless BF16 recodings (Bf16Lut3 / Bf16Huff). These are pure
+            // storage: decoding yields the identical BF16 bytes.
+            49 | 50 => {
+                let logical = hipfire_runtime::hfq::decode_bf16_packed(qt, &bytes, n)
+                    .ok_or_else(|| format!("qwen4_exp: `{name}` bf16 recoding is corrupt"))?;
+                Ok(logical
+                    .chunks_exact(2)
+                    .map(|c| {
+                        f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16)
+                    })
+                    .collect())
+            }
+            3 => Ok(dq::dequant_q8f16(&bytes, n)),
+            4 => Ok(dq::dequant_q4k(&bytes, n)),
+            // Opus W4/W8. `OqPlusG256` (33) is W4 stored in Oq4G256 blocks — the
+            // loader ordinarily nibble-expands it to int8 for the W8A8 path; here
+            // it dequantises through the same blocks.
+            33 | 34 => Ok(dq::dequant_oq4g256(&bytes, n)),
+            35 => Ok(dq::dequant_oq8g256(&bytes, n)),
+            // Compact Opus carries a sparse outlier overlay, so it needs the 2-D
+            // shape rather than just the element count.
+            36 | 52 => {
+                if dims.len() != 2 {
+                    return Err(format!(
+                        "qwen4_exp: `{name}` is compact Opus (qt {qt}) but its shape is {dims:?}; \
+                         the overlay decode needs a 2-D [rows, cols] tensor"
+                    ));
+                }
+                Ok(dq::dequant_oqplus_compact(&bytes, dims[0], dims[1]))
+            }
             other => Err(format!(
                 "qwen4_exp: `{name}` is quant type {other}, which this loader does not \
-                 dequantise yet. Serve a float artifact (bf16/f16/f32) for now; the \
-                 quantised expert path needs the indexed-expert admission work first."
+                 dequantise. Serve a float artifact (bf16/f16/f32) or one of the supported \
+                 quantised formats (q8f16, q4k, oq4, oq8, oq+ compact)."
             )),
         }
     }

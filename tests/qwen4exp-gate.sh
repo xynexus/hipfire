@@ -186,6 +186,7 @@ if [ -f "$TMP/fx.bf16.hfq" ]; then
   esac
   # A frozen argmax is the signature of a dead forward, and it is reported rather
   # than thrown, so check the line explicitly.
+  bf16_argmax="$(echo "$sv" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
   case "$sv" in
     *"argmax moved = false"*)
       echo "qwen4exp-gate: decode ran but the argmax never moved — dead forward"
@@ -193,6 +194,35 @@ if [ -f "$TMP/fx.bf16.hfq" ]; then
   esac
 else
   echo "qwen4exp-gate: no bf16 artifact to serve"
+  fail=1
+fi
+
+step "GPU: serve QUANTISED artifacts, against the bf16 control"
+# The trunk dequantises oq4/oq8 at load. What makes this a real check rather than
+# a smoke test is comparing the ARGMAX to the bf16 run above: a dequant that is
+# subtly wrong (mismatched FWHT basis, wrong block stride) still yields finite
+# logits, and only diverges from the float control.
+if [ -n "${bf16_argmax:-}" ]; then
+  for q in oq4 oq8; do
+    if ! ./target/release/hipfire-quantize --input "$TMP/fx" --output "$TMP/fx.$q.hfq" \
+         --format "$q" >/dev/null 2>&1; then
+      echo "qwen4exp-gate: could not quantize the fixture to $q"; fail=1; continue
+    fi
+    qout="$(./target/release/examples/serve_fixture "$TMP/fx.$q.hfq" 2>&1 || true)"
+    case "$qout" in
+      *"serve_fixture: OK"*) ;;
+      *) echo "  $q: FAILED to serve"; echo "$qout" | tail -3 | sed 's/^/    /'; fail=1; continue ;;
+    esac
+    qam="$(echo "$qout" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+    if [ "$qam" = "$bf16_argmax" ]; then
+      echo "  $q: serves, argmax $qam matches the bf16 control"
+    else
+      echo "qwen4exp-gate: $q argmax $qam != bf16 argmax $bf16_argmax — dequant is wrong"
+      fail=1
+    fi
+  done
+else
+  echo "qwen4exp-gate: no bf16 argmax recorded; cannot compare quantised runs"
   fail=1
 fi
 

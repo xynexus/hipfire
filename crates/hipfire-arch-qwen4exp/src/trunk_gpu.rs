@@ -25,7 +25,7 @@ use crate::moe_gpu::{moe_forward, MoeScratch, MoeWeights};
 use crate::ngram::NgramHasher;
 use crate::ple_gpu::{ple_step, PleScratch, PleWeights};
 
-use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipError, HipResult};
 
 pub enum TokenMixer {
     Gdn(GdnWeights),
@@ -76,6 +76,17 @@ pub trait TensorReader {
     fn read(&self, name: &str) -> Result<Vec<f32>, String>;
 }
 
+/// A reader error is a LOAD FAILURE, not a crash.
+///
+/// These helpers used to `panic!` on an unreadable tensor. That is fine in an
+/// example and wrong everywhere else: the daemon loads artifacts in-process, so an
+/// unsupported quant format in one model would take down a server holding others.
+/// The message is already specific — it names the tensor and the format — so it
+/// only needed to be returned rather than thrown.
+fn read_err(name: &str, e: String) -> HipError {
+    HipError::new(0, &format!("qwen4_exp load `{name}`: {e}"))
+}
+
 fn up2(
     gpu: &mut Gpu,
     w: &dyn TensorReader,
@@ -83,7 +94,7 @@ fn up2(
     rows: usize,
     cols: usize,
 ) -> HipResult<GpuTensor> {
-    let v = w.read(name).unwrap_or_else(|e| panic!("{e}"));
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
     gpu.upload_f32(&v, &[rows, cols])
 }
 
@@ -112,22 +123,28 @@ fn stack_experts(
     let mut all = Vec::with_capacity(n_exp * per);
     for e in 0..n_exp {
         let name = format!("{mp}.experts.{e}.{which}.weight");
-        let v = w
-            .read(&name)
-            .unwrap_or_else(|err| panic!("{err} (also tried the stacked `{mp}.experts.{which}`)"));
-        assert_eq!(
-            v.len(),
-            per,
-            "expert {e} `{which}` has {} elements, expected {per}",
-            v.len()
-        );
+        let v = w.read(&name).map_err(|err| {
+            read_err(
+                &name,
+                format!("{err} (also tried the stacked `{mp}.experts.{which}`)"),
+            )
+        })?;
+        if v.len() != per {
+            return Err(read_err(
+                &name,
+                format!(
+                    "expert {e} `{which}` has {} elements, expected {per}",
+                    v.len()
+                ),
+            ));
+        }
         all.extend_from_slice(&v);
     }
     gpu.upload_f32(&all, shape)
 }
 
 fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> {
-    let v = w.read(name).unwrap_or_else(|e| panic!("{e}"));
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
     let n = v.len();
     gpu.upload_f32(&v, &[n])
 }
