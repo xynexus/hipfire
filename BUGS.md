@@ -2018,7 +2018,7 @@ k-generic, and the work is the two selection kernels plus threading `k` through
 repack so they keep agreeing. Rename to `_indexed_` (dropping `k8`), or add a
 one-line header note on each, so the next reader does not re-derive this.
 
-## `K % 256 != 0` splits one MoE layer across THREE quant families, and drops calibration
+## [FIXED 2026-08-30 for oq4; oq8 now WARNS] `K % 256 != 0` splits one MoE layer across THREE quant families, and drops calibration
 
 **Found 2026-08-29 on `feat/buffer-origin-tag-and-route`, halo. Reproduces on a tiny fixture
 in ~2 s, no GPU. Verified at the byte level; the calibration half is the serious part.**
@@ -2029,6 +2029,28 @@ in ~2 s, no GPU. Verified at the byte level; the calibration half is the serious
 qwen3_5_moe_indexed   (mi 512)   shared.down [256,256] Oq4G256   gate_up Oq4G256   down [256,512] Oq4G256
 qwen3_5_moe_mi640_k10 (mi 640)   shared.down [512,640] Q8F16     gate_up Oq4G256   down [512,640] HFQ4G128
 ```
+
+**FIX (2026-08-30).** The admission gate asked `inner_k % 256 == 0` and, failing
+that, dropped the tensor out of Opus entirely. It now asks which Opus group the
+tensor's K ADMITS — the rotate is an FWHT, so powers of two only: 256, else 128,
+else none — and routes a 128-but-not-256 K to `OqPlusCompactG128` (qt 52), which
+exists for exactly this case and, unlike the HFQ4G128 it used to land on, carries
+calibration.
+
+Scope of the fix, precisely:
+
+- `--format oq4`: FIXED. `gemma4_moe` and `qwen3_5_moe` (both mi=128, both in the
+  tiny-quant gate) now emit zero HFQ4G128 routed experts; `down_proj [256, 128]`
+  stays `OQ4-EXP`. tiny-quant-gate PASSES with the change.
+- `--format oq8` / `oq8+`: NOT fixed — there is no G128 8-bit *input format* wired
+  into `quantize_hfq_source_tensor` yet (the `Oq8G128` quant type exists; the
+  producer path does not). These still fall out of Opus, but now print
+  `⚠️ down_proj: K=128 admits no Opus group for this format ... which also drops
+  calibration for this tensor` instead of exiting 0 in silence. The silence was
+  the actual complaint in this entry.
+
+This matters beyond the fixtures: Qwen3.8-Flash-Next ships `moe_intermediate_size
+= 640`, so every routed `down_proj` in that model was on the broken path.
 
 At mi=640 **one layer holds three families**, and two tensors of *identical shape* `[512,640]`
 get different answers, because there are two independent fallback policies:

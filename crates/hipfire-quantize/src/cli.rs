@@ -4122,8 +4122,9 @@ fn stacked_expert_oq_format(
     use_oq4: bool,
     use_oq8: bool,
     use_oq8_plus: bool,
-    // 256 or 128; ignored unless `use_opus_mixed`. Threaded through because the
-    // flag's group would otherwise be lost here and silently fall back to 256.
+    // 256 or 128. For the mixed format this is the flag's own group. For plain
+    // `oq4` it is what the tensor's K ADMITS, which is how a K that is a multiple
+    // of 128 but not 256 keeps an Opus home instead of silently leaving the family.
     opus_group: usize,
 ) -> Option<HfqInputFormat> {
     if use_opus_mixed {
@@ -4133,7 +4134,14 @@ fn stacked_expert_oq_format(
             HfqInputFormat::OqPlusCompact
         })
     } else if use_oq4 {
-        Some(HfqInputFormat::Oq4)
+        // `Oq4` is G256-only (its rotate is a 256-point FWHT). At G128 the
+        // representable Opus home is the compact form, which is also the one that
+        // carries calibration — the whole point of not falling through here.
+        Some(if opus_group == 128 {
+            HfqInputFormat::OqPlusCompactG128
+        } else {
+            HfqInputFormat::Oq4
+        })
     } else if use_oq8_plus {
         Some(HfqInputFormat::Oq8Plus)
     } else if use_oq8 {
@@ -10957,19 +10965,51 @@ pub fn main() {
                 || tiered_layer_is_mq3
                 || antirez_mq3)
                 && supports_g256;
+            // The Opus group this expert's K actually admits. The rotate is an
+            // FWHT, so only powers of two: 256 when K divides by it, else 128, else
+            // no Opus home at all. `moe_intermediate_size` 640 (Qwen3.8-Flash-Next)
+            // and 128 (the qwen3_5_moe / gemma4_moe fixtures) are all 128-but-not-256,
+            // and used to fall out of Opus entirely — down_proj landing on
+            // UNCALIBRATED HFQ4G128 while its own gate_up stayed Oq4G256, exit 0 and
+            // no warning. See BUGS.md.
+            let opus_expert_group: Option<usize> = if inner_k % 256 == 0 {
+                Some(256)
+            } else if inner_k % 128 == 0 {
+                Some(128)
+            } else {
+                None
+            };
             let stacked_oq_format = stacked_expert_oq_format(
                 use_opus_mixed,
                 use_oq4,
                 use_oq8,
                 use_oq8_plus,
-                opus_mixed_spec.map(|s| s.group).unwrap_or(256),
+                opus_mixed_spec
+                    .map(|s| s.group)
+                    .or(opus_expert_group)
+                    .unwrap_or(256),
             );
+            // oq8/oq8+ have no G128 input format yet, so they still need 256. Say so
+            // rather than dropping them silently, which is the defect being fixed.
+            let oq_needs_g256 = use_oq8 || use_oq8_plus;
+            let opus_admits = match opus_expert_group {
+                Some(256) => true,
+                Some(_) => !oq_needs_g256,
+                None => false,
+            };
+            if stacked_oq_format.is_some() && !opus_admits {
+                quant_log!(
+                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group for this format \
+                     (oq8/oq8+ need K % 256 == 0); falling back OUT of Opus, which also \
+                     drops calibration for this tensor"
+                );
+            }
             // Undercovered experts go to W8 rather than source precision, but
             // only where an OQ expert target is actually in play — under a
             // BF16/F16/MQ target there is no pageability to protect and the old
             // fallback is still the right answer. See the branch below.
             let undercovered_experts_w8 = stacked_oq_format.is_some()
-                && supports_g256
+                && opus_admits
                 && !hipfire_env::UNDERCOVERED_EXPERTS_SOURCE.flag();
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
@@ -11094,7 +11134,7 @@ pub fn main() {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if use_fp16 || use_bf16 {
                         (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
-                    } else if let Some(oq_format) = stacked_oq_format.filter(|_| supports_g256) {
+                    } else if let Some(oq_format) = stacked_oq_format.filter(|_| opus_admits) {
                         // Opus-quant experts feed the indexed-MoE kernels; the loader
                         // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
                         // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
@@ -11262,7 +11302,7 @@ pub fn main() {
                 "BF16"
             } else if use_fp16 || use_bf16 {
                 "F16"
-            } else if stacked_oq_format.is_some() && supports_g256 {
+            } else if stacked_oq_format.is_some() && opus_admits {
                 if use_opus_mixed || use_oq8 || use_oq8_plus || OQPLUS_W8_FRAC.get().is_some() {
                     "OQ+C-EXP"
                 } else {
