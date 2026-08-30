@@ -630,11 +630,25 @@ mod tests {
             M * K + M * (K / 256) * 4,
             "G128 expansion must not be mistakable for an Oq8G256 buffer"
         );
-        // And the load path must refuse rather than hand it out as Oq8G256.
-        assert!(
-            oq8_arch_load(QuantType::OqPlusCompactG128.code(), &data, M, K).is_none(),
-            "expanding G128 to Oq8G256 is a silent wrong answer; load must refuse"
+        // The load path must hand this out as `Oq8G128` — NEVER as `Oq8G256`.
+        //
+        // This used to assert a REFUSAL, and that was right while no G128 dtype
+        // existed: the scale plane is twice an Oq8G256 consumer's `ng = K/256`,
+        // and the weights carry the 128-point FWHT (seeds 43/1043) that a
+        // 256-point activation rotation does not cancel. Both hazards are
+        // properties of the TAG, not the bytes, so the fix was a dtype that
+        // states them (`Oq8G128`, `RotationPlan::FwhtG128`) rather than refusing
+        // to load a perfectly good expansion.
+        //
+        // What must never happen is the mislabel, so that is what is asserted.
+        let (_, dtype) = oq8_arch_load(QuantType::OqPlusCompactG128.code(), &data, M, K)
+            .expect("G128 compact expands now that Oq8G128 exists");
+        assert_eq!(
+            dtype,
+            DType::Oq8G128,
+            "G128 bytes tagged as anything else is the silent wrong answer this guards"
         );
+        assert_ne!(dtype, DType::Oq8G256);
         // Bulk nibbles: low then high of 0x21 sign-extended = 1, 2. Position 1 is
         // bulk; position 0 is NOT, because overlay s=0 has index 0 and overrides
         // it — which is the precedence the format requires.

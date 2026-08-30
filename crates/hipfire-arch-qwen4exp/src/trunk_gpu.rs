@@ -229,12 +229,20 @@ fn stack_experts(
             // model's 512-expert `down_proj` (4.25 b/w compact -> 8 b/w int8) added
             // ~20 GB and OOM'd a 128 GB box during load. The compact dtypes have
             // their own GEMV arms, so nothing downstream needs the expansion.
-            hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, bytes, rows, cols).or_else(
-                || {
-                    hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
-                        .map(|(b, d)| (b.into_owned(), d))
-                },
-            )
+            if let Some(out) =
+                hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, bytes, rows, cols)
+            {
+                return Some(out);
+            }
+            // ⚠️ PRE-CHECK before `oq4_arch_load`: `oq4_pack_arch_combined` asserts
+            // on a ragged K, and an assert in a loader aborts the whole daemon
+            // rather than failing one model. Not hypothetical here — this model's
+            // `moe_intermediate_size` is 640, so every routed `down_proj` is K=640.
+            if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(rows, cols).is_some() {
+                return None;
+            }
+            hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
+                .map(|(b, d)| (b.into_owned(), d))
         };
         if convert(first.0, &first.1).is_none() {
             // Do NOT degrade silently. Falling back to f32 costs 8x the resident
