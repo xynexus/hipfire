@@ -469,6 +469,21 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 .map(|v| v as usize)
         })
         .unwrap_or(default_top_k);
+    // Tell the lm_head what this request's sampler needs BEFORE any forward runs.
+    // The two-stage path -inf-masks every vocab row outside its K-row shortlist,
+    // so an unpublished policy would let a `top_k` larger than K draw from fewer
+    // candidates than asked for, and a `top_p < 1.0` nucleus be truncated — both
+    // silently. Set every field on every request: leaving a previous request's
+    // values in place would size K against the wrong sampler.
+    hipfire_runtime::llama::set_lmhead_sampling(hipfire_runtime::llama::LmheadSampling {
+        temperature: temp,
+        top_k,
+        top_p,
+        needs_full_logits: false,
+    });
+    // Flush the two-stage counters when this request leaves, by any path — the
+    // handler has several early returns and a call at each would rot.
+    let _lmq_flush = hipfire_runtime::lmhead_quality::flush_on_drop();
     // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
     // and HF transformers `generate(repetition_penalty=1.0)`
     // defaults. The prior 1.3 default suppressed legitimately

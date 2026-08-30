@@ -73,7 +73,13 @@ pub struct DaemonMoeRouterHistogramGuard {
 
 impl DaemonMoeRouterHistogramGuard {
     pub fn start(evidence_dir: Option<&str>, config: &qwen35::Qwen35Config) -> Self {
-        let active = evidence_dir.is_some() && config.num_experts > 0;
+        // Two reasons to collect: an explicit evidence run, or this generation
+        // landing on the persistent-counter sampling cadence. Collection costs
+        // two blocking D2H syncs per MoE layer per token (see `moe_quality`),
+        // so `should_sample` is what keeps that off the common path — and it
+        // must be consulted exactly once per generation, which is here.
+        let active = config.num_experts > 0
+            && (evidence_dir.is_some() || crate::moe_quality::should_sample());
         if active {
             qwen35::reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
         }

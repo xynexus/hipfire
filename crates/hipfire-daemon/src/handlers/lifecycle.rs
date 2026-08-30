@@ -696,6 +696,20 @@ pub(crate) fn load(
             // (arch 5/6): a bundled `-mq4+mtp.hfq` trailer or a
             // sibling `.mtp.hfq` sidecar. Used by mtp_mode to decide
             // whether to drive the MTP spec-decode path at generate.
+            // Bind the two-stage lm_head counters to this model. Keyed by
+            // artifact stem, and reset on a model change — merging two heads'
+            // shortlist distributions would describe neither.
+            let quality_stem = hipfire_model::model_artifact_stem(&m.model_path);
+            // The producer-stamped content hash, not the filename — a re-quant
+            // under the same name must not merge into the old counters.
+            let quality_hash = hipfire_model::model_hash(&m.model_path);
+            hipfire_runtime::lmhead_quality::set_model(
+                &quality_stem,
+                quality_hash.as_deref(),
+                vocab,
+                dim,
+            );
+            hipfire_serving_core::moe_quality::set_model(&quality_stem, quality_hash.as_deref());
             let qwen35_mtp_present = is_qwen35_family_arch_id(m.arch_id) && {
                 let bundled = hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(
                     std::path::Path::new(&m.model_path),
