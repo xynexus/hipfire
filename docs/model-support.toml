@@ -155,11 +155,14 @@ vision = "none"
 # What is missing, and why this is not `full`:
 #   - prefill is PER-TOKEN. The trunk has no batched path, and the recurrent
 #     halves (GDN state, PLE conv ring) are sequential by construction.
-#   - the SHIPPED checkpoint cannot be served yet: its n-gram table is 102 GB and
-#     the trunk still takes it as a host slice, so the factory refuses it by name
-#     rather than being OOM-killed. `ngram_store` is the streaming reader that
-#     closes this.
-#   - no quality evidence on a real artifact, and no VL/MTP wiring.
+#   - no quality evidence on a REAL artifact. Everything above is fixture-scale;
+#     the shipped checkpoint has never been quantised or served, so `full` would
+#     be a claim about a path nobody has walked.
+#   - no VL or MTP wiring, though mRoPE's vision interleave now exists.
+#
+# The two structural blockers are CLOSED: the 102 GB n-gram table streams row by
+# row (bit-identically to resident), and the routed experts — 97.3% of the trunk —
+# stay natively quantised instead of being dequantised to f32.
 ids = [26]
 label = "qwen4-exp"
 prefill = "partial"
@@ -1215,46 +1218,46 @@ arch = 26
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. The trunk DEQUANTISES oq4 to f32 at load, so such an artifact loads and decodes (tests/qwen4exp-gate.sh serves oq4 and oq8 fixtures through the registered factory and checks the argmax matches the bf16 control). It is NOT memory-cheap: weights land on the GPU as f32, so the resident cost is that of an f32 model. Serving the shipped 360 GB checkpoint needs the weights to STAY quantised behind WeightTensor, plus the streaming n-gram reader. OQ checklist producer=yes loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. ROUTED EXPERTS stay natively quantised at oq4 — 97.3% of the trunk, so this is what decides whether the model fits (~32 GB vs ~258 GB at f32). tests/qwen4exp-gate.sh serves oq4 and oq8 fixtures through the registered factory, requires the argmax to match the bf16 control, AND fails if the experts come back as F32. The remaining 2.7% (attention, GDN, hyper-connections, PLE, lm_head) is still dequantised to f32 at load; that is memory-irrelevant and tracked in docs/todo/2026-08-30-qwen4exp-native-quantised-weights.md. OQ checklist producer=yes loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. Same on-disk format as oq4, which the trunk dequantises at load, so the LOADER half is covered; the calibrated producer path is untested for this family — quantizing the fixture at oq4+ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. Same on-disk format as oq4, so the LOADER half is covered and routed experts stay natively quantised; the calibrated producer path is untested for this family — quantizing the fixture at oq4+ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq4++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. Same on-disk format as oq4, which the trunk dequantises at load, so the LOADER half is covered; the calibrated producer path is untested for this family — quantizing the fixture at oq4++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. Same on-disk format as oq4, so the LOADER half is covered and routed experts stay natively quantised; the calibrated producer path is untested for this family — quantizing the fixture at oq4++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq4.25++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. Same on-disk format as the compact Opus blocks (qt 36), which the trunk dequantises at load, so the LOADER half is covered; the calibrated producer path is untested for this family — quantizing the fixture at oq4.25++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. Same on-disk format as the compact Opus blocks (qt 36/52), so the LOADER half is covered and routed experts stay natively quantised; the calibrated producer path is untested for this family — quantizing the fixture at oq4.25++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. The trunk DEQUANTISES oq8 to f32 at load, so such an artifact loads and decodes (tests/qwen4exp-gate.sh serves oq4 and oq8 fixtures through the registered factory and checks the argmax matches the bf16 control). It is NOT memory-cheap: weights land on the GPU as f32, so the resident cost is that of an f32 model. Serving the shipped 360 GB checkpoint needs the weights to STAY quantised behind WeightTensor, plus the streaming n-gram reader. OQ checklist producer=yes loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. ROUTED EXPERTS stay natively quantised at oq8 — 97.3% of the trunk, so this is what decides whether the model fits (~32 GB vs ~258 GB at f32). tests/qwen4exp-gate.sh serves oq4 and oq8 fixtures through the registered factory, requires the argmax to match the bf16 control, AND fails if the experts come back as F32. The remaining 2.7% (attention, GDN, hyper-connections, PLE, lm_head) is still dequantised to f32 at load; that is memory-irrelevant and tracked in docs/todo/2026-08-30-qwen4exp-native-quantised-weights.md. OQ checklist producer=yes loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. Same on-disk format as oq8, which the trunk dequantises at load, so the LOADER half is covered; the calibrated producer path is untested for this family — quantizing the fixture at oq8+ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. Same on-disk format as oq8, so the LOADER half is covered and routed experts stay natively quantised; the calibrated producer path is untested for this family — quantizing the fixture at oq8+ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
 
 [[gate]]
 arch = 26
 quant = "oq8++"
 feature = "prefill"
 support = "partial"
-note = "Qwen3.8-Flash-Next. Same on-disk format as oq8, which the trunk dequantises at load, so the LOADER half is covered; the calibrated producer path is untested for this family — quantizing the fixture at oq8++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
+note = "Qwen3.8-Flash-Next. Same on-disk format as oq8, so the LOADER half is covered and routed experts stay natively quantised; the calibrated producer path is untested for this family — quantizing the fixture at oq8++ needs calibration inputs this gate does not have. OQ checklist producer=untested loader=yes-native-experts decode=smoke prefill=per-token tiny=pending golden=pending eval=pending artifact=pending"
