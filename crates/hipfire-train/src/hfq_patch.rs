@@ -144,6 +144,22 @@ pub fn parse_hfq(bytes: &[u8]) -> Result<(Vec<HfqEntry>, String), String> {
         } else {
             cum
         };
+        // The payload range is the other half of "a Result must not panic".
+        // Bounds-checking the INDEX is not enough: `data_size` is a file-supplied
+        // length and, in v2, `entry_offset` is a file-supplied offset, so an
+        // entry can point past EOF while its index entry parses cleanly.
+        // `patch_norms_inplace` writes at exactly these offsets, so an unchecked
+        // pair is a panic at best.
+        let entry_end = entry_offset
+            .checked_add(data_size)
+            .ok_or_else(|| format!("HFQM entry {name} range overflows"))?;
+        if entry_end > bytes.len() {
+            return Err(format!(
+                "HFQM entry {name} spans {entry_offset}..{entry_end}, past the \
+                 {}-byte file",
+                bytes.len()
+            ));
+        }
         entries.push(HfqEntry {
             name,
             quant_type,
@@ -151,7 +167,9 @@ pub fn parse_hfq(bytes: &[u8]) -> Result<(Vec<HfqEntry>, String), String> {
             data_offset: entry_offset,
             data_size,
         });
-        cum += data_size;
+        // Only v1 consumes this, but a corrupt file must not overflow it here
+        // either — the running sum is unbounded in a way each entry is not.
+        cum = cum.saturating_add(data_size);
     }
     Ok((entries, metadata_json))
 }
@@ -290,6 +308,26 @@ mod tests {
         bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
         let err = parse_hfq(&bytes).expect_err("v3 must be refused");
         assert!(err.contains("newer than this parser"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_pointing_past_the_file_is_rejected_before_it_can_be_patched() {
+        // `patch_norms_inplace` writes at `data_offset`, so a v2 offset read
+        // straight off disk must be range-checked by the parser or the write
+        // panics (or, with a smaller overrun, corrupts a neighbour).
+        let mut bytes = container(2);
+        // Point the second entry's offset far past EOF. Its `div32` sits at the
+        // end of that entry's index record; find it by value rather than by a
+        // hand-computed offset.
+        let want = ((4096usize + 32) / HFQM_V2_OFFSET_ALIGN) as u64;
+        let pos = bytes
+            .windows(8)
+            .position(|w| u64::from_le_bytes(w.try_into().unwrap()) == want)
+            .expect("second entry's div32 offset is in the index");
+        bytes[pos..pos + 8].copy_from_slice(&(u64::MAX / 64).to_le_bytes());
+
+        let err = parse_hfq(&bytes).expect_err("an out-of-range entry must be refused");
+        assert!(err.contains("past the"), "{err}");
     }
 
     #[test]
