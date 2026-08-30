@@ -551,33 +551,25 @@ fn oq8_arch_load_inner(
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
         c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
-        // G=128 does NOT expand to an Oq8G256-compatible layout, despite what the
-        // comment here used to claim. Two things differ, either one fatal:
+        // G=128 expands to `Oq8G128`, NOT `Oq8G256`. This used to refuse outright,
+        // and the refusal named its own two preconditions — both now met:
         //
-        //   1. Scale plane size. The expansion allocates `m*k + m*(k/group)*4`,
-        //      so at group=128 the plane holds TWICE the scales an Oq8G256
-        //      consumer computes (`ng = k/256`) — every consumer slices
-        //      `sub_offset(m*k, m*ng*4)` and reads the wrong region.
+        //   1. Scale plane size. The expansion allocates `m*k + m*(k/group)*4`, so
+        //      at group=128 the plane holds TWICE the scales an Oq8G256 consumer
+        //      computes (`ng = k/256`). `Oq8G128` sizes `ng = k/128`, which is what
+        //      this produces.
         //   2. Rotation order. G128 weights carry the 128-point FWHT (seeds
-        //      43/1043); every Oq8G256 consumer rotates the activation with the
-        //      256-point transform (42/1042), so the two do not cancel.
+        //      43/1043) and every Oq8G256 consumer rotates with the 256-point
+        //      transform (42/1042), so the two did not cancel. `Oq8G128` declares
+        //      `RotationPlan::FwhtG128`, so the activation now takes the matching
+        //      basis.
         //
-        // Tagging it `Oq8G256` therefore produced a silent wrong answer on every
-        // arch that does not decode compact natively (i.e. everything but
-        // qwen35). There is no correct expansion: merging two 128-groups into one
-        // 256-group scale needs requantization, and that still leaves the
-        // rotation mismatched. Refuse until an `Oq8G128` dtype exists with its own
-        // `RotationPlan::FwhtG128` and consumer arms.
+        // Tagging it `Oq8G256` DID produce a silent wrong answer on every arch
+        // without native compact decode. Tagging it `Oq8G128` does not — that dtype
+        // exists precisely because a 128-grouped Opus W8 had nowhere correct to go.
         c if c == QuantType::OqPlusCompactG128.code() => {
-            hipfire_rdna::kernel_trace::record_fallback(
-                "oq load: REFUSED OqPlusCompactG128 expansion — no Oq8G128 dtype",
-                &format!(
-                    "qt={qt} m={m} k={k}: expanding G128 yields a {}-group scale plane                      and 128-point-FWHT weights, which the Oq8G256 consumers misread                      as {}-group / 256-point. Load this artifact on an arch with                      native compact decode (qwen35), or re-quantize at G256.",
-                    k / 128,
-                    k / 256,
-                ),
-            );
-            return None;
+            let expanded = oqplus_compact_to_oq8_combined_g(data, m, k, 128);
+            return Some((expanded, DType::Oq8G128));
         }
         c if c == QuantType::Oq3G256.code() => oq3_to_oq8_combined(data, m, k),
         _ => return None,

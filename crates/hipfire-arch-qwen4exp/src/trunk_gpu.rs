@@ -118,16 +118,17 @@ fn load_linear(
     k: usize,
 ) -> HipResult<WeightTensor> {
     if let Some((qt, bytes)) = w.read_raw(name) {
-        let converted = hipfire_runtime::oq8_arch::oq8_arch_load(qt, &bytes, m, k).or_else(|| {
-            // Same ragged-K pre-check as the expert path: `oq4_pack_arch_combined`
-            // asserts, and an assert in a loader aborts the daemon.
-            if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k).is_some() {
-                None
-            } else {
-                hipfire_runtime::oq4_arch::oq4_arch_load(qt, &bytes, m, k)
-                    .map(|(b, d)| (b.into_owned(), d))
-            }
-        });
+        let converted = hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, &bytes, m, k)
+            .or_else(|| {
+                // Same ragged-K pre-check as the expert path: `oq4_pack_arch_combined`
+                // asserts, and an assert in a loader aborts the daemon.
+                if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k).is_some() {
+                    None
+                } else {
+                    hipfire_runtime::oq4_arch::oq4_arch_load(qt, &bytes, m, k)
+                        .map(|(b, d)| (b.into_owned(), d))
+                }
+            });
         if let Some((bytes, dtype)) = converted {
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             return Ok(WeightTensor {
@@ -223,11 +224,29 @@ fn stack_experts(
     // than producing a stack whose dtype lies about half its contents.
     if let Some(first) = w.read_raw(&format!("{mp}.experts.0.{which}.weight")) {
         let convert = |qt: u8, bytes: &[u8]| -> Option<(Vec<u8>, DType)> {
-            hipfire_runtime::oq8_arch::oq8_arch_load(qt, bytes, rows, cols).or_else(|| {
-                hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
-                    .map(|(b, d)| (b.into_owned(), d))
-            })
+            // `_allow_compact` KEEPS compact blocks compact instead of expanding
+            // them to one int8 per weight. Not a micro-optimisation: expanding this
+            // model's 512-expert `down_proj` (4.25 b/w compact -> 8 b/w int8) added
+            // ~20 GB and OOM'd a 128 GB box during load. The compact dtypes have
+            // their own GEMV arms, so nothing downstream needs the expansion.
+            hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, bytes, rows, cols).or_else(
+                || {
+                    hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
+                        .map(|(b, d)| (b.into_owned(), d))
+                },
+            )
         };
+        if convert(first.0, &first.1).is_none() {
+            // Do NOT degrade silently. Falling back to f32 costs 8x the resident
+            // bytes, which on this model is the difference between fitting and
+            // not — and it is invisible in the output.
+            eprintln!(
+                "[qwen4_exp] ⚠️  {mp}.experts.*.{which}: quant type {} could not be \
+                 converted to a device form; falling back to f32 for the WHOLE \
+                 projection (8x the resident bytes)",
+                first.0
+            );
+        }
         if let Some((first_bytes, dtype)) = convert(first.0, &first.1) {
             let stride = first_bytes.len();
             let mut all = Vec::with_capacity(n_exp * stride);
@@ -238,7 +257,13 @@ fn stack_experts(
                 match w.read_raw(&name).and_then(|(qt, b)| convert(qt, &b)) {
                     // A differing stride would silently misalign every later expert.
                     Some((b, d)) if d == dtype && b.len() == stride => all.extend_from_slice(&b),
-                    _ => {
+                    other => {
+                        eprintln!(
+                            "[qwen4_exp] ⚠️  {name}: expert {e} did not match expert 0 \
+                             (dtype/stride mismatch: {:?} vs {dtype:?}/{stride}); falling \
+                             back to f32 for the whole projection",
+                            other.map(|(_, d)| d)
+                        );
                         ok = false;
                         break;
                     }

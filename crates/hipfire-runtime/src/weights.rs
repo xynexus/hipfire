@@ -717,6 +717,55 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             let ws = w.buf.sub_offset(w.m * w.k, w.m * ng * 4);
             gpu.gemv_oq8_grouped(&w.buf, &ws, &xr, y, w.m, w.k, GROUP)
         }
+        // Compact Opus (W4 + sparse outlier overlay), G256 and G128.
+        //
+        // `weight_gemv` needed these because qwen4_exp's routed experts call it
+        // DIRECTLY rather than through the gemv registry: its MoE does CPU top-k
+        // and loops one expert at a time, so each expert is a `WeightTensor`, not
+        // a registry dispatch. Without an arm here the real 180B artifact loaded
+        // and then failed on the first token with "no GEMV route for dtype
+        // OqCompactG128".
+        //
+        // Keeping compact blocks COMPACT is what makes that model fit at all:
+        // expanding them to one int8 per weight added ~20 GB and OOM'd a 128 GB
+        // box during load.
+        DType::OqCompactG256 | DType::OqCompactG128 => {
+            let group: usize = if w.gpu_dtype == DType::OqCompactG128 {
+                128
+            } else {
+                256
+            };
+            let ng = w.k / group;
+            let blocks = w.m * ng;
+            if blocks == 0 || w.buf.byte_size() % blocks != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "compact Opus weight_gemv: {} bytes over {blocks} blocks (M={} K={} \
+                         group={group}) is not a whole block stride",
+                        w.buf.byte_size(),
+                        w.m,
+                        w.k
+                    ),
+                ));
+            }
+            // The overlay count is per-artifact, so the stride is derived from the
+            // buffer rather than assumed — a wrong stride reads the same bytes as a
+            // different format and yields silent garbage.
+            let block_stride = w.buf.byte_size() / blocks;
+            gpu.ensure_mq_signs()?;
+            if group == 128 {
+                gpu.ensure_mq_signs_128()?;
+            }
+            gpu.ensure_oq4_scratch()?;
+            let xr = xr!();
+            if group == 128 {
+                rotate_x_mq_128_for(gpu, w, x, &xr, w.k)?;
+            } else {
+                rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
+            }
+            gpu.gemv_oq_compact_grouped_auto(&w.buf, &xr, y, w.m, w.k, group, block_stride)
+        }
         // Opus Quant W8 at group 128 — the protected set under an oq8 bulk.
         // Identical to the arm above except the group and, critically, the
         // rotation BASIS: G128 weights are FWHT-128 rotated (seeds 43/1043), so
