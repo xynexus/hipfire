@@ -92,6 +92,12 @@ pub struct Qwen4ExpBackend {
     /// PLE hash reads an n-gram window, not just the current token.
     history: Vec<u32>,
     eos: u32,
+    /// The routed-expert pager, when this artifact carries a module table.
+    ///
+    /// Held so `unload` can free what it paged in. The expert stacks hold their
+    /// own `Arc` clones, so this is not what keeps it alive — it is the handle
+    /// for the teardown the stacks deliberately do not do.
+    pager: Option<crate::moe_gpu::ExpertPager>,
 }
 
 impl Qwen4ExpBackend {
@@ -109,6 +115,86 @@ impl Qwen4ExpBackend {
     /// addressing (shard split, row-in-shard, element offset) would only ever run
     /// on the 102 GB model, where a wrong row is an indistinguishable-looking
     /// embedding rather than a failure.
+    /// Routed-expert paging counters, or `None` when this model is not paged.
+    ///
+    /// Exists so a check can prove it is not passing VACUOUSLY: "paged and
+    /// resident agree" means nothing if the paged run never actually paged.
+    pub fn expert_pager_stats(&self) -> Option<hipfire_runtime::weight_pager::ModulePagerStats> {
+        // Registered is NOT the same as used. A bf16 artifact carries a module
+        // table like any other, but bf16 has no per-expert device form, so every
+        // layer declines the pager and loads resident. Reporting stats then would
+        // read as "paged, 0 cold loads" — which is what a silent fallback bug
+        // looks like, so the honest answer is `None`.
+        if !self.weights.layers.iter().any(|l| l.moe.gate_up.is_paged()) {
+            return None;
+        }
+        let p = self.pager.as_ref()?;
+        Some(p.lock().ok()?.module_stats())
+    }
+
+    /// Open a routed-expert pager over `hfq`, or `None` when it has no module
+    /// table to page from.
+    ///
+    /// `PerExpertNative` rather than the indexed-MoE default: this arch's
+    /// `moe_forward` calls `weight_gemv` once per routed expert with a
+    /// `WeightTensor`, so it needs each expert in the layout that dispatch reads
+    /// — not the block-interleaved form the indexed kernels want.
+    fn build_expert_pager(hfq: &HfqFile) -> Result<Option<crate::moe_gpu::ExpertPager>, String> {
+        use hipfire_runtime::weight_pager::{
+            ExpertResidentLayout, PagerConfig, ResidencyPolicy, WeightPager,
+        };
+        if hfq.modules().is_empty() {
+            return Ok(None);
+        }
+        // Debug escape hatch, not a user knob. Paged and resident must produce
+        // identical logits, and that is only checkable if the resident path can
+        // still be reached on an artifact that carries a module table — which,
+        // since the quantizer emits one, is now every artifact.
+        if matches!(
+            std::env::var("HIPFIRE_QWEN4EXP_PAGED_EXPERTS")
+                .ok()
+                .as_deref(),
+            Some("0" | "off" | "false" | "no")
+        ) {
+            return Ok(None);
+        }
+        // No budget = pin on first touch and never evict, which still skips every
+        // expert the prompt does not route to. A budget adds LRU eviction on top.
+        let residency = match std::env::var("HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|b| *b > 0)
+        {
+            Some(vram_budget_bytes) => ResidencyPolicy::LazyLru { vram_budget_bytes },
+            None => ResidencyPolicy::PinAll,
+        };
+        let mut pager = WeightPager::with_env_transport(
+            hfq.path(),
+            PagerConfig {
+                expert_layout: ExpertResidentLayout::PerExpertNative,
+                residency,
+                trace: matches!(
+                    std::env::var("HIPFIRE_QWEN4EXP_EXPERT_CACHE_TRACE")
+                        .ok()
+                        .as_deref(),
+                    Some("1" | "true" | "on" | "yes")
+                ),
+            },
+        )
+        .map_err(|e| format!("qwen4_exp: open expert module pager: {e}"))?;
+        let n = pager
+            .register_expert_modules(hfq.modules().iter().cloned())
+            .map_err(|e| format!("qwen4_exp: register expert modules: {e}"))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        // Registered, not necessarily used — whether a layer takes the pager
+        // depends on its quant type having a per-expert device form. Worded so it
+        // does not claim more than it knows.
+        eprintln!("qwen4_exp: module table: {n} routed expert modules available to page");
+        Ok(Some(std::sync::Arc::new(std::sync::Mutex::new(pager))))
+    }
+
     pub fn load_with_ngram_budget(
         gpu: &mut Gpu,
         hfq: &mut HfqFile,
@@ -116,7 +202,17 @@ impl Qwen4ExpBackend {
         ngram_host_budget: u64,
     ) -> Result<Self, String> {
         let cfg = Qwen4Exp::config_from_hfq(hfq)?;
-        let weights = Qwen4Exp::load_weights(hfq, &cfg, gpu)?;
+        // PAGED ROUTED EXPERTS, when the artifact was repacked with a module
+        // table. Presence of the table IS the switch: routed experts are 97.3%
+        // of this trunk, so an artifact that carries the table was repacked in
+        // order to be paged, and one that does not cannot be. There is nothing
+        // for a flag to choose between.
+        let pager = Self::build_expert_pager(hfq)?;
+        let weights = {
+            let reader = HfqTensorReader { hfq };
+            TrunkWeights::upload_paged(gpu, &cfg, &reader, pager.as_ref())
+                .map_err(|e| format!("qwen4_exp: {e:?}"))?
+        };
         let max_seq = max_seq.min(cfg.max_position).max(1);
         let state =
             TrunkState::new(gpu, &cfg, max_seq).map_err(|e| format!("qwen4_exp state: {e:?}"))?;
@@ -163,6 +259,7 @@ impl Qwen4ExpBackend {
             ngram,
             history: Vec::new(),
             eos,
+            pager,
         })
     }
 
@@ -187,7 +284,7 @@ impl Qwen4ExpBackend {
     /// costs ~8x the memory. On the shipped geometry the experts are 97.3% of the
     /// trunk, so this one value decides whether the model fits.
     pub fn routed_expert_dtype(&self) -> Option<hipfire_rdna::DType> {
-        self.weights.layers.first().map(|l| l.moe.gate_up.dtype)
+        self.weights.layers.first().map(|l| l.moe.gate_up.dtype())
     }
 
     /// One trunk step at absolute position `pos`, leaving logits on the GPU.
@@ -204,6 +301,8 @@ impl Qwen4ExpBackend {
             ngram,
             history,
             eos,
+            // Reached through the expert stacks, not from here.
+            pager: _,
         } = self;
         let resident;
         let streamed;
@@ -297,6 +396,13 @@ impl ServingBackend for Qwen4ExpBackend {
         m.weights.free(gpu);
         m.state.free(gpu);
         m.scratch.free(gpu);
+        // The expert stacks deliberately free nothing — the pager owns those
+        // buffers, and it outlives any one of them.
+        if let Some(pager) = m.pager {
+            if let Ok(mut p) = pager.lock() {
+                p.free_all(gpu);
+            }
+        }
     }
 }
 

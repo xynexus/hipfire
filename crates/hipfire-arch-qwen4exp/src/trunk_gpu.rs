@@ -21,7 +21,7 @@ use crate::attn_gpu::{qsa_decode_step, QsaCache, QsaScratch, QsaWeights};
 use crate::config::{LayerType, Qwen4ExpConfig};
 use crate::gdn::{gdn_decode_step, GdnScratch, GdnState, GdnWeights};
 use crate::hc_gpu::{hc_read, hc_write, HcScratch, HcWeights};
-use crate::moe_gpu::{moe_forward, MoeScratch, MoeWeights};
+use crate::moe_gpu::{moe_forward, ExpertPager, MoeScratch, MoeWeights};
 use crate::ngram::NgramHasher;
 use crate::ple_gpu::{ple_step, PleScratch, PleWeights};
 
@@ -204,11 +204,56 @@ fn stack_experts(
     which: &str,
     n_exp: usize,
     shape: &[usize],
+    pager: Option<&ExpertPager>,
+    layer: usize,
+    role: hipfire_runtime::weight_pager::ExpertRole,
 ) -> HipResult<crate::moe_gpu::ExpertStack> {
     // `shape` is [n_exp, rows, cols]; one expert's region is rows*cols f32, which
     // is self-contained, so a per-expert view is a single offset.
     let rows = shape[1];
     let cols = shape[2];
+
+    // PAGED. Checked before anything is read: the point of paging is that these
+    // do not all fit, so the resident path below must not run first.
+    //
+    // Expert 0 stands for the layer. The module table is written per expert with
+    // a uniform shape, and `register_expert_module` rejects a module whose
+    // gate_up span is discontiguous, so if expert 0 registered then the layer's
+    // experts are pageable — and if it did not, falling through loads the layer
+    // resident, which is correct, just larger.
+    if let Some(pg) = pager {
+        use hipfire_runtime::weight_pager::ExpertModuleKey;
+        let key = ExpertModuleKey {
+            layer: layer as u16,
+            expert: 0,
+        };
+        let desc = pg
+            .lock()
+            .ok()
+            .filter(|p| p.has_expert_module(key))
+            .and_then(|p| p.expert_module_role_desc(key, role));
+        if let Some(d) = desc {
+            if d.m != rows || d.k != cols {
+                return Err(read_err(
+                    &format!("{mp}.experts.*.{which}"),
+                    format!(
+                        "module table says [{}, {}] but the config says [{rows}, {cols}]",
+                        d.m, d.k
+                    ),
+                ));
+            }
+            return Ok(crate::moe_gpu::ExpertStack::Paged(Box::new(
+                crate::moe_gpu::PagedExperts {
+                    pager: std::sync::Arc::clone(pg),
+                    layer: layer as u16,
+                    role,
+                    dtype: d.dtype,
+                    rows,
+                    cols,
+                },
+            )));
+        }
+    }
 
     // NATIVE QUANTISED EXPERTS. Try the on-disk bytes first: the routed experts are
     // 97.3% of this model's trunk, so dequantising them is the difference between
@@ -223,26 +268,18 @@ fn stack_experts(
     // unconvertible falls the whole projection back to the f32 path below rather
     // than producing a stack whose dtype lies about half its contents.
     if let Some(first) = w.read_raw(&format!("{mp}.experts.0.{which}.weight")) {
+        // Shared with the WEIGHT PAGER, which prepares paged experts with the
+        // same call. The two used to be separate bodies and diverged twice —
+        // once dropping the compact overlay normalisation, once missing oq8
+        // entirely — each time serving a paged expert bytes the GEMV could not
+        // read. Keeping ONE body is what makes paged and resident identical by
+        // construction rather than by review.
+        //
+        // It keeps compact blocks COMPACT rather than expanding them to one int8
+        // per weight: expanding this model's 512-expert `down_proj` (4.25 b/w ->
+        // 8 b/w) added ~20 GB and OOM'd a 128 GB box during load.
         let convert = |qt: u8, bytes: &[u8]| -> Option<(Vec<u8>, DType)> {
-            // `_allow_compact` KEEPS compact blocks compact instead of expanding
-            // them to one int8 per weight. Not a micro-optimisation: expanding this
-            // model's 512-expert `down_proj` (4.25 b/w compact -> 8 b/w int8) added
-            // ~20 GB and OOM'd a 128 GB box during load. The compact dtypes have
-            // their own GEMV arms, so nothing downstream needs the expansion.
-            if let Some(out) =
-                hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, bytes, rows, cols)
-            {
-                return Some(out);
-            }
-            // ⚠️ PRE-CHECK before `oq4_arch_load`: `oq4_pack_arch_combined` asserts
-            // on a ragged K, and an assert in a loader aborts the whole daemon
-            // rather than failing one model. Not hypothetical here — this model's
-            // `moe_intermediate_size` is 640, so every routed `down_proj` is K=640.
-            if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(rows, cols).is_some() {
-                return None;
-            }
-            hipfire_runtime::oq4_arch::oq4_arch_load(qt, bytes, rows, cols)
-                .map(|(b, d)| (b.into_owned(), d))
+            hipfire_runtime::weight_pager::per_expert_native_form(qt, bytes, rows, cols)
         };
         if convert(first.0, &first.1).is_none() {
             // Do NOT degrade silently. Falling back to f32 costs 8x the resident
@@ -279,7 +316,7 @@ fn stack_experts(
             }
             if ok {
                 let buf = gpu.upload_raw(&all, &[all.len()])?;
-                return Ok(crate::moe_gpu::ExpertStack {
+                return Ok(crate::moe_gpu::ExpertStack::Resident {
                     buf,
                     dtype,
                     rows,
@@ -289,7 +326,7 @@ fn stack_experts(
             }
         }
     }
-    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack {
+    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack::Resident {
         buf,
         dtype: DType::F32,
         rows,
@@ -332,6 +369,22 @@ fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> 
 impl TrunkWeights {
     /// Upload from checkpoint-named weights.
     pub fn upload(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, w: &dyn TensorReader) -> HipResult<Self> {
+        Self::upload_paged(gpu, cfg, w, None)
+    }
+
+    /// As [`Self::upload`], but routed experts come from `pager` when it has a
+    /// module registered for that layer.
+    ///
+    /// Per LAYER, not per model: a layer whose experts are not in the module
+    /// table loads resident, so a partially-repacked artifact still serves. The
+    /// two paths produce identical weights — the pager's `PerExpertNative`
+    /// layout runs the same transforms `stack_experts` does below.
+    pub fn upload_paged(
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        w: &dyn TensorReader,
+        pager: Option<&ExpertPager>,
+    ) -> HipResult<Self> {
         let p = "model.language_model";
         let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
         let width = hc * hidden;
@@ -460,6 +513,9 @@ impl TrunkWeights {
                     "gate_up_proj",
                     m.num_experts,
                     &[m.num_experts, 2 * m.intermediate, hidden],
+                    pager,
+                    l,
+                    hipfire_runtime::weight_pager::ExpertRole::GateUp,
                 )?,
                 down: stack_experts(
                     gpu,
@@ -468,6 +524,9 @@ impl TrunkWeights {
                     "down_proj",
                     m.num_experts,
                     &[m.num_experts, hidden, m.intermediate],
+                    pager,
+                    l,
+                    hipfire_runtime::weight_pager::ExpertRole::Down,
                 )?,
                 shared_gate: load_linear(
                     gpu,

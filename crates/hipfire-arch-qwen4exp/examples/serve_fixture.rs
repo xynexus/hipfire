@@ -166,6 +166,28 @@ fn main() {
     }
     println!("  reset:   same prompt reproduces argmax {am1} ({mx1:.4})");
 
+    // Whether the experts came from the pager, and if so how hard it worked.
+    // Printed HERE, after decoding — read at load time every counter is zero,
+    // and "paged agrees with resident" is evidence only if the paged run paged.
+    // A `0 cold loads` line means the paged arm silently served resident weights
+    // and the comparison proved nothing.
+    match m.expert_pager_stats() {
+        Some(st) => {
+            println!(
+                "  paging: {} modules registered, {} resident, {} cold loads, {} hits, {} evictions",
+                st.registered_modules,
+                st.resident_modules,
+                st.module_cold_loads,
+                st.module_cache_hits,
+                st.module_evictions
+            );
+            if st.module_cold_loads == 0 {
+                fail("a module table was registered but nothing was ever paged in".into());
+            }
+        }
+        None => println!("  paging: experts loaded resident (no module table)"),
+    }
+
     // 4b. `serve()` END TO END. Everything above drives `SimpleAr` directly; this
     // is the entry point the DAEMON actually calls, and it exercises the pieces
     // between — the tokenizer, the sampler, the EOS filter and the streaming sink.

@@ -15,7 +15,7 @@
 //! `k_top` admission work (M17/M18) before they accept this geometry.
 
 use crate::config::Qwen4ExpConfig;
-use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipError, HipResult};
 use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 /// The routed experts for ONE projection, in a single allocation.
@@ -31,51 +31,157 @@ use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 /// `[int8 weights | f32 scales]` form the kernels expect — which is why the
 /// experts cannot simply be a stride into one flat weight plane: `weight_gemv`
 /// finds a tensor's scales immediately after its own weights.
-pub struct ExpertStack {
-    pub buf: GpuTensor,
-    pub dtype: DType,
-    /// Per-expert output rows.
-    pub rows: usize,
-    /// Per-expert input dim (K).
-    pub cols: usize,
-    /// Elements between the start of one expert's region and the next.
-    pub stride: usize,
+/// Where one projection's routed experts live.
+///
+/// Two residencies, and the choice is about MEMORY, not correctness — both serve
+/// identical weights:
+///
+/// * [`Resident`](Self::Resident) uploads every expert at load, in ONE allocation
+///   per projection. gfx1151 rounds each GTT allocation up to 2 MiB, so a
+///   512-expert model allocated per expert would pay that rounding 512 times per
+///   projection per layer.
+/// * [`Paged`](Self::Paged) holds nothing and asks the weight pager per routed
+///   expert, which evicts under a budget.
+pub enum ExpertStack {
+    Resident {
+        buf: GpuTensor,
+        dtype: DType,
+        /// Per-expert output rows.
+        rows: usize,
+        /// Per-expert input dim (K).
+        cols: usize,
+        /// Elements between the start of one expert's region and the next.
+        stride: usize,
+    },
+    Paged(Box<PagedExperts>),
 }
 
 impl ExpertStack {
-    /// A `WeightTensor` view of expert `e`. Cheap — a sub-offset, no copy.
-    ///
-    /// The 2-D shape has to be restored explicitly. `sub_offset` returns a flat
-    /// `[len]` view, and the F32 GEMV reads `shape[1]` for its inner dimension —
-    /// leaving it 1-D indexes out of bounds. Quantised paths take `m`/`k` from the
-    /// `WeightTensor` instead and do not care, so this only has to be right where
-    /// the shape is actually read.
-    pub fn expert(&self, e: usize) -> WeightTensor {
-        let mut buf = self.buf.sub_offset(e * self.stride, self.stride);
-        if self.dtype == DType::F32 {
-            buf.shape = vec![self.rows, self.cols];
-        }
-        WeightTensor {
-            buf,
-            gpu_dtype: self.dtype,
-            m: self.rows,
-            k: self.cols,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
+    pub fn is_paged(&self) -> bool {
+        matches!(self, ExpertStack::Paged(_))
+    }
+
+    pub fn dtype(&self) -> DType {
+        match self {
+            ExpertStack::Resident { dtype, .. } => *dtype,
+            ExpertStack::Paged(p) => p.dtype,
         }
     }
 
-    pub fn free(self, gpu: &mut Gpu) {
-        let Self {
-            buf,
-            dtype: _,
-            rows: _,
-            cols: _,
-            stride: _,
-        } = self;
-        let _ = gpu.free_tensor(buf);
+    /// Elements this projection currently holds ITSELF.
+    ///
+    /// Zero when paged: the pager accounts for the whole model in one budget, so
+    /// asking a single projection what it holds would double-count across layers
+    /// and roles. `WeightPager::module_stats()` is the honest number there.
+    pub fn resident_elems(&self) -> usize {
+        match self {
+            ExpertStack::Resident { buf, .. } => buf.numel(),
+            ExpertStack::Paged(_) => 0,
+        }
     }
+
+    /// A `WeightTensor` view of expert `e`, paging it in first if needed.
+    ///
+    /// The 2-D shape has to be restored explicitly for F32. `sub_offset` returns
+    /// a flat `[len]` view and the F32 GEMV reads `shape[1]` for its inner
+    /// dimension, so leaving it 1-D indexes out of bounds. Quantised paths take
+    /// `m`/`k` from the `WeightTensor` and never read the shape.
+    pub fn expert(&self, gpu: &mut Gpu, e: usize) -> HipResult<WeightTensor> {
+        let (buf, dtype, rows, cols) = match self {
+            ExpertStack::Resident {
+                buf,
+                dtype,
+                rows,
+                cols,
+                stride,
+            } => (buf.sub_offset(e * *stride, *stride), *dtype, *rows, *cols),
+            ExpertStack::Paged(p) => {
+                use hipfire_runtime::weight_pager::{ExpertModuleKey, ExpertRole};
+                let key = ExpertModuleKey {
+                    layer: p.layer,
+                    expert: e as u16,
+                };
+                let mut pager = p
+                    .pager
+                    .lock()
+                    .map_err(|_| HipError::new(0, "qwen4_exp: expert pager mutex poisoned"))?;
+                pager
+                    .ensure_expert_module_resident(key, gpu)
+                    .map_err(|err| {
+                        HipError::new(
+                            0,
+                            &format!("qwen4_exp paged expert l{} e{e}: {err}", p.layer),
+                        )
+                    })?;
+                let views = pager.resident_expert_views(key).ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "qwen4_exp paged expert l{} e{e}: resident but no view",
+                            p.layer
+                        ),
+                    )
+                })?;
+                // One module holds BOTH projections back to back, so each role is
+                // an offset into the same buffer — which is also why the GTT
+                // rounding is paid once per expert rather than twice.
+                let rel = match p.role {
+                    ExpertRole::GateUp => views.gate_up_rel,
+                    ExpertRole::Down => views.down_rel,
+                };
+                let len = views.buf.numel().saturating_sub(rel);
+                (views.buf.sub_offset(rel, len), p.dtype, p.rows, p.cols)
+            }
+        };
+        let mut buf = buf;
+        if dtype == DType::F32 {
+            buf.shape = vec![rows, cols];
+        }
+        Ok(WeightTensor {
+            buf,
+            gpu_dtype: dtype,
+            m: rows,
+            k: cols,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        match self {
+            ExpertStack::Resident { buf, .. } => {
+                let _ = gpu.free_tensor(buf);
+            }
+            // The pager owns paged buffers and frees them on eviction/unload.
+            ExpertStack::Paged(_) => {}
+        }
+    }
+}
+
+/// Routed experts served by [`hipfire_runtime::weight_pager::WeightPager`].
+///
+/// Holds no weights: it names the layer and asks the pager for each expert as it
+/// is routed to. Residency, LRU eviction, GTT-aware accounting and the transport
+/// are the pager's, not this crate's — an earlier version of this feature grew
+/// its own cache and got only the easy half (a HashMap, no eviction).
+///
+/// The pager is shared across every layer, so its budget is one budget for the
+/// whole model rather than a per-layer allowance that cannot see the others.
+/// The shared expert pager, as the loader and the MoE forward pass hold it.
+pub type ExpertPager = std::sync::Arc<std::sync::Mutex<hipfire_runtime::weight_pager::WeightPager>>;
+
+pub struct PagedExperts {
+    /// Shared across every layer and both roles, so the eviction budget is ONE
+    /// budget for the model. `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` because
+    /// `ServingBackend` is `Send`; serving is single-threaded, so the lock is
+    /// uncontended.
+    pub pager: ExpertPager,
+    pub layer: u16,
+    pub role: hipfire_runtime::weight_pager::ExpertRole,
+    pub dtype: DType,
+    pub rows: usize,
+    pub cols: usize,
 }
 
 pub struct MoeWeights {
@@ -168,8 +274,8 @@ pub fn moe_forward(
         let e = e.max(0) as usize;
         // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
         // runs its own kernel rather than being dequantised into scratch.
-        let gu = w.gate_up.expert(e);
-        let dn = w.down.expert(e);
+        let gu = w.gate_up.expert(gpu, e)?;
+        let dn = w.down.expert(gpu, e)?;
         weight_gemv(gpu, &gu, x, &s.gu)?;
         // Contiguous halves of the projection output, gate FIRST.
         let gate = s.gu.sub_offset(0, mi);

@@ -113,14 +113,14 @@ fn main() {
                 &[n_exp, hidden],
             )
             .unwrap(),
-            gate_up: hipfire_arch_qwen4exp::moe_gpu::ExpertStack {
+            gate_up: hipfire_arch_qwen4exp::moe_gpu::ExpertStack::Resident {
                 buf: gpu.upload_f32(&gu, &[n_exp, 2 * mi, hidden]).unwrap(),
                 dtype: hipfire_rdna::DType::F32,
                 rows: 2 * mi,
                 cols: hidden,
                 stride: 2 * mi * hidden,
             },
-            down: hipfire_arch_qwen4exp::moe_gpu::ExpertStack {
+            down: hipfire_arch_qwen4exp::moe_gpu::ExpertStack::Resident {
                 buf: gpu.upload_f32(&dn, &[n_exp, hidden, mi]).unwrap(),
                 dtype: hipfire_rdna::DType::F32,
                 rows: hidden,

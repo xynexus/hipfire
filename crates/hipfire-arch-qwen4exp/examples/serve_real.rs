@@ -105,5 +105,20 @@ fn main() {
         t2.elapsed().as_secs_f32() / steps as f32
     );
     assert!(moved, "a frozen argmax means a dead forward");
+    // Paging is the whole reason this model loads at all: routed experts are
+    // 97.3% of the trunk. Printed after decoding, when the counters mean
+    // something — at load time they are all zero.
+    match m.expert_pager_stats() {
+        Some(st) => println!(
+            "  paging: {} modules registered, {} resident ({:.1} GiB), {} cold loads, {} hits, {} evictions",
+            st.registered_modules,
+            st.resident_modules,
+            st.resident_module_bytes as f64 / (1u64 << 30) as f64,
+            st.module_cold_loads,
+            st.module_cache_hits,
+            st.module_evictions
+        ),
+        None => println!("  paging: routed experts loaded resident"),
+    }
     println!("serve_real: OK");
 }
