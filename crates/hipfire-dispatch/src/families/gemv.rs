@@ -537,6 +537,18 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             let _ = gpu.free_tensor(xs);
             res
         }
+        // Opus W8 at group 128. `x` arrives FWHT-128-rotated (RotationPlan::FwhtG128),
+        // and `gemv_oq8_grouped` consumes the f32 activation directly — dequantizing
+        // the int8 weight inline (W8A16 decode). That is BOTH faster and more
+        // accurate than the G256 arm above, which has no 1-column kernel and burns
+        // a WMMA GEMM at n=1; the port that taught the kernel group 128 is what
+        // makes this available. Same numerics as `weight_gemv`'s Oq8G128 arm.
+        K::GemvOq8G128Prerotated => {
+            const GROUP: usize = 128;
+            let ng = k / GROUP;
+            let ws = w.buf.sub_offset(m * k, m * ng * 4);
+            hip!(gpu.gemv_oq8_grouped(w.buf, &ws, x, y, m, k, GROUP))
+        }
         // Compact-resident Opus W8A8: identical to GemvOq8G256Prerotated except
         // the weight stays as on-disk OqPlusCompact blocks and the kernel decodes
         // the nibbles + sparse overlay per tile. A GEMV here is just the batched

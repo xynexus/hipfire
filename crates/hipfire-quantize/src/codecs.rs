@@ -1004,6 +1004,42 @@ pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
     output
 }
 
+/// Opus-Quant W8 at group 128 (`Oq8G128`) — `[f16 scale][128 signed int8]` =
+/// 130 B/group (8.125 b/w). Identical to [`quantize_oq8g256`] except the group,
+/// and therefore the FWHT length: callers MUST pass 128-length sign tables built
+/// from seeds 43/1043, the pair `ensure_mq_signs_128` uploads for the runtime
+/// rotate. Passing the 256 pair rotates by a transform the forward never inverts,
+/// which reads as plausible garbage rather than an error.
+///
+/// Exists so the protected set has somewhere above an `oq8` bulk to go: `Oq8G256`
+/// is that bulk, and the only alternative was bf16 at twice the bytes.
+pub fn quantize_oq8g128(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert_eq!(signs1.len(), 128, "Oq8G128 needs 128-length FWHT signs");
+    assert_eq!(signs2.len(), 128, "Oq8G128 needs 128-length FWHT signs");
+    let (group_size, block_bytes) = (128usize, bb(QuantType::Oq8G128)); // 2 + 128 int8
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 128];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        signed_fwht(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 127.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..128 {
+            let q = (group[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+    output
+}
+
 /// Opus-Quant W6 weight codec (Oq6G256) — the symmetric-INT6 mid-tier between Oq4
 /// and Oq8 (near-lossless, ~+12 dB over Oq4). Per 256-group block = `[f16 scale]
 /// [192 B 6-bit-packed]` = 194 B/group (6.0625 b/w). FWHT-256 rotated, symmetric
@@ -3025,5 +3061,110 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod oq8_group_tests {
+    use super::*;
+    use hipfire_primitives::fwht::gen_fwht_signs;
+
+    /// Dequantize an `[f16 scale][G int8]` Opus block stream and undo the FWHT.
+    /// The transform is orthonormal, so the inverse is the same call with the
+    /// sign tables swapped.
+    fn dequant(bytes: &[u8], n: usize, group: usize, s1: &[f32], s2: &[f32]) -> Vec<f32> {
+        let block = 2 + group;
+        let mut out = vec![0.0f32; n];
+        for (b, chunk) in bytes.chunks_exact(block).enumerate() {
+            let scale = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+            let mut g: Vec<f32> = chunk[2..]
+                .iter()
+                .map(|&c| (c as i8) as f32 * scale)
+                .collect();
+            signed_fwht(&mut g, s2, s1);
+            for (i, v) in g.into_iter().enumerate() {
+                let k = b * group + i;
+                if k < n {
+                    out[k] = v;
+                }
+            }
+        }
+        out
+    }
+
+    fn rmse(a: &[f32], b: &[f32]) -> f32 {
+        (a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>() / a.len() as f32).sqrt()
+    }
+
+    /// MEASUREMENT, not a threshold: relative reconstruction error of Oq8 at
+    /// group 256 vs group 128 on gaussian weights with outliers.
+    #[test]
+    fn oq8_group_size_reconstruction_report() {
+        let n = 8192;
+        let mut st = 0x9e3779b97f4a7c15u64;
+        let mut u = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 40) as f32 / 16_777_216.0) * 2.0 - 1.0
+        };
+        // Approximately gaussian (sum of 6 uniforms), with 1-in-257 outliers —
+        // the shape a real weight row has, and what the FWHT exists to tame.
+        let data: Vec<f32> = (0..n)
+            .map(|i| {
+                let g: f32 = (0..6).map(|_| u()).sum::<f32>() / 6.0f32.sqrt();
+                if i % 257 == 0 {
+                    g * 10.0
+                } else {
+                    g
+                }
+            })
+            .collect();
+
+        // Q8F16 for reference: G32, NO rotation, [f16 scale][32 int8] = 34 B,
+        // i.e. 8.5 b/w against Oq8G128's 8.125 — the format the protected set
+        // used before it was deprecated, and the bar Oq8G128 has to clear.
+        let q8 = quantize_q8f16(&data);
+        let mut q8_deq = vec![0.0f32; n];
+        for (b, chunk) in q8.chunks_exact(34).enumerate() {
+            let sc = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+            for (i, &c) in chunk[2..].iter().enumerate() {
+                let k = b * 32 + i;
+                if k < n {
+                    q8_deq[k] = (c as i8) as f32 * sc;
+                }
+            }
+        }
+
+        let (a1, a2) = (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
+        let (b1, b2) = (gen_fwht_signs(43, 128), gen_fwht_signs(1043, 128));
+        let g256 = dequant(&quantize_oq8g256(&data, &a1, &a2), n, 256, &a1, &a2);
+        let g128 = dequant(&quantize_oq8g128(&data, &b1, &b2), n, 128, &b1, &b2);
+
+        let mag = (data.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+        let (e256, e128) = (rmse(&data, &g256), rmse(&data, &g128));
+        println!("  rms(data)  = {mag:.6}");
+        println!(
+            "  Oq8G256    = {e256:.3e}  ({:.4}% of rms)",
+            100.0 * e256 / mag
+        );
+        println!(
+            "  Oq8G128    = {e128:.3e}  ({:.4}% of rms)",
+            100.0 * e128 / mag
+        );
+        let eq8 = rmse(&data, &q8_deq);
+        println!(
+            "  Q8F16(G32) = {eq8:.3e}  ({:.4}% of rms)",
+            100.0 * eq8 / mag
+        );
+        println!("  G128/G256  = {:.3}x", e128 / e256);
+        println!(
+            "  G128/Q8F16 = {:.3}x  (<1 means Oq8G128 is the better home)",
+            e128 / eq8
+        );
+        // Sanity only: both must actually reconstruct, so a broken sign table or
+        // block stride shows up here rather than as a quality opinion.
+        assert!(e256 / mag < 0.02, "G256 round trip broken: {e256:.3e}");
+        assert!(e128 / mag < 0.02, "G128 round trip broken: {e128:.3e}");
     }
 }

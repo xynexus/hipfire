@@ -118,6 +118,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // x_rot before the grouped iu4 GEMM (see launch_op / oq4_gemv_into).
         Oq4G256 | Oq8G256 | OqCompactG256 => RotationPlan::FwhtG256,
         // G=128 must use the 128-point FWHT (sign seeds 43/1043), like MQ4G128.
+        Oq8G128 => RotationPlan::FwhtG128,
         OqCompactG128 => RotationPlan::FwhtG128,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
@@ -135,7 +136,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | Qtip3G256 | Qtip3G256I3 | Qtip4G256 | MQ2G256 | MQ6G256 | MQ8G256
         | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MQ4G128 | Oq4G256 | Oq8G256
-        | OqCompactG256 | OqCompactG128 => GemvVariant::Prerotated,
+        | Oq8G128 | OqCompactG256 | OqCompactG128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -235,6 +236,11 @@ pub enum KernelKey {
     // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
     // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
     GemvOq8G256Prerotated,
+    /// Opus W8 at group 128 (the protected set under an oq8 bulk). Unlike
+    /// [`Self::GemvOq8G256Prerotated`] this is a REAL single-column kernel —
+    /// `gemv_oq8_grouped` — so it needs no activation quantization and no
+    /// per-call scratch, and it matches `weight_gemv`'s Oq8G128 arm exactly.
+    GemvOq8G128Prerotated,
     /// Compact-resident Opus W8A8: same math as [`Self::GemvOq8G256Prerotated`]
     /// but the weight is on-disk OqPlusCompact blocks decoded in-kernel.
     GemvOqCompactG256Prerotated,
@@ -623,6 +629,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
             Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
+            Oq8G128 => Ok(Self::GemvOq8G128Prerotated),
             OqCompactG256 => Ok(Self::GemvOqCompactG256Prerotated),
             OqCompactG128 => Ok(Self::GemvOqCompactG128Prerotated),
             Oq4G256 => Ok(Self::GemvOq4G256Prerotated),
@@ -734,7 +741,7 @@ impl KernelKey {
             // int weights via iu4/iu8 grouped WMMA.
             // Compact-resident Opus rides the same iu8 WMMA core as Oq8G256;
             // it only differs in how the weight bytes are decoded.
-            Oq4G256 | Oq8G256 | OqCompactG256 | OqCompactG128 => ArchPredicate::HasWmma,
+            Oq4G256 | Oq8G256 | Oq8G128 | OqCompactG256 | OqCompactG128 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
             Q8HFQ | DflashOq8Plain | DflashOq4Plain | DflashOq4MixedPlain | Raw => {
@@ -813,8 +820,10 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             // run_auto/gemv_steps, which Oq4 never uses (it calls the kernels direct).
             | Oq4G256
             // Opus W8A8: weight_gemv's Oq8G256 arm does the FWHT + int8 act-quant
-            // itself; same rationale as Oq4G256 above.
+            // itself; same rationale as Oq4G256 above. Oq8G128 is the same arm at
+            // the 128 group (and the FWHT-128 basis), so it must reach it too.
             | Oq8G256
+            | Oq8G128
             // Compact-RESIDENT Opus (HIPFIRE_OQ_COMPACT_RESIDENT). Same artifact
             // as Oq8G256, just left in 4.25 b/w blocks instead of expanded at
             // load, so it needs the same FWHT + AWQ divide. Omitting it made

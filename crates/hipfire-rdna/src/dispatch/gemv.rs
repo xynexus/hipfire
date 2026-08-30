@@ -6041,7 +6041,10 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(group, 256, "gemv_oq8_grouped: group must be 256");
+        assert!(
+            group == 256 || group == 128,
+            "gemv_oq8_grouped: group must be 256 or 128, got {group}"
+        );
         assert_eq!(
             k % group,
             0,
@@ -6055,7 +6058,9 @@ impl Gpu {
         let ki = k as i32;
         let gi = group as i32;
         // Bandwidth-optimized v2 (128-bit loads + 2 groups/wave) when K % 512 == 0.
-        if k % 512 == 0 {
+        // v2 is G256-ONLY — it hard-requires `group == 256` for its 128-bit load
+        // shape, so a G128 weight must take v1 even when K % 512 == 0.
+        if group == 256 && k % 512 == 0 {
             self.ensure_kernel(
                 "gemv_oq8_grouped_v2",
                 kernels::GEMV_OQ8_GROUPED_V2_SRC,

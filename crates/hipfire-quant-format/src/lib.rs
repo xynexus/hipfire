@@ -296,6 +296,17 @@ pub enum QuantType {
     /// refused at load rather than read as garbage. Produced by `hipfire
     /// optimize`; the canonical file remains the source of truth.
     Oq4G256MoeBlocks = 53,
+    /// Opus Quant W8 at **group 128** — `[f16 scale][128 signed int8]` = 130 B,
+    /// FWHT-**128** rotated (sign seeds 43/1043, as MQ4G128; NOT the 42/1042 pair
+    /// G256 uses — rotating with the wrong pair is inverted by nothing in the
+    /// forward and reads as plausible garbage rather than an error).
+    ///
+    /// Exists for the PROTECTED SET under an `oq8` bulk. `Oq8G256` cannot serve
+    /// there: it *is* the bulk, so promoting to it leaves the protected set no
+    /// better than what surrounds it. This is twice as finely grouped at
+    /// ~1.02 B/weight, versus 2.0 for the bf16 that would otherwise be the only
+    /// thing above the bulk.
+    Oq8G128 = 54,
 }
 
 impl QuantType {
@@ -434,6 +445,7 @@ impl QuantType {
             Oq2G256 => Some(66),           // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
             Oq6G256 => Some(194),          // 2 (f16 scale) + 192 (6-bit×256)
             Oq8G256 | Oq8G256RowPadded => Some(258), // 2 (f16 scale) + 256 int8
+            Oq8G128 => Some(130),          // 2 (f16 scale) + 128 int8
             Oq8Plain => Some(258),
             Oq4Plain => Some(130),
             OpaqueBytes => Some(1),

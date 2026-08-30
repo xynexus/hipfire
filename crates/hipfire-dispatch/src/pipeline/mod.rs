@@ -69,7 +69,21 @@ pub fn execute_pipeline(
         match step {
             PipelineOp::RotateFwht => {
                 use crate::families::rotation::{RotationFamily, RotationParams};
+                use crate::types::RotationPlan;
                 let rot = RotationFamily::new();
+                // The BASIS must follow the weight's dtype. This used to pass
+                // `Plain` unconditionally, i.e. always the FWHT-256 tables, so a
+                // G128 weight arriving here was rotated by a transform its
+                // dequant never inverts — coherent-looking garbage, not an error.
+                // Latent until now only because the existing G128 dtypes reach
+                // their rotation by other routes.
+                let g128 = matches!(dtype_rotation_plan(dtype), RotationPlan::FwhtG128);
+                if g128 {
+                    // rotate_x_mq_128 ensures its own (43/1043) tables, but the
+                    // x_rot scratch below is allocated by ensure_mq_signs.
+                    gpu.ensure_mq_signs_128()
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
                 gpu.ensure_mq_signs()
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let x_rot = unsafe {
@@ -92,7 +106,11 @@ pub fn execute_pipeline(
                         k: params.k,
                         eps: 1e-6,
                         batch_size: 1,
-                        variant: RotationVariant::Plain,
+                        variant: if g128 {
+                            RotationVariant::PlainG128
+                        } else {
+                            RotationVariant::Plain
+                        },
                         givens_pairs: None,
                         givens_theta: None,
                         givens_scales: None,

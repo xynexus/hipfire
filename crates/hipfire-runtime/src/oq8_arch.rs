@@ -42,24 +42,35 @@ fn sext4(nib: u8) -> i8 {
 /// `Oq8G256` (qt 35): `[f16 scale][256 int8]` per 256-group, row-contiguous →
 /// combined `[int8 m*k][f32 scales m*ng]`.
 pub fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
+    oq8_combined_g(data, m, k, 256)
+}
+
+/// `oq8_combined` with an explicit group. `Oq8G128` (qt 54) has the same shape
+/// with a 130-byte block and twice as many scales; the device layout is identical
+/// apart from `ng`, so the two share this body rather than duplicating it.
+pub fn oq8_combined_g(data: &[u8], m: usize, k: usize, group: usize) -> Vec<u8> {
+    assert!(group == 256 || group == 128, "Oq8 group must be 256 or 128");
     // Single-sourced from hipfire-quant-format: Oq8G256 on-disk block = 258.
-    const BLOCK: usize = QuantType::Oq8G256.block_bytes().unwrap();
-    assert_eq!(k % GROUP, 0, "Oq8G256 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let expect = m * ng * BLOCK;
+    let block: usize = if group == 256 {
+        QuantType::Oq8G256.block_bytes().unwrap()
+    } else {
+        QuantType::Oq8G128.block_bytes().unwrap()
+    };
+    assert_eq!(k % group, 0, "Oq8 requires K % {group} == 0 (got K={k})");
+    let ng = k / group;
+    let expect = m * ng * block;
     assert_eq!(
         data.len(),
         expect,
-        "Oq8G256 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+        "Oq8 weight byte length {} != M*ng*{block} = {expect} (M={m} K={k})",
         data.len()
     );
     let mut combined = vec![0u8; m * k + m * ng * 4];
     for r in 0..m {
         for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let dst = r * k + g * GROUP;
-            combined[dst..dst + GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let src = (r * ng + g) * block;
+            let dst = r * k + g * group;
+            combined[dst..dst + group].copy_from_slice(&data[src + 2..src + block]);
             let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
             let so = m * k + (r * ng + g) * 4;
             combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
@@ -528,6 +539,13 @@ fn oq8_arch_load_inner(
                 compact_shape_selected(m, k)
             ),
         );
+    }
+    // Oq8G128 (qt 54) expands through the same path at a 128 group, but unlike
+    // the compact-G128 case above it must keep its OWN dtype: the expansion does
+    // NOT absorb the group here. `ng` doubles and the activation needs the
+    // FWHT-128 basis, and neither is recoverable from the planar buffer.
+    if qt == QuantType::Oq8G128.code() {
+        return Some((oq8_combined_g(data, m, k, 128), DType::Oq8G128));
     }
     let bytes = match qt {
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
