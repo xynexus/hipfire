@@ -222,9 +222,49 @@ serialized layer 0 and pushed the divergence to layer 1.
   and 6 of 10 under `AMD_SERIALIZE_KERNEL=3`).
 - `tiny-quant-gate.sh`: **187 pass / 0 fail, twice consecutively.**
 
-## Scope
+## Scope — checked, and NO real model was affected
 
-The refusal is the part that matters beyond this fixture. Any zaya artifact with
-`num_key_value_heads == 1` was taking the same racing, out-of-bounds path in
-prefill — including production calibration, where nothing would have flagged it.
-It now fails loudly at dispatch instead.
+The commit message for the fix said any zaya artifact with `nkv == 1` "was taking
+the same racing path, production calibration included". That is true as a
+conditional, but a survey shows **no such artifact exists**, so nothing shipped
+was ever hit. Recorded here so nobody goes looking for corrupted production
+calibration that cannot be there.
+
+Local store — all `nq/nkv = 8/2`:
+
+    /srv/hipfire/models/ZAYA1-8B--bf16.hfq
+    /srv/hipfire/models/zaya1-8b-native.bf16.hfq
+    /srv/hipfire/models/zaya1-8b-parity.bf16.hfq
+
+Every upstream Zyphra ZAYA checkpoint, fetched from the HF config API:
+
+| model | nq | nkv |
+|---|---|---|
+| ZAYA1-74B-preview | 16 | 2 |
+| ZAYA1-74B-preview-legacy | 16 | 2 |
+| ZAYA1-base | 16 | 2 |
+| ZAYA1-reasoning-base | 16 | 2 |
+| ZAYA1-8B | 8 | 2 |
+| ZAYA1-8B-legacy | 8 | 2 |
+| ZAYA1-VL-8B | 8 | 2 |
+| ZAYA1-8B-FP8-Experts | 8 | 2 |
+| ZAYA1-8B-MXFP4-Experts | 8 | 2 |
+
+`nkv == 1` is not a shape ZAYA ships. And nothing can derive it: `num_kv_heads`
+is a direct passthrough of `num_key_value_heads` (`hipfire-arch-zaya/src/lib.rs`),
+a REQUIRED serde field with no default and no arithmetic between config and
+kernel. The only `nkv == 1` config that ever existed was hipfire's own toy
+fixture, which is what made this a test-only defect that merely *looked* like a
+production risk.
+
+The refusal still earns its place: it converts an unsupported geometry from
+silent corruption plus an out-of-bounds write into a named error at dispatch.
+
+## Unrelated finding from the same survey: two ZAYA configs will not load
+
+`ZAYA1-base` and `ZAYA1-reasoning-base` (the 120-layer pretraining bases) declare
+`kv_channels: 128` and carry **no `head_dim` key**. hipfire's `ZayaRawConfig`
+has `head_dim: usize` as a required field with no default and no `kv_channels`
+alias, so both fail to deserialize before anything else is tried. The 8B, VL-8B,
+and 74B-preview checkpoints all carry `head_dim` and are unaffected. Not fixed
+here — filed as its own gap.
