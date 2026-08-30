@@ -122,6 +122,24 @@ original report suggested is wrong:
 
 Recurring shape, again: **a fix applied to one path and not its sibling.**
 
+## [FIXED 2026-08-30] Three HFQM parsers ignored the container version
+
+Found by running one of the never-executed sweeps from the coverage-gaps doc
+("12 of 20 `b\"HFQM\"` parsers have no `version >= 2` branch"). Three were live:
+`hipfire-train/src/hfq_patch.rs`, `hipfire-runtime/examples/hfq_split.rs` and
+`hipfire-quantize/src/tools/draft_to_mq4.rs` read the version into a discarded
+binding and walked a v1 index, so on a v2 artifact — which is what the
+quantizer writes and what most of `/srv/hipfire/models` holds — every offset
+after the first was wrong. `hfq_patch` also panicked on a truncated file from a
+`Result`-returning function. All fixed and pinned by tests.
+
+**The sibling half of that sweep is REFUTED and should not be re-filed:** the
+`HFQ_VERSION` constant really does disagree across 6 files (2 vs 1), but the
+five that say 1 are writers emitting a self-consistent v1 container. Importing
+the canonical constant would MAKE a bug, not fix one.
+
+→ `docs/bugs/2026-08-30-hfqm-v1-only-parsers.md`
+
 ## [High] cohere2 with `sliding_window > 1024` cannot serve — every sliding layer fails its first staging launch
 
 **Found 2026-08-29 on master `0c9e3d252`, nix1. Confirmed by source trace plus an
