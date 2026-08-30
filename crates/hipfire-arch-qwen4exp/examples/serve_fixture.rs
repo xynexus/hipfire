@@ -166,6 +166,46 @@ fn main() {
     }
     println!("  reset:   same prompt reproduces argmax {am1} ({mx1:.4})");
 
+    // 4b. `serve()` END TO END. Everything above drives `SimpleAr` directly; this
+    // is the entry point the DAEMON actually calls, and it exercises the pieces
+    // between — the tokenizer, the sampler, the EOS filter and the streaming sink.
+    // A backend can pass every check above and still fail here (a wrong eos, a
+    // vocab the sampler sizes differently), so it is worth its own run.
+    {
+        let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .unwrap_or_else(|e| fail(format!("fixture has no usable tokenizer: {e:?}")));
+        let mut out: Vec<u8> = Vec::new();
+        let mut ctx = hipfire_runtime::arch::GenerateCtx {
+            id: "serve_fixture",
+            prompt: "hello",
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 1,
+            max_tokens: 8,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            max_think_tokens: 0,
+            stop_sequences: &[],
+            output_holdback_prefixes: &[],
+            strip_think: false,
+            output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
+            images: &[],
+            sink: &mut out,
+        };
+        match m.serve(&mut gpu, &tok, &mut ctx) {
+            Ok(outcome) => println!(
+                "  serve():  {} token(s) from {} prompt token(s), stop = {:?}, {} visible byte(s)",
+                outcome.tokens_generated,
+                outcome.prompt_tokens,
+                outcome.stop_reason,
+                out.len()
+            ),
+            Err(e) => fail(format!("serve(): {e}")),
+        }
+    }
+
     // 5. The STREAMED n-gram path must agree with the resident one EXACTLY. Force
     // it with a zero budget so this small fixture takes the same route the 102 GB
     // model has no choice about. A wrong shard split or row offset still yields a
