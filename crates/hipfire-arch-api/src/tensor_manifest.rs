@@ -43,12 +43,30 @@ pub struct TensorPattern {
     /// optional bias). Absence of an optional pattern is not an error; presence
     /// still counts as claimed, so it does not show up as unclaimed either.
     pub required: bool,
-    /// First layer this pattern applies to. Not every per-layer tensor exists on
-    /// every layer, and a manifest that assumes it does reports a real model as
-    /// broken: zaya's `mlp.gate.router_states_scale` starts at layer 1, because
-    /// the EDA router scales state carried from the PREVIOUS block and block 0
-    /// has none. The 40-layer ZAYA1-8B artifact carries 39 of them, from layer 1.
-    pub layer_from: usize,
+    /// Which layers this pattern applies to. Not every per-layer tensor exists
+    /// on every layer, and a manifest that assumes it does reports a real model
+    /// as broken -- twice over in this tree:
+    ///
+    /// - zaya's `mlp.gate.router_states_scale` starts at layer 1 (the EDA router
+    ///   scales state carried from the PREVIOUS block; block 0 has none). The
+    ///   40-layer ZAYA1-8B artifact carries 39, from layer 1. [`LayerScope::From`]
+    /// - qwen3.5 interleaves layer TYPES, listed in config `layer_types`, so
+    ///   `linear_attn.*` and `self_attn.*` live on disjoint layer sets.
+    ///   [`LayerScope::Class`]
+    pub layers: LayerScope,
+}
+
+/// Which layers a pattern covers. Resolved against the manifest's bounds and,
+/// for [`LayerScope::Class`], its `layer_classes` map -- so the const pattern
+/// table stays const while the actual indices come from config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerScope {
+    /// Every layer in `0..bounds.layers`.
+    All,
+    /// `from..bounds.layers`.
+    From(usize),
+    /// The layer indices the arch registered under this class name.
+    Class(&'static str),
 }
 
 impl TensorPattern {
@@ -56,14 +74,14 @@ impl TensorPattern {
         Self {
             template,
             required: true,
-            layer_from: 0,
+            layers: LayerScope::All,
         }
     }
     pub const fn optional(template: &'static str) -> Self {
         Self {
             template,
             required: false,
-            layer_from: 0,
+            layers: LayerScope::All,
         }
     }
     /// Required, but only from `layer_from` onward.
@@ -71,7 +89,15 @@ impl TensorPattern {
         Self {
             template,
             required: true,
-            layer_from,
+            layers: LayerScope::From(layer_from),
+        }
+    }
+    /// Required, but only on the layers the arch registered under `class`.
+    pub const fn required_on_class(class: &'static str, template: &'static str) -> Self {
+        Self {
+            template,
+            required: true,
+            layers: LayerScope::Class(class),
         }
     }
 }
@@ -89,23 +115,36 @@ pub struct TensorManifest {
     pub arch: &'static str,
     pub bounds: ManifestBounds,
     pub patterns: Vec<TensorPattern>,
+    /// Named layer sets a [`LayerScope::Class`] pattern resolves against, filled
+    /// from the model config (e.g. qwen3.5's `layer_types`). A class with no
+    /// entry covers no layers, so a pattern scoped to an absent class simply
+    /// expands to nothing rather than falsely reporting every layer missing.
+    pub layer_classes: BTreeMap<&'static str, Vec<usize>>,
 }
 
 /// Which pattern a name matched, and with what indices.
-fn expand(pattern: &TensorPattern, bounds: ManifestBounds) -> Vec<String> {
+fn expand(
+    pattern: &TensorPattern,
+    bounds: ManifestBounds,
+    classes: &BTreeMap<&'static str, Vec<usize>>,
+) -> Vec<String> {
     let template = pattern.template;
-    let (first, layers) = if template.contains(LAYER) {
-        (pattern.layer_from, bounds.layers)
+    let layer_indices: Vec<usize> = if template.contains(LAYER) {
+        match pattern.layers {
+            LayerScope::All => (0..bounds.layers).collect(),
+            LayerScope::From(f) => (f..bounds.layers).collect(),
+            LayerScope::Class(c) => classes.get(c).cloned().unwrap_or_default(),
+        }
     } else {
-        (0, 1)
+        vec![0]
     };
     let experts = if template.contains(EXPERT) {
         bounds.experts
     } else {
         1
     };
-    let mut out = Vec::with_capacity(layers.saturating_sub(first) * experts);
-    for l in first..layers {
+    let mut out = Vec::with_capacity(layer_indices.len() * experts);
+    for l in layer_indices {
         let with_layer = template.replace(LAYER, &l.to_string());
         for e in 0..experts {
             out.push(with_layer.replace(EXPERT, &e.to_string()));
@@ -181,7 +220,7 @@ impl TensorManifest {
     pub fn expected(&self) -> Vec<String> {
         self.patterns
             .iter()
-            .flat_map(|p| expand(p, self.bounds))
+            .flat_map(|p| expand(p, self.bounds, &self.layer_classes))
             .collect()
     }
 
@@ -193,7 +232,7 @@ impl TensorManifest {
 
         for p in &self.patterns {
             let mut absent = 0usize;
-            for name in expand(p, self.bounds) {
+            for name in expand(p, self.bounds, &self.layer_classes) {
                 if present.contains(name.as_str()) {
                     claimed.insert(name);
                 } else {
@@ -237,6 +276,7 @@ mod tests {
                 ),
                 TensorPattern::optional("lm_head.weight"),
             ],
+            layer_classes: Default::default(),
         }
     }
 

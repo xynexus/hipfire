@@ -64,6 +64,15 @@ const PATTERNS: &[TensorPattern] = &[
     // ── per (layer, expert) ──
     TensorPattern::required("model.layers.{layer}.mlp.experts.{expert}.gate_up_proj.weight"),
     TensorPattern::required("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+    // ── companions a CALIBRATED artifact adds ──
+    // Optional, not unexpected: an activation-aware quant writes a per-tensor
+    // AWQ scale beside the weight it scales. Declaring them keeps a calibrated
+    // artifact from reporting three unclaimed shapes on every load.
+    TensorPattern::optional("model.layers.{layer}.mlp.gate.down_proj.awq_scale.weight"),
+    TensorPattern::optional(
+        "model.layers.{layer}.mlp.experts.{expert}.gate_up_proj.awq_scale.weight",
+    ),
+    TensorPattern::optional("model.layers.{layer}.mlp.experts.{expert}.down_proj.awq_scale.weight"),
 ];
 
 /// Build the manifest for a given geometry.
@@ -72,6 +81,8 @@ pub fn zaya_manifest(layers: usize, experts: usize) -> TensorManifest {
         arch: "zaya",
         bounds: ManifestBounds { layers, experts },
         patterns: PATTERNS.to_vec(),
+        // zaya has one layer kind; every pattern is All or From.
+        layer_classes: Default::default(),
     }
 }
 

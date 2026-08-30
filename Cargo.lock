@@ -1847,6 +1847,7 @@ name = "hipfire-arch-zaya"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-zaya-spec",
  "hipfire-dispatch",
  "hipfire-kvquant",
  "hipfire-mixer",

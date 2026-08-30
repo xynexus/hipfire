@@ -515,8 +515,42 @@ impl ZayaGpuWeights {
     }
 }
 
+/// Check the artifact against the arch's declared tensor manifest before loading
+/// anything.
+///
+/// MISSING required tensors are fatal, which costs nothing: the load was going
+/// to fail at the first `ok_or_else` anyway. What changes is the message. An
+/// artifact in the upstream Zyphra naming (`ZAYA1-8B--bf16.hfq` in the shared
+/// store is one) previously reported `missing tensor
+/// "model.embed_tokens.weight"` -- one string, with no indication that all ~35
+/// name shapes differ. It now reports the whole set difference and names the
+/// likely cause.
+///
+/// UNCLAIMED tensors only warn, and must not do more. Artifacts legitimately
+/// carry names this manifest does not list: `hipfire model compose` stores
+/// bundled components under a `__hipfire_component/` prefix, and a future
+/// sidecar is not a load error. (Calibrated `.awq_scale.weight` companions ARE
+/// declared, as optional, so the common case stays quiet.)
+fn validate_manifest(hfq: &HfqFile, cfg: &ZayaConfig) -> Result<(), String> {
+    let names: Vec<&str> = hfq.tensors().iter().map(|t| t.name.as_str()).collect();
+    let manifest =
+        hipfire_arch_zaya_spec::manifest::zaya_manifest(cfg.num_blocks, cfg.moe.num_experts);
+    let report = manifest.validate(names);
+    if !report.missing.is_empty() {
+        return Err(report.render("zaya"));
+    }
+    if !report.unclaimed.is_empty() {
+        eprintln!(
+            "[zaya] {} tensor shape(s) present but not declared in the manifest (not an error)",
+            report.unclaimed.len()
+        );
+    }
+    Ok(())
+}
+
 impl ZayaGpuWeights {
     pub fn load(hfq: &HfqFile, gpu: &mut Gpu, cfg: &ZayaConfig) -> Result<Self, String> {
+        validate_manifest(hfq, cfg)?;
         let embed = load_linear(hfq, gpu, "model.embed_tokens.weight")?;
         let in_scale = up(hfq, gpu, "model.input_hidden_states_scale")?;
         let in_bias = up(hfq, gpu, "model.input_hidden_states_bias")?;

@@ -7,6 +7,8 @@
 //! DeltaNet linear-attention + short-conv mixer and the MoE router/experts). Deps
 //! only `hipfire-arch-api`.
 
+pub mod manifest;
+
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
     ContinuousBatching, ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
