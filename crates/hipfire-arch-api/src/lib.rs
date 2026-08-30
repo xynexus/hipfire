@@ -46,6 +46,7 @@ pub use ingest::{
     TensorRole,
 };
 
+pub mod tensor_manifest;
 pub mod toy;
 pub use toy::{Dt, Init, TensorSpec, ToyFixture};
 

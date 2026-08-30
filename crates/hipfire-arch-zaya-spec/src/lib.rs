@@ -5,6 +5,8 @@
 //! Lean offline spec for the Zyphra ZAYA1 MoE family (arch_id 16): identity + the
 //! `Ingest` quant-policy (shared transformer prior). Deps only `hipfire-arch-api`.
 
+pub mod manifest;
+
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
     ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
