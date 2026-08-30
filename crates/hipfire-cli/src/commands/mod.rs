@@ -119,3 +119,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Is `pid` a live process on this host?
+///
+/// `kill(pid, 0)` delivers nothing and only probes for existence: `0` means
+/// alive, `EPERM` means alive but not ours to signal (another uid), and `ESRCH`
+/// means gone. Dropping the EPERM case reports another user's process as dead —
+/// which is what the third copy of this in `hipfire-hub`'s cache did, reclaiming
+/// `.part` downloads that were still being written.
+///
+/// `pid <= 1` is refused: `kill` reads 0 as "this process group" and negatives
+/// as a group id, so neither names a process, and pid 1 is never a hipfire
+/// process worth waiting on.
+pub(crate) fn pid_alive(pid: impl Into<i64>) -> bool {
+    let pid: i64 = pid.into();
+    if pid <= 1 {
+        return false;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 is a pure existence probe.
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
+}

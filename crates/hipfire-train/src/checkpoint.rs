@@ -139,6 +139,7 @@ pub fn load_labels(path: &str, key: u64) -> Option<(Vec<Vec<u32>>, Vec<Vec<f32>>
 
 // ── drafter checkpoint ────────────────────────────────────────────────────
 const CKPT_MAGIC: &[u8; 4] = b"PFDC";
+const CKPT_VERSION: u32 = 1;
 
 pub fn save_drafter(
     gpu: &mut Gpu,
@@ -157,7 +158,7 @@ pub fn save_drafter(
     let mut f = io::BufWriter::new(std::fs::File::create(&tmp).map_err(io_err)?);
     (|| -> io::Result<()> {
         f.write_all(CKPT_MAGIC)?;
-        wu32(&mut f, 1)?;
+        wu32(&mut f, CKPT_VERSION)?;
         wu32(&mut f, epoch)?;
         wu32(&mut f, weights.len() as u32)?;
         for w in &weights {
@@ -218,7 +219,17 @@ fn read_ckpt<R: Read>(
             "bad checkpoint magic",
         ));
     }
-    let _ver = ru32(f)?;
+    // Checked, not discarded: `load_labels` above already refuses a version it
+    // does not know, and a reader that drops the field parses the NEXT layout
+    // with this one's assumptions. Only v1 exists, so today this rejects
+    // nothing — it is what makes bumping the writer loud instead of silent.
+    let ver = ru32(f)?;
+    if ver != CKPT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("checkpoint version {ver} is not {CKPT_VERSION}"),
+        ));
+    }
     let epoch = ru32(f)?;
     let np = ru32(f)? as usize;
     let weights: Vec<Vec<f32>> = (0..np).map(|_| rvec(f)).collect::<io::Result<_>>()?;

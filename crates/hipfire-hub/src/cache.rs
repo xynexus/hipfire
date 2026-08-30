@@ -28,8 +28,16 @@ fn parse_part_name(name: &str) -> Option<(&str, i32)> {
 /// a positive pid names a process. Without this guard a `.part` tagged 0 looks
 /// permanently alive and is never reclaimed.
 fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
     // SAFETY: signal 0 only probes for existence, it delivers nothing.
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+    //
+    // EPERM means the process EXISTS but is not ours to signal — a `.part`
+    // owned by another uid on this host. Testing only `== 0` reported those as
+    // dead and reclaimed a download that was still being written. The two
+    // copies of this in hipfire-cli always handled it; this one did not.
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
 }
 
 /// A model's directory inside the cache root.
@@ -248,5 +256,41 @@ mod tests {
         let f = p.file_name().unwrap().to_str().unwrap();
         assert!(f.starts_with(".a__b__model.safetensors."), "{f}");
         assert!(f.ends_with(&format!(".{}.part", std::process::id())), "{f}");
+    }
+}
+
+#[cfg(test)]
+mod pid_alive_tests {
+    use super::pid_alive;
+
+    #[test]
+    fn a_pid_that_cannot_name_a_process_is_never_alive() {
+        // kill() reads 0 as "this process group" and negatives as a group id,
+        // so neither names a process. A `.part` tagged 0 must not look
+        // permanently alive.
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+    }
+
+    #[test]
+    fn our_own_process_is_alive_and_a_reaped_child_is_not() {
+        assert!(pid_alive(std::process::id() as i32));
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as i32;
+        child.wait().expect("wait");
+        assert!(!pid_alive(pid), "a reaped child must not read as alive");
+    }
+
+    #[test]
+    fn a_process_we_may_not_signal_is_still_alive() {
+        // pid 1 exists and is root-owned, so an unprivileged `kill(1, 0)`
+        // returns EPERM. Testing only `== 0` reports it dead — which is how a
+        // `.part` owned by another uid on this host got reclaimed while it was
+        // still being written. Running as root this passes via the `== 0` arm
+        // instead, so it can only pass, never falsely fail.
+        assert!(pid_alive(1), "EPERM means alive, not gone");
     }
 }

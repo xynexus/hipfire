@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::pid_alive;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use hipfire_config::{hipfire_dir, ConfigLayer, ConfigLayerKind, LoadedConfig};
@@ -689,13 +690,6 @@ fn url_for(host: &str, port: u16) -> String {
     } else {
         format!("http://{host}:{port}")
     }
-}
-
-fn pid_alive(pid: u32) -> bool {
-    if pid <= 1 {
-        return false;
-    }
-    unsafe { libc::kill(pid as i32, 0) == 0 || *libc::__errno_location() == libc::EPERM }
 }
 
 fn signal(pid: u32, sig: i32) -> Result<()> {

@@ -142,13 +142,7 @@ fn lockfile_path() -> PathBuf {
     hipfire_lock::gpu_resource_lock_path()
 }
 
-fn pid_alive(pid: i32) -> bool {
-    if pid <= 1 {
-        return false;
-    }
-    // kill(pid, 0): 0 ⇒ alive; EPERM ⇒ alive (not permitted); ESRCH ⇒ gone.
-    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
-}
+use super::pid_alive;
 
 pub fn run(args: LockArgs) -> anyhow::Result<()> {
     match args.action {
