@@ -639,16 +639,82 @@ fn server_model_worker_key_id(model_path: &str) -> String {
     format!("server-model:{:016x}", hasher.finish())
 }
 
+/// Fraction of detected VRAM to budget for model residency when the operator
+/// has not set one.
+///
+/// The planner prices a model at its FILE SIZE, but resident cost is higher —
+/// KV, scratch and allocator rounding on top — and the check is peak-aware, so
+/// the incoming model is counted while the outgoing one is still resident.
+/// Measured file -> resident on gfx1103 with kvarn KV:
+///
+///     Qwen3.5-9B    5.7 -> 7.7 GB   1.35x
+///     Qwen3.8-27B  15.5 -> 19.4 GB  1.25x
+///     Qwen3.6-35B  19.3 -> 20.6 GB  1.07x   (MoE, fewer bytes active)
+///
+/// At the worst observed 1.35x, a budget of B file-bytes can occupy 1.35xB, so
+/// B must stay under ~0.74 of total. 2/3 is the next fraction below that with
+/// room for the estimate being wrong in the same direction again.
+///
+/// 4/5 was tried first and is NOT enough: it admitted 27B + 35B (34.8 GB of
+/// files against a 36 GB budget), which then OOM'd loading the second one.
+const DERIVED_VRAM_BUDGET_NUMERATOR: u64 = 2;
+const DERIVED_VRAM_BUDGET_DENOMINATOR: u64 = 3;
+
+/// The VRAM budget residency planning should use.
+///
+/// An explicit `scheduler_vram_budget_bytes` wins. Otherwise derive one from
+/// detected VRAM: the config default is 0, and `effective_limit` reads 0 as
+/// UNLIMITED, which is why nothing was ever evicted and parked workers
+/// accumulated until a load ran out of memory. A static default cannot know the
+/// GPU, so this asks the daemon once and caches the answer.
+///
+/// Returns 0 — i.e. unchanged, unlimited — when the probe cannot answer. A
+/// diagnostic that fails must not start refusing loads.
+async fn effective_vram_budget_bytes(state: &SharedState, configured: u64) -> u64 {
+    if configured > 0 {
+        return configured;
+    }
+    if let Some(cached) = *state.detected_vram_bytes.lock().await {
+        return cached;
+    }
+    let inventory = crate::scheduler::server_accelerator_inventory(state).await;
+    let detected = inventory
+        .devices
+        .iter()
+        .find(|device| device.selected && device.available)
+        .and_then(|device| device.total_memory_bytes)
+        .map(|total| total / DERIVED_VRAM_BUDGET_DENOMINATOR * DERIVED_VRAM_BUDGET_NUMERATOR)
+        .unwrap_or(0);
+    if detected > 0 {
+        tracing::info!(
+            "residency: no scheduler_vram_budget_bytes set; budgeting {:.1} GiB \
+             ({}/{} of detected VRAM). Set it explicitly to override.",
+            detected as f64 / (1u64 << 30) as f64,
+            DERIVED_VRAM_BUDGET_NUMERATOR,
+            DERIVED_VRAM_BUDGET_DENOMINATOR,
+        );
+    } else {
+        tracing::warn!(
+            "residency: no scheduler_vram_budget_bytes set and VRAM could not be \
+             detected; residency stays unbounded"
+        );
+    }
+    *state.detected_vram_bytes.lock().await = Some(detected);
+    detected
+}
+
 async fn plan_residency_for_load(
     state: &SharedState,
     model_path: &str,
     worker_key_id: &str,
 ) -> Result<hipfire_scheduler::ModelResidencyPlan, String> {
     let cfg = state.config.lock().await.clone();
+    let vram_budget_bytes =
+        effective_vram_budget_bytes(state, cfg.scheduler_vram_budget_bytes).await;
     let budget = ResourceBudget {
         system_memory_budget_bytes: cfg.scheduler_system_memory_budget_bytes,
         system_memory_headroom_bytes: cfg.scheduler_system_memory_headroom_bytes,
-        vram_budget_bytes: cfg.scheduler_vram_budget_bytes,
+        vram_budget_bytes,
         vram_headroom_bytes: cfg.scheduler_vram_headroom_bytes,
     };
     let requested_mode = ResidencyMode::parse(&cfg.model_residency_mode)
@@ -657,9 +723,8 @@ async fn plan_residency_for_load(
         system_memory_bytes: 0,
         vram_bytes: model_file_bytes(model_path),
     };
-    let effective_module_budget = cfg
-        .scheduler_vram_budget_bytes
-        .saturating_sub(cfg.scheduler_vram_headroom_bytes);
+    let effective_module_budget =
+        vram_budget_bytes.saturating_sub(cfg.scheduler_vram_headroom_bytes);
     let estimated_qwen_moe_modules =
         qwen_moe_module_capable_model(model_path).then_some(ResourceUsage {
             system_memory_bytes: 0,
@@ -677,6 +742,7 @@ async fn plan_residency_for_load(
             model_path: model_path.to_string(),
             requested_mode,
             max_resident_workers: cfg.max_resident_workers,
+            budget_is_advisory: cfg.scheduler_vram_budget_bytes == 0,
             estimated_full,
             estimated_qwen_moe_modules,
         },
