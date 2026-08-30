@@ -11,7 +11,7 @@ use std::ffi::OsString;
     version = hipfire_build_info::VERSION,
     about = "hipfire LLM inference CLI",
     long_about = "hipfire runs the local operator TUI, background inference server, model inventory, eval, benchmark, diagnostics, and artifact tools.\n\nRunning `hipfire` with no command opens the operator TUI; press `?` there for the in-app key reference.",
-    after_help = "Examples:\n  hipfire                         Open the operator TUI (`?` for keys)\n  hipfire help                    Show the command summary\n  hipfire start                   Start the background server\n  hipfire status --json           Machine-readable server status\n  hipfire list                    Local models, sizes, and capabilities\n  hipfire bench --model Qwen3.5-30B-A3B\n\n`--json` is available on start, stop, restart, status, list, and inspect.\nUse `hipfire <command> help` or `hipfire <command> --help` for detailed command help."
+    after_help = "Examples:\n  hipfire                         Open the operator TUI (`?` for keys)\n  hipfire help                    Show the command summary\n  hipfire start                   Start the background server\n  hipfire status --json           Machine-readable server status\n  hipfire list                    Local models, sizes, and capabilities\n  hipfire download Qwen/Qwen3.5-9B   Fetch a model into the local store\n  hipfire induct Qwen/Qwen3.5-9B     Fetch, calibrate and quantize in one go\n  hipfire bench --model Qwen3.5-30B-A3B\n\n`--json` is available on start, stop, restart, status, list, and inspect.\nUse `hipfire <command> help` or `hipfire <command> --help` for detailed command help."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +36,11 @@ enum Command {
     /// Load a model and generate a response (one-shot)
     #[command(hide = true)]
     Chat(commands::chat::ChatArgs),
+    /// Download a model repository (`org/name`) into the local store
+    Download(commands::download::DownloadArgs),
+    /// Bring an external model into a named `.hfq` — calibrate, quantize, fold
+    /// sidecars. Accepts a HuggingFace `org/name` or a local safetensors dir.
+    Induct(commands::induct::InductArgs),
     /// List locally available models
     #[command(alias = "models")]
     List(commands::list::ListArgs),
@@ -76,7 +81,10 @@ enum Command {
     /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
     CollectArtifacts(commands::forward::CollectArtifactsArgs),
     /// Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
-    #[command(alias = "repack")]
+    ///
+    /// The `repack` alias is gone: `repack` is a DIFFERENT operation — the
+    /// HF-dir <-> `.hfa` archive round-trip — and one name for two things is
+    /// worse than a longer name for one.
     Optimize(commands::forward::OptimizeArgs),
     /// Compose/decompose .hfq packaging: bundle a base + role/feature sidecars
     /// into one container, or split a bundle back into its component files.
@@ -260,6 +268,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Serve(args)) => rt()?.block_on(commands::serve::run(args, loaded_config)),
         Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
         Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
+        Some(Command::Download(args)) => commands::download::run_download(args),
+        Some(Command::Induct(args)) => commands::induct::run_induct(args, loaded_config),
         Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),

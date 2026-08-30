@@ -73,13 +73,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             hipfire_coexistence::export_safetensors::run_cli(&args[2..])
         }
         (Some("repack"), _) => hipfire_coexistence::repack::run_cli(&args[1..]),
-        (Some("download"), Some(repo)) if !repo.starts_with("--") => {
-            hub_cli("fetch", Some(repo), &args[2..])
-        }
-        (Some("hub"), Some("fetch")) => {
-            Err("`hub fetch` moved: use `hipfire-coexistence download <org/name>`".into())
-        }
-        (Some("hub"), Some(op)) => hub_cli(op, None, &args[2..]),
+        (Some("download"), Some(repo)) if !repo.starts_with("--") => download_cli(repo, &args[2..]),
+        // `hub` is retired. `download` is the only fetch front door, and archive
+        // integrity is `repack --check` — `hub verify` routed there anyway for
+        // an archive, so the group was one spelling of two other commands.
+        (Some("hub"), _) => Err("`hub` is retired: use `hipfire download <org/name>` \
+             to fetch, and `hipfire convert repack --check <archive>` to verify"
+            .into()),
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
@@ -133,9 +133,9 @@ fn usage() {
          \x20            --raw fetches a HuggingFace cache tree instead. --jobs (default 4)\n\
          \x20            opens that many connections: whole files in raw mode, ranged\n\
          \x20            windows within each file in archive mode.\n\
-         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
+         
          [--only <glob>]\n\
-         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>] [--raw] \
+         
          [--only <glob>]\n\
          \x20            --only restricts the sweep; both read every byte they cover.\n\
          repack --input <hf_dir> --output <archive.hfa>   (lossless, no arch needed)\n\
@@ -620,176 +620,30 @@ fn archive_root() -> PathBuf {
     }
 }
 
-/// `hub {fetch,verify,repair}`. Offline tooling — the runtime never links this.
+/// `download <org/name> [flags]`. Offline tooling — the runtime never links this.
 ///
-/// `fetch` writes an `.hfa` archive by default, encoding as the bytes arrive so
-/// the raw checkpoint is never staged. `--raw` restores the older behaviour of
-/// materialising a HuggingFace cache tree, which is what you want when another
-/// tool has to read the checkpoint as files.
-fn hub_cli(op: &str, repo_arg: Option<&str>, args: &[String]) -> Result<(), Box<dyn Error>> {
+/// Parses the flag bag and defers to [`hipfire_coexistence::download`], which is
+/// the same entry point `hipfire download` calls through clap. One
+/// implementation, two front doors, so the standalone binary and the subcommand
+/// cannot drift.
+fn download_cli(repo: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     let val = |k: &str| -> Option<String> {
         args.iter()
             .position(|a| a == k)
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    // `download <org/name>` passes the repo positionally; verify/repair still
-    // take --repo. A --provider flag can join here when a second source exists.
-    let repo = repo_arg
-        .map(str::to_string)
-        .or_else(|| val("--repo"))
-        .ok_or("hub: --repo <org/name> is required")?;
-    let revision = val("--revision").unwrap_or_else(|| "main".to_string());
-    let raw = args.iter().any(|a| a == "--raw");
-    let force = args.iter().any(|a| a == "--force");
-    let root = match val("--dest") {
-        Some(d) => PathBuf::from(d),
-        None if raw => PathBuf::from(
-            std::env::var("HF_HOME").unwrap_or_else(|_| "/srv/huggingface".to_string()),
-        ),
-        None => archive_root(),
+    let opts = hipfire_coexistence::download::DownloadOptions {
+        repo: repo.to_string(),
+        revision: val("--revision").unwrap_or_else(|| "main".to_string()),
+        include: val("--include"),
+        dest: val("--dest").map(PathBuf::from),
+        output: val("--output").map(PathBuf::from),
+        force: args.iter().any(|a| a == "--force"),
+        raw: args.iter().any(|a| a == "--raw"),
+        jobs: val("--jobs")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4),
     };
-    let archive = match val("--output") {
-        Some(o) => PathBuf::from(o),
-        None => root.join(archive_name(&repo)),
-    };
-    let include = val("--include");
-    // Verify and repair read every byte they cover, so restricting them to one
-    // shard is the difference between seconds and hashing the whole repo.
-    let only = val("--only");
-    // Parallel connections: whole files in raw mode, ranged windows within a
-    // file in archive mode (drained in order, so the stream stays sequential).
-    let jobs = val("--jobs")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("hub: runtime: {e}"))?;
-
-    rt.block_on(async {
-        match op {
-            "fetch" if !raw => {
-                // These archives are routinely the only copy of their model on
-                // an array with no redundancy, so overwriting one is never the
-                // silent default.
-                if archive.exists() && !force {
-                    return Err(format!(
-                        "hub: {} already exists — pass --force to replace it, \
-                         or `repack --check` it first",
-                        archive.display()
-                    )
-                    .into());
-                }
-                // The archive is written under a `.part` marker and only
-                // renamed into place once complete and digest-verified, so the
-                // final name never holds a truncated file. A leftover marker is
-                // from an interrupted run: fetch_to_archive resumes it at the
-                // last completed file via the `.manifest` sidecar (rechecking
-                // the kept bytes first), or restarts if the manifest is
-                // missing, stale, or fails the recheck.
-                let part = PathBuf::from(format!("{}.part", archive.display()));
-                if let Some(p) = archive.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                let files = hipfire_hub::list_files(&repo, &revision).await?;
-                hipfire_coexistence::hub_archive::fetch_to_archive(
-                    &part,
-                    &repo,
-                    &revision,
-                    include.as_deref(),
-                    files,
-                    jobs,
-                )
-                .await?;
-                std::fs::rename(&part, &archive)?;
-                eprintln!("hub: wrote {}", archive.display());
-            }
-            "fetch" => {
-                let n = hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref(), jobs)
-                    .await?;
-                eprintln!("hub: {n} file(s) present and verified");
-            }
-            // An archive keeps a checksum per stored payload, not the hub's
-            // per-file digest, so verifying one is `repack --check` rather than
-            // a re-listing. Routing it here means `hub verify` answers the
-            // question for whichever form the fetch actually produced.
-            "verify" if !raw && archive.exists() => {
-                hipfire_coexistence::repack::check(&archive)?;
-            }
-            "repair" if !raw && archive.exists() => {
-                return Err(format!(
-                    "hub: {} is an archive — a damaged payload cannot be patched in place. \
-                     Re-run `download {repo} --force`, or restore from it with \
-                     `repack --input <archive> --output <dir>` if it still checks out",
-                    archive.display()
-                )
-                .into());
-            }
-            "verify" => {
-                let states =
-                    hipfire_hub::run::verify(&root, &repo, &revision, only.as_deref()).await?;
-                let mut good = 0;
-                let mut gitok = 0;
-                let mut bad = 0;
-                let mut missing = 0;
-                let mut lenonly = 0;
-                for (f, s) in &states {
-                    use hipfire_hub::run::FileState::*;
-                    match s {
-                        Good => good += 1,
-                        // Reported apart from a SHA-256 match: the git blob
-                        // hash is a real content check but a weaker one.
-                        GoodGitOid => gitok += 1,
-                        Corrupt { want, got, windows } => {
-                            // Naming the windows is the point of recording a
-                            // table: it turns "this shard is wrong" into the
-                            // byte ranges `hub repair` will fetch.
-                            if let Some(w) = windows {
-                                let span: u64 = w.iter().map(|c| c.len).sum();
-                                eprintln!(
-                                    "  {} damaged window(s) in {} — {:.2} MB to refetch",
-                                    w.len(),
-                                    f.path,
-                                    span as f64 / 1e6
-                                );
-                            }
-                            bad += 1;
-                            eprintln!(
-                                "  CORRUPT {} expected {}… got {}…",
-                                f.path,
-                                &want[..16.min(want.len())],
-                                &got[..16.min(got.len())]
-                            );
-                        }
-                        Missing => {
-                            missing += 1;
-                            eprintln!("  MISSING {}", f.path);
-                        }
-                        Unreadable(e) => {
-                            bad += 1;
-                            eprintln!("  UNREADABLE {} ({e})", f.path);
-                        }
-                        // Reported separately: the hub gives no content hash for
-                        // these, so calling them "verified" would overstate it.
-                        LengthOnly => lenonly += 1,
-                    }
-                }
-                eprintln!(
-                    "hub: {good} verified (sha256), {gitok} verified (git blob sha1), \
-{bad} corrupt, {missing} missing, {lenonly} length-only"
-                );
-                if bad > 0 || missing > 0 {
-                    return Err(format!("{} file(s) need repair", bad + missing).into());
-                }
-            }
-            "repair" => {
-                let n = hipfire_hub::run::repair(&root, &repo, &revision, only.as_deref()).await?;
-                eprintln!("hub: repaired {n} file(s)");
-            }
-            other => return Err(format!("hub: unknown op {other:?}").into()),
-        }
-        Ok::<(), Box<dyn Error>>(())
-    })
+    hipfire_coexistence::download::run(&opts)
 }

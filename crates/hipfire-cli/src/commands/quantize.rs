@@ -39,6 +39,9 @@ pub fn run(_args: QuantizeArgs) -> Result<()> {
 /// because grouping conversion tooling in one place is what AGENTS.md asks for.
 /// Step 6 of the merge plan adds coexistence's offline half here too.
 #[derive(Debug, Subcommand)]
+#[command(
+    after_help = "Also reachable here, forwarded verbatim to the offline conversion tools:\n          artifact   inspect | audit-calibration | compare-calibration | moe-router-profile\n          import     gguf | safetensors\n          export     safetensors\n          repack     <hf_dir> <-> <archive.hfa>, or --check   (NOT `optimize`, which is a layout pass)\n          lora       export | merge | convert\n          calibrate  activation capture -> .calib.hfq\n          two-pass   |  induct  |  npu pair-hfp\n\n        These arrive as an external subcommand, so clap cannot enumerate them and\n        `gen-docs` cannot render them -- this list is the only place they appear.\n        Promote one to a real subcommand (as `hipfire download` now is) and it\n        documents itself."
+)]
 pub enum ConvertCommand {
     /// Build a DFlash drafter sidecar from a model
     Dflash(ToolArgs),

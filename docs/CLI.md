@@ -10,6 +10,8 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire restart`↴](#hipfire-restart)
 * [`hipfire status`↴](#hipfire-status)
 * [`hipfire daemon`↴](#hipfire-daemon)
+* [`hipfire download`↴](#hipfire-download)
+* [`hipfire induct`↴](#hipfire-induct)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -71,6 +73,8 @@ Examples:
   hipfire start                   Start the background server
   hipfire status --json           Machine-readable server status
   hipfire list                    Local models, sizes, and capabilities
+  hipfire download Qwen/Qwen3.5-9B   Fetch a model into the local store
+  hipfire induct Qwen/Qwen3.5-9B     Fetch, calibrate and quantize in one go
   hipfire bench --model Qwen3.5-30B-A3B
 
 `--json` is available on start, stop, restart, status, list, and inspect.
@@ -83,6 +87,8 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `restart` — Restart the background hipfire server
 * `status` — Show background server status
 * `daemon` — Run the inference daemon in the foreground (JSON-lines over stdin/stdout)
+* `download` — Download a model repository (`org/name`) into the local store
+* `induct` — Bring an external model into a named `.hfq` — calibrate, quantize, fold sidecars. Accepts a HuggingFace `org/name` or a local safetensors dir
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -206,6 +212,60 @@ Examples:
 
 
 
+## `hipfire download`
+
+Download a model repository (`org/name`) into the local store
+
+**Usage:** `hipfire download [OPTIONS] <REPO>`
+
+Examples:
+  hipfire download Qwen/Qwen3.5-9B
+  hipfire download Qwen/Qwen3.5-9B --revision <sha>
+  hipfire download Zyphra/ZAYA1-8B --include '*.safetensors'
+  hipfire download Qwen/Qwen3.5-9B --raw          # HuggingFace cache tree
+
+Streams into ~/.hipfire/models/models--Org--Name.hfa, encoding as it
+downloads so the raw checkpoint is never staged. An interrupted run
+leaves <archive>.hfa.part and resumes on the next download.
+
+###### **Arguments:**
+
+* `<REPO>` — Repository to fetch, as `org/name`.
+
+   HuggingFace is the only source today. When a second one exists it joins as `--source <name>` rather than a new subcommand.
+
+###### **Options:**
+
+* `--revision <REVISION>` — Revision to pin: a commit sha, or `main`
+
+  Default value: `main`
+* `--include <INCLUDE>` — Only fetch paths matching this glob
+* `--dest <DEST>` — Destination root. Defaults to `~/.hipfire/models` (or `$HF_HOME` with `--raw`)
+* `--output <OUTPUT>` — Write the archive to this exact path instead of deriving it from the repo
+* `--force` — Replace an existing archive. Without this an existing file is never overwritten — these are routinely the only copy of a model on an array with no redundancy
+* `--raw` — Fetch a HuggingFace cache tree instead of encoding to a `.hfa` archive
+* `--jobs <JOBS>` — Parallel connections: whole files in raw mode, ranged windows within a file in archive mode
+
+  Default value: `4`
+
+
+
+## `hipfire induct`
+
+Bring an external model into a named `.hfq` — calibrate, quantize, fold sidecars. Accepts a HuggingFace `org/name` or a local safetensors dir
+
+**Usage:** `hipfire induct [OPTIONS] [SOURCE]`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Model source: a HuggingFace repo id (`org/name`) or a local safetensors directory. Omit to be prompted
+
+###### **Options:**
+
+* `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+
+
+
 ## `hipfire list`
 
 List locally available models
@@ -266,6 +326,20 @@ Examples:
 Convert model artefacts (drafters, MTP heads)
 
 **Usage:** `hipfire convert <COMMAND>`
+
+Also reachable here, forwarded verbatim to the offline conversion tools:
+          artifact   inspect | audit-calibration | compare-calibration | moe-router-profile
+          import     gguf | safetensors
+          export     safetensors
+          repack     <hf_dir> <-> <archive.hfa>, or --check   (NOT `optimize`, which is a layout pass)
+          lora       export | merge | convert
+          calibrate  activation capture -> .calib.hfq
+          two-pass   |  induct  |  npu pair-hfp
+
+        These arrive as an external subcommand, so clap cannot enumerate them and
+        `gen-docs` cannot render them -- this list is the only place they appear.
+        Promote one to a real subcommand (as `hipfire download` now is) and it
+        documents itself.
 
 ###### **Subcommands:**
 
@@ -483,6 +557,8 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 ## `hipfire optimize`
 
 Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+
+The `repack` alias is gone: `repack` is a DIFFERENT operation — the HF-dir <-> `.hfa` archive round-trip — and one name for two things is worse than a longer name for one.
 
 **Usage:** `hipfire optimize [ARGS]...`
 

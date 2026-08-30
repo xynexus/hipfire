@@ -6,8 +6,9 @@
 // without this alias, so it is what lets that file move in untouched.
 extern crate self as hipfire_coexistence;
 
-/// The `hipfire-coexistence` command line, as a module rather than a crate root.
 pub mod cli;
+/// The `hipfire-coexistence` command line, as a module rather than a crate root.
+pub mod download;
 
 /// How this process was invoked, for user-facing text.
 ///
