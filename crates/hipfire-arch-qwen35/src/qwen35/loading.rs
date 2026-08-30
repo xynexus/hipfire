@@ -4800,6 +4800,11 @@ pub fn load_weights(
         let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
             hfq.path(),
             hipfire_runtime::weight_pager::PagerConfig {
+                // Indexed MoE kernels read these experts, so they want the
+                // MoE-block layout. Named rather than defaulted, so a future
+                // consumer choice is a decision here and not an inheritance.
+                expert_layout:
+                    hipfire_runtime::weight_pager::ExpertResidentLayout::IndexedMoeBlocks,
                 // u64::MAX has always meant "never evict"; say so now that the
                 // pager has a name for it.
                 residency: if config.vram_budget_bytes == u64::MAX {
