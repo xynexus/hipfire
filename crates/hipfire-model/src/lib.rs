@@ -3817,7 +3817,7 @@ mod tests {
             kv_cache: "asym3".to_string(),
             kv_adaptive: "balanced".to_string(),
             flash_mode: "auto".to_string(),
-            dflash_mode: "off".to_string(),
+            dflash_draft: "off".to_string(),
             dflash_adaptive_b: false,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,

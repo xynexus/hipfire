@@ -2136,6 +2136,7 @@ mod tests {
                 vocab: None,
                 model_worker: None,
                 response_id: Some("stale".to_string()),
+                batch_prefill_capable: None,
             }),
             DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "worker-a".to_string(),
@@ -2146,6 +2147,7 @@ mod tests {
                 vocab: Some(151936),
                 model_worker: None,
                 response_id: None,
+                batch_prefill_capable: None,
             }),
         ]);
 
