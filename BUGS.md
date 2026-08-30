@@ -1873,7 +1873,7 @@ where the decode GEMV takes a per-expert table. Patching only the gate gives
 
 → `docs/bugs/2026-08-26-122b-prefill-ceiling.md`
 
-## [Medium] `--mixed-bpw` is silently ignored unless the input is an `.hfq`
+## [Medium — PARTLY FIXED 2026-08-30] `--mixed-bpw` is silently ignored unless the input is an `.hfq`
 
 Threaded only into `run_hfq_source_pipeline`, so safetensors and `.hfa` input
 drop it with no warning and produce uniform experts. (`.hfa` input itself is

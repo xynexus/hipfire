@@ -1,6 +1,10 @@
 # `--mixed-bpw` is silently ignored unless the input is an `.hfq`
 
-Status: **OPEN**. Opened 2026-08-27. Summary entry in `BUGS.md`.
+Status: **FIXED 2026-08-30** — the silent no-op is gone; `--mixed-bpw` now
+REFUSES a non-`.hfq` input (and a malformed value, which used to `.ok()` into
+`None` and read as "flag not passed"). Threading the promoter into the source
+pipeline is still open, and is the better fix; see "Fix" below. Opened
+2026-08-27. Summary entry in `BUGS.md`.
 
 ## The defect
 
@@ -72,3 +76,20 @@ per-tensor choice; today it arrives run-wide (`opus_group`).
 Either thread `mixed_bpw_target` into the source pipeline, or reject
 `--mixed-bpw` loudly when the input is not an `.hfq`. The silent no-op is the
 worst of the three.
+
+**Done 2026-08-30: the refusal half.** `crates/hipfire-quantize/src/cli.rs`
+rejects `--mixed-bpw` on a non-HFQ input, next to the identical
+`--tensor-format` guard that was already there, and the error names the
+`source -> .hfq -> re-quantize` route plus the `--mixed-bpw` vs `oq4.25++`
+distinction this document warns about. The argument parser no longer swallows a
+missing or unparseable value.
+
+`tests/tiny-moe-mixed-gate.sh` asserts the refusal before its GPU steps, so a
+regression to silence fails the gate. It uses `--format oq4` deliberately: the
+`++` formats demand `--hessian` earlier in the same function, so an `oq4.25++`
+probe would refuse for an unrelated reason and assert nothing.
+
+**Still open: threading `mixed_bpw_target` into the source pipeline**, which is
+what makes a mixed artifact buildable directly from `.hfa`/safetensors and
+avoids the tensor-set difference (and the `K % 256` hard error) that the
+`source -> .hfq -> re-quantize` detour introduces.
