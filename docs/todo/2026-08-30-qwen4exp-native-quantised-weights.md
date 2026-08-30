@@ -61,18 +61,39 @@ Three things about that path are already known and should not be re-derived:
    put the 512-expert set at ~66 GB with N=4 grouping versus 105 GB per-tensor, so
    this does not additionally require the pager.
 
+## Where the bytes actually are
+
+Measured against the shipped geometry (hidden 2560, mi 640, 48 layers, 512
+experts, vocab 248320):
+
+```
+  routed experts          120.80 B params   97.3%
+  shared experts            0.24 B params    0.2%
+  attn + GDN (approx)       2.52 B params    2.0%
+  lm_head                   0.64 B params    0.5%
+  TOTAL trunk             124.18 B params
+```
+
+**The routed experts are 97.3% of the trunk.** Converting every other linear in
+the crate saves 2.7% and changes nothing about whether the model fits. That is
+worth stating plainly because the natural instinct — do the easy mechanical ones
+first, then the hard one — produces a large diff, a satisfying green gate, and no
+progress against the actual constraint.
+
 ## Suggested order
 
-1. Fix the `mi=640` Opus admission bug first — otherwise every quality number
-   measured on this geometry is measuring an uncalibrated HFQ4G128 fallback.
-2. Convert the NON-expert linears (attention, GDN, hyper-connections, PLE, router,
-   shared expert, lm_head) to `WeightTensor` + `weight_gemv`. Mechanical, and it
-   makes the remaining diff purely about experts.
-3. Move routed experts onto the indexed kernels, threading `k` (10 here) through
-   `INDEXED_MOE_K_TOP` / `oq_indexed_admissible` / the loader repack so they keep
-   agreeing.
-4. Only then re-measure. Until step 1 lands, an oq4 number on this family is not
-   a quantisation result.
+1. **Fix the `mi=640` Opus admission bug.** DONE 2026-08-30 for `oq4` (see
+   BUGS.md): a 128-aligned K now routes to `OqPlusCompactG128` instead of falling
+   out of Opus and losing calibration. Still open for `oq8`/`oq8+`, which have no
+   G128 producer path and now warn loudly instead of failing silently. Until this
+   held, any oq4 number on this geometry was measuring an uncalibrated HFQ4G128
+   fallback, not a quantisation result.
+2. **Routed experts onto the indexed kernels.** This is the whole job. Thread `k`
+   (10 here) through `INDEXED_MOE_K_TOP` / `oq_indexed_admissible` / the loader
+   repack so they keep agreeing, and replace `moe_gpu::view2d` + `gemv_f32` with
+   the indexed GEMVs.
+3. The other linears, whenever. They are 2.7% and can follow at leisure — or never,
+   if `weight_gemv` on an f32 `WeightTensor` is not worth the churn.
 
 ## Do not
 

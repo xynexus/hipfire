@@ -115,9 +115,20 @@ fn stack_experts(
     which: &str,
     n_exp: usize,
     shape: &[usize],
-) -> HipResult<GpuTensor> {
+) -> HipResult<crate::moe_gpu::ExpertStack> {
+    // `shape` is [n_exp, rows, cols]; one expert's region is rows*cols f32, which
+    // is self-contained, so a per-expert view is a single offset.
+    let rows = shape[1];
+    let cols = shape[2];
+    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack {
+        buf,
+        dtype: DType::F32,
+        rows,
+        cols,
+        stride: rows * cols,
+    };
     if let Ok(v) = w.read(&format!("{mp}.experts.{which}")) {
-        return gpu.upload_f32(&v, shape);
+        return Ok(wrap(gpu.upload_f32(&v, shape)?));
     }
     let per: usize = shape[1..].iter().product();
     let mut all = Vec::with_capacity(n_exp * per);
@@ -140,7 +151,7 @@ fn stack_experts(
         }
         all.extend_from_slice(&v);
     }
-    gpu.upload_f32(&all, shape)
+    Ok(wrap(gpu.upload_f32(&all, shape)?))
 }
 
 fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> {

@@ -16,14 +16,75 @@
 
 use crate::config::Qwen4ExpConfig;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
+
+/// The routed experts for ONE projection, in a single allocation.
+///
+/// One buffer, not `n_experts` of them, and that is a hardware decision rather
+/// than tidiness: gfx1151 rounds every GTT allocation up to 2 MiB, so a 512-expert
+/// model allocated per expert pays that rounding 512 times per projection per
+/// layer. The measured cost of getting this wrong on a comparable model was
+/// 105 GB against 66 GB for the same weights.
+///
+/// The experts sit back to back, each region SELF-CONTAINED so a per-expert view
+/// is one offset. For a quantised Opus dtype that region is the combined
+/// `[int8 weights | f32 scales]` form the kernels expect — which is why the
+/// experts cannot simply be a stride into one flat weight plane: `weight_gemv`
+/// finds a tensor's scales immediately after its own weights.
+pub struct ExpertStack {
+    pub buf: GpuTensor,
+    pub dtype: DType,
+    /// Per-expert output rows.
+    pub rows: usize,
+    /// Per-expert input dim (K).
+    pub cols: usize,
+    /// Elements between the start of one expert's region and the next.
+    pub stride: usize,
+}
+
+impl ExpertStack {
+    /// A `WeightTensor` view of expert `e`. Cheap — a sub-offset, no copy.
+    ///
+    /// The 2-D shape has to be restored explicitly. `sub_offset` returns a flat
+    /// `[len]` view, and the F32 GEMV reads `shape[1]` for its inner dimension —
+    /// leaving it 1-D indexes out of bounds. Quantised paths take `m`/`k` from the
+    /// `WeightTensor` instead and do not care, so this only has to be right where
+    /// the shape is actually read.
+    pub fn expert(&self, e: usize) -> WeightTensor {
+        let mut buf = self.buf.sub_offset(e * self.stride, self.stride);
+        if self.dtype == DType::F32 {
+            buf.shape = vec![self.rows, self.cols];
+        }
+        WeightTensor {
+            buf,
+            gpu_dtype: self.dtype,
+            m: self.rows,
+            k: self.cols,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        }
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            buf,
+            dtype: _,
+            rows: _,
+            cols: _,
+            stride: _,
+        } = self;
+        let _ = gpu.free_tensor(buf);
+    }
+}
 
 pub struct MoeWeights {
     /// `[n_experts, hidden]`
     pub router: GpuTensor,
-    /// `[n_experts, 2 * mi, hidden]` stacked, gate first.
-    pub gate_up: GpuTensor,
-    /// `[n_experts, hidden, mi]` stacked.
-    pub down: GpuTensor,
+    /// `[n_experts, 2 * mi, hidden]`, gate first.
+    pub gate_up: ExpertStack,
+    /// `[n_experts, hidden, mi]`.
+    pub down: ExpertStack,
     /// `[shared_mi, hidden]` each.
     pub shared_gate: GpuTensor,
     pub shared_up: GpuTensor,
@@ -77,17 +138,6 @@ impl MoeScratch {
     }
 }
 
-/// A 2-D view into a stacked expert tensor.
-///
-/// `sub_offset` returns a flat `[len]` view, but `gemv_f32` reads `shape[1]` for
-/// its inner dimension — a 1-D view makes it index out of bounds. The shape has to
-/// be restored explicitly.
-fn view2d(t: &GpuTensor, offset: usize, rows: usize, cols: usize) -> GpuTensor {
-    let mut v = t.sub_offset(offset, rows * cols);
-    v.shape = vec![rows, cols];
-    v
-}
-
 /// One token through the block. `x` and `out` are `[hidden]`.
 pub fn moe_forward(
     gpu: &mut Gpu,
@@ -114,17 +164,18 @@ pub fn moe_forward(
         .iter()
         .map(|v| v.to_bits() as i32)
         .collect();
-    let (gu_sz, dn_sz) = (2 * mi * hidden, hidden * mi);
     for (slot, &e) in idx.iter().enumerate() {
         let e = e.max(0) as usize;
-        let gu = view2d(&w.gate_up, e * gu_sz, 2 * mi, hidden);
-        let dn = view2d(&w.down, e * dn_sz, hidden, mi);
-        gpu.gemv_f32(&gu, x, &s.gu)?;
+        // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
+        // runs its own kernel rather than being dequantised into scratch.
+        let gu = w.gate_up.expert(e);
+        let dn = w.down.expert(e);
+        weight_gemv(gpu, &gu, x, &s.gu)?;
         // Contiguous halves of the projection output, gate FIRST.
         let gate = s.gu.sub_offset(0, mi);
         let up = s.gu.sub_offset(mi, mi);
         gpu.silu_mul_f32(&gate, &up, &s.inter)?;
-        gpu.gemv_f32(&dn, &s.inter, &s.expert_out)?;
+        weight_gemv(gpu, &dn, &s.inter, &s.expert_out)?;
         // The routing weight scales the expert's OUTPUT, after `down`.
         // Slot 0 overwrites; the rest accumulate. Saves a zero-fill pass.
         gpu.moe_accum_scaled(
@@ -166,10 +217,10 @@ impl MoeWeights {
             shared_down,
             shared_expert_gate,
         } = self;
+        gate_up.free(gpu);
+        down.free(gpu);
         for t in [
             router,
-            gate_up,
-            down,
             shared_gate,
             shared_up,
             shared_down,
