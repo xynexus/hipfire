@@ -1,7 +1,9 @@
 # Calibration capture is nondeterministic; inference is not
 
-Status: **localized to layer-0 attention, NOT fixed** — 2026-08-30, nix2 (gfx1103).
-Instrumented and re-measured; the original suspect below is DISPROVEN.
+Status: **ROOT-CAUSED AND FIXED** — 2026-08-30, nix2 (gfx1103). A data race in
+`zaya_value_compose_f32` when `num_key_value_heads == 1`. Two earlier suspects in
+this document (the gather skip, then attention itself) are both DISPROVEN; the
+trail is kept because the eliminations are what made the last step obvious.
 
 Chasing the flaky `zaya/kld:oq4.25++` tiny-quant cell led to something larger
 than a flaky cell. `tiny_quant_probe collect` — the instrumented forward that
@@ -156,3 +158,73 @@ kernels, which is the kind of timing/occupancy change that surfaces a latent
 multi-wave or LDS hazard. gfx1103 has a documented one (README "gfx1103 /
 Phoenix LDS status", HIP-719 / CWSR), which makes the attention reduction on this
 arch the first place to look.
+
+
+## Root cause: `zaya_value_compose_f32` races when `nkv == 1`
+
+Bisected by hashing tensors along the calibration forward. Per layer, in order:
+
+    L0.vcur_postgemv    identical
+    L0.vdel_postgemv    identical
+    L0.vcur_precompose  identical
+    L0.vdel_precompose  identical
+    L0.q_in             identical
+    L0.k_in             identical
+    L0.v_in             DIFFERENT   <-- first divergence
+    L0.attn_out         DIFFERENT   (consequence)
+
+So attention was innocent — as its structure already implied: one thread per
+(token, head), private output row, no atomics, no LDS, no shuffles. Its `value`
+input was already wrong. And `v_cur`/`v_del` are bit-identical immediately before
+the compose, so the compose kernel turns identical inputs into different output.
+
+The kernel writes the composed value as two KV heads:
+
+    value[(t*nkv + 0)*hd + d] = v_cur[t*hd + d];
+    value[(t*nkv + 1)*hd + d] = (t == 0) ? 0.0f : v_del[(t-1)*hd + d];
+
+The zaya toy fixture is `heads: 2, kv_heads: 1, head_dim: 128`. With `nkv == 1`,
+`(t*1 + 1)*hd` is **token t+1's head 0**. Thread `t` writes `v_del[t-1]` to the
+exact address thread `t+1` writes `v_cur[t+1]` to — same location, different
+values, winner decided by scheduling. A data race, from bit-identical inputs.
+
+Two more consequences of the same off-by-one:
+
+- The `t = s-1` thread writes one full head *past the end* of the
+  `s*nkv*hd` buffer.
+- Attention computes `groups = nq/nkv`, so with `nq=2, nkv=1` every query head
+  reads value head 0. The delayed half is never consumed, while its write
+  corrupts the half that is.
+
+This explains every earlier observation: identical inputs with divergent output,
+rarity (one order usually wins), amplification under `AMD_SERIALIZE_*` (changed
+scheduling), invisibility to plain decode (`gpu_forward_calib` prefills all 24
+tokens at once, so `s > 1` and adjacent-token threads coexist; decode runs s=1
+and cannot race), and the Heisenbug where adding a `download_f32` probe
+serialized layer 0 and pushed the divergence to layer 1.
+
+`nkv >= 2` is structural for a compositional value, not a tuning choice.
+
+## Fix
+
+- `zaya_value_compose_f32` (dispatch) now **refuses** `nkv < 2` with a message
+  naming the aliasing, rather than computing a silently wrong answer — the house
+  rule from the 2026-08-29 hunt.
+- The zaya toy fixture takes `kv_heads: 2`, which is what the design requires and
+  what makes the tiny gate exercise the real path. All 7 zaya baselines were
+  re-recorded (the geometry changed, so every one is stale by construction);
+  `oq8` fell from 3.85e-6 to 2e-8, i.e. near-lossless once the value tensor stops
+  being corrupted.
+
+## Verification
+
+- `collect` × 16 on the corrected fixture: **1 distinct artifact** (was 2 of 10,
+  and 6 of 10 under `AMD_SERIALIZE_KERNEL=3`).
+- `tiny-quant-gate.sh`: **187 pass / 0 fail, twice consecutively.**
+
+## Scope
+
+The refusal is the part that matters beyond this fixture. Any zaya artifact with
+`num_key_value_heads == 1` was taking the same racing, out-of-bounds path in
+prefill — including production calibration, where nothing would have flagged it.
+It now fails loudly at dispatch instead.
