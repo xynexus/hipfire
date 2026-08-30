@@ -46,6 +46,10 @@
 // One wave32 computes one 16x16 output tile. Both fragments come straight from
 // global every k-step. This is the floor: it does the least possible work per
 // byte moved, and every later rung has to beat it.
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
