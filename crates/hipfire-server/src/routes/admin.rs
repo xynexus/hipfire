@@ -702,6 +702,11 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       background: var(--panel);
     }
     .login-card h2 { margin: 0; font-size: 16px; }
+    /* The global input width is a fixed 360px — the same as the card — so
+       inside the card the fields overflowed its padding by 44px and painted
+       past the border. Fields in here fill the card instead. */
+    .login-card label { display: grid; gap: 6px; }
+    .login-card input, .login-card button { width: 100%; }
     .login-card .login-error { color: var(--warn); min-height: 16px; font-size: 12px; }
     #logout { margin-left: 12px; }
   </style>
@@ -736,6 +741,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       <button class="tab" data-tab="diagnostics" type="button">Diagnostics</button>
       <button class="tab" data-tab="logs" type="button">Logs</button>
       <button class="tab" data-tab="config" id="tab-config" type="button">Config</button>
+      <button class="tab" data-tab="jobs" id="tab-jobs" type="button">Jobs</button>
       <button class="tab" data-tab="training" id="tab-training" type="button">Training</button>
     </nav>
     <section id="overview-panel" class="panel">
@@ -746,6 +752,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         <div class="metric"><span>Health</span><strong id="overview-health">-</strong></div>
         <div class="metric"><span>PID</span><strong id="overview-pid">-</strong></div>
         <div class="metric"><span>Model</span><strong id="overview-model">-</strong></div>
+        <div class="metric"><span>Jobs</span><strong id="overview-jobs">-</strong></div>
         <div class="metric"><span>Training</span><strong id="overview-training">-</strong></div>
       </section>
       <div class="grid">
@@ -870,6 +877,45 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         <tbody id="rows"></tbody>
       </table>
     </section>
+    <section id="jobs-panel" class="panel" hidden>
+      <div class="toolbar">
+        <button id="jobs-refresh" type="button">Refresh</button>
+        <button id="jobs-cancel" type="button" disabled>Cancel selected</button>
+      </div>
+      <section class="summary" aria-label="Jobs summary">
+        <div class="metric"><span>Jobs</span><strong id="jobs-count">-</strong></div>
+        <div class="metric"><span>Running</span><strong id="jobs-running">-</strong></div>
+        <div class="metric"><span>Directory</span><strong id="jobs-dir">-</strong></div>
+      </section>
+      <div class="grid">
+        <section>
+          <h2 class="section-title">Queue</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>State</th>
+                <th>Done</th>
+                <th>Target</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-rows"></tbody>
+          </table>
+        </section>
+        <section>
+          <h2 class="section-title">Selected Job</h2>
+          <section class="summary" aria-label="Selected job">
+            <div class="metric"><span>Kind</span><strong id="job-kind">-</strong></div>
+            <div class="metric"><span>State</span><strong id="job-state">-</strong></div>
+            <div class="metric"><span>Target</span><strong id="job-target">-</strong></div>
+            <div class="metric"><span>Progress</span><strong id="job-progress">-</strong></div>
+          </section>
+          <div id="job-id" class="key">-</div>
+          <div id="job-detail" class="muted">-</div>
+          <div id="job-log" class="event-list"></div>
+        </section>
+      </div>
+    </section>
     <section id="training-panel" class="panel" hidden>
       <div class="toolbar">
         <button id="training-refresh" type="button">Refresh</button>
@@ -928,6 +974,20 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const overviewPidEl = document.getElementById("overview-pid");
     const overviewModelEl = document.getElementById("overview-model");
     const overviewTrainingEl = document.getElementById("overview-training");
+    const overviewJobsEl = document.getElementById("overview-jobs");
+    const jobsRefreshEl = document.getElementById("jobs-refresh");
+    const jobsCancelEl = document.getElementById("jobs-cancel");
+    const jobsCountEl = document.getElementById("jobs-count");
+    const jobsRunningEl = document.getElementById("jobs-running");
+    const jobsDirEl = document.getElementById("jobs-dir");
+    const jobsRowsEl = document.getElementById("jobs-rows");
+    const jobKindEl = document.getElementById("job-kind");
+    const jobStateEl = document.getElementById("job-state");
+    const jobTargetEl = document.getElementById("job-target");
+    const jobProgressEl = document.getElementById("job-progress");
+    const jobIdEl = document.getElementById("job-id");
+    const jobDetailEl = document.getElementById("job-detail");
+    const jobLogEl = document.getElementById("job-log");
     const overviewRuntimeEl = document.getElementById("overview-runtime");
     const overviewIssuesEl = document.getElementById("overview-issues");
     const chatModelEl = document.getElementById("chat-model");
@@ -971,6 +1031,11 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const trainingAdmissionEl = document.getElementById("training-admission");
     const trainingEventsEl = document.getElementById("training-events");
     let selectedTrainingRun = null;
+    let selectedJob = null;
+    // Poll handle for the Jobs tab. A queue view that needs the Refresh button
+    // pressed is not a monitor, but polling a tab nobody is looking at is just
+    // load, so this is started and stopped by showTab().
+    let jobsPollTimer = null;
     let chatMessages = [];
     let currentConfigSnapshot = null;
 
@@ -1139,16 +1204,19 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
 
     async function loadOverview() {
       statusEl.textContent = "loading overview";
-      const [health, diagnostics, training] = await Promise.all([
+      const [health, diagnostics, training, jobs] = await Promise.all([
         fetchJson("/health"),
         fetchJson("/admin/diagnostics"),
         fetchJson("/admin/training/runs"),
+        fetchJson("/admin/jobs"),
       ]);
       overviewHealthEl.textContent = health.status || "-";
       overviewPidEl.textContent = health.pid || "-";
       overviewModelEl.textContent = health.active_model || health.model || "none";
       const runs = training.runs || [];
       overviewTrainingEl.textContent = `${runs.filter(isActiveRun).length} active / ${runs.length} runs`;
+      const jobList = jobs.jobs || [];
+      overviewJobsEl.textContent = `${jobList.filter((job) => job.state === "running").length} running / ${jobList.length} jobs`;
       overviewRuntimeEl.replaceChildren(...keyValueRows([
         ["Bind", location.origin],
         ["Residency", health.scheduler_resources && health.scheduler_resources.model_residency_mode],
@@ -1280,6 +1348,120 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       const snapshot = await fetchJson(`/admin/config/editor${suffix}`);
       render(snapshot);
       statusEl.textContent = model ? `model ${model}` : "config editor";
+    }
+
+    function shortJobId(id) {
+      const underscore = id.indexOf("_");
+      return underscore > 0 && id.length > underscore + 9 ? `${id.slice(0, underscore + 9)}\u2026` : id;
+    }
+
+    function jobPercent(job) {
+      // The fetcher already prints its own progress ("... (2%) ..."), so read
+      // the number back out of the detail line rather than inventing a field.
+      const match = /\((\d+)%\)/.exec(job.detail || "");
+      return match ? `${match[1]}%` : "-";
+    }
+
+    async function loadJobs() {
+      const payload = await fetchJson("/admin/jobs");
+      renderJobs(payload);
+      const ids = (payload.jobs || []).map((job) => job.id);
+      if (!selectedJob || !ids.includes(selectedJob)) selectedJob = ids[0] || null;
+      if (selectedJob) {
+        await loadJobDetail(selectedJob);
+      } else {
+        clearJobDetail();
+      }
+      statusEl.textContent = "jobs";
+    }
+
+    async function loadJobDetail(id) {
+      selectedJob = id;
+      const detail = await fetchJson(`/admin/jobs/${encodeURIComponent(id)}`);
+      renderJobDetail(detail);
+    }
+
+    async function cancelSelectedJob() {
+      if (!selectedJob) return;
+      const resp = requireAuthorized(await fetch(`/admin/jobs/${encodeURIComponent(selectedJob)}/cancel`, {
+        method: "POST",
+      }));
+      const payload = await resp.json();
+      if (!resp.ok || payload.error) {
+        throw new Error((payload.error && payload.error.message) || `cancel ${resp.status}`);
+      }
+      statusEl.textContent = payload.detail || "cancel requested";
+      await loadJobs();
+    }
+
+    function renderJobs(payload) {
+      const jobs = payload.jobs || [];
+      jobsCountEl.textContent = String(jobs.length);
+      jobsRunningEl.textContent = String(jobs.filter((job) => job.state === "running").length);
+      jobsDirEl.textContent = payload.jobs_dir || "-";
+      jobsRowsEl.replaceChildren(...jobs.map((job) => {
+        const tr = document.createElement("tr");
+        tr.className = `selectable${job.id === selectedJob ? " selected" : ""}`;
+        tr.addEventListener("click", () => loadJobDetail(job.id).catch(showError));
+        const id = document.createElement("td");
+        id.className = "key";
+        // A `<kind>_<uuid>` id is wide enough to push the table over its grid
+        // column and paint on top of the detail pane, so show a short form and
+        // keep the whole thing on the row title and in the detail pane.
+        id.textContent = shortJobId(job.id);
+        id.title = job.id;
+        const state = document.createElement("td");
+        state.className = job.state === "failed" ? "warn" : "";
+        state.textContent = job.state;
+        const done = document.createElement("td");
+        done.textContent = jobPercent(job);
+        const target = document.createElement("td");
+        target.textContent = job.label || "-";
+        tr.append(id, state, done, target);
+        return tr;
+      }));
+      if (!jobs.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.className = "muted";
+        cell.textContent = "Nothing queued. Start one with `hipfire download <repo> --detach`.";
+        row.append(cell);
+        jobsRowsEl.replaceChildren(row);
+      }
+    }
+
+    function renderJobDetail(detail) {
+      const job = detail.summary || {};
+      jobIdEl.textContent = job.id || "-";
+      jobKindEl.textContent = job.kind || "-";
+      jobStateEl.textContent = job.state || "-";
+      jobTargetEl.textContent = job.label || "-";
+      jobProgressEl.textContent = jobPercent(job);
+      jobDetailEl.textContent = job.detail || "-";
+      jobsCancelEl.disabled = job.state !== "running" && job.state !== "queued";
+      const lines = (detail.log || "").split("\n").filter((line) => line.length);
+      jobLogEl.replaceChildren(...lines.map((line) => {
+        const div = document.createElement("div");
+        div.className = "event";
+        div.textContent = line;
+        return div;
+      }));
+      if (!lines.length) {
+        const div = document.createElement("div");
+        div.className = "muted";
+        div.textContent = "No log output yet.";
+        jobLogEl.replaceChildren(div);
+      }
+    }
+
+    function clearJobDetail() {
+      selectedJob = null;
+      jobsCancelEl.disabled = true;
+      for (const el of [jobIdEl, jobKindEl, jobStateEl, jobTargetEl, jobProgressEl, jobDetailEl]) {
+        el.textContent = "-";
+      }
+      jobLogEl.replaceChildren();
     }
 
     async function loadTraining() {
@@ -1576,8 +1758,16 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         diagnostics: loadDiagnostics,
         logs: loadLogs,
         config: loadConfig,
+        jobs: loadJobs,
         training: loadTraining,
       };
+      if (jobsPollTimer) {
+        clearInterval(jobsPollTimer);
+        jobsPollTimer = null;
+      }
+      if (name === "jobs") {
+        jobsPollTimer = setInterval(() => loadJobs().catch(showError), 2000);
+      }
       (loaders[name] || loadOverview)().catch(showError);
     }
 
@@ -1601,6 +1791,8 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     configTargetEl.addEventListener("change", () => {
       if (currentConfigSnapshot) render(currentConfigSnapshot);
     });
+    jobsRefreshEl.addEventListener("click", () => loadJobs().catch(showError));
+    jobsCancelEl.addEventListener("click", () => cancelSelectedJob().catch(showError));
     trainingRefreshEl.addEventListener("click", () => loadTraining().catch(showError));
     for (const tab of tabEls) tab.addEventListener("click", () => showTab(tab.dataset.tab));
     modelEl.addEventListener("keydown", (event) => {
@@ -1651,6 +1843,10 @@ mod tests {
         assert!(ADMIN_INDEX_HTML.contains("id=\"login-form\""));
         assert!(ADMIN_INDEX_HTML.contains("function showLogin"));
         assert!(ADMIN_INDEX_HTML.contains("requireAuthorized"));
+        // The global `input { width: min(360px, 76vw) }` is exactly the card's
+        // own width, so without this override the fields overflow the card's
+        // padding and paint past its border.
+        assert!(ADMIN_INDEX_HTML.contains(".login-card input, .login-card button { width: 100%; }"));
     }
 
     #[test]
@@ -1673,6 +1869,26 @@ mod tests {
                 ADMIN_INDEX_HTML.matches(open).count(),
                 1,
                 "expected exactly one {open}"
+            );
+        }
+    }
+
+    /// The page is a string constant, so a tab whose panel, loader or handler
+    /// got lost in an edit still compiles. Pin the pieces that have to line up.
+    #[test]
+    fn admin_index_exposes_the_jobs_surface() {
+        for needle in [
+            "data-tab=\"jobs\"",
+            "id=\"jobs-panel\"",
+            "/admin/jobs",
+            "function loadJobs",
+            "function renderJobs",
+            "cancelSelectedJob",
+            "/cancel",
+        ] {
+            assert!(
+                ADMIN_INDEX_HTML.contains(needle),
+                "admin page lost {needle}"
             );
         }
     }

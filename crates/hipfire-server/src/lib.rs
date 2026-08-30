@@ -110,6 +110,12 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/admin/models/registry",
             get(routes::models::get_model_registry),
         )
+        .route("/admin/jobs", get(routes::jobs::list_jobs_route))
+        .route("/admin/jobs/{id}", get(routes::jobs::get_job))
+        .route(
+            "/admin/jobs/{id}/cancel",
+            post(routes::jobs::post_job_cancel),
+        )
         .route(
             "/admin/training/runs",
             get(routes::training::list_training_runs_route),
