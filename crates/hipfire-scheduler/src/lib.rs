@@ -1244,6 +1244,21 @@ pub fn server_prefill_batch_enabled(env: &SchedulerPolicyEnv) -> bool {
         .unwrap_or(true)
 }
 
+/// What the `counters` key says in every health view that has no instrumentation
+/// behind it.
+///
+/// Issue #384: these builders used to emit ~25 zeroed counters — `cache_hits`,
+/// `entries`, `prefix_hash_preflight_matches` — interleaved with genuinely
+/// config-derived fields, and nothing in the payload separated the two. One live
+/// response reported `scheduled_total: 300` beside `cache_misses: 0`, which is
+/// arithmetically impossible for a real counter, and a stone-cold cache was
+/// indistinguishable from a working one. The literals are gone rather than
+/// nulled: an ABSENT key cannot be misread as a measurement of zero. Fields that
+/// survive here are measured or config-derived; `batch_runner`'s telemetry
+/// patches the live ones in when the continuous-batch runner is active.
+const UNMEASURED_COUNTERS: &str =
+    "unimplemented — absent counter keys are not instrumented, not zero";
+
 pub fn server_prefill_batch_health_json(env: &SchedulerPolicyEnv) -> serde_json::Value {
     if !server_prefill_batch_enabled(env) {
         return serde_json::json!({ "enabled": false });
@@ -1255,42 +1270,19 @@ pub fn server_prefill_batch_health_json(env: &SchedulerPolicyEnv) -> serde_json:
 
     let mut payload = serde_json::json!({
         "enabled": true,
-        "queued": 0,
-        "eligible": 0,
-        "selected": 0,
-        "skipped": 0,
-        "total_batches": 0,
-        "fused_batches": 0,
-        "fallback_batches": 0,
-        "batch_size_histogram": {},
-        "cache_hits": 0,
-        "cache_misses": 0,
-        "metadata_cache_hits": 0,
-        "runtime_cache_hits": 0,
-        "queue_size": 0,
-        "pending_requests": 0,
-        "resident_runtime_sessions": 0,
-        "resident_decode_sessions": 0,
-        "resident_checkpoints": 0,
+        "counters": UNMEASURED_COUNTERS,
         "resident_checkpoint_max": controls.resident_checkpoint_max,
         "resident_state_cache": controls.resident_state_cache,
         "resident_state_limit": policy.resident_state_max,
         "spillable_batch_max": policy.spillable_batch_max,
-        "spillable_sessions": 0,
         "state_cache_disk": controls.state_cache_disk,
         "state_cache_disk_min_priority": policy.disk_spill_min_priority,
         "disk_spill_allowed": policy.disk_spill_allowed,
-        "state_cache_evictions_total": 0,
-        "state_cache_recompute_required_total": 0,
         "generate_batch_prefill_capability": "unknown",
         "generate_batch_prefill_capability_reason": "rust_server_daemon_capability_not_probed",
         "queue_wait_reason": "disabled",
         "fallback_reason": "rust_server_scheduler_metadata_only",
         "runtime_dispatch_skipped_reason": "rust_server_prefill_queue_not_enabled",
-        "selected_batch_size": 0,
-        "last_prefill_tokens": 0,
-        "last_prefill_ms": 0,
-        "last_prefill_tok_s": 0,
     });
     payload["policy"] = serde_json::json!({
         "priority": policy.priority,
@@ -1309,14 +1301,7 @@ pub fn server_decode_batch_health_json(env: &SchedulerPolicyEnv) -> serde_json::
     }
     serde_json::json!({
         "enabled": true,
-        "eligible": 0,
-        "selected": 0,
-        "skipped": 0,
-        "active_sessions": 0,
-        "selected_batch_size": 0,
-        "total_batches": 0,
-        "serial_batches": 0,
-        "fused_batches": 0,
+        "counters": UNMEASURED_COUNTERS,
         "last_skipped_reason": "rust_server_decode_scheduler_not_enabled",
         "fallback_reason": "rust_server_scheduler_metadata_only",
     })
@@ -1329,29 +1314,10 @@ pub fn server_state_cache_health_json(env: &SchedulerPolicyEnv) -> serde_json::V
     let controls = parse_server_prefill_policy_controls(env);
     serde_json::json!({
         "enabled": controls.resident_state_cache || controls.state_cache_disk,
+        "counters": UNMEASURED_COUNTERS,
         "resident_enabled": controls.resident_state_cache,
-        "resident_checkpoints": 0,
         "resident_checkpoint_max": controls.resident_checkpoint_max,
         "disk_enabled": controls.state_cache_disk,
-        "daemon_prefix_hash": false,
-        "daemon_prefix_hash_entries": 0,
-        "semantic_boundary_checkpoints": false,
-        "semantic_boundary_checkpoint_entries": 0,
-        "prefix_hash_preflight_requests": 0,
-        "prefix_hash_preflight_candidates": 0,
-        "prefix_hash_preflight_matches": 0,
-        "prefix_hash_preflight_boundary_matches": 0,
-        "shared_prefix_fanout_groups": 0,
-        "shared_prefix_fanout_followers": 0,
-        "responses_previous_response_hits": 0,
-        "responses_previous_response_misses": 0,
-        "responses_stored_contexts": 0,
-        "entries": 0,
-        "bytes": 0,
-        "metadata_hits": 0,
-        "runtime_hits": 0,
-        "evictions_total": 0,
-        "recompute_required_total": 0,
     })
 }
 
@@ -2158,6 +2124,78 @@ mod tests {
         assert_eq!(payload["resident_enabled"], true);
         assert_eq!(payload["resident_checkpoint_max"], 5);
         assert_eq!(payload["disk_enabled"], true);
+    }
+
+    #[test]
+    fn health_views_emit_no_uninstrumented_counter() {
+        // Issue #384: a zeroed literal beside a real config-derived field is
+        // indistinguishable from a measurement. Nothing these builders emit on
+        // their own may be a counter.
+        let on = env(&[("HIPFIRE_SERVER_PREFILL_BATCH", "1")]);
+        // Every counter key the builders used to fabricate.
+        let fabricated = [
+            "queued",
+            "eligible",
+            "selected",
+            "skipped",
+            "total_batches",
+            "fused_batches",
+            "fallback_batches",
+            "serial_batches",
+            "batch_size_histogram",
+            "cache_hits",
+            "cache_misses",
+            "metadata_cache_hits",
+            "runtime_cache_hits",
+            "queue_size",
+            "pending_requests",
+            "active_sessions",
+            "resident_runtime_sessions",
+            "resident_decode_sessions",
+            "resident_checkpoints",
+            "spillable_sessions",
+            "state_cache_evictions_total",
+            "state_cache_recompute_required_total",
+            "selected_batch_size",
+            "last_prefill_tokens",
+            "last_prefill_ms",
+            "last_prefill_tok_s",
+            "daemon_prefix_hash",
+            "daemon_prefix_hash_entries",
+            "semantic_boundary_checkpoints",
+            "semantic_boundary_checkpoint_entries",
+            "prefix_hash_preflight_requests",
+            "prefix_hash_preflight_candidates",
+            "prefix_hash_preflight_matches",
+            "prefix_hash_preflight_boundary_matches",
+            "shared_prefix_fanout_groups",
+            "shared_prefix_fanout_followers",
+            "responses_previous_response_hits",
+            "responses_previous_response_misses",
+            "responses_stored_contexts",
+            "entries",
+            "bytes",
+            "metadata_hits",
+            "runtime_hits",
+            "evictions_total",
+            "recompute_required_total",
+        ];
+        for (name, payload) in [
+            ("prefill_batch", server_prefill_batch_health_json(&on)),
+            ("decode_batch", server_decode_batch_health_json(&on)),
+            ("state_cache", server_state_cache_health_json(&on)),
+        ] {
+            assert_eq!(
+                payload["counters"], UNMEASURED_COUNTERS,
+                "{name} must say its counters are unimplemented"
+            );
+            for key in fabricated {
+                assert!(
+                    payload.get(key).is_none(),
+                    "{name}.{key} is back as a literal; wire it or leave it absent"
+                );
+            }
+        }
     }
 
     #[test]

@@ -530,13 +530,11 @@ fn gemma3_kv_mode(kv_mode: &str) -> (hipfire_runtime::kv::KvQuantMode, usize) {
 /// the same information as a wall of compile errors with no runtime context.
 ///
 /// `HIPFIRE_KV_ALLOW_DEPRECATED=1` re-admits them for a transition period.
-const DEPRECATED_KV_MODES: &[&str] = &[
-    "q4", "q8", "int8", "int8c", "hfq4kv", "hfq4", "hfq8", "asym2", "asym3", "asym4", "fwht2",
-    "fwht3", "fwht4", "turbo4",
-];
-
+/// The list itself lives in `hipfire-config` as `DEPRECATED_KV_MODES`, so config
+/// resolution warns about the same modes this refuses (issue #386) rather than
+/// holding a second opinion that only disagrees at load time.
 fn reject_deprecated_kv_mode(kv_mode: &str) -> Result<(), String> {
-    if !DEPRECATED_KV_MODES.contains(&kv_mode) {
+    if !hipfire_config::DEPRECATED_KV_MODES.contains(&kv_mode) {
         return Ok(());
     }
     if std::env::var("HIPFIRE_KV_ALLOW_DEPRECATED").ok().as_deref() == Some("1") {
@@ -4423,7 +4421,7 @@ mod admission_tests {
                  triattn_can_evict_kv_mode"
             );
             assert!(
-                DEPRECATED_KV_MODES.contains(&m),
+                hipfire_config::DEPRECATED_KV_MODES.contains(&m),
                 "{m} is evictable but no longer deprecated: TriAttention eviction \
                  now has a supported caller, so revisit the load-path filter that \
                  declines the sidecar"

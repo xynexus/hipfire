@@ -927,6 +927,7 @@ pub fn resolve_typed_config_layers(
     let mut resolution = resolve_config_layers(config_schema(), layers);
     unknown_keys_in_unapplied_overrides(layers, &model_overrides, &mut resolution);
     diagnostics.extend(domain_diagnostics(&resolution));
+    diagnostics.extend(deprecated_kv_diagnostics(&resolution));
     let config = materialize_config(&resolution, model_overrides, &mut diagnostics);
     ResolvedTypedConfig {
         config,
@@ -1203,6 +1204,57 @@ pub fn path_existence_diagnostics(config: &HipfireConfig) -> Vec<ConfigDiagnosti
         });
     }
     out
+}
+
+/// KV storage modes hipfire is retiring, in the one place both the config layer
+/// and the loader read.
+///
+/// `hipfire-serving-core`'s `reject_deprecated_kv_mode` refuses these at model
+/// load. That refusal used to be the FIRST time an operator heard about it: the
+/// `kv_cache` enum accepted `q8`/`asym2`/`asym3`/`asym4`, config validation
+/// passed, the server reported healthy, and only the first request that needed a
+/// load failed (issue #386). The list lives here so the warning fires when the
+/// config resolves and the loader's refusal stays the same decision, not a
+/// second opinion.
+pub const DEPRECATED_KV_MODES: &[&str] = &[
+    "q4", "q8", "int8", "int8c", "hfq4kv", "hfq4", "hfq8", "asym2", "asym3", "asym4", "fwht2",
+    "fwht3", "fwht4", "turbo4",
+];
+
+/// Warn, at config-resolution time, about a `kv_cache` the loader will refuse.
+///
+/// Warning rather than error for the same reason as [`domain_diagnostics`]: these
+/// are configs already running, and `HIPFIRE_KV_ALLOW_DEPRECATED=1` still admits
+/// them. Naming the value early is the fix; refusing to resolve is not.
+fn deprecated_kv_diagnostics(resolution: &ConfigResolution) -> Vec<ConfigDiagnostic> {
+    resolution
+        .values
+        .iter()
+        .filter(|resolved| resolved.key == "kv_cache")
+        // Only what someone actually WROTE, matching domain_diagnostics.
+        .filter(|resolved| {
+            !matches!(
+                resolved.source.as_ref().map(|source| source.kind),
+                None | Some(ConfigLayerKind::CompiledDefault)
+            )
+        })
+        .filter_map(|resolved| {
+            let mode = resolved.value.as_ref()?.as_str()?;
+            if !DEPRECATED_KV_MODES.contains(&mode) {
+                return None;
+            }
+            Some(ConfigDiagnostic {
+                severity: ConfigDiagnosticSeverity::Warning,
+                message: format!(
+                    "config key `kv_cache` = \"{mode}\" is DEPRECATED and the model loader \
+                     will refuse it. hipfire is retiring KV storage down to two families: \
+                     kvarn (kvarn2 / kvarn / kvarn4 / kvarn8) and unquantized (fp32). Set \
+                     HIPFIRE_KV_ALLOW_DEPRECATED=1 to run it during migration, or pick a \
+                     supported mode."
+                ),
+            })
+        })
+        .collect()
 }
 
 /// Warn about resolved values that violate their field's declared domain.
@@ -1905,6 +1957,37 @@ mod tests {
         assert_eq!(
             resolved.config.kv_cache, "kvarnn",
             "reporting must not change what resolves — this warns, never rejects"
+        );
+    }
+
+    #[test]
+    fn a_deprecated_kv_mode_is_reported_before_the_loader_refuses_it() {
+        // Issue #386: `q8` passed the enum, the server reported healthy, and the
+        // loader's refusal was the first anyone heard of it.
+        for mode in ["q8", "asym2", "asym3", "asym4"] {
+            let raw = serde_json::json!({ "kv_cache": mode });
+            let resolved = resolve_typed_config_document(&raw, None);
+            let message = resolved
+                .diagnostics
+                .iter()
+                .find(|d| d.message.contains("DEPRECATED"))
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| panic!("{mode} resolved silently: {:?}", resolved.diagnostics));
+            assert!(
+                message.contains("HIPFIRE_KV_ALLOW_DEPRECATED"),
+                "the warning must carry the migration escape hatch: {message}"
+            );
+            assert_eq!(
+                resolved.config.kv_cache, mode,
+                "reporting must not change what resolves — this warns, never rejects"
+            );
+        }
+        // A supported mode stays silent.
+        let ok = resolve_typed_config_document(&serde_json::json!({ "kv_cache": "kvarn" }), None);
+        assert!(
+            ok.diagnostics.is_empty(),
+            "a supported kv_cache must not warn: {:?}",
+            ok.diagnostics
         );
     }
 
