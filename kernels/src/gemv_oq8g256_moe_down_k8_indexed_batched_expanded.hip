@@ -2,6 +2,10 @@
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 
 // Atomic-free batched indexed MoE down GEMV for OQ8G256 — OQ8 sibling of

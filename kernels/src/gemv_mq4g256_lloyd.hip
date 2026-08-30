@@ -10,6 +10,10 @@
 // This is the slow generic chip variant; LDS-codebook fast path mirrors
 // gemv_mq3g256_lloyd.gfx1100.hip.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

@@ -1,3 +1,7 @@
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 
 // gfx942 (MI300X CDNA3) v2 GEMV — 4 rows per WG, NO LDS.

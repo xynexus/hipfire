@@ -14,6 +14,10 @@
 // Same grid/block/LDS layout as the baseline 4w_k2. Bit-exact output
 // (same arithmetic, different load schedule).
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

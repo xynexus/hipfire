@@ -3,6 +3,10 @@
 This subtree owns HIP kernel sources. Kernel changes are high risk because small
 layout or launch-shape edits can silently change model behavior.
 
+For a tree-wide inventory (family × arch), the JIT/selector dispatch model, and
+the current dead-source / LDS-hazard / quant-contract findings, see
+[`docs/kernels/kernel-audit.md`](../docs/kernels/kernel-audit.md).
+
 ## Kernel Rules
 
 - Keep kernels HIP/ROCm-direct. Do not introduce Vulkan, wgpu, or cross-vendor

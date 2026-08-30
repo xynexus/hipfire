@@ -7,6 +7,10 @@
 // stages one 64-token x 256-K HFQ6 group of X in LDS, then reuses each
 // dequantized weight row across four 16-token WMMA tiles.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

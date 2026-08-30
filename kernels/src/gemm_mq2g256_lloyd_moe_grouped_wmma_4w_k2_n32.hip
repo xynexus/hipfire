@@ -15,6 +15,10 @@
 // Scatter is unchanged (BLOCK_M=16); only the dispatch halves grid.y to
 // (m_total/16 + 1)/2. Y_grouped output stays slot-indexed → unscatter unchanged.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

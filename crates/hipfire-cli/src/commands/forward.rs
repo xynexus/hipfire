@@ -131,10 +131,7 @@ Usage:
 
 The positional model accepts a local name, shorthand, alias, or path.
 
-NOT `hipfire repack`: that is the lossless container round-trip (HF dir <-> .hfa).
-`optimize` lost its colliding `repack` alias when coexistence's subcommands were
-promoted; following the old alias would run a completely different operation on
-the same file.
+Not to be confused with `hipfire repack`, the lossless container round-trip.
 
 Build runner:
   cargo build --release -p hipfire-runtime --example optimize"#;
