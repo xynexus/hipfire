@@ -30,21 +30,23 @@ promotion is real is that the man page appears without anyone writing it.
 | `export` | `hipfire export safetensors` | |
 | `repack` | `hipfire repack` | `optimize` lost its colliding `repack` alias |
 | `hub` | **retired** | was one spelling of `download` + `repack --check` |
+| `lora` | `hipfire lora {export,merge,convert}` | |
+| `artifact` | `hipfire artifact {audit-calibration,compare-calibration,compare-calibration-stability,compare-residuals,moe-router-profile}` | `inspect` folded into `hipfire inspect` |
+| `calibrate` | `hipfire calibrate` | bridged to `CalibrateCommand::parse`, which keeps sole ownership of defaults and cross-flag rules |
+| `two-pass` | `hipfire two-pass` | `--` tail forwarded to the quantizer |
+| `npu` | `hipfire npu pair-hfp` | linux only |
 
 ## Remaining
 
-| group | ops | shape |
-|---|---|---|
-| `artifact` | `inspect`, `audit-calibration`, `compare-calibration`, `compare-calibration-stability`, `compare-residuals`, `moe-router-profile` | six read-only reporters; several already overlap `hipfire inspect` |
-| `lora` | `export`, `merge`, `convert` | |
-| `calibrate` | one op, ~30 flags | the largest bag by far |
-| `two-pass` | one op | shares `induction/` with `induct` |
-| `npu` | `pair-hfp` | linux-only (`#[cfg(target_os = "linux")]`) |
+**None.** All eleven groups are promoted or retired. `hipfire convert` is back to
+its five drafter tools, and the `external_subcommand` catch-all is gone — so
+every conversion command is now enumerable, `--help`-visible, and rendered by
+`gen-docs` without anyone writing prose for it.
 
-Suggested order: `lora` (small, three clean ops), `artifact` (mechanical, but
-see the overlap question below), `two-pass`, `npu`, `calibrate` last — its flag
-bag is big enough that a mechanical transcription is where an argument would
-silently drift.
+One consequence worth stating: `ArgBag` silently ignored unknown flags, so
+`two-pass --typo 1` used to be accepted and dropped. Under clap it is an error.
+That is a behaviour change, and a good one, but it will surface any script that
+was passing a flag the tool never read.
 
 ## Things to decide, not just transcribe
 
@@ -54,15 +56,27 @@ because scripts already use them. Unifying is a breaking change and wants its
 own decision — a clap `alias` could accept both, at the cost of two documented
 names for one flag.
 
-**`artifact inspect` overlaps `hipfire inspect`.** Both report on a `.hfq`. If
-`artifact` is promoted as-is there will be two commands answering nearly the
-same question, which is the naming failure `optimize`/`repack` just demonstrated
-in a smaller way. Worth resolving BEFORE promoting rather than after.
+**`artifact inspect` overlap — RESOLVED 2026-08-30, and the duplicate is gone.**
+`hipfire inspect --json` was already a near-superset. The one thing
+`artifact inspect` had that it did not was an `artifact_fingerprint` computed by
+a SECOND algorithm — coexistence hashed a JSON serialization of
+`{version, arch_id, metadata, tensors}` while the runtime FNV-1a's
+`metadata_json + arch_id + per-tensor fields` inline. Same question, two answers,
+different values, and `calibration_audit` recorded the coexistence one as
+provenance.
 
-**The `.hfa` inspect gap.** `hipfire inspect` refuses an `.hfa` with a pointer to
-`hipfire-coexistence repack`. That pointer now names a command that no longer
-needs the standalone binary — `hipfire repack` — and the message should be
-updated when `artifact` is settled.
+Both now use `HfqFile::index_fingerprint`. `crate::artifact::index_identity` and
+`index_fingerprint` are deleted, `fingerprint_scope` is deleted (a scope string
+distinguishes algorithms, and there is only one now), and `hipfire inspect`
+reports a single `fingerprint` plus `file_bytes` — the on-disk size, which is
+genuinely distinct from `totals.bytes`, the tensor payload sum. Verified: the
+audit report and `hipfire inspect` print the same number for the same artifact.
+
+**This invalidated previously recorded fingerprints, deliberately.** Any
+`artifact_fingerprint` written into an induction manifest or calibration audit
+before this change carries the old algorithm's value and will not match a
+freshly computed one. Accepted rather than migrated: the alternative was
+carrying two hashes indefinitely so that stale records keep verifying.
 
 **Every promotion is a bridge, not a rewrite.** The current commands build an
 argv vector and call the existing `run_cli`. That keeps behaviour identical and

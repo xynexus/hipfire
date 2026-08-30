@@ -5,6 +5,7 @@ pub mod chat_ui;
 pub mod embeddings;
 pub mod files;
 pub mod health;
+pub mod jobs;
 pub mod models;
 pub mod responses;
 pub mod sdapi;

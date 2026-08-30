@@ -51,6 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Models => draw_models(frame, app, root[1]),
         Tab::Runtime => draw_runtime(frame, app, root[1]),
         Tab::Logs => draw_logs(frame, app, root[1]),
+        Tab::Jobs => draw_jobs(frame, app, root[1]),
         Tab::Training => draw_training(frame, app, root[1]),
         Tab::Settings => draw_settings(frame, app, root[1]),
         Tab::System => draw_system(frame, app, root[1]),
@@ -111,9 +112,21 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     draw_gpu_bar(frame, bar[1]);
 
+    // Badge the Jobs tab with the running count, so a background download is
+    // visible from whichever tab the operator is actually sitting on.
+    let running_jobs = app.jobs.active_count();
     let titles = Tab::ALL
         .iter()
-        .map(|tab| Line::from(Span::raw(tab.title())))
+        .map(|tab| {
+            if *tab == Tab::Jobs && running_jobs > 0 {
+                Line::from(vec![
+                    Span::raw(tab.title()),
+                    Span::styled(format!(" ({running_jobs})"), Style::default().fg(GREEN)),
+                ])
+            } else {
+                Line::from(Span::raw(tab.title()))
+            }
+        })
         .collect::<Vec<_>>();
     let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
     let tabs = Tabs::new(titles)
@@ -182,6 +195,11 @@ fn tab_keys(tab: Tab) -> &'static [(&'static str, &'static str)] {
         ],
         Tab::Runtime => &[("r", "refresh health, kernels, and locks")],
         Tab::Logs => &[("r", "refresh the log tails")],
+        Tab::Jobs => &[
+            ("Up / Down", "select a job"),
+            ("c", "cancel the selected job"),
+            ("r", "refresh"),
+        ],
         Tab::Training => &[("Up / Down", "select a run")],
         Tab::Settings => &[
             ("e", "easy view"),
@@ -956,6 +974,148 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             chunks[1],
         );
     }
+}
+
+fn draw_jobs(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(pad(area, 1, 0));
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(8)])
+        .split(cols[0]);
+
+    frame.render_widget(
+        card(
+            "Job monitor",
+            vec![
+                Line::from(format!(
+                    "Jobs       {}    running: {}",
+                    app.jobs.jobs.len(),
+                    app.jobs.active_count()
+                )),
+                Line::from(format!("Directory  {}", app.jobs.dir.display())),
+            ],
+        ),
+        left[0],
+    );
+
+    let rows = app
+        .jobs
+        .jobs
+        .iter()
+        .enumerate()
+        .skip(scroll_start(app.jobs.selected, left[1].height, 3))
+        .take(visible_rows(left[1].height, 3))
+        .map(|(idx, job)| {
+            Row::new([
+                job.id.clone(),
+                job.state.clone(),
+                job.progress_percent()
+                    .map(|p| format!("{p}%"))
+                    .unwrap_or_else(|| "-".into()),
+                if job.label.is_empty() {
+                    "-".to_string()
+                } else {
+                    job.label.clone()
+                },
+            ])
+            .style(if idx == app.jobs.selected {
+                Style::default().fg(ACCENT).bg(PANEL_2)
+            } else if job.state == "failed" {
+                Style::default().fg(YELLOW).bg(PANEL)
+            } else if job.is_active() {
+                Style::default().fg(GREEN).bg(PANEL)
+            } else {
+                Style::default().fg(TEXT).bg(PANEL)
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows = if rows.is_empty() {
+        vec![Row::new([
+            "No jobs".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ])
+        .style(Style::default().fg(MUTED).bg(PANEL))]
+    } else {
+        rows
+    };
+    frame.render_widget(
+        Table::new(
+            rows,
+            // Wide enough for a whole `<kind>_<uuid>` id: a truncated one
+            // cannot be pasted into `hipfire jobs cancel`. The kind is the id
+            // prefix, so it needs no column of its own.
+            [
+                Constraint::Length(42),
+                Constraint::Length(8),
+                Constraint::Length(5),
+                Constraint::Min(12),
+            ],
+        )
+        .header(Row::new(["Job", "State", "Done", "Target"]).style(Style::default().fg(MUTED)))
+        .block(block("Queue"))
+        .style(Style::default().fg(TEXT).bg(PANEL)),
+        left[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Text::from(jobs_detail_lines(app)))
+            .block(block("Selected job"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        cols[1],
+    );
+}
+
+fn jobs_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(job) = app.jobs.selected_job() else {
+        // The hint lives here rather than in the empty table row: this pane is
+        // wide enough to show the command without truncating it.
+        return vec![
+            Line::from(Span::styled("Nothing queued.", Style::default().fg(MUTED))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Queue a background fetch with",
+                Style::default().fg(MUTED),
+            )),
+            Line::from("  hipfire download <repo> --detach"),
+            Line::from("  hipfire induct <repo> --format <fmt> --detach"),
+        ];
+    };
+    let mut lines = vec![
+        Line::from(format!("Id      {}", job.id)),
+        Line::from(format!("Kind    {}", job.kind)),
+        Line::from(format!("State   {}", job.state)),
+        Line::from(format!(
+            "Target  {}",
+            if job.label.is_empty() {
+                "-"
+            } else {
+                &job.label
+            }
+        )),
+    ];
+    if !job.detail.is_empty() {
+        lines.push(Line::from(format!("Detail  {}", job.detail)));
+    }
+    lines.push(Line::from(""));
+    if app.jobs.log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no log yet",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "--- log ---",
+            Style::default().fg(MUTED),
+        )));
+        lines.extend(app.jobs.log.lines().map(|l| Line::from(l.to_string())));
+    }
+    lines
 }
 
 fn draw_training(frame: &mut Frame, app: &App, area: Rect) {

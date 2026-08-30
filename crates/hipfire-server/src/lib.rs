@@ -110,6 +110,29 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/admin/models/registry",
             get(routes::models::get_model_registry),
         )
+        // The console's Chat tab, on the admin surface rather than `/v1`.
+        //
+        // The session cookie is `Path=/admin`, so a logged-in browser never
+        // sends it to `/v1/*`, and binding a non-loopback host flips API auth
+        // to required for every caller — which left the console's own chat
+        // 401ing. Serving the same handler here reuses the admin gate for
+        // authentication and `admin_mutation_same_origin` for CSRF, instead of
+        // widening the cookie's scope or parking an API token in the page.
+        //
+        // `post_chat_completions` takes its accounting extension as an Option,
+        // so this path simply has none: operator console traffic is not metered
+        // against an API principal, and the console is already privileged
+        // enough to edit config and reset the runtime.
+        .route(
+            "/admin/chat/completions",
+            post(routes::chat::post_chat_completions),
+        )
+        .route("/admin/jobs", get(routes::jobs::list_jobs_route))
+        .route("/admin/jobs/{id}", get(routes::jobs::get_job))
+        .route(
+            "/admin/jobs/{id}/cancel",
+            post(routes::jobs::post_job_cancel),
+        )
         .route(
             "/admin/training/runs",
             get(routes::training::list_training_runs_route),

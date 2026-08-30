@@ -52,9 +52,41 @@ pub struct DownloadArgs {
     /// file in archive mode.
     #[arg(long, default_value_t = 4)]
     pub jobs: usize,
+    /// Queue the fetch as a background job instead of downloading here, and
+    /// return its id. Monitor it with `hipfire jobs watch <id>`.
+    ///
+    /// The job is a file in `~/.hipfire/jobs/deferred/queued`, so this works
+    /// whether or not the server is running — an unclaimed job simply waits.
+    #[arg(long)]
+    pub detach: bool,
 }
 
 pub fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
+    if args.detach {
+        let mut spec = serde_json::json!({
+            "kind": "download",
+            "repo": args.repo,
+            "revision": args.revision,
+            "force": args.force,
+            "raw": args.raw,
+            "jobs": args.jobs,
+        });
+        // Only send the optional paths that were actually given, so the job
+        // file records the request rather than this command's defaults.
+        if let Some(v) = args.include {
+            spec["include"] = serde_json::json!(v);
+        }
+        if let Some(v) = args.dest {
+            spec["dest"] = serde_json::json!(v.display().to_string());
+        }
+        if let Some(v) = args.output {
+            spec["output"] = serde_json::json!(v.display().to_string());
+        }
+        let id = crate::commands::jobs::submit(spec)?;
+        println!("queued download job {id}");
+        println!("  hipfire jobs watch {id}");
+        return Ok(());
+    }
     let opts = DownloadOptions {
         repo: args.repo,
         revision: args.revision,

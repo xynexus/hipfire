@@ -50,6 +50,19 @@ enum Command {
     /// NOT `optimize`: that rewrites a `.hfq` into an arch-optimal weight
     /// layout. This is the lossless container round-trip.
     Repack(commands::interop::RepackArgs),
+    /// Derive, merge or convert a steering adapter
+    Lora(commands::interop::LoraArgs),
+    /// Audit and compare calibration / residual artifacts
+    Artifact(commands::interop::ArtifactArgs),
+    /// Capture activation statistics into a `.calib.hfq`
+    Calibrate(commands::interop::CalibrateArgs),
+    /// Calibrate then quantize in one run
+    #[command(name = "two-pass")]
+    TwoPass(commands::interop::TwoPassArgs),
+    /// NPU artifact tooling (linux only)
+    Npu(commands::interop::NpuArgs),
+    /// Submit, watch and cancel background jobs (downloads, training)
+    Jobs(commands::jobs::JobsArgs),
     /// List locally available models
     #[command(alias = "models")]
     List(commands::list::ListArgs),
@@ -278,10 +291,16 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Daemon(args)) => commands::daemon::run_worker(args),
         Some(Command::Chat(args)) => rt()?.block_on(commands::chat::run(args, loaded_config)),
         Some(Command::Download(args)) => commands::download::run_download(args),
+        Some(Command::Jobs(args)) => commands::jobs::run(args),
         Some(Command::Induct(args)) => commands::induct::run_induct(args, loaded_config),
         Some(Command::Import(args)) => commands::interop::run_import(args),
         Some(Command::Export(args)) => commands::interop::run_export(args),
         Some(Command::Repack(args)) => commands::interop::run_repack(args),
+        Some(Command::Lora(args)) => commands::interop::run_lora(args),
+        Some(Command::Artifact(args)) => commands::interop::run_artifact(args),
+        Some(Command::Calibrate(args)) => commands::interop::run_calibrate(args),
+        Some(Command::TwoPass(args)) => commands::interop::run_two_pass(args),
+        Some(Command::Npu(args)) => commands::interop::run_npu(args),
         Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),

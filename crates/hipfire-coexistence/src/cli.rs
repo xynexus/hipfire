@@ -78,7 +78,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // integrity is `repack --check` — `hub verify` routed there anyway for
         // an archive, so the group was one spelling of two other commands.
         (Some("hub"), _) => Err("`hub` is retired: use `hipfire download <org/name>` \
-             to fetch, and `hipfire convert repack --check <archive>` to verify"
+             to fetch, and `hipfire repack --input <archive> --check` to verify"
             .into()),
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),

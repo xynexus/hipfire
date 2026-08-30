@@ -15,6 +15,7 @@ pub mod gen_model_support;
 pub mod induct;
 pub mod inspect;
 pub mod interop;
+pub mod jobs;
 pub mod list;
 pub mod lock;
 pub mod model;

@@ -18,6 +18,25 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire export`↴](#hipfire-export)
 * [`hipfire export safetensors`↴](#hipfire-export-safetensors)
 * [`hipfire repack`↴](#hipfire-repack)
+* [`hipfire lora`↴](#hipfire-lora)
+* [`hipfire lora export`↴](#hipfire-lora-export)
+* [`hipfire lora merge`↴](#hipfire-lora-merge)
+* [`hipfire lora convert`↴](#hipfire-lora-convert)
+* [`hipfire artifact`↴](#hipfire-artifact)
+* [`hipfire artifact audit-calibration`↴](#hipfire-artifact-audit-calibration)
+* [`hipfire artifact compare-calibration`↴](#hipfire-artifact-compare-calibration)
+* [`hipfire artifact compare-calibration-stability`↴](#hipfire-artifact-compare-calibration-stability)
+* [`hipfire artifact compare-residuals`↴](#hipfire-artifact-compare-residuals)
+* [`hipfire artifact moe-router-profile`↴](#hipfire-artifact-moe-router-profile)
+* [`hipfire calibrate`↴](#hipfire-calibrate)
+* [`hipfire two-pass`↴](#hipfire-two-pass)
+* [`hipfire npu`↴](#hipfire-npu)
+* [`hipfire npu pair-hfp`↴](#hipfire-npu-pair-hfp)
+* [`hipfire jobs`↴](#hipfire-jobs)
+* [`hipfire jobs list`↴](#hipfire-jobs-list)
+* [`hipfire jobs status`↴](#hipfire-jobs-status)
+* [`hipfire jobs watch`↴](#hipfire-jobs-watch)
+* [`hipfire jobs cancel`↴](#hipfire-jobs-cancel)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
@@ -98,6 +117,12 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `import` — Import an external checkpoint (GGUF, safetensors) into a `.hfq`
 * `export` — Export a `.hfq` back to an external format
 * `repack` — Pack a HuggingFace directory into a `.hfa` archive, or restore/verify one
+* `lora` — Derive, merge or convert a steering adapter
+* `artifact` — Audit and compare calibration / residual artifacts
+* `calibrate` — Capture activation statistics into a `.calib.hfq`
+* `two-pass` — Calibrate then quantize in one run
+* `npu` — NPU artifact tooling (linux only)
+* `jobs` — Submit, watch and cancel background jobs (downloads, training)
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
@@ -256,6 +281,9 @@ leaves <archive>.hfa.part and resumes on the next download.
 * `--jobs <JOBS>` — Parallel connections: whole files in raw mode, ranged windows within a file in archive mode
 
   Default value: `4`
+* `--detach` — Queue the fetch as a background job instead of downloading here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   The job is a file in `~/.hipfire/jobs/deferred/queued`, so this works whether or not the server is running — an unclaimed job simply waits.
 
 
 
@@ -272,6 +300,9 @@ Bring an external model into a named `.hfq` — calibrate, quantize, fold sideca
 ###### **Options:**
 
 * `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+* `--detach` — Queue the induction as a background job instead of running it here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   Both `source` and `--format` are required with this flag: a detached job has no terminal to prompt on.
 
 
 
@@ -374,6 +405,341 @@ an arch-optimal weight layout.
 
 
 
+## `hipfire lora`
+
+Derive, merge or convert a steering adapter
+
+**Usage:** `hipfire lora <COMMAND>`
+
+###### **Subcommands:**
+
+* `export` — Derive a steering adapter from contrastive prompt sets
+* `merge` — Merge an adapter into a base `.hfq`
+* `convert` — Convert an adapter between `.hfq` and `.json` forms
+
+
+
+## `hipfire lora export`
+
+Derive a steering adapter from contrastive prompt sets
+
+**Usage:** `hipfire lora export [OPTIONS] --hfq <HFQ> --data-dir <DATA_DIR> --out <OUT>`
+
+###### **Options:**
+
+* `--hfq <HFQ>` — Base model to derive the adapter against
+* `--data-dir <DATA_DIR>` — Directory holding `good_prompts.txt` and `bad_prompts.txt`
+* `--out <OUT>` — Destination adapter (`.lora.hfq` or `.lora.json`)
+* `--limit <LIMIT>` — Prompts to read from each set
+
+  Default value: `16`
+* `--strength <STRENGTH>` — Steering strength
+
+  Default value: `0.2`
+* `--max-seq <MAX_SEQ>` — Max sequence length during capture
+
+  Default value: `2048`
+* `--no-orthogonalize` — Skip orthogonalisation of the derived directions
+
+
+
+## `hipfire lora merge`
+
+Merge an adapter into a base `.hfq`
+
+**Usage:** `hipfire lora merge --hfq <HFQ> --adapter <ADAPTER> --out <OUT>`
+
+###### **Options:**
+
+* `--hfq <HFQ>` — Base `.hfq`
+* `--adapter <ADAPTER>` — Adapter to merge
+* `--out <OUT>` — Destination merged `.hfq`
+
+
+
+## `hipfire lora convert`
+
+Convert an adapter between `.hfq` and `.json` forms
+
+**Usage:** `hipfire lora convert --in <INPUT> --out <OUT>`
+
+###### **Options:**
+
+* `--in <INPUT>` — Source adapter. (Spelled `--in`, matching the existing tool.)
+* `--out <OUT>` — Destination adapter
+
+
+
+## `hipfire artifact`
+
+Audit and compare calibration / residual artifacts
+
+**Usage:** `hipfire artifact <COMMAND>`
+
+###### **Subcommands:**
+
+* `audit-calibration` — Check a `.calib.hfq` for structural and coverage problems
+* `compare-calibration` — Compare two calibration artifacts numerically
+* `compare-calibration-stability` — Compare a lower-capacity calibration against a higher-capacity one
+* `compare-residuals` — Compare two residual-probe artifacts
+* `moe-router-profile` — Report routed-expert activation distribution from a calibration artifact
+
+
+
+## `hipfire artifact audit-calibration`
+
+Check a `.calib.hfq` for structural and coverage problems
+
+**Usage:** `hipfire artifact audit-calibration --input <INPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Calibration artifact to audit
+
+
+
+## `hipfire artifact compare-calibration`
+
+Compare two calibration artifacts numerically
+
+**Usage:** `hipfire artifact compare-calibration [OPTIONS] --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference artifact
+* `--candidate <CANDIDATE>` — Candidate artifact
+* `--atol <ATOL>` — Absolute tolerance
+* `--rtol <RTOL>` — Relative tolerance
+* `--max-reports <MAX_REPORTS>` — Cap on reported mismatches
+* `--allow-unproven-provenance` — Compare even when provenance cannot be proven equal
+
+
+
+## `hipfire artifact compare-calibration-stability`
+
+Compare a lower-capacity calibration against a higher-capacity one
+
+**Usage:** `hipfire artifact compare-calibration-stability --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference (higher-capacity) artifact
+* `--candidate <CANDIDATE>` — Candidate (lower-capacity) artifact
+
+
+
+## `hipfire artifact compare-residuals`
+
+Compare two residual-probe artifacts
+
+**Usage:** `hipfire artifact compare-residuals [OPTIONS] --reference <REFERENCE> --candidate <CANDIDATE>`
+
+###### **Options:**
+
+* `--reference <REFERENCE>` — Reference residuals artifact
+* `--candidate <CANDIDATE>` — Candidate residuals artifact
+* `--atol <ATOL>` — Absolute tolerance
+* `--rtol <RTOL>` — Relative tolerance
+* `--max-reports <MAX_REPORTS>` — Cap on reported mismatches
+
+
+
+## `hipfire artifact moe-router-profile`
+
+Report routed-expert activation distribution from a calibration artifact
+
+**Usage:** `hipfire artifact moe-router-profile [OPTIONS] --input <INPUT>`
+
+###### **Options:**
+
+* `--input <INPUT>` — Calibration artifact to profile
+* `--layer <LAYER>` — Restrict to one layer
+* `--top <TOP>` — Report the top N experts
+* `--min-activations <MIN_ACTIVATIONS>` — Ignore experts below this activation count
+* `--tokenizer <TOKENIZER>` — Tokenizer for naming, when available
+* `--json` — Emit JSON instead of a table
+
+
+
+## `hipfire calibrate`
+
+Capture activation statistics into a `.calib.hfq`
+
+**Usage:** `hipfire calibrate [OPTIONS] --model <MODEL> --corpus <CORPUS> --output <OUTPUT>`
+
+Defaults, validation and the `auto|N` forms are owned by the
+        calibration parser, not by this command -- so they are applied but not
+        listed here. `hipfire calibrate --help-flags` prints the full reference.
+
+###### **Options:**
+
+* `--model <MODEL>` — Model to calibrate: a safetensors dir or cache root
+* `--corpus <CORPUS>` — Calibration corpus
+* `--output <OUTPUT>` — Destination `.calib.hfq`
+* `--sequences <SEQUENCES>`
+* `--context <CONTEXT>`
+* `--sampling-seed <SAMPLING_SEED>`
+* `--sequence-batch <SEQUENCE_BATCH>` — `auto` or a row count
+* `--time-tile <TIME_TILE>` — `auto` or a tile size
+* `--max-rows <MAX_ROWS>`
+* `--min-expert-activations <MIN_EXPERT_ACTIVATIONS>`
+* `--expert-capture-target <EXPERT_CAPTURE_TARGET>`
+* `--expert-capture-tile-rows <EXPERT_CAPTURE_TILE_ROWS>`
+* `--required-expert-fraction <REQUIRED_EXPERT_FRACTION>`
+* `--expert-coverage-policy <EXPERT_COVERAGE_POLICY>` — `strict` or `preserve-undercovered`
+* `--kldref` — Capture a KLD reference
+* `--no-kldref` — Skip the KLD reference
+* `--kldref-topk <KLDREF_TOPK>`
+* `--kldref-rows <KLDREF_ROWS>`
+* `--layer-prefetch-bytes <LAYER_PREFETCH_BYTES>`
+* `--boundary-ram` — Hold boundary rows in RAM instead of on disk
+* `--boundary-dir <BOUNDARY_DIR>`
+* `--resume` — Resume an interrupted run (the default)
+* `--no-resume` — Start fresh, discarding any spool
+* `--finalize-completed` — Publish an already-complete resumed spool without executing a layer
+* `--pause-after-layers <PAUSE_AFTER_LAYERS>`
+* `--residual-probe-output <RESIDUAL_PROBE_OUTPUT>`
+* `--residual-probe-rows <RESIDUAL_PROBE_ROWS>`
+* `--cask-output <CASK_OUTPUT>` — Also write a CASK (TriAttention centers) sidecar
+* `--cask-only` — CASK only: the calibration artifact is scratch and removed after
+* `--dry-run` — Plan without executing
+* `--help-flags` — Print the calibration parser's own flag reference and exit
+
+
+
+## `hipfire two-pass`
+
+Calibrate then quantize in one run
+
+**Usage:** `hipfire two-pass [OPTIONS] --model <MODEL> --calib <CALIB> --output <OUTPUT> [-- <QUANT_ARGS>...]`
+
+Arguments after `--` are forwarded verbatim to the quantizer.
+
+###### **Arguments:**
+
+* `<QUANT_ARGS>` — Quantizer arguments, after `--`
+
+###### **Options:**
+
+* `--model <MODEL>` — Model to calibrate then quantize
+* `--calib <CALIB>` — Calibration artifact to write or reuse (`.calib.hfq`)
+* `--output <OUTPUT>` — Destination quantized artifact
+* `--format <FORMAT>` — Quant format token
+* `--corpus <CORPUS>` — Calibration corpus
+* `--skip-calib` — Reuse an existing calibration instead of capturing one
+* `--dry-run` — Plan without executing
+
+
+
+## `hipfire npu`
+
+NPU artifact tooling (linux only)
+
+**Usage:** `hipfire npu <COMMAND>`
+
+###### **Subcommands:**
+
+* `pair-hfp` — Pair a whole-scaled `.hfp` into the paired layout (linux only)
+
+
+
+## `hipfire npu pair-hfp`
+
+Pair a whole-scaled `.hfp` into the paired layout (linux only)
+
+**Usage:** `hipfire npu pair-hfp --in <INPUT> --out <OUTPUT>`
+
+###### **Options:**
+
+* `--in <INPUT>` — Source `.hfp`. (Spelled `--in`, matching the existing tool.)
+* `--out <OUTPUT>` — Destination `.hfp`
+
+
+
+## `hipfire jobs`
+
+Submit, watch and cancel background jobs (downloads, training)
+
+**Usage:** `hipfire jobs <COMMAND>`
+
+Examples:
+  hipfire download Qwen/Qwen3.5-9B --detach   # submit, return immediately
+  hipfire jobs list
+  hipfire jobs watch <id>
+  hipfire jobs cancel <id>
+
+A cancelled download can be resubmitted: the archive is written under a
+.part marker with a .manifest sidecar, so it resumes rather than restarts.
+
+###### **Subcommands:**
+
+* `list` — List jobs in every state
+* `status` — Show one job, with the tail of its log
+* `watch` — Follow one job until it finishes
+* `cancel` — Ask a running job to stop, or drop a queued one
+
+
+
+## `hipfire jobs list`
+
+List jobs in every state
+
+**Usage:** `hipfire jobs list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of a table
+
+
+
+## `hipfire jobs status`
+
+Show one job, with the tail of its log
+
+**Usage:** `hipfire jobs status [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
+
+
+
+## `hipfire jobs watch`
+
+Follow one job until it finishes
+
+**Usage:** `hipfire jobs watch [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
+
+
+
+## `hipfire jobs cancel`
+
+Ask a running job to stop, or drop a queued one
+
+**Usage:** `hipfire jobs cancel [OPTIONS] <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id, as printed by `list`
+
+###### **Options:**
+
+* `--json` — Emit JSON instead of text
+
+
+
 ## `hipfire list`
 
 List locally available models
@@ -434,20 +800,6 @@ Examples:
 Convert model artefacts (drafters, MTP heads)
 
 **Usage:** `hipfire convert <COMMAND>`
-
-Also reachable here, forwarded verbatim to the offline conversion tools:
-          artifact   inspect | audit-calibration | compare-calibration | moe-router-profile
-          import     gguf | safetensors
-          export     safetensors
-          repack     <hf_dir> <-> <archive.hfa>, or --check   (NOT `optimize`, which is a layout pass)
-          lora       export | merge | convert
-          calibrate  activation capture -> .calib.hfq
-          two-pass   |  induct  |  npu pair-hfp
-
-        These arrive as an external subcommand, so clap cannot enumerate them and
-        `gen-docs` cannot render them -- this list is the only place they appear.
-        Promote one to a real subcommand (as `hipfire download` now is) and it
-        documents itself.
 
 ###### **Subcommands:**
 
@@ -742,6 +1094,9 @@ Interactive wizard: bring an external model (HuggingFace repo or local safetenso
 ###### **Options:**
 
 * `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
+* `--detach` — Queue the induction as a background job instead of running it here, and return its id. Monitor it with `hipfire jobs watch <id>`.
+
+   Both `source` and `--format` are required with this flag: a detached job has no terminal to prompt on.
 
 
 

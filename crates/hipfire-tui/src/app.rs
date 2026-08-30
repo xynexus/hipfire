@@ -14,6 +14,7 @@ use ratatui::layout::Rect;
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     config::{ConfigEditDirection, ConfigState},
+    jobs::JobsState,
     registry::{RegistryAction, RegistryState},
     status::{
         restart_background_serve, start_background_serve, stop_background_serve, StatusState,
@@ -42,18 +43,20 @@ pub enum Tab {
     Models,
     Runtime,
     Logs,
+    Jobs,
     Training,
     Settings,
     System,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 9] = [
         Tab::Home,
         Tab::Chat,
         Tab::Models,
         Tab::Runtime,
         Tab::Logs,
+        Tab::Jobs,
         Tab::Training,
         Tab::Settings,
         Tab::System,
@@ -66,6 +69,7 @@ impl Tab {
             Tab::Models => "Models",
             Tab::Runtime => "Runtime",
             Tab::Logs => "Logs",
+            Tab::Jobs => "Jobs",
             Tab::Training => "Training",
             Tab::Settings => "Settings",
             Tab::System => "System",
@@ -79,6 +83,7 @@ pub struct App {
     pub registry: RegistryState,
     pub status: StatusState,
     pub training: TrainingState,
+    pub jobs: JobsState,
     pub active_model: String,
     pub tab: Tab,
     pub settings_easy: bool,
@@ -106,6 +111,7 @@ impl App {
         let registry = RegistryState::load(&paths, &config);
         let status = StatusState::load(&paths, &config);
         let training = TrainingState::load(&paths, &config);
+        let jobs = JobsState::load(&paths);
         let active_model = config.default_model.clone();
         Ok(Self {
             paths,
@@ -113,6 +119,7 @@ impl App {
             registry,
             status,
             training,
+            jobs,
             active_model,
             tab: Tab::Home,
             settings_easy: true,
@@ -132,7 +139,8 @@ impl App {
         self.registry = RegistryState::load(&self.paths, &self.config);
         self.status = StatusState::load(&self.paths, &self.config);
         self.training = TrainingState::load(&self.paths, &self.config);
-        self.last_reload = "reloaded config, registry, models, and serve status".into();
+        self.jobs.refresh(&self.paths);
+        self.last_reload = "reloaded config, registry, models, jobs, and serve status".into();
     }
 
     pub fn next_tab(&mut self) {
@@ -150,6 +158,7 @@ impl App {
             Tab::Home => self.handle_home_key(key),
             Tab::Chat => self.handle_chat_key(key),
             Tab::Models => self.handle_models_key(key),
+            Tab::Jobs => self.handle_jobs_key(key),
             Tab::Training => self.handle_training_key(key),
             Tab::Settings => self.handle_settings_key(key),
             _ => {}
@@ -243,10 +252,31 @@ impl App {
         }
     }
 
+    /// Re-read the job queue on a timer. A monitor that needs `r` pressed is
+    /// not a monitor — and the tab badge has to be right from any tab, so this
+    /// runs regardless of which one is showing. Once a second: the queue is a
+    /// handful of small files, but the redraw loop runs at ~12 Hz.
+    pub fn poll_jobs(&mut self) {
+        if self.tick % 12 == 0 {
+            self.jobs.refresh(&self.paths);
+        }
+    }
+
     /// Current braille spinner glyph for the title bar, driven by `tick`.
     pub fn spinner_frame(&self) -> char {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         FRAMES[(self.tick / 2) as usize % FRAMES.len()]
+    }
+
+    fn handle_jobs_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.jobs.select_delta(1, &self.paths),
+            KeyCode::Up | KeyCode::Char('k') => self.jobs.select_delta(-1, &self.paths),
+            KeyCode::Char('c') => {
+                self.last_reload = self.jobs.cancel_selected(&self.paths);
+            }
+            _ => {}
+        }
     }
 
     fn handle_training_key(&mut self, key: KeyEvent) {

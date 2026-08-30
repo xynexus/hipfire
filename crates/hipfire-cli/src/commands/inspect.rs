@@ -108,6 +108,10 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let diffusion = hipfire_diffusion::is_diffusion_hfq(&path)
         .then(|| inspect_hfq_with_runtime_support(&path).map_err(|e| e.to_string()));
 
+    // On-disk size. Distinct from `totals.bytes`, which sums tensor payloads and
+    // so excludes the header, metadata and index.
+    let file_bytes = std::fs::metadata(&path).map(|m| m.len()).ok();
+
     if args.json {
         print_json(
             &args.target,
@@ -118,6 +122,7 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             arch_name,
             &components,
             diffusion,
+            file_bytes,
         );
     } else {
         print_human(
@@ -129,6 +134,7 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             args.tensors,
             &components,
             diffusion,
+            file_bytes,
         );
     }
     Ok(())
@@ -577,6 +583,7 @@ fn print_human(
     list_tensors: bool,
     components: &[Value],
     diffusion: Option<Result<DiffusionHfqInspection, String>>,
+    file_bytes: Option<u64>,
 ) {
     let name = path
         .file_name()
@@ -596,6 +603,9 @@ fn print_human(
     // Comparable with a calib's `source fp`: that is this value, computed over
     // the artefact the calib was captured from.
     println!("fingerprint {}", hfq.index_fingerprint());
+    if let Some(b) = file_bytes {
+        println!("file      {b} bytes on disk");
+    }
     if calib {
         for (key, label) in [
             ("n_hessian", "hessians"),
@@ -807,6 +817,7 @@ fn print_json(
     arch_name: Option<&str>,
     components: &[Value],
     diffusion: Option<Result<DiffusionHfqInspection, String>>,
+    file_bytes: Option<u64>,
 ) {
     let shape: serde_json::Map<String, Value> = SHAPE_FIELDS
         .iter()
@@ -895,6 +906,7 @@ fn print_json(
         "quant_histogram": histogram,
         "totals": { "tensors": total_tensors, "bytes": total_bytes },
         "modules": modules,
+        "file_bytes": file_bytes,
         "diffusion": diffusion,
         "tensors": tensors,
         "metadata": meta,

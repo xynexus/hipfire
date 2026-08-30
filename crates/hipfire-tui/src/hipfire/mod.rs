@@ -4,6 +4,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod jobs;
 pub mod registry;
 pub mod status;
 pub mod training;
@@ -33,6 +34,7 @@ pub struct HipfirePaths {
     pub logs: PathBuf,
     pub kernels: PathBuf,
     pub training_runs: PathBuf,
+    pub jobs: PathBuf,
 }
 
 impl HipfirePaths {
@@ -52,6 +54,7 @@ impl HipfirePaths {
             logs: root.join("logs"),
             kernels: root.join("kernels"),
             training_runs: root.join("training").join("runs"),
+            jobs: hipfire_operator::jobs::jobs_dir(&root),
             root,
         }
     }

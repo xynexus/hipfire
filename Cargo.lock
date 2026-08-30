@@ -1962,6 +1962,7 @@ dependencies = [
  "hipfire-lock",
  "hipfire-model",
  "hipfire-monitor",
+ "hipfire-operator",
  "hipfire-quantize",
  "hipfire-runtime",
  "hipfire-server",
