@@ -714,51 +714,56 @@ pub(crate) fn load(
             });
             if let Some(df) = m.dflash.as_mut() {
                 df.adaptive_b = adaptive_b;
-                df.ngram = ngram_setup;
-            } else if let Some(setup) = ngram_setup {
-                // The server routes on `batch_prefill_capable`, which the daemon
-                // answers from this executor's own probe, so a model carrying a
-                // speculative-decode state takes the legacy path instead of
-                // being dispatched into a batched prefill that refuses it.
-                {
-                    // Drafter-free n-gram spec decode, which is what `ngram_spec`
-                    // has always advertised. The spine comes from the n-gram
-                    // tables, so the state carries only the TARGET half — no
-                    // drafter weights, no hidden-state ring, and therefore no
-                    // per-layer extraction on any verify.
-                    //
-                    // Until this existed the setup built just above was dropped on
-                    // the floor here, because the only place it could be stored was
-                    // inside a DFlash state that requires a drafter.
-                    match (m.q35_config.as_ref(), m.q35_weights.as_ref(), m.dn_state()) {
-                        (Some(config), Some(weights), Some(dn)) => {
-                            match hipfire_serving_core::load::ngram_only_state(
-                                ngram_max_spine as usize,
-                                m.max_seq,
-                                config,
-                                dn,
-                                weights.output.k,
-                                &mut daemon_state.gpu,
-                            ) {
-                                Ok(mut state) => {
-                                    state.ngram = Some(setup);
-                                    m.dflash = Some(state);
-                                    tracing::info!(
-                                        "n-gram speculative decode active (no drafter): \
+            }
+            // The setup goes on the MODEL, unconditionally. It used to be
+            // assigned into `DflashState`, which meant a model with no drafter
+            // had nowhere to put it and the value built just above was dropped
+            // on the floor. Storing it here cannot fail, so the only remaining
+            // question is whether the VERIFY half can be built.
+            m.ngram = ngram_setup.map(hipfire_serving_core::model::NgramState::new);
+
+            // That verify half is still DFlash's. Drafter-free n-gram spec decode
+            // needs no drafter weights, no hidden-state ring and no per-layer
+            // extraction — but the spine is checked by `spec_step_dflash`, which
+            // wants the target-side scratch, snapshot and tape a `DflashState`
+            // carries. So a model without one still needs a target-only state
+            // built here, and that construction is qwen35-shaped.
+            //
+            // The server routes on `batch_prefill_capable`, which the daemon
+            // answers from this executor's own probe, so a model carrying a
+            // speculative-decode state takes the legacy path instead of being
+            // dispatched into a batched prefill that refuses it.
+            if m.ngram.is_some() && m.dflash.is_none() {
+                match (m.q35_config.as_ref(), m.q35_weights.as_ref(), m.dn_state()) {
+                    (Some(config), Some(weights), Some(dn)) => {
+                        match hipfire_serving_core::load::ngram_only_state(
+                            ngram_max_spine as usize,
+                            m.max_seq,
+                            config,
+                            dn,
+                            weights.output.k,
+                            &mut daemon_state.gpu,
+                        ) {
+                            Ok(state) => {
+                                m.dflash = Some(state);
+                                tracing::info!(
+                                    "n-gram speculative decode active (no drafter): \
                                      max_spine={ngram_max_spine} orders={ngram_orders:?}"
-                                    );
-                                }
-                                Err(err) => tracing::warn!(
-                                    "ngram_spec is on but its state could not be built ({err}); \
-                                 decoding without speculation"
-                                ),
+                                );
                             }
+                            Err(err) => tracing::warn!(
+                                "ngram_spec is on but its verify state could not be built \
+                                 ({err}); decoding without speculation"
+                            ),
                         }
-                        _ => tracing::warn!(
-                            "ngram_spec is on but this model is not a Qwen3.5/3.6 target; \
-                         n-gram speculative decode supports that family only"
-                        ),
                     }
+                    // The SETUP survives on `m.ngram` either way. Only the verify
+                    // half is family-gated, and that gate is the thing a generic
+                    // multi-token verify seam on `ServingBackend` would remove.
+                    _ => tracing::warn!(
+                        "ngram_spec is on but this model is not a Qwen3.5/3.6 target; \
+                         n-gram verify supports that family only"
+                    ),
                 }
             }
             daemon_state

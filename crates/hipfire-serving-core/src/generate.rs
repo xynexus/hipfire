@@ -628,6 +628,10 @@ pub fn generate_dflash(
         }
     }
     let chat_template_profile = m.chat_template_profile.clone();
+    // Taken out before `df` borrows `m` for the rest of this function, and put
+    // back at the end. Owning it here rather than reaching through `m` is what
+    // keeps the n-gram state independent of DFlash without fighting the borrow.
+    let mut ngram_state = m.ngram.take();
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
     if let Some(draft_scratch) = df.draft_scratch.as_mut() {
@@ -804,69 +808,67 @@ pub fn generate_dflash(
     };
     // Reuse the live state when this request has the same scope; otherwise drop
     // the old one (persisting what it staged) and build fresh.
-    let carried = match df.ngram_live.take() {
-        Some((k, prev)) if k == ngram_key => Some(prev),
-        Some((_, mut prev)) => {
-            let _ = prev.merge();
-            None
-        }
-        None => None,
-    };
+    let carried = ngram_state
+        .as_mut()
+        .and_then(|st| st.take_live_for(&ngram_key));
     let mut ngram = carried.or_else(|| {
-        df.ngram.clone().map(|setup| {
-            use crate::model::NgramWriteTarget as Wt;
-            use hipfire_specdecode_ngram::WriteTarget;
-            let cfg = hipfire_specdecode_ngram::NgramConfig {
-                orders: setup.orders.clone(),
-                chain_floor: setup.chain_floor,
-                max_spine: setup.max_spine,
-                promote_count: setup.promote_count,
-                write_target: match setup.write_target {
-                    Wt::User => WriteTarget::User,
-                    Wt::Topic => WriteTarget::Topic,
-                    Wt::None => WriteTarget::None,
-                },
-                ..Default::default()
-            };
-            let mut ng = hipfire_specdecode_ngram::NgramSpec::new(cfg);
-            if setup.persists() {
-                let layout = hipfire_specdecode_ngram::ScopeLayout::new(&setup.store_root);
-                let vocab = target.config.vocab_size;
-                // The writable table belongs to one user. With no request identity
-                // the daemon is single-tenant, so everything shares `local` — which
-                // is correct there and unsafe the moment it is not, because
-                // `next`/`next2` are plaintext and a shared writable table is a
-                // continuation oracle.
-                let scope = ngram_scope.unwrap_or_default();
-                let user = scope.user_id.unwrap_or("local");
-                if let Some(p) = layout.user(&setup.scope, user) {
-                    if let Err(e) = ng.attach_user(&p, vocab, setup.blocks) {
-                        eprintln!("[ngram] user store unavailable ({}): {e}", p.display());
+        ngram_state
+            .as_ref()
+            .map(|st| st.setup.clone())
+            .map(|setup| {
+                use crate::model::NgramWriteTarget as Wt;
+                use hipfire_specdecode_ngram::WriteTarget;
+                let cfg = hipfire_specdecode_ngram::NgramConfig {
+                    orders: setup.orders.clone(),
+                    chain_floor: setup.chain_floor,
+                    max_spine: setup.max_spine,
+                    promote_count: setup.promote_count,
+                    write_target: match setup.write_target {
+                        Wt::User => WriteTarget::User,
+                        Wt::Topic => WriteTarget::Topic,
+                        Wt::None => WriteTarget::None,
+                    },
+                    ..Default::default()
+                };
+                let mut ng = hipfire_specdecode_ngram::NgramSpec::new(cfg);
+                if setup.persists() {
+                    let layout = hipfire_specdecode_ngram::ScopeLayout::new(&setup.store_root);
+                    let vocab = target.config.vocab_size;
+                    // The writable table belongs to one user. With no request identity
+                    // the daemon is single-tenant, so everything shares `local` — which
+                    // is correct there and unsafe the moment it is not, because
+                    // `next`/`next2` are plaintext and a shared writable table is a
+                    // continuation oracle.
+                    let scope = ngram_scope.unwrap_or_default();
+                    let user = scope.user_id.unwrap_or("local");
+                    if let Some(p) = layout.user(&setup.scope, user) {
+                        if let Err(e) = ng.attach_user(&p, vocab, setup.blocks) {
+                            eprintln!("[ngram] user store unavailable ({}): {e}", p.display());
+                        }
                     }
-                }
-                // A topic table lives *under the user*, so it is private and may be
-                // written. A topic table shared across users would need to be
-                // read-only for the same reason the base one is.
-                if let Some(t) = scope.session_type {
-                    if let Some(p) = layout.topic(&setup.scope, t, Some(user)) {
-                        // Writable because it lives under the user, so it is
-                        // private. A topic table shared across users would have to
-                        // be read-only, like the base tier.
-                        if let Err(e) = ng.attach_topic(&p, vocab, setup.blocks, true) {
-                            eprintln!("[ngram] topic store unavailable ({}): {e}", p.display());
+                    // A topic table lives *under the user*, so it is private and may be
+                    // written. A topic table shared across users would need to be
+                    // read-only for the same reason the base one is.
+                    if let Some(t) = scope.session_type {
+                        if let Some(p) = layout.topic(&setup.scope, t, Some(user)) {
+                            // Writable because it lives under the user, so it is
+                            // private. A topic table shared across users would have to
+                            // be read-only, like the base tier.
+                            if let Err(e) = ng.attach_topic(&p, vocab, setup.blocks, true) {
+                                eprintln!("[ngram] topic store unavailable ({}): {e}", p.display());
+                            }
+                        }
+                    }
+                    if let Some(p) = layout.base(&setup.scope) {
+                        if p.exists() {
+                            if let Err(e) = ng.attach_base(&p) {
+                                eprintln!("[ngram] base store unavailable ({}): {e}", p.display());
+                            }
                         }
                     }
                 }
-                if let Some(p) = layout.base(&setup.scope) {
-                    if p.exists() {
-                        if let Err(e) = ng.attach_base(&p) {
-                            eprintln!("[ngram] base store unavailable ({}): {e}", p.display());
-                        }
-                    }
-                }
-            }
-            ng
-        })
+                ng
+            })
     });
     // Seed from the prompt: prompt-echo is where a training-free drafter earns
     // most of its acceptance. `reset()` drops the previous request's rolling
@@ -1326,8 +1328,11 @@ pub fn generate_dflash(
         })
     });
     if let Some(n) = ngram {
-        df.ngram_live = Some((ngram_key, n));
+        if let Some(st) = ngram_state.as_mut() {
+            st.live = Some((ngram_key, n));
+        }
     }
+    m.ngram = ngram_state;
 
     // Put target state back on LoadedModel so the next request sees fresh
     // (reset) state. We zero DN/kv on entry anyway, but we still need the
