@@ -429,3 +429,36 @@ cache, and nothing was invalidating it.**
 3. Anything sourced from memory needs `git log --grep` + a `docs/todo` sweep
    before it earns a rank. Six items, ~2 minutes each, would have caught all of
    this before the list was published.
+
+### #12 LQER — MISCHARACTERISED (seventh)
+
+"Promote the low-rank residual to a first-class config setting with a default
+rank per bit-width." It cannot be promoted: it is not a format.
+
+`HIPFIRE_LOWRANK_R` lives inside the **`use_qtip_sim` simulation path**
+(`cli.rs:12816`), operates only on `QuantType::BF16` tensors, and ends with
+
+    t.data = f32_slice_to_bf16_bytes(&deq);
+
+It writes BF16 back. It is a **quality probe**: it bakes the quality of a
+hypothetical W4 + UᵥVᵥ correction into a bf16 artifact so KLD can be measured
+without building the format. Its own comment says so — "sims the quality of W4 +
+a 2-WMMA UᵥVᵥ correction".
+
+Promoting it to a config default would hand operators a knob that produces
+**bf16-sized artifacts with simulated quality**. The measurement behind the item
+(-13% at 2 bit; qtip4+LDLQ+lr32 beating oq4++) is real and says the format is
+worth BUILDING — storage layout plus a 2-WMMA runtime correction. That is a
+project, not a config flip.
+
+**Seven of twenty now dead, done, or mischaracterised.** And the pattern in the
+last three is sharper than "stale": #17 would have made quality worse, and #12
+would have shipped a misleading knob. A memory-sourced rank is not just
+out-of-date, it can be actively wrong about what the thing IS.
+
+### Remaining live items are all large
+
+#9 (Speculator seam), #13 (GuidedQuant), #18 (MoE allocation shape), #20
+(qwen4_exp batched forward). None is an overnight win; each wants a dedicated
+session with real-model validation. **The cheap wins are exhausted** — which is
+itself the answer to "how many of the twenty survive contact with measurement".
