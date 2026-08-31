@@ -291,3 +291,47 @@ loading and not.
 
 Promoted to the top of the remaining queue: highest measured payoff, existing
 pattern to copy, no new kernel.
+
+### ⚠️ CORRECTION to the GTT finding — it is model-shaped, and it does NOT unlock the 122B
+
+I wrote "20 GiB is the difference between the 122B loading and not." **Wrong.**
+Computed from the real artifacts' routed-expert tensor sizes through
+`gtt_alloc_cost` (no GPU needed — the rounding rule is pure arithmetic):
+
+| model | expert pairs | raw | separate | one/expert | saving |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B oq4.25++ | 10240 | 16.5 GiB | 30.0 (1.814x) | 20.0 (1.209x) | **10.0 GiB (33.3%)** |
+| Qwen3.5-122B-A10B oq4.25++ | 12288 | 63.0 GiB | 75.8 (1.204x) | 74.5 (1.184x) | **1.3 GiB (1.7%)** |
+
+**The benefit is entirely a function of where per-expert size sits on the 2 MiB
+grid.** The 35B's pairs are ~1.6 MB and land just over a boundary, so rounding
+costs 1.81x and merging recovers a third. The 122B's are ~5.25 MB, already well
+above the grid, so rounding only costs 1.20x and merging recovers almost nothing.
+
+So: worth doing for the 35B class, **not** a 122B unlock. The 122B's problem was
+the compact->Oq8 expansion (1.80x), and that is already closed by
+compact-resident being default. My earlier 60->40 GiB figure also came from the
+doc's POST-EXPANSION alloc report; against today's compact-resident reality the
+same model is 30.0 -> 20.0 GiB.
+
+Two lessons, and the second is the general one:
+
+1. Do not carry a memory-resident number (the doc's alloc report) into a present
+   claim without re-deriving it against current defaults. Compact-resident landed
+   between that doc and now and moved every figure in it.
+2. **A ratio measured on one model is not a property of the code.** This one
+   varies 33.3% -> 1.7% across two models of the same family and quant. Check the
+   shape before generalising.
+
+Also confirmed while checking: the GPU pool RECYCLES WHOLE BUFFERS, it does not
+sub-allocate from slabs (`pool.rs::alloc` pops a free-list entry or `hipMalloc`s
+at the requested size). So routing expert loads through the pool is NOT an
+alternative fix — the per-tensor rounding applies either way. The allocation
+shape is the only lever.
+
+**Revised status:** still the best remaining item by measured payoff on the 35B
+class, but it is a 10 GiB win on one model shape, not a 20 GiB structural unlock.
+The refactor it needs (`load_moe_expert` returning bytes so the caller can pack
+gate_up||down into one buffer, with the existing pointer tables retargeted at
+base and base+len) touches the loading path for every MoE model, so it wants a
+dedicated session with real-model validation — not an unattended 3 a.m. edit.
