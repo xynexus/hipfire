@@ -354,3 +354,56 @@ Finish by writing a summary at the top of the run log: what landed, what moved
 and by how much, what is still open, and — most usefully — **what you learned
 that changes the ranked list.** The list is a hypothesis, not a work order; if
 the measurements say item 6 is dead and something unranked matters more, say so.
+
+---
+
+# FINAL LEDGER — all twenty verified against the repo (2026-09-01)
+
+The directive was "land as many as survive contact with measurement". Every item
+was checked against the tree, not against the memory it came from.
+
+| # | item | verdict |
+|---|---|---|
+| 1 | chain vs tree 3.2x | **RETRACTED** — cold-cache artifact; chain beats AR 1.45x |
+| 2 | `is_batchable_la` G128 | **BLOCKED** — needs a G128 fused rotate + activation splitting; groundwork landed (`d7ba9d27a`), incl. a latent overrun fix |
+| 3 | KVarN x batched prefill | **CLOSED** — `96d53741c`, 2026-08-29 |
+| 4 | paged-expert per-access cost | ✅ **LANDED** `322324721` — 0.25 → 0.18 s/tok (1.39x) |
+| 5 | batched vs per-token hidden states | **EXPLAINED** — same fp16 narrowing cadence as #3; measured and costed in BUGS.md, dither tried and WORSE |
+| 6 | oq8 GEMM at 54% of ceiling | **LIVE, large** — own goal file; LDS staging already tried and lost |
+| 7 | MoE decode at 36% of roofline | **LIVE, large** — grid-65536 shape is the lead |
+| 8 | W4A4 beyond prefill | **LIVE, large** — pair with SpinQuant; A4 costs ~3.5 dB |
+| 9 | unify accept loops onto `Speculator` | **LIVE** — trait exists, zero implementors |
+| 10 | gemma3 windowed attention | **ALREADY DONE** — `attention_swa_gqa_batched` + `swa_ring_write` |
+| 11 | lm_head two-stage | **ALREADY DONE** — shipped; body extension is research |
+| 12 | LQER to config | **MISCHARACTERISED** — a `use_qtip_sim` probe that emits bf16; not a format |
+| 13 | GuidedQuant / end-loss gradients | **LIVE, largest quality ceiling** |
+| 14 | calib seq-len 2048 | ✅ **LANDED** `548a10711` |
+| 15 | OQ8++ promotion, not Q8 | **STALE PREMISE** — `opus_mixed` is within-format outlier budgeting; the protected set already routes ABOVE 8-bit (see #16, #17) |
+| 16 | embed stays 16-bit | **ALREADY DONE** — `--embed-precision` defaults to `source` |
+| 17 | OQ8 router default | **VOID — would DOWNGRADE**; routers already lossless BF16 |
+| 18 | GTT 2 MiB rounding | **DESIGNED, blocked** — `docs/todo/2026-09-01-moe-expert-pair-allocation.md`; 10 GiB on the 35B, 1.3 on the 122B |
+| 19 | repacker pre-split | **LIVE, moderate** — already scoped as an optimisation, not a prerequisite |
+| 20 | qwen4_exp batched forward | **LIVE, large** — gates all speculation on the 180B |
+
+**Tally: 2 landed · 9 do not survive (done, closed, void, retracted, explained,
+or mischaracterised) · 1 designed and blocked · 8 live, of which 6 are
+dedicated-session kernel or research work.**
+
+## Also shipped, none of it on the list
+
+| commit | what |
+|---|---|
+| `f212ae076` | **`tiny-spec-gate`** — failing on `master` since it landed, asserting a path it had disabled |
+| `217e5c909` | **cold-cache guard** — catches the trap that produced this run's own wrong headline |
+| `db02784e6` | six ASCII tables rustdoc was compiling; workspace doctests clean |
+| `d7ba9d27a` | latent buffer overrun at group 128 |
+| `563ff6f02` | n-gram state off `DflashState`, + a scope-leak test |
+
+## The lesson this run actually bought
+
+Nine of twenty did not survive because **the list was built from memory and the
+repo was weeks ahead of it**. One item (#17) would have made quality worse; one
+(#12) would have shipped a misleading knob. The infrastructure shipped above
+exists so the next list can be trusted: a guard against the measurement error
+that produced the wrong headline, and a gate that can now actually fail.
+
