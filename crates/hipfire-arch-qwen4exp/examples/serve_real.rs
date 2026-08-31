@@ -80,7 +80,13 @@ fn main() {
     let mut tok = am as u32;
     let mut moved = false;
     let t2 = Instant::now();
-    let steps = 4;
+    // 4 steps is a liveness check, not a throughput measurement: with paged
+    // experts the first tokens are dominated by cold page-ins, so a short run
+    // reports the warm-up rather than the steady state. Override to measure.
+    let steps: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     for i in 0..steps {
         m.decode_step(&mut gpu, tok, prompt.len() + i)
             .expect("decode");
