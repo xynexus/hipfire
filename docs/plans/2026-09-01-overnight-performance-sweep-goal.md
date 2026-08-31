@@ -367,7 +367,7 @@ was checked against the tree, not against the memory it came from.
 | 1 | chain vs tree 3.2x | **RETRACTED** — cold-cache artifact; chain beats AR 1.45x |
 | 2 | `is_batchable_la` G128 | **BLOCKED** — needs a G128 fused rotate + activation splitting; groundwork landed (`d7ba9d27a`), incl. a latent overrun fix |
 | 3 | KVarN x batched prefill | **CLOSED** — `96d53741c`, 2026-08-29 |
-| 4 | paged-expert per-access cost | ✅ **LANDED** `322324721` — 0.25 → 0.18 s/tok (1.39x) |
+| 4 | paged-expert per-access cost | ✅ **LANDED** `322324721` — ~0.245 → ~0.19 s/tok (**~1.3x**, median of 3; the 1.39x in the commit message was a best single run) |
 | 5 | batched vs per-token hidden states | **EXPLAINED** — same fp16 narrowing cadence as #3; measured and costed in BUGS.md, dither tried and WORSE |
 | 6 | oq8 GEMM at 54% of ceiling | **LIVE, large** — own goal file; LDS staging already tried and lost |
 | 7 | MoE decode at 36% of roofline | **LIVE, large** — grid-65536 shape is the lead |
@@ -382,12 +382,14 @@ was checked against the tree, not against the memory it came from.
 | 16 | embed stays 16-bit | **ALREADY DONE** — `--embed-precision` defaults to `source` |
 | 17 | OQ8 router default | **VOID — would DOWNGRADE**; routers already lossless BF16 |
 | 18 | GTT 2 MiB rounding | **DESIGNED, blocked** — `docs/todo/2026-09-01-moe-expert-pair-allocation.md`; 10 GiB on the 35B, 1.3 on the 122B |
-| 19 | repacker pre-split | **LIVE, moderate** — already scoped as an optimisation, not a prerequisite |
+| 19 | repacker pre-split | **KILLED BY MEASUREMENT** — 2.2x more cold loads measured 1.6x FASTER, so page-in cost is not the term that matters |
 | 20 | qwen4_exp batched forward | **LIVE, large** — gates all speculation on the 180B |
 
-**Tally: 2 landed · 9 do not survive (done, closed, void, retracted, explained,
-or mischaracterised) · 1 designed and blocked · 8 live, of which 6 are
-dedicated-session kernel or research work.**
+**Tally: 2 landed · 10 do not survive (done, closed, void, retracted, explained,
+mischaracterised, or killed by measurement) · 1 designed and blocked · 7 live,
+all of them dedicated-session kernel or research work.**
+
+Half the list did not survive. That is the run's actual finding.
 
 ## Also shipped, none of it on the list
 
