@@ -7,6 +7,77 @@ Entries are appended as work happens, failures included.
 
 ---
 
+# MORNING SUMMARY
+
+**Headline: the ranked list was the problem, not the code.** Of twenty items,
+**seven did not survive contact with the repo** — already done, already fixed,
+or wrong about what the thing is. One of them (#17, "make the OQ8 router the
+default") would have made quality *worse*: routers already default to lossless
+BF16. Another (#12, LQER) would have shipped a knob that emits bf16-sized
+artifacts with simulated quality.
+
+The list was built from memory entries. Every one was true when written; nothing
+invalidates a memory when the code moves. `--embed-precision source` landed
+2026-07-22, gemma3's windowed attention was already wired, KVarN batched was
+fixed 2026-08-29, the G128 blocker was documented 2026-08-30 — and the list was
+written 2026-09-01 without checking any of it.
+
+## What shipped (21 commits, all gates green)
+
+| commit | what |
+|---|---|
+| `563ff6f02` | n-gram state hoisted off `DflashState` onto the model, + a scope-leak test |
+| `d7ba9d27a` | batched oq8 path made group-parametric — **fixes a latent buffer overrun** at group 128 |
+| `548a10711` | calibration sequence length defaults to 2048 (was `usize::MAX`, i.e. O(n²)) |
+| `db02784e6` | six ASCII tables rustdoc was compiling; workspace doctests clean |
+| `f212ae076` | **`tiny-spec-gate` fixed** — it had been failing on `master` since it landed |
+| `217e5c909` | **cold-cache guard** — the trap that produced this run's own wrong headline |
+
+## What I got wrong, and corrected
+
+1. **"Chain DFlash loses to AR by 0.67x, a 3.2x bug-shaped gap."** A cold JIT
+   kernel cache. Warm: chain 22.1 tok/s, **1.45x AR**. Proven by moving the
+   cache aside — cold 6.41 vs warm 22.13, **3.45x, with tau bit-identical**.
+   Corrected in the doc, the goal file, the artifact and memory, and the guard
+   in `217e5c909` now catches it.
+2. **"20 GiB is the difference between the 122B loading and not."** It is 10.0
+   GiB on the 35B and **1.3 GiB on the 122B**. The benefit depends on where
+   per-expert size sits on the 2 MiB grid.
+3. **W1's root cause.** I re-derived a document that already existed and then
+   proposed a fix that cannot work.
+
+## Where to pick up
+
+Live and worth doing, verified against the tree:
+
+- **#18 MoE allocation shape** — designed in
+  `docs/todo/2026-09-01-moe-expert-pair-allocation.md`, 10 GiB on the 35B class.
+  Blocked on one ownership decision (`sub_offset` yields a `NonOwning` buffer and
+  `dispose` debug-asserts on one by design), not on effort. **Closest to ready.**
+- **#9 Speculator seam** — the trait exists, `SpecTarget` has three implementors,
+  `Speculator` has zero. Five hand-rolled accept loops could collapse onto it.
+- **#13 GuidedQuant** — the real quality ceiling; `hipfire-train` is already fp32
+  GPU autograd, so the keystone exists.
+- **#20 qwen4_exp batched forward** — gates everything speculative on the 180B.
+
+Everything else on the list is closed, void, or needs re-deriving from the repo
+rather than from memory.
+
+## Process changes earned tonight
+
+1. **Grep before ranking.** `git log --grep` + `docs/todo` + `docs/plans` +
+   `BUGS.md`, per item, before it earns a place in a plan. Two minutes each would
+   have caught all seven.
+2. **Discard the first run after any rebuild.** Now enforced by a warning.
+3. **Check a gate can fail.** `tiny-spec-gate` asserted a path it had itself
+   disabled; the guard in `serve_fixture` and the ratio assertion in
+   `oq8_batched_xs_len` exist for the same reason.
+
+---
+
+
+---
+
 ## Step 0 — land in-flight work · DONE
 
 Tree was dirty on `master`; branched first.
