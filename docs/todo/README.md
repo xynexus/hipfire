@@ -21,6 +21,7 @@ finished work.
 | `2026-07-22-hfq-compose-dflash-tria.md` | shipped in `hfq_compose.rs` + `hipfire model compose` |
 | `2026-08-25-regen-gfx1103-tiny-state-baselines.md` | baselines recorded; `tiny-state-gate: PASS (18 cell(s))` verified by running it |
 | `2026-08-09-deltanet-state-handover.md` | self-declared DONE in its own title; kept as the record of what was removed |
+| `free-tensor-provenance.md` | `BufferOrigin` tag added; `dispose` routes Pooled/Direct/NonOwning, and its warning cites this doc |
 
 ## Unblocked since they were written
 

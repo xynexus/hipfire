@@ -1,5 +1,27 @@
 # `free_tensor` does not know what it is freeing
 
+> **CLOSED 2026-08-31 — provenance exists and disposal routes on it.**
+>
+> The complaint below quotes `free_tensor` calling `self.pool.free(tensor.buf)`
+> unconditionally. It now calls `self.dispose(tensor.buf)`
+> (`hipfire-rdna/src/dispatch/mod.rs:2401`), and `dispose` matches on
+> `buf.origin()`:
+>
+> - `BufferOrigin::Pooled` -> `self.pool.free(buf)`
+> - `BufferOrigin::Direct` -> `self.hip.free(buf)`
+> - `BufferOrigin::NonOwning` -> neither, which is the correct disposal for a
+>   view — plus a `debug_assert!`, a `NON_OWNING_DISPOSES` counter, and a
+>   one-shot warning that cites this document by name.
+>
+> The tag is stamped at allocation, not inferred: `GpuPool::alloc` marks
+> `Pooled`, `DeviceBuffer::from_raw` / `alias` mark `NonOwning`
+> (`hip-bridge/src/lib.rs:89`). The `NonOwning` arm's comment records what this
+> prevented — issue #262, "where the alias went to the pool and came back as
+> scratch over live weights", which is exactly the failure this document was
+> written to stop.
+>
+> Kept as the record of why the tag exists.
+
 `Gpu::free_tensor` returns every buffer to `GpuPool`, regardless of how that
 buffer was allocated:
 
