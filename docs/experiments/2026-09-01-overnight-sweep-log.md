@@ -231,3 +231,63 @@ docs, and the repo is ahead of the memory.** For the remaining items, the first
 action must be `git log --grep` plus a `docs/todo` + `docs/plans` + `BUGS.md`
 sweep for the subsystem, BEFORE any analysis or measurement. Two of these three
 would have been closed in minutes that way.
+
+---
+
+## Bulk pre-screen of the remaining items (applying the lesson)
+
+Screened every remaining item with `git log --grep` + a `docs/todo`,
+`docs/plans`, `docs/bugs` sweep BEFORE analysing any of them. Results:
+
+| item | repo status |
+|---|---|
+| W5a calib seq-len 2048 | no prior work — **live** |
+| W5b LQER low-rank residual | no prior work — **live** |
+| W5c OQ8 router default | no prior work — **live** |
+| W5d embed 16-bit rule | no prior work — **live** |
+| W6a GTT 2 MiB rounding | `docs/plans/2026-08-23-gtt-2mib-rounding-moe-memory.md` — **half closed, half now actionable (below)** |
+| W6b repacker pre-split | only this branch's own commits — **live** |
+| W6c oq8 GEMM ceiling | no prior work — **live** |
+
+Two minutes of screening, and it kept the remaining seven honest.
+
+## ⭐ NEW FINDING — 20 GiB of MoE memory from one allocation shape
+
+The GTT doc attributes the 122B's failure to two stacked ~1.9x amplifications:
+
+| cause | factor | status |
+|---|---|---|
+| compact -> Oq8 expansion on load | 1.80x | **CLOSED** — compact-resident is default-on now (`compact_resident_enabled`, only `0/off/false/no` disables) |
+| GTT allocation rounded to 2 MiB | 1.88x | still live |
+
+But the surviving half is not a driver problem to work around — it is an
+allocation SHAPE problem, and the fix already exists in this tree.
+
+`HIPFIRE_ALLOC_REPORT` on `Qwen3.6-35B-A3B--oq4.25++` shows the resident loader
+allocating each expert's two projections SEPARATELY:
+
+    20.31 GiB   10240 x 2129920 B   <- expert gate_up
+    10.16 GiB   10240 x 1064960 B   <- expert down
+
+Both land just over a rounding boundary. Through `gtt_alloc_cost`:
+
+| shape | GTT bytes/expert | vs raw |
+|---|---|---|
+| two separate allocations | 6 291 456 | 1.969x |
+| **one allocation** | **4 194 304** | **1.313x** |
+
+**33.3% saved — 2.00 MiB per expert, 60.0 GiB -> 40.0 GiB across 10240 experts.**
+
+And `weight_pager` ALREADY does this: a module holds gate_up and down back to
+back in one buffer, which is why `ResidentExpertViews` hands out byte offsets
+rather than two tensors. Its own comment says "the GTT rounding is paid once per
+module rather than per projection". The resident loader simply never adopted the
+shape.
+
+**So the item is not "work around 2 MiB rounding" — it is "give the resident MoE
+loader the same one-allocation-per-expert shape the pager already uses."** That
+reframing makes it tractable, and 20 GiB is the difference between the 122B
+loading and not.
+
+Promoted to the top of the remaining queue: highest measured payoff, existing
+pattern to copy, no new kernel.
