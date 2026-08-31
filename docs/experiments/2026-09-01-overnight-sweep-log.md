@@ -32,6 +32,7 @@ written 2026-09-01 without checking any of it.
 | `db02784e6` | six ASCII tables rustdoc was compiling; workspace doctests clean |
 | `f212ae076` | **`tiny-spec-gate` fixed** — it had been failing on `master` since it landed |
 | `217e5c909` | **cold-cache guard** — the trap that produced this run's own wrong headline |
+| `322324721` | **#4 landed: paged decode 0.25 -> 0.18 s/tok (1.39x)** on the 180B |
 
 ## What I got wrong, and corrected
 
@@ -50,6 +51,7 @@ written 2026-09-01 without checking any of it.
 
 Live and worth doing, verified against the tree:
 
+- ~~#4 paged-expert per-access overhead~~ — **LANDED** (`322324721`), 1.39x.
 - **#18 MoE allocation shape** — designed in
   `docs/todo/2026-09-01-moe-expert-pair-allocation.md`, 10 GiB on the 35B class.
   Blocked on one ownership decision (`sub_offset` yields a `NonOwning` buffer and
@@ -559,3 +561,37 @@ run kept finding:
    its stub `main`, so the attribute applied to the helper and the file had two
    unconditional `main`s. Anchoring text insertion on a string that appears more
    than once is how both of these happened.
+
+---
+
+## #4 LANDED — paged decode 1.39x
+
+`gate_up.expert()` and `down.expert()` each locked, hashed and ensured **the same
+module** — one module holds both projections. `ExpertStack::expert_pair` does it
+once.
+
+Qwen3.8-Flash-Next-180B, 8 GiB budget, 64 decode steps:
+
+| | before | after |
+|---|---|---|
+| decode | 0.25 s/tok | **0.18 s/tok (1.39x)** |
+| pager hits | 48245 | **15605** |
+| cold loads | 17035 | 17035 |
+| evictions | 15670 | 15670 |
+| argmax | 1892 (13.9764) | unchanged |
+
+The hit delta is exactly 64 x 48 x 10 plus prefill, so the mechanism is confirmed
+rather than inferred. This is the fix the earlier measurement pointed at — a
+48 GiB budget with zero evictions being no faster than an 8 GiB one thrashing
+15670 said the cost was per-access work, not fetching.
+
+**Trap #3 caught me again, in a new form.** The first measurement after the edit
+read 0.24 s/tok with the pager counters IDENTICAL to baseline — because
+`cargo build --workspace` had not rebuilt the example, so I was timing the OLD
+binary. The counters were the tell: if ensures had halved, hits could not be
+unchanged. **When a change shows no effect, check you measured the change** — the
+same discipline as discarding a cold first run.
+
+I had also written this item off as "a dedicated session". That was wrong: it was
+one contained method in code I wrote earlier tonight, and it is the largest
+throughput win of the run.
