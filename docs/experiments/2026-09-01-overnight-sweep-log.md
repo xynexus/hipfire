@@ -67,53 +67,58 @@ Gates: `cargo test -p hipfire-rdna` 63/63, clippy clean, `no-gpu-ci` exit 0.
 4. Need a G128 artifact to test on — none exists locally; quantize a small model
    to oq8 at group 128.
 
-### W1 step 2 — the rotation basis · ROOT-CAUSED
+### W1 step 2 — the rotation basis · CORRECTION, and W1 is DEPRIORITISED
 
-The blocker is a **kernel** gap, not a dispatch one, and it explains a previously
-unexplained result.
+⚠️ **My first write-up of this step was wrong in three ways.** Kept visible
+rather than rewritten, because the error is instructive: I re-derived a known
+result, mis-stated the prior art, and proposed a fix that does not work.
 
-`dtype_rotation_plan` is correct — `Oq8G128` and `OqCompactG128` both map to
-`RotationPlan::FwhtG128` (`hipfire-dispatch/src/types.rs:121-122`). The GEMV path
-honours it via `ensure_mq_signs_128` (seeds 43/1043).
+**`docs/todo/2026-08-30-oq8g128-protected-set.md` already had this**, and its
+title says so: *"needs a G128 fused rmsnorm+rotate"*. Specifically:
 
-**But batched prefill rotates with the FUSED rmsnorm+rotate kernels, and all
-three are FWHT-256 only:**
+1. I wrote that the KLD 0.83 "was attributed to the format". It was not. That doc
+   argues Oq8G128 is **21.6% better than the Q8F16 it replaces using FEWER bits**
+   (RMSE 4.110e-3 vs 5.243e-3, 8.125 vs 8.5 b/w). Nobody blamed the format.
+2. I presented the fused-256 root cause as a finding. It was already documented,
+   along with the note that `gemm_oq8_grouped_wmma` "needed nothing (it already
+   took `group`)" and that `mq_rotate_x_128` was only missing a batched dispatch.
+3. **My proposed fix was wrong.** I said "unfuse it: rmsnorm →
+   `rotate_x_mq_128_batched` → `gemm_..._g(128)`". That misses the actual
+   difficulty, which the doc states plainly: qwen35's lowered executor fuses
+   rmsnorm+rotate into one kernel and **every attention projection consumes that
+   single FWHT-256-rotated activation**. Giving one weight the 128 basis needs a
+   G128 fused rmsnorm+rotate *and* a way to split the shared activation, because
+   the layer then needs both a 256- and a 128-rotated copy of the same input.
+   Unfusing one call site does not get there.
 
-| kernel | evidence |
-|---|---|
-| `fused_rmsnorm_mq_rotate.hip` | "FWHT rotation per 256-element group" |
-| `fused_rmsnorm_mq_rotate_awq.hip` | `const int groups_total = K / 256;` (line 92) |
-| `fused_rmsnorm_mq_rotate_plain.hip` | "group-of-256 butterflies" |
+**What survives from this branch's work:** commit `d7ba9d27a` is still real. The
+batched-path scratch allocator sized the activation-scale plane `n * (k / 256)`,
+which doubles at group 128 — a latent overrun the prior doc does not cover,
+because it was about the GEMV path and the batched path was blocked anyway. That
+groundwork stands and is behaviour-neutral (18 tiny-state hashes bit-identical).
 
-So a G128 weight met FWHT-256 activations. The rotations do not cancel, which is
-**exactly** the previously-recorded "qwen35 KLD 0.83 with Oq8G128" — a number
-that was attributed to the format and is in fact this kernel mismatch. The emit
-was then reverted and the infra kept, which is why `quantize_oq8g128` exists in
-`codecs.rs:1016` with **no CLI format token to reach it** ("Both keep the
-Oq8G256 W8A8 runtime format").
+**W1 is deprioritised, and this changes the ranked list.** The goal file ranked
+it #2 on the premise "add two dispatch arms". That premise is dead: it needs a
+new fused G128 kernel family (`RmsnormRotateMqG128` plus AWQ/batched siblings —
+none of the `RmsnormRotateMq*` keys have a G128 form) and an activation-splitting
+scheme in the lowered executor. That is a multi-day kernel job, not an overnight
+dispatch fix.
 
-**The missing piece already exists.** `rotate_x_mq_128_batched`
-(`dispatch/rope.rs:112`) is a batched FWHT-128 rotation, and its own doc says:
-*"Kernel-side this needed nothing: `mq_rotate_x_128` already offsets by
-`blockIdx.y * K` ... it was simply never launched with a grid.y > 1."*
+Two further constraints from the same doc, worth not rediscovering:
+- there is **no AWQ sidecar support at G128** (`rotate_x_mq_128_for` takes the
+  non-AWQ path) — check before enabling calibrated paths;
+- **LDLQ has no G128 form** (`cli.rs` refuses `--ldlq` at group 128, because
+  `oqplus_compact_ldlq_pack` emits 256-element blocks).
 
-So every component is present; nothing is fused for G128, that is all.
+And a measurement warning: the tiny-quant KLD numbers **cannot adjudicate this**
+— the same change scored 6.9x better on one family and 2x worse on another, on
+random-init fixtures where KLD measures perturbation sensitivity, not quality.
+Use the reconstruction test.
 
-**W1 is therefore a 4-step chain, in this order:**
+**Next: skip to W2** (the 3.2x chain-vs-spine gap), which is measured, local, and
+has no kernel dependency. W1 resumes only if a G128 fused rotate is worth a
+dedicated session.
 
-1. Wire an **unfused** G128 branch into batched prefill:
-   rmsnorm → `rotate_x_mq_128_batched` → `gemm_oq8_grouped_act_batched_g(.., 128)`.
-   Two kernels instead of one — slower than the fused G256 path, far faster than
-   the per-token fallback it replaces.
-2. Add the `is_batchable_la` arms in **both** `qwen35/mod.rs` and
-   `runtime/dispatch.rs` (matching-pair comment: keep in sync).
-3. Re-enable the `oq8g128` emit token in `hipfire-quantize` — currently there is
-   no way to produce a test artifact at all.
-4. Measure. **Falsifiable prediction: KLD 0.83 collapses to ~oq8 levels.** If it
-   does not, this root cause is wrong and the format is genuinely at fault.
-
-Step 3 depends on 1+2 landing, or the artifact is unservable again and the emit
-gets reverted a second time.
-
-**Bug filed by this analysis:** the deprecation note "Oq8G128 is bad" is wrong —
-it was never a format problem. Anything asserting that should be corrected.
+**Process lesson for the rest of this run:** grep `docs/todo/` and `docs/plans/`
+for the subsystem BEFORE analysing it. Two hours of this tick re-derived a
+document that already existed.
