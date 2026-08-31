@@ -20,6 +20,19 @@ finished work.
 | `2026-07-21-embed-per-row-lloyd-codebook.md` | REJECTED by measurement |
 | `2026-07-22-hfq-compose-dflash-tria.md` | shipped in `hfq_compose.rs` + `hipfire model compose` |
 | `2026-08-25-regen-gfx1103-tiny-state-baselines.md` | baselines recorded; `tiny-state-gate: PASS (18 cell(s))` verified by running it |
+| `2026-08-09-deltanet-state-handover.md` | self-declared DONE in its own title; kept as the record of what was removed |
+
+## Unblocked since they were written
+
+- `2026-08-12-batched-prefill-reconciliation.md` — its ⚠️ BLOCKER (does master's
+  grouped-WMMA read resident qt=34/37 experts correctly at offset 0?) is
+  **resolved**: the branch's `weight_byte_offset` fix landed on master
+  independently, formula for formula. Item (1), the eligibility unlock and the
+  actual perf win, is no longer gated. The port itself is still real work and
+  wants GPU validation.
+- `2026-08-11-122b-paged-serving.md` — partially superseded by
+  `2026-08-12-handover-indexed-oq-moe.md` on the decode blocker; read the
+  handover first.
 
 ## Blocked on a decision only the owner can make
 
