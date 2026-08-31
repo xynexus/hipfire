@@ -595,3 +595,53 @@ same discipline as discarding a cold first run.
 I had also written this item off as "a dedicated session". That was wrong: it was
 one contained method in code I wrote earlier tonight, and it is the largest
 throughput win of the run.
+
+---
+
+## Three corrections/findings from re-measuring #4
+
+### 1. The 1.39x claim was a best-single-run number — it is ~1.3x
+
+Repeated the 8 GiB post-fix config three times, clean:
+
+    0.21 · 0.19 · 0.19 s/tok   (median 0.19)
+
+Pre-fix samples were 0.25, 0.25, 0.24. So the honest figure is
+**~0.245 -> ~0.19 s/tok, about 1.3x**, not the 1.39x taken from a single 0.18
+reading. The mechanism is unchanged and still confirmed by the hit-count delta
+(48245 -> 15605); only the magnitude was over-stated. Commit `322324721`'s
+message says 1.39x and should be read as the best observed run.
+
+### 2. NEW TRAP — a run is contaminated by the previous run's residency
+
+One 8 GiB run read **0.27 s/tok with counters identical to a 0.19 run**. It had
+been preceded by a 48 GiB run that left 45.2 GiB resident; `free` showed 22 GiB
+still in buff/cache. On a UMA box the page cache and GPU memory are one pool, so
+the previous run's footprint is still charged to the next one.
+
+**Successive benchmark runs are not independent when they differ in residency.**
+Interleave arms, or re-run each arm until it settles, and treat the first run
+after a large-footprint arm the same way as a cold-cache run: discard it. This is
+the second time tonight the same discipline was needed and the second distinct
+mechanism behind it (the first was JIT compilation).
+
+### 3. #19 (repacker pre-split) is KILLED by measurement
+
+The item's premise is that page-in cost matters, so pre-splitting compact planes
+at repack time — making `prepare_expert_module` a memcpy instead of a transform —
+would pay. Post-fix, comparing budgets:
+
+| budget | cold loads | evictions | decode |
+|---|---|---|---|
+| 48 GiB | 7711 | **0** | 0.30 s/tok |
+| 8 GiB | 17035 | 15670 | **0.19 s/tok** |
+
+**2.2x MORE cold loads is 1.6x FASTER.** Cold-load count does not drive decode
+time here, so making each cold load cheaper attacks the wrong term. #19 is not
+worth a session on this evidence.
+
+And the counter-intuitive corollary, which is the useful part: **a bigger paging
+budget is SLOWER**. 45.2 GiB resident on a 128 GB UMA box pressures the shared
+pool enough to cost more than the page-ins it avoids. The budget should be tuned
+DOWN, not up — the opposite of how a cache budget usually behaves, and worth
+knowing before anyone "optimises" by raising it.
