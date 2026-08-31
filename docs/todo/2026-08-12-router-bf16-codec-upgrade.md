@@ -1,5 +1,34 @@
 # BF16 codecs: finish the in-memory half
 
+> **HALF LANDED — re-checked 2026-08-31. The "Lut3 in VRAM" half is real; the
+> "recode Huff -> Lut3 at load" half is not.**
+>
+> **Done, and it is the hard half.** `gemv_bf16l3.hip` and
+> `gemv_bf16l3_xf32.hip` exist, and the loader hands a Lut3 lm_head to the GPU
+> as PACKED bytes for `gemv_bf16l3_xf32` to decode in-kernel
+> (`qwen35/loading.rs:4620`). `expand_bf16_index` declines to expand a head
+> tensor "for exactly this reason". So the doc comment this note calls "an
+> intent, not current behaviour" — a kernel consuming the codec compressed in
+> VRAM — IS current behaviour on that path. Measured payoff recorded in place:
+> decoding instead produced a 1017 MB f32 head whose GEMV cost 5255 us per call
+> and 24.8% of all GPU time.
+>
+> **Still open, and worth knowing before touching it:**
+> - Residency is **opt-in and global** (`HIPFIRE_BF16L3_RESIDENT`). It is enabled
+>   to keep the lm_head packed, but then every bf16 tensor stays packed and every
+>   loader must cope; `qwen35/loading.rs:706` carries a decode arm precisely for
+>   that, and the comment records that making residency the default once took
+>   tiny-quant-gate "from 8 failures to 58".
+> - The **pipeline in "The upgrade" is not wired**: `storage::transcode_resident`
+>   exists but has no consumer outside `storage.rs`, so nothing recodes Huff to
+>   Lut3 during load. Today you get whichever codec is on disk.
+> - `QuantType::logical()` still maps `Bf16Lut3 | Bf16Huff -> BF16`
+>   (`storage.rs:36`), and neither has a GPU `DType` — the kernel takes packed
+>   bytes directly rather than going through a dtype.
+>
+> Related: `2026-08-04-lut3-resident-kldrefs.md`, which applies the same
+> primitive to kldrefs and is PARKED for want of a forcing constraint.
+
 MoE routers are now stored lossless BF16 (`is_moe_like` path in
 `hipfire-quantize`, `--q8-router` restores the old Q8F16). This note is about the
 part that is **not** done, and why it gets more valuable as models grow.
