@@ -376,3 +376,56 @@ One env var. Gate now reports **"spec loop OK (checkpoint engaged 31x, output ==
 AR)"**, which is exactly the second-model coverage `825d3ccfc` said was missing.
 Non-vacuous both ways: fails without the fix, and the 31 firings still produce
 AR-identical output.
+
+---
+
+## ⭐ FULL AUDIT OF THE 20-ITEM LIST — six items were already done or void
+
+Verified each against the repo rather than against memory. This is the headline
+result of the night, and it is about the list, not the code.
+
+| # | item | verified status |
+|---|---|---|
+| 1 | chain vs tree 3.2x gap | **RETRACTED** — my own cold-cache artifact; chain beats AR 1.45x |
+| 2 | `is_batchable_la` G128 arms | **premise wrong** — needs a G128 fused rotate + activation splitting (multi-day); groundwork landed |
+| 3 | KVarN x batched prefill 57x | **CLOSED** — fixed by `96d53741c`, 2026-08-29 |
+| 6 | oq8 GEMM at 54% of ceiling | unverified; M-slab work not where I expected |
+| 9 | unify accept loops onto `Speculator` | **LIVE** — still zero implementors |
+| 10 | gemma3 windowed attention kernel | **DONE** — `attention_swa_gqa_batched` + `swa_ring_write` already wired in `gemma3/forward.rs` |
+| 11 | lm_head two-stage | **DONE** — `lmhead_twostage` shipped; extending to the body is a research item |
+| 12 | LQER low-rank residual to config | **LIVE** — `HIPFIRE_LOWRANK_R` still Developer-env only |
+| 13 | GuidedQuant / end-loss gradients | **LIVE** — no implementation in tree |
+| 14 | calib seq-len 2048 default | **DONE TONIGHT** (`548a10711`) |
+| 16 | embed stays 16-bit | **DONE** — `--embed-precision` defaults to `source`; the override runs before the Q8 arm |
+| 17 | OQ8 MoE router default | **VOID — would be a DOWNGRADE.** Routers already default to lossless BF16 (`--q8-router` is opt-in). Promoting to OQ8 makes them worse. The "lying counter" is also already gone. |
+| 18 | GTT 2 MiB rounding | half closed (compact-resident); remainder is 33% on the 35B, **1.7% on the 122B** — not the unlock I claimed |
+| 20 | qwen4_exp batched forward | **LIVE** — still per-token by construction |
+
+**Six of the twenty were already done, void, or retracted.** One (#17) would have
+made things worse if implemented: routers are lossless today, and the item asked
+to quantize them to 8-bit.
+
+### Why — and it is not that the repo moved fast
+
+The list was built from **memory entries**, and every one of those entries was
+true when written. The repo simply moved past them:
+
+- `--embed-precision source` landed 2026-07-22
+- gemma3 SWA + ring-write landed before this branch
+- the router policy went to lossless BF16
+- KVarN batched was fixed 2026-08-29
+- the G128 blocker was documented 2026-08-30
+
+The list was written 2026-09-01 and did not check any of it. **Memory is a
+cache, and nothing was invalidating it.**
+
+### What this changes
+
+1. **Stop treating the ranked list as a work order.** It is a set of hypotheses
+   whose evidence is up to six weeks stale.
+2. The genuinely live items are fewer and different: **#9 (Speculator seam, zero
+   implementors), #12 (LQER still env-only), #13 (GuidedQuant, the real quality
+   ceiling), #20 (qwen4_exp batched forward), and #18 for the 35B class.**
+3. Anything sourced from memory needs `git log --grep` + a `docs/todo` sweep
+   before it earns a rank. Six items, ~2 minutes each, would have caught all of
+   this before the list was published.
