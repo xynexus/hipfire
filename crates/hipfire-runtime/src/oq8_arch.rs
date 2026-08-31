@@ -247,11 +247,13 @@ pub fn normalize_compact_overlays(data: &mut [u8], m: usize, k: usize, group: us
 /// the decode GEMV's exact access pattern (`hipfire-rdna` example
 /// `bench_oq_layout`, M=69632 K=5120, ~4x the 32 MiB MALL) prices that:
 ///
+/// ```text
 ///     flat dwordx4 stream (upper bound)      243.1 GB/s   100.0%
 ///     interleaved 136 + side reads           226.4         93.1%
 ///     interleaved 136, nibbles only          229.3         94.3%
 ///     128-byte stride, same instructions     235.6         96.9%
 ///     SPLIT PLANES                           234.7         96.6%
+/// ```
 ///
 /// The nibble plane makes every row start `ng * (group/2)` bytes in, a multiple
 /// of 128 at G=256, so every row is aligned. Splitting per ROW instead was tried

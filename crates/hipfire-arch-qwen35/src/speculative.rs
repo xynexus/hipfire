@@ -1177,8 +1177,10 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
 /// mix, greedy, it is the serial path that DIVERGES and the batched one that is
 /// exact:
 ///
+/// ```text
 ///     serial  (this off)  -> differs from plain AR
 ///     batched (this on)   -> BYTE-IDENTICAL to plain AR
+/// ```
 ///
 /// Deterministic across repeated runs both ways. Spec decode's whole guarantee
 /// is that it cannot change the output, so a rollback that diverges from AR is
@@ -6505,8 +6507,10 @@ pub struct DflashVerifyOutput {
 /// Measured on Qwen3.5-35B-A3B--oq4.25++ with its DFlash drafter, greedy, 24
 /// tokens, against plain AR decode of the same target:
 ///
+/// ```text
 ///     gdn-tape replay  (this on)  -> `...561, 12386, 19825...`   DIVERGES
 ///     full-prefill     (this off) -> `...561, 30315, 557...`     BYTE-IDENTICAL to AR
+/// ```
 ///
 /// The tape replay restores the WRONG DeltaNet state. That state is recurrent
 /// and lives OUTSIDE the KV cache, which is why the divergence is invariant to
@@ -6534,8 +6538,10 @@ pub struct DflashVerifyOutput {
 /// 🔴 **DO NOT ENABLE ON THE SERVING PATH.** Measured 2026-08-26 through the
 /// daemon, same model/drafter/prompt/B=4, fp32 KV, ONE variable:
 ///
+/// ```text
 ///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=0   tau 1.595   accept 0.399   14.6 tok/s
 ///     HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1   tau 0.056   accept 0.014    9.4 tok/s
+/// ```
 ///
 /// A 28x acceptance collapse, and the path ENGAGED (the announce fired), so it
 /// is restoring WRONG state rather than skipping. Stock serving DFlash is

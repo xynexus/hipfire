@@ -647,9 +647,11 @@ fn server_model_worker_key_id(model_path: &str) -> String {
 /// the incoming model is counted while the outgoing one is still resident.
 /// Measured file -> resident on gfx1103 with kvarn KV:
 ///
+/// ```text
 ///     Qwen3.5-9B    5.7 -> 7.7 GB   1.35x
 ///     Qwen3.8-27B  15.5 -> 19.4 GB  1.25x
 ///     Qwen3.6-35B  19.3 -> 20.6 GB  1.07x   (MoE, fewer bytes active)
+/// ```
 ///
 /// At the worst observed 1.35x, a budget of B file-bytes can occupy 1.35xB, so
 /// B must stay under ~0.74 of total. 2/3 is the next fraction below that with

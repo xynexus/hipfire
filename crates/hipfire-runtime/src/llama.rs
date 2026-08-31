@@ -60,11 +60,13 @@ thread_local! {
 /// Qwen3.8-27B's [248320, 5120] head, against the exact full-vocab compact GEMV
 /// — `examples/verify_lmhead_twostage_compact.rs`:
 ///
+/// ```text
 ///     bits   K      tier+fine MB   vs full   recall@1
 ///        2   32          318.9      2.12x    323/323
 ///        2   512         320.2      2.11x    323/323
 ///        2   8192        341.1      1.98x    323/323
 ///        4   512         638.1      1.06x    323/323
+/// ```
 ///
 /// TWO CONCLUSIONS. **q2 is the only bitwidth worth having**: a q4 tier is
 /// 637 MB against the head's own 675 MB, a 1.06x saving that cannot pay for
