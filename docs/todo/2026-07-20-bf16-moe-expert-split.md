@@ -1,5 +1,9 @@
 # TODO: bf16/f16 quantize does not split 3D-stacked MoE experts
 
+> **CLOSED — resolved in `f6d031b7e`** ("fix(quantize): don't direct-stream
+> perturbing formats or stacked-MoE experts"). Commit verified present on
+> `master` 2026-08-31.
+
 **Status:** RESOLVED 2026-07-20 (commit `f6d031b7e`). See "Fix (landed)" below.
 
 ## Fix (landed)
