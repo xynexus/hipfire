@@ -1,5 +1,26 @@
 # TODO
 
+> **SAMPLED 2026-08-31, NOT fully verified — its "Active" section contains work
+> that is already landed.**
+>
+> Spot-checked the first item under "Active", which is written in the past tense
+> and describes the accelerator-inventory work. All three of its sub-claims are
+> DONE in the tree:
+> - the daemon exposes a typed JSONL `inventory` command
+>   (`hipfire-daemon/src/handlers/status.rs:113`);
+> - server health reports the shared inventory payload
+>   (`routes/health.rs:80`, `server_accelerator_inventory`);
+> - the `source=not_probed` fallback exists
+>   (`hipfire-model/src/lib.rs:357`).
+>
+> So this file has drifted the same way the rest of `docs/todo` had — see
+> `README.md` for the pass that found six of ten documents misstating their own
+> status. At 666 lines and 21 sections it needs a **dedicated pass**, not a
+> drive-by: each item has to be checked against the tree before it is struck,
+> and one sample is not licence to strike the rest.
+>
+> Treat every "Active" entry here as unverified until that pass happens.
+
 ## Evaluation Branch
 
 ### Active

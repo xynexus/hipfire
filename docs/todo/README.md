@@ -41,6 +41,26 @@ Recorded in `DECISIONS-PENDING.md` rather than left inline, so they are countabl
 Each names the fork and what each branch costs. Implementation on these is
 deliberately not started.
 
+## Corrected in place — the status line was wrong, the doc is still open
+
+| doc | what had changed |
+|---|---|
+| `2026-08-20-handover-dflash2-qwen38-27b.md` | its open bug is FIXED and the dense/MoE asymmetry has **inverted** — MoE is now the broken side, so its dense reproducer reproduces nothing |
+| `2026-08-12-batched-prefill-reconciliation.md` | its ⚠️ BLOCKER is resolved; the branch's `weight_byte_offset` fix landed on master |
+| `2026-08-12-router-bf16-codec-upgrade.md` | the "Lut3 in VRAM" half LANDED; only the Huff->Lut3 recode-at-load remains |
+| `2026-08-07-kld-eval-throughput-remaining.md` | the transcode it asks for is written (`storage::transcode_resident`); it needs a call site, not an implementation |
+| `2026-08-12-handover-indexed-oq-moe.md` | "defaults ON" vs "reverted" reconciled: ON, with a `% 256` admissibility guard |
+| `2026-08-08-quant-benchmark-queue-handoff.md` | its "in flight" jobs are dead and the expensive artifacts are gone — a restart, not a resume |
+| `2026-08-26-coresident-training-m8.md` | "unblocked" is true of the code, but neither artifact exists on this box |
+| `2026-08-27-oq4-moe-prefill-coverage.md` | its open question is answered: the fixture's K=2 fails `moe_prefill_topk_shape_supported`, so the fix is to the fixture |
+| `2026-08-04-lut3-resident-kldrefs.md` | PARKED by its own criterion — largest kldref is 2.31 GiB, 1.38x decides nothing |
+| `2026-07-21-tiny-quant-mixed-precision-opus.md` | `TierPlan` is LFM2-gated, so take its own stated fallback |
+
+## Not verified
+
+`LEGACY-TODO.md` — 666 lines, 21 sections. Sampled only: its first "Active" item
+is already landed. Needs a dedicated pass; treat every entry as unverified.
+
 ## Live, and startable without any decision
 
 The rest. Where a doc lists "open questions", check whether they are questions
