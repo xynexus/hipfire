@@ -35,6 +35,10 @@
 // is read once, and OQC_MW row-tiles (one per WAVE) so those waves share the
 // same activation columns through L1.
 
+// Quant-basis contract: input activation `x` must already be rotated into the
+// weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
+// runs but yields garbage. See kernels/AGENTS.md.
+
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 

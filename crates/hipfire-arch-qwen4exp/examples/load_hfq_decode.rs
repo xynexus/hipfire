@@ -11,6 +11,7 @@
 //!     cargo run --release -p hipfire-arch-qwen4exp --example load_hfq_decode -- model.hfq
 
 use hipfire_arch_qwen4exp::arch::{load_ngram_table, HfqTensorReader, Qwen4Exp};
+use hipfire_arch_qwen4exp::ngram_rows::ResidentRows;
 use hipfire_arch_qwen4exp::trunk_gpu::{decode_step, TensorReader, TrunkScratch, TrunkState};
 use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
@@ -80,6 +81,7 @@ fn main() {
         .as_ref()
         .map(|_| load_ngram_table(&r, &cfg).unwrap());
 
+    let ngram_rows = ngram.as_deref().map(|t| ResidentRows { table: t });
     let eos = 2u32;
     let prompt: Vec<u32> = vec![3, 17, 42, 5, 9, 7, 61, 23];
     let mut history = Vec::new();
@@ -93,7 +95,9 @@ fn main() {
             &mut st,
             &mut sc,
             &embed,
-            ngram.as_deref(),
+            ngram_rows
+                .as_ref()
+                .map(|r| r as &dyn hipfire_arch_qwen4exp::ngram_rows::NgramRows),
             &history,
             t,
             eos,

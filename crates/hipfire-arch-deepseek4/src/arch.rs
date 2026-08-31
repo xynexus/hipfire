@@ -1517,6 +1517,11 @@ impl DeepseekV4 {
             let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
                 hfq.path(),
                 hipfire_runtime::weight_pager::PagerConfig {
+                    // Indexed MoE kernels read these experts, so they want the
+                    // MoE-block layout. Named rather than defaulted, so a future
+                    // consumer choice is a decision here and not an inheritance.
+                    expert_layout:
+                        hipfire_runtime::weight_pager::ExpertResidentLayout::IndexedMoeBlocks,
                     // No budget set = pin everything. #310 landed the rename,
                     // so the old `u64::MAX` sentinel is now a named policy.
                     residency: match budget {

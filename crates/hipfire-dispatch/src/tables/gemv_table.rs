@@ -79,6 +79,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MQ4G256Lloyd,
         DType::MFP4G32,
         DType::Oq8G256,
+        DType::Oq8G128,
         DType::Oq4G256,
         DType::OqCompactG256,
         DType::OqCompactG128,

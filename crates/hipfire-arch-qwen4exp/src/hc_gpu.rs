@@ -16,16 +16,17 @@
 
 use crate::config::Qwen4ExpConfig;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 pub struct HcWeights {
     /// `[hc_count * hidden]`
     pub hc_norm: GpuTensor,
     /// `[lowrank, hc_count * hidden]`
-    pub mix_down: GpuTensor,
+    pub mix_down: WeightTensor,
     /// `[hc_count * hidden, lowrank]`
-    pub mix_up: GpuTensor,
+    pub mix_up: WeightTensor,
     /// `[hc_count, hc_count * hidden]`, absent for the model-level mixer.
-    pub block_inject: Option<GpuTensor>,
+    pub block_inject: Option<WeightTensor>,
 }
 
 /// Scratch for one residual read. Sized off the config, reused across layers.
@@ -76,20 +77,20 @@ pub fn hc_read(
     )?;
     // Low-rank gate: down -> /hc_count -> silu -> up -> sigmoid. The division is
     // INSIDE the silu, before the expand.
-    gpu.gemv_f32(&w.mix_down, &s.normed, &s.lowrank)?;
+    weight_gemv(gpu, &w.mix_down, &s.normed, &s.lowrank)?;
     gpu.hc_scaled_silu(
         &s.lowrank,
         &s.lowrank,
         cfg.gated_residual.lowrank as i32,
         inv,
     )?;
-    gpu.gemv_f32(&w.mix_up, &s.lowrank, &s.mix)?;
+    weight_gemv(gpu, &w.mix_up, &s.lowrank, &s.mix)?;
     gpu.hc_sigmoid(&s.mix, &s.mix, width as i32)?;
     // MEAN over streams of the per-channel-gated normed streams.
     gpu.hc_input_map_perchannel(&s.mix, &s.normed, mixed_out, cfg.hidden as i32, hc as i32)?;
 
     if let Some(bi) = w.block_inject.as_ref() {
-        gpu.gemv_f32(bi, &s.normed, &s.inject)?;
+        weight_gemv(gpu, bi, &s.normed, &s.inject)?;
         gpu.hc_inject_gate(&s.inject, &s.inject, hc as i32, inv)?;
     }
     Ok(())
@@ -113,4 +114,44 @@ pub fn hc_write(
         cfg.hidden as i32,
         cfg.gated_residual.count as i32,
     )
+}
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Every `free` below DESTRUCTURES its struct exhaustively rather than naming
+// fields to free. That is deliberate: a field added later fails to compile until
+// someone decides what happens to it, where a `self.a; self.b;` list would just
+// silently leak the new tensor. `unload` on a 360 GB model has no test that would
+// catch that.
+
+impl HcWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            hc_norm,
+            mix_down,
+            mix_up,
+            block_inject,
+        } = self;
+        let _ = gpu.free_tensor(hc_norm);
+        for t in [Some(mix_down), Some(mix_up), block_inject]
+            .into_iter()
+            .flatten()
+        {
+            let _ = gpu.free_tensor(t.buf);
+        }
+    }
+}
+
+impl HcScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            normed,
+            lowrank,
+            mix,
+            inject,
+        } = self;
+        for t in [normed, lowrank, mix, inject] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

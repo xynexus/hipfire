@@ -42,24 +42,35 @@ fn sext4(nib: u8) -> i8 {
 /// `Oq8G256` (qt 35): `[f16 scale][256 int8]` per 256-group, row-contiguous →
 /// combined `[int8 m*k][f32 scales m*ng]`.
 pub fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
+    oq8_combined_g(data, m, k, 256)
+}
+
+/// `oq8_combined` with an explicit group. `Oq8G128` (qt 54) has the same shape
+/// with a 130-byte block and twice as many scales; the device layout is identical
+/// apart from `ng`, so the two share this body rather than duplicating it.
+pub fn oq8_combined_g(data: &[u8], m: usize, k: usize, group: usize) -> Vec<u8> {
+    assert!(group == 256 || group == 128, "Oq8 group must be 256 or 128");
     // Single-sourced from hipfire-quant-format: Oq8G256 on-disk block = 258.
-    const BLOCK: usize = QuantType::Oq8G256.block_bytes().unwrap();
-    assert_eq!(k % GROUP, 0, "Oq8G256 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let expect = m * ng * BLOCK;
+    let block: usize = if group == 256 {
+        QuantType::Oq8G256.block_bytes().unwrap()
+    } else {
+        QuantType::Oq8G128.block_bytes().unwrap()
+    };
+    assert_eq!(k % group, 0, "Oq8 requires K % {group} == 0 (got K={k})");
+    let ng = k / group;
+    let expect = m * ng * block;
     assert_eq!(
         data.len(),
         expect,
-        "Oq8G256 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+        "Oq8 weight byte length {} != M*ng*{block} = {expect} (M={m} K={k})",
         data.len()
     );
     let mut combined = vec![0u8; m * k + m * ng * 4];
     for r in 0..m {
         for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let dst = r * k + g * GROUP;
-            combined[dst..dst + GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let src = (r * ng + g) * block;
+            let dst = r * k + g * group;
+            combined[dst..dst + group].copy_from_slice(&data[src + 2..src + block]);
             let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
             let so = m * k + (r * ng + g) * 4;
             combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
@@ -529,37 +540,36 @@ fn oq8_arch_load_inner(
             ),
         );
     }
+    // Oq8G128 (qt 54) expands through the same path at a 128 group, but unlike
+    // the compact-G128 case above it must keep its OWN dtype: the expansion does
+    // NOT absorb the group here. `ng` doubles and the activation needs the
+    // FWHT-128 basis, and neither is recoverable from the planar buffer.
+    if qt == QuantType::Oq8G128.code() {
+        return Some((oq8_combined_g(data, m, k, 128), DType::Oq8G128));
+    }
     let bytes = match qt {
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
         c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
-        // G=128 does NOT expand to an Oq8G256-compatible layout, despite what the
-        // comment here used to claim. Two things differ, either one fatal:
+        // G=128 expands to `Oq8G128`, NOT `Oq8G256`. This used to refuse outright,
+        // and the refusal named its own two preconditions — both now met:
         //
-        //   1. Scale plane size. The expansion allocates `m*k + m*(k/group)*4`,
-        //      so at group=128 the plane holds TWICE the scales an Oq8G256
-        //      consumer computes (`ng = k/256`) — every consumer slices
-        //      `sub_offset(m*k, m*ng*4)` and reads the wrong region.
+        //   1. Scale plane size. The expansion allocates `m*k + m*(k/group)*4`, so
+        //      at group=128 the plane holds TWICE the scales an Oq8G256 consumer
+        //      computes (`ng = k/256`). `Oq8G128` sizes `ng = k/128`, which is what
+        //      this produces.
         //   2. Rotation order. G128 weights carry the 128-point FWHT (seeds
-        //      43/1043); every Oq8G256 consumer rotates the activation with the
-        //      256-point transform (42/1042), so the two do not cancel.
+        //      43/1043) and every Oq8G256 consumer rotates with the 256-point
+        //      transform (42/1042), so the two did not cancel. `Oq8G128` declares
+        //      `RotationPlan::FwhtG128`, so the activation now takes the matching
+        //      basis.
         //
-        // Tagging it `Oq8G256` therefore produced a silent wrong answer on every
-        // arch that does not decode compact natively (i.e. everything but
-        // qwen35). There is no correct expansion: merging two 128-groups into one
-        // 256-group scale needs requantization, and that still leaves the
-        // rotation mismatched. Refuse until an `Oq8G128` dtype exists with its own
-        // `RotationPlan::FwhtG128` and consumer arms.
+        // Tagging it `Oq8G256` DID produce a silent wrong answer on every arch
+        // without native compact decode. Tagging it `Oq8G128` does not — that dtype
+        // exists precisely because a 128-grouped Opus W8 had nowhere correct to go.
         c if c == QuantType::OqPlusCompactG128.code() => {
-            hipfire_rdna::kernel_trace::record_fallback(
-                "oq load: REFUSED OqPlusCompactG128 expansion — no Oq8G128 dtype",
-                &format!(
-                    "qt={qt} m={m} k={k}: expanding G128 yields a {}-group scale plane                      and 128-point-FWHT weights, which the Oq8G256 consumers misread                      as {}-group / 256-point. Load this artifact on an arch with                      native compact decode (qwen35), or re-quantize at G256.",
-                    k / 128,
-                    k / 256,
-                ),
-            );
-            return None;
+            let expanded = oqplus_compact_to_oq8_combined_g(data, m, k, 128);
+            return Some((expanded, DType::Oq8G128));
         }
         c if c == QuantType::Oq3G256.code() => oq3_to_oq8_combined(data, m, k),
         _ => return None,
@@ -620,11 +630,25 @@ mod tests {
             M * K + M * (K / 256) * 4,
             "G128 expansion must not be mistakable for an Oq8G256 buffer"
         );
-        // And the load path must refuse rather than hand it out as Oq8G256.
-        assert!(
-            oq8_arch_load(QuantType::OqPlusCompactG128.code(), &data, M, K).is_none(),
-            "expanding G128 to Oq8G256 is a silent wrong answer; load must refuse"
+        // The load path must hand this out as `Oq8G128` — NEVER as `Oq8G256`.
+        //
+        // This used to assert a REFUSAL, and that was right while no G128 dtype
+        // existed: the scale plane is twice an Oq8G256 consumer's `ng = K/256`,
+        // and the weights carry the 128-point FWHT (seeds 43/1043) that a
+        // 256-point activation rotation does not cancel. Both hazards are
+        // properties of the TAG, not the bytes, so the fix was a dtype that
+        // states them (`Oq8G128`, `RotationPlan::FwhtG128`) rather than refusing
+        // to load a perfectly good expansion.
+        //
+        // What must never happen is the mislabel, so that is what is asserted.
+        let (_, dtype) = oq8_arch_load(QuantType::OqPlusCompactG128.code(), &data, M, K)
+            .expect("G128 compact expands now that Oq8G128 exists");
+        assert_eq!(
+            dtype,
+            DType::Oq8G128,
+            "G128 bytes tagged as anything else is the silent wrong answer this guards"
         );
+        assert_ne!(dtype, DType::Oq8G256);
         // Bulk nibbles: low then high of 0x21 sign-extended = 1, 2. Position 1 is
         // bulk; position 0 is NOT, because overlay s=0 has index 0 and overrides
         // it — which is the precedence the format requires.

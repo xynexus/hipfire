@@ -132,7 +132,7 @@ pub fn layer_classes(layer_types: &[String]) -> BTreeMap<&'static str, Vec<usize
 pub fn qwen35_manifest(layers: usize, experts: usize, layer_types: &[String]) -> TensorManifest {
     TensorManifest {
         arch: "qwen3_5",
-        bounds: ManifestBounds { layers, experts },
+        bounds: ManifestBounds::new(layers, experts),
         patterns: PATTERNS.to_vec(),
         layer_classes: layer_classes(layer_types),
     }

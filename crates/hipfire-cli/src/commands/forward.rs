@@ -131,6 +131,8 @@ Usage:
 
 The positional model accepts a local name, shorthand, alias, or path.
 
+Not to be confused with `hipfire repack`, the lossless container round-trip.
+
 Build runner:
   cargo build --release -p hipfire-runtime --example optimize"#;
 

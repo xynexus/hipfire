@@ -53,13 +53,16 @@ use std::path::PathBuf;
 
 use hipfire_quant_format::QuantType;
 use hipfire_runtime::hfq::{
-    oq4_pack_arch_combined, plan_hfqm_layout, write_hfqm_package_mem, HfqFile, HfqMemTensor,
+    oq4_pack_arch_combined, plan_hfqm_layout, write_hfqm_package_streaming, HfqFile,
     HfqStreamEntry, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 use hipfire_runtime::hfq_modules::{
     module_table_json, HfqModuleKind, HfqModuleRecord, HFQM_MODULE_TABLE_KEY,
 };
+use hipfire_runtime::oq4_arch::oq4_arch_combined_len;
 use hipfire_runtime::oq_moe::oq4_canonical_to_moe_blocks;
+use hipfire_runtime::oq_moe::oq4_moe_packed_len;
+use std::io::Write;
 
 /// Best-effort live GPU arch probe (e.g. "gfx1103"). Read-only
 /// `hipGetDeviceProperties` on device 0 — no GPU lock, no compute context, so it
@@ -210,87 +213,78 @@ fn main() {
         .collect();
 
     let infos: Vec<_> = hfq.tensors().to_vec();
-    let mut out_tensors: Vec<HfqMemTensor> = Vec::with_capacity(infos.len());
+
+    // PLAN FIRST, TRANSFORM LATER. The previous version built every output tensor
+    // in memory and handed the lot to `write_hfqm_package_mem`, which needs RAM
+    // equal to the whole derived model. Measured on the 170 GB Qwen3.8-Flash-Next
+    // artifact: 115 GiB RSS after 80 s, then OOM-killed — so the tool for making
+    // large models load faster could not be run on a large model.
+    //
+    // Every output length is computable WITHOUT doing the transform, which is what
+    // lets the index be written before any payload exists (see `HfqStreamEntry`).
+    // So this pass decides what each tensor becomes, and the writer below streams
+    // them one at a time.
+    #[derive(Clone, Copy)]
+    enum Plan {
+        Copy,
+        MoeBlocks,
+        ArchCombined,
+    }
+    let mut plans: Vec<Plan> = Vec::with_capacity(infos.len());
+    let mut entries: Vec<HfqStreamEntry> = Vec::with_capacity(infos.len());
     let mut repacked = 0usize;
     let mut copied = 0usize;
     let mut canon_bytes = 0u64;
     let mut packed_bytes = 0u64;
 
     for info in &infos {
-        let (_, data) = hfq
-            .tensor_data_vec(&info.name)
-            .unwrap_or_else(|| panic!("tensor data not found: {}", info.name));
-
-        if moe_blocks {
-            // Only routed-expert tensors are pre-packed; everything else is copied
-            // byte-for-byte. The module table below is rebuilt against the new
-            // layout, which is the part that makes the derived file loadable.
-            if info.quant_type == OQ4_CANONICAL_QT && routed_tensor_names.contains(&info.name) {
-                assert_eq!(
-                    info.shape.len(),
-                    2,
-                    "OQ4 routed tensor {} expected 2D [m,k], got {:?}",
-                    info.name,
-                    info.shape
-                );
-                let m = info.shape[0] as usize;
-                let k = info.shape[1] as usize;
-                let packed = oq4_canonical_to_moe_blocks(&data, m, k).unwrap_or_else(|e| {
-                    eprintln!("moe-block pack {}: {e}", info.name);
-                    std::process::exit(1);
-                });
-                canon_bytes += data.len() as u64;
-                packed_bytes += packed.len() as u64;
-                out_tensors.push(HfqMemTensor {
-                    name: info.name.clone(),
-                    quant_type: QuantType::Oq4G256MoeBlocks.code(),
-                    shape: info.shape.clone(),
-                    group_size: info.group_size,
-                    data: packed,
-                });
-                repacked += 1;
-            } else {
-                out_tensors.push(HfqMemTensor {
-                    name: info.name.clone(),
-                    quant_type: info.quant_type,
-                    shape: info.shape.clone(),
-                    group_size: info.group_size,
-                    data,
-                });
-                copied += 1;
-            }
-        } else if info.quant_type == OQ4_CANONICAL_QT {
-            // OQ4 weight matrices are stored [m, k] = [out, in].
+        let two_d = |what: &str| {
             assert_eq!(
                 info.shape.len(),
                 2,
-                "OQ4 tensor {} expected 2D [m,k], got shape {:?}",
+                "OQ4 {what} tensor {} expected 2D [m,k], got {:?}",
                 info.name,
                 info.shape
             );
-            let m = info.shape[0] as usize;
-            let k = info.shape[1] as usize;
-            let combined = oq4_pack_arch_combined(&data, m, k);
-            canon_bytes += data.len() as u64;
-            packed_bytes += combined.len() as u64;
-            out_tensors.push(HfqMemTensor {
-                name: info.name.clone(),
-                quant_type: OQ4_ARCH_PACKED_QT,
-                shape: info.shape.clone(),
-                group_size: info.group_size,
-                data: combined,
-            });
-            repacked += 1;
+            (info.shape[0] as usize, info.shape[1] as usize)
+        };
+        let (plan, out_qt, out_len) = if moe_blocks {
+            if info.quant_type == OQ4_CANONICAL_QT && routed_tensor_names.contains(&info.name) {
+                let (m, k) = two_d("routed");
+                let len = oq4_moe_packed_len(m, k).unwrap_or_else(|e| {
+                    eprintln!("moe-block length {}: {e}", info.name);
+                    std::process::exit(1);
+                });
+                (Plan::MoeBlocks, QuantType::Oq4G256MoeBlocks.code(), len)
+            } else {
+                (Plan::Copy, info.quant_type, info.data_size)
+            }
+        } else if info.quant_type == OQ4_CANONICAL_QT {
+            let (m, k) = two_d("");
+            (
+                Plan::ArchCombined,
+                OQ4_ARCH_PACKED_QT,
+                oq4_arch_combined_len(m, k),
+            )
         } else {
-            out_tensors.push(HfqMemTensor {
-                name: info.name.clone(),
-                quant_type: info.quant_type,
-                shape: info.shape.clone(),
-                group_size: info.group_size,
-                data,
-            });
-            copied += 1;
+            (Plan::Copy, info.quant_type, info.data_size)
+        };
+        match plan {
+            Plan::Copy => copied += 1,
+            _ => {
+                repacked += 1;
+                canon_bytes += info.data_size as u64;
+                packed_bytes += out_len as u64;
+            }
         }
+        plans.push(plan);
+        entries.push(HfqStreamEntry {
+            name: info.name.clone(),
+            quant_type: out_qt,
+            shape: info.shape.clone(),
+            group_size: info.group_size,
+            data_len: out_len as u64,
+        });
     }
 
     if repacked == 0 {
@@ -306,7 +300,7 @@ fn main() {
     // Passing the source metadata through unchanged, as this tool used to, would
     // produce a file whose module table points into the OLD layout.
     let metadata_json = if moe_blocks {
-        rebuild_metadata_with_modules(&hfq, &out_tensors).unwrap_or_else(|e| {
+        rebuild_metadata_with_modules(&hfq, &entries).unwrap_or_else(|e| {
             eprintln!("rebuild module table: {e}");
             std::process::exit(1);
         })
@@ -318,12 +312,46 @@ fn main() {
         std::process::exit(1);
     });
 
-    write_hfqm_package_mem(&output, hfq.arch_id, &metadata_json, &out_tensors).unwrap_or_else(
-        |e| {
-            eprintln!("write {}: {e}", output.display());
-            std::process::exit(1);
+    // One tensor resident at a time: read, transform, write, drop.
+    write_hfqm_package_streaming(
+        &output,
+        hfq.arch_id,
+        &metadata_json,
+        &entries,
+        |i, w: &mut dyn Write| {
+            let info = &infos[i];
+            let (_, data) = hfq
+                .tensor_data_vec(&info.name)
+                .unwrap_or_else(|| panic!("tensor data not found: {}", info.name));
+            let out = match plans[i] {
+                Plan::Copy => data,
+                Plan::MoeBlocks => {
+                    let (m, k) = (info.shape[0] as usize, info.shape[1] as usize);
+                    oq4_canonical_to_moe_blocks(&data, m, k).unwrap_or_else(|e| {
+                        eprintln!("moe-block pack {}: {e}", info.name);
+                        std::process::exit(1);
+                    })
+                }
+                Plan::ArchCombined => {
+                    let (m, k) = (info.shape[0] as usize, info.shape[1] as usize);
+                    oq4_pack_arch_combined(&data, m, k)
+                }
+            };
+            // The planned length is what the index already promised; a mismatch
+            // would corrupt every later tensor's offset.
+            assert_eq!(
+                out.len() as u64,
+                entries[i].data_len,
+                "planned length for {} disagrees with the transform",
+                info.name
+            );
+            w.write_all(&out)
         },
-    );
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("write {}: {e}", output.display());
+        std::process::exit(1);
+    });
 
     let (to_qt, layout_note) = if moe_blocks {
         (
@@ -351,19 +379,9 @@ fn main() {
 /// three; `hipfire-quantize`'s own writer does the same thing.
 fn rebuild_metadata_with_modules(
     hfq: &HfqFile,
-    out_tensors: &[HfqMemTensor],
+    entries: &[HfqStreamEntry],
 ) -> Result<String, String> {
-    let entries: Vec<HfqStreamEntry> = out_tensors
-        .iter()
-        .map(|t| HfqStreamEntry {
-            name: t.name.clone(),
-            quant_type: t.quant_type,
-            shape: t.shape.clone(),
-            group_size: t.group_size,
-            data_len: t.data.len() as u64,
-        })
-        .collect();
-    let index_of: std::collections::HashMap<&str, usize> = out_tensors
+    let index_of: std::collections::HashMap<&str, usize> = entries
         .iter()
         .enumerate()
         .map(|(i, t)| (t.name.as_str(), i))
@@ -374,7 +392,7 @@ fn rebuild_metadata_with_modules(
 
     let mut metadata_json = hfq.metadata_json.clone();
     for round in 0..8 {
-        let layout = plan_hfqm_layout(metadata_json.len(), &entries)
+        let layout = plan_hfqm_layout(metadata_json.len(), entries)
             .map_err(|e| format!("plan layout: {e}"))?;
 
         let mut modules: Vec<HfqModuleRecord> = Vec::with_capacity(hfq.modules().len());
@@ -396,7 +414,7 @@ fn rebuild_metadata_with_modules(
                 let i = index_of[t.name.as_str()];
                 t.rel_offset = (layout.tensor_offsets[i] - start) as usize;
                 t.data_size = entries[i].data_len as usize;
-                t.quant_type = out_tensors[i].quant_type;
+                t.quant_type = entries[i].quant_type;
             }
             modules.push(record);
         }

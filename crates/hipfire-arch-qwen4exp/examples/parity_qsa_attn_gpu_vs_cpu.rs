@@ -114,15 +114,22 @@ fn main() {
         }
     };
     let w = QsaWeights {
-        q_proj: gpu.upload_f32(&qp, &[nh * hd * 2, hidden]).unwrap(),
-        k_proj: gpu.upload_f32(&kp, &[nkv * hd, hidden]).unwrap(),
-        v_proj: gpu.upload_f32(&vp, &[nkv * hd, hidden]).unwrap(),
-        o_proj: gpu.upload_f32(&op, &[hidden, nh * hd]).unwrap(),
+        q_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &qp, &[nh * hd * 2, hidden])
+            .unwrap(),
+        k_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &kp, &[nkv * hd, hidden])
+            .unwrap(),
+        v_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &vp, &[nkv * hd, hidden])
+            .unwrap(),
+        o_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &op, &[hidden, nh * hd])
+            .unwrap(),
         q_norm: gpu.upload_f32(&qn, &[hd]).unwrap(),
         k_norm: gpu.upload_f32(&kn, &[hd]).unwrap(),
-        ix_qk_proj: gpu
-            .upload_f32(&iqk, &[(ix.n_heads + ix.kv_heads) * ix.head_dim, hidden])
-            .unwrap(),
+        ix_qk_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+            &mut gpu,
+            &iqk,
+            &[(ix.n_heads + ix.kv_heads) * ix.head_dim, hidden],
+        )
+        .unwrap(),
         ix_q_norm: gpu.upload_f32(&iqn, &[ix.head_dim]).unwrap(),
         ix_k_norm: gpu.upload_f32(&ikn, &[ix.head_dim]).unwrap(),
     };

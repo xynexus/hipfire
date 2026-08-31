@@ -213,6 +213,11 @@ pub struct Qwen4ExpConfig {
     /// Layers in the embedded multi-token-prediction head, if present.
     /// `max_position_embeddings` from the checkpoint.
     pub max_position: usize,
+    /// End-of-turn token. Lives under `text_config` in this family (the shipped
+    /// checkpoint says 248044), NOT at the config root where a flat text model
+    /// would put it. Defaults to `vocab - 1` only so a fixture without one still
+    /// loads; a real artifact always carries it.
+    pub eos_token_id: u32,
     pub mtp_layers: usize,
     /// Whether the checkpoint carries a vision tower.
     pub has_vision: bool,
@@ -479,6 +484,11 @@ impl Qwen4ExpConfig {
             gated_residual,
             ngram,
             max_position: usize_at(text, "max_position_embeddings").unwrap_or(4096),
+            eos_token_id: usize_at(text, "eos_token_id")
+                .map(|v| v as u32)
+                .unwrap_or_else(|| {
+                    usize_at(text, "vocab_size").unwrap_or(1).saturating_sub(1) as u32
+                }),
             mtp_layers: usize_at(text, "mtp_num_hidden_layers").unwrap_or(0),
             vision: root.get("vision_config").map(|v| VisionConfig {
                 depth: usize_at(v, "depth").unwrap_or(0),

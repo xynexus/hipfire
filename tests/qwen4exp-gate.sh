@@ -165,6 +165,114 @@ else
   fail=1
 fi
 
+step "GPU: serve through the REGISTERED factory"
+# The only check that the SERVING seam is wired, as opposed to the trunk being
+# correct. It fails for four distinct reasons, each of which has happened: arch 26
+# not resolving to a factory (a missing link edge in hipfire-archs), the factory
+# failing to build a backend, a dead forward (finite but frozen logits), and an
+# incomplete reset leaking recurrent state between requests.
+if ! cargo build --quiet --release -p hipfire-arch-qwen4exp \
+     --example serve_fixture 2>&1 | tail -5; then
+  echo "qwen4exp-gate: serve_fixture build FAILED"
+  exit 2
+fi
+if [ -f "$TMP/fx.bf16.hfq" ]; then
+  sv="$(./target/release/examples/serve_fixture "$TMP/fx.bf16.hfq" 2>&1 || true)"
+  echo "$sv" | sed 's/^/  /'
+  case "$sv" in
+    *"serve_fixture: OK"*) ;;
+    *skipped*) ;;
+    *) echo "qwen4exp-gate: serving through the factory FAILED"; fail=1 ;;
+  esac
+  # A frozen argmax is the signature of a dead forward, and it is reported rather
+  # than thrown, so check the line explicitly.
+  bf16_argmax="$(echo "$sv" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+  case "$sv" in
+    *"argmax moved = false"*)
+      echo "qwen4exp-gate: decode ran but the argmax never moved — dead forward"
+      fail=1 ;;
+  esac
+else
+  echo "qwen4exp-gate: no bf16 artifact to serve"
+  fail=1
+fi
+
+step "GPU: serve QUANTISED artifacts, against the bf16 control"
+# The trunk dequantises oq4/oq8 at load. What makes this a real check rather than
+# a smoke test is comparing the ARGMAX to the bf16 run above: a dequant that is
+# subtly wrong (mismatched FWHT basis, wrong block stride) still yields finite
+# logits, and only diverges from the float control.
+if [ -n "${bf16_argmax:-}" ]; then
+  for q in oq4 oq8; do
+    if ! ./target/release/hipfire-quantize --input "$TMP/fx" --output "$TMP/fx.$q.hfq" \
+         --format "$q" >/dev/null 2>&1; then
+      echo "qwen4exp-gate: could not quantize the fixture to $q"; fail=1; continue
+    fi
+    qout="$(./target/release/examples/serve_fixture "$TMP/fx.$q.hfq" 2>&1 || true)"
+    case "$qout" in
+      *"serve_fixture: OK"*) ;;
+      *) echo "  $q: FAILED to serve"; echo "$qout" | tail -3 | sed 's/^/    /'; fail=1; continue ;;
+    esac
+    qam="$(echo "$qout" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+    qdt="$(echo "$qout" | sed -nE 's/.*routed experts resident as Some\(([A-Za-z0-9]+)\).*/\1/p' | head -1)"
+    if [ "$qam" != "$bf16_argmax" ]; then
+      echo "qwen4exp-gate: $q argmax $qam != bf16 argmax $bf16_argmax — dequant is wrong"
+      fail=1
+    # The experts must stay QUANTISED. Falling back to F32 serves identically and
+    # costs ~8x the memory, so it is invisible in the logits — on the shipped
+    # geometry the routed experts are 97.3% of the trunk, which is the whole
+    # difference between ~32 GB and ~258 GB resident.
+    elif [ "$qdt" = "F32" ] || [ -z "$qdt" ]; then
+      echo "qwen4exp-gate: $q serves but its routed experts are resident as '${qdt:-unknown}'"
+      echo "               — they were silently dequantised; the model would not fit"
+      fail=1
+    else
+      echo "  $q: serves, argmax $qam matches bf16, experts resident as $qdt"
+    fi
+  done
+else
+  echo "qwen4exp-gate: no bf16 argmax recorded; cannot compare quantised runs"
+  fail=1
+fi
+
+step "GPU: PAGED routed experts vs resident, on the same artifact"
+# Routed experts are 97.3% of this trunk, so paging them is what decides whether
+# the shipped model loads at all. Both arms read the SAME file: the only
+# difference is whether the experts came through the weight pager.
+#
+# The budget is deliberately far below the fixture's expert bytes, to force
+# eviction and re-page rather than a load-everything-once path that would never
+# exercise the interesting half. The cold-load/eviction counters are checked
+# because "paged matches resident" proves nothing if nothing was paged — that
+# exact vacuous pass happened while writing this.
+if [ -f "$TMP/fx.oq4.hfq" ]; then
+  res="$(HIPFIRE_QWEN4EXP_PAGED_EXPERTS=0 \
+         ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  pag="$(HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES=524288 \
+         ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  res_am="$(echo "$res" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+  pag_am="$(echo "$pag" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
+  evicts="$(echo "$pag" | sed -nE 's/.*, ([0-9]+) evictions.*/\1/p' | head -1)"
+  colds="$(echo "$pag" | sed -nE 's/.*, ([0-9]+) cold loads.*/\1/p' | head -1)"
+  if [ -z "$res_am" ] || [ -z "$pag_am" ]; then
+    echo "qwen4exp-gate: one of the paged/resident arms did not report an argmax"
+    fail=1
+  elif [ "$res_am" != "$pag_am" ]; then
+    echo "qwen4exp-gate: paged argmax $pag_am != resident argmax $res_am"
+    echo "               — the pager's expert layout differs from the loader's"
+    fail=1
+  elif [ "${colds:-0}" -lt 1 ] || [ "${evicts:-0}" -lt 1 ]; then
+    echo "qwen4exp-gate: paged arm did $colds cold loads and $evicts evictions —"
+    echo "               it never actually paged, so the match above proves nothing"
+    fail=1
+  else
+    echo "  paged: argmax $pag_am matches resident, $colds cold loads, $evicts evictions"
+  fi
+else
+  echo "qwen4exp-gate: no oq4 artifact to page"
+  fail=1
+fi
+
 if [ "$CPU_ONLY" = "1" ]; then
   [ "$fail" = "0" ] && echo && echo "qwen4exp-gate: PASS (cpu-only)"
   exit "$fail"

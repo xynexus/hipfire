@@ -107,13 +107,46 @@ fn main() {
         };
 
         let w = MoeWeights {
-            router: gpu.upload_f32(&router, &[n_exp, hidden]).unwrap(),
-            gate_up: gpu.upload_f32(&gu, &[n_exp, 2 * mi, hidden]).unwrap(),
-            down: gpu.upload_f32(&dn, &[n_exp, hidden, mi]).unwrap(),
-            shared_gate: gpu.upload_f32(&sg, &[smi, hidden]).unwrap(),
-            shared_up: gpu.upload_f32(&su, &[smi, hidden]).unwrap(),
-            shared_down: gpu.upload_f32(&sd, &[hidden, smi]).unwrap(),
-            shared_expert_gate: gpu.upload_f32(&seg, &[1, hidden]).unwrap(),
+            router: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+                &mut gpu,
+                &router,
+                &[n_exp, hidden],
+            )
+            .unwrap(),
+            gate_up: hipfire_arch_qwen4exp::moe_gpu::ExpertStack::Resident {
+                buf: gpu.upload_f32(&gu, &[n_exp, 2 * mi, hidden]).unwrap(),
+                dtype: hipfire_rdna::DType::F32,
+                rows: 2 * mi,
+                cols: hidden,
+                stride: 2 * mi * hidden,
+            },
+            down: hipfire_arch_qwen4exp::moe_gpu::ExpertStack::Resident {
+                buf: gpu.upload_f32(&dn, &[n_exp, hidden, mi]).unwrap(),
+                dtype: hipfire_rdna::DType::F32,
+                rows: hidden,
+                cols: mi,
+                stride: hidden * mi,
+            },
+            shared_gate: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+                &mut gpu,
+                &sg,
+                &[smi, hidden],
+            )
+            .unwrap(),
+            shared_up: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &su, &[smi, hidden])
+                .unwrap(),
+            shared_down: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+                &mut gpu,
+                &sd,
+                &[hidden, smi],
+            )
+            .unwrap(),
+            shared_expert_gate: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+                &mut gpu,
+                &seg,
+                &[1, hidden],
+            )
+            .unwrap(),
         };
         let mut s = MoeScratch::new(&mut gpu, &cfg).unwrap();
 

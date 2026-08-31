@@ -104,15 +104,24 @@ fn main() {
     };
     let up = |g: &mut Gpu, v: &[f32], shape: &[usize]| g.upload_f32(v, shape).unwrap();
     let gw = GdnWeights {
-        in_proj_qkv: up(&mut gpu, &w_qkv, &[qkv_dim, hidden]),
-        in_proj_z: up(&mut gpu, &w_z, &[z_dim, hidden]),
-        in_proj_a: up(&mut gpu, &w_a, &[nv, hidden]),
-        in_proj_b: up(&mut gpu, &w_b, &[nv, hidden]),
+        in_proj_qkv: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(
+            &mut gpu,
+            &w_qkv,
+            &[qkv_dim, hidden],
+        )
+        .unwrap(),
+        in_proj_z: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &w_z, &[z_dim, hidden])
+            .unwrap(),
+        in_proj_a: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &w_a, &[nv, hidden])
+            .unwrap(),
+        in_proj_b: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &w_b, &[nv, hidden])
+            .unwrap(),
         conv_weight: up(&mut gpu, &w_conv, &[qkv_dim, d.conv_kernel]),
         a_log: up(&mut gpu, &a_log, &[nv]),
         dt_bias: up(&mut gpu, &dt_bias, &[nv]),
         norm_weight: up(&mut gpu, &w_norm, &[hv]),
-        out_proj: up(&mut gpu, &w_out, &[hidden, z_dim]),
+        out_proj: hipfire_arch_qwen4exp::trunk_gpu::f32_weight(&mut gpu, &w_out, &[hidden, z_dim])
+            .unwrap(),
     };
     let mut scratch = GdnScratch::new(&mut gpu, &cfg).unwrap();
     let mut gst = GdnState::zeros(&mut gpu, &cfg).unwrap();

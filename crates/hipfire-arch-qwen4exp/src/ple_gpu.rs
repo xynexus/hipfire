@@ -10,12 +10,13 @@
 
 use crate::config::Qwen4ExpConfig;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 pub struct PleWeights {
     /// `[hc_count * hidden, embed_dim]`
-    pub key_proj: GpuTensor,
+    pub key_proj: WeightTensor,
     /// `[hidden, embed_dim]`
-    pub value_proj: GpuTensor,
+    pub value_proj: WeightTensor,
     pub norm_key: GpuTensor,
     pub norm_query: GpuTensor,
     pub norm_conv: GpuTensor,
@@ -73,7 +74,7 @@ pub fn ple_step(
     let width = hc * cfg.hidden;
     let (h32, hc32) = (cfg.hidden as i32, hc as i32);
 
-    gpu.gemv_f32(&w.key_proj, ngram_embed, &s.key)?;
+    weight_gemv(gpu, &w.key_proj, ngram_embed, &s.key)?;
     gpu.hc_grouped_rmsnorm(
         &s.key,
         &w.norm_key,
@@ -82,7 +83,7 @@ pub fn ple_step(
         hc32,
         cfg.rms_norm_eps,
     )?;
-    gpu.gemv_f32(&w.value_proj, ngram_embed, &s.value)?;
+    weight_gemv(gpu, &w.value_proj, ngram_embed, &s.value)?;
     gpu.hc_grouped_rmsnorm(
         hidden_wide,
         &w.norm_query,
@@ -113,4 +114,55 @@ pub fn ple_step(
         n.ngram_size as i32,
     )?;
     gpu.add_f32(&s.gated, &s.conv, out)
+}
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Exhaustive destructures, so a field added later fails to compile until someone
+// decides whether it needs freeing. See the note in `hc_gpu.rs`.
+
+impl PleWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            key_proj,
+            value_proj,
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv_weight,
+        } = self;
+        for t in [key_proj, value_proj] {
+            let _ = gpu.free_tensor(t.buf);
+        }
+        for t in [norm_key, norm_query, norm_conv, conv_weight] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl PleScratch {
+    /// Clear the dilated tap history. The rest is written before it is read
+    /// within a step; `conv_state` is the only thing that crosses positions.
+    pub fn reset(&self, gpu: &mut Gpu) -> hipfire_rdna::HipResult<()> {
+        let zeros = vec![0u8; self.conv_state.buf.size()];
+        gpu.memcpy_htod_auto(&self.conv_state.buf, &zeros)
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            key,
+            key_normed,
+            value,
+            query,
+            gated,
+            normed,
+            conv,
+            conv_state,
+        } = self;
+        for t in [
+            key, key_normed, value, query, gated, normed, conv, conv_state,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

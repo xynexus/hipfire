@@ -614,7 +614,72 @@ fn module_tensor_shape(tensor: &HfqModuleTensor) -> Result<(usize, usize), Weigh
     Ok((*m as usize, *k as usize))
 }
 
-fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightPagerError> {
+/// The device form a PER-EXPERT consumer reads, produced by exactly the calls the
+/// resident loader makes.
+///
+/// This exists as ONE function because the pager previously re-derived it in its
+/// own `match`, and the two drifted twice: the compact arms dropped the overlay
+/// normalisation, and `Oq8G256` was missing altogether, so a paged oq8 expert was
+/// served raw on-disk bytes and produced non-finite logits. A parallel match
+/// cannot be kept in step by review; a shared call cannot drift at all.
+///
+/// `None` means "no per-expert device form for this quant type" — the caller
+/// should load resident, not fail.
+pub fn per_expert_native_form(
+    qt: u8,
+    source: &[u8],
+    m: usize,
+    k: usize,
+) -> Option<(Vec<u8>, DType)> {
+    // Compact stays compact; Opus W8 forms take the combined layout.
+    if let Some(out) = crate::oq8_arch::oq8_arch_load_allow_compact(qt, source, m, k) {
+        return Some(out);
+    }
+    // ⚠️ `oq4_pack_arch_combined` ASSERTS on a ragged K, and an assert here aborts
+    // the process rather than declining one tensor. qwen4_exp's routed `down_proj`
+    // is K=640, so this is load-bearing, not defensive.
+    if crate::oq4_arch::oq4_arch_unsupported_reason(m, k).is_some() {
+        return None;
+    }
+    crate::oq4_arch::oq4_arch_load(qt, source, m, k).map(|(b, d)| (b.into_owned(), d))
+}
+
+/// Byte length [`per_expert_native_form`] produces, without producing it.
+///
+/// Needed because the pager reserves and budgets BEFORE it reads any bytes. It is
+/// the one thing that still restates the layout, so `prepare_expert_module`
+/// checks the two against each other and errors on a mismatch — drift here is
+/// loud rather than a quietly wrong eviction budget.
+fn per_expert_native_len(qt: QuantType, m: usize, k: usize) -> Option<usize> {
+    // Combined Opus W8: one int8 per weight plus an f32 scale per group.
+    let combined = |group: usize| m * k + m * (k / group) * 4;
+    match qt {
+        // Byte-preserving: `split_compact_planes` only reorders.
+        QuantType::OqPlusCompact | QuantType::OqPlusCompactG128 => None,
+        QuantType::Oq8G256 | QuantType::OqPlusG256 | QuantType::Oq3G256 => Some(combined(256)),
+        QuantType::Oq8G128 => Some(combined(128)),
+        QuantType::Oq4G256 => Some(crate::oq4_arch::oq4_arch_combined_len(m, k)),
+        _ => None,
+    }
+}
+
+fn module_tensor_resident_len(
+    tensor: &HfqModuleTensor,
+    layout: ExpertResidentLayout,
+) -> Result<usize, WeightPagerError> {
+    // PerExpertNative keeps every Opus form at its own width: canonical OQ4 goes
+    // to the arch combined layout, and compact STAYS COMPACT because
+    // `split_compact_planes` only reorders bytes. Neither expands, so the sole
+    // length that differs from disk is the combined one.
+    if layout == ExpertResidentLayout::PerExpertNative {
+        let (m, k) = module_tensor_shape(tensor)?;
+        return Ok(QuantType::from_code(tensor.quant_type)
+            .and_then(|qt| per_expert_native_len(qt, m, k))
+            // Compact (either group) and anything with no device form: the disk
+            // length. Compact only ever has its planes reordered, and a type with
+            // no form is never paged, so neither grows.
+            .unwrap_or(tensor.data_size));
+    }
     let Some(quant_type) = QuantType::from_code(tensor.quant_type) else {
         return Err(WeightPagerError::InvalidModule(format!(
             "routed tensor {} has unknown quant_type {}",
@@ -824,13 +889,39 @@ fn module_gate_up_span_is_contiguous(module: &HfqModuleRecord) -> bool {
     else {
         return false;
     };
-    match module_tensor_resident_len(w1) {
+    match module_tensor_resident_len(w1, ExpertResidentLayout::IndexedMoeBlocks) {
         Ok(len) => w1.rel_offset.saturating_add(len) == w3.rel_offset,
         Err(_) => false,
     }
 }
 
-fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
+fn module_requires_host_repack(module: &HfqModuleRecord, layout: ExpertResidentLayout) -> bool {
+    if layout == ExpertResidentLayout::PerExpertNative {
+        // EVERY type `per_expert_native_form` transforms must be listed, or the
+        // module takes the verbatim-fetch branch and the GEMV reads raw on-disk
+        // bytes. That is not a fallback — it is silent garbage: oq8 experts
+        // served this way produced non-finite logits, having been fetched
+        // untouched because `Oq8G256` was missing from this list while the
+        // converter handled it.
+        //
+        // The one exception is `Oq4G256MoeBlocks`, which is STORED already
+        // transformed and is the reason this is a list of types rather than
+        // "anything the converter accepts".
+        return module.tensors.iter().any(|tensor| {
+            matches!(
+                QuantType::from_code(tensor.quant_type),
+                Some(
+                    QuantType::Oq4G256
+                        | QuantType::Oq8G256
+                        | QuantType::Oq8G128
+                        | QuantType::OqPlusG256
+                        | QuantType::Oq3G256
+                        | QuantType::OqPlusCompact
+                        | QuantType::OqPlusCompactG128
+                )
+            )
+        });
+    }
     module.tensors.iter().any(|tensor| {
         matches!(
             QuantType::from_code(tensor.quant_type),
@@ -885,7 +976,7 @@ mod gtt_granularity_agreement_tests {
     /// `estimated_module_resident_bytes` rounds PER TENSOR (`for tensor in
     /// &module.tensors { resident += gtt_alloc_cost(len) }`) while
     /// `ensure_expert_module_resident` allocates ONCE PER MODULE
-    /// (`gtt_alloc_cost(module_resident_len(&module))`). Both are individually
+    /// (`gtt_alloc_cost(module_resident_len(&module, ExpertResidentLayout::IndexedMoeBlocks))`). Both are individually
     /// correct; they disagree whenever the two tensors land in the
     /// 512 KiB..2 MiB power-of-two regime and their sum crosses into the
     /// >2 MiB multiple-of-2-MiB regime.
@@ -1000,7 +1091,8 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
             let len = if compact_resident && tensor.quant_type == QuantType::OqPlusCompact.code() {
                 tensor.data_size
             } else {
-                module_tensor_resident_len(tensor).unwrap_or(tensor.data_size)
+                module_tensor_resident_len(tensor, ExpertResidentLayout::IndexedMoeBlocks)
+                    .unwrap_or(tensor.data_size)
             };
             resident += gtt_alloc_cost(len) as u64;
         }
@@ -1008,12 +1100,15 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
     (resident, on_disk)
 }
 
-fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerError> {
-    if !module_requires_host_repack(module) {
+fn module_resident_len(
+    module: &HfqModuleRecord,
+    layout: ExpertResidentLayout,
+) -> Result<usize, WeightPagerError> {
+    if !module_requires_host_repack(module, layout) {
         // Still validate unsupported transformed storage before accepting its
         // disk length as the resident layout.
         for tensor in &module.tensors {
-            module_tensor_resident_len(tensor)?;
+            module_tensor_resident_len(tensor, layout)?;
         }
         return Ok(module.data_size);
     }
@@ -1023,7 +1118,7 @@ fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerErr
     for tensor in tensors {
         len = align_up(len, MODULE_TENSOR_ALIGN);
         len = len
-            .checked_add(module_tensor_resident_len(tensor)?)
+            .checked_add(module_tensor_resident_len(tensor, layout)?)
             .ok_or_else(|| {
                 WeightPagerError::InvalidModule(format!(
                     "resident byte length overflows for module {}",
@@ -1037,6 +1132,7 @@ fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerErr
 fn prepare_expert_module(
     module: &HfqModuleRecord,
     disk_bytes: &[u8],
+    layout: ExpertResidentLayout,
 ) -> Result<PreparedExpertModule, WeightPagerError> {
     if disk_bytes.len() != module.data_size {
         return Err(WeightPagerError::InvalidModule(format!(
@@ -1048,7 +1144,7 @@ fn prepare_expert_module(
     }
     let mut tensors = module.tensors.iter().collect::<Vec<_>>();
     tensors.sort_by_key(|tensor| tensor.rel_offset);
-    let capacity = module_resident_len(module)?;
+    let capacity = module_resident_len(module, layout)?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut gate_up_rel = None;
     let mut down_rel = None;
@@ -1080,28 +1176,57 @@ fn prepare_expert_module(
                 tensor.name, tensor.quant_type
             ))
         })?;
-        let transformed = match quant_type {
-            QuantType::Oq4G256 => {
-                let (m, k) = module_tensor_shape(tensor)?;
-                oq4_canonical_to_moe_blocks(source, m, k)
-                    .map_err(WeightPagerError::InvalidModule)?
+        let transformed = if layout == ExpertResidentLayout::PerExpertNative {
+            // THE SAME CALL THE RESIDENT LOADER MAKES. Not a reimplementation of
+            // it — see `per_expert_native_form` for why that distinction is the
+            // whole point here.
+            let (m, k) = module_tensor_shape(tensor)?;
+            let out = per_expert_native_form(tensor.quant_type, source, m, k)
+                .map(|(bytes, _)| bytes)
+                // A type with no per-expert form is never paged (the arch
+                // declines it at load), so passing the bytes through is
+                // unreachable in practice and harmless if reached.
+                .unwrap_or_else(|| source.to_vec());
+            // The pager reserves and budgets from `per_expert_native_len` BEFORE
+            // reading anything, so that length is the one restatement of this
+            // layout left. Check it here rather than let a stale formula
+            // mis-account every eviction.
+            if let Some(want) = per_expert_native_len(quant_type, m, k) {
+                if out.len() != want {
+                    return Err(WeightPagerError::InvalidModule(format!(
+                        "tensor {} ({:?} [{m}, {k}]): the per-expert form is {} bytes but \
+                         `per_expert_native_len` reserved {want} — the two have drifted",
+                        tensor.name,
+                        quant_type,
+                        out.len()
+                    )));
+                }
             }
-            QuantType::Oq8G256 => {
-                let (m, k) = module_tensor_shape(tensor)?;
-                oq8_canonical_to_moe_blocks(source, m, k)
-                    .map_err(WeightPagerError::InvalidModule)?
+            out
+        } else {
+            match quant_type {
+                QuantType::Oq4G256 => {
+                    let (m, k) = module_tensor_shape(tensor)?;
+                    oq4_canonical_to_moe_blocks(source, m, k)
+                        .map_err(WeightPagerError::InvalidModule)?
+                }
+                QuantType::Oq8G256 => {
+                    let (m, k) = module_tensor_shape(tensor)?;
+                    oq8_canonical_to_moe_blocks(source, m, k)
+                        .map_err(WeightPagerError::InvalidModule)?
+                }
+                QuantType::OqPlusCompact => {
+                    let (m, k) = module_tensor_shape(tensor)?;
+                    oqplus_compact_to_moe_oq8_blocks(source, m, k)
+                        .map_err(WeightPagerError::InvalidModule)?
+                }
+                QuantType::Oq4G256ArchPacked | QuantType::OqPlusG256 => {
+                    // Produce the precise diagnostic shared with preflight.
+                    module_tensor_resident_len(tensor, layout)?;
+                    unreachable!("unsupported OQ module storage returned a resident length")
+                }
+                _ => source.to_vec(),
             }
-            QuantType::OqPlusCompact => {
-                let (m, k) = module_tensor_shape(tensor)?;
-                oqplus_compact_to_moe_oq8_blocks(source, m, k)
-                    .map_err(WeightPagerError::InvalidModule)?
-            }
-            QuantType::Oq4G256ArchPacked | QuantType::OqPlusG256 => {
-                // Produce the precise diagnostic shared with preflight.
-                module_tensor_resident_len(tensor)?;
-                unreachable!("unsupported OQ module storage returned a resident length")
-            }
-            _ => source.to_vec(),
         };
         bytes.extend_from_slice(&transformed);
         match expert_module_tensor_role(&tensor.name) {
@@ -1209,6 +1334,9 @@ impl Drop for AlignedHostBuffer {
 pub struct PagerConfig {
     /// How registered weights are kept resident. See [`ResidencyPolicy`].
     pub residency: ResidencyPolicy,
+    /// The DEVICE LAYOUT a paged routed expert is prepared into. See
+    /// [`ExpertResidentLayout`].
+    pub expert_layout: ExpertResidentLayout,
     /// If true, the pager prints structured residency events to stderr.
     /// Disabled by default; useful when debugging eviction policy.
     pub trace: bool,
@@ -1252,10 +1380,41 @@ impl PagerConfig {
     }
 }
 
+/// What device layout a paged routed expert lands in.
+///
+/// The pager was written for ONE consumer — the indexed MoE kernels, which read
+/// `[scale][nibbles]` MoE blocks and are handed device pointers through
+/// `patch_expert_module_ptr_table`. A second consumer exists: qwen4_exp does CPU
+/// top-k and loops one expert at a time through `weight_gemv`, so it needs each
+/// expert in the layout that dispatch accepts, not the indexed one.
+///
+/// The two differ per quant type, and neither is convertible to the other for
+/// free, so the choice is made once at pager construction rather than guessed
+/// per module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum ExpertResidentLayout {
+    /// MoE blocks for the `*_indexed*` kernels. Canonical OQ4/OQ8 are converted
+    /// to `[f32 scale][nibbles]` blocks, and compact is EXPANDED to Oq8 blocks
+    /// (4.25 b/w -> 8.125, 1.80x) because those kernels cannot read compact.
+    #[default]
+    IndexedMoeBlocks,
+    /// The layouts `hipfire_runtime::weights::weight_gemv` dispatches on:
+    /// canonical OQ4 -> the arch combined form (`DType::Oq4G256`), and compact
+    /// -> SPLIT PLANES (`DType::OqCompactG256` / `OqCompactG128`), which
+    /// `gemv_oq_compact_grouped` and the iu4x2 GEMMs read directly.
+    ///
+    /// Compact stays compact here. That is the whole point: expanding it is what
+    /// makes a 4.25 b/w artifact cost 8.125, and `split_compact_planes`
+    /// preserves the byte count exactly, so the resident length is the disk
+    /// length.
+    PerExpertNative,
+}
+
 impl Default for PagerConfig {
     fn default() -> Self {
         Self {
             residency: ResidencyPolicy::PinAll,
+            expert_layout: ExpertResidentLayout::IndexedMoeBlocks,
             trace: false,
         }
     }
@@ -1357,6 +1516,32 @@ struct ResidentModule {
     bytes: u64,
     gate_up_ptr: u64,
     down_ptr: u64,
+}
+
+/// One resident routed expert, addressed the way a per-expert consumer needs.
+///
+/// `gate_up_rel` / `down_rel` are byte offsets into `buf`, which holds the whole
+/// module (both projections) in ONE allocation — so a per-expert view is a single
+/// `sub_offset`, and the GTT rounding is paid once per module rather than per
+/// projection.
+pub struct ResidentExpertViews<'a> {
+    pub buf: &'a GpuTensor,
+    pub gate_up_rel: usize,
+    pub down_rel: usize,
+}
+
+/// What one role's weights look like ONCE RESIDENT, answered from the module
+/// table alone.
+///
+/// An arch needs the device dtype and `[m, k]` at load time to build its weight
+/// views, but paging an expert in to find out would defeat the point — the whole
+/// reason to page is that they do not all fit. This reads the registered
+/// metadata instead and touches no bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedRoleDesc {
+    pub dtype: DType,
+    pub m: usize,
+    pub k: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1465,7 +1650,7 @@ impl WeightPager {
                 module.module_id
             )));
         }
-        module_resident_len(&module)?;
+        module_resident_len(&module, self.config.expert_layout)?;
         self.module_catalog
             .insert(ExpertModuleKey { layer, expert }, module);
         self.module_stats.registered_modules = self.module_catalog.len();
@@ -1514,7 +1699,8 @@ impl WeightPager {
                 .module_catalog
                 .get(&key)
                 .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
-            need = need.saturating_add(module_resident_len(module)? as u64);
+            need =
+                need.saturating_add(module_resident_len(module, self.config.expert_layout)? as u64);
         }
         self.would_fit(need)
     }
@@ -1532,7 +1718,10 @@ impl WeightPager {
             .module_catalog
             .iter()
             .filter(|(key, _)| key.layer == layer)
-            .map(|(_, module)| module_resident_len(module).map(|size| gtt_alloc_cost(size) as u64))
+            .map(|(_, module)| {
+                module_resident_len(module, self.config.expert_layout)
+                    .map(|size| gtt_alloc_cost(size) as u64)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let need: u64 = sizes.iter().take(k).sum();
@@ -1642,7 +1831,7 @@ impl WeightPager {
         // rounding applies once to the whole module rather than per tensor --
         // which is why module paging is cheaper than the per-tensor resident
         // path even before eviction.
-        let need = gtt_alloc_cost(module_resident_len(&module)?) as u64;
+        let need = gtt_alloc_cost(module_resident_len(&module, self.config.expert_layout)?) as u64;
         self.would_fit(need)?;
         if self
             .config
@@ -1651,11 +1840,12 @@ impl WeightPager {
         {
             self.evict_lru_until(need, gpu)?;
         }
-        let (tensor, gate_up_rel, down_rel) = if module_requires_host_repack(&module) {
+        let layout = self.config.expert_layout;
+        let (tensor, gate_up_rel, down_rel) = if module_requires_host_repack(&module, layout) {
             let disk_bytes = self
                 .transport
                 .read_host(module.data_offset, module.data_size, gpu)?;
-            let prepared = prepare_expert_module(&module, &disk_bytes)?;
+            let prepared = prepare_expert_module(&module, &disk_bytes, layout)?;
             // POOLED, not `upload_raw`. Eviction returns the buffer via
             // `free_tensor` -> `pool.free`, so allocating outside the pool means
             // every cold load takes fresh GTT while every eviction piles into a
@@ -1854,6 +2044,59 @@ impl WeightPager {
                 .memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
         }
         Ok(())
+    }
+
+    /// A resident routed expert's buffer and the offset of each projection
+    /// WITHIN it, in elements of that buffer.
+    ///
+    /// The pager otherwise publishes residency only as device pointers pushed
+    /// into `expert_ptr_tables`, which is what the `*_indexed*` kernels read.
+    /// A consumer that dispatches one expert at a time — qwen4_exp does CPU
+    /// top-k and calls `weight_gemv` per expert — needs a tensor it can
+    /// sub-offset instead, so this returns the same information in that form.
+    ///
+    /// Returns `None` when the module is not resident; call
+    /// [`Self::ensure_expert_module_resident`] first.
+    /// True when `key` was registered, without regard to residency.
+    pub fn has_expert_module(&self, key: ExpertModuleKey) -> bool {
+        self.module_catalog.contains_key(&key)
+    }
+
+    /// Describe `role`'s resident form for `key` from metadata only.
+    ///
+    /// `None` when the module is unregistered, the role is absent, or the
+    /// configured layout has no `weight_gemv` dtype for that quant type — all
+    /// three mean "this arch cannot page this expert", which a caller should
+    /// treat as a reason to load resident rather than as an error.
+    pub fn expert_module_role_desc(
+        &self,
+        key: ExpertModuleKey,
+        role: ExpertRole,
+    ) -> Option<PagedRoleDesc> {
+        let module = self.module_catalog.get(&key)?;
+        let tensor = module
+            .tensors
+            .iter()
+            .find(|t| expert_module_tensor_role(&t.name) == Some(role))?;
+        let (m, k) = module_tensor_shape(tensor).ok()?;
+        // The dtype is whatever the shared converter yields — asked with a
+        // zero-filled buffer of the right length, because these transforms are
+        // shape-driven and the answer does not depend on the values. Deriving it
+        // from a second `match` here is exactly the duplication that made a paged
+        // oq8 expert serve raw bytes.
+        let (_, dtype) =
+            per_expert_native_form(tensor.quant_type, &vec![0u8; tensor.data_size], m, k)?;
+        Some(PagedRoleDesc { dtype, m, k })
+    }
+
+    pub fn resident_expert_views(&self, key: ExpertModuleKey) -> Option<ResidentExpertViews<'_>> {
+        let m = self.resident_modules.get(&key)?;
+        let base = m.tensor.buf.as_ptr() as u64;
+        Some(ResidentExpertViews {
+            buf: &m.tensor,
+            gate_up_rel: m.gate_up_ptr.saturating_sub(base) as usize,
+            down_rel: m.down_ptr.saturating_sub(base) as usize,
+        })
     }
 
     pub fn patch_expert_module_ptr_table(
@@ -2393,6 +2636,120 @@ mod tests {
         }
     }
 
+    /// A paged expert must be BYTE-IDENTICAL to the same expert loaded resident.
+    ///
+    /// The two sides are `prepare_expert_module` (paged) and
+    /// `oq8_arch_load_allow_compact` (resident, what `stack_experts` calls). They
+    /// were not identical: the resident loader normalises the sparse-overlay
+    /// padding before splitting planes and the paged one only split, so a paged
+    /// expert decoded with junk corrections in the unused overlay slots. Nothing
+    /// errors on that — the logits are just wrong — so the invariant is asserted
+    /// here rather than left to a serving diff.
+    ///
+    /// Overlay bytes are deliberately filled with a non-zero pattern; with a
+    /// zeroed buffer both paths agree trivially and the test proves nothing.
+    #[test]
+    fn a_paged_compact_expert_matches_the_resident_loader_byte_for_byte() {
+        for (qt, group) in [
+            (QuantType::OqPlusCompact, 256usize),
+            (QuantType::OqPlusCompactG128, 128usize),
+        ] {
+            // n_out = 2 correction slots, which is what makes the padding real.
+            let block = 2 + group / 2 + 2 * 2;
+            let (gu_m, gu_k) = (1024usize, 2048usize);
+            let (dn_m, dn_k) = (2048usize, 512usize);
+            let gu_len = (gu_m * gu_k / group) * block;
+            let dn_len = (dn_m * dn_k / group) * block;
+            let mut module = routed_module_qt(qt.code(), gu_len, dn_len);
+            for t in &mut module.tensors {
+                t.group_size = group as u32;
+            }
+
+            let disk: Vec<u8> = (0..gu_len + dn_len).map(|i| (i % 251 + 1) as u8).collect();
+            let prepared =
+                prepare_expert_module(&module, &disk, ExpertResidentLayout::PerExpertNative)
+                    .expect("prepare");
+
+            for (rel_start, len, m, k, resident_rel) in [
+                (0usize, gu_len, gu_m, gu_k, prepared.gate_up_rel),
+                (gu_len, dn_len, dn_m, dn_k, prepared.down_rel),
+            ] {
+                let (want, _) = crate::oq8_arch::oq8_arch_load_allow_compact(
+                    qt.code(),
+                    &disk[rel_start..rel_start + len],
+                    m,
+                    k,
+                )
+                .expect("resident loader handles compact");
+                assert_eq!(
+                    &prepared.bytes[resident_rel..resident_rel + want.len()],
+                    &want[..],
+                    "{qt:?} [{m}, {k}]: paged bytes differ from the resident loader"
+                );
+            }
+        }
+    }
+
+    /// `PerExpertNative` must NOT expand compact.
+    ///
+    /// The indexed layout converts `OqPlusCompact` to Oq8 MoE blocks — 4.25 b/w
+    /// becoming 8.125, 1.80x — because those kernels cannot read compact. A
+    /// per-expert consumer reads compact directly (`gemv_oq_compact_grouped`,
+    /// the iu4x2 GEMMs), so its residency must stay at the disk length:
+    /// `split_compact_planes` only reorders bytes.
+    ///
+    /// Asserted as a RATIO against the indexed layout rather than a constant,
+    /// because the expansion is the thing that must not happen, and a constant
+    /// would still pass if both paths grew.
+    #[test]
+    fn per_expert_native_keeps_compact_compact() {
+        // Compact blocks: [f16 scale][k/2 nibbles] per group, no overlay.
+        let gu_groups = 1024 * 2048 / 256;
+        let dn_groups = 2048 * 512 / 256;
+        let block = 2 + 128;
+        let m = routed_module_qt(
+            QuantType::OqPlusCompact.code(),
+            gu_groups * block,
+            dn_groups * block,
+        );
+
+        let native = module_resident_len(&m, ExpertResidentLayout::PerExpertNative).unwrap();
+        let indexed = module_resident_len(&m, ExpertResidentLayout::IndexedMoeBlocks).unwrap();
+
+        assert_eq!(
+            native, m.data_size,
+            "compact must stay at its disk length under PerExpertNative"
+        );
+        assert!(
+            indexed > native,
+            "the indexed layout expands compact ({indexed} vs {native}); if it no \
+             longer does, this test has lost its point"
+        );
+    }
+
+    /// G128 compact (qt 52) is what qwen4_exp's `down_proj` is, and the indexed
+    /// path does not list it at all — it falls through to the disk length, which
+    /// is right only by accident. Under `PerExpertNative` it is right on purpose.
+    #[test]
+    fn per_expert_native_handles_compact_g128() {
+        let gu_groups = 1024 * 2048 / 128;
+        let dn_groups = 2048 * 512 / 128;
+        let block = 2 + 64;
+        let m = routed_module_qt(
+            QuantType::OqPlusCompactG128.code(),
+            gu_groups * block,
+            dn_groups * block,
+        );
+        assert_eq!(
+            module_resident_len(&m, ExpertResidentLayout::PerExpertNative).unwrap(),
+            m.data_size
+        );
+        assert!(
+            module_requires_host_repack(&m, ExpertResidentLayout::PerExpertNative),
+            "compact needs its planes split before a per-expert GEMV reads it"
+        );
+    }
+
     /// The whole point of `Oq4G256MoeBlocks`: it is stored in the layout the
     /// indexed kernels consume, so page-in is a verbatim fetch instead of a
     /// per-module CPU transform. Canonical OQ4 must still repack.
@@ -2404,7 +2761,7 @@ mod tests {
         let canonical =
             routed_module_qt(QuantType::Oq4G256.code(), groups_gu * 130, groups_dn * 130);
         assert!(
-            module_requires_host_repack(&canonical),
+            module_requires_host_repack(&canonical, ExpertResidentLayout::IndexedMoeBlocks),
             "canonical OQ4 is 130 B/group on disk and must be transformed on page-in"
         );
 
@@ -2414,7 +2771,7 @@ mod tests {
             groups_dn * 132,
         );
         assert!(
-            !module_requires_host_repack(&packed),
+            !module_requires_host_repack(&packed, ExpertResidentLayout::IndexedMoeBlocks),
             "pre-transformed OQ4 must be fetched verbatim — this predicate IS the CPU cost"
         );
     }
@@ -2435,14 +2792,15 @@ mod tests {
 
         for (tc, tp) in canonical.tensors.iter().zip(&packed.tensors) {
             assert_eq!(
-                module_tensor_resident_len(tc).unwrap(),
-                module_tensor_resident_len(tp).unwrap(),
+                module_tensor_resident_len(tc, ExpertResidentLayout::IndexedMoeBlocks).unwrap(),
+                module_tensor_resident_len(tp, ExpertResidentLayout::IndexedMoeBlocks).unwrap(),
                 "resident length must not depend on which on-disk form was used"
             );
         }
         // And the pre-transformed on-disk size IS the resident size.
         assert_eq!(
-            module_tensor_resident_len(&packed.tensors[0]).unwrap(),
+            module_tensor_resident_len(&packed.tensors[0], ExpertResidentLayout::IndexedMoeBlocks)
+                .unwrap(),
             packed.tensors[0].data_size,
         );
     }
@@ -2562,8 +2920,12 @@ mod tests {
             ],
         };
 
-        assert_eq!(module_resident_len(&module).unwrap(), 292);
-        let prepared = prepare_expert_module(&module, &disk).unwrap();
+        assert_eq!(
+            module_resident_len(&module, ExpertResidentLayout::IndexedMoeBlocks).unwrap(),
+            292
+        );
+        let prepared =
+            prepare_expert_module(&module, &disk, ExpertResidentLayout::IndexedMoeBlocks).unwrap();
         assert_eq!(prepared.bytes.len(), 292);
         assert_eq!(prepared.gate_up_rel, 0);
         assert_eq!(prepared.down_rel, 160);
@@ -2578,7 +2940,7 @@ mod tests {
         let mut module = routed_module(0, 0);
         module.tensors[0].quant_type = QuantType::Oq4G256ArchPacked.code();
         assert!(matches!(
-            module_resident_len(&module),
+            module_resident_len(&module, ExpertResidentLayout::IndexedMoeBlocks),
             Err(WeightPagerError::InvalidModule(message))
                 if message.contains("dense Oq4G256ArchPacked")
         ));
@@ -2592,6 +2954,7 @@ mod tests {
     #[test]
     fn pin_all_never_budgets_and_lazy_lru_does() {
         let pin = PagerConfig {
+            expert_layout: ExpertResidentLayout::IndexedMoeBlocks,
             residency: ResidencyPolicy::PinAll,
             trace: false,
         };
@@ -2600,6 +2963,7 @@ mod tests {
         assert_eq!(PagerConfig::default().eviction_budget(), None);
 
         let lazy = PagerConfig {
+            expert_layout: ExpertResidentLayout::IndexedMoeBlocks,
             residency: ResidencyPolicy::LazyLru {
                 vram_budget_bytes: 100,
             },
@@ -2611,6 +2975,7 @@ mod tests {
         // back as Some(u64::MAX), or `evict_lru_until` walks the LRU to free
         // bytes it can never need.
         let unlimited = PagerConfig {
+            expert_layout: ExpertResidentLayout::IndexedMoeBlocks,
             residency: ResidencyPolicy::LazyLru {
                 vram_budget_bytes: u64::MAX,
             },
@@ -2635,6 +3000,7 @@ mod tests {
         let pager = WeightPager::with_pread_transport(
             &path,
             PagerConfig {
+                expert_layout: ExpertResidentLayout::IndexedMoeBlocks,
                 residency: ResidencyPolicy::LazyLru {
                     vram_budget_bytes: 100,
                 },

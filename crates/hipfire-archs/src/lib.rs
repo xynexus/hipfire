@@ -34,6 +34,8 @@ mod force_link {
     use hipfire_arch_gemma4 as _;
     #[allow(unused_imports)]
     use hipfire_arch_qwen2 as _;
+    #[allow(unused_imports)]
+    use hipfire_arch_qwen4exp as _;
     // The template's two halves (serving ToyModel + offline Ingest) on one id.
     #[allow(unused_imports)]
     use hipfire_arch_template as _;
@@ -120,6 +122,20 @@ mod tests {
             .expect("Gemma 4 factory linked");
         assert_eq!(qwen2.family(), "qwen2");
         assert_eq!(gemma4.family(), "gemma4");
+    }
+
+    /// Qwen3.8-Flash-Next reaches the daemon by DATA lookup, not an `arch_id`
+    /// branch. Registration is `inventory`-based, so the failure this guards is a
+    /// missing link edge: without the `use hipfire_arch_qwen4exp as _;` above, the
+    /// factory simply is not in the binary and the daemon reports the artifact as
+    /// an unknown architecture.
+    #[test]
+    fn qwen4exp_serving_factory_is_linked() {
+        let f = hipfire_runtime::arch::serving_factory(26)
+            .expect("unique qwen4_exp factory")
+            .expect("qwen4_exp factory linked");
+        assert_eq!(f.family(), "qwen4exp");
+        assert_eq!(f.arch_id(), 26);
     }
 
     /// Completeness gate. Two invariants that hold today and guard migration:

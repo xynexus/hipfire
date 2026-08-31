@@ -105,6 +105,43 @@ impl Gpu {
         self.invalidate_x_caches_for(xrp);
         result
     }
+    /// Batched `rotate_x_mq_128`. Grid.y is the batch dim.
+    ///
+    /// Kernel-side this needed nothing: `mq_rotate_x_128` already offsets by
+    /// `blockIdx.y * K`, exactly as the G256 `mq_rotate_x` does — it was simply
+    /// never launched with a grid.y > 1.
+    pub fn rotate_x_mq_128_batched(
+        &mut self,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs_128()?;
+        self.ensure_kernel("gemv_mq4g128", kernels::GEMV_MQ4G128_SRC, "mq_rotate_x_128")?;
+        let s1_ptr = self.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 128) as u32;
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_128_batched", bytes);
+        let result = self.launch_kernargs(
+            "mq_rotate_x_128",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr xrp, ptr s1_ptr, ptr s2_ptr, i32 kv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
     /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
     ///
     /// Divides each input element by `awq_scale[i]` BEFORE the FWHT,

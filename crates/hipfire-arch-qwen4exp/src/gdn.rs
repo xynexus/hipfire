@@ -21,16 +21,17 @@
 
 use crate::config::Qwen4ExpConfig;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 /// Per-layer weights, already resident.
 pub struct GdnWeights {
     /// `[qkv_dim, hidden]` — Q and K at the key span, V at the value span.
-    pub in_proj_qkv: GpuTensor,
+    pub in_proj_qkv: WeightTensor,
     /// `[z_dim, hidden]` — the output gate, spanning V.
-    pub in_proj_z: GpuTensor,
+    pub in_proj_z: WeightTensor,
     /// `[value_heads, hidden]` each.
-    pub in_proj_a: GpuTensor,
-    pub in_proj_b: GpuTensor,
+    pub in_proj_a: WeightTensor,
+    pub in_proj_b: WeightTensor,
     /// `[qkv_dim, 1, conv_kernel]`, flattened.
     pub conv_weight: GpuTensor,
     /// `[value_heads]` each.
@@ -40,7 +41,7 @@ pub struct GdnWeights {
     /// this family's other norm which carries a `+1`.
     pub norm_weight: GpuTensor,
     /// `[hidden, z_dim]`
-    pub out_proj: GpuTensor,
+    pub out_proj: WeightTensor,
 }
 
 /// Recurrent state for one sequence in one layer.
@@ -128,10 +129,10 @@ pub fn gdn_decode_step(
     let d = &cfg.deltanet;
     let hd = d.key_head_dim;
 
-    gpu.gemv_f32(&w.in_proj_qkv, x, &s.qkv)?;
-    gpu.gemv_f32(&w.in_proj_z, x, &s.z)?;
-    gpu.gemv_f32(&w.in_proj_a, x, &s.a)?;
-    gpu.gemv_f32(&w.in_proj_b, x, &s.b)?;
+    weight_gemv(gpu, &w.in_proj_qkv, x, &s.qkv)?;
+    weight_gemv(gpu, &w.in_proj_z, x, &s.z)?;
+    weight_gemv(gpu, &w.in_proj_a, x, &s.a)?;
+    weight_gemv(gpu, &w.in_proj_b, x, &s.b)?;
 
     // beta = sigmoid(b); alpha = softplus(a + dt_bias) * -exp(A_log).
     // The kernel reads `a`/`b` in place through the alpha/beta buffers.
@@ -212,5 +213,83 @@ pub fn gdn_decode_step(
         )?;
     }
 
-    gpu.gemv_f32(&w.out_proj, &s.gated, y)
+    weight_gemv(gpu, &w.out_proj, &s.gated, y)
+}
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Every `free` below DESTRUCTURES its struct exhaustively rather than naming
+// fields to free. That is deliberate: a field added later fails to compile until
+// someone decides what happens to it, where a `self.a; self.b;` list would just
+// silently leak the new tensor. `unload` on a 360 GB model has no test that would
+// catch that.
+
+impl GdnWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_a,
+            in_proj_b,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            out_proj,
+        } = self;
+        for t in [in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj] {
+            let _ = gpu.free_tensor(t.buf);
+        }
+        for t in [conv_weight, a_log, dt_bias, norm_weight] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl GdnState {
+    /// Zero the recurrent state and the conv ring. A new sequence must not
+    /// inherit the previous one's history — this is the whole state a GDN layer
+    /// carries between tokens.
+    pub fn reset(&self, gpu: &mut Gpu) -> hipfire_rdna::HipResult<()> {
+        // No in-place zero primitive exists, so write host zeros over the
+        // buffers. Both are small (one S matrix and one conv ring per layer) and
+        // this runs once per sequence, not per token.
+        for t in [&self.recurrent, &self.conv] {
+            let zeros = vec![0u8; t.buf.size()];
+            gpu.memcpy_htod_auto(&t.buf, &zeros)?;
+        }
+        Ok(())
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self { recurrent, conv } = self;
+        for t in [recurrent, conv] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl GdnScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            qkv,
+            z,
+            a,
+            b,
+            alpha,
+            beta,
+            q_raw,
+            k_raw,
+            v,
+            q,
+            k,
+            attn,
+            gated,
+        } = self;
+        for t in [
+            qkv, z, a, b, alpha, beta, q_raw, k_raw, v, q, k, attn, gated,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

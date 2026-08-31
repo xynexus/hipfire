@@ -293,7 +293,7 @@ fn main() {
             &mut st,
             &mut sc,
             &embed,
-            Some(&ngram),
+            Some(&hipfire_arch_qwen4exp::ngram_rows::ResidentRows { table: &ngram }),
             &tokens[..=t],
             t,
             eos,
@@ -356,15 +356,15 @@ fn assert_experts_are_one_slab(w: &TrunkWeights, cfg: &Qwen4ExpConfig) {
         let want_gu = m.num_experts * 2 * m.intermediate * cfg.hidden;
         let want_dn = m.num_experts * cfg.hidden * m.intermediate;
         assert_eq!(
-            l.moe.gate_up.numel(),
+            l.moe.gate_up.resident_elems(),
             want_gu,
             "layer {i}: gate_up is {} elements, not the whole {}-expert stack — \
              experts are being allocated separately",
-            l.moe.gate_up.numel(),
+            l.moe.gate_up.resident_elems(),
             m.num_experts
         );
         assert_eq!(
-            l.moe.down.numel(),
+            l.moe.down.resident_elems(),
             want_dn,
             "layer {i}: down is not one stack"
         );

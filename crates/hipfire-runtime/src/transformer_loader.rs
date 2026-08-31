@@ -279,12 +279,14 @@ impl<'a> TransformerLoader<'a> {
         let (info, data) = self.required_data(name, &[m, k]);
         let mut weight = match info.quant_type {
             // OQ int8-activation family (33 = OQ+ W4A8, 35 = OQ8 W8A8, 36 = OQ+
-            // compact) via the shared `oq8_arch_load`, parallel to the OQ4 arm
-            // below — the single arch-agnostic OQ8 dispatch every loader routes
-            // through.
-            qt @ (33 | 35 | 36 | 52) => {
+            // compact, 54 = OQ8 at group 128) via the shared `oq8_arch_load`,
+            // parallel to the OQ4 arm below — the single arch-agnostic OQ8
+            // dispatch every loader routes through. Note 54 is the one code here
+            // that does NOT come back tagged `Oq8G256`: it keeps its own dtype so
+            // the forward picks the FWHT-128 basis.
+            qt @ (33 | 35 | 36 | 52 | 54) => {
                 let (bytes, dtype) = oq8_arch_load(qt, &data, m, k)
-                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
+                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52/54");
                 self.upload_weight_bytes(gpu, bytes, dtype, m, k)?
             }
             OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {

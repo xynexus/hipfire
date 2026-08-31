@@ -15,20 +15,21 @@
 
 use crate::config::Qwen4ExpConfig;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 pub struct QsaWeights {
     /// `[n_heads * head_dim * 2, hidden]` — query AND output gate.
-    pub q_proj: GpuTensor,
+    pub q_proj: WeightTensor,
     /// `[n_kv * head_dim, hidden]`
-    pub k_proj: GpuTensor,
-    pub v_proj: GpuTensor,
+    pub k_proj: WeightTensor,
+    pub v_proj: WeightTensor,
     /// `[hidden, n_heads * head_dim]`
-    pub o_proj: GpuTensor,
+    pub o_proj: WeightTensor,
     /// `[head_dim]`, shared across heads
     pub q_norm: GpuTensor,
     pub k_norm: GpuTensor,
     /// `[(ix_heads + ix_kv) * ix_head_dim, hidden]`
-    pub ix_qk_proj: GpuTensor,
+    pub ix_qk_proj: WeightTensor,
     /// `[ix_head_dim]` each
     pub ix_q_norm: GpuTensor,
     pub ix_k_norm: GpuTensor,
@@ -136,12 +137,12 @@ pub fn qsa_decode_step(
     let ms = cache.max_seq;
 
     // Query and its output gate share one doubled projection, per head.
-    gpu.gemv_f32(&w.q_proj, x, &s.qg)?;
+    weight_gemv(gpu, &w.q_proj, x, &s.qg)?;
     gpu.qsa_split_query_gate(&s.qg, &s.query, &s.gate, nh as i32, hd as i32)?;
     gpu.rms_norm_heads_shared_w(&s.query, &w.q_norm, &s.qn, hd as i32, nh as i32, eps)?;
-    gpu.gemv_f32(&w.k_proj, x, &s.k)?;
+    weight_gemv(gpu, &w.k_proj, x, &s.k)?;
     gpu.rms_norm_heads_shared_w(&s.k, &w.k_norm, &s.kn, hd as i32, nkv as i32, eps)?;
-    gpu.gemv_f32(&w.v_proj, x, &s.v)?;
+    weight_gemv(gpu, &w.v_proj, x, &s.v)?;
 
     let pos_buf = gpu.upload_f32(&[f32::from_bits(pos as u32)], &[1])?;
     gpu.rope_partial_interleaved_f32_batched(
@@ -164,7 +165,7 @@ pub fn qsa_decode_step(
     cache.len = cache.len.max(pos + 1);
 
     // ── indexer ─────────────────────────────────────────────────────────────
-    gpu.gemv_f32(&w.ix_qk_proj, x, &s.ix_qk)?;
+    weight_gemv(gpu, &w.ix_qk_proj, x, &s.ix_qk)?;
     // The indexer's key is stored RAW; norm and rotation apply to the pooled
     // block key, not to the per-token one.
     let ix_key = s.ix_qk.sub_offset(ix.n_heads * ix.head_dim, ix.head_dim);
@@ -289,5 +290,88 @@ pub fn qsa_decode_step(
         hd,
     )?;
     gpu.qsa_apply_output_gate(&s.ctx, &s.gate, &s.gated, (nh * hd) as i32)?;
-    gpu.gemv_f32(&w.o_proj, &s.gated, out)
+    weight_gemv(gpu, &w.o_proj, &s.gated, out)
+}
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Exhaustive destructures, so a field added later fails to compile until someone
+// decides whether it needs freeing. See the note in `hc_gpu.rs`.
+
+impl QsaWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            ix_qk_proj,
+            ix_q_norm,
+            ix_k_norm,
+        } = self;
+        for t in [q_proj, k_proj, v_proj, o_proj, ix_qk_proj] {
+            let _ = gpu.free_tensor(t.buf);
+        }
+        for t in [q_norm, k_norm, ix_q_norm, ix_k_norm] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl QsaCache {
+    /// Rewind to an empty cache. Only `len` needs clearing — the K/V and indexer
+    /// key buffers are written before they are read at every position < len, so
+    /// stale bytes past the cursor are never visible.
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            k,
+            v,
+            ix_keys,
+            len: _,
+            max_seq: _,
+        } = self;
+        for t in [k, v, ix_keys] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+impl QsaScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            qg,
+            query,
+            gate,
+            qn,
+            k,
+            kn,
+            v,
+            ix_qk,
+            ix_q,
+            block_keys,
+            starts,
+            scores,
+            block_mask,
+            slots,
+            count,
+            gath_k,
+            gath_v,
+            ctx,
+            gated,
+            m,
+            l,
+        } = self;
+        for t in [
+            qg, query, gate, qn, k, kn, v, ix_qk, ix_q, block_keys, starts, scores, block_mask,
+            slots, count, gath_k, gath_v, ctx, gated, m, l,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }

@@ -1125,13 +1125,16 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
-        33 | 35 | 36 | 52 => {
-            // OQ8-family dense tensors (OQ+ W4A8, OQ8 W8A8, and compact mixed
-            // OQ) all resolve through the shared runtime helper to the combined
-            // Oq8G256 device layout consumed by the iu8 GEMV/GEMM kernels. Routed
-            // MoE experts keep their indexed block layout in `load_moe_expert`.
+        33 | 35 | 36 | 52 | 54 => {
+            // OQ8-family dense tensors (OQ+ W4A8, OQ8 W8A8, compact mixed OQ, and
+            // OQ8 at group 128) all resolve through the shared runtime helper to
+            // the combined device layout consumed by the iu8 GEMV/GEMM kernels.
+            // `gpu_dtype` comes BACK from the helper rather than being assumed:
+            // 54 returns `Oq8G128`, which is what selects the FWHT-128 basis in
+            // the forward. Routed MoE experts keep their indexed block layout in
+            // `load_moe_expert`.
             let (bytes, gpu_dtype) = oq8_arch_load_allow_compact(quant_type, data, m, k)
-                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52");
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36/52/54");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -4797,6 +4800,11 @@ pub fn load_weights(
         let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
             hfq.path(),
             hipfire_runtime::weight_pager::PagerConfig {
+                // Indexed MoE kernels read these experts, so they want the
+                // MoE-block layout. Named rather than defaulted, so a future
+                // consumer choice is a decision here and not an inheritance.
+                expert_layout:
+                    hipfire_runtime::weight_pager::ExpertResidentLayout::IndexedMoeBlocks,
                 // u64::MAX has always meant "never evict"; say so now that the
                 // pager has a name for it.
                 residency: if config.vram_budget_bytes == u64::MAX {

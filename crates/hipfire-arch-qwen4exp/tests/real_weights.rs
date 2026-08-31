@@ -373,3 +373,130 @@ fn the_mtp_composition_argument_holds_against_the_checkpoint() {
         "MTP has its own embedding; it should share the trunk's"
     );
 }
+
+// ── the declarative tensor manifest, against the same 1658 real names ────────
+//
+// `plan()` above is a shape-checked list the loader walks; the manifest is a
+// name-level expectation that ALSO reports what an artifact carries but nothing
+// claimed. The two are independent statements about the same family, so pointing
+// both at the shipped checkpoint is what keeps them from drifting apart — which
+// is precisely the failure the manifest exists to catch elsewhere.
+
+use hipfire_arch_qwen4exp_spec::manifest::{qwen4exp_manifest, Qwen4ExpGeometry};
+
+fn real_geometry(c: &Qwen4ExpConfig) -> (Vec<String>, Qwen4ExpGeometry) {
+    let layer_types: Vec<String> = c
+        .layer_types
+        .iter()
+        .map(|t| match t {
+            LayerType::LinearAttention => "linear_attention".to_string(),
+            LayerType::SparseAttention => "qwen_sparse_attention".to_string(),
+        })
+        .collect();
+    let geom = Qwen4ExpGeometry {
+        layers: c.layers,
+        experts: c.moe.num_experts,
+        ngram_layer: c.ngram.as_ref().map(|n| n.layer_idx),
+        ngram_shards: c.ngram.as_ref().map(|n| n.shards).unwrap_or(1),
+        mtp_layers: c.mtp_layers,
+        vision_blocks: c.vision.as_ref().map(|v| v.depth).unwrap_or(0),
+    };
+    (layer_types, geom)
+}
+
+/// Every REQUIRED pattern must be satisfied by the shipped checkpoint. A failure
+/// here is a load failure on a 238 GB conversion, found in milliseconds.
+#[test]
+fn manifest_requires_nothing_the_checkpoint_lacks() {
+    let c = cfg();
+    let (layer_types, geom) = real_geometry(&c);
+    let available = real_shapes();
+    let names: Vec<&str> = available.keys().map(|s| s.as_str()).collect();
+    let report = qwen4exp_manifest(&layer_types, geom).validate(names);
+    assert!(
+        report.missing.is_empty(),
+        "manifest demands tensors the real checkpoint does not have:\n{}",
+        report.render("qwen4_exp")
+    );
+}
+
+/// The manifest must also EXPLAIN the checkpoint: anything it cannot account for
+/// is a name shape nobody declared, which is how a family quietly grows a tensor
+/// the loader never learns to read. Reported as a set, not one string.
+#[test]
+fn manifest_accounts_for_every_real_tensor() {
+    let c = cfg();
+    let (layer_types, geom) = real_geometry(&c);
+    let available = real_shapes();
+    let names: Vec<&str> = available.keys().map(|s| s.as_str()).collect();
+    let report = qwen4exp_manifest(&layer_types, geom).validate(names);
+    assert!(
+        report.unclaimed.is_empty(),
+        "real tensors no pattern claims:\n{}",
+        report.render("qwen4_exp")
+    );
+}
+
+/// The geometry the manifest is built from must be the REAL one, or both tests
+/// above could pass vacuously against a 4-layer toy.
+#[test]
+fn the_real_geometry_is_what_it_claims() {
+    let c = cfg();
+    let (layer_types, geom) = real_geometry(&c);
+    assert_eq!(geom.layers, 48, "48 text layers");
+    assert_eq!(layer_types.len(), geom.layers);
+    assert_eq!(geom.experts, 512, "512 routed experts");
+    // ple_layer_ids is one-based in the file; [2] means layer 1.
+    assert_eq!(geom.ngram_layer, Some(1), "PLE rides layer 1, not layer 2");
+    assert!(geom.ngram_shards > 1, "the n-gram table is sharded on disk");
+}
+
+/// The shipped model must FIT with routed experts natively quantised, and the
+/// margin must come from the experts staying quantised rather than from luck.
+///
+/// This is arithmetic over the REAL config and the actual on-disk byte rates, not
+/// an estimate: `Oq4G256`'s combined device form is `m*k/2` nibble bytes plus one
+/// f32 scale per 256-group. It exists because the failure it guards is silent —
+/// dequantising the experts to f32 serves identically on a fixture and only fails
+/// on a machine that then cannot hold the model.
+#[test]
+fn shipped_trunk_fits_with_quantised_experts() {
+    let c = cfg();
+    let oq4_bytes = |m: usize, k: usize| -> u64 {
+        // [m*k/2 nibbles | m * (k/256) f32 scales]
+        (m as u64 * k as u64) / 2 + (m as u64 * (k as u64 / 256)) * 4
+    };
+    let f32_bytes = |m: usize, k: usize| -> u64 { m as u64 * k as u64 * 4 };
+
+    let (h, mi, e) = (c.hidden, c.moe.intermediate, c.moe.num_experts);
+    let per_expert = oq4_bytes(2 * mi, h) + oq4_bytes(h, mi);
+    let experts = per_expert * e as u64 * c.layers as u64;
+
+    // Everything else is still dequantised to f32 today — count it that way, so
+    // the test measures what actually loads rather than what we would like to.
+    let others = (f32_bytes(2 * mi, h) + f32_bytes(h, mi)) * c.layers as u64  // shared expert
+        + f32_bytes(c.vocab, h)                                              // lm_head
+        + (8 * f32_bytes(h, h)) * c.layers as u64; // attention + GDN, generous
+
+    let total_gib = (experts + others) as f64 / (1u64 << 30) as f64;
+    let experts_gib = experts as f64 / (1u64 << 30) as f64;
+    println!("  routed experts (Oq4G256): {experts_gib:.1} GiB");
+    println!("  trunk total:              {total_gib:.1} GiB");
+
+    // 128 GB of UMA, shared with everything else on the box. Anything approaching
+    // that is a failure even though it is arithmetically "under".
+    assert!(
+        total_gib < 96.0,
+        "shipped trunk needs {total_gib:.1} GiB — too close to a 128 GB budget"
+    );
+    // And the same weights dequantised must NOT fit, or this test proves nothing:
+    // it would pass even if the experts silently reverted to f32.
+    let f32_experts = (f32_bytes(2 * mi, h) + f32_bytes(h, mi)) * e as u64 * c.layers as u64;
+    let f32_total_gib = (f32_experts + others) as f64 / (1u64 << 30) as f64;
+    assert!(
+        f32_total_gib > 128.0,
+        "control failed: at f32 the trunk is {f32_total_gib:.1} GiB, which would fit — \
+         this test would then not be detecting a silent dequantisation"
+    );
+    println!("  (same weights at f32:     {f32_total_gib:.1} GiB — would not fit)");
+}

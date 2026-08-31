@@ -57,10 +57,10 @@ use hipfire_quantize::hfq_out::parameter_counts_metadata;
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
 use hipfire_arch_api::{
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
-    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
-    ARCH_ID_QWEN4EXP, ARCH_ID_ZAYA,
+    TensorRole, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA,
+    ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL,
+    ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE,
+    ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_QWEN4EXP, ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
@@ -3482,6 +3482,22 @@ fn precision_class_via_ingest(
     )
 }
 
+/// The arch's own role for `name`. Roles are declared per FAMILY in each `-spec`
+/// crate, so this is a (family, tensor) answer rather than a name heuristic: the
+/// same spelling can mean different things in different families, and a spec is
+/// free to override the `transformer_role` default when it does.
+fn role_via_ingest(arch_id: u32, name: &str) -> Option<hipfire_arch_api::TensorRole> {
+    use hipfire_arch_api::ArchId;
+    Some(
+        ARCH_REGISTRY
+            .get_or_init(hipfire_arch_api::ArchRegistry::build)
+            .get(ArchId(arch_id as u16))?
+            .caps
+            .ingest?
+            .role(name),
+    )
+}
+
 /// Structural (not arch-specific) test for a short-conv recurrence filter:
 /// `{prefix}.conv1d.weight`, shape [conv_channels, 1, K]. Small (~32K elem) and
 /// runs every token — Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3)
@@ -4106,8 +4122,9 @@ fn stacked_expert_oq_format(
     use_oq4: bool,
     use_oq8: bool,
     use_oq8_plus: bool,
-    // 256 or 128; ignored unless `use_opus_mixed`. Threaded through because the
-    // flag's group would otherwise be lost here and silently fall back to 256.
+    // 256 or 128. For the mixed format this is the flag's own group. For plain
+    // `oq4` it is what the tensor's K ADMITS, which is how a K that is a multiple
+    // of 128 but not 256 keeps an Opus home instead of silently leaving the family.
     opus_group: usize,
 ) -> Option<HfqInputFormat> {
     if use_opus_mixed {
@@ -4117,7 +4134,14 @@ fn stacked_expert_oq_format(
             HfqInputFormat::OqPlusCompact
         })
     } else if use_oq4 {
-        Some(HfqInputFormat::Oq4)
+        // `Oq4` is G256-only (its rotate is a 256-point FWHT). At G128 the
+        // representable Opus home is the compact form, which is also the one that
+        // carries calibration — the whole point of not falling through here.
+        Some(if opus_group == 128 {
+            HfqInputFormat::OqPlusCompactG128
+        } else {
+            HfqInputFormat::Oq4
+        })
     } else if use_oq8_plus {
         Some(HfqInputFormat::Oq8Plus)
     } else if use_oq8 {
@@ -10941,19 +10965,51 @@ pub fn main() {
                 || tiered_layer_is_mq3
                 || antirez_mq3)
                 && supports_g256;
+            // The Opus group this expert's K actually admits. The rotate is an
+            // FWHT, so only powers of two: 256 when K divides by it, else 128, else
+            // no Opus home at all. `moe_intermediate_size` 640 (Qwen3.8-Flash-Next)
+            // and 128 (the qwen3_5_moe / gemma4_moe fixtures) are all 128-but-not-256,
+            // and used to fall out of Opus entirely — down_proj landing on
+            // UNCALIBRATED HFQ4G128 while its own gate_up stayed Oq4G256, exit 0 and
+            // no warning. See BUGS.md.
+            let opus_expert_group: Option<usize> = if inner_k % 256 == 0 {
+                Some(256)
+            } else if inner_k % 128 == 0 {
+                Some(128)
+            } else {
+                None
+            };
             let stacked_oq_format = stacked_expert_oq_format(
                 use_opus_mixed,
                 use_oq4,
                 use_oq8,
                 use_oq8_plus,
-                opus_mixed_spec.map(|s| s.group).unwrap_or(256),
+                opus_mixed_spec
+                    .map(|s| s.group)
+                    .or(opus_expert_group)
+                    .unwrap_or(256),
             );
+            // oq8/oq8+ have no G128 input format yet, so they still need 256. Say so
+            // rather than dropping them silently, which is the defect being fixed.
+            let oq_needs_g256 = use_oq8 || use_oq8_plus;
+            let opus_admits = match opus_expert_group {
+                Some(256) => true,
+                Some(_) => !oq_needs_g256,
+                None => false,
+            };
+            if stacked_oq_format.is_some() && !opus_admits {
+                quant_log!(
+                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group for this format \
+                     (oq8/oq8+ need K % 256 == 0); falling back OUT of Opus, which also \
+                     drops calibration for this tensor"
+                );
+            }
             // Undercovered experts go to W8 rather than source precision, but
             // only where an OQ expert target is actually in play — under a
             // BF16/F16/MQ target there is no pageability to protect and the old
             // fallback is still the right answer. See the branch below.
             let undercovered_experts_w8 = stacked_oq_format.is_some()
-                && supports_g256
+                && opus_admits
                 && !hipfire_env::UNDERCOVERED_EXPERTS_SOURCE.flag();
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
@@ -11078,7 +11134,7 @@ pub fn main() {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if use_fp16 || use_bf16 {
                         (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
-                    } else if let Some(oq_format) = stacked_oq_format.filter(|_| supports_g256) {
+                    } else if let Some(oq_format) = stacked_oq_format.filter(|_| opus_admits) {
                         // Opus-quant experts feed the indexed-MoE kernels; the loader
                         // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
                         // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
@@ -11246,7 +11302,7 @@ pub fn main() {
                 "BF16"
             } else if use_fp16 || use_bf16 {
                 "F16"
-            } else if stacked_oq_format.is_some() && supports_g256 {
+            } else if stacked_oq_format.is_some() && opus_admits {
                 if use_opus_mixed || use_oq8 || use_oq8_plus || OQPLUS_W8_FRAC.get().is_some() {
                     "OQ+C-EXP"
                 } else {
@@ -11863,14 +11919,99 @@ pub fn main() {
                             },
                         ) == Some(true)
                     {
-                        // Q8 router for MoE: keep the protected set — routers
+                        // Keep the protected set — routers
                         // (mlp.gate/shared_expert_gate/mixer.gate), attention, and the
-                        // gather tables — at Q8 regardless of --format. The arch's
+                        // gather tables — at 8 BITS regardless of --format. The arch's
                         // Ingest importance is the single source for "protected"; this
                         // reproduces the old is_q8_tensor set (conv1d/norm never reach
                         // this 2D-weight selection — should_quantize keeps them f16).
-                        let q = quantize_q8f16(&f32_data);
-                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        //
+                        // Under an OQ format the 8-bit tier is Oq8G256, NOT Q8F16. Q8 is
+                        // deprecated for weights, and emitting it here silently mixed a
+                        // legacy format into an Opus artifact: on the zaya tiny fixture
+                        // it put the ENTIRE attention stack (q/k/v/o_proj) at Q8 under
+                        // `--format oq4`, so that artifact's oq4 and oq8 KLDs sat within
+                        // 6x of each other (2.3e-5 vs 3.9e-6) where llama's differ by
+                        // 135x — the oq4 cell was not measuring 4-bit attention at all.
+                        //
+                        // ⚠️ GATHER TABLES STAY Q8F16. An embedding / lm_head is
+                        // ROW-GATHERED at runtime; Oq8G256 groups along K with an FWHT
+                        // rotation, which a row gather cannot undo. Promoting it
+                        // produced a NON-FINITE KLD on the deepseek4 tiny fixture —
+                        // `embed.weight [4096, 256]` was the only tensor that switched,
+                        // and it broke oq4/oq4+/oq4++ outright. That is what the
+                        // original "gather tables" note in this comment was protecting.
+                        //
+                        // Ragged K also keeps Q8F16: Oq8G256 groups along K in 256s and
+                        // the GPU serving loaders assert K % 256 == 0, so a padded group
+                        // would only load on the NPU-native path.
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        // ⚠️ ROW-GATHERED TABLES STAY Q8F16, and the test is the
+                        // arch's OWN role for this tensor — not a name match. Name
+                        // matching gets this wrong in both directions: the shared
+                        // `is_embedding_table_name` misses deepseek4's `embed.weight`
+                        // (it knows only embed_tokens / embeddings.weight /
+                        // embedding.weight), which is how that table reached this
+                        // branch at all, while a widened `ends_with("embed.weight")`
+                        // would also swallow qwen35/qwen4exp's `pos_embed.weight`.
+                        // Each `-spec` declares its own roles, so asking the family
+                        // is both correct today and correct for the next family.
+                        //
+                        // The reason is a runtime gap, not the math: `Oq8G256` groups
+                        // along K, and for these tables K IS the row, so a gather does
+                        // take whole groups. But `dispatch/embedding.rs` has per-dtype
+                        // gather entry points (f32 / q8 / q4k / hfq4g256 / bf16) and no
+                        // Oq8G256 one, so the lookup misreads the tensor. Promoting
+                        // `embed.weight [4096, 256]` produced a NON-FINITE KLD on the
+                        // deepseek4 tiny fixture. Add the gather kernel and this guard
+                        // can go.
+                        let gathered = matches!(
+                            role_via_ingest(arch_id, name),
+                            Some(TensorRole::Embed) | Some(TensorRole::LmHead)
+                        );
+                        // PROTECTED MEANS STRICTLY BETTER THAN THE BULK. Under oq4/oq3/oq2
+                        // `Oq8G256` clears the bulk and is the right home. Under oq8 the bulk
+                        // IS `Oq8G256`, so promoting there would set protected == bulk and the
+                        // protected set would stop existing — hence `Oq8G128`, the same W8 at
+                        // twice the grouping. That costs ~1.02 B/weight against the 1.06 of the
+                        // deprecated `Q8F16` it replaces, where source precision would be 2.0.
+                        //
+                        // ⚠️ `Oq8G128` (qt 54) is the RIGHT home here and is now wired
+                        // end to end — codec, loader, dispatch, and a G128 arm in both
+                        // `gemv_oq8_grouped` and `weight_gemv`. It measures 21.6% better
+                        // than the `Q8F16` this replaced and 8.5% better than `Oq8G256`,
+                        // at FEWER bits (8.125 vs 8.5) — see the reconstruction test in
+                        // `codecs.rs`. It is NOT the default yet for one reason: archs
+                        // that fuse rmsnorm+rotate (qwen35's lowered executor) rotate the
+                        // attention input ONCE, at FWHT-256, and every projection reading
+                        // that activation shares it. Giving one of them the 128 basis
+                        // needs a G128 fused rmsnorm+rotate and a split of that shared
+                        // activation; without it qwen35 serves garbage (KLD 0.83).
+                        // Archs whose weights rotate per-tensor (gemma4, nemotron, zaya)
+                        // already work. See docs/todo/2026-08-30-oq8g128-protected-set.md.
+                        let bulk_is_8bit = use_oq8 || use_oq8_plus;
+                        if bulk_is_8bit && !gathered {
+                            (
+                                f32_slice_to_bf16_bytes(&f32_data),
+                                QuantType::BF16,
+                                0u32,
+                                "BF16",
+                            )
+                        } else if use_oq_family && k_dim % 256 == 0 && !gathered {
+                            // Same fixed FWHT seeds every Opus site uses (42 / 1042);
+                            // the rotation must match what the runtime decodes with.
+                            let s1 = gen_fwht_signs(42, 256);
+                            let s2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_oq8g256(&f32_data, &s1, &s2);
+                            (q, QuantType::Oq8G256, 256u32, "OQ8G256")
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
                     } else if use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")

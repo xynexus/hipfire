@@ -21,11 +21,12 @@ use crate::attn_gpu::{qsa_decode_step, QsaCache, QsaScratch, QsaWeights};
 use crate::config::{LayerType, Qwen4ExpConfig};
 use crate::gdn::{gdn_decode_step, GdnScratch, GdnState, GdnWeights};
 use crate::hc_gpu::{hc_read, hc_write, HcScratch, HcWeights};
-use crate::moe_gpu::{moe_forward, MoeScratch, MoeWeights};
+use crate::moe_gpu::{moe_forward, ExpertPager, MoeScratch, MoeWeights};
 use crate::ngram::NgramHasher;
 use crate::ple_gpu::{ple_step, PleScratch, PleWeights};
 
-use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipError, HipResult};
+use hipfire_runtime::weights::WeightTensor;
 
 pub enum TokenMixer {
     Gdn(GdnWeights),
@@ -43,7 +44,7 @@ pub struct LayerWeights {
 pub struct TrunkWeights {
     pub layers: Vec<LayerWeights>,
     pub mixer: HcWeights,
-    pub lm_head: GpuTensor,
+    pub lm_head: WeightTensor,
 }
 
 /// Per-sequence state: one recurrent state per Gated DeltaNet layer, one KV cache
@@ -74,6 +75,105 @@ pub struct TrunkScratch {
 /// resident in host memory at once. Each tensor is read, uploaded, and dropped.
 pub trait TensorReader {
     fn read(&self, name: &str) -> Result<Vec<f32>, String>;
+
+    /// The tensor's ON-DISK encoding and bytes, when the source has them.
+    ///
+    /// [`read`](Self::read) dequantises, which is correct for everything small and
+    /// ruinous for the routed experts: they are 97.3% of this model's trunk, so
+    /// dequantising them to f32 is the difference between ~32 GB and ~258 GB
+    /// resident. This lets the expert loader keep them in their on-disk form.
+    ///
+    /// Defaults to `None`, so a synthetic reader (the parity examples upload f32
+    /// arrays) keeps the dequantised path with no changes.
+    fn read_raw(&self, _name: &str) -> Option<(u8, Vec<u8>)> {
+        None
+    }
+}
+
+/// A reader error is a LOAD FAILURE, not a crash.
+///
+/// These helpers used to `panic!` on an unreadable tensor. That is fine in an
+/// example and wrong everywhere else: the daemon loads artifacts in-process, so an
+/// unsupported quant format in one model would take down a server holding others.
+/// The message is already specific — it names the tensor and the format — so it
+/// only needed to be returned rather than thrown.
+fn read_err(name: &str, e: String) -> HipError {
+    HipError::new(0, &format!("qwen4_exp load `{name}`: {e}"))
+}
+
+/// Load a LINEAR weight, keeping its on-disk encoding when we can decode it.
+///
+/// The routed experts are 97.3% of this model, so these are the other 2.7% — the
+/// memory does not turn on them. What does turn on them is consistency: a weight
+/// held as `WeightTensor` dispatches on its own dtype, so an artifact that
+/// quantised a projection is served that way instead of being quietly widened.
+///
+/// Falls back to f32 for anything the arch loaders decline, which includes the
+/// synthetic readers the parity examples use (they implement `read` only).
+fn load_linear(
+    gpu: &mut Gpu,
+    w: &dyn TensorReader,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    if let Some((qt, bytes)) = w.read_raw(name) {
+        let converted = hipfire_runtime::oq8_arch::oq8_arch_load_allow_compact(qt, &bytes, m, k)
+            .or_else(|| {
+                // Same ragged-K pre-check as the expert path: `oq4_pack_arch_combined`
+                // asserts, and an assert in a loader aborts the daemon.
+                if hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason(m, k).is_some() {
+                    None
+                } else {
+                    hipfire_runtime::oq4_arch::oq4_arch_load(qt, &bytes, m, k)
+                        .map(|(b, d)| (b.into_owned(), d))
+                }
+            });
+        if let Some((bytes, dtype)) = converted {
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+    }
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
+    let mut buf = gpu.upload_f32(&v, &[m, k])?;
+    buf.shape = vec![m, k];
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
+/// Wrap an f32 host array as a `WeightTensor`.
+///
+/// For tests and parity examples, which build synthetic weights rather than
+/// reading an artifact. `m`/`k` come from the shape so a caller cannot set a
+/// weight's logical dims to something its buffer does not have.
+pub fn f32_weight(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> HipResult<WeightTensor> {
+    assert_eq!(shape.len(), 2, "a linear weight is 2-D, got {shape:?}");
+    let mut buf = gpu.upload_f32(data, shape)?;
+    buf.shape = shape.to_vec();
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m: shape[0],
+        k: shape[1],
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
 }
 
 fn up2(
@@ -83,7 +183,7 @@ fn up2(
     rows: usize,
     cols: usize,
 ) -> HipResult<GpuTensor> {
-    let v = w.read(name).unwrap_or_else(|e| panic!("{e}"));
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
     gpu.upload_f32(&v, &[rows, cols])
 }
 
@@ -104,30 +204,164 @@ fn stack_experts(
     which: &str,
     n_exp: usize,
     shape: &[usize],
-) -> HipResult<GpuTensor> {
+    pager: Option<&ExpertPager>,
+    layer: usize,
+    role: hipfire_runtime::weight_pager::ExpertRole,
+) -> HipResult<crate::moe_gpu::ExpertStack> {
+    // `shape` is [n_exp, rows, cols]; one expert's region is rows*cols f32, which
+    // is self-contained, so a per-expert view is a single offset.
+    let rows = shape[1];
+    let cols = shape[2];
+
+    // PAGED. Checked before anything is read: the point of paging is that these
+    // do not all fit, so the resident path below must not run first.
+    //
+    // Expert 0 stands for the layer. The module table is written per expert with
+    // a uniform shape, and `register_expert_module` rejects a module whose
+    // gate_up span is discontiguous, so if expert 0 registered then the layer's
+    // experts are pageable — and if it did not, falling through loads the layer
+    // resident, which is correct, just larger.
+    if let Some(pg) = pager {
+        use hipfire_runtime::weight_pager::ExpertModuleKey;
+        let key = ExpertModuleKey {
+            layer: layer as u16,
+            expert: 0,
+        };
+        let desc = pg
+            .lock()
+            .ok()
+            .filter(|p| p.has_expert_module(key))
+            .and_then(|p| p.expert_module_role_desc(key, role));
+        if let Some(d) = desc {
+            if d.m != rows || d.k != cols {
+                return Err(read_err(
+                    &format!("{mp}.experts.*.{which}"),
+                    format!(
+                        "module table says [{}, {}] but the config says [{rows}, {cols}]",
+                        d.m, d.k
+                    ),
+                ));
+            }
+            return Ok(crate::moe_gpu::ExpertStack::Paged(Box::new(
+                crate::moe_gpu::PagedExperts {
+                    pager: std::sync::Arc::clone(pg),
+                    layer: layer as u16,
+                    role,
+                    dtype: d.dtype,
+                    rows,
+                    cols,
+                },
+            )));
+        }
+    }
+
+    // NATIVE QUANTISED EXPERTS. Try the on-disk bytes first: the routed experts are
+    // 97.3% of this model's trunk, so dequantising them is the difference between
+    // ~32 GB and ~258 GB resident. Each expert is converted to the COMBINED device
+    // form (`[int8 weights | f32 scales]` for the Opus family) and the regions are
+    // concatenated, which keeps one allocation per projection while leaving every
+    // per-expert region self-contained — `weight_gemv` reads a tensor's scales
+    // immediately after its own weights, so the regions cannot share planes.
+    //
+    // All-or-nothing on purpose: a mixed stack (some experts quantised, some not)
+    // has no single dtype and would need per-expert dispatch, so anything
+    // unconvertible falls the whole projection back to the f32 path below rather
+    // than producing a stack whose dtype lies about half its contents.
+    if let Some(first) = w.read_raw(&format!("{mp}.experts.0.{which}.weight")) {
+        // Shared with the WEIGHT PAGER, which prepares paged experts with the
+        // same call. The two used to be separate bodies and diverged twice —
+        // once dropping the compact overlay normalisation, once missing oq8
+        // entirely — each time serving a paged expert bytes the GEMV could not
+        // read. Keeping ONE body is what makes paged and resident identical by
+        // construction rather than by review.
+        //
+        // It keeps compact blocks COMPACT rather than expanding them to one int8
+        // per weight: expanding this model's 512-expert `down_proj` (4.25 b/w ->
+        // 8 b/w) added ~20 GB and OOM'd a 128 GB box during load.
+        let convert = |qt: u8, bytes: &[u8]| -> Option<(Vec<u8>, DType)> {
+            hipfire_runtime::weight_pager::per_expert_native_form(qt, bytes, rows, cols)
+        };
+        if convert(first.0, &first.1).is_none() {
+            // Do NOT degrade silently. Falling back to f32 costs 8x the resident
+            // bytes, which on this model is the difference between fitting and
+            // not — and it is invisible in the output.
+            eprintln!(
+                "[qwen4_exp] ⚠️  {mp}.experts.*.{which}: quant type {} could not be \
+                 converted to a device form; falling back to f32 for the WHOLE \
+                 projection (8x the resident bytes)",
+                first.0
+            );
+        }
+        if let Some((first_bytes, dtype)) = convert(first.0, &first.1) {
+            let stride = first_bytes.len();
+            let mut all = Vec::with_capacity(n_exp * stride);
+            all.extend_from_slice(&first_bytes);
+            let mut ok = true;
+            for e in 1..n_exp {
+                let name = format!("{mp}.experts.{e}.{which}.weight");
+                match w.read_raw(&name).and_then(|(qt, b)| convert(qt, &b)) {
+                    // A differing stride would silently misalign every later expert.
+                    Some((b, d)) if d == dtype && b.len() == stride => all.extend_from_slice(&b),
+                    other => {
+                        eprintln!(
+                            "[qwen4_exp] ⚠️  {name}: expert {e} did not match expert 0 \
+                             (dtype/stride mismatch: {:?} vs {dtype:?}/{stride}); falling \
+                             back to f32 for the whole projection",
+                            other.map(|(_, d)| d)
+                        );
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let buf = gpu.upload_raw(&all, &[all.len()])?;
+                return Ok(crate::moe_gpu::ExpertStack::Resident {
+                    buf,
+                    dtype,
+                    rows,
+                    cols,
+                    stride,
+                });
+            }
+        }
+    }
+    let wrap = |buf: GpuTensor| crate::moe_gpu::ExpertStack::Resident {
+        buf,
+        dtype: DType::F32,
+        rows,
+        cols,
+        stride: rows * cols,
+    };
     if let Ok(v) = w.read(&format!("{mp}.experts.{which}")) {
-        return gpu.upload_f32(&v, shape);
+        return Ok(wrap(gpu.upload_f32(&v, shape)?));
     }
     let per: usize = shape[1..].iter().product();
     let mut all = Vec::with_capacity(n_exp * per);
     for e in 0..n_exp {
         let name = format!("{mp}.experts.{e}.{which}.weight");
-        let v = w
-            .read(&name)
-            .unwrap_or_else(|err| panic!("{err} (also tried the stacked `{mp}.experts.{which}`)"));
-        assert_eq!(
-            v.len(),
-            per,
-            "expert {e} `{which}` has {} elements, expected {per}",
-            v.len()
-        );
+        let v = w.read(&name).map_err(|err| {
+            read_err(
+                &name,
+                format!("{err} (also tried the stacked `{mp}.experts.{which}`)"),
+            )
+        })?;
+        if v.len() != per {
+            return Err(read_err(
+                &name,
+                format!(
+                    "expert {e} `{which}` has {} elements, expected {per}",
+                    v.len()
+                ),
+            ));
+        }
         all.extend_from_slice(&v);
     }
-    gpu.upload_f32(&all, shape)
+    Ok(wrap(gpu.upload_f32(&all, shape)?))
 }
 
 fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> {
-    let v = w.read(name).unwrap_or_else(|e| panic!("{e}"));
+    let v = w.read(name).map_err(|e| read_err(name, e))?;
     let n = v.len();
     gpu.upload_f32(&v, &[n])
 }
@@ -135,6 +369,22 @@ fn up1(gpu: &mut Gpu, w: &dyn TensorReader, name: &str) -> HipResult<GpuTensor> 
 impl TrunkWeights {
     /// Upload from checkpoint-named weights.
     pub fn upload(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, w: &dyn TensorReader) -> HipResult<Self> {
+        Self::upload_paged(gpu, cfg, w, None)
+    }
+
+    /// As [`Self::upload`], but routed experts come from `pager` when it has a
+    /// module registered for that layer.
+    ///
+    /// Per LAYER, not per model: a layer whose experts are not in the module
+    /// table loads resident, so a partially-repacked artifact still serves. The
+    /// two paths produce identical weights — the pager's `PerExpertNative`
+    /// layout runs the same transforms `stack_experts` does below.
+    pub fn upload_paged(
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        w: &dyn TensorReader,
+        pager: Option<&ExpertPager>,
+    ) -> HipResult<Self> {
         let p = "model.language_model";
         let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
         let width = hc * hidden;
@@ -146,14 +396,14 @@ impl TrunkWeights {
         let hcw = |gpu: &mut Gpu, base: &str, inject: bool| -> HipResult<HcWeights> {
             Ok(HcWeights {
                 hc_norm: up1(gpu, w, &format!("{base}.hc_norm.weight"))?,
-                mix_down: up2(
+                mix_down: load_linear(
                     gpu,
                     w,
                     &format!("{base}.input_mix_weight_down.weight"),
                     lr,
                     width,
                 )?,
-                mix_up: up2(
+                mix_up: load_linear(
                     gpu,
                     w,
                     &format!("{base}.input_mix_weight_up.weight"),
@@ -161,7 +411,7 @@ impl TrunkWeights {
                     lr,
                 )?,
                 block_inject: if inject {
-                    Some(up2(
+                    Some(load_linear(
                         gpu,
                         w,
                         &format!("{base}.block_inject_weight.weight"),
@@ -180,22 +430,28 @@ impl TrunkWeights {
             let mixer = if cfg.layer_types[l] == LayerType::LinearAttention {
                 let la = format!("{lp}.linear_attn");
                 TokenMixer::Gdn(GdnWeights {
-                    in_proj_qkv: up2(
+                    in_proj_qkv: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_qkv.weight"),
                         d.qkv_dim(),
                         hidden,
                     )?,
-                    in_proj_z: up2(gpu, w, &format!("{la}.in_proj_z.weight"), d.z_dim(), hidden)?,
-                    in_proj_a: up2(
+                    in_proj_z: load_linear(
+                        gpu,
+                        w,
+                        &format!("{la}.in_proj_z.weight"),
+                        d.z_dim(),
+                        hidden,
+                    )?,
+                    in_proj_a: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_a.weight"),
                         d.value_heads,
                         hidden,
                     )?,
-                    in_proj_b: up2(
+                    in_proj_b: load_linear(
                         gpu,
                         w,
                         &format!("{la}.in_proj_b.weight"),
@@ -212,19 +468,31 @@ impl TrunkWeights {
                     a_log: up1(gpu, w, &format!("{la}.A_log"))?,
                     dt_bias: up1(gpu, w, &format!("{la}.dt_bias"))?,
                     norm_weight: up1(gpu, w, &format!("{la}.norm.weight"))?,
-                    out_proj: up2(gpu, w, &format!("{la}.out_proj.weight"), hidden, d.z_dim())?,
+                    out_proj: load_linear(
+                        gpu,
+                        w,
+                        &format!("{la}.out_proj.weight"),
+                        hidden,
+                        d.z_dim(),
+                    )?,
                 })
             } else {
                 let sa = format!("{lp}.self_attn");
                 let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
                 TokenMixer::Qsa(QsaWeights {
-                    q_proj: up2(gpu, w, &format!("{sa}.q_proj.weight"), nh * hd * 2, hidden)?,
-                    k_proj: up2(gpu, w, &format!("{sa}.k_proj.weight"), nkv * hd, hidden)?,
-                    v_proj: up2(gpu, w, &format!("{sa}.v_proj.weight"), nkv * hd, hidden)?,
-                    o_proj: up2(gpu, w, &format!("{sa}.o_proj.weight"), hidden, nh * hd)?,
+                    q_proj: load_linear(
+                        gpu,
+                        w,
+                        &format!("{sa}.q_proj.weight"),
+                        nh * hd * 2,
+                        hidden,
+                    )?,
+                    k_proj: load_linear(gpu, w, &format!("{sa}.k_proj.weight"), nkv * hd, hidden)?,
+                    v_proj: load_linear(gpu, w, &format!("{sa}.v_proj.weight"), nkv * hd, hidden)?,
+                    o_proj: load_linear(gpu, w, &format!("{sa}.o_proj.weight"), hidden, nh * hd)?,
                     q_norm: up1(gpu, w, &format!("{sa}.q_norm.weight"))?,
                     k_norm: up1(gpu, w, &format!("{sa}.k_norm.weight"))?,
-                    ix_qk_proj: up2(
+                    ix_qk_proj: load_linear(
                         gpu,
                         w,
                         &format!("{sa}.indexer.index_qk_proj.weight"),
@@ -237,7 +505,7 @@ impl TrunkWeights {
             };
             let mp = format!("{lp}.mlp");
             let moe = MoeWeights {
-                router: up2(gpu, w, &format!("{mp}.gate.weight"), m.num_experts, hidden)?,
+                router: load_linear(gpu, w, &format!("{mp}.gate.weight"), m.num_experts, hidden)?,
                 gate_up: stack_experts(
                     gpu,
                     w,
@@ -245,6 +513,9 @@ impl TrunkWeights {
                     "gate_up_proj",
                     m.num_experts,
                     &[m.num_experts, 2 * m.intermediate, hidden],
+                    pager,
+                    l,
+                    hipfire_runtime::weight_pager::ExpertRole::GateUp,
                 )?,
                 down: stack_experts(
                     gpu,
@@ -253,29 +524,32 @@ impl TrunkWeights {
                     "down_proj",
                     m.num_experts,
                     &[m.num_experts, hidden, m.intermediate],
+                    pager,
+                    l,
+                    hipfire_runtime::weight_pager::ExpertRole::Down,
                 )?,
-                shared_gate: up2(
+                shared_gate: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.gate_proj.weight"),
                     m.shared_intermediate,
                     hidden,
                 )?,
-                shared_up: up2(
+                shared_up: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.up_proj.weight"),
                     m.shared_intermediate,
                     hidden,
                 )?,
-                shared_down: up2(
+                shared_down: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert.down_proj.weight"),
                     hidden,
                     m.shared_intermediate,
                 )?,
-                shared_expert_gate: up2(
+                shared_expert_gate: load_linear(
                     gpu,
                     w,
                     &format!("{mp}.shared_expert_gate.weight"),
@@ -287,14 +561,14 @@ impl TrunkWeights {
                 Some(n) => {
                     let pl = format!("{lp}.ple");
                     Some(PleWeights {
-                        key_proj: up2(
+                        key_proj: load_linear(
                             gpu,
                             w,
                             &format!("{pl}.key_proj.weight"),
                             width,
                             n.embed_dim,
                         )?,
-                        value_proj: up2(
+                        value_proj: load_linear(
                             gpu,
                             w,
                             &format!("{pl}.value_proj.weight"),
@@ -327,7 +601,7 @@ impl TrunkWeights {
         Ok(Self {
             layers,
             mixer: hcw(gpu, &format!("{p}.hyper_connection_mixer"), false)?,
-            lm_head: up2(gpu, w, "lm_head.weight", cfg.vocab, hidden)?,
+            lm_head: load_linear(gpu, w, "lm_head.weight", cfg.vocab, hidden)?,
         })
     }
 }
@@ -359,6 +633,13 @@ impl TrunkState {
 }
 
 impl TrunkScratch {
+    /// The last-position logits buffer, `[vocab]` f32, left populated by
+    /// [`decode_step_into`]. Exposed so the serving seam can sample on the GPU
+    /// instead of paying a `vocab`-wide download every token.
+    pub fn logits(&self) -> &GpuTensor {
+        &self.logits
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
         let width = cfg.gated_residual.count * cfg.hidden;
         Ok(Self {
@@ -381,18 +662,24 @@ impl TrunkScratch {
 /// `history` is the token stream INCLUDING this token; the n-gram window needs it
 /// and it is EOS-segment aware, so a bare "previous two tokens" is not enough.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_step(
+/// One decode step, leaving the last-position logits in `s.logits` ON THE GPU.
+///
+/// This is the serving entry point. [`decode_step`] wraps it and downloads, which
+/// is what the parity examples and tests want but costs a `vocab`-wide transfer
+/// per token — 993 KB at the shipped 248320 vocab, every step, for a sampler that
+/// may only need an argmax.
+pub fn decode_step_into(
     gpu: &mut Gpu,
     cfg: &Qwen4ExpConfig,
     w: &TrunkWeights,
     st: &mut TrunkState,
     s: &mut TrunkScratch,
     embed_table: &[f32],
-    ngram_table: Option<&[f32]>,
+    ngram_rows: Option<&dyn crate::ngram_rows::NgramRows>,
     history: &[u32],
     pos: usize,
     eos: u32,
-) -> HipResult<Vec<f32>> {
+) -> HipResult<()> {
     let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
     let tok = history[history.len() - 1] as usize;
 
@@ -408,11 +695,11 @@ pub fn decode_step(
         let lw = &w.layers[l];
 
         // PLE is additive on the WIDE stream, before the residual read.
-        if let (Some(pw), Some(ps), Some(n), Some(table)) = (
+        if let (Some(pw), Some(ps), Some(n), Some(src)) = (
             lw.ple.as_ref(),
             st.ple[l].as_mut(),
             cfg.ngram.as_ref(),
-            ngram_table,
+            ngram_rows,
         ) {
             let hasher = NgramHasher::from_config(n, cfg.vocab as u64, eos);
             let hd = n.head_dim();
@@ -422,10 +709,9 @@ pub fn decode_step(
             let i = hist.len() - 1;
             let preds: Vec<Option<u32>> = hist[..i].iter().map(|&v| Some(v)).collect();
             let rows = hasher.rows(hist[i], &preds);
-            let emb: Vec<f32> = rows
-                .iter()
-                .flat_map(|&r| table[r as usize * hd..(r as usize + 1) * hd].to_vec())
-                .collect();
+            // `heads_per_ngram` rows, whether they come from a resident slice or a
+            // ranged read of the shard tensors — the trunk does not know which.
+            let emb = src.gather(&rows, hd).map_err(|e| HipError::new(0, &e))?;
             let g_emb = gpu.upload_f32(&emb, &[n.embed_dim])?;
             ple_step(gpu, cfg, pw, ps, &s.wide, &g_emb, &s.ple_out)?;
             gpu.add_inplace_f32(&s.wide, &s.ple_out)?;
@@ -462,6 +748,164 @@ pub fn decode_step(
 
     // The mixer's own norm is the LAST normalisation — there is no `model.norm`.
     hc_read(gpu, cfg, &w.mixer, &mut s.hc, &s.wide, &s.collapsed)?;
-    gpu.gemv_f32(&w.lm_head, &s.collapsed, &s.logits)?;
+    hipfire_runtime::weights::weight_gemv(gpu, &w.lm_head, &s.collapsed, &s.logits)
+}
+
+/// [`decode_step_into`] followed by a download of the logits.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_step(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &TrunkWeights,
+    st: &mut TrunkState,
+    s: &mut TrunkScratch,
+    embed_table: &[f32],
+    ngram_rows: Option<&dyn crate::ngram_rows::NgramRows>,
+    history: &[u32],
+    pos: usize,
+    eos: u32,
+) -> HipResult<Vec<f32>> {
+    decode_step_into(
+        gpu,
+        cfg,
+        w,
+        st,
+        s,
+        embed_table,
+        ngram_rows,
+        history,
+        pos,
+        eos,
+    )?;
     gpu.download_f32(&s.logits)
+}
+
+// ── GPU teardown and per-sequence reset ─────────────────────────────────────
+//
+// Exhaustive destructures throughout, so a field added later fails to compile
+// until someone decides whether it needs freeing (see the note in `hc_gpu.rs`).
+// An `unload` that silently leaks has no test that would catch it, and this model
+// is 360 GB.
+
+impl TokenMixer {
+    pub fn free(self, gpu: &mut Gpu) {
+        match self {
+            TokenMixer::Gdn(w) => w.free(gpu),
+            TokenMixer::Qsa(w) => w.free(gpu),
+        }
+    }
+}
+
+impl LayerWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            attn_hc,
+            mlp_hc,
+            mixer,
+            moe,
+            ple,
+        } = self;
+        attn_hc.free(gpu);
+        mlp_hc.free(gpu);
+        mixer.free(gpu);
+        moe.free(gpu);
+        if let Some(p) = ple {
+            p.free(gpu);
+        }
+    }
+}
+
+impl TrunkWeights {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            layers,
+            mixer,
+            lm_head,
+        } = self;
+        for l in layers {
+            l.free(gpu);
+        }
+        mixer.free(gpu);
+        let _ = gpu.free_tensor(lm_head.buf);
+    }
+}
+
+impl TrunkState {
+    /// Drop everything carried between sequences.
+    ///
+    /// All three halves matter and they fail differently: a stale GDN recurrent
+    /// state or PLE conv ring silently conditions the next prompt on the last
+    /// one, while a stale KV `len` makes attention read positions the new
+    /// sequence never wrote.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for g in self.gdn.iter().flatten() {
+            g.reset(gpu)?;
+        }
+        for q in self.qsa.iter_mut().flatten() {
+            q.reset();
+        }
+        for p in self.ple.iter().flatten() {
+            p.reset(gpu)?;
+        }
+        Ok(())
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self { gdn, qsa, ple } = self;
+        for g in gdn.into_iter().flatten() {
+            g.free(gpu);
+        }
+        for q in qsa.into_iter().flatten() {
+            q.free(gpu);
+        }
+        for p in ple.into_iter().flatten() {
+            p.free(gpu);
+        }
+    }
+}
+
+impl TrunkScratch {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            hc,
+            gdn,
+            qsa,
+            moe,
+            mixed,
+            block_out,
+            wide,
+            ple_out,
+            collapsed,
+            logits,
+        } = self;
+        hc.free(gpu);
+        gdn.free(gpu);
+        qsa.free(gpu);
+        moe.free(gpu);
+        for t in [mixed, block_out, wide, ple_out, collapsed, logits] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod expert_load_tests {
+    /// The native-quantised expert path must PRE-CHECK before `oq4_arch_load`.
+    ///
+    /// `oq4_pack_arch_combined` asserts on a ragged K, and an assert in a loader
+    /// aborts the whole daemon rather than failing one model. The fixture here has
+    /// `moe_intermediate_size = 256`, so it never exercises this — but the SHIPPED
+    /// model is 640, meaning every routed `down_proj` in the real checkpoint takes
+    /// the ragged branch. This pins the arithmetic that makes the guard necessary.
+    #[test]
+    fn shipped_down_proj_k_is_ragged_and_must_be_pre_checked() {
+        use hipfire_runtime::oq4_arch::oq4_arch_unsupported_reason;
+        // Routed down_proj on the shipped geometry: [hidden 2560, mi 640].
+        assert!(
+            oq4_arch_unsupported_reason(2560, 640).is_some(),
+            "K=640 is not 256-aligned; without the pre-check this asserts"
+        );
+        // gate_up on the same layer is [2*mi, hidden] — K = hidden, which is fine.
+        assert!(oq4_arch_unsupported_reason(1280, 2560).is_none());
+    }
 }

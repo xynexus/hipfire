@@ -68,6 +68,10 @@ pub enum DType {
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Oq4G256, // Opus Quant W4A4: symmetric signed-INT4, FWHT-rotated, per-group f32 scale.
     Oq8G256, // Opus Quant W8A8: symmetric signed-INT8, FWHT-rotated, per-group f32 scale (iu8 WMMA).
+    // Same device layout as Oq8G256 ([int8 m*k | f32 scales m*ng]) but ng = k/128
+    // and the activation takes the FWHT-128 basis. Distinct DType because the
+    // group is NOT recoverable from the buffer — only from the type.
+    Oq8G128,
     // Opus Quant W8A8, compact-resident: the on-disk OqPlusCompact (qt=36) blocks
     // kept as-is on device instead of expanded to one int8 per weight at load.
     //   [f16 scale | 128 packed signed-int4 | N_out * (u8 idx, i8 val)]
@@ -165,6 +169,7 @@ impl DType {
             | DType::DflashOq4MixedPlain
             | DType::W8A8Ref
             | DType::Oq8G256
+            | DType::Oq8G128
             // OqCompactG256 is block-structured with a variable-width overlay
             // table, so like Bf16L3 it has no per-element stride: a length is
             // `M * (K/256) * (130 + 2*N_out)`, never `n * size()`.
@@ -251,6 +256,7 @@ impl DType {
                 // int8); same AWQ contract — the forward divides x by the sidecar
                 // before FWHT+int8-quantize. (Real W8A8 Oq8 has no sidecar → no-op.)
                 | DType::Oq8G256
+                | DType::Oq8G128
                 // QTIP-3 trellis: the pack applies W*s before the FWHT exactly as
                 // the Opus arms do, so the forward must divide x by the sidecar to
                 // complete (W*s).(x/s) = W.x. Without this arm the quantizer would
