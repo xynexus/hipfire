@@ -122,3 +122,58 @@ dedicated session.
 **Process lesson for the rest of this run:** grep `docs/todo/` and `docs/plans/`
 for the subsystem BEFORE analysing it. Two hours of this tick re-derived a
 document that already existed.
+
+---
+
+## W2 — chain vs tree · THE HEADLINE WAS WRONG, and the cause is a general trap
+
+**Retraction first.** I reported chain DFlash at 10.26 tok/s, "loses to AR by
+0.67x", and a 3.2x chain-vs-tree gap I called "bug-shaped". All of that is
+withdrawn. Warm, same session, repeated twice:
+
+| arm | pass 1 | pass 2 | tau | vs AR |
+|---|---|---|---|---|
+| AR | 15.25 | 15.25 | 1.00 | 1.00x |
+| chain DFlash B=16 | 22.31 | 21.98 | 2.49 | **1.45x** |
+| DDTree budget 12, topk 1 | 32.69 | 32.76 | 5.79 | **2.14x** |
+
+**Both speculative paths beat AR.** No defect. The real gap is 1.47x.
+
+### The cause, proven not assumed
+
+Moved `~/.hipfire/kernels/gfx1151` aside (pure JIT cache, regenerates on demand,
+restored afterwards to its original 1846 entries) and re-ran the same command:
+
+| kernel cache | chain B=16 | tau |
+|---|---|---|
+| cold | **6.41 tok/s** | 2.4865 |
+| warm | **22.13 tok/s** | 2.4865 |
+
+**3.45x, tau bit-identical.** The computation is the same; only wall-clock
+differs, because kernels JIT-compile INSIDE the timed window. The identical tau
+is what makes it dangerous — every acceptance metric looks healthy while
+throughput reads a third of real.
+
+This is now measurement trap #3 in the goal file. It invalidates any first-run
+benchmark in this repo, and it is worth more than the W2 item it destroyed.
+
+### What actually survives as W2
+
+Block size is NOT the confound — chain returns tau **2.4865 at both B=12 and
+B=16**, accepting the same 92 tokens, with accept_rate falling 0.226 -> 0.166 as
+the extra width is wasted. So chain's draft saturates at ~2.5 accepted no matter
+how much room it gets, while the same drafter reaches 5.79 through the tree
+path's confidence-pruned spine (`build_ddtree_tree_with_cutoff`) vs chain's
+unconditional per-position argmax.
+
+Do NOT retry the DFlash2 candidate selector: already implemented, gated behind
+`HIPFIRE_DFLASH2_SELECTOR=1`, measured WORSE (tau 2.421 -> 2.25, decode 6.14 ->
+5.92).
+
+### Housekeeping
+
+- `~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq` (3.46 GB, arch 20) promoted
+  out of /tmp. Reproduce: `dflash_convert --input
+  /srv/huggingface/models--z-lab--Qwen3.6-27B-DFlash/snapshots/*/ --output <path>`.
+- Corrected: `docs/perf/ddtree-vs-chain-opus.md`, the goal file's baseline table
+  and W2, and the published artifact.
