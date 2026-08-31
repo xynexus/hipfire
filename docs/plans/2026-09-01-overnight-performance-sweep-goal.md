@@ -63,7 +63,15 @@ Three traps have each cost a previous session real time:
    not a null result.** Pass `--force`.
 2. **`rocprofv3`'s `top_kernels` view mis-scales durations.** Query
    `rocpd_kernel_dispatch` in `run_results.db` instead.
-3. **Never calibrate and evaluate on the same corpus.** A previous "−13.6%" result
+3. **Discard the first run after any rebuild, kernel edit, or new arm.** Kernels
+   are JIT-compiled into `~/.hipfire/kernels/<arch>/` and the compile happens
+   INSIDE the timed window. Measured: chain DFlash reads **6.41 tok/s** cold and
+   **22.13** warm — **3.45x** — with tau bit-identical both times. That identity
+   is the trap: acceptance metrics look healthy while throughput is a third of
+   real. A control must be re-run in the same warm session as its treatment,
+   never quoted from an earlier one. This one already cost this run a wrong
+   headline.
+4. **Never calibrate and evaluate on the same corpus.** A previous "−13.6%" result
    was train-on-test and had to be retracted. Keep the KLD reference disjoint.
 
 **Locking.** Non-daemon GPU binaries do not self-lock — wrap examples and benches
@@ -110,12 +118,17 @@ Gate before moving on: `./tests/no-gpu-ci.sh` must exit 0.
 Record these in the run log before touching anything. Everything later is
 measured against them.
 
+⚠️ **All 27B figures below are WARM-CACHE, re-measured 2026-09-01 and repeated.**
+Any earlier quote of chain at 10.26 tok/s is withdrawn (cold-cache artifact).
+
 | what | command | value |
 |---|---|---|
-| 27B AR decode | `dflash_spec_demo --ar-baseline` | 15.23 tok/s *(known)* |
-| 27B best spec | `--ddtree-batched --ddtree-budget 12 --ddtree-topk 1` | 32.89 tok/s *(known)* |
-| 180B paged decode | `serve_real <model> 64` | 0.25 s/tok @ 8 GiB *(known)* |
-| 180B eager decode | `HIPFIRE_QWEN4EXP_PAGED_EXPERTS=0` | 0.08 s/tok *(known)* |
+| 27B AR decode | `dflash_spec_demo --ar-baseline` | **15.25** tok/s (both passes) |
+| 27B chain DFlash B=16 | `--block-size 16` | **22.1** tok/s, tau 2.49 |
+| 27B best spec | `--ddtree-batched --ddtree-budget 12 --ddtree-topk 1` | **32.7** tok/s, tau 5.79 |
+| 27B chain, COLD cache | (do not use — trap reference) | 6.41 tok/s |
+| 180B paged decode | `serve_real <model> 64` | 0.25 s/tok @ 8 GiB |
+| 180B eager decode | `HIPFIRE_QWEN4EXP_PAGED_EXPERTS=0` | 0.08 s/tok |
 
 Artifacts: `~/.hipfire/models/Qwen3.6-27B--oq4.25++.hfq`,
 `~/.hipfire/models/Qwen3.8-Flash-Next-180B--oq4.hfq`.
@@ -130,8 +143,8 @@ DFlash path can run from them. Rebuild from HF source:
   --output ~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq
 ```
 
-Worth doing properly and keeping (canonical name, `--dflash.bf16.hfq`), rather
-than leaving it in `/tmp` as the last session did.
+**DONE 2026-09-01** — `~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq` (3.46 GB,
+arch 20) exists and is what the corrected numbers above were measured with.
 
 ---
 
@@ -141,7 +154,24 @@ Ordering rule: **highest confidence × lowest blast radius first**, so that a ru
 which stalls at 3 a.m. has still landed something. Each item ends with a commit
 or an explicit "abandoned, because —" note in the run log.
 
-### W1 · `is_batchable_la` is missing the G128 Opus dtypes  *(list #2)*
+### W1 · `is_batchable_la` is missing the G128 Opus dtypes  *(list #2)* — DEPRIORITISED
+
+⚠️ **Groundwork landed (`d7ba9d27a`); the rest is NOT an overnight item.** The
+premise below — "add two arms" — is wrong. `docs/todo/2026-08-30-oq8g128-
+protected-set.md` already documents the real blocker: qwen35's lowered executor
+fuses rmsnorm+rotate and shares ONE FWHT-256-rotated activation across every
+attention projection, so a G128 weight needs a new G128 fused rotate kernel
+family AND a way to split that shared activation. Multi-day kernel work.
+
+What DID land is worth keeping: the batched scratch allocator sized the
+activation-scale plane `n * (k / 256)`, which doubles at group 128 — a latent
+overrun that doc does not cover. Now group-parametric, behaviour-neutral.
+
+Also do not rediscover: no AWQ sidecar at G128, no LDLQ at G128, and tiny-quant
+KLD **cannot adjudicate** G128 (6.9x better on one family, 2x worse on another,
+on random-init fixtures). Use the reconstruction test.
+
+Original framing, retained for context:
 
 Batchable today: `Oq4G256`, `Oq8G256`, `OqCompactG256`. **No arm for
 `OqCompactG128` or `Oq8G128`** — verified by reading the arms in
@@ -159,22 +189,37 @@ but a GEMV-heavy histogram."
 decline trace is silent. **If no G128 artifact exists locally, make one** —
 quantize a small model to `oq8` at group 128.
 
-### W2 · Chain DFlash is 3.2× slower than the same work as a DDTree spine  *(list #1)*
+### W2 · Why does the tree path get tau 5.79 where chain gets 2.49?  *(list #1, REVISED)*
 
-`spec_step_dflash` at B=16 gives 10.26 tok/s; `spec_step_ddtree_batched` at
-budget 12 / topk 1 gives 32.89. Both verify a linear run of drafted tokens. Chain
-is *below* AR (15.23).
+⚠️ **This item was void as first written.** It said "chain is 3.2x slower and
+loses to AR (10.26 vs 15.23)". That chain number was a cold-kernel-cache
+artifact. Corrected, warm, repeated:
 
-- First equalise the comparison: run chain at B=12 and the tree at budget 16, so
-  block size is not the confound.
-- Then trace both. Hypothesis to test first: chain issues **per-token verify
-  launches** where the tree path issues one batched forward. `is_batchable_la`
-  (W1) may be part of the same story — do W1 first for that reason.
-- Chain's acceptance is τ 2.49 at accept-rate 0.166: it proposes 15 and keeps
-  1.5. Check whether the adaptive-B controller is even engaging.
+| arm | tok/s | tau |
+|---|---|---|
+| AR | 15.25 | 1.00 |
+| chain DFlash B=16 | 22.1 | 2.49 |
+| DDTree budget 12, topk 1 | 32.7 | 5.79 |
 
-**Done when:** the gap is explained. Closing it is better, but a written
-root-cause with evidence is a complete result.
+**Both speculative paths beat AR.** There is no defect. The remaining gap is
+1.47x and it is entirely acceptance.
+
+The real question, and it is a good one: **block size is not the confound.**
+Chain gives tau 2.4865 at BOTH B=12 and B=16 — identical accepted tokens (92),
+with accept_rate falling 0.226 -> 0.166 as the extra proposals are wasted. So
+chain's draft saturates at ~2.5 accepted regardless of how much width it is
+given, while the tree path's spine reaches 5.79 from the same drafter.
+
+- Find where the tree path's spine construction differs from chain's
+  per-position argmax — `build_ddtree_tree_with_cutoff` prunes on confidence,
+  chain proposes B-1 unconditionally.
+- Do NOT re-try the DFlash2 candidate selector: already implemented, gated behind
+  `HIPFIRE_DFLASH2_SELECTOR=1`, and MEASURED WORSE (tau 2.421 -> 2.25, decode
+  6.14 -> 5.92).
+
+**Done when:** the tau difference is explained. If chain can be made to truncate
+on confidence too, that is the win; if not, the finding is that chain's fixed
+block size is the wrong shape and DDTree-topk1 should be the default spine.
 
 ### W3 · KVarN × batched prefill is 57× less faithful  *(list #3)*
 
