@@ -462,3 +462,29 @@ out-of-date, it can be actively wrong about what the thing IS.
 (qwen4_exp batched forward). None is an overnight win; each wants a dedicated
 session with real-model validation. **The cheap wins are exhausted** — which is
 itself the answer to "how many of the twenty survive contact with measurement".
+
+---
+
+## Cold-cache guard landed (`217e5c909`)
+
+The trap that produced this run's wrong headline now announces itself.
+`hipfire_rdna::jit_compiles()` counts kernels hipcc actually compiled;
+`dflash_spec_demo` prints a warning before BOTH `BENCH METRICS` blocks when it
+is non-zero.
+
+Verified by moving the cache aside:
+
+    cold: "COLD KERNEL CACHE: 32 kernel(s) were compiled during this run"  6.38 tok/s
+    warm: silent                                                          26.32 tok/s
+
+Two mistakes worth recording, because both are the same shape as the bugs this
+run kept finding:
+
+1. The first attempt put the guard before the AR-baseline metrics block only.
+   The test drove the spec arm, so it printed nothing and looked like the counter
+   was broken. **A guard in one of two arms covers nothing** — same failure as
+   tiny-spec-gate asserting a path it had disabled.
+2. The helper was then inserted between `#[cfg(not(feature = "deltanet"))]` and
+   its stub `main`, so the attribute applied to the helper and the file had two
+   unconditional `main`s. Anchoring text insertion on a string that appears more
+   than once is how both of these happened.
