@@ -1,5 +1,33 @@
 # GOAL: finish the quant benchmark queue (unattended handoff)
 
+> **STATE RE-CHECKED 2026-08-31 — the "in flight" section below is dead, and
+> most of "Done so far" no longer exists on disk. Read this first.**
+>
+> - **Both background jobs are gone.** The scratchpad they lived in
+>   (`.../1aa40aa2-.../scratchpad`) does not exist, so per this document's own
+>   note the scripts are gone with it. Nothing is running; re-derive from
+>   §"Recipe" if resuming.
+> - **The expensive Qwen3.5-35B-A3B outputs are gone.** No bf16 (43 GB), no
+>   calib (1.8 GB), no `oq4.25++` (17.9 GB) anywhere under `/srv`. Searched by
+>   several name shapes; the only 35B artifacts present are Qwen3.**6**
+>   (`Qwen3.6-35B-A3B--oq4.moeblocks.hfq`, `...-DFlash--bf16.hfq`) plus a
+>   `qwen3.6-35b-a3b-bf16.kldref.json` whose `.hfq` was deleted as damaged (see
+>   BUGS.md: 0% agreement on every chunk). So this is NOT "kld reference running
+>   -> score" with three stages banked — it is a restart from the `.hfa`.
+> - **What DOES survive is the source and the knowledge.**
+>   `models--Qwen--Qwen3.5-35B-A3B.hfa` (47.7 GB) is on disk, and §1 is accurate:
+>   `97a06db3f` landed, `03f7a2612` landed and was reverted by `dc18bdd39` —
+>   all three verified present on master.
+> - **The durable result is §1's finding, and it does not depend on any
+>   artifact:** the per-expert LDLQ factorization is irreducible for calibrated
+>   recipes, because AWQ rebases the Hessian per tensor and the damping is
+>   applied after the rebase, so `(D H D + lambda I)^-1 != D (H + lambda' I)^-1 D`.
+>   That is worth keeping whatever happens to the queue.
+>
+> **Not restarted unattended, deliberately.** Re-running this is hours of GPU on
+> a box whose daemon is serving, and whether the benchmark queue is still worth
+> that is a priority call, not a technical one. See `DECISIONS-PENDING.md`.
+
 Written 2026-08-08 at the end of a long session. Everything below is state you
 can act on without asking. Read "Traps" before running anything — several cost
 hours this session.

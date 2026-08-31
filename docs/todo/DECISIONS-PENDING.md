@@ -85,6 +85,25 @@ already uses for its manifest. That one is just work.
 
 ---
 
+## 6. Quant benchmark queue — restart the 35B pipeline, or drop it?
+
+`2026-08-08-quant-benchmark-queue-handoff.md`
+
+Re-checked 2026-08-31: the two "in flight" jobs are dead, their scratchpad and
+scripts are gone, and every expensive Qwen3.5-35B-A3B output (bf16 43 GB, calib
+1.8 GB, `oq4.25++` 17.9 GB) is absent from `/srv`. The source `.hfa` (47.7 GB)
+survives, so it is restartable from §"Recipe" — but it is a restart, not a
+resume, and the doc's "three stages banked" is no longer true.
+
+That is hours of GPU on a box whose daemon is serving. Whether the benchmark
+queue is still worth it is a priority call. Not restarted unattended.
+
+The one durable result needs no rerun and is recorded in place: the per-expert
+LDLQ factorization is irreducible for calibrated recipes (AWQ rebases the
+Hessian per tensor, damping is applied after the rebase).
+
+---
+
 ## Go / no-go, rather than a design answer
 
 Five documents are unapproved by their own status line, so starting them is a
