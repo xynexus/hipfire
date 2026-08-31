@@ -205,16 +205,29 @@ for raw_family in "${families[@]}"; do
         # Both parenthesise the number; the old pattern matched only the first, so
         # the GOOD case parsed as empty and was skipped by `[ -n ]`. That made a
         # measurement that did not happen indistinguishable from one that passed.
+        # stderr goes to a file, not /dev/null. A probe that DIES produced the
+        # same empty string as one that ran and said nothing, so "no parseable
+        # summary" was reported with the reason discarded — six failures on two
+        # MoE families all traced to one config leak, and the gate could not say
+        # so. The reason is now printed with the failure.
+        HID_ERR="$TMP/hidden-probe.err"
         hid_worst() {
-            "$HID" --model "$2" --n 32 --kv-mode "$1" 2>/dev/null |
+            "$HID" --model "$2" --n 32 --kv-mode "$1" 2>"$HID_ERR" |
                 grep -oE '\(worst (overall )?[0-9.eE+-]+\)' |
                 sed -E 's/.*[[:space:]]([0-9.eE+-]+)\)/\1/' | tail -1
+        }
+        # One line of why, from whatever the probe last complained about.
+        hid_why() {
+            [ -s "$HID_ERR" ] || { echo "(probe wrote nothing to stderr)"; return; }
+            grep -oE "(panicked at|message: )[^\"]*" "$HID_ERR" | tail -1 |
+                cut -c1-160 || tail -1 "$HID_ERR" | cut -c1-160
         }
         w32="$(hid_worst fp32 "$hfq")"
         if [ -z "$w32" ]; then
             echo "  FAIL hidden-state probe emitted no parseable summary at fp32 KV —"
             echo "       treating an unmeasured invariant as a pass is how this arm"
             echo "       went unnoticed before; fix the probe or this parser"
+            echo "       probe said: $(hid_why)"
             fail=$((fail + 1))
         elif [ "$(awk -v a="$w32" 'BEGIN{print (a>0)?1:0}')" = "1" ]; then
             echo "  FAIL hidden states differ at fp32 KV (worst $w32) — the prefill"
@@ -228,6 +241,7 @@ for raw_family in "${families[@]}"; do
             wq="$(hid_worst "$hkv" "$hfq")"
             if [ -z "$wq" ]; then
                 echo "  FAIL hidden-state probe emitted no parseable summary for $hkv"
+                echo "       probe said: $(hid_why)"
                 fail=$((fail + 1))
                 continue
             fi
