@@ -79,6 +79,13 @@ in `hipfire lock acquire <label>` / `release`. But **never** wrap `hipfire-eval`
 `tests/tiny-*.sh`, or `coexistence calibrate`: they acquire it themselves and
 will deadlock naming your own label as the blocker.
 
+**Check the repo before analysing — this has now cost three items.** W1, W2 and
+W3 each rested on a stale premise, and two of them were already answered in the
+tree: W1's blocker in `docs/todo/2026-08-30-oq8g128-protected-set.md`, W3's fix
+in commit `96d53741c`. This list was built from memory entries, and **the repo is
+ahead of the memory**. First action on any remaining item: `git log --grep=<topic>`
+plus a sweep of `docs/todo`, `docs/plans` and `BUGS.md`. Only then measure.
+
 **Every performance claim needs a control.** Same binary, same prompt, same
 artifact, both arms in the same session. A number without its baseline is not a
 result.
@@ -221,18 +228,28 @@ given, while the tree path's spine reaches 5.79 from the same drafter.
 on confidence too, that is the win; if not, the finding is that chain's fixed
 block size is the wrong shape and DDTree-topk1 should be the default spine.
 
-### W3 · KVarN × batched prefill is 57× less faithful  *(list #3)*
+### W3 · KVarN × batched prefill  *(list #3)* — CLOSED, does not reproduce
 
-Against an fp32-KV reference: per-token 0.016, batched **0.93**. KVarN is the
-**default**, so this is live for real requests.
+⚠️ **Already fixed by `96d53741c` (2026-08-29), two days before this file listed
+it as open.** Re-measured on `qwen3.5-2b--bf16.hfq`, warm:
 
-- Reproduce first with `example compare_prefill_hidden_paths`. If it no longer
-  reproduces, say so loudly and close the item — that is a valuable result.
-- The tier is fine; the batched attention path is the defect. Do **not** "fix" it
-  by disabling KVarN.
+| KV mode | batched | per-token | ratio |
+|---|---|---|---|
+| q8 | 2.057e-2 | 1.580e-2 | 1.30x |
+| kvarn | 1.994e-2 | 1.607e-2 | **1.24x** (was 57x) |
 
-**Done when:** batched fidelity is within ~2× of per-token, or the defect is
-root-caused in writing.
+That commit overturned both premises: the KVarN write path was never broken
+(`kvarn_attend`'s segment-then-flush ordering fixed it; 3.31e-4 flat through the
+128-token flush boundary), and the residual divergence is **fp16 narrowing
+cadence in the DeltaNet state** — batched narrows S once, per-token narrows n
+times. KVarN amplifies it, it does not cause it.
+
+The two real fixes are costed in BUGS.md and are design calls (they touch the
+spec-decode snapshot contract), not overnight cleanups.
+
+**Vacuity note for whoever re-checks:** on a compact target BOTH arms fall back
+to per-token and report identical numbers, which proves nothing. Only trust this
+comparison when the two arms differ.
 
 ### W4 · Paged-expert per-access overhead  *(list #4)*
 

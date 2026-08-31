@@ -177,3 +177,57 @@ Do NOT retry the DFlash2 candidate selector: already implemented, gated behind
   /srv/huggingface/models--z-lab--Qwen3.6-27B-DFlash/snapshots/*/ --output <path>`.
 - Corrected: `docs/perf/ddtree-vs-chain-opus.md`, the goal file's baseline table
   and W2, and the published artifact.
+
+---
+
+## W3 — KVarN × batched prefill · CLOSED, already fixed before this run started
+
+**Does not reproduce.** `compare_prefill_hidden_paths` on
+`qwen3.5-2b--bf16.hfq`, warm cache, against the fp32-KV reference:
+
+| KV mode | batched | per-token | ratio |
+|---|---|---|---|
+| q8 | 2.057e-2 | 1.580e-2 | 1.30x |
+| **kvarn** | **1.994e-2** | **1.607e-2** | **1.24x** |
+
+Against the recorded defect of batched **9.334e-1** vs per-token 1.633e-2 — a
+57x gap. It is now 1.24x, i.e. gone.
+
+**Vacuity check, because the prior write-up warns about exactly this:** on a
+compact target both arms silently fall back to per-token and report *identical*
+numbers (the 27B read batched == per-token == 1.203e-2, which proves nothing).
+Here the two arms differ (1.994e-2 vs 1.607e-2), so the batched path really ran.
+Also confirmed `--n` is honoured (`rows = ....min(n)`, `tokens = (0..n)`); the
+metric is invariant n=8..96 only because it is a MAX and the max sits in the
+first 8 rows.
+
+**Closed by `96d53741c` (2026-08-29), before this goal file was written.** That
+commit overturned both premises the item rested on:
+
+1. The KVarN per-token write path was never broken — `kvarn_attend`'s
+   segment-then-flush ordering fixed it. Batched and per-token agree at 3.31e-4
+   given identical inputs, flat across n=32/127/128/129/200, straight through the
+   128-token flush boundary that used to step.
+2. The residual divergence is **fp16 narrowing cadence in the DeltaNet state**,
+   not KV at all: batched prefill is one launch narrowing S once, per-token is n
+   launches narrowing n times. KVarN is the AMPLIFIER (1.04e-2 under q8 vs
+   1.06e-1 under KVarN at the next layer), not the source.
+
+The two real fixes (fp32 S for the duration of a prefill, or fp16 + an int8
+mantissa residual at 3 B/element) are already costed in BUGS.md and are design
+calls, not cleanups.
+
+### ⚠️ Pattern — three for three
+
+W1, W2 and W3 have each had a **stale premise**:
+
+- W1 framed as "add two dispatch arms"; the real blocker was documented in
+  `docs/todo/2026-08-30-oq8g128-protected-set.md` a day earlier.
+- W2 rested on a cold-cache measurement artifact of my own making.
+- W3 was fixed on 2026-08-29, two days before the goal file listed it as open.
+
+**The ranked list was built from memory entries rather than from the repo's own
+docs, and the repo is ahead of the memory.** For the remaining items, the first
+action must be `git log --grep` plus a `docs/todo` + `docs/plans` + `BUGS.md`
+sweep for the subsystem, BEFORE any analysis or measurement. Two of these three
+would have been closed in minutes that way.
