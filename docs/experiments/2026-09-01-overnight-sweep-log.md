@@ -335,3 +335,44 @@ The refactor it needs (`load_moe_expert` returning bytes so the caller can pack
 gate_up||down into one buffer, with the existing pointer tables retargeted at
 base and base+len) touches the loading path for every MoE model, so it wants a
 dedicated session with real-model validation — not an unattended 3 a.m. edit.
+
+---
+
+## Implementations landed this tick
+
+**1. `feat(calib)` — calibration sequence length defaults to 2048** (`548a10711`).
+`calib_sequences` split only when `HIPFIRE_CALIB_SEQ_LEN` was set; unset gave
+`usize::MAX`, so the O(n²) shape was the default and the cost grew with the very
+budget that makes calibration worth doing. 2048 matches the n_ctx KLD references
+are built at. Evidence was already in the function's own doc comment: zaya1-8b at
+32768 tokens, 10746 s -> 1065 s, quality unchanged.
+
+⚠️ The first version of the test sized its input as `DEFAULT_CALIB_SEQ_LEN * 3`,
+so raising the constant grew the input to match — it could not fail. Input is a
+literal now, and the negative control (revert to `usize::MAX`) genuinely fails.
+
+**2. `fix(docs)` — six ASCII tables rustdoc was compiling** (`db02784e6`).
+`cargo test --doc` failed workspace-wide; indented blocks in doc comments are
+treated as Rust. Fenced as ```text. Workspace doctests are clean now — they were
+unusable as a signal before, because each crate stopped at its first failure.
+
+**3. `fix(gate)` — tiny-spec-gate demanded coverage it had made unreachable.**
+The checkpoint-rollback stage fails on `origin/master` too (verified in a scratch
+worktree at 7f739be21), so every spec-touching commit was tripping it and
+escalating to the full coherence battery.
+
+Root cause is in a log line the gate never read:
+
+    DFlash checkpoint rollback: DISABLED — it needs FP32 DeltaNet state and this
+    session resolved FP16.
+
+The stage set `HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1` but not
+`HIPFIRE_DN_STATE_FP16=0`, so `replay_checkpoint` was pinned at 0 and the
+assertion could not pass whatever the code did. Everything else worked as
+designed — 31 cycles, 0 accepted (random-init drafter, deliberately), rollback
+going through `replay_full_prefill=31`.
+
+One env var. Gate now reports **"spec loop OK (checkpoint engaged 31x, output ==
+AR)"**, which is exactly the second-model coverage `825d3ccfc` said was missing.
+Non-vacuous both ways: fails without the fix, and the 31 firings still produce
+AR-identical output.
