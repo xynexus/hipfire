@@ -2423,6 +2423,34 @@ agree with each other.
 
 Do NOT "fix" this by raising the tiny-prefill ceiling.
 
+## [tiny-state now GREEN; tiny-prefill still red — re-confirmed 2026-08-31] Three tiny-gate cells are already failing on origin/master
+
+**Re-run 2026-08-31 on nix2 (gfx1103) at `e4025250f`, A/B against a working
+branch on the same host and build cache. Two of the three populations have
+diverged in outcome:**
+
+- **`tiny-state` PASSES, 18/18 cells.** The 4 drifted cells now match, because
+  the baselines were re-recorded to what this file lists as the *observed*
+  values — `qwen3_5/fp16` is now baselined at
+  `0xed48922801655d8b/0xbccf1d6a241a4482`, which is exactly the hash this entry
+  records as drifting against `0xdb7f521096082900/0x1187a5029a78ab92`. So the
+  "confirm the cause before re-recording" caution below was overtaken; the
+  re-record happened. Worth knowing if anyone still expects those cells red.
+- **`tiny-prefill` is unchanged and still red**, and it is NOT branch-local:
+  clean `origin/master` and the branch both give `ran=4 fail=6`, the same six
+  `hidden-state probe emitted no parseable summary` failures (fp32/q8/kvarn on
+  `qwen3_5` and `qwen3_5_moe`) and the same two `qwen3_5_moe` SKIPs
+  (`batched prefill did not execute for this fixture`). The probe DOES work —
+  it prints `hidden fp32: 0.00e0 / q8 0.00e0 / kvarn 0.00e0` for the family that
+  parses — so this is the parser or the probe's output shape on the other two
+  families, not a quality regression.
+
+So the tripwire consequence below is now specific to `tiny-prefill`:
+`tiny-affected-gate` still fails for every commit touching a covered path, but
+`tiny-state` is once again a discriminating signal.
+
+Original 2026-08-29 investigation follows.
+
 ## [RESOLVED 2026-08-29 for state+quant; prefill open — see the entry above] Three tiny-gate cells are already failing on origin/master
 
 Confirmed 2026-08-29 by running each gate in a clean `git worktree` at
