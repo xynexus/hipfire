@@ -233,8 +233,45 @@ fixture still declined. Narrowed to `ffn_admissible=false`, i.e.
   That attempt was reverted rather than shipped: instrumentation that cannot be
   shown to fire is worth nothing.
 
-**Next step for whoever picks this up:** find where the qwen35 forward decides
-against batching for this fixture (upstream of `prefill_batch.rs:6421`) and flush
-the trace there. The `[pbs-gate]` diagnostic recomputes proxy terms for display
-and prints `per_layer_dtypes~=true` while the real verdict is false — so it
-actively misleads. Its own comment demands "Name every term"; it does not.
+**~~Next step for whoever picks this up~~ — ANSWERED 2026-08-31. No new
+instrumentation was needed: `HIPFIRE_KERNEL_TRACE=1` already flushes the
+gate-reason diagnostic, which is exactly what that env var documents itself as
+doing.**
+
+The fixture declines for ONE reason, and it is a **fixture shape**, not a
+runtime bug. Measured on nix2 (gfx1103), `--n 512`, paged experts pinned off:
+
+    qwen3_5_moe          (K=2, E=8)   moe_topk_ok=false  ->  verdict=false
+    qwen3_5_moe_indexed  (K=8, E=10)  moe_topk_ok=true   ->  verdict=true
+
+Every other term is identical and true across the two — `!force_fallback`,
+`n>=MIN_BATCH`, `dn_quant_ok`, `any_deltanet`, `router_logits`,
+`per_layer_dtypes~`, `allow_compact`, `tape_in_play=false`. The single differing
+term is `moe_topk_ok`.
+
+The site is `prefill_batch_pbs_eligible` (`qwen35/mod.rs:2314`), and the
+condition is `moe_prefill_topk_shape_supported` (`qwen35/mod.rs:2048`):
+
+```rust
+matches!(k_top, 8 | 10) && num_experts <= 1024
+```
+
+`K=2` is not in the admitted set. That set is deliberately narrow — the comment
+above it says "Keep the explicit admitted set narrow until another K is
+channel-tested" — so this is the gate working as designed against a fixture whose
+top-K no production Qwen3.5 MoE uses.
+
+**So the fix is to the FIXTURE, not the runtime:** emit `qwen3_5_moe` with
+`num_experts_per_tok = 8` (its indexed sibling already does, which is why that
+one batches and is covered). Widening `moe_prefill_topk_shape_supported` to admit
+K=2 would be the wrong move — it would channel-admit an untested K purely to make
+a fixture batch.
+
+Two diagnostic warts noted while doing this, neither blocking:
+- The complaint below is half right. `per_layer_dtypes~=true` is printed with a
+  `~` marking it a recomputed proxy, but the genuinely false term
+  (`moe_topk_ok=false`) IS named, so the line did point at the answer.
+- With `verdict=true` on the indexed fixture, the trace summary still printed
+  `qwen35 prefill batching DECLINED at n=512: no dispatches`. A downstream
+  decline, separate from the pbs gate; worth knowing before trusting that
+  summary line alone.
