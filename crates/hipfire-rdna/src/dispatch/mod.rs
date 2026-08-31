@@ -809,6 +809,18 @@ pub struct Gpu {
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from the shared Hipfire LCG.
 pub use hipfire_primitives::fwht::gen_fwht_signs;
 
+/// Activation-scale plane length for the batched oq8 path: one f32 per group
+/// per row.
+///
+/// Pulled out of `ensure_oq8_scratch_batched_g` so the rule has ONE definition
+/// and a test that does not need a GPU. It was `n * (k / 256)` inline, with 256
+/// hardcoded in three places above a kernel that takes `group` at runtime — so a
+/// 128-grouped dtype admitted to the batched path would have written past this
+/// buffer instead of failing.
+pub fn oq8_batched_xs_len(n: usize, k: usize, group: usize) -> usize {
+    n * (k / group.max(1))
+}
+
 impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).
     fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
@@ -2739,9 +2751,31 @@ impl Gpu {
         k: usize,
         m_max: usize,
     ) -> HipResult<()> {
+        self.ensure_oq8_scratch_batched_g(n, k, m_max, 256)
+    }
+
+    /// [`Self::ensure_oq8_scratch_batched`] with an explicit group size.
+    ///
+    /// The activation-scale plane is one f32 per group per row, so its size is
+    /// `n * (k / group)` — it DOUBLES at group 128. The 256 was a constant here
+    /// (and in `quantize_act_oq8_batched` / `gemm_oq8_grouped_prequant`) while
+    /// the kernel underneath has always taken `group` at runtime, so admitting a
+    /// G128 dtype to the batched path without this would have written past this
+    /// buffer rather than failing cleanly.
+    pub fn ensure_oq8_scratch_batched_g(
+        &mut self,
+        n: usize,
+        k: usize,
+        m_max: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        debug_assert!(
+            group > 0 && k % group == 0,
+            "ensure_oq8_scratch_batched_g: K={k} not a multiple of group={group}"
+        );
         self.bind_thread()?;
         let need_xq = n * k;
-        let need_xs = n * (k / 256);
+        let need_xs = oq8_batched_xs_len(n, k, group);
         let need_y = n * m_max;
         let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
             cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)
@@ -5404,5 +5438,41 @@ mod tests {
             s1,
             "seed 43 should differ from seed 42"
         );
+    }
+}
+
+#[cfg(test)]
+mod oq8_batched_scratch_tests {
+    use super::oq8_batched_xs_len;
+
+    /// The activation-scale plane DOUBLES at group 128, and that is the whole
+    /// reason `is_batchable_la` could not simply admit `Oq8G128` /
+    /// `OqCompactG128`: three call sites hardcoded 256 above a kernel that has
+    /// always taken `group` at runtime, so admitting a 128-grouped dtype would
+    /// have written past this buffer rather than failing cleanly.
+    ///
+    /// Asserted as a RATIO as well as an absolute, because a future refactor
+    /// that reintroduced the constant would still satisfy the 256 case alone.
+    #[test]
+    fn xs_plane_scales_with_the_group_not_a_constant() {
+        let (n, k) = (512usize, 4096usize);
+        let g256 = oq8_batched_xs_len(n, k, 256);
+        let g128 = oq8_batched_xs_len(n, k, 128);
+
+        assert_eq!(g256, n * (k / 256));
+        assert_eq!(g128, n * (k / 128));
+        assert_eq!(
+            g128,
+            2 * g256,
+            "a 128 group needs twice the activation scales; if this is equal, \
+             the group has been hardcoded again and G128 batching will overrun"
+        );
+    }
+
+    /// `group.max(1)` guards the divide. A zero group is a caller bug, but it
+    /// must not be a division by zero inside an allocator.
+    #[test]
+    fn a_zero_group_does_not_divide_by_zero() {
+        assert_eq!(oq8_batched_xs_len(4, 256, 0), 4 * 256);
     }
 }
