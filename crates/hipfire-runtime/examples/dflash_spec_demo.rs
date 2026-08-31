@@ -171,6 +171,25 @@ impl MarkovHead {
     }
 }
 
+/// Warn when this process JIT-compiled kernels, because the timings below then
+/// include hipcc rather than only the model.
+///
+/// Kernels compile INSIDE the window a benchmark is timing. A cold run is not
+/// slightly slow — measured cold-vs-warm on one command: 6.41 vs 22.13 tok/s,
+/// **3.45x**, with tau bit-identical at 2.4865. Every quality metric reads
+/// perfectly while throughput reads a third of real, which is how a cold number
+/// once reached a published table.
+fn warn_if_cold_kernel_cache() {
+    let jit = hipfire_rdna::jit_compiles();
+    if jit > 0 {
+        eprintln!(
+            "\n⚠️  COLD KERNEL CACHE: {jit} kernel(s) were compiled during this run.\n\
+             \x20   Timings below include compilation and are NOT comparable to a warm \
+             run.\n\x20   Re-run the same command and use the second result."
+        );
+    }
+}
+
 #[cfg(feature = "deltanet")]
 fn main() {
     // Same ordering rule as the daemon: install before any Gpu::init --
@@ -2175,6 +2194,7 @@ fn main() {
             // Printed next to the metrics deliberately: a tok/s number and the list of
             // fast paths that did not apply belong in the same output.
             hipfire_rdna::kernel_trace::dump("dflash_spec_demo");
+            warn_if_cold_kernel_cache();
             eprintln!("=== BENCH METRICS ===");
             eprintln!("prompt_tokens: {}", prompt_tokens.len());
             eprintln!("prefill_secs: {:.4}", prefill_secs);
@@ -3102,6 +3122,7 @@ fn main() {
                 eprintln!("warning: failed to write --evidence-dir {dir}: {err}");
             }
         }
+        warn_if_cold_kernel_cache();
         eprintln!("=== BENCH METRICS ===");
         eprintln!("prompt_tokens: {}", prompt_tokens.len());
         if pflash_path.is_some() {

@@ -90,6 +90,25 @@ fn hsaco_is_elf_path(path: &Path) -> bool {
 
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
+/// Kernels actually compiled by hipcc in this process, as opposed to served
+/// from the pre-compiled blob directory or the on-disk cache.
+///
+/// Exists because JIT compilation happens INSIDE whatever window a benchmark is
+/// timing, and a cold run is not slightly slower — it is several times slower
+/// while every quality metric looks perfect. Measured on a warm-vs-cold pair of
+/// the same command: 6.41 vs 22.13 tok/s, 3.45x, with tau bit-identical at
+/// 2.4865. Nothing else in the output distinguishes the two, which is how a
+/// cold number reached a published table.
+///
+/// Read it with [`jit_compiles`]; a benchmark that sees a non-zero count after
+/// its warm-up should discard the run.
+static JIT_COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Kernels hipcc-compiled in this process so far. See [`JIT_COMPILES`].
+pub fn jit_compiles() -> usize {
+    JIT_COMPILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
@@ -381,6 +400,7 @@ impl KernelCompiler {
             static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let _guard = COMPILE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
             if !Self::cache_valid(&obj_path, &hash_path, &src_hash) {
+                JIT_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Self::hipcc_compile(
                     &self.arch,
                     &src_path,
