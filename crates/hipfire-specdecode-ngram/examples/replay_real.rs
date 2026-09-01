@@ -32,6 +32,8 @@ fn main() {
     let mut chain_floor = 8u8;
     let mut merge_every = 0usize;
     let mut hot_cap = 1usize << 20;
+    let mut min_acceptance = 0.0f32;
+    let mut min_acceptance_proposals = 8u32;
 
     let mut i = 1;
     while i < args.len() {
@@ -71,6 +73,14 @@ fn main() {
             "--topic-writable" => {
                 topic_writable = true;
                 i += 1;
+            }
+            "--min-acceptance" => {
+                min_acceptance = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--min-acceptance-proposals" => {
+                min_acceptance_proposals = args[i + 1].parse().unwrap();
+                i += 2;
             }
             "--blocks" => {
                 blocks = args[i + 1].parse().unwrap();
@@ -140,6 +150,8 @@ fn main() {
         chain_floor,
         hot_capacity: hot_cap,
         write_target,
+        min_acceptance,
+        min_acceptance_proposals,
         ..Default::default()
     });
     if let Some(p) = &user {

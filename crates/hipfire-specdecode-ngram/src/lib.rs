@@ -180,7 +180,33 @@ pub struct NgramConfig {
     /// 0.20 is the knee — 0.30 matches its efficiency while accepting less, so
     /// it is dominated, and everything above 0.30 gives efficiency back.
     ///
-    /// **It is still not defaulted on, and the sweep cannot decide that.**
+    /// ## The SHIPPED implementation, measured by `replay_real`
+    ///
+    /// The table above is the simplified sweep. `replay_real` drives THIS crate
+    /// over the same corpus, and its control reproduces the published 1M-token
+    /// operating point exactly (2.23 accepted/decode step):
+    ///
+    /// | min_acceptance | accepted/decode step | drafted/proposing | verify eff |
+    /// |---|---|---|---|
+    /// | off | 2.23 | 10.57 | 26.7% |
+    /// | 0.05 | 1.84 | 6.33 | 38.5% |
+    /// | 0.10 | 1.68 | 5.91 | 38.6% |
+    /// | 0.15 | 1.63 | 5.73 | 39.3% |
+    /// | 0.20 | 1.57 | 5.53 | 39.4% |
+    ///
+    /// **Trust these over the sweep's.** The trade is steeper here — **-30%
+    /// accepted for -48% drafted** at 0.20, against the sweep's -14%/-41% —
+    /// because the sweep models neither the inline `next2` pair nor the tier
+    /// ladder, so it under-counts both what a gram offers and what suppressing
+    /// it costs. The direction and the rough magnitude agree; the exact
+    /// exchange rate does not, and the shipped path is the one that matters.
+    ///
+    /// The knee is flatter than the sweep suggested: 0.05 already captures most
+    /// of the efficiency (38.5% of the eventual 39.4%) while giving up far less
+    /// acceptance (1.84 vs 1.57). If this is ever defaulted on, **start at 0.05,
+    /// not 0.20.**
+    ///
+    /// **It is still not defaulted on, and no replay can decide that.**
     /// Whether -14% accepted is worth -41% drafted depends on what a wasted
     /// draft slot costs on the part, which is exactly the axis `chain_floor`'s
     /// own note describes ("lower it if verify width is cheap; raise it if the
