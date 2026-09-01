@@ -133,6 +133,31 @@ pub struct NgramConfig {
     /// noise (order 2 accepts 0.75 tokens on average).
     pub next2_min_order: u8,
     pub write_target: WriteTarget,
+    /// Suppress drafting from a gram whose MEASURED acceptance is confidently
+    /// poor. `0.0` disables the gate entirely (the default) — it exists because
+    /// observation count is a weak proxy for acceptance and, at the top end, an
+    /// actively misleading one.
+    ///
+    /// Replay sweep, 400k tokens of this repo's Rust (`ngram_replay_sweep`):
+    ///
+    /// | gram count at hit | proposals | precision |
+    /// |---|---|---|
+    /// | 2 | 105555 | 57.0% |
+    /// | 9-16 | 94700 | **62.9%** |
+    /// | 17+ | 293012 | **56.7%** |
+    ///
+    /// Precision peaks at 9-16 and FALLS at 17+, below even count-2 — and that
+    /// bucket is 293k proposals, the largest of the five. A gram seen 500 times
+    /// with many distinct continuations is frequent and unpredictable, and no
+    /// count threshold can tell it from a frequent, reliable one. Outcome can.
+    ///
+    /// Compared against a lower confidence bound, not the raw rate, so a gram
+    /// that went 0-for-1 is not condemned on one sample. See
+    /// [`acceptance_lower_bound`].
+    pub min_acceptance: f32,
+    /// Proposals a gram needs before `min_acceptance` may suppress it. Below
+    /// this the bound is too wide to act on and the gram drafts normally.
+    pub min_acceptance_proposals: u32,
 }
 
 impl Default for NgramConfig {
@@ -147,6 +172,10 @@ impl Default for NgramConfig {
             flush_per_token: 4,
             next2_min_order: 5,
             write_target: WriteTarget::User,
+            // Off by default: this changes what gets drafted, so it ships
+            // measurable-but-inert until a sweep says what the bar should be.
+            min_acceptance: 0.0,
+            min_acceptance_proposals: 8,
         }
     }
 }
@@ -308,6 +337,16 @@ pub struct NgramSpec {
     /// Reusable draft buffer, and the tier that served each position.
     spine: Vec<u32>,
     tiers: Vec<Tier>,
+    /// The gram that produced each spine position, parallel to `tiers`.
+    ///
+    /// A gram carrying an inline `next2` pushes TWO positions, so the same
+    /// `(key, fp)` appears twice here — deliberately. Those are two independent
+    /// chances for the target to accept, and collapsing them would under-count
+    /// the proposals of exactly the grams that offer the most.
+    spine_grams: Vec<(u32, u64)>,
+    /// Measured outcome per gram. Bounded by `outcomes_cap`; see `note_outcome`.
+    outcomes: std::collections::HashMap<(u32, u64), GramOutcome>,
+    outcomes_cap: usize,
     stats: NgramStats,
     max_order: usize,
     /// Grams the trickle path could not place — a key owns no blocks until a
@@ -318,12 +357,63 @@ pub struct NgramSpec {
     merge_backlog_cap: usize,
 }
 
+/// Measured outcome for one gram: how often drafting it was proposed, and how
+/// often the target kept the token.
+///
+/// `u32` rather than `u64` deliberately — this is per-gram and bounded by the
+/// hot table's capacity, so the memory is `capacity * 8` bytes and a counter
+/// that could reach 4 billion proposals for a single gram is not a real shape.
+/// Saturating adds, so a pathological session cannot wrap one into a low count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GramOutcome {
+    pub proposed: u32,
+    pub accepted: u32,
+}
+
+impl GramOutcome {
+    #[inline]
+    fn observe(&mut self, accepted: bool) {
+        self.proposed = self.proposed.saturating_add(1);
+        if accepted {
+            self.accepted = self.accepted.saturating_add(1);
+        }
+    }
+}
+
+/// Lower bound of a Wilson score interval on the acceptance rate.
+///
+/// The point estimate `accepted / proposed` is unusable as a gate: it ranks a
+/// gram that went 1-for-1 above one that went 40-for-50, which is the same flaw
+/// `promote_count`'s raw threshold has one level up. The lower bound of the
+/// interval instead asks "what acceptance can we be confident this gram at
+/// least has", so evidence must accumulate before a gram is judged either way.
+///
+/// Wilson rather than a Beta posterior quantile because it is a closed form —
+/// this runs in the draft path, which is latency-critical.
+///
+/// `z = 1.96` (95%). `proposed == 0` returns 0.0: no evidence is not evidence of
+/// badness, and the caller gates on `min_acceptance_proposals` before acting.
+pub fn acceptance_lower_bound(o: GramOutcome) -> f32 {
+    if o.proposed == 0 {
+        return 0.0;
+    }
+    let n = o.proposed as f32;
+    let p = (o.accepted as f32) / n;
+    const Z: f32 = 1.96;
+    let z2 = Z * Z;
+    let denom = 1.0 + z2 / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = Z * ((p * (1.0 - p) / n) + (z2 / (4.0 * n * n))).sqrt();
+    ((centre - margin) / denom).max(0.0)
+}
+
 impl NgramSpec {
     pub fn new(cfg: NgramConfig) -> Self {
         let mut cfg = cfg;
         cfg.orders.sort_by(|a, b| b.cmp(a)); // longest first
         let max_order = *cfg.orders.iter().max().unwrap_or(&2) as usize;
         let hot = HotTable::new(cfg.hot_capacity, cfg.promote_count);
+        let cfg_hot_capacity = cfg.hot_capacity;
         Self {
             cfg,
             hot,
@@ -334,6 +424,12 @@ impl NgramSpec {
             hist: Vec::with_capacity(64),
             spine: Vec::new(),
             tiers: Vec::new(),
+            spine_grams: Vec::new(),
+            outcomes: std::collections::HashMap::new(),
+            // Same order as the hot table: the ledger is only useful for grams
+            // recent enough to draft again, so it is pointless for it to
+            // outlive them.
+            outcomes_cap: cfg_hot_capacity,
             stats: NgramStats::default(),
             max_order,
             merge_backlog: Vec::new(),
@@ -535,6 +631,7 @@ impl NgramSpec {
         self.stats.steps += 1;
         self.spine.clear();
         self.tiers.clear();
+        self.spine_grams.clear();
         if self.hist.len() < 2 {
             return None;
         }
@@ -556,23 +653,33 @@ impl NgramSpec {
                 let sfx = &ctx[ctx.len() - o..];
                 let key = sfx[o - 1];
                 let fp = fingerprint(ord, sfx);
+                // Outcome gate. Skipping CONTINUES the order loop rather than
+                // breaking it, so a gram with a bad record falls through to a
+                // shorter order instead of ending the spine — the shorter gram
+                // is a worse prediction than a good long one, but a better one
+                // than a long gram we have measured as unreliable.
+                if self.suppressed(key, fp) {
+                    continue;
+                }
                 if let Some(h) = self.probe(key, fp) {
-                    hit = Some(h);
+                    hit = Some((h, key, fp));
                     break; // orders is longest-first
                 }
             }
-            let (next, next2, tier) = match hit {
+            let ((next, next2, tier), key, fp) = match hit {
                 Some(h) => h,
                 None => break,
             };
             self.spine.push(next);
             self.tiers.push(tier);
+            self.spine_grams.push((key, fp));
             ctx.push(next);
 
             // A stored second token is free — it needs no further block read.
             if next2 != NO_TOKEN && self.spine.len() < self.cfg.max_spine {
                 self.spine.push(next2);
                 self.tiers.push(tier);
+                self.spine_grams.push((key, fp));
                 ctx.push(next2);
             }
         }
@@ -596,6 +703,47 @@ impl NgramSpec {
         for t in self.tiers.iter().take(n) {
             self.stats.accepted_by_tier[t.idx()] += 1;
         }
+        // Per-gram outcome. Both halves matter: crediting alone would make every
+        // gram look perfect, and the rejected tail is the signal that identifies
+        // a frequent-but-unpredictable context.
+        for i in 0..self.spine_grams.len() {
+            let g = self.spine_grams[i];
+            self.note_outcome(g, i < n);
+        }
+    }
+
+    /// Record one proposal outcome, evicting wholesale if the ledger is full.
+    ///
+    /// Clearing rather than evicting one entry is deliberate: an LRU here would
+    /// cost a second index and this map exists to be cheap. Losing the ledger
+    /// costs nothing permanent — the gate simply stops suppressing until the
+    /// counts rebuild, which is the safe direction to fail.
+    fn note_outcome(&mut self, gram: (u32, u64), accepted: bool) {
+        if self.outcomes.len() >= self.outcomes_cap && !self.outcomes.contains_key(&gram) {
+            self.outcomes.clear();
+        }
+        self.outcomes.entry(gram).or_default().observe(accepted);
+    }
+
+    /// Has this gram measurably earned being skipped?
+    ///
+    /// False whenever the gate is off, the evidence is thin, or the gram is
+    /// unknown — the gate only ever acts on grams it has actually watched fail.
+    fn suppressed(&self, key: u32, fp: u64) -> bool {
+        if self.cfg.min_acceptance <= 0.0 {
+            return false;
+        }
+        match self.outcomes.get(&(key, fp)) {
+            Some(&o) if o.proposed >= self.cfg.min_acceptance_proposals => {
+                acceptance_lower_bound(o) < self.cfg.min_acceptance
+            }
+            _ => false,
+        }
+    }
+
+    /// Measured outcome for one gram, for tests and offline analysis.
+    pub fn outcome(&self, key: u32, fp: u64) -> Option<GramOutcome> {
+        self.outcomes.get(&(key, fp)).copied()
     }
 
     /// Compact and rebalance the writable store, folding in everything queued.
@@ -1084,5 +1232,116 @@ mod tests {
         assert_eq!(st.accepted_in(Tier::Hot), n as u64);
         assert_eq!(st.accepted_in(Tier::Base), 0);
         assert!(st.verify_efficiency() > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+
+    #[test]
+    fn the_bound_ranks_sustained_performance_above_a_lucky_streak() {
+        // The whole reason for a bound rather than accepted/proposed: the point
+        // estimate ranks 1-for-1 (100%) above 40-for-50 (80%), which is the same
+        // flaw `promote_count`'s raw threshold has one level up.
+        let lucky = GramOutcome {
+            proposed: 1,
+            accepted: 1,
+        };
+        let proven = GramOutcome {
+            proposed: 50,
+            accepted: 40,
+        };
+        assert!(
+            acceptance_lower_bound(proven) > acceptance_lower_bound(lucky),
+            "40/50 ({:.3}) must outrank 1/1 ({:.3})",
+            acceptance_lower_bound(proven),
+            acceptance_lower_bound(lucky)
+        );
+    }
+
+    #[test]
+    fn the_bound_is_conservative_and_tightens_with_evidence() {
+        // Same 80% rate, more evidence -> a higher (tighter) lower bound, but
+        // never above the rate itself.
+        let small = GramOutcome {
+            proposed: 10,
+            accepted: 8,
+        };
+        let large = GramOutcome {
+            proposed: 1000,
+            accepted: 800,
+        };
+        let (bs, bl) = (acceptance_lower_bound(small), acceptance_lower_bound(large));
+        assert!(bs < bl, "more evidence must tighten: {bs:.3} vs {bl:.3}");
+        assert!(
+            bl < 0.8,
+            "the bound must stay below the point estimate: {bl:.3}"
+        );
+        assert!(bl > 0.75, "1000 samples should be tight: {bl:.3}");
+    }
+
+    #[test]
+    fn no_evidence_is_not_evidence_of_badness() {
+        assert_eq!(acceptance_lower_bound(GramOutcome::default()), 0.0);
+        // ... and a gram with no record is never suppressed, whatever the bar.
+        let mut cfg = NgramConfig::default();
+        cfg.min_acceptance = 0.9;
+        let spec = NgramSpec::new(cfg);
+        assert!(!spec.suppressed(7, 0xdead_beef));
+    }
+
+    #[test]
+    fn the_gate_is_inert_until_both_the_bar_and_the_evidence_are_set() {
+        let mut cfg = NgramConfig::default();
+        cfg.min_acceptance_proposals = 4;
+        // Default bar is 0.0 = off, which is the shipped state.
+        assert_eq!(NgramConfig::default().min_acceptance, 0.0);
+
+        cfg.min_acceptance = 0.5;
+        let mut spec = NgramSpec::new(cfg);
+        let gram = (3u32, 99u64);
+        // Three rejections: below the evidence floor, so still not suppressed.
+        for _ in 0..3 {
+            spec.note_outcome(gram, false);
+        }
+        assert!(
+            !spec.suppressed(gram.0, gram.1),
+            "3 < min_acceptance_proposals"
+        );
+        // The fourth crosses the floor, and 0-for-4 is confidently below 0.5.
+        spec.note_outcome(gram, false);
+        assert!(
+            spec.suppressed(gram.0, gram.1),
+            "0/4 must suppress at a 0.5 bar"
+        );
+
+        // A gram that actually performs is never suppressed.
+        let good = (4u32, 100u64);
+        for _ in 0..20 {
+            spec.note_outcome(good, true);
+        }
+        assert!(!spec.suppressed(good.0, good.1));
+    }
+
+    #[test]
+    fn a_full_ledger_fails_toward_drafting_not_away_from_it() {
+        // Clearing loses counts, so the gate stops suppressing until they
+        // rebuild. That is the safe direction: it drafts more, never less.
+        let mut cfg = NgramConfig::default();
+        cfg.min_acceptance = 0.5;
+        cfg.min_acceptance_proposals = 1;
+        cfg.hot_capacity = 4;
+        let mut spec = NgramSpec::new(cfg);
+        let victim = (1u32, 1u64);
+        spec.note_outcome(victim, false);
+        assert!(spec.suppressed(victim.0, victim.1));
+        for i in 2..12u64 {
+            spec.note_outcome((i as u32, i), false);
+        }
+        assert!(
+            !spec.suppressed(victim.0, victim.1),
+            "an evicted gram must draft again, not stay condemned"
+        );
     }
 }
