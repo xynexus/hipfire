@@ -823,6 +823,8 @@ pub fn generate_dflash(
                     chain_floor: setup.chain_floor,
                     max_spine: setup.max_spine,
                     promote_count: setup.promote_count,
+                    min_acceptance: setup.min_acceptance,
+                    min_acceptance_proposals: setup.min_acceptance_proposals,
                     write_target: match setup.write_target {
                         Wt::User => WriteTarget::User,
                         Wt::Topic => WriteTarget::Topic,

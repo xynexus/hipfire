@@ -186,6 +186,12 @@ fn default_ngram_spec_store_mb() -> u32 {
 fn default_ngram_spec_orders() -> String {
     "8,7,6,5,4,3,2".to_string()
 }
+fn default_ngram_spec_min_acceptance() -> f64 {
+    0.0
+}
+fn default_ngram_spec_min_acceptance_proposals() -> u32 {
+    8
+}
 fn default_ngram_spec_chain_floor() -> u8 {
     8
 }
@@ -471,6 +477,10 @@ pub struct HipfireConfig {
     /// 20.6% efficiency; floor 8 -> 6.94 at 37.9%). 0 disables the gate.
     #[serde(default = "default_ngram_spec_chain_floor")]
     pub ngram_spec_chain_floor: u8,
+    #[serde(default = "default_ngram_spec_min_acceptance")]
+    pub ngram_spec_min_acceptance: f64,
+    #[serde(default = "default_ngram_spec_min_acceptance_proposals")]
+    pub ngram_spec_min_acceptance_proposals: u32,
     #[serde(default = "default_ngram_spec_max_spine")]
     pub ngram_spec_max_spine: u32,
     /// Observations before a gram is worth a disk write. Gates persistence
@@ -677,6 +687,8 @@ impl Default for HipfireConfig {
             ngram_spec_store_mb: default_ngram_spec_store_mb(),
             ngram_spec_orders: default_ngram_spec_orders(),
             ngram_spec_chain_floor: default_ngram_spec_chain_floor(),
+            ngram_spec_min_acceptance: default_ngram_spec_min_acceptance(),
+            ngram_spec_min_acceptance_proposals: default_ngram_spec_min_acceptance_proposals(),
             ngram_spec_max_spine: default_ngram_spec_max_spine(),
             ngram_spec_promote_count: default_ngram_spec_promote_count(),
             ngram_spec_write_target: default_ngram_spec_write_target(),

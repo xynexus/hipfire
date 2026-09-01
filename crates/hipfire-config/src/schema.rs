@@ -824,6 +824,36 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Minimum winning order to keep extending an n-gram chain; 0 disables."
     ),
     field!(
+        "ngram_spec_min_acceptance",
+        ConfigType::F64,
+        Requirement::Optional,
+        Some("0.0"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Suppress drafting from an n-gram whose MEASURED acceptance is confidently below \
+         this, judged by the lower bound of a Wilson interval rather than the raw rate. \
+         0 disables. Exists because observation count is a weak proxy for acceptance and \
+         at the top end an actively misleading one: on a 400k-token Rust replay, precision \
+         peaks at 62.9% for grams seen 9-16 times and FALLS to 56.7% for 17+, the largest \
+         bucket. Measured effect at 0.20 (the knee): accepted/step 2.10 -> 1.81, \
+         drafted/step 6.31 -> 3.74, verify efficiency 33.3% -> 48.5% — trading 14% of \
+         accepted tokens for 41% fewer drafted. Whether that is a win depends on what a \
+         wasted draft slot costs on your part, the same axis ngram_spec_chain_floor \
+         describes, so it ships off.",
+        validation: "0.0..=1.0"
+    ),
+    field!(
+        "ngram_spec_min_acceptance_proposals",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("8"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Proposals an n-gram needs before `ngram_spec_min_acceptance` may suppress it. \
+         Below this the confidence interval is too wide to act on and the gram drafts \
+         normally, so no gram is condemned on a short streak."
+    ),
+    field!(
         "ngram_spec_max_spine",
         ConfigType::U32,
         Requirement::Optional,
