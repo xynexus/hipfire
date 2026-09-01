@@ -74,6 +74,21 @@ anchor_for() {
     esac
 }
 
+# Families whose recurrent state IS a low-precision accumulator: the state is
+# held in fp16 and re-rounded every kernel invocation, with no error feedback, so
+# divergence grows superlinearly (BUGS.md measures 13x error for 2.5x tokens on
+# the DeltaNet analogue). For those, `logit_hash [exact]` asserts a property the
+# arithmetic does not have — mamba2/fp16 has taken four different values across
+# two architectures with no code change. `token_hash` stays blocking for every
+# family; only the sub-argmax noise is downgraded. Add a family here only with a
+# documented instance, not on suspicion: every other fp16 cell is stable.
+logit_is_advisory() {
+    case "$1" in
+        mamba2) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # ROCm/HIP toolchain version — changes kernel codegen, so it changes logit bits.
 hip_version() {
     hipconfig --version 2>/dev/null | head -1 | tr -d ' \n' || true
@@ -86,7 +101,7 @@ lookup_baseline() {
     awk -v g="$1" -v f="$2" -v q="$3" -v h="$4" '
         $1==g && $2==f && $3==q {
             env_hip = ""
-            for (i = 7; i <= NF; i++) {
+            for (i = 6; i <= NF; i++) {
                 if ($i ~ /^hip=/) { env_hip = substr($i, 5) }
             }
             if (env_hip == "")     { legacy = $4" "$5" legacy" }
@@ -116,6 +131,7 @@ P="$ROOT/target/release/examples/tiny_quant_probe"
 fail=0
 skip=0
 matched=0
+advisory=0
 declare -a RECORDED=()
 
 for raw_family in "${families[@]}"; do
@@ -166,7 +182,7 @@ for raw_family in "${families[@]}"; do
         continue
     fi
     env_hip="$(hip_version)"
-    RECORDED+=("$gpu_arch $family $fmt $logit_hash $token_hash 0 hip=$env_hip")
+    RECORDED+=("$gpu_arch $family $fmt $logit_hash $token_hash hip=$env_hip")
     if [ "$RECORD" = 1 ]; then
         echo "  $fmt: $logit_hash $token_hash ($gpu_arch hip=$env_hip) [record]"
         matched=$((matched + 1))
@@ -177,10 +193,19 @@ for raw_family in "${families[@]}"; do
     if [ -z "$base_logit" ] || [ -z "$base_token" ]; then
         echo "  NOTE no baseline for $gpu_arch/$family/$fmt at hip=$env_hip — observed $logit_hash $token_hash"
         skip=$((skip + 1))
-    elif [ "$base_logit" != "$logit_hash" ] || [ "$base_token" != "$token_hash" ]; then
-        echo "  FAIL drift: observed $logit_hash/$token_hash baseline $base_logit/$base_token [$base_scope]"
+    elif [ "$base_token" != "$token_hash" ]; then
+        echo "  FAIL token drift: observed $logit_hash/$token_hash baseline $base_logit/$base_token [$base_scope]"
         [ "$base_scope" = legacy ] && echo "         (matched a pre-env-key row; it may have been recorded under a different toolchain — hip=$env_hip here)"
         fail=$((fail + 1))
+    elif [ "$base_logit" != "$logit_hash" ]; then
+        if logit_is_advisory "$family"; then
+            echo "  ADVISORY logit drift (token stream identical): observed $logit_hash baseline $base_logit [$base_scope]"
+            advisory=$((advisory + 1))
+        else
+            echo "  FAIL logit drift: observed $logit_hash/$token_hash baseline $base_logit/$base_token [$base_scope]"
+            [ "$base_scope" = legacy ] && echo "         (matched a pre-env-key row; it may have been recorded under a different toolchain — hip=$env_hip here)"
+            fail=$((fail + 1))
+        fi
     else
         echo "  OK $fmt: matches baseline ($logit_hash/$token_hash)"
         matched=$((matched + 1))
@@ -190,7 +215,7 @@ done
 if [ "$RECORD" = 1 ]; then
     tmp_base="$(mktemp)"
     {
-        echo "# tiny-state AR hash baselines — gpu_arch family format logit_hash token_hash rel_tol"
+        echo "# tiny-state AR hash baselines — gpu_arch family format logit_hash token_hash [env...]"
         echo "# len=$LEN prompt_len=$PROMPT_LEN seed=$SEED"
     } >"$tmp_base"
     {
@@ -206,16 +231,18 @@ if [ "$RECORD" = 1 ]; then
     echo "tiny-state-gate: merged ${#RECORDED[@]} baseline(s) into $BASELINES"
     exit 0
 fi
+adv_note=""
+[ "$advisory" -gt 0 ] && adv_note=", $advisory advisory logit drift"
 if [ "$fail" -gt 0 ]; then
-    echo "tiny-state-gate: FAIL ($fail cell(s))"
+    echo "tiny-state-gate: FAIL ($fail cell(s)$adv_note)"
     exit 1
 fi
 if [ "$skip" -gt 0 ]; then
-    echo "tiny-state-gate: INCONCLUSIVE ($skip skipped/no-baseline cell(s), $matched matched)"
+    echo "tiny-state-gate: INCONCLUSIVE ($skip skipped/no-baseline cell(s), $matched matched$adv_note)"
     exit 3
 fi
-if [ "$matched" -gt 0 ]; then
-    echo "tiny-state-gate: PASS ($matched cell(s))"
+if [ "$((matched + advisory))" -gt 0 ]; then
+    echo "tiny-state-gate: PASS ($matched cell(s)$adv_note)"
     exit 0
 fi
 echo "tiny-state-gate: INCONCLUSIVE (no cells ran)"
