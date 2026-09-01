@@ -1926,7 +1926,9 @@ pub fn llt_lower_right_looking_gpu(
 /// object, which a raw device-produced factor cannot supply. So the inverse is
 /// built directly instead: with `H+λI = C·Cᵀ` (C lower),
 ///
+/// ```text
 ///     (H+λI)⁻¹ = C⁻ᵀ·C⁻¹
+/// ```
 ///
 /// via a lower-triangular inverse then one symmetric product — the same O(k³/3)
 /// each that faer's `inverse()` costs, with no `Llt` required. That leaves the

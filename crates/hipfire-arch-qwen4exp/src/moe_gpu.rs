@@ -148,6 +148,82 @@ impl ExpertStack {
         })
     }
 
+    /// Both projections of expert `e`, resolved in ONE pager round-trip.
+    ///
+    /// `gate_up.expert()` + `down.expert()` each take the mutex, hash the key and
+    /// call `ensure_expert_module_resident` — **for the same module**, since one
+    /// module holds both projections. The second is a cache hit but still pays
+    /// lock, hash and an LRU touch. At 48 layers x top-10 that is ~960 round
+    /// trips per token where ~480 suffice.
+    ///
+    /// That overhead is the cost, not fetching: a 48 GiB budget with ZERO
+    /// evictions measured no faster (0.27 s/tok) than an 8 GiB budget thrashing
+    /// 15670 of them (0.25) — so the paged-vs-eager gap is fixed per-access work.
+    ///
+    /// Residency is still ensured immediately before use, so nothing may be
+    /// evicted between ensuring and reading it. That is why this resolves ONE
+    /// expert rather than pre-ensuring the whole top-k: with a tight budget,
+    /// ensuring expert k can evict expert 1.
+    pub fn expert_pair(
+        gate_up: &ExpertStack,
+        down: &ExpertStack,
+        gpu: &mut Gpu,
+        e: usize,
+    ) -> HipResult<(WeightTensor, WeightTensor)> {
+        // Only the paged/paged case can share a round-trip; anything else falls
+        // back to the independent path, which is already lock-free.
+        let (ExpertStack::Paged(gp), ExpertStack::Paged(dp)) = (gate_up, down) else {
+            return Ok((gate_up.expert(gpu, e)?, down.expert(gpu, e)?));
+        };
+        debug_assert_eq!(
+            gp.layer, dp.layer,
+            "gate_up and down must page from the same layer"
+        );
+        use hipfire_runtime::weight_pager::ExpertModuleKey;
+        let key = ExpertModuleKey {
+            layer: gp.layer,
+            expert: e as u16,
+        };
+        let mut pager = gp
+            .pager
+            .lock()
+            .map_err(|_| HipError::new(0, "qwen4_exp: expert pager mutex poisoned"))?;
+        pager
+            .ensure_expert_module_resident(key, gpu)
+            .map_err(|err| {
+                HipError::new(
+                    0,
+                    &format!("qwen4_exp paged expert l{} e{e}: {err}", gp.layer),
+                )
+            })?;
+        let views = pager.resident_expert_views(key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!(
+                    "qwen4_exp paged expert l{} e{e}: resident but no view",
+                    gp.layer
+                ),
+            )
+        })?;
+        let mk = |rel: usize, p: &PagedExperts| -> WeightTensor {
+            let len = views.buf.numel().saturating_sub(rel);
+            let mut buf = views.buf.sub_offset(rel, len);
+            if p.dtype == DType::F32 {
+                buf.shape = vec![p.rows, p.cols];
+            }
+            WeightTensor {
+                buf,
+                gpu_dtype: p.dtype,
+                m: p.rows,
+                k: p.cols,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        };
+        Ok((mk(views.gate_up_rel, gp), mk(views.down_rel, dp)))
+    }
+
     pub fn free(self, gpu: &mut Gpu) {
         match self {
             ExpertStack::Resident { buf, .. } => {
@@ -274,8 +350,7 @@ pub fn moe_forward(
         let e = e.max(0) as usize;
         // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
         // runs its own kernel rather than being dequantised into scratch.
-        let gu = w.gate_up.expert(gpu, e)?;
-        let dn = w.down.expert(gpu, e)?;
+        let (gu, dn) = ExpertStack::expert_pair(&w.gate_up, &w.down, gpu, e)?;
         weight_gemv(gpu, &gu, x, &s.gu)?;
         // Contiguous halves of the projection output, gate FIRST.
         let gate = s.gu.sub_offset(0, mi);

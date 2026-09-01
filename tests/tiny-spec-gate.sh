@@ -94,7 +94,16 @@ if [[ "${HIPFIRE_TINY_SPEC_SKIP_DFLASH:-0}" != "1" ]]; then
         echo "tiny-spec-gate: FAIL spec-loop AR baseline"; tail -5 "$SPEC_DIR/ar.log"
         exit 1
     fi
-    if ! HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1 \
+    # HIPFIRE_DN_STATE_FP16=0 is REQUIRED, not belt-and-braces. The checkpoint
+    # path needs FP32 DeltaNet state; with the session's default FP16 the
+    # runtime prints
+    #   "DFlash checkpoint rollback: DISABLED - it needs FP32 DeltaNet state
+    #    and this session resolved FP16"
+    # and silently skips the snapshot allocation, so replay_checkpoint stays 0
+    # and the assertion below fails no matter what the code does. That is what
+    # it did from the day this stage landed: the gate demanded coverage it had
+    # itself made unreachable.
+    if ! HIPFIRE_DFLASH_CHECKPOINT_ROLLBACK=1 HIPFIRE_DN_STATE_FP16=0 \
         cargo run -q -p hipfire-runtime --features deltanet --example dflash_spec_demo -- \
         "${SPEC_ARGS[@]}" > "$SPEC_DIR/ckpt.log" 2>&1; then
         echo "tiny-spec-gate: FAIL spec-loop checkpoint run"; tail -5 "$SPEC_DIR/ckpt.log"

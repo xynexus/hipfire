@@ -1300,6 +1300,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -1455,6 +1457,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -1566,6 +1570,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -1663,6 +1669,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -1791,6 +1799,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -1891,6 +1901,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -2004,6 +2016,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -2104,6 +2118,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -2225,6 +2241,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -2352,6 +2370,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -2595,6 +2615,8 @@ pub fn load_model(
                 #[cfg(feature = "arch-lfm2moe")]
                 lfm2_dflash,
                 dflash: None,
+                // Opt-in; the daemon fills this in from `ngram_spec` after load.
+                ngram: None,
                 dspark: None,
                 chat_template,
                 chat_template_profile,
@@ -2995,6 +3017,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark: None,
             chat_template,
             chat_template_profile,
@@ -3146,6 +3170,8 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            // Opt-in; the daemon fills this in from `ngram_spec` after load.
+            ngram: None,
             dspark,
             chat_template,
             chat_template_profile,
@@ -3626,6 +3652,8 @@ pub fn load_model_pp(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2_dflash: None,
         dflash: None,
+        // Opt-in; the daemon fills this in from `ngram_spec` after load.
+        ngram: None,
         dspark: None,
         chat_template,
         chat_template_profile,
@@ -4141,8 +4169,6 @@ pub fn ngram_only_state(
         adaptive_b: false,
         // DDTree is a tree over a drafter's candidates.
         ddtree: None,
-        ngram: None,
-        ngram_live: None,
     })
 }
 
@@ -4395,9 +4421,6 @@ fn load_dflash_state_source(
         // trained (scope doc item 4) and the search space contains a win.
         adaptive_b: false,
         ddtree,
-        // Opt-in; the daemon fills this in from `ngram_spec` after load.
-        ngram: None,
-        ngram_live: None,
     })
 }
 

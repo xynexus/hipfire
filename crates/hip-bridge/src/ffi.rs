@@ -1036,6 +1036,7 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        crate::copy_census::record(std::panic::Location::caller(), size);
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         let loc = std::panic::Location::caller();
@@ -1077,7 +1078,9 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2D offset")
     }
 
+    #[track_caller]
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        crate::copy_census::record(std::panic::Location::caller(), src.len());
         assert!(
             src.len() <= dst.size,
             "source ({}) exceeds device buffer ({})",
@@ -1183,6 +1186,7 @@ impl HipRuntime {
         src: &DeviceBuffer,
         size: usize,
     ) -> HipResult<()> {
+        crate::copy_census::record(std::panic::Location::caller(), size);
         assert!(size <= dst.size && size <= src.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();

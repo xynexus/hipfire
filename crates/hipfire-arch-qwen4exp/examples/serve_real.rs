@@ -52,7 +52,16 @@ fn main() {
     );
 
     // A short prompt: prefill is per-token, and this model has 48 layers.
-    let prompt: Vec<u32> = vec![9707u32, 11, 1879, 0];
+    // Length overridable (argv[3]) so prefill SCALING can be measured: this
+    // trunk prefills one token at a time, so cost should be strictly linear and
+    // the slope is what a batched forward would attack.
+    let prompt_len: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let prompt: Vec<u32> = (0..prompt_len)
+        .map(|i| 9707u32 + (i as u32 % 977))
+        .collect();
     let t1 = Instant::now();
     m.prefill(&mut gpu, &prompt).expect("prefill");
     let logits = gpu.download_f32(m.logits()).expect("download");
@@ -80,7 +89,13 @@ fn main() {
     let mut tok = am as u32;
     let mut moved = false;
     let t2 = Instant::now();
-    let steps = 4;
+    // 4 steps is a liveness check, not a throughput measurement: with paged
+    // experts the first tokens are dominated by cold page-ins, so a short run
+    // reports the warm-up rather than the steady state. Override to measure.
+    let steps: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     for i in 0..steps {
         m.decode_step(&mut gpu, tok, prompt.len() + i)
             .expect("decode");

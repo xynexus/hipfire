@@ -2253,8 +2253,23 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        self.quantize_act_oq8_batched(x_rot, m, k, n)?;
-        self.gemm_oq8_grouped_prequant(w_combined, y, m, k, n)
+        self.gemm_oq8_grouped_act_batched_g(w_combined, x_rot, y, m, k, n, 256)
+    }
+
+    /// [`Self::gemm_oq8_grouped_act_batched`] with an explicit group size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq8_grouped_act_batched_g(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.quantize_act_oq8_batched_g(x_rot, m, k, n, group)?;
+        self.gemm_oq8_grouped_prequant_g(w_combined, y, m, k, n, group)
     }
 
     /// Quantize the rotated activation into the shared oq8 batched scratch.
@@ -2339,11 +2354,28 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        self.quantize_act_oq8_batched_g(x_rot, m_max, k, n, 256)
+    }
+
+    /// [`Self::quantize_act_oq8_batched`] with an explicit group size.
+    ///
+    /// ⚠️ `x_rot` must already carry the rotation basis matching `group` —
+    /// FWHT-256 (sign seeds 42/1042) for a 256 group, FWHT-128 (43/1043) for a
+    /// 128 one. This function quantizes; it does not rotate, and a mismatched
+    /// basis does not cancel and produces plausible-looking wrong logits.
+    pub fn quantize_act_oq8_batched_g(
+        &mut self,
+        x_rot: &GpuTensor,
+        m_max: usize,
+        k: usize,
+        n: usize,
+        group: usize,
+    ) -> HipResult<()> {
         // Any re-quantize invalidates the k-major twin above.
         self.oq_act_gen = self.oq_act_gen.wrapping_add(1);
-        const GROUP: usize = 256;
-        self.ensure_oq8_scratch_batched(n, k, m_max)?;
-        let ng = k / GROUP;
+        let group_sz = group;
+        self.ensure_oq8_scratch_batched_g(n, k, m_max, group_sz)?;
+        let ng = k / group_sz;
         let xq = GpuTensor {
             buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * k],
@@ -2354,7 +2386,7 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        self.quantize_act_oq8(x_rot, &xq, &xs, n, k, GROUP)
+        self.quantize_act_oq8(x_rot, &xq, &xs, n, k, group_sz)
     }
 
     /// One grouped int8-WMMA GEMM against the activation already quantized into
@@ -2400,9 +2432,27 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        const GROUP: usize = 256;
-        self.ensure_oq8_scratch_batched(n, k, m)?;
-        let ng = k / GROUP;
+        self.gemm_oq8_grouped_prequant_g(w_combined, y, m, k, n, 256)
+    }
+
+    /// [`Self::gemm_oq8_grouped_prequant`] with an explicit group size.
+    ///
+    /// `w_combined` is `[int8 weights | f32 scales]`, and the scale plane starts
+    /// at `m * k` with `m * (k / group)` entries — so the group determines where
+    /// the weights end and the scales begin. Passing the wrong one reads scales
+    /// out of the weight bytes.
+    pub fn gemm_oq8_grouped_prequant_g(
+        &mut self,
+        w_combined: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        let group_sz = group;
+        self.ensure_oq8_scratch_batched_g(n, k, m, group_sz)?;
+        let ng = k / group_sz;
         let xq = GpuTensor {
             buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * k],
@@ -2414,7 +2464,7 @@ impl Gpu {
             dtype: DType::F32,
         };
         let ws = w_combined.sub_offset(m * k, m * ng * 4);
-        self.gemm_oq8_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        self.gemm_oq8_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, group_sz)
     }
 
     /// Batched W8A8 oq8 GEMM with residual add: `residual[N×M] += W·x_rot`.

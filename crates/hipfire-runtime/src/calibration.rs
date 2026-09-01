@@ -37,6 +37,13 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
+/// Sequence length calibration splits to when `HIPFIRE_CALIB_SEQ_LEN` is unset.
+///
+/// 2048 because that is what KLD references are built at — calibrating under a
+/// longer context than is served is a mismatch, and the attention cost of the
+/// unbounded alternative is O(n²) in the token budget.
+pub const DEFAULT_CALIB_SEQ_LEN: usize = 2048;
+
 /// Split a calibration token stream into independent sequences, per
 /// `HIPFIRE_CALIB_SEQ_LEN`. This is the chunking POLICY, owned by the shared
 /// seam so no arch can accidentally calibrate under one unbounded context.
@@ -52,7 +59,19 @@ const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 /// zaya1-8b at 32768 tokens: 10746 s → 1065 s, quality unchanged
 /// (`docs/quant-formats/moe-expert-hessians.md`, Q6).
 ///
-/// Unset yields a single sequence, the historical behaviour.
+/// **Default 2048 as of 2026-09-01.** Unset used to yield a single unbounded
+/// sequence, which meant the historical behaviour was the O(n²) one and every
+/// caller had to know to set the variable to avoid it. Two reasons the default
+/// is the right place to fix that rather than the call sites:
+///
+/// * the cost is quadratic in the budget, so the larger the calibration run the
+///   worse the unset default behaves — precisely backwards;
+/// * KLD references are built at `n_ctx=2048`, so 2048 also makes calibration
+///   match the context actually served, instead of calibrating under a longer
+///   one.
+///
+/// Set `HIPFIRE_CALIB_SEQ_LEN` to override; a value below 2 restores the single
+/// unbounded sequence, which is now the thing you have to ask for.
 ///
 /// The ARCH still owns what "independent" means for it — resetting KV, SSM or
 /// recurrent state between sequences, and restarting positions at 0.
@@ -63,7 +82,7 @@ pub fn calib_sequences<'a>(inputs: &[&'a [u32]]) -> Vec<&'a [u32]> {
     let seq_len = hipfire_env::CALIB_SEQ_LEN
         .parse::<usize>()
         .filter(|n| *n >= 2)
-        .unwrap_or(usize::MAX);
+        .unwrap_or(DEFAULT_CALIB_SEQ_LEN);
     let n_in: usize = inputs.iter().map(|s| s.len()).sum();
     // A 1-token sequence has no next-token target and contributes only a
     // degenerate row, so drop a trailing remainder of one.
@@ -2282,5 +2301,58 @@ mod tests {
         }
         drop(hfq);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod calib_sequence_default_tests {
+    use super::{calib_sequences, DEFAULT_CALIB_SEQ_LEN};
+
+    /// The DEFAULT must split. This used to be `usize::MAX` — one unbounded
+    /// sequence — so the O(n²) shape was what you got unless you knew to set
+    /// `HIPFIRE_CALIB_SEQ_LEN`, and the cost grew with the very budget that
+    /// makes calibration worth doing. Measured on zaya1-8b at 32768 tokens:
+    /// 10746 s -> 1065 s, quality unchanged.
+    ///
+    /// ⚠️ The input length is a LITERAL, not derived from the constant. A first
+    /// version of this test sized its input as `DEFAULT_CALIB_SEQ_LEN * 3`, so
+    /// raising the constant grew the input to match and the assertion held for
+    /// any value — it could not fail. Keep the literal.
+    ///
+    /// Guarded on the env var being unset, because these tests share a process
+    /// and the variable is read at call time.
+    #[test]
+    fn the_default_splits_rather_than_running_one_unbounded_sequence() {
+        if std::env::var("HIPFIRE_CALIB_SEQ_LEN").is_ok() {
+            return; // an explicit override is being exercised elsewhere
+        }
+        let toks: Vec<u32> = (0..6644u32).collect(); // literal: ~3.2x of 2048
+        let out = calib_sequences(&[&toks[..]]);
+        assert!(
+            out.len() > 1,
+            "the default must chunk 6644 tokens; got {} sequence(s), which is the \
+             O(n^2) shape this default exists to prevent",
+            out.len()
+        );
+        assert!(
+            out.iter().all(|s| s.len() <= 2048),
+            "no sequence may exceed 2048"
+        );
+        // 2048 matches the n_ctx KLD references are built at; drifting from that
+        // reintroduces the calibrate-long/serve-short mismatch.
+        assert_eq!(DEFAULT_CALIB_SEQ_LEN, 2048);
+    }
+
+    /// A trailing 1-token remainder has no next-token target and would
+    /// contribute a degenerate row, so it is dropped rather than kept.
+    #[test]
+    fn a_one_token_remainder_is_dropped() {
+        if std::env::var("HIPFIRE_CALIB_SEQ_LEN").is_ok() {
+            return;
+        }
+        let toks: Vec<u32> = (0..2049u32).collect(); // literal 2048 + 1
+        let out = calib_sequences(&[&toks[..]]);
+        assert_eq!(out.len(), 1, "the 1-token tail must not become a sequence");
+        assert_eq!(out[0].len(), 2048);
     }
 }

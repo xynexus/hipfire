@@ -6,6 +6,9 @@
 
 pub mod arch_caps;
 mod compiler;
+/// Kernels hipcc-compiled in this process. A benchmark that sees a non-zero
+/// count is timing compilation as well as the model — see the constant's doc.
+pub use compiler::jit_compiles;
 mod dispatch;
 pub mod feature_flags;
 pub mod gdn_chunk;

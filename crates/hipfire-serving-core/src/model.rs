@@ -135,10 +135,25 @@ pub struct DflashState {
     /// the decode loop falls through to `spec_step_dflash` (chain mode).
     /// See `spec_step_ddtree_batched` for the tree-verify path.
     pub ddtree: Option<DdtreeState>,
-    /// Opt-in n-gram speculative decode (`ngram_spec`). `None` = off, and the
-    /// decode loop behaves exactly as before. See `NgramSetup`.
-    pub ngram: Option<NgramSetup>,
-    /// The live n-gram state, kept across requests for the life of the load.
+}
+
+/// Drafter-free n-gram speculative decode, owned by the MODEL.
+///
+/// It used to live on [`DflashState`], which was the wrong home twice over: the
+/// feature needs no drafter, and a `DflashState` is the one place it could be
+/// stored, so on a model without a drafter the setup was built and then dropped
+/// on the floor. Hanging it off `LoadedModel` instead means any decode path can
+/// reach it — today only the qwen35-shaped `generate()` body does, but that is
+/// now a wiring gap rather than a type-level impossibility.
+///
+/// It does NOT make n-gram spec decode arch-generic on its own. Verification
+/// still runs through `spec_step_dflash`, which wants DFlash's verify scratch,
+/// snapshot and tape; making THAT generic needs a multi-token verify seam on
+/// `ServingBackend`, which has none today.
+pub struct NgramState {
+    /// Static configuration, from the `ngram_spec*` settings at load.
+    pub setup: NgramSetup,
+    /// Live tables, kept across requests for the life of the load.
     ///
     /// This has to outlive a single request or the feature is decorative: the
     /// hot tier carries ~95% of the measured value and grams only reach disk
@@ -146,7 +161,32 @@ pub struct DflashState {
     /// every counter and almost nothing is ever promoted. The `String` is the
     /// scope key (user + session type); a request with a different key swaps
     /// the state out rather than reading another user's table.
-    pub ngram_live: Option<(String, hipfire_specdecode_ngram::NgramSpec)>,
+    pub live: Option<(String, hipfire_specdecode_ngram::NgramSpec)>,
+}
+
+impl NgramState {
+    pub fn new(setup: NgramSetup) -> Self {
+        Self { setup, live: None }
+    }
+
+    /// Take the live tables if they belong to `key`, otherwise drop them.
+    ///
+    /// This is the privacy boundary of the feature, not a cache policy: the
+    /// tables are built from one scope's decoded tokens, so handing them to a
+    /// request with a different scope key would let one user's text draft
+    /// another's. Returning `None` costs a cold start; returning the wrong
+    /// state leaks. A dropped state is merged first so what it staged still
+    /// reaches disk.
+    pub fn take_live_for(&mut self, key: &str) -> Option<hipfire_specdecode_ngram::NgramSpec> {
+        match self.live.take() {
+            Some((k, prev)) if k == key => Some(prev),
+            Some((_, mut prev)) => {
+                let _ = prev.merge();
+                None
+            }
+            None => None,
+        }
+    }
 }
 
 /// Per-request identity used to pick n-gram tables.
@@ -571,6 +611,9 @@ pub struct LoadedModel {
     pub memory: ModelArtifactMemory,
     // DFlash speculative decoding state (populated when load supplied a draft).
     pub dflash: Option<DflashState>,
+    // Drafter-free n-gram speculative decode (`ngram_spec`). `None` = off.
+    // Deliberately NOT inside `dflash`: it needs no drafter. See `NgramState`.
+    pub ngram: Option<NgramState>,
     // DSpark speculative decoding state for the dense LLaMA/Qwen3 arch (0/1),
     // populated when a `.dspark.hfq` sidecar is discovered next to the target.
     pub dspark: Option<DsparkState>,
@@ -617,6 +660,51 @@ impl LoadedModel {
 #[cfg(test)]
 mod ngram_setup_tests {
     use super::*;
+
+    fn setup() -> NgramSetup {
+        NgramSetup {
+            store_root: std::path::PathBuf::from("ram"),
+            scope: "s".into(),
+            blocks: 1,
+            orders: vec![2],
+            chain_floor: 0,
+            max_spine: 1,
+            promote_count: 1,
+            write_target: NgramWriteTarget::User,
+        }
+    }
+
+    /// A request must never inherit live tables staged under a different scope
+    /// key. The key is user + session type, so a mismatch here is one user's
+    /// decoded text drafting another user's request — a leak, not a cache miss.
+    #[test]
+    fn live_tables_never_cross_a_scope_key() {
+        let mut st = NgramState::new(setup());
+        let cfg = hipfire_specdecode_ngram::NgramConfig::default();
+
+        st.live = Some((
+            "alice\u{1}chat".into(),
+            hipfire_specdecode_ngram::NgramSpec::new(cfg.clone()),
+        ));
+        assert!(
+            st.take_live_for("bob\u{1}chat").is_none(),
+            "bob must not receive alice's tables"
+        );
+        assert!(
+            st.live.is_none(),
+            "the mismatched state must be dropped, not left for the next caller"
+        );
+
+        st.live = Some((
+            "alice\u{1}chat".into(),
+            hipfire_specdecode_ngram::NgramSpec::new(cfg),
+        ));
+        assert!(
+            st.take_live_for("alice\u{1}chat").is_some(),
+            "the same scope must carry its own tables across requests, or the hot \
+             tier is rebuilt per request and the feature is decorative"
+        );
+    }
 
     /// `persists()` reads the `ngram_store_root` schema field's arm rather than
     /// its own list, so the two cannot drift. This is what binds them: a
