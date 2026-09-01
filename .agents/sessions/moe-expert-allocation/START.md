@@ -1,5 +1,16 @@
 # Session: stack the HFQ loader's routed experts into per-layer storage
 
+**DONE 2026-09-01 — `484af81bd`.** Landed on `docs/moe-alloc-decision`.
+Measured on `Qwen3.6-35B-A3B--oq4.25++`: peak GTT **23.08 → 19.13 GiB**
+(−3.96 GiB), decode 60.3 → 60.0 tok/s, output byte-identical, tiny gate green.
+
+⚠️ **The −35.4 GiB payoff below did NOT hold. The real number is −3.96 GiB.**
+Mechanism was right, magnitude was 9x optimistic — see "Why the prediction was
+wrong" at the bottom. Everything from here down is the original brief, kept for
+the reasoning; read the correction first.
+
+---
+
 **UNBLOCKED 2026-09-01 — decided: reuse `RawExpertStorage` (two owning
 allocations per LAYER).** Not "an arena per expert", and not a new allocator.
 
@@ -154,3 +165,53 @@ either way. The allocation SHAPE is the only lever.
 - ⚠️ `mamba2/fp16` in the tiny-state gate is currently RED for unrelated reasons
   (`docs/bugs/2026-09-01-mamba2-tiny-state-drift.md`) — logit-only, token stream
   identical. Do not read it as caused by this change; check the other 17 cells.
+
+
+---
+
+## Why the prediction was wrong (measured 2026-09-01, after the change landed)
+
+The payoff table said −35.4 GiB at 1.969x. The load shows **−3.96 GiB at
+1.247x**. Three compounding errors, all in the same direction:
+
+**1. The per-expert size was wrong for this artifact.** The brief's 2 129 920 B
+gate_up / 1 064 960 B down are twice the real ones. `Qwen3.6-35B-A3B--oq4.25++`
+carries **1 114 112 B gate_up and 557 056 B down**, and 40 layers, not 48.
+
+**2. `gtt_granularity` measures ONE SIZE AT A TIME, and that is not the shape
+the loader allocates in.** Re-run against the real sizes, the example still
+reproduces its own numbers:
+
+| requested | per-alloc consumed | ratio |
+|---|---|---|
+| 1 114 112 (gate_up) | 2 096 103 | 1.881x |
+| 557 056 (down) | 698 352 | 1.254x |
+
+But the driver **suballocates from 2 MiB blocks** — it is not a flat 2 MiB per
+allocation, which is why 557 056 measures 1.254x and not 3.76x: three of them
+pack into one block. In a uniform stream only ONE 1 114 112 B gate_up fits per
+block, so it measures 1.881x. **The loader's stream is not uniform.** It
+alternates gate_up, down, gate_up, down — and `1 114 112 + 557 056 =
+1 671 168`, which fits ONE 2 MiB block. The pair costs 2 MiB, i.e. **1.255x**,
+and the load measured **1.247x**. The isolated 1.881x was never available to
+win back.
+
+**3. So the rule is not "alignment, not size" — it is packing.** An exact 2 MiB
+multiple still costs exactly its size (the stacked buffers here are
+285 212 672 B = 136.0 x 2 MiB and 142 606 336 B = 68.0 x 2 MiB, both exact), so
+the fix is right. But a sub-2 MiB allocation does not automatically pay a whole
+granule; it pays for the fraction of a block its NEIGHBOURS cannot use.
+
+**What to take forward.** Before predicting a GTT win from allocation shape,
+measure the sizes the loader actually emits (`HIPFIRE_ALLOC_REPORT=1`) and feed
+the interleaved stream, not one size in a loop. `gtt_granularity` answers "what
+does N of THIS size cost", which is a different and more pessimistic question.
+
+The change is still worth having: −3.96 GiB is 17% of this model's footprint,
+throughput is unchanged, and it collapsed two divergent MoE teardown paths into
+one that no longer leaks the AWQ sidecars or the stride tensors.
+
+**Follow-on, if a bigger win is wanted:** the residual tax is now in the
+2 MiB-block packing of everything ELSE, not the experts. `HIPFIRE_ALLOC_REPORT`
+on the post-change binary shows the next-largest repeated shapes are 10 561 x
+8 192 B and 10 445 x 2 048 B — small, numerous, and unstacked.
