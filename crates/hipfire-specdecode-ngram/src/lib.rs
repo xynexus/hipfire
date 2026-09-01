@@ -697,6 +697,28 @@ impl NgramSpec {
     /// to another.
     pub fn reset_sequence(&mut self) {
         self.hist.clear();
+        // Request-SPECIFIC state goes with the history; LEARNED state stays.
+        // Same split `BlockController::reset` makes ("reset only
+        // request-specific state ... calibrate once, reuse across requests"),
+        // and for the same reason.
+        //
+        // The per-gram outcome ledger belongs on the request side because it
+        // STEERS DRAFTING. `take_live_for` hands the whole `NgramSpec` back to
+        // the next request with a matching scope, so a ledger that survived
+        // would make request B's drafts depend on request A having run — and
+        // replaying B alone would then not reproduce it. That is the property
+        // the fused-batch investigation checked for and found intact ("does a
+        // session's output depend on who else is in the batch"), so it is worth
+        // keeping intact here.
+        //
+        // The hot and cold tables are NOT cleared: they are the learned content,
+        // carrying them is the entire point, and `reset()` is the caller that
+        // wants them gone.
+        self.outcomes.clear();
+        self.spine.clear();
+        self.tiers.clear();
+        self.spine_grams.clear();
+        self.spine_token_cap = None;
     }
 
     /// Forget everything session-local, hot table included. The on-disk stores
@@ -1630,6 +1652,58 @@ mod width_seam_tests {
         assert!(
             undriven > steps_cap,
             "max_spine ({steps_cap}) bounds steps, not tokens; drafted {undriven}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_scoping_tests {
+    use super::*;
+
+    /// The outcome ledger steers drafting, so it must not outlive the request.
+    /// The learned tables must, because carrying them is the point.
+    #[test]
+    fn reset_sequence_drops_outcomes_but_keeps_the_learned_table() {
+        let mut cfg = NgramConfig::default();
+        cfg.min_acceptance = 0.5;
+        cfg.min_acceptance_proposals = 1;
+        let mut spec = NgramSpec::new(cfg);
+
+        // Learn something, and condemn a gram.
+        let cycle: Vec<u32> = (0..8).collect();
+        for _ in 0..32 {
+            spec.observe(&cycle);
+        }
+        let learned = spec.hot_len();
+        let gram = (5u32, 12345u64);
+        spec.note_outcome(gram, false);
+        spec.note_outcome(gram, false);
+        assert!(spec.suppressed(gram.0, gram.1), "the gram is condemned");
+
+        spec.reset_sequence();
+
+        assert!(
+            !spec.suppressed(gram.0, gram.1),
+            "a verdict from the PREVIOUS request must not steer this one"
+        );
+        assert_eq!(spec.outcome(gram.0, gram.1), None, "the ledger is cleared");
+        assert_eq!(
+            spec.hot_len(),
+            learned,
+            "the learned table must survive — carrying it is the point"
+        );
+    }
+
+    /// A controller's width cap belongs to the request that set it.
+    #[test]
+    fn reset_sequence_releases_the_controller_cap() {
+        let mut spec = NgramSpec::new(NgramConfig::default());
+        spec.set_spine_token_cap(Some(3));
+        spec.reset_sequence();
+        assert_eq!(
+            spec.spine_token_cap(),
+            None,
+            "the next request re-derives its own width from its own controller"
         );
     }
 }
