@@ -232,6 +232,11 @@ pub struct NgramSetup {
     pub promote_count: u16,
     /// Which store the write path feeds.
     pub write_target: NgramWriteTarget,
+    /// Confidence-bounded acceptance floor below which a gram stops drafting.
+    /// 0 disables. See `ngram_spec_min_acceptance`.
+    pub min_acceptance: f32,
+    /// Proposals required before that floor may act.
+    pub min_acceptance_proposals: u32,
 }
 
 impl NgramSetup {
@@ -668,6 +673,8 @@ mod ngram_setup_tests {
             blocks: 1,
             orders: vec![2],
             chain_floor: 0,
+            min_acceptance: 0.0,
+            min_acceptance_proposals: 8,
             max_spine: 1,
             promote_count: 1,
             write_target: NgramWriteTarget::User,
@@ -721,6 +728,8 @@ mod ngram_setup_tests {
                 chain_floor: 0,
                 max_spine: 1,
                 promote_count: 1,
+                min_acceptance: 0.0,
+                min_acceptance_proposals: 8,
                 write_target: NgramWriteTarget::User,
             };
             assert!(
@@ -743,6 +752,8 @@ mod ngram_setup_tests {
             chain_floor: 0,
             max_spine: 1,
             promote_count: 1,
+            min_acceptance: 0.0,
+            min_acceptance_proposals: 8,
             write_target: NgramWriteTarget::User,
         };
         for off in [

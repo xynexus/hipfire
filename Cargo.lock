@@ -1767,6 +1767,7 @@ dependencies = [
  "hipfire-rocm",
  "hipfire-runtime",
  "hipfire-specdecode",
+ "hipfire-specdecode-ngram",
  "hipfire-steer",
  "libc",
  "libloading",

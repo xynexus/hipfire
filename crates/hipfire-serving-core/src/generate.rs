@@ -823,6 +823,8 @@ pub fn generate_dflash(
                     chain_floor: setup.chain_floor,
                     max_spine: setup.max_spine,
                     promote_count: setup.promote_count,
+                    min_acceptance: setup.min_acceptance,
+                    min_acceptance_proposals: setup.min_acceptance_proposals,
                     write_target: match setup.write_target {
                         Wt::User => WriteTarget::User,
                         Wt::Topic => WriteTarget::Topic,
@@ -1101,6 +1103,21 @@ pub fn generate_dflash(
             // n-gram first: a hit shrinks the verify batch to the spine and
             // skips the drafter forward entirely; a miss leaves this `None`
             // and the drafter runs.
+            // Let the throughput controller drive the n-gram spine too. It
+            // already argmaxes committed-tokens / window-wall-time for the
+            // DFlash block from live timing, and it is drafter-agnostic by
+            // design — everything it needs is accept depth, proposal count and
+            // wall time, all of which this path already reports below. Driving
+            // one controller is the point: a second, n-gram-specific width
+            // estimator would re-derive the same quantity from the same clock,
+            // and re-learn the ramp and cap-trap fixes this one already carries.
+            // A TOKEN cap, not `cfg.max_spine`: that bounds probe steps, and a
+            // step carrying an inline `next2` emits two tokens, so setting it
+            // from `block()` would steer roughly double the intended width and
+            // fit the controller's cost model against the wrong number.
+            if let (Some(c), Some(n)) = (block_controller.as_ref(), ngram.as_mut()) {
+                n.set_spine_token_cap(Some(c.block()));
+            }
             ngram_spine = ngram.as_mut().and_then(|n| n.draft().map(|sp| sp.to_vec()));
             spec_step_dflash(
                 gpu,

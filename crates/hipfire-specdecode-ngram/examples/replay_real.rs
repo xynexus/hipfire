@@ -32,6 +32,8 @@ fn main() {
     let mut chain_floor = 8u8;
     let mut merge_every = 0usize;
     let mut hot_cap = 1usize << 20;
+    let mut min_acceptance = 0.0f32;
+    let mut min_acceptance_proposals = 8u32;
 
     let mut i = 1;
     while i < args.len() {
@@ -71,6 +73,14 @@ fn main() {
             "--topic-writable" => {
                 topic_writable = true;
                 i += 1;
+            }
+            "--min-acceptance" => {
+                min_acceptance = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--min-acceptance-proposals" => {
+                min_acceptance_proposals = args[i + 1].parse().unwrap();
+                i += 2;
             }
             "--blocks" => {
                 blocks = args[i + 1].parse().unwrap();
@@ -140,6 +150,8 @@ fn main() {
         chain_floor,
         hot_capacity: hot_cap,
         write_target,
+        min_acceptance,
+        min_acceptance_proposals,
         ..Default::default()
     });
     if let Some(p) = &user {
@@ -203,6 +215,27 @@ fn main() {
         100.0 * s.verify_efficiency()
     );
     println!("hot table entries       : {}", ng.hot_len());
+
+    // The marginal-acceptance curve: the observable that decides BOTH
+    // min_acceptance and chain_floor. Shadow mode — reported, never applied.
+    println!("\n--- marginal acceptance by spine depth (shadow: reported, not applied) ---");
+    println!("{:>6}  {:>12}  {:>10}", "depth", "drafted", "P(accept)");
+    for d in 0..hipfire_specdecode_ngram::MAX_TRACKED_DEPTH {
+        let drafted = s.drafted_by_depth[d];
+        if drafted == 0 {
+            break;
+        }
+        println!(
+            "{:>6}  {:>12}  {:>9.1}%",
+            d,
+            drafted,
+            100.0 * s.marginal_acceptance(d)
+        );
+    }
+    println!("\n  (choosing the width is BlockController's job — it argmaxes committed");
+    println!("   tokens per window wall-time from live timing. This curve is the");
+    println!("   diagnostic: it shows how slowly acceptance decays with depth, and");
+    println!("   that depth 1 beats depth 0 because of the inline next2 pair.)");
     println!(
         "\n--- tier attribution (first hit wins, so each row is that tier's marginal value) ---"
     );

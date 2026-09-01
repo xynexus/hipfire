@@ -341,6 +341,14 @@ pub(crate) fn load(
         "ngram_spec_chain_floor",
         ngram_cfg.ngram_spec_chain_floor as u64,
     );
+    // f64 in the schema, f32 in the engine: the value is a probability read from
+    // config, so the narrow type is the right storage and the wide one is only
+    // the config surface.
+    let ngram_min_acceptance = ngram_cfg.ngram_spec_min_acceptance as f32;
+    let ngram_min_acceptance_proposals = ngram_u64(
+        "ngram_spec_min_acceptance_proposals",
+        ngram_cfg.ngram_spec_min_acceptance_proposals as u64,
+    ) as u32;
     let ngram_max_spine = ngram_u64(
         "ngram_spec_max_spine",
         ngram_cfg.ngram_spec_max_spine as u64,
@@ -705,6 +713,8 @@ pub(crate) fn load(
                     blocks: (ngram_store_mb as usize) * 256,
                     orders: ngram_orders.clone(),
                     chain_floor: ngram_chain_floor.min(255) as u8,
+                    min_acceptance: ngram_min_acceptance,
+                    min_acceptance_proposals: ngram_min_acceptance_proposals,
                     max_spine: ngram_max_spine as usize,
                     promote_count: ngram_promote_count.min(u16::MAX as u64) as u16,
                     write_target: hipfire_serving_core::model::NgramWriteTarget::parse(
