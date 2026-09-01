@@ -35,7 +35,7 @@
 //! grad wired anyway).
 
 use crate::model::LlamaModel;
-use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+use hipfire_primitives::fwht::{gen_fwht_signs, signed_fwht};
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// An orthonormal `[h,h]` rotation, row-major (`r[i*h + j]`). Invariant: `R Rᵀ = I`.
@@ -115,24 +115,49 @@ impl Rotation {
     /// reproduces the codec's `fwht_rows`, so `F` is the rotation the deployed
     /// int4 pipeline already applies. `h % 256 == 0` required.
     pub fn block_fwht(h: usize) -> Self {
-        assert_eq!(h % 256, 0, "block_fwht size {h} not a multiple of 256");
-        let (s1, s2) = (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
-        // Column i of the 256-block = cpu_fwht_256(e_i) (so rotate_rows == fwht).
-        let mut block = vec![0.0f32; 256 * 256];
-        for i in 0..256 {
-            let mut e = [0.0f32; 256];
+        Self::block_fwht_with(h, 256, 42, 1042)
+    }
+
+    /// The general form: a block-diagonal `[h,h]` rotation whose blocks are a
+    /// `group`-wide signed FWHT with the given sign seeds.
+    ///
+    /// [`block_fwht`] is this with the Oq4G256 codec's parameters (256, 42/1042).
+    /// The width and the seeds both have to match the codec you are baking for,
+    /// because the bake identity is `F·(Fᵀ M) = M` and a mismatched `F` on either
+    /// side leaves a residual rotation rather than cancelling — which is silent,
+    /// since the result is still an orthonormal matrix.
+    ///
+    /// The other live width is 128 with seeds 43/1043, which is what
+    /// `paro_la_gates_codec`'s MQ4G128 encoder and the `gemv_hfq4g128` kernel use
+    /// (uploaded by `ensure_mq_signs_128`). That is the width that makes a
+    /// per-head R2 deployable — see [`bake_for_per_head_codec`].
+    pub fn block_fwht_with(h: usize, group: usize, seed1: u32, seed2: u32) -> Self {
+        assert!(
+            group.is_power_of_two(),
+            "block_fwht group {group} is not a power of two"
+        );
+        assert_eq!(
+            h % group,
+            0,
+            "block_fwht size {h} not a multiple of {group}"
+        );
+        let (s1, s2) = (gen_fwht_signs(seed1, group), gen_fwht_signs(seed2, group));
+        // Column i of the block = signed_fwht(e_i) (so rotate_rows == fwht).
+        let mut block = vec![0.0f32; group * group];
+        for i in 0..group {
+            let mut e = vec![0.0f32; group];
             e[i] = 1.0;
-            cpu_fwht_256(&mut e, &s1, &s2);
+            signed_fwht(&mut e, &s1, &s2);
             for (j, &v) in e.iter().enumerate() {
-                block[j * 256 + i] = v;
+                block[j * group + i] = v;
             }
         }
         let mut r = vec![0.0f32; h * h];
-        for b in 0..(h / 256) {
-            let off = b * 256;
-            for j in 0..256 {
-                for i in 0..256 {
-                    r[(off + j) * h + (off + i)] = block[j * 256 + i];
+        for b in 0..(h / group) {
+            let off = b * group;
+            for j in 0..group {
+                for i in 0..group {
+                    r[(off + j) * h + (off + i)] = block[j * group + i];
                 }
             }
         }
@@ -453,9 +478,167 @@ pub fn bake_for_oq4_recipe(m: &Rotation) -> Rotation {
     Rotation::block_fwht(m.h).transpose().compose(m)
 }
 
+/// Sign seeds and group width of the live 128-wide FWHT codec — the one
+/// `paro_la_gates_codec`'s MQ4G128 encoder writes and `gemv_hfq4g128` reads
+/// (tables uploaded by `ensure_mq_signs_128`).
+pub const G128_CODEC: (usize, u32, u32) = (128, 43, 1043);
+
+/// Bake a learned per-head rotation `R2` for deployment through a codec whose
+/// FWHT group width EQUALS the head dimension.
+///
+/// This is what unblocks R2 deploy. The Oq4G256 path cannot carry R2 at all: its
+/// FWHT is 256 wide, so with `head_dim = 128` a group spans two heads and the net
+/// transform is `F₂₅₆ ∘ blockdiag(R2)`, which is not `R2` and cannot be un-baked
+/// by any per-head pre-rotation. Nothing about that is fixable in the plumbing —
+/// it is true of the safetensors-round-trip route too, because that runs the same
+/// codec.
+///
+/// When the group width equals `head_dim`, each FWHT group is exactly one head,
+/// so the identity that makes R1 work applies per head: pre-rotate by `Fᵀ R2`,
+/// the codec applies `F`, and `F·(Fᵀ R2) = R2` leaves the int4 grid in the learned
+/// per-head basis. `r2` is the single `[head_dim, head_dim]` block; `apply_r2`
+/// already expands one block across heads via `rotate_head_cols`.
+///
+/// `group` must equal `r2.h`, and the seeds must be the target codec's — a
+/// mismatch on either leaves a residual rotation instead of cancelling, and does
+/// so silently, since the product is still orthonormal.
+pub fn bake_for_per_head_codec(r2: &Rotation, group: usize, seed1: u32, seed2: u32) -> Rotation {
+    assert_eq!(
+        r2.h, group,
+        "per-head bake needs the codec group width ({group}) to equal head_dim ({}); \
+         a group that spans two heads cannot be un-baked per head",
+        r2.h
+    );
+    Rotation::block_fwht_with(group, group, seed1, seed2)
+        .transpose()
+        .compose(r2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The R2 deploy proof: with the codec's FWHT group width equal to head_dim,
+    /// pre-rotating by `Fᵀ R2` and then applying the codec's per-group FWHT leaves
+    /// exactly `R2`. This is the per-head analogue of
+    /// `bake_cancels_codec_fwht_leaving_m` in hipfire-quantize's rotate.rs.
+    #[test]
+    fn per_head_bake_cancels_the_codec_fwht_leaving_r2() {
+        let (group, seed1, seed2) = G128_CODEC;
+        let n_heads = 3usize;
+        let h = group * n_heads;
+        let r2 = Rotation::hadamard(group, 7);
+        let baked = bake_for_per_head_codec(&r2, group, seed1, seed2);
+
+        // A deterministic weight [out, h] whose h dim is head-major.
+        let out = 9usize;
+        let mut w = vec![0.0f32; out * h];
+        let mut st = 0x9E37_79B9u64;
+        for v in w.iter_mut() {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((st >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+        }
+
+        // Path 1: rotate per head by the BAKED R2 using the SAME helper the
+        // production `apply_r2` uses, then apply the codec FWHT per group —
+        // which is per head, because group == head_dim. Using the helper rather
+        // than a hand-rolled multiply is deliberate: it is the convention that
+        // ships, and a transposed convention here would silently pass or fail
+        // for reasons unrelated to the bake.
+        let mut w1 = rotate_head_cols(&w, &baked, n_heads, out);
+        let (s1, s2) = (gen_fwht_signs(seed1, group), gen_fwht_signs(seed2, group));
+        for o in 0..out {
+            for head in 0..n_heads {
+                let base = o * h + head * group;
+                let mut buf = w1[base..base + group].to_vec();
+                signed_fwht(&mut buf, &s1, &s2);
+                w1[base..base + group].copy_from_slice(&buf);
+            }
+        }
+
+        // Path 2: rotate per head directly by R2 — what the int4 grid should see.
+        let w2 = rotate_head_cols(&w, &r2, n_heads, out);
+
+        let worst = w1
+            .iter()
+            .zip(&w2)
+            .fold(0.0f32, |acc, (&a, &b)| acc.max((a - b).abs()));
+        assert!(
+            worst < 1e-3,
+            "per-head bake did not cancel the codec FWHT: max|delta| {worst:.2e}"
+        );
+    }
+
+    /// The OTHER silent failure the doc comment warns about: right width, wrong
+    /// SEEDS. `Fᵀ_a` then `F_b` is still an orthonormal matrix, so nothing errors
+    /// and the artifact quantizes cleanly — it just is not in the learned basis.
+    /// Only a numeric check catches it, so here is the numeric check.
+    #[test]
+    fn baking_against_the_wrong_sign_seeds_does_not_cancel() {
+        let (group, seed1, seed2) = G128_CODEC;
+        let n_heads = 2usize;
+        let out = 5usize;
+        let h = group * n_heads;
+        let r2 = Rotation::hadamard(group, 7);
+        // Baked with the Oq4G256 codec's seeds (42/1042) instead of this codec's.
+        let wrong = bake_for_per_head_codec(&r2, group, 42, 1042);
+
+        let mut w = vec![0.0f32; out * h];
+        let mut st = 0xDEAD_BEEFu64;
+        for v in w.iter_mut() {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((st >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+        }
+
+        let mut w1 = rotate_head_cols(&w, &wrong, n_heads, out);
+        let (s1, s2) = (gen_fwht_signs(seed1, group), gen_fwht_signs(seed2, group));
+        for o in 0..out {
+            for head in 0..n_heads {
+                let base = o * h + head * group;
+                let mut buf = w1[base..base + group].to_vec();
+                signed_fwht(&mut buf, &s1, &s2);
+                w1[base..base + group].copy_from_slice(&buf);
+            }
+        }
+        let w2 = rotate_head_cols(&w, &r2, n_heads, out);
+        let worst = w1
+            .iter()
+            .zip(&w2)
+            .fold(0.0f32, |acc, (&a, &b)| acc.max((a - b).abs()));
+        assert!(
+            worst > 1e-2,
+            "wrong seeds appeared to cancel (max|delta| {worst:.2e}) — then the \
+             seeds do not matter and the doc comment is wrong"
+        );
+    }
+
+    /// The negative control, and the reason this needed a new codec width at all:
+    /// a 256-wide FWHT over `head_dim = 128` spans TWO heads, so no per-head
+    /// pre-rotation can cancel it. Without this, the test above would pass just as
+    /// happily against a width that cannot work, and prove nothing.
+    #[test]
+    fn a_group_spanning_two_heads_cannot_be_un_baked() {
+        let head_dim = 128usize;
+        let r2 = Rotation::hadamard(head_dim, 7);
+        // The 256 codec's block over a 256-wide span is NOT block-diagonal in
+        // 128-blocks, so Fᵀ over 256 does not commute with a per-head R2.
+        let f256 = Rotation::block_fwht(256);
+        let mut cross = 0.0f32;
+        for j in 0..256 {
+            for i in 0..256 {
+                let same_head = (j < head_dim) == (i < head_dim);
+                if !same_head {
+                    cross = cross.max(f256.r[j * 256 + i].abs());
+                }
+            }
+        }
+        assert!(
+            cross > 1e-3,
+            "F256 has no cross-head energy ({cross:.2e}) — if this ever holds, the \
+             256 codec could carry R2 and bake_for_per_head_codec is unnecessary"
+        );
+        assert_eq!(r2.h, head_dim);
+    }
 
     #[test]
     fn random_rotation_is_orthonormal() {
