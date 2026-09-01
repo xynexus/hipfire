@@ -9,12 +9,15 @@
 //! describe it. Promotion is what makes them self-documenting — the man pages
 //! appear on their own.
 //!
-//! Flag names mirror the hand-rolled bags EXACTLY, including their
-//! inconsistency: `import gguf` takes `--in`/`--out` while every other group
-//! takes `--input`/`--output`. Scripts already use both spellings, so the names
-//! are preserved and the inconsistency is recorded in
-//! `docs/todo/2026-08-30-coexistence-subcommand-promotion.md` rather than fixed
-//! silently here.
+//! Flag names are now uniform: every group takes `--input`/`--output`.
+//!
+//! `import gguf` used to spell them `--in`/`--out` — a hand-rolled-bag
+//! inconsistency the promotion preserved deliberately rather than fixing
+//! silently. It is fixed now, as a DELIBERATE BREAK: the old spellings are
+//! rejected with a message naming the replacement, not accepted as aliases.
+//! Two documented names for one flag is the cost an alias would carry forever,
+//! and a rename nobody is told about is the failure mode `RENAMED_KEYS` exists
+//! to prevent on the config side.
 
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -53,11 +56,11 @@ enum ImportCommand {
 
 #[derive(Debug, Args)]
 pub struct ImportGgufArgs {
-    /// Source `.gguf`. (Spelled `--in`, not `--input`, to match the existing tool.)
-    #[arg(long = "in")]
+    /// Source `.gguf`.
+    #[arg(long)]
     input: PathBuf,
     /// Destination `.hfq`.
-    #[arg(long = "out")]
+    #[arg(long)]
     output: PathBuf,
     /// Target quant format token.
     #[arg(long)]
@@ -92,8 +95,8 @@ pub fn run_import(args: ImportArgs) -> anyhow::Result<()> {
         ImportCommand::Gguf(a) => {
             let argv = to_argv(
                 vec![
-                    ("--in", Some(a.input.display().to_string())),
-                    ("--out", Some(a.output.display().to_string())),
+                    ("--input", Some(a.input.display().to_string())),
+                    ("--output", Some(a.output.display().to_string())),
                     ("--format", Some(a.format)),
                     ("--kmap-mode", Some(a.kmap_mode)),
                 ],

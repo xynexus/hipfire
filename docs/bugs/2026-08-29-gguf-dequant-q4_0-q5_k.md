@@ -86,7 +86,7 @@ diverge, so this is a local mistake, not a house convention.
 
 Shipping CLI, no flag required:
 
-`hipfire-coexistence import gguf --in <model.gguf> --out <model.hfq> --format <FMT>`
+`hipfire-coexistence import gguf --input <model.gguf> --output <model.hfq> --format <FMT>`
 → `cli.rs:68` → `import_gguf` (`cli.rs:168`) → `run_gguf_pipeline`
 → `gguf_import.rs:244/249/255/300/356/416` → `gguf_input::tensor_to_f32`
 → the two decoders.

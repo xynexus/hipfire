@@ -169,7 +169,7 @@ fn import_gguf(args: &[String]) -> Result<(), Box<dyn Error>> {
     use hipfire_quantize::gguf_import::run_gguf_pipeline;
     use hipfire_quantize::quant_plan::GgufFormat;
 
-    // --in/--out/--format take values; the kmap flags are parsed positionally
+    // --input/--output/--format take values; the kmap flags are parsed positionally
     // (mirrors the quantize CLI) since `--no-kmap`/`--kmap-dense` are presence
     // flags and `run_gguf_pipeline` also reads `--arch-id` from the process
     // args directly.
@@ -179,8 +179,25 @@ fn import_gguf(args: &[String]) -> Result<(), Box<dyn Error>> {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
     };
-    let input = val("--in").ok_or("import gguf: --in <model.gguf> is required")?;
-    let output = val("--out").ok_or("import gguf: --out <model.hfq> is required")?;
+    // `--in`/`--out` were renamed to `--input`/`--output` so every coexistence
+    // group spells its paths the same way. Rejected by NAME rather than dropped:
+    // a bare "--input is required" against a command line that plainly says
+    // `--in` is the kind of error that costs someone ten minutes, and the config
+    // side already sets the precedent (`RENAMED_KEYS` honours the old key and
+    // says what to write instead). This is the loud half of that contract — the
+    // break is deliberate, so it names its own replacement.
+    for (old_flag, new_flag) in [("--in", "--input"), ("--out", "--output")] {
+        if args.iter().any(|a| a == old_flag) {
+            return Err(format!(
+                "import gguf: `{old_flag}` was renamed to `{new_flag}` so every \
+                 coexistence command spells its paths the same way. Use \
+                 `{new_flag} <path>`."
+            )
+            .into());
+        }
+    }
+    let input = val("--input").ok_or("import gguf: --input <model.gguf> is required")?;
+    let output = val("--output").ok_or("import gguf: --output <model.hfq> is required")?;
     let format = val("--format").ok_or("import gguf: --format <FMT> is required")?;
     let gguf_format = GgufFormat::from_flag(format).ok_or_else(|| {
         format!(
@@ -646,4 +663,48 @@ fn download_cli(repo: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
             .unwrap_or(4),
     };
     hipfire_coexistence::download::run(&opts)
+}
+
+#[cfg(test)]
+mod flag_rename_tests {
+    use super::import_gguf;
+
+    /// The rename is a deliberate break, so the old spelling must be REJECTED BY
+    /// NAME — not silently dropped, and not answered with a bare "--input is
+    /// required" against a command line that plainly says `--in`.
+    ///
+    /// The promoted `hipfire import gguf` path needs no equivalent: clap already
+    /// answers `--in` with "unexpected argument '--in' found / tip: a similar
+    /// argument exists: '--input'", which is exactly this message's job.
+    #[test]
+    fn the_old_spellings_are_refused_by_name() {
+        for (old, new) in [("--in", "--input"), ("--out", "--output")] {
+            let args = vec![
+                "import".to_string(),
+                "gguf".to_string(),
+                old.to_string(),
+                "x".to_string(),
+            ];
+            let err = import_gguf(&args).expect_err("the old spelling must not be accepted");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(old),
+                "the error must name what was typed: {msg}"
+            );
+            assert!(
+                msg.contains(new),
+                "the error must name the replacement: {msg}"
+            );
+        }
+    }
+
+    /// Absent both spellings, the required-flag error names the CURRENT flag.
+    #[test]
+    fn a_missing_path_names_the_new_flag() {
+        let args = vec!["import".to_string(), "gguf".to_string()];
+        let msg = import_gguf(&args)
+            .expect_err("input is required")
+            .to_string();
+        assert!(msg.contains("--input"), "{msg}");
+    }
 }

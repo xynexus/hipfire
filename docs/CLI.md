@@ -323,12 +323,12 @@ Import an external checkpoint (GGUF, safetensors) into a `.hfq`
 
 Import a GGUF checkpoint into a `.hfq`
 
-**Usage:** `hipfire import gguf [OPTIONS] --in <INPUT> --out <OUTPUT> --format <FORMAT>`
+**Usage:** `hipfire import gguf [OPTIONS] --input <INPUT> --output <OUTPUT> --format <FORMAT>`
 
 ###### **Options:**
 
-* `--in <INPUT>` — Source `.gguf`. (Spelled `--in`, not `--input`, to match the existing tool.)
-* `--out <OUTPUT>` — Destination `.hfq`
+* `--input <INPUT>` — Source `.gguf`
+* `--output <OUTPUT>` — Destination `.hfq`
 * `--format <FORMAT>` — Target quant format token
 * `--no-kmap` — Disable the k-map, quantizing uniformly
 * `--kmap-dense` — Dense k-map
