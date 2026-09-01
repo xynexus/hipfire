@@ -46,6 +46,14 @@ yet tested, roughly in order of cheapness:
 1. **Driver/GPU state.** The session ran many hours of GPU work, including two
    full kernel-cache rebuilds and repeated large allocations. A reboot is the
    cheap discriminator and has not been tried.
+
+   ⚠️ **Price it first.** The only process holding `/dev/kfd` and
+   `/dev/dri/renderD128` is a **systemd-managed hipfire server** (PID 251918,
+   child of `systemd --user`, 6 sockets, 36 threads, `Ssl`, ~25 min CPU over
+   5.6 days of uptime). A reboot drops it. It is also **not the cause**: it has
+   been up since Aug 26, so it was holding the GPU while this cell was GREEN
+   earlier in the same session and while it is RED now — its presence is
+   constant across both states, which rules it out rather than implicating it.
 2. **An uninitialised read** in the Mamba-2 path whose value happens to be stable
    while the allocator hands back the same pages, and changed when the heap
    shape changed. This fits "stable now, different from before" better than a
