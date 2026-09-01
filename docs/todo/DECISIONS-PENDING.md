@@ -151,6 +151,105 @@ Hessian per tensor, damping is applied after the rebase).
 
 ---
 
+## 7. MoE routed experts — one allocation per expert, and who owns it?
+
+`2026-09-01-moe-expert-pair-allocation.md`
+
+gfx1151 rounds every GTT allocation, and the qwen35 loader allocates each
+expert's two projections separately, so some models pay the rounding twice.
+Computed from the real artifacts through `gtt_alloc_cost`:
+
+| model | separate | one/expert | saving |
+|---|---|---|---|
+| Qwen3.6-35B-A3B oq4.25++ | 30.0 GiB | 20.0 GiB | **10.0 GiB (33.3%)** |
+| Qwen3.5-122B-A10B oq4.25++ | 75.8 GiB | 74.5 GiB | 1.3 GiB (1.7%) |
+
+Model-shaped, not universal — it depends where per-expert size sits on the 2 MiB
+grid, and it is **not** a 122B unlock (that model's amplification was the
+compact->Oq8 expansion, already closed by compact-resident being default).
+
+**The decision is ownership, not effort.** Packing after load is the low-risk
+shape — loaders untouched, correctness is a device-to-device copy — but
+`GpuTensor::sub_offset` yields a `NonOwning` buffer, and `dispose()` carries
+
+```rust
+BufferOrigin::NonOwning => {
+    debug_assert!(false, "dispose() on a non-owning buffer — aliasing bug");
+}
+```
+
+That assert exists because of #262, where an alias went back to the pool and came
+back as scratch over live weights. So packing means `ExpertWeights` must learn
+that `down` is a view and must not be freed — a lifetime change on the load path
+of every MoE model, and one that deliberately routes around a guard added after a
+memory-corruption bug.
+
+The fork:
+
+- **one buffer with two views** — smallest diff, but needs the ownership change
+  above and an explicit exemption from the alias invariant;
+- **a per-layer arena** for all of a layer's experts — amortises the rounding
+  further (512 experts in one allocation rather than 512 allocations), but changes
+  how `expert_gate_up_ptrs` / `expert_down_ptrs` are built, from independent
+  addresses to offsets into one base, so it wants measuring against the indexed
+  MoE kernels first.
+
+Not startable unattended: either branch is a deliberate break of an invariant
+that was added in response to memory corruption, which is an owner call.
+
+Ruled out and not worth re-testing: routing expert loads through the GPU pool.
+`pool.rs::alloc` recycles whole buffers rather than sub-allocating from slabs, so
+the per-tensor rounding applies either way. The allocation SHAPE is the only lever.
+
+---
+
+## 8. The `*-DFlash--bf16.hfq` drafters on `/srv` are unusable — re-cut, or delete?
+
+Found 2026-09-01 while measuring speculative decode.
+
+**Every DFlash artifact on `/srv/hipfire/models` is `arch 1` (qwen2), not
+`arch 20`**, so `DflashConfig::from_hfq` rejects all seven and no DFlash path can
+load from them. They do carry drafter provenance
+(`config.dflash_config` with `mask_token_id` + `target_layer_ids`), just under an
+older key than the loader's top-level `dflash`, and with the wrong arch tag:
+
+| artifact | size | matching HF source on `/srv`? |
+|---|---|---|
+| `Qwen3.6-27B-DFlash--bf16.hfq` | 2.29 GB | **yes** — already re-cut (see below) |
+| `Qwen3.5-122B-A10B-DFlash--bf16.hfq` | 0.68 GB | no |
+| `Qwen3.5-397B-A17B-DFlash--bf16.hfq` | 1.64 GB | no |
+| `Qwen3.5-9B-DFlash--bf16.hfq` | 1.39 GB | no |
+| `Qwen3.6-35B-A3B-DFlash--bf16.hfq` | 0.50 GB | no (the source is Qwen3.**5**-35B-A3B) |
+| `gemma-4-26B-A4B-it-DFlash--bf16.hfq` | 0.57 GB | no |
+| `gemma-4-31B-it-DFlash--bf16.hfq` | 2.04 GB | no |
+
+**Only one of the seven can be regenerated locally.** That one is done —
+`dflash_convert --input /srv/huggingface/models--z-lab--Qwen3.6-27B-DFlash/snapshots/*/`
+produced `~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq` (3.46 GB, arch 20), and
+it is what the DDTree-vs-chain numbers in `docs/perf/ddtree-vs-chain-opus.md` were
+measured with.
+
+The decision, and why it is not mine:
+
+- these live on **`/srv`**, the shared NFS mount, which the overnight brief treats
+  as read-only precisely because its contents are often the only copy;
+- **six of the seven have no local source**, so "delete the unusable ones" may be
+  destructive in a way no re-cut can undo. Whether a copy exists elsewhere — an
+  upstream HF repo still published, another machine — is not something I can
+  determine from here.
+
+Options: re-cut the one that can be re-cut and leave the rest (status quo, but the
+directory keeps advertising six drafters that cannot load); fetch the missing
+sources and re-cut all seven; or delete the six as dead weight. The middle option
+depends on whether those upstream repos still exist.
+
+Worth fixing either way, and it is plain work rather than a decision: the loader
+could **name the mismatch** instead of failing with `parse DflashConfig`. It has
+enough information to say "this artifact is arch 1 with a `config.dflash_config`
+block — it looks like a pre-`arch 20` drafter; re-cut it with `dflash_convert`."
+
+---
+
 ## Go / no-go, rather than a design answer
 
 Five documents are unapproved by their own status line, so starting them is a

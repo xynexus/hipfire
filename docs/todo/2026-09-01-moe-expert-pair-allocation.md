@@ -1,7 +1,8 @@
 # TODO: one GTT allocation per routed expert, not two
 
 **Status:** open, designed, NOT implemented (2026-09-01). Blocked on an ownership
-question that deserves a decision rather than a 4 a.m. patch.
+question that deserves a decision rather than a 4 a.m. patch — registered as
+item 7 in `DECISIONS-PENDING.md`.
 
 ## The win, measured
 
