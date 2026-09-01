@@ -154,6 +154,38 @@ pub struct NgramConfig {
     /// Compared against a lower confidence bound, not the raw rate, so a gram
     /// that went 0-for-1 is not condemned on one sample. See
     /// [`acceptance_lower_bound`].
+    ///
+    /// ## Measured (`ngram_replay_sweep`, 400k tokens of this repo's Rust)
+    ///
+    /// `--orders 8..2 --max-spine 16 --chain-floor 8 --min-count 1`, gate over
+    /// `>= 8` proposals. The control arm reproduces the documented operating
+    /// point (2.10 accepted/step vs the 1M-token table's 2.23):
+    ///
+    /// | min_acceptance | accepted/step | drafted/step | verify eff |
+    /// |---|---|---|---|
+    /// | off | 2.10 | 6.31 | 33.3% |
+    /// | 0.05 | 1.93 | 4.08 | 47.3% |
+    /// | 0.10 | 1.89 | 3.92 | 48.1% |
+    /// | 0.15 | 1.82 | 3.78 | 48.3% |
+    /// | **0.20** | **1.81** | **3.74** | **48.5%** |
+    /// | 0.30 | 1.74 | 3.58 | 48.5% |
+    /// | 0.50 | 1.58 | 3.32 | 47.5% |
+    ///
+    /// The trade is **-14% accepted for -41% drafted**, and verify efficiency
+    /// rises 33.3% -> 48.5%. Note it reaches operating points `chain_floor`
+    /// cannot: the floor is already at the maximum order and bottoms out at
+    /// 6.31 drafted/step, so this opens a region of the curve that was not
+    /// previously reachable.
+    ///
+    /// 0.20 is the knee — 0.30 matches its efficiency while accepting less, so
+    /// it is dominated, and everything above 0.30 gives efficiency back.
+    ///
+    /// **It is still not defaulted on, and the sweep cannot decide that.**
+    /// Whether -14% accepted is worth -41% drafted depends on what a wasted
+    /// draft slot costs on the part, which is exactly the axis `chain_floor`'s
+    /// own note describes ("lower it if verify width is cheap; raise it if the
+    /// target forward is bandwidth-bound"). That needs a GPU tok/s comparison
+    /// on a real model, not a CPU acceptance oracle.
     pub min_acceptance: f32,
     /// Proposals a gram needs before `min_acceptance` may suppress it. Below
     /// this the bound is too wide to act on and the gram drafts normally.

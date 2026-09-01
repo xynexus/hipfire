@@ -53,3 +53,9 @@ required-features = ["deltanet"]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]
+
+[dev-dependencies]
+# For ngram_replay_sweep: the sweep gates on the SHIPPED
+# `acceptance_lower_bound`, not a copy, so the measurement cannot drift from
+# what production does.
+hipfire-specdecode-ngram = { path = "../hipfire-specdecode-ngram" }

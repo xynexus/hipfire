@@ -30,6 +30,7 @@ use std::path::Path;
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_specdecode_ngram::{acceptance_lower_bound, GramOutcome};
 
 /// One context -> next-token histogram, plus the age bookkeeping the real
 /// design needs (last_seen drives MRU eviction; hits_served sizes the budget).
@@ -127,6 +128,11 @@ fn main() {
     // — a chain that falls back to a bigram is drifting, and every further
     // token costs verify width for near-nothing.
     let mut chain_floor = 0u8;
+    // Outcome gate under test: suppress a gram whose measured acceptance is
+    // confidently below `min_acceptance`. 0.0 = off, which reproduces the
+    // pre-gate numbers exactly and is the control arm.
+    let mut min_acceptance = 0.0f32;
+    let mut min_acceptance_proposals = 8u32;
     // Split the stream: the first `prime_frac` is observe-only (stands in for a
     // cold table built offline), the remainder is what we score. `freeze` stops
     // the scored half from feeding the table, isolating cold-table value from
@@ -193,6 +199,14 @@ fn main() {
             }
             "--self-check" => {
                 i += 1;
+            }
+            "--min-acceptance" => {
+                min_acceptance = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--min-acceptance-proposals" => {
+                min_acceptance_proposals = args[i + 1].parse().unwrap();
+                i += 2;
             }
             "--chain-floor" => {
                 chain_floor = args[i + 1].parse().unwrap();
@@ -277,6 +291,11 @@ fn main() {
     let mut mixed_drafted = 0u64; // total tokens drafted across those steps
     let mut spine_hist = vec![0u64; max_spine + 1];
     let mut spine_by_order: HashMap<u8, (u64, u64)> = HashMap::new(); // order -> (steps, accepted)
+                                                                      // Per-gram outcome, exactly as NgramSpec keeps it. Unbounded here on
+                                                                      // purpose: the sweep is offline and an eviction policy would confound the
+                                                                      // thing being measured.
+    let mut outcomes: HashMap<u64, GramOutcome> = HashMap::new();
+    let mut suppressed_hits = 0u64;
     let mut steps_total = 0u64;
 
     let max_order = *orders.iter().max().unwrap() as usize;
@@ -322,10 +341,11 @@ fn main() {
             // Mixed-order chained spine: highest order that clears min_count
             // wins the first token, then re-probe at full order for the next.
             let mut spine: Vec<u32> = Vec::with_capacity(max_spine);
+            let mut spine_keys: Vec<u64> = Vec::with_capacity(max_spine);
             let mut first_order: Option<u8> = None;
             let mut ctx: Vec<u32> = tokens[i - max_order..i].to_vec();
             for step in 0..max_spine {
-                let mut hit: Option<(u8, u32)> = None;
+                let mut hit: Option<(u8, u32, u64)> = None;
                 for &ord in &orders {
                     if step > 0 && ord < chain_floor {
                         continue;
@@ -335,19 +355,33 @@ fn main() {
                         continue;
                     }
                     let key = fingerprint(ord, &ctx[ctx.len() - o..]);
+                    // The gate, using the SHIPPED bound. `continue` not `break`,
+                    // matching NgramSpec: a suppressed long gram falls through
+                    // to a shorter order rather than ending the spine.
+                    if min_acceptance > 0.0 {
+                        if let Some(&o_rec) = outcomes.get(&key) {
+                            if o_rec.proposed >= min_acceptance_proposals
+                                && acceptance_lower_bound(o_rec) < min_acceptance
+                            {
+                                suppressed_hits += 1;
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(e) = table.get(&key) {
                         if let Some((pred, cnt)) = e.best() {
                             if cnt >= min_count {
-                                hit = Some((ord, pred));
+                                hit = Some((ord, pred, key));
                                 break; // orders is longest-first
                             }
                         }
                     }
                 }
                 match hit {
-                    Some((ord, pred)) => {
+                    Some((ord, pred, key)) => {
                         first_order.get_or_insert(ord);
                         spine.push(pred);
+                        spine_keys.push(key);
                         ctx.push(pred);
                     }
                     None => break,
@@ -363,6 +397,15 @@ fn main() {
                         acc += 1;
                     } else {
                         break;
+                    }
+                }
+                // Feed the outcome back, same credit/debit split as
+                // NgramSpec::record_acceptance.
+                for (k, key) in spine_keys.iter().enumerate() {
+                    let rec = outcomes.entry(*key).or_default();
+                    rec.proposed = rec.proposed.saturating_add(1);
+                    if k < acc {
+                        rec.accepted = rec.accepted.saturating_add(1);
                     }
                 }
                 mixed_steps += 1;
@@ -445,6 +488,15 @@ fn main() {
         "verify efficiency (accepted/drafted):    {:.1}%",
         100.0 * mixed_accepted as f64 / mixed_drafted.max(1) as f64
     );
+    if min_acceptance > 0.0 {
+        println!(
+            "outcome gate: min_acceptance={min_acceptance} over >={min_acceptance_proposals} \
+             proposals | {suppressed_hits} gram hit(s) suppressed | {} grams tracked",
+            outcomes.len()
+        );
+    } else {
+        println!("outcome gate: OFF (control arm)");
+    }
     println!("\naccepted-length histogram:");
     for (k, &c) in spine_hist.iter().enumerate() {
         if c > 0 {
