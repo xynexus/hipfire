@@ -8,6 +8,27 @@ delete the directory or leave a `RESULT.md` beside the brief saying what happene
 — including if the answer was "this item does not survive contact with
 measurement", which is a real outcome and worth as much as a fix.
 
+## State as of 2026-09-02
+
+Every brief here now carries a `RESULT.md`. Four were done, two were **refuted**,
+two remain open with corrected premises. Read the `RESULT.md` before the
+`START.md` — three of the briefs are wrong in ways that matter.
+
+| session | outcome |
+|---|---|
+| `tiny-state-hash-severity` | **DONE** — token_hash blocks, mamba2 logit_hash advisory; dead `rel_tol` deleted |
+| `repair-dflash-drafters` | **DONE, and narrower than briefed** — 6 repaired, 2 verified working (τ 3.0 / 2.0 vs a 2.1 control); gemma-4 has NO DFlash runtime path |
+| `gate-vacuity-sweep` | **DONE** — found a live one: a tripwire FAIL was escalating into a gate that cannot fail on drift |
+| `moe-expert-allocation` | **DONE** (earlier) — −3.96 GiB, not the predicted −35.4 |
+| `gtt-slab-suballocator` | **REFUTED** — step 2 doubles GTT while scoring a perfect ratio; step 3's prize is <0.2 GiB |
+| `guidedquant-backward-capture` | **REFUTED AS SCOPED** — largely already built; the gap is a measurement, not a feature |
+| `qwen4exp-batched-forward` | **OPEN** — premise re-measured and holds (0.114 s/token marginal) |
+| `speculator-seam` | **PARTIALLY DONE** — first implementor landed and verified; the registry + daemon routing remain |
+
+The pattern from the house rules held again: of the eight, **three briefs were
+materially wrong about the state of the code**, and one proposed a change that
+measurement showed would make things worse.
+
 ## What every brief must contain
 
 - **Objective** — one paragraph, and what "done" means.
