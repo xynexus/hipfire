@@ -893,3 +893,42 @@ The instrumentation is kept (`HIPFIRE_COPY_REPORT=1`, off by default, one relaxe
 atomic load per copy, verified 52.0 tok/s and byte-identical output with it
 compiled in). It paid for itself immediately by killing a lead I had called "the
 most promising unexamined thing I've seen tonight".
+
+---
+
+## #20 qwen4_exp batched forward · PAYOFF QUANTIFIED — it is a usability bug, not a spec-decode enabler
+
+I had justified #20 as "gates everything speculative on the 180B". That
+undersells it. Measured prefill scaling (`serve_real <model> <steps> <prompt_len>`,
+8 GiB expert budget, warm):
+
+| prompt tokens | prefill time | tok/s |
+|---|---|---|
+| 8 | 2.35 s | 3.4 |
+| 16 | 4.64 s | 3.4 |
+| 32 | 6.49 s | 4.9 |
+| 64 | 10.95 s | **5.8** |
+
+Linear, as a per-token forward must be. The slight rise with length is the expert
+cache warming, not batching.
+
+**Extrapolated: a 2048-token prompt takes ~6 minutes before the first output
+token.** A 512-token prompt takes ~88 s.
+
+For contrast, `Qwen3.6-35B-A3B--oq4.25++` — which HAS batched prefill — measures
+**224.6 tok/s at pp32 and 360.1 at pp128** on the same box. That is a **40-60x
+gap**, and it is entirely the batched/per-token distinction, not model size:
+the 180B's decode is 0.18 s/tok (5.6 tok/s), so prefill and decode run at
+comparable rates, which is the signature of a prefill that never batches.
+
+**So #20 is not "unlock speculation" — it is "make the model usable on a real
+prompt".** Speculation is a second-order benefit of the same work. That is a much
+stronger case for the dedicated session, and it reprioritises #20 above the
+remaining kernel items.
+
+The blocker is unchanged and structural: `decode_step_into` advances exactly one
+position, and both recurrent halves (Gated DeltaNet state, PLE conv ring) are
+sequential by construction. A batched forward needs the chunked-scan treatment
+that `gated_delta_net_f16` already has on the qwen35 side — that is the reference
+implementation to copy, and it is the reason this is a session rather than a
+patch.

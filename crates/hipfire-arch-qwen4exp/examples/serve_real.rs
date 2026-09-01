@@ -52,7 +52,16 @@ fn main() {
     );
 
     // A short prompt: prefill is per-token, and this model has 48 layers.
-    let prompt: Vec<u32> = vec![9707u32, 11, 1879, 0];
+    // Length overridable (argv[3]) so prefill SCALING can be measured: this
+    // trunk prefills one token at a time, so cost should be strictly linear and
+    // the slope is what a batched forward would attack.
+    let prompt_len: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let prompt: Vec<u32> = (0..prompt_len)
+        .map(|i| 9707u32 + (i as u32 % 977))
+        .collect();
     let t1 = Instant::now();
     m.prefill(&mut gpu, &prompt).expect("prefill");
     let logits = gpu.download_f32(m.logits()).expect("download");
