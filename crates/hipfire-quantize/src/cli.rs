@@ -9687,6 +9687,29 @@ pub fn main() {
             );
             std::process::exit(2);
         }
+        // arch 5 is NOT VALIDATED and currently produces a BROKEN model. The
+        // name table is complete (138 residual readers + 48 writers over 24
+        // layers on Qwen3.5-0.8B, matching the tensor inventory exactly) and the
+        // unit-offset RMSNorm fold is correct, but a bug remains: oq8++ scores
+        // kld 0.000676 unrotated and 7.78 rotated against a bf16 reference.
+        //
+        // A llama fixture control puts an upper bound on how much of that is
+        // ours: on arch 0 the same Hadamard takes oq8 from kld 0.000006 to
+        // 0.058 — imperfect, so PART of this predates arch 5 — but qwen3.5 is
+        // still ~130x worse than that, so an arch-5-specific bug remains.
+        //
+        // Gated rather than removed so the research can continue: shipping a
+        // flag that silently emits a broken model is the exact failure mode
+        // this file keeps hitting.
+        if arch_id == ARCH_ID_QWEN35_DENSE && !hipfire_env::ALLOW_ROTATE_QWEN35.flag() {
+            eprintln!(
+                "error: --rotate on arch_id {ARCH_ID_QWEN35_DENSE} (qwen3.5) is NOT VALIDATED \
+                 and currently produces a broken model\n\
+                 \x20      (measured: oq8++ kld 0.000676 unrotated vs 7.78 rotated).\n\
+                 \x20      Set HIPFIRE_ALLOW_ROTATE_QWEN35=1 to run it anyway for research."
+            );
+            std::process::exit(2);
+        }
         match build_rotation_overrides(rotate_path, &config, n_layers, &st_files, &fp8_scale_for) {
             Ok((overrides, lm_head)) => {
                 ROTATION_OVERRIDE

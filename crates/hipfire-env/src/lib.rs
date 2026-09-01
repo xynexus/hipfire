@@ -413,6 +413,16 @@ env_vars! {
          garbage weights.";
 
     // ── Quantizer: research-format opt-in gates (hipfire-quantize) ──────────
+    ALLOW_ROTATE_QWEN35 = "HIPFIRE_ALLOW_ROTATE_QWEN35", Developer,
+        "Set 1 to allow `--rotate` (SpinQuant R1 deploy pre-pass) on qwen3.5 \
+         (arch 5). NOT VALIDATED: it currently produces a broken model — \
+         Qwen3.5-0.8B oq8++ measures kld 0.000676 unrotated against 7.78 \
+         rotated. The residual-reader/writer name table is complete and the \
+         unit-offset RMSNorm fold is correct, so the remaining bug is elsewhere. \
+         A llama fixture control bounds how much is arch-5-specific: the same \
+         Hadamard takes arch-0 oq8 from kld 0.000006 to 0.058, so `--rotate` is \
+         imperfect even on its native arch, but qwen3.5 is ~130x worse still.";
+
     ALLOW_MQ2 = "HIPFIRE_ALLOW_MQ2", Developer,
         "Set 1 to allow `--format mq2`, equivalent to `--allow-mq2`. Gated \
          because the uniform 4-level codebook collapses at every model size \
