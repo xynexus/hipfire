@@ -79,7 +79,7 @@ exists, at minimum assert the stream is non-degenerate and `decode_tau > 1`.
 - Only Qwen3.6-27B has a matching HF source; the rest **must** be repaired rather
   than reconverted.
 
-## Then
+## Note
 
-Update `docs/todo/DECISIONS-PENDING.md` item 8 — it is written as a
-delete-or-lose decision and is now stale. This work retires it.
+`DECISIONS-PENDING.md` item 8 covered this and is already **withdrawn** — the
+repair route retired it. Nothing to update there; just do the work.
