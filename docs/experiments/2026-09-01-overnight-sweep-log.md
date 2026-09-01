@@ -857,3 +857,39 @@ the 7.4% the profile reports. Unlike the sampler (see #7), these are not hidden
 behind a sync that would eat the saving: they are serialised kernel launches in
 the decode path. Halving them is worth ~4%, which is more than anything left on
 the twenty-item list except the large structural work.
+
+### ⚠️ CORRECTION — the copyBuffer lead is model LOAD, not decode. It is dead.
+
+Built the attribution rather than guessing further: `HIPFIRE_COPY_REPORT=1`
+records `Location::caller()` at the HIP boundary (`hip_bridge::copy_census`),
+with `#[track_caller]` on the `*_auto` wrappers so attribution passes through to
+the real origin. One run answered it:
+
+    === copy census (42716 copies) ===
+      41662 calls   18385.36 MB   97.5%  dispatch/mod.rs:2284   <- upload_raw
+        490 calls       1.29 MB    1.1%  dispatch/kv.rs:1800
+        221 calls       4.42 MB    0.5%  dispatch/mod.rs:2175
+         48 calls       0.00 MB    0.1%  qwen35/mod.rs:1077
+         48 calls       0.00 MB    0.1%  runtime/sampler.rs:239
+
+`mod.rs:2284` is `upload_raw`'s `memcpy_htod` — the **weight loader**. 18.4 GB
+across 41662 calls is the 19.26 GB model going to the GPU. **That is load, not
+decode.**
+
+Decode-time copies are `kv.rs:1800` (490), `qwen35/mod.rs:1077` (48) and
+`sampler.rs:239` (48) — about **12 per token totalling 1.3 MB**. Negligible.
+
+**My "~537 copies per token" was wrong**: I divided a whole-run profile
+(load + generate + unload) by decode tokens. The 7.4% `copyBuffer` share is
+dominated by the one-time load, which at 6.7 s for 19.26 GB is ~2.9 GB/s and
+unremarkable.
+
+**Third time tonight the same error shape appeared** — attributing a whole-run
+measurement to one phase. The first was the cold kernel cache, the second was
+timing a stale binary. **Profile the phase you mean, or partition the numbers
+before dividing.**
+
+The instrumentation is kept (`HIPFIRE_COPY_REPORT=1`, off by default, one relaxed
+atomic load per copy, verified 52.0 tok/s and byte-identical output with it
+compiled in). It paid for itself immediately by killing a lead I had called "the
+most promising unexamined thing I've seen tonight".

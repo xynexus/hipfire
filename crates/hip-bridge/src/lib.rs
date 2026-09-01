@@ -98,6 +98,74 @@ pub enum BufferOrigin {
     NonOwning,
 }
 
+/// Per-call-site copy census for `HIPFIRE_COPY_REPORT=1`.
+///
+/// `__amd_rocclr_copyBuffer` measured **7.4% of decode GPU time** on
+/// Qwen3.6-35B-A3B — 25771 dispatches, grid 512 / workgroup 512, ~2.9 us each,
+/// roughly 537 per token. That is launch LATENCY, not bandwidth: the copies are
+/// tiny and serialised into the decode stream.
+///
+/// A kernel trace gives dispatches but not call sites, and reading the source
+/// eliminated the two obvious candidates without finding the real one. This sits
+/// at the HIP boundary rather than on the `*_auto` wrappers because 266 call
+/// sites use `hip.memcpy_htod` directly against 60 that use the wrapper — the
+/// wrapper is not the chokepoint. The wrappers carry `#[track_caller]` so
+/// attribution passes through them to the real origin.
+///
+/// Off by default; one relaxed atomic load per copy when unset.
+pub mod copy_census {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    static SITES: Mutex<Option<BTreeMap<String, (u64, u64)>>> = Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        INIT.call_once(|| {
+            let on = std::env::var("HIPFIRE_COPY_REPORT")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false);
+            ON.store(on, Ordering::Relaxed);
+        });
+        ON.load(Ordering::Relaxed)
+    }
+
+    pub fn record(site: &'static std::panic::Location<'static>, bytes: usize) {
+        if !enabled() {
+            return;
+        }
+        let key = format!("{}:{}", site.file(), site.line());
+        if let Ok(mut g) = SITES.lock() {
+            let m = g.get_or_insert_with(BTreeMap::new);
+            let e = m.entry(key).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += bytes as u64;
+        }
+    }
+
+    /// Print the census, busiest site first.
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let Ok(g) = SITES.lock() else { return };
+        let Some(m) = g.as_ref() else { return };
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by_key(|(_, (c, _))| std::cmp::Reverse(*c));
+        let total: u64 = v.iter().map(|(_, (c, _))| *c).sum();
+        eprintln!("\n=== copy census ({total} copies) ===");
+        for (site, (calls, bytes)) in v.iter().take(24) {
+            eprintln!(
+                "  {calls:>8} calls  {:>10.2} MB  {:>5.1}%  {site}",
+                *bytes as f64 / 1.048576e6,
+                100.0 * *calls as f64 / total.max(1) as f64
+            );
+        }
+    }
+}
+
 /// Opaque GPU buffer handle. Tracks pointer + size + how to dispose of it.
 pub struct DeviceBuffer {
     ptr: *mut std::ffi::c_void,

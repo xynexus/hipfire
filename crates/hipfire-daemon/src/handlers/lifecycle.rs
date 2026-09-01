@@ -1331,6 +1331,9 @@ pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
 }
 
 pub(crate) fn unload(daemon_state: &mut DaemonState) {
+    // End of a decode session is the natural place to print the
+    // `HIPFIRE_COPY_REPORT=1` census. No-op when unset.
+    hip_bridge::copy_census::report();
     // PFlash drafter goes FIRST: its weights/scratch/KV
     // tensors are released via Gpu::free_tensor, which only
     // queues into the GPU pool. The actual hipFree happens

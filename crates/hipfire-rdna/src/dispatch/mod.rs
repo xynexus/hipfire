@@ -1515,6 +1515,11 @@ impl Gpu {
     /// legacy stream depend on a capturing blocking stream" under capture
     /// mode Global. Use this helper whenever the copy might live inside
     /// a captured region.
+    /// Print the `HIPFIRE_COPY_REPORT=1` census. No-op when unset.
+    pub fn copy_report(&self) {
+        hip_bridge::copy_census::report();
+    }
+
     #[track_caller]
     pub fn memcpy_dtod_at_auto(
         &self,
@@ -1535,6 +1540,7 @@ impl Gpu {
     }
 
     /// D→D copy (whole buffer) that picks async on the active stream when set.
+    #[track_caller]
     pub fn memcpy_dtod_auto(
         &self,
         dst: &hip_bridge::DeviceBuffer,
@@ -1552,6 +1558,7 @@ impl Gpu {
     /// dependency with the capturing stream. This method routes to
     /// `memcpy_htod_async` on the active (capturing) stream when in capture
     /// mode, falling back to sync `memcpy_htod` otherwise.
+    #[track_caller]
     pub fn memcpy_htod_auto(&self, dst: &hip_bridge::DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.bind_thread()?;
         if self.capture_mode {
