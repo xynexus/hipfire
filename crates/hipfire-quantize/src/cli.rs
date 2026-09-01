@@ -1123,14 +1123,16 @@ fn build_rotation_overrides(
     st_files: &[SafetensorsFile],
     fp8_scale_for: &HashMap<String, (usize, String)>,
 ) -> Result<(HashMap<String, Vec<f32>>, Option<Vec<f32>>), String> {
-    let h = config
-        .get("hidden_size")
-        .and_then(|v| v.as_u64())
-        .ok_or("config missing hidden_size")? as usize;
-    let vocab = config
-        .get("vocab_size")
-        .and_then(|v| v.as_u64())
-        .ok_or("config missing vocab_size")? as usize;
+    // A multimodal wrapper (Qwen3.5-VL, gemma3-vl) nests the text config, and
+    // `n_layers` at the call site already falls back the same way.
+    let cfg_u64 = |key: &str| -> Option<u64> {
+        config
+            .get(key)
+            .or_else(|| config.get("text_config").and_then(|tc| tc.get(key)))
+            .and_then(|v| v.as_u64())
+    };
+    let h = cfg_u64("hidden_size").ok_or("config missing hidden_size")? as usize;
+    let vocab = cfg_u64("vocab_size").ok_or("config missing vocab_size")? as usize;
     if h % 256 != 0 {
         return Err(format!(
             "--rotate needs hidden_size {h} %256==0 (codec FWHT)"
@@ -1160,76 +1162,127 @@ fn build_rotation_overrides(
         None
     };
 
+    // Tensor-name prefix. A VL wrapper puts the decoder under
+    // `model.language_model.`; a plain dense model uses `model.`.
+    let prefix = if st_files
+        .iter()
+        .any(|st| st.tensor_data("model.language_model.embed_tokens.weight").is_some())
+    {
+        "model.language_model."
+    } else {
+        "model."
+    };
+
+    // Residual READERS: every 2D weight whose INPUT is the h-wide residual, so
+    // rotating its columns by R1 cancels the rotation the writers applied.
+    // Attention-group readers take input_layernorm; MLP readers take
+    // post_attention_layernorm. A layer carries ONE of the attention groups:
+    // `self_attn.*` on a full-attention layer, `linear_attn.in_proj_*` on a
+    // Gated-DeltaNet layer (Qwen3.5 is 18 linear to 6 full at 24 layers).
+    // Absent names are skipped, which is what lets one table serve both.
+    //
+    // Deliberately ABSENT, because they do not read the residual and rotating
+    // them would corrupt the model: `linear_attn.norm` (per-head, head_dim=128),
+    // `self_attn.{q,k,v}_norm` (head_dim=256), `linear_attn.{A_log,dt_bias}`
+    // (per-head scalars), and `linear_attn.conv1d` (acts on the QKV projection
+    // output, not on the residual).
+    const ATTN_READERS: &[&str] = &[
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.in_proj_z",
+        "linear_attn.in_proj_a",
+        "linear_attn.in_proj_b",
+    ];
+    const MLP_READERS: &[&str] = &["mlp.gate_proj", "mlp.up_proj"];
+    // Residual WRITERS: 2D weights whose OUTPUT is the h-wide residual.
+    const WRITERS: &[&str] = &["self_attn.o_proj", "linear_attn.out_proj", "mlp.down_proj"];
+
     // RMSNorm scales folded into their readers.
     let mut norm1 = Vec::with_capacity(n_layers);
     let mut norm2 = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
         norm1.push(
-            get_f32(&format!("model.layers.{l}.input_layernorm.weight"))
+            get_f32(&format!("{prefix}layers.{l}.input_layernorm.weight"))
                 .ok_or_else(|| format!("missing input_layernorm for layer {l}"))?,
         );
         norm2.push(
-            get_f32(&format!("model.layers.{l}.post_attention_layernorm.weight"))
+            get_f32(&format!("{prefix}layers.{l}.post_attention_layernorm.weight"))
                 .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
         );
     }
-    let final_norm = get_f32("model.norm.weight").ok_or("missing model.norm.weight")?;
+    let final_norm = get_f32(&format!("{prefix}norm.weight"))
+        .ok_or_else(|| format!("missing {prefix}norm.weight"))?;
 
     let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
+    let (mut n_readers, mut n_writers) = (0usize, 0usize);
     for l in 0..n_layers {
-        // Attention readers: fold input_layernorm, then reader-rotate on h.
-        for suf in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
-            if let Some(mut w) = get_f32(&name) {
-                let out = w.len() / h;
-                rotate::fold_cols(&mut w, &norm1[l], out, h);
-                plan.rotate_reader(&mut w, out);
-                ov.insert(name, w);
+        let (mut layer_readers, mut layer_writers) = (0usize, 0usize);
+        // Readers: fold the group's RMSNorm, then reader-rotate on h.
+        for (sufs, norm) in [(ATTN_READERS, &norm1[l]), (MLP_READERS, &norm2[l])] {
+            for suf in sufs {
+                let name = format!("{prefix}layers.{l}.{suf}.weight");
+                if let Some(mut w) = get_f32(&name) {
+                    let out = w.len() / h;
+                    rotate::fold_cols(&mut w, norm, out, h);
+                    plan.rotate_reader(&mut w, out);
+                    ov.insert(name, w);
+                    layer_readers += 1;
+                }
             }
         }
-        // MLP readers: fold post_attention_layernorm, then reader-rotate on h.
-        for suf in ["mlp.gate_proj", "mlp.up_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
-            if let Some(mut w) = get_f32(&name) {
-                let out = w.len() / h;
-                rotate::fold_cols(&mut w, &norm2[l], out, h);
-                plan.rotate_reader(&mut w, out);
-                ov.insert(name, w);
-            }
-        }
-        // Writers (o_proj, down_proj): writer-rotate on the output h dim.
-        for suf in ["self_attn.o_proj", "mlp.down_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
+        // Writers: writer-rotate on the output h dim.
+        for suf in WRITERS {
+            let name = format!("{prefix}layers.{l}.{suf}.weight");
             if let Some(mut w) = get_f32(&name) {
                 let cols = w.len() / h;
                 plan.rotate_writer(&mut w, cols);
                 ov.insert(name, w);
+                layer_writers += 1;
             }
         }
+        // A layer that contributed nothing means the name table missed this
+        // architecture. Rotation is only correct if EVERY reader and writer of
+        // the residual is transformed: miss one and the un-rotated tensor reads
+        // a rotated residual, which is silent garbage rather than an error. Fail
+        // loudly instead.
+        if layer_readers == 0 || layer_writers == 0 {
+            return Err(format!(
+                "--rotate: layer {l} matched {layer_readers} residual readers and \
+                 {layer_writers} writers under prefix `{prefix}` — the name table does \
+                 not cover this architecture, and a partial rotation is silently wrong"
+            ));
+        }
+        n_readers += layer_readers;
+        n_writers += layer_writers;
         // Folded norms → identity (ones).
         ov.insert(
-            format!("model.layers.{l}.input_layernorm.weight"),
+            format!("{prefix}layers.{l}.input_layernorm.weight"),
             vec![1.0f32; h],
         );
         ov.insert(
-            format!("model.layers.{l}.post_attention_layernorm.weight"),
+            format!("{prefix}layers.{l}.post_attention_layernorm.weight"),
             vec![1.0f32; h],
         );
     }
 
     // Head: synthesize the untied lm_head (fold final_norm into the ORIGINAL embed,
     // then reader-rotate) BEFORE rotating the input embedding.
-    let mut embed = get_f32("model.embed_tokens.weight").ok_or("missing embed_tokens")?;
+    let embed_name = format!("{prefix}embed_tokens.weight");
+    let mut embed = get_f32(&embed_name).ok_or_else(|| format!("missing {embed_name}"))?;
     let mut lm_head = embed.clone();
     rotate::fold_cols(&mut lm_head, &final_norm, vocab, h);
     plan.rotate_reader(&mut lm_head, vocab);
     // Input embedding: reader-rotate on h (no fold).
     plan.rotate_reader(&mut embed, vocab);
-    ov.insert("model.embed_tokens.weight".to_string(), embed);
-    ov.insert("model.norm.weight".to_string(), vec![1.0f32; h]);
+    ov.insert(embed_name, embed);
+    ov.insert(format!("{prefix}norm.weight"), vec![1.0f32; h]);
 
     eprintln!(
-        "  --rotate: {} tensors folded+rotated; synthesized untied lm_head [{vocab}×{h}]",
+        "  --rotate: prefix `{prefix}`, {n_readers} residual readers + {n_writers} writers \
+         over {n_layers} layers; {} tensors folded+rotated; synthesized untied lm_head \
+         [{vocab}×{h}]",
         ov.len()
     );
     Ok((ov, Some(lm_head)))
@@ -9573,8 +9626,16 @@ pub fn main() {
     // after the main tensor loop.
     let mut rotate_lm_head: Option<Vec<f32>> = None;
     if let Some(rotate_path) = arg_value(&args, "--rotate") {
-        if arch_id != 0 && arch_id != 1 {
-            eprintln!("error: --rotate is dense-llama only (arch_id 0/1); got arch_id {arch_id}");
+        // 0/1 dense llama-shaped, 5 qwen3.5 dense (a Gated-DeltaNet/full-attention
+        // hybrid, and a VL wrapper whose decoder lives under
+        // `model.language_model.`). The name table covers both; a layer that
+        // matches no residual reader or writer is a hard error rather than a
+        // partial rotation, so an unlisted arch fails loudly if forced here.
+        if !matches!(arch_id, 0 | 1 | ARCH_ID_QWEN35_DENSE) {
+            eprintln!(
+                "error: --rotate supports arch_id 0/1 (dense llama) and \
+                 {ARCH_ID_QWEN35_DENSE} (qwen3.5 dense); got arch_id {arch_id}"
+            );
             std::process::exit(2);
         }
         match build_rotation_overrides(rotate_path, &config, n_layers, &st_files, &fp8_scale_for) {
@@ -12821,8 +12882,10 @@ pub fn main() {
     // per-format weight-codec branch. The runtime prefers an explicit lm_head.weight
     // over the tied embedding (see hfq.rs loader), so this deploys the rotated head.
     if let Some(lm) = rotate_lm_head.take() {
+        // Same text_config fallback the pre-pass uses: a VL wrapper nests it.
         let h = config
             .get("hidden_size")
+            .or_else(|| config.get("text_config").and_then(|tc| tc.get("hidden_size")))
             .and_then(|v| v.as_u64())
             .expect("hidden_size (validated in --rotate pre-pass)") as usize;
         let vocab = lm.len() / h;
