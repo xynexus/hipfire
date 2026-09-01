@@ -7302,6 +7302,28 @@ fn is_embedding_table_name(name: &str) -> bool {
         || name.ends_with("embedding.weight")
 }
 
+/// `--embed-precision <P>` to the code [`embed_precision_override`] dispatches
+/// on. `None` for an unrecognised value (the caller reports and exits).
+///
+/// **0 is not in this table on purpose.** Code 0 means "unconfigured" — a
+/// library or unit-test caller that never ran `main` — and makes the override
+/// return `None` so the format's own embed handling stands. An explicit
+/// `--embed-precision q8` is a different request and gets its own code, because
+/// "keep the caller's default" is only Q8 on formats whose default embed arm is
+/// Q8. On every bf16-staging format (bf16, qtip3, roughquant) that arm is
+/// source-precision bf16, so mapping explicit q8 to 0 made the flag a silent
+/// no-op there.
+fn embed_precision_code_for(name: &str) -> Option<u8> {
+    Some(match name {
+        "source" | "auto" => 3,
+        "bf16" => 1,
+        "f16" => 2,
+        "hfq4" | "q4" => 4,
+        "q8" => 5,
+        _ => return None,
+    })
+}
+
 /// Embed-table storage override for `--embed-precision`. Returns
 /// `Some((bytes, quant_type, group, label))` when the flag keeps the embed above
 /// Q8, so callers replace their default Q8 embed emission with a source-precision
@@ -7316,8 +7338,12 @@ fn embed_precision_override(
     f32_data: &[f32],
 ) -> Option<(Vec<u8>, QuantType, u32, &'static str)> {
     match embed_precision_code() {
-        // q8 (and unconfigured library callers): keep the caller's Q8 default.
+        // Unconfigured (library / unit-test callers that never run main): keep
+        // whatever the caller would have done. NOT the same as an explicit
+        // `--embed-precision q8`, which is code 5 below.
         0 => None,
+        // q8 (explicit): emit Q8 whatever the format's own embed arm would be.
+        5 => Some((quantize_q8f16(f32_data), QuantType::Q8F16, 32, "Q8_F16")),
         // bf16 (force): store the table as bf16 regardless of source width. bf16
         // source round-trips losslessly through f32; f16/f32 sources are re-encoded.
         1 => Some((
@@ -7841,19 +7867,13 @@ pub fn main() {
     }
 
     let embed_precision = arg_value(&args, "--embed-precision").unwrap_or("source");
-    let embed_precision_code = match embed_precision {
-        "source" | "auto" => 3u8,
-        "q8" => 0u8,
-        "bf16" => 1u8,
-        "f16" => 2u8,
-        "hfq4" | "q4" => 4u8,
-        other => {
-            eprintln!(
-                "error: --embed-precision must be one of source|q8|bf16|f16|hfq4 (got '{other}')"
-            );
-            std::process::exit(1);
-        }
-    };
+    let embed_precision_code = embed_precision_code_for(embed_precision).unwrap_or_else(|| {
+        eprintln!(
+            "error: --embed-precision must be one of source|q8|bf16|f16|hfq4 \
+             (got '{embed_precision}')"
+        );
+        std::process::exit(1);
+    });
     let _ = EMBED_PRECISION.set(embed_precision_code);
     eprintln!("Embed precision: {embed_precision}");
 
@@ -11608,10 +11628,10 @@ pub fn main() {
                     .then(|| embed_precision_override(&raw_data, &meta.dtype, &f32_data))
                     .flatten()
                 {
-                    // --embed-precision bf16|f16: keep the gather table at source
-                    // precision instead of dropping it to Q8. No-op (None) under
-                    // the default q8, so every format's Q8 embed arm below is
-                    // unchanged then.
+                    // --embed-precision: the operator's explicit choice for the
+                    // gather table wins over this format's own embed arm below.
+                    // None only when UNCONFIGURED, so every format's default embed
+                    // handling is unchanged when the flag is absent.
                     ov
                 } else if use_bf16 {
                     let (data, qt, label) =
@@ -17977,6 +17997,42 @@ mod codec_golden {
         h("hfq2g128", &quantize_hfq2g128(&x));
         h("hfp4g32_2d", &quantize_hfp4g32_2d(&x, m, k));
         out
+    }
+
+    /// Every `--embed-precision` value maps to a DISTINCT non-zero code.
+    ///
+    /// Regression: `q8` used to map to 0, the same code an unconfigured library
+    /// caller gets, which makes `embed_precision_override` return `None` ("keep
+    /// the caller's default"). On oq4/oq8 that default happens to be Q8 so the
+    /// flag appeared to work; on every bf16-staging format (bf16, qtip3,
+    /// roughquant) the default is source-precision bf16, so an explicit
+    /// `--embed-precision q8` silently produced a bf16 embed. Measured on
+    /// Qwen3.5-0.8B: `--format qtip3` with `--embed-precision q8` and with
+    /// `bf16` emitted byte-identical 479,622,157-byte artifacts.
+    #[test]
+    fn embed_precision_codes_are_distinct_and_nonzero() {
+        let names = ["source", "auto", "q8", "bf16", "f16", "hfq4", "q4"];
+        let mut seen = std::collections::HashMap::new();
+        for n in names {
+            let c = embed_precision_code_for(n)
+                .unwrap_or_else(|| panic!("--embed-precision {n} must be accepted"));
+            assert_ne!(c, 0, "{n} must not reuse the unconfigured code 0");
+            seen.insert(n, c);
+        }
+        // Aliases agree; distinct requests differ.
+        assert_eq!(seen["source"], seen["auto"]);
+        assert_eq!(seen["hfq4"], seen["q4"]);
+        for (a, b) in [
+            ("q8", "bf16"),
+            ("q8", "source"),
+            ("q8", "hfq4"),
+            ("bf16", "f16"),
+            ("bf16", "hfq4"),
+            ("source", "hfq4"),
+        ] {
+            assert_ne!(seen[a], seen[b], "{a} and {b} must be distinguishable");
+        }
+        assert_eq!(embed_precision_code_for("nonsense"), None);
     }
 
     /// `--embed-precision hfq4` emits bytes the qwen35 loader's qt-6 arm can
