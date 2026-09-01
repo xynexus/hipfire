@@ -2630,6 +2630,120 @@ re-recording would bury them.
 Consequence today: `tiny-affected-gate` fails for every commit that touches a
 covered path, escalates to the coherence battery, and that battery only fails on
 hard errors — so the tripwire is permanently tripped and no longer discriminates.
+## [High] `hipfire stop` / `restart` ORPHANS the daemon child — every loaded model stays resident
+
+**Found 2026-08-30 on master `886436954`, nix1 (gfx1103, 62 GiB unified).**
+
+`stop()` (`crates/hipfire-cli/src/commands/daemon.rs:191`) signals exactly one
+pid — the one in `serve.pid` — and `restart()` (`:246`) is just `stop` + `start`.
+Nothing reaps the `hipfire daemon --listen` child, so it is reparented to init and
+keeps every model it has loaded. `StdioTransport::spawn_with` does set
+`kill_on_drop(true)` (`crates/hipfire-daemon-adapter/src/lib.rs:208`), but that
+runs on Drop, and `stop` escalates to `SIGKILL` (`daemon.rs:210` for `--force`,
+`:233` after the 5s graceful deadline) where no Drop ever runs.
+
+Measured: one orphan up 57 minutes held **44 GiB**. Killing that single pid took
+the machine from `used=44G avail=17G` to `used=2G avail=60G`. No process shows it
+in RSS — the daemon's own RSS was 0.5 GB — because GPU allocations on unified
+memory do not appear there, so the usual `ps` sweep says the machine is idle while
+three quarters of RAM is gone.
+
+Consequence, and how it presents: a benchmark loop that called `hipfire restart`
+between models OOM'd four of six models with
+`hipMalloc(2228224 bytes = 2.12 MiB), free=10.1 MiB of total=43008.0 MiB` and
+`refusing to load: this model needs about 32.0 GiB resident and only 17.3 GiB is
+available`. The admission check is doing its job; the memory it is refusing to
+overcommit belongs to a server that was stopped. On unified memory this is worse
+than a normal leak, because the loader's own error text warns that overcommitting
+"invokes the OOM killer on whatever else is running".
+
+Workaround: `hipfire stop && kill $(pgrep -f 'hipfire daemon --listen')`.
+
+Note this is NOT the same as the resolved "hipfire-daemon inference worker killed
+on client disconnect" tombstone — that was the child dying too eagerly; this is the
+child not dying at all.
+
+## [Medium] `finish_reason` is `"stop"` on `max_tokens` truncation — on BOTH decode paths
+
+**Found 2026-08-30 on master `886436954`.** Minimal repro, `Qwen3.5--0.8b-oq4++`
+with `max_tokens: 32` on a prompt that cannot finish in 32 tokens ("Count slowly
+from one to five hundred in words"):
+
+    {"finish":"stop","tokens":32}
+
+Exactly at the cap, reported as a natural stop. Reproduced identically at 512 and
+1536. It is **not** the continuous-batching runner: re-running with
+`HIPFIRE_SERVER_PREFILL_BATCH=0` (confirmed absent from `serve.log`) gives the same
+`{"finish":"stop","tokens":32}`, so the legacy path has it too.
+
+What makes this non-obvious: three separate mappings all look correct —
+`crates/hipfire-runtime/src/arch.rs:1350`
+(`StopReason::MaxTokens if generated >= ctx.max_tokens => "length"`),
+`crates/hipfire-serving-core/src/generate_arch.rs:1217`
+(`generated_count >= max_tokens`), and
+`crates/hipfire-server/src/batch_runner.rs:1107`. The comment at
+`generate_arch.rs:1200-1206` says this was already fixed once, for exactly this
+symptom ("Without this the CLI fell back to 'stop' for every non-tool-call turn,
+hiding `max_tokens` truncation").
+
+Two leads, neither confirmed — do not assume the first:
+- **The comparand, not the comparison.** `config.json` carries `max_tokens: 131072`.
+  If the engine's `ctx.max_tokens` / `max_tokens` is the CONFIG ceiling rather than
+  the request's, then `generated >= max_tokens` is false for every real request and
+  all three sites are dead code. This would explain both paths failing at once,
+  which a per-path bug does not.
+- **A fourth site that hardcodes it.** `batch_runner.rs:1085` sends
+  `{"finish_reason": "stop"}` unconditionally when a step yields no per-session
+  done event ("end the request cleanly"), with no budget check.
+
+Also note `chat.rs:1232` only ever upgrades to `"length"` via
+`detect_tool_call_truncation`, which returns `None` unless there is an unclosed
+`<tool_call>` — so the OpenAI layer cannot rescue the plain-text case.
+
+Impact: strict clients use `finish_reason: "length"` to decide whether to retry
+with a larger budget, and every eval or benchmark that trusts it will score
+truncated output as complete. It did exactly that here — a model that never
+terminates was recorded as finishing cleanly until the generated code was
+compiled.
+
+## [Medium] Three served models emit unusable Python; ZAYA1 is the one that looks like OUR bug
+
+**Found 2026-08-30 on master `886436954`, nix1.** One prompt (write
+`merge_intervals(intervals)`), `temperature: 0`, `max_tokens: 512`, each model
+loaded into an empty machine, generated function executed against six cases
+(empty / single / overlapping / touching / unsorted / nested):
+
+| model | decode t/s | gen tok | code |
+|---|---|---|---|
+| `Qwen3.5--0.8b-oq4++` | 67.3 | 512 (cap) | ✗ never emits code |
+| `MiniCPM5--1B.oq4.25++` | 52.5 | 362 | ✗ wrong |
+| `ZAYA1--8b.oq4++` | 28.1 | 180 | ✗ syntactically broken |
+| `Qwen3.6--35B-A3B.oq4.25++` | 23.6 | 428 | ✓ |
+| `Qwen3.5-9B--oq4.25++` | 10.5 | 353 | ✓ |
+| `Qwen3.8-27B--oq4.25++` | 4.7 | 310 | ✓ |
+
+Three passing models on the same server, harness and prompt rule out a harness
+artifact. The two tiny models are plausibly just capability limits and are recorded
+as a baseline, not a claim: MiniCPM5-1B returns complete, syntactically valid,
+WRONG code (`[[1,3]] -> []`); Qwen3.5-0.8b degenerates into a repetition loop
+("Let me write the function. But note: ... We'll write the function.") and produced
+**zero** complete code blocks in 1536 tokens.
+
+**ZAYA1-8b is the one worth investigating.** It stopped after 180 tokens
+mid-expression — `if not intervals(` — then emitted its closing fence, with
+`finish_reason: "stop"` and well under the cap. An 8.8B model truncating inside an
+expression and then closing the block reads like a decode/tokenizer defect rather
+than weak coding ability. It is also the model whose quant is UNVERIFIED: see
+"zaya's tiny-quant KLD cells measure NOTHING" above — those cells were deliberately
+left unrecorded, so nothing would have caught a bad ZAYA1 quant. Cheapest next
+step is a KLD cell against a reference, not more prompting.
+
+Incidental, worth its own look: `Qwen3.6--35B-A3B` (34.7B, E3.4B) decodes **5x**
+faster than `Qwen3.8-27B` (27.8B, E26.9B) — 23.6 vs 4.7 tok/s — and 2.2x faster
+than the dense 9B, while being the largest artifact on disk. Consistent with active
+params, but 4.7 tok/s for the 27B is low enough to be worth confirming it is not
+the same mixed-layer prefill/decode ceiling recorded for the 122B above.
+
 ## Fixed — tombstones
 
 One line per fixed bug, newest work last. Full write-ups live in `docs/bugs/`;
