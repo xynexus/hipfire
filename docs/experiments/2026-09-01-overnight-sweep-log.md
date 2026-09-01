@@ -719,3 +719,58 @@ start there and can skip the experiment above.
 `__amd_rocclr_copyBuffer` is **7.4% of GPU time across 27311 calls** — ~427 per
 token. Not investigated. That is a lot of small copies for a decode loop and is
 the most suspicious remaining line.
+
+---
+
+## #6 oq8 GEMM ceiling · VERIFIED — number stale, and a real cliff found (but not where I guessed)
+
+`examples/bench_oq8_gemm_small_n`, warm, gfx1151. GB/s counts WEIGHT bytes only.
+
+| projection | weights | B=1 | B=16 | B=17 | B=32 |
+|---|---|---|---|---|---|
+| gate/up `[17408, 5120]` | 86.3 MiB | 150.7 | 152.1 | **78.7 (1.92x time)** | 66.9 |
+| down `[5120, 17408]` | 86.3 MiB | 173.9 | 171.2 | 158.7 (1.10x) | 149.6 |
+| o_proj `[5120, 5120]` | 25.4 MiB | 311.8 | 315.9 | 266.5 (1.17x) | 255.7 |
+
+**The "54% of ceiling" figure is stale.** DRAM-bound shapes run 150–174 GB/s =
+**60–70%** of the 248.5 GB/s ceiling. `o_proj` at 25.4 MiB runs 311 GB/s, ABOVE
+the DRAM ceiling, because it fits the 32 MB MALL — a different regime, not a
+better kernel.
+
+### The real finding: a ~1.9x cliff at B=17, on gate/up only
+
+`gate/up` is flat from B=1 to B=16 (~150 GB/s, 0.99–1.02x the B=1 call) and then
+takes **1.92x the time at B=17** — nearly double for one extra row. `down` and
+`o_proj` cross the same boundary gently (1.10x, 1.17x). So it is shape-specific,
+not a general tiling limit, and it means **an oq8 batch of 17 costs about what 32
+costs**.
+
+### The connection I guessed, and it is WRONG
+
+DDTree budget 16 linearizes to 1 seed + 16 = 17 verify rows, so I predicted the
+cliff explained why budget 12 (32.89 tok/s) beats budget 16 (30.51). Tested
+directly on the 27B:
+
+| budget | verify rows | tok/s | tau |
+|---|---|---|---|
+| 13 | 14 | 31.72 | 5.84 |
+| 14 | 15 | 29.93 | 5.60 |
+| 15 | **16** | 30.48 | 5.95 |
+| 16 | **17** | 30.50 | 5.95 |
+| 17 | 18 | 30.42 | 5.95 |
+
+**No cliff at the 16→17 boundary** — 15/16/17 are within noise of each other.
+The hypothesis is refuted, and the reason is simple: the bench measures **oq8
+W8A8**, while `Qwen3.6-27B--oq4.25++` dispatches the **compact** kernel family
+(`gemv_oq_compact_*`). Different kernels; the cliff does not apply.
+
+The plateau has a duller explanation visible in the same table: **tau saturates
+at 5.9474 for budgets 15/16/17** — the tree stops growing, so extra budget buys
+nothing and costs a little. That is the "tune on wall-clock, not tau" rule again,
+not a hardware cliff.
+
+**Actionable:** the B=17 cliff is real and worth fixing for oq8 models (it caps
+useful batched-verify width at 16 on gate/up), but it is NOT what limits DDTree
+on a compact target. Anyone chasing it should confirm which kernel family their
+model actually dispatches first — that check is 30 seconds and would have saved
+this detour.
