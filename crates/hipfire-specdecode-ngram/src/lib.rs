@@ -61,6 +61,7 @@
 
 pub mod cold;
 pub mod hot;
+pub mod slot_cost;
 
 use std::io;
 use std::path::{Path, PathBuf};
