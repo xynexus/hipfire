@@ -1278,6 +1278,29 @@ fn main() {
     // either way. No warning is emitted, because a warning that is false where
     // it prints is worse than none.
     let t1 = Instant::now();
+    // Arch capability gate. The serving path refuses a drafter whose TARGET arch
+    // is not marked DFlash=Full (`load.rs::require_arch_feature`); this harness
+    // bypassed that and went straight to the loader. A gemma-4 target (arch 24,
+    // `dflash = "none"`) therefore died with `tensor not found:
+    // layers.0.mlp.gate.weight` from inside the qwen35 loader — a message about
+    // a MoE router in a family the model does not belong to, which reads as a
+    // broken drafter rather than an unsupported arch. Refuse by name instead.
+    {
+        let target_arch = HfqFile::open(Path::new(&target_path))
+            .expect("open target")
+            .arch_id;
+        let feat = hipfire_model::arch_features(target_arch);
+        if !feat.dflash.is_full() {
+            eprintln!(
+                "FATAL: target arch {target_arch} ({}) does not support DFlash \
+                 (model-support.toml: dflash = {:?}). Only the qwen3.5 family \
+                 (arch ids 5, 6) is marked Full. The drafter may be perfectly \
+                 well-formed — there is no runtime path to drive it here.",
+                feat.label, feat.dflash,
+            );
+            std::process::exit(2);
+        }
+    }
     let mut target = ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg)
         .expect("load target");
     eprintln!("target loaded in {:.2}s", t1.elapsed().as_secs_f64());
