@@ -1140,6 +1140,22 @@ fn build_rotation_overrides(
     };
     let h = cfg_u64("hidden_size").ok_or("config missing hidden_size")? as usize;
     let vocab = cfg_u64("vocab_size").ok_or("config missing vocab_size")? as usize;
+
+    // GemmaRMSNorm storage convention: the Qwen3.5+ family stores RAW `w` and
+    // applies `(1 + w)` — hipfire bakes the `+= 1.0` in `load_norm_weight`
+    // (qwen35/loading.rs:4530). Llama stores the effective scale directly.
+    //
+    // This is load-bearing here in TWO places, and getting it wrong is silent:
+    // fold `w` instead of `1 + w`, and write back `1.0` (which the loader turns
+    // into 2.0) instead of `0.0`, and the model merely gets quietly worse.
+    // Measured on Qwen3.5-0.8B: oq8++ scores kld 0.000676 unrotated and 20.4
+    // rotated without this correction.
+    let unit_offset_norm = config_uses_unit_offset_norm(config);
+    // The value a folded-away norm must carry so the RUNTIME sees scale 1.0.
+    let identity_norm = if unit_offset_norm { 0.0f32 } else { 1.0f32 };
+    if unit_offset_norm {
+        eprintln!("  --rotate: unit-offset RMSNorm family — folding (1+w), identity norm = 0.0");
+    }
     if h % 256 != 0 {
         return Err(format!(
             "--rotate needs hidden_size {h} %256==0 (codec FWHT)"
@@ -1219,8 +1235,19 @@ fn build_rotation_overrides(
                 .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
         );
     }
-    let final_norm = get_f32(&format!("{prefix}norm.weight"))
+    let mut final_norm = get_f32(&format!("{prefix}norm.weight"))
         .ok_or_else(|| format!("missing {prefix}norm.weight"))?;
+    // Bake the unit offset ONCE, here, so every fold below sees the effective scale.
+    if unit_offset_norm {
+        for v in norm1.iter_mut().chain(norm2.iter_mut()) {
+            for x in v.iter_mut() {
+                *x += 1.0;
+            }
+        }
+        for x in final_norm.iter_mut() {
+            *x += 1.0;
+        }
+    }
 
     let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
     let (mut n_readers, mut n_writers) = (0usize, 0usize);
@@ -1266,11 +1293,11 @@ fn build_rotation_overrides(
         // Folded norms → identity (ones).
         ov.insert(
             format!("{prefix}layers.{l}.input_layernorm.weight"),
-            vec![1.0f32; h],
+            vec![identity_norm; h],
         );
         ov.insert(
             format!("{prefix}layers.{l}.post_attention_layernorm.weight"),
-            vec![1.0f32; h],
+            vec![identity_norm; h],
         );
     }
 
@@ -1284,7 +1311,7 @@ fn build_rotation_overrides(
     // Input embedding: reader-rotate on h (no fold).
     plan.rotate_reader(&mut embed, vocab);
     ov.insert(embed_name, embed);
-    ov.insert(format!("{prefix}norm.weight"), vec![1.0f32; h]);
+    ov.insert(format!("{prefix}norm.weight"), vec![identity_norm; h]);
 
     eprintln!(
         "  --rotate: prefix `{prefix}`, {n_readers} residual readers + {n_writers} writers \
@@ -7360,6 +7387,21 @@ fn is_embedding_table_name(name: &str) -> bool {
     name.contains("embed_tokens")
         || name.ends_with("embeddings.weight")
         || name.ends_with("embedding.weight")
+}
+
+/// Does this model store RMSNorm weights in the GemmaRMSNorm convention — raw
+/// `w`, with `(1 + w)` applied at runtime — rather than the effective scale?
+///
+/// Mirrors `hipfire_train::loader::uses_unit_offset_norm`, and reads
+/// `text_config.model_type` too because a VL wrapper nests it. Getting this wrong
+/// is silent (shapes match, the model just degrades), which is why it is a named,
+/// tested predicate rather than an inline condition.
+fn config_uses_unit_offset_norm(config: &serde_json::Value) -> bool {
+    config
+        .get("model_type")
+        .or_else(|| config.get("text_config").and_then(|tc| tc.get("model_type")))
+        .and_then(|v| v.as_str())
+        .is_some_and(|mt| mt.starts_with("qwen3_5") || mt.starts_with("qwen3_next"))
 }
 
 /// `--embed-precision <P>` to the code [`embed_precision_override`] dispatches
@@ -18067,6 +18109,31 @@ mod codec_golden {
         h("hfq2g128", &quantize_hfq2g128(&x));
         h("hfp4g32_2d", &quantize_hfp4g32_2d(&x, m, k));
         out
+    }
+
+    /// `--rotate` folds RMSNorm into its readers, so it must know whether the
+    /// stored weight IS the scale (llama) or whether the runtime adds 1 first
+    /// (Qwen3.5 / Qwen3-Next, per qwen35/loading.rs:4530). Guessing wrong is
+    /// silent: measured on Qwen3.5-0.8B, oq8++ scored kld 0.000676 unrotated and
+    /// 20.43 rotated while this predicate was missing.
+    #[test]
+    fn unit_offset_norm_families() {
+        let j = |v: serde_json::Value| config_uses_unit_offset_norm(&v);
+        // Qwen3.5 and Qwen3-Next store raw w.
+        assert!(j(serde_json::json!({"model_type": "qwen3_5"})));
+        assert!(j(serde_json::json!({"model_type": "qwen3_5_text"})));
+        assert!(j(serde_json::json!({"model_type": "qwen3_next"})));
+        // A VL wrapper nests the text config; the top level says "qwen3_5" here
+        // but the nested form must be found on its own too.
+        assert!(j(
+            serde_json::json!({"text_config": {"model_type": "qwen3_5_text"}})
+        ));
+        // Llama-shaped models store the effective scale — must stay false, or
+        // --rotate would start double-counting a +1 on arch 0/1.
+        assert!(!j(serde_json::json!({"model_type": "llama"})));
+        assert!(!j(serde_json::json!({"model_type": "qwen2"})));
+        assert!(!j(serde_json::json!({"model_type": "qwen3"})));
+        assert!(!j(serde_json::json!({})));
     }
 
     /// Every `--embed-precision` value maps to a DISTINCT non-zero code.
