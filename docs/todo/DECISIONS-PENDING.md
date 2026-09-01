@@ -203,50 +203,40 @@ the per-tensor rounding applies either way. The allocation SHAPE is the only lev
 
 ---
 
-## 8. The `*-DFlash--bf16.hfq` drafters on `/srv` are unusable — re-cut, or delete?
+## 8. ~~The `*-DFlash--bf16.hfq` drafters on `/srv` are unusable~~ — WITHDRAWN 2026-09-01
 
-Found 2026-09-01 while measuring speculative decode.
+**Registered as a decision, then answered the same day. It is work, not a call.**
 
-**Every DFlash artifact on `/srv/hipfire/models` is `arch 1` (qwen2), not
-`arch 20`**, so `DflashConfig::from_hfq` rejects all seven and no DFlash path can
-load from them. They do carry drafter provenance
-(`config.dflash_config` with `mask_token_id` + `target_layer_ids`), just under an
-older key than the loader's top-level `dflash`, and with the wrong arch tag:
+I framed it as delete-vs-re-cut, weighted by "six of seven have no matching local
+HF source, so deleting may be destructive in a way no re-cut can undo". That
+framing assumed the only route back was a reconvert from upstream.
 
-| artifact | size | matching HF source on `/srv`? |
-|---|---|---|
-| `Qwen3.6-27B-DFlash--bf16.hfq` | 2.29 GB | **yes** — already re-cut (see below) |
-| `Qwen3.5-122B-A10B-DFlash--bf16.hfq` | 0.68 GB | no |
-| `Qwen3.5-397B-A17B-DFlash--bf16.hfq` | 1.64 GB | no |
-| `Qwen3.5-9B-DFlash--bf16.hfq` | 1.39 GB | no |
-| `Qwen3.6-35B-A3B-DFlash--bf16.hfq` | 0.50 GB | no (the source is Qwen3.**5**-35B-A3B) |
-| `gemma-4-26B-A4B-it-DFlash--bf16.hfq` | 0.57 GB | no |
-| `gemma-4-31B-it-DFlash--bf16.hfq` | 2.04 GB | no |
+It is not. The artifacts are **mislabelled, not structurally different** — 58
+identical tensor names (including `fc.weight` and `hidden_norm.weight`), identical
+geometry, and `config.dflash_config` already carrying `mask_token_id` and
+`target_layer_ids`. Everything `DflashConfig::from_hfq` needs is already inside
+each file, under different keys and behind an `arch 1` tag.
 
-**Only one of the seven can be regenerated locally.** That one is done —
-`dflash_convert --input /srv/huggingface/models--z-lab--Qwen3.6-27B-DFlash/snapshots/*/`
-produced `~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq` (3.46 GB, arch 20), and
-it is what the DDTree-vs-chain numbers in `docs/perf/ddtree-vs-chain-opus.md` were
-measured with.
+Two commands repair one, no upstream checkpoint required:
 
-The decision, and why it is not mine:
+```sh
+hfq rearch   src.hfq step1.hfq --arch-id 20
+hfq meta-set step1.hfq out.hfq --key dflash --value-file dflash.json --json
+```
 
-- these live on **`/srv`**, the shared NFS mount, which the overnight brief treats
-  as read-only precisely because its contents are often the only copy;
-- **six of the seven have no local source**, so "delete the unusable ones" may be
-  destructive in a way no re-cut can undo. Whether a copy exists elsewhere — an
-  upstream HF repo still published, another machine — is not something I can
-  determine from here.
+Verified by output, not by loading: the repaired 27B drafter produced a
+**token-for-token identical** draft stream and identical `decode_tau` (10.6667)
+against one freshly built by `dflash_convert` from the same checkpoint.
 
-Options: re-cut the one that can be re-cut and leave the rest (status quo, but the
-directory keeps advertising six drafters that cannot load); fetch the missing
-sources and re-cut all seven; or delete the six as dead weight. The middle option
-depends on whether those upstream repos still exist.
+So nothing needs deleting and nothing is at risk. Recipe and field mapping:
+`docs/help/hfq-container-surgery.md`. The remaining six are queued as
+`.agents/sessions/repair-dflash-drafters/`.
 
-Worth fixing either way, and it is plain work rather than a decision: the loader
-could **name the mismatch** instead of failing with `parse DflashConfig`. It has
-enough information to say "this artifact is arch 1 with a `config.dflash_config`
-block — it looks like a pre-`arch 20` drafter; re-cut it with `dflash_convert`."
+**What made this a false decision:** I registered it while the cheap route was
+unexplored. A decision entry should assert that the alternatives were *tried*,
+not merely that one looked expensive — otherwise the register accumulates
+questions that a few minutes of work would answer, which is the same failure mode
+as the memory-sourced ranked list this session spent the night correcting.
 
 ---
 
