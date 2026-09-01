@@ -7361,6 +7361,26 @@ pub(crate) fn requested_block_size(
     block_size_override.or(draft_block_size).unwrap_or(1)
 }
 
+/// Verify width for one step.
+///
+/// `untrained_cap` is `Some(verify_scratch.max_n)` exactly when nothing
+/// supplies a trained width — no drafter AND no override. There `requested_b`
+/// is `requested_block_size`'s bare fallback of 1, so bounding the spine by it
+/// discards the spine entirely and every step degrades to a plain AR step. The
+/// spine is the width in that case, capped by the scratch the verify asserts
+/// on. Otherwise the trained/overridden width bounds it as before.
+pub(crate) fn effective_block_size(
+    pld_spine: Option<&[u32]>,
+    requested_b: usize,
+    untrained_cap: Option<usize>,
+) -> usize {
+    match (pld_spine, untrained_cap) {
+        (Some(pld), Some(max_n)) => (1 + pld.len()).min(max_n).max(1),
+        (Some(pld), None) => (1 + pld.len()).min(requested_b).max(1),
+        (None, _) => requested_b,
+    }
+}
+
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -7412,10 +7432,16 @@ pub fn spec_step_dflash(
     // This is the "stop speculating" capability the engine previously lacked.
     // Without it a caller cannot fall back on a prompt the drafter cannot
     // predict, and DFlash measures 0.60x AR there while nothing notices.
-    let b = match pld_spine {
-        Some(pld) => (1 + pld.len()).min(requested_b).max(1),
-        None => requested_b,
-    };
+    // See `effective_block_size`. The drafter-free n-gram path used to bound its
+    // spine by `requested_b`, which with no drafter is the literal 1 — so the
+    // spine was discarded on every step and the whole feature was inert:
+    // measured on gfx1103, 9321 tokens drafted and 0 accepted, decoding 8%
+    // SLOWER than AR because building the discarded spine still costs.
+    let b = effective_block_size(
+        pld_spine,
+        requested_b,
+        (draft_cfg.is_none() && block_size_override.is_none()).then_some(verify_scratch.max_n),
+    );
     // Hidden width is the TARGET's; the drafter merely matches it.
     let h = draft_cfg.map(|c| c.hidden).unwrap_or(target.config.dim);
     // Extraction count is a drafter input. With no drafter nothing extracts, and
@@ -13033,6 +13059,28 @@ pub fn compact_target_hidden_host(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_supplied_spine_is_not_bounded_by_the_no_drafter_fallback() {
+        // The regression. `requested_block_size(None, None)` is 1 and rightly so
+        // (see the next test) -- but bounding a spine by it discarded the spine
+        // on every step, so drafter-free n-gram spec decode never speculated:
+        // 9321 drafted / 0 accepted on gfx1103, 8% slower than plain AR.
+        let spine: Vec<u32> = (0..16).collect();
+        let requested_b = requested_block_size(None, None);
+        assert_eq!(
+            effective_block_size(Some(&spine), requested_b, Some(64)),
+            17,
+            "spine must supply the width when nothing else does"
+        );
+        // Bounded by the verify scratch, which is what the verify asserts on.
+        assert_eq!(effective_block_size(Some(&spine), requested_b, Some(8)), 8);
+        // An empty spine still means "do not speculate".
+        assert_eq!(effective_block_size(Some(&[]), requested_b, Some(64)), 1);
+        // A drafter or an override is authoritative: unchanged behaviour.
+        assert_eq!(effective_block_size(Some(&spine), 4, None), 4);
+        assert_eq!(effective_block_size(None, 4, None), 4);
+    }
 
     #[test]
     fn a_step_with_no_drafter_and_no_cap_does_not_speculate() {
