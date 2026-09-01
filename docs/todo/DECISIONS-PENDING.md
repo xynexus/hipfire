@@ -85,9 +85,10 @@ That reframes the question rather than answering it, and it is worth saying how:
   far stronger signal than a topic classifier — and cheap enough for the write
   path.
 
-**Still open.** Recorded as the owner's current thinking, not a decision. If it
-proceeds, the narrow version — treesitter, code vs not-code, one destination per
-gram — is the one that keeps the write path single and adds no model dependency.
+**Still open**, and now written into `2026-08-29-ngram-topic-tags.md` §4 as a
+fourth option beside the original three, with what it changes and the narrowing
+that looks right: treesitter, code vs prose, one destination per gram — a parse
+either succeeds or it does not, which needs no model on the write path.
 
 Secondary, same doc: probe order across tags (§3). Tags have no natural order;
 the doc leans request order. Whatever is chosen must be stable within a session
