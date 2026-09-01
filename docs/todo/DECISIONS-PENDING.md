@@ -47,52 +47,39 @@ Worth knowing before anyone funds it: the same doc measured that on gfx1151,
 with no rotation is about as fast for far less risk. The SpinQuant throughput
 payoff is marginal *on this APU*; revisit on CDNA/gfx12, which are core-bound.
 
-## 2. n-gram topic tags — the write path
+## 2. ~~n-gram topic tags — the write path~~ — DISSOLVED 2026-09-01
 
-`2026-08-29-ngram-topic-tags.md`
+Not decided: **removed**. Every option on the table (write to all N tags, write
+to the first, curate offline) made a HARD assignment at write time, and the hard
+assignment was the thing generating the unrecoverable-misclassification problem.
 
-With N attached tags, "write to topic" is ambiguous:
+The design that replaces it is a **dynamic mixture-of-experts** over the attached
+stores, written up as §4b of `2026-08-29-ngram-topic-tags.md`. Each store is
+weighted by how well it would have predicted the recent context
+(`s_k <- lambda*s_k + log p_k(t|c)`, softmax to a posterior), and prediction is
+the weighted mixture. Nothing is ever hard-assigned, so nothing can be
+misassigned.
 
-- write to **every** attached tag table — N-fold write amplification, and a gram
-  learned in a `rust+gpu` session pollutes both single-topic tables;
-- write to the **first** tag only;
-- keep writing to the **user** table and build tag tables offline from curated
-  corpora.
+The realisation that collapses it: **the per-store likelihood is already the
+detector.** `fn `, `) {` and an identifier shape are high-probability under a
+Rust store and low under a prose store, so a keyword list — or a treesitter parse
+— is a hand-rolled, strictly worse approximation of a number the stores compute
+anyway. Treesitter was considered explicitly and is the wrong tool for the topic
+half: it extends to new *languages*, not new *subjects*.
 
-This decides what the stored data MEANS, so it is not a default I should pick.
-The doc leans toward the third (keeps the write path single, keeps tag tables
-clean, fits the "generate training data" motivation).
+**Two real questions remain, and both are engineering rather than product:**
 
-**Owner's position, 2026-09-01:** no good method yet. The one shape that seems
-workable is a **treesitter or classification model detecting code/topic**, and
-routing n-gram updates to the respective stores on that signal — i.e. neither
-"write to all N tags" nor "first tag only", but *classify, then direct*.
+1. **Hot-path cost.** K lookups per proposal instead of 1, in latency-critical
+   spec decode. Cap the stores, recompute the posterior every N tokens rather
+   than per token, prune to top-2 for the proposal.
+2. **Determinism.** History-dependent weights make drafting non-reproducible
+   across sessions unless the posterior is seeded from fixed state. Much of this
+   repo's testing rests on byte-identical replay, so decide whether the drafter
+   must be reproducible.
 
-That reframes the question rather than answering it, and it is worth saying how:
-
-- It makes the write path **single per gram** again (one classified destination),
-  which is what made option three attractive — without giving up online learning
-  the way "build tag tables offline from curated corpora" does.
-- It moves the cost from write amplification to **classification latency on the
-  write path**, and adds a dependency the n-gram store does not currently have.
-  Treesitter is cheap and deterministic for the code/not-code split; a
-  classification model is neither, and would want to be async or batched.
-- It introduces a **new failure mode**: a misclassified gram lands in the wrong
-  table and is indistinguishable from a correct one afterwards. Option three's
-  offline curation has no equivalent, because the corpus is chosen deliberately.
-- Treesitter alone may cover the case that motivated topics. If the split that
-  matters is code vs prose, a parse either succeeds or it does not, and that is a
-  far stronger signal than a topic classifier — and cheap enough for the write
-  path.
-
-**Still open**, and now written into `2026-08-29-ngram-topic-tags.md` §4 as a
-fourth option beside the original three, with what it changes and the narrowing
-that looks right: treesitter, code vs prose, one destination per gram — a parse
-either succeeds or it does not, which needs no model on the write path.
-
-Secondary, same doc: probe order across tags (§3). Tags have no natural order;
-the doc leans request order. Whatever is chosen must be stable within a session
-or the per-tag marginal numbers are meaningless.
+Promotion is also specified there: replace the raw `ngram_spec_promote_count`
+threshold with a Beta-Bernoulli lower confidence bound on measured ACCEPTANCE,
+so a 1-for-1 gram stops outranking a 40-for-50 one.
 
 ## 3. Coexistence flag spelling — a deliberate compatibility break
 
