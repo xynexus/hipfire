@@ -40,21 +40,21 @@ pub struct BlockController {
     /// Per-depth acceptance-survival COUNTS (request-specific; reset each request).
     /// `s_hit[k]` = #windows with accept_len ≥ k; `s_tot[k]` = #windows that drafted
     /// ≥ k (so depth k was observable). The survival estimate is S(k)=s_hit[k]/s_tot[k],
-    /// k ∈ 1..=8. Counts grow only for depths actually drafted, so once the block
+    /// k ∈ 1..=MAX_DEPTH. Counts grow only for depths actually drafted, so once the block
     /// settles below k, s_tot[k] stops growing and S(k) retains its last value — the
     /// cap-trap fix (the old decaying P(accept==k) histogram forgot the ramp's
     /// deep-survival samples, so a low-settled block could never re-discover depth).
     /// Counts converge fast (a deterministic full-accept depth reads 2/2=1 after just
     /// the ramp), where a slow EMA would still read ≈0.1.
-    s_hit: [f32; 9],
-    s_tot: [f32; 9],
+    s_hit: [f32; MAX_DEPTH + 1],
+    s_tot: [f32; MAX_DEPTH + 1],
     windows_seen: u32,
     // ── live window-cost calibration (hardware cost; stable across requests) ──
     /// Total timing samples observed; gated to ≥TIMING_WARMUP before calibrating.
     timing_samples: u32,
     /// Per-n EMA of full-window wall-time in ms (draft+heads+verify), indexed by
-    /// n_verify (= 1 + drafted block), slots 2..9.
-    t_window_by_n: [f32; 10],
+    /// n_verify (= 1 + drafted block), slots 2..=MAX_DEPTH+1.
+    t_window_by_n: [f32; MAX_DEPTH + 2],
     /// True once the window-cost curve has been fit; preserved across reset().
     calibrated: bool,
     /// Marginal per-position window cost (ms) = slope of the window-cost curve,
@@ -66,6 +66,18 @@ pub struct BlockController {
     /// the argmax is disabled and the block stays at default_block.
     cost_ready: bool,
 }
+
+/// Deepest block the controller can model, and the size of every per-depth
+/// array. This used to be a bare `8` written into three places at once --
+/// `s_hit`/`s_tot` sized 9, the `(2..10)` timing window, and `max_tried.min(8)`
+/// inside the argmax. The last of those is why `max_block` above 8 did nothing:
+/// the argmax could not RETURN a larger block however wide the caller allowed.
+///
+/// That was invisible while only a DFlash drafter drove this, since trained
+/// blocks are <= 8. The drafter-free n-gram path routinely wants 16, so it hit
+/// all three caps at once and settled around 4. Raised to 32 (n_verify = block
+/// + 1, so this covers a 31-token spine) and derived from one constant.
+const MAX_DEPTH: usize = 32;
 
 /// Skip the first few windows so the block doesn't react to bootstrap noise.
 const WARMUP_WINDOWS: u32 = 6;
@@ -84,11 +96,11 @@ impl BlockController {
             min_block,
             max_block,
             max_tried: default_block,
-            s_hit: [0.0f32; 9],
-            s_tot: [0.0f32; 9],
+            s_hit: [0.0f32; MAX_DEPTH + 1],
+            s_tot: [0.0f32; MAX_DEPTH + 1],
             windows_seen: 0,
             timing_samples: 0,
-            t_window_by_n: [0.0f32; 10],
+            t_window_by_n: [0.0f32; MAX_DEPTH + 2],
             calibrated: false,
             // Dormant cost prior: only the dt/t_ar RATIO drives the argmax, and it
             // stays disabled (cost_ready=false) until live window timing refines
@@ -111,8 +123,8 @@ impl BlockController {
         self.block = self.default_block;
         self.max_tried = self.default_block;
         self.windows_seen = 0;
-        self.s_hit = [0.0f32; 9];
-        self.s_tot = [0.0f32; 9];
+        self.s_hit = [0.0f32; MAX_DEPTH + 1];
+        self.s_tot = [0.0f32; MAX_DEPTH + 1];
     }
 
     /// Observe one window's full wall-time (draft+heads+verify). Accumulates per-n
@@ -124,7 +136,7 @@ impl BlockController {
     /// rather than be blocked by phantom marginal cost. Only a clearly-too-steep fit
     /// (Δt > t_ar/2, i.e. a thermal spike) is rejected. Preserved across reset().
     pub fn observe_timing(&mut self, t_window_ms: f32, n_verify: usize) {
-        if (2..10).contains(&n_verify) && t_window_ms > 0.0 {
+        if (2..=MAX_DEPTH + 1).contains(&n_verify) && t_window_ms > 0.0 {
             let slot = &mut self.t_window_by_n[n_verify];
             *slot = if *slot == 0.0 {
                 t_window_ms
@@ -136,8 +148,10 @@ impl BlockController {
         if self.calibrated || self.timing_samples < TIMING_WARMUP {
             return;
         }
-        let lo = (2..10).find(|&n| self.t_window_by_n[n] > 0.0);
-        let hi = (2..10).rev().find(|&n| self.t_window_by_n[n] > 0.0);
+        let lo = (2..=MAX_DEPTH + 1).find(|&n| self.t_window_by_n[n] > 0.0);
+        let hi = (2..=MAX_DEPTH + 1)
+            .rev()
+            .find(|&n| self.t_window_by_n[n] > 0.0);
         if let (Some(n_lo), Some(n_hi)) = (lo, hi) {
             // If the controller never visits ≥2 distinct n_verify (block pinned),
             // n_hi > n_lo never holds and cost_ready stays false — the block then
@@ -176,7 +190,7 @@ impl BlockController {
         // retains its last value (the cap-trap fix; the old decaying P(accept==k)
         // histogram forgot the ramp's deep-survival samples so a low-settled block
         // could never re-discover that drafting deeper pays).
-        let depth = n_proposed.min(8);
+        let depth = n_proposed.min(MAX_DEPTH);
         for k in 1..=depth {
             self.s_tot[k] += 1.0;
             if accept_len >= k {
@@ -213,7 +227,7 @@ impl BlockController {
         let mut tau = 1.0f32;
         let mut best_n = 1usize;
         let mut best_score = f32::MIN;
-        for n in 1..=self.max_tried.min(8) {
+        for n in 1..=self.max_tried.min(MAX_DEPTH) {
             // S(n)=P(accept_len≥n) from the counts; 0 for a never-drafted depth.
             let survival = if self.s_tot[n] > 0.0 {
                 self.s_hit[n] / self.s_tot[n]

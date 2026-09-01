@@ -1014,24 +1014,21 @@ pub fn generate_dflash(
     // controller, driven with per-window accept depth + wall time. Chain mode
     // only (the DDTree steps take no block override). max_block is clamped to
     // the trained block so every scratch stays validly sized (item 4 — sizing
-    // for B above trained — is not landed); an explicit HIPFIRE_DFLASH_BLOCK
+    // for B above trained — is not landed); an explicit `spec_block`
     // pin wins over the controller.
-    let mut block_controller = if df.adaptive_b
-        && df.ddtree.is_none()
-        && dflash_block_override().is_none()
-        && df.block_size > 2
-    {
-        Some(
-            hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
-                df.block_size,
-                2,
-                df.block_size,
-                0.18, // dormant cost prior; live window timing replaces it
-            ),
-        )
-    } else {
-        None
-    };
+    let mut block_controller =
+        if df.adaptive_b && df.ddtree.is_none() && df.spec_block.is_none() && df.block_size > 2 {
+            Some(
+                hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
+                    df.block_size,
+                    2,
+                    df.block_size,
+                    0.18, // dormant cost prior; live window timing replaces it
+                ),
+            )
+        } else {
+            None
+        };
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while !first_filter_stop && !first_token_is_eos && generated < max_tokens {
@@ -1136,7 +1133,8 @@ pub fn generate_dflash(
                 0.0_f32, // temperature
                 &mut rng_state,
                 // Block override: env pin, else the adaptive controller.
-                dflash_block_override().or_else(|| block_controller.as_ref().map(|c| c.block())),
+                df.spec_block
+                    .or_else(|| block_controller.as_ref().map(|c| c.block())),
                 None, // ngram_cache
                 &emitted,
                 0.0_f32, // cactus_delta
@@ -3640,27 +3638,6 @@ pub enum Qwen35Start {
 /// bands (14952 / 14917 / 14903 / 14918 ms on a two-session prompt), so the band
 /// size can be chosen from the latency target alone.
 /// Log which prefill arm each request takes (`HIPFIRE_PREFILL_PATH_TRACE`).
-/// Draft block size B for spec decode, overriding what the drafter was trained
-/// at (`HIPFIRE_DFLASH_BLOCK`).
-///
-/// Worth exposing because B and tau interact and the trained B is not
-/// necessarily the throughput optimum. At B=8 with tau 2.42 on
-/// Qwen3.8-27B/DFlash2, five of eight drafted positions are discarded every
-/// cycle, and the draft phase is charged for all of them (52 ms) while a
-/// rejection also pays the replay (67-336 ms). Shrinking B cuts both terms
-/// without touching acceptance per position; a batched verify costs about one
-/// weight sweep whether B is 3 or 8.
-///
-/// `spec_step_dflash` has taken a `block_size_override` all along -- its own
-/// comment anticipates "a caller doing adaptive-B based on rolling tau" -- but
-/// no serving caller ever passed one.
-fn dflash_block_override() -> Option<usize> {
-    std::env::var("HIPFIRE_DFLASH_BLOCK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|b| *b >= 2)
-}
-
 fn prefill_path_trace() -> bool {
     std::env::var("HIPFIRE_PREFILL_PATH_TRACE").is_ok()
 }

@@ -2770,3 +2770,4 @@ so nothing is recoverable only from `git log`.
 - **Four serving-path lifecycle defects** — FIXED 2026-08-29. [`2026-08-29-serving-lifecycle-defects`](docs/bugs/2026-08-29-serving-lifecycle-defects.md)
 - **Diffusion img2img noise is wrong on BOTH scheduler families** — FIXED 2026-08-29. [`2026-08-29-diffusion-img2img-and-samplers`](docs/bugs/2026-08-29-diffusion-img2img-and-samplers.md)
 - **Drafter-free n-gram spec decode never speculated — the spine was discarded every step (8% slower than plain AR)** — FIXED 2026-09-01. [`2026-09-01-ngram-spine-discarded-by-block-fallback`](docs/bugs/2026-09-01-ngram-spine-discarded-by-block-fallback.md)
+- **`BlockController` could never return a block above 8; `dflash_adaptive_b` applied to nothing; renamed keys' ENV spellings evaporated** — FIXED 2026-09-01. [`2026-09-01-spec-block-controller-and-naming`](docs/bugs/2026-09-01-spec-block-controller-and-naming.md)

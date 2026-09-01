@@ -135,6 +135,12 @@ pub const RENAMED_KEYS: &[(&str, &str)] = &[
     // and the drafter it applies to. The values carry over unchanged, and a path
     // now says "on" by naming what to use.
     ("dflash_mode", "dflash_draft"),
+    // The verify block and its controller are properties of SPECULATION, not of
+    // the DFlash drafter: `spec_step_dflash` is the shared verify engine, and
+    // both settings apply with no drafter loaded at all. `HIPFIRE_DFLASH_BLOCK`
+    // keeps working through these entries (the env layer resolves old names).
+    ("dflash_adaptive_b", "spec_adaptive_block"),
+    ("dflash_block", "spec_block"),
 ];
 
 /// Sentinel values of [`NGRAM_STORE_ROOT_RAM`] meaning "keep tables in RAM".
@@ -752,13 +758,52 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
          drafter the naming convention would not find."
     ),
     field!(
-        "dflash_adaptive_b",
+        "spec_adaptive_block",
         ConfigType::Bool,
         Requirement::Optional,
-        Some("true"),
+        Some("false"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "Whether DFlash may adapt draft batch size."
+        "Let the dspark cost-model controller pick the speculative verify block \
+         per window instead of using a fixed width. Named `spec_`, not `dflash_`, \
+         because the controller is drafter-agnostic by construction — it consumes \
+         only accept depth, proposal count and wall time — and it drives the \
+         drafter-free n-gram path too. Was `dflash_adaptive_b`, whose default said \
+         `true` while both load sites hardcoded `false`, so it applied to nothing. \
+         Default is now `false`, which is what the code actually did and what \
+         measurement supports on both paths. With a DFlash drafter, max_block is \
+         clamped to the TRAINED block, which already is the in-range optimum, so \
+         there is no upside to find and the ramp costs ~25% decode. On the \
+         drafter-free n-gram path, measured on gfx1103/qwen3.5-0.8b over 3 reps at \
+         2000 tokens: a fixed block of 16 gave 319-321 tok/s with an identical \
+         draft length every rep, while the controller gave 252-289 and a draft \
+         length that moved between reps, because it calibrates off wall time. The \
+         controller looks for an interior optimum on a DECAYING survival curve; \
+         n-gram survival stays near-flat out to the spine limit, so the optimum \
+         sits at the boundary and an argmax has nothing to find."
+    ),
+    field!(
+        "spec_block",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Pin the speculative verify block to a fixed width; 0 means auto. Auto is \
+         the trained block for a DFlash drafter, and the spine's own length on the \
+         drafter-free n-gram path. A pin also suppresses `spec_adaptive_block`. \
+         Named `spec_`, not `dflash_`: this sizes the shared verify engine and \
+         applies with no drafter loaded. Replaces the raw `HIPFIRE_DFLASH_BLOCK` \
+         env read, which outranked config silently — env is a resolution layer, \
+         not a bypass. Values below 2 mean no speculation and are rejected as a \
+         likely mistake; write 0 for auto. Worth pinning because B and tau \
+         interact and the trained B is not necessarily the throughput optimum: at \
+         B=8 with tau 2.42 on Qwen3.8-27B/DFlash2, five of eight drafted positions \
+         are discarded every cycle and the draft phase is charged for all of them \
+         (52 ms), while a rejection also pays the replay (67-336 ms). Shrinking B \
+         cuts both terms without touching per-position acceptance; a batched \
+         verify costs about one weight sweep whether B is 3 or 8.",
+        validation: "0, or 2..=32"
     ),
     field!(
         "ngram_spec",

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::{ConfigField, ConfigType, Requirement};
+use crate::schema::{ConfigField, ConfigType, Requirement, RENAMED_KEYS};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +145,33 @@ pub fn config_layer_from_env_with(
         match parse_env_value(&raw, &field.ty) {
             Ok(value) => {
                 layer.values.insert(field.key.to_string(), value);
+            }
+            Err(why) => rejected.push(format!("{name}={raw} ignored: {why}")),
+        }
+    }
+
+    // A renamed key's ENV spelling used to stop working silently. `RENAMED_KEYS`
+    // is applied to layers by `apply_renamed_keys`, but this layer is built by
+    // iterating schema FIELDS, and a retired name is not a field -- so
+    // `HIPFIRE_NGRAM_MAX_SPINE` and friends simply evaporated, which is the
+    // "parses, applies to nothing, says nothing" failure this area keeps
+    // producing. Probe the old spellings too and insert under the OLD key;
+    // `apply_renamed_keys` then moves the value and emits the rename warning, so
+    // the deprecation path is identical to the config-file one.
+    //
+    // The new spelling wins: only fill the old name when the new one is absent.
+    for (old, new) in RENAMED_KEYS {
+        if layer.values.contains_key(*new) {
+            continue;
+        }
+        let Some(field) = fields.iter().find(|f| f.key == *new) else {
+            continue;
+        };
+        let name = env_var_name_for_key(old);
+        let Some(raw) = lookup(&name) else { continue };
+        match parse_env_value(&raw, &field.ty) {
+            Ok(value) => {
+                layer.values.insert((*old).to_string(), value);
             }
             Err(why) => rejected.push(format!("{name}={raw} ignored: {why}")),
         }
@@ -646,5 +673,79 @@ mod env_layer_tests {
         let (layer, rejected) = layer_from(&[]);
         assert!(layer.is_none());
         assert!(rejected.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod renamed_env_tests {
+    use super::*;
+    use crate::schema::{CONFIG_FIELDS, RENAMED_KEYS};
+
+    /// A renamed key's ENV spelling keeps working. Before this the env layer was
+    /// built by iterating schema FIELDS, and a retired name is not a field, so
+    /// `HIPFIRE_DFLASH_BLOCK` evaporated with no diagnostic.
+    #[test]
+    fn old_env_spelling_still_resolves_to_the_new_key() {
+        let fields = CONFIG_FIELDS;
+        let (layer, rejected) = config_layer_from_env_with(fields, |n| {
+            (n == "HIPFIRE_DFLASH_BLOCK").then(|| "16".to_string())
+        });
+        assert!(rejected.is_empty(), "unexpected rejects: {rejected:?}");
+        let layer = layer.expect("old env spelling produced no layer");
+        // Lands under the OLD key; `apply_renamed_keys` moves it and warns.
+        assert_eq!(
+            layer.values.get("dflash_block"),
+            Some(&serde_json::json!(16))
+        );
+    }
+
+    /// The new spelling wins when both are set, matching `apply_renamed_keys`.
+    #[test]
+    fn new_env_spelling_beats_the_old_one() {
+        let fields = CONFIG_FIELDS;
+        let (layer, _) = config_layer_from_env_with(fields, |n| match n {
+            "HIPFIRE_SPEC_BLOCK" => Some("8".to_string()),
+            "HIPFIRE_DFLASH_BLOCK" => Some("16".to_string()),
+            _ => None,
+        });
+        let layer = layer.expect("no layer");
+        assert_eq!(layer.values.get("spec_block"), Some(&serde_json::json!(8)));
+        assert!(layer.values.get("dflash_block").is_none());
+    }
+
+    /// Every rename target must be a real field, or the old spelling silently
+    /// resolves to nothing again.
+    #[test]
+    fn every_rename_target_is_a_live_field() {
+        let fields = CONFIG_FIELDS;
+        for (old, new) in RENAMED_KEYS {
+            assert!(
+                fields.iter().any(|f| f.key == *new),
+                "RENAMED_KEYS maps `{old}` to `{new}`, which is not a schema field"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod renamed_env_e2e {
+    /// The old env spelling must both APPLY and SAY SO. The value landing
+    /// silently is only half the contract: `apply_renamed_keys` exists to tell
+    /// the operator what to write instead.
+    #[test]
+    fn legacy_env_applies_and_warns() {
+        // Serialized against other env-touching tests by running in one test fn.
+        std::env::set_var("HIPFIRE_DFLASH_BLOCK", "8");
+        let resolved = crate::resolve_typed_config_document(&serde_json::json!({}), None);
+        std::env::remove_var("HIPFIRE_DFLASH_BLOCK");
+        assert_eq!(resolved.config.spec_block, 8, "old spelling did not apply");
+        assert!(
+            resolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("dflash_block") && d.message.contains("spec_block")),
+            "old spelling applied but produced no rename diagnostic: {:?}",
+            resolved.diagnostics
+        );
     }
 }
