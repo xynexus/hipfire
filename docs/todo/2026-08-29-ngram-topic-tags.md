@@ -80,6 +80,34 @@ The third keeps the write path single, keeps tag tables clean, and fits the
 "generate training data" goal that motivated topics in the first place. It also
 sidesteps the sharing hazard below.
 
+**Owner's position, 2026-09-01 — a fourth option: classify, then direct.** None
+of the three above is satisfying. The shape that seems workable is a
+**treesitter or classification model detecting code/topic**, with the n-gram
+update routed to the matching store on that signal.
+
+What that changes, relative to the three:
+
+- It restores a **single write destination per gram**, which is the property that
+  made option three attractive — without giving up online learning, which option
+  three does give up by sourcing tag tables from curated corpora only.
+- It moves the cost from write amplification to **classification on the write
+  path**, and adds a dependency the n-gram store does not have today.
+- It introduces a failure mode the others do not have: a **misclassified gram
+  lands in the wrong table and is indistinguishable from a correct one
+  afterwards**. Offline curation cannot misclassify, because the corpus is chosen
+  deliberately. Worth deciding up front whether a wrong tag is recoverable —
+  today nothing records why a gram went where it did.
+
+**Narrowing that looks right:** if the split that actually matters is **code vs
+prose**, treesitter alone is likely enough, and is the version to build first. A
+parse either succeeds or it does not — a far stronger and cheaper signal than a
+topic classifier, deterministic, no model dependency, and no inference on the
+write path. A general topic classifier is a much larger commitment for a signal
+that is fuzzier at exactly the boundaries that matter.
+
+Still open. This is recorded as the direction, not a settled design; the write
+path stays as it is until it is.
+
 ### 5. Privacy — do not lose this
 
 Tag tables that live under `<root>/user/<user>/` are private and may be written.
