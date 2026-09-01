@@ -215,6 +215,29 @@ fn main() {
         100.0 * s.verify_efficiency()
     );
     println!("hot table entries       : {}", ng.hot_len());
+
+    // The marginal-acceptance curve: the observable that decides BOTH
+    // min_acceptance and chain_floor. Shadow mode — reported, never applied.
+    println!("\n--- marginal acceptance by spine depth (shadow: reported, not applied) ---");
+    println!("{:>6}  {:>12}  {:>10}", "depth", "drafted", "P(accept)");
+    for d in 0..hipfire_specdecode_ngram::MAX_TRACKED_DEPTH {
+        let drafted = s.drafted_by_depth[d];
+        if drafted == 0 {
+            break;
+        }
+        println!(
+            "{:>6}  {:>12}  {:>9.1}%",
+            d,
+            drafted,
+            100.0 * s.marginal_acceptance(d)
+        );
+    }
+    println!("\noptimal draft width by slot-cost ratio r = c1/(c0+c1):");
+    println!("  (r = marginal cost of one verify slot as a fraction of a full AR");
+    println!("   step — a per-arch constant measured offline, never a clock)");
+    for r in [0.02f64, 0.05, 0.10, 0.20, 0.40] {
+        println!("    r={r:<5} -> optimal width {}", s.optimal_width(r, 64));
+    }
     println!(
         "\n--- tier attribution (first hit wins, so each row is that tier's marginal value) ---"
     );

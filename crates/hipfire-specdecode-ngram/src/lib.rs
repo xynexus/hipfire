@@ -248,7 +248,18 @@ pub struct NgramStats {
     pub accepted_by_tier: [u64; 4],
     pub lookups_by_tier: [u64; 4],
     pub hits_by_tier: [u64; 4],
+    /// Drafted / accepted counts bucketed by POSITION in the spine.
+    ///
+    /// This is the observable that decides both `min_acceptance` and
+    /// `chain_floor`, and it is pure counts — no clock, so it replays
+    /// identically. See [`NgramStats::marginal_acceptance`].
+    pub drafted_by_depth: [u64; MAX_TRACKED_DEPTH],
+    pub accepted_by_depth: [u64; MAX_TRACKED_DEPTH],
 }
+
+/// Spine depths tracked for the marginal-acceptance curve. Beyond this the
+/// counts fold into the last bucket; `max_spine` defaults to 16.
+pub const MAX_TRACKED_DEPTH: usize = 16;
 
 impl NgramStats {
     pub fn coverage(&self) -> f64 {
@@ -270,6 +281,105 @@ impl NgramStats {
     }
     /// Share of accepted tokens only this tier could supply — its marginal
     /// value, since a more-specific tier would have won the probe otherwise.
+    /// P(accepted | drafted) at spine position `depth`.
+    ///
+    /// ## Why this is the number that matters
+    ///
+    /// Drafting one more slot costs the marginal compute of a wider verify,
+    /// `c1`; an accepted token saves a whole AR step, `c0 + c1` (the weight read
+    /// dominates `c0`). So the slot is worth drafting exactly when
+    ///
+    /// ```text
+    /// P(accept) * (c0 + c1) > c1        i.e.   P(accept) > c1 / (c0 + c1)
+    /// ```
+    ///
+    /// The right-hand side is dimensionless and is a property of the part and
+    /// model — the marginal cost of one verify slot as a fraction of a full AR
+    /// step — not of the moment. Call it `r`. Then:
+    ///
+    /// - `min_acceptance` **is** `r`. That is the whole derivation.
+    /// - the optimal `chain_floor` is the largest depth whose marginal
+    ///   acceptance still exceeds `r`.
+    ///
+    /// Both knobs are approximations of one rule: stop drafting when the
+    /// marginal acceptance falls below the marginal slot cost. This curve is the
+    /// left-hand side, measured; `r` is the right-hand side, and it has to come
+    /// from an offline per-arch measurement (the shape
+    /// `benchmarks/perf-baselines/gfx*.json` already holds) because no count can
+    /// supply a time ratio.
+    ///
+    /// ## Measured curve (`replay_real`, 400k tokens of this repo's Rust)
+    ///
+    /// | depth | drafted | P(accept) |
+    /// |---|---|---|
+    /// | 0 | 316909 | 60.1% |
+    /// | 1 | 160432 | **60.8%** |
+    /// | 2 | 132558 | 54.6% |
+    /// | 4 | 132487 | 40.6% |
+    /// | 8 | 131770 | 24.8% |
+    /// | 14 | 130207 | 14.3% |
+    ///
+    /// Two readings, and the second matters more than the gate this was built
+    /// for.
+    ///
+    /// **Depth 1 beats depth 0.** The second token of a stored `next2` pair is a
+    /// BETTER prediction than a fresh probe, which is a direct validation of the
+    /// inline-pair design — it is not merely free, it is more accurate.
+    ///
+    /// **The optimal width is wide unless slots are expensive.** Reading
+    /// [`optimal_width`](Self::optimal_width) off this curve:
+    ///
+    /// | r | optimal width |
+    /// |---|---|
+    /// | 0.02 | 16 (the cap) |
+    /// | 0.05 | 16 |
+    /// | 0.10 | 16 |
+    /// | 0.20 | 11 |
+    /// | 0.40 | 5 |
+    ///
+    /// So if the target forward is bandwidth-bound — which this module's own
+    /// header asserts — then `c0` dominates, `r` is SMALL, and the right move is
+    /// to draft **more**, not less. That is the opposite direction to
+    /// `min_acceptance`, and it means the gate is only the right tool on a part
+    /// where a verify slot is genuinely expensive (`r >= 0.2`).
+    ///
+    /// Neither knob should be set from taste. Measure `r` once per arch, read
+    /// the width off this curve, and both `min_acceptance` and `chain_floor`
+    /// follow from one number instead of a sweep.
+    ///
+    /// Deliberately NOT derived from a clock. A wall-clock term would make the
+    /// bar depend on thermals and on which other requests share the batch, and
+    /// spec-decode output is not yet provably identical to AR decode here (open
+    /// entry in BUGS.md) — so a timing-dependent bar risks non-reproducible
+    /// TEXT, not merely non-reproducible speed. Counts replay exactly.
+    pub fn marginal_acceptance(&self, depth: usize) -> f64 {
+        let d = depth.min(MAX_TRACKED_DEPTH - 1);
+        let drafted = self.drafted_by_depth[d];
+        if drafted == 0 {
+            return 0.0;
+        }
+        self.accepted_by_depth[d] as f64 / drafted as f64
+    }
+
+    /// The deepest spine position whose marginal acceptance still pays for its
+    /// slot at cost ratio `r` — i.e. the optimal draft width, read off the
+    /// measured curve. `min_samples` guards against a depth seen too rarely to
+    /// judge.
+    pub fn optimal_width(&self, r: f64, min_samples: u64) -> usize {
+        let mut best = 0;
+        for d in 0..MAX_TRACKED_DEPTH {
+            if self.drafted_by_depth[d] < min_samples {
+                break;
+            }
+            if self.marginal_acceptance(d) > r {
+                best = d + 1;
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
     pub fn marginal_share(&self, t: Tier) -> f64 {
         self.accepted_by_tier[t.idx()] as f64 / self.accepted.max(1) as f64
     }
@@ -767,6 +877,14 @@ impl NgramSpec {
         for i in 0..self.spine_grams.len() {
             let g = self.spine_grams[i];
             self.note_outcome(g, i < n);
+        }
+        // Marginal-acceptance curve, by spine position. Counts only.
+        for i in 0..self.tiers.len() {
+            let d = i.min(MAX_TRACKED_DEPTH - 1);
+            self.stats.drafted_by_depth[d] += 1;
+            if i < n {
+                self.stats.accepted_by_depth[d] += 1;
+            }
         }
     }
 
@@ -1401,5 +1519,66 @@ mod acceptance_tests {
             !spec.suppressed(victim.0, victim.1),
             "an evicted gram must draft again, not stay condemned"
         );
+    }
+}
+
+#[cfg(test)]
+mod marginal_curve_tests {
+    use super::*;
+
+    fn stats_with(drafted: &[u64], accepted: &[u64]) -> NgramStats {
+        let mut s = NgramStats::default();
+        for (i, (&d, &a)) in drafted.iter().zip(accepted).enumerate() {
+            s.drafted_by_depth[i] = d;
+            s.accepted_by_depth[i] = a;
+        }
+        s
+    }
+
+    #[test]
+    fn the_curve_reads_back_what_was_recorded() {
+        let s = stats_with(&[100, 100, 100], &[90, 50, 10]);
+        assert!((s.marginal_acceptance(0) - 0.90).abs() < 1e-9);
+        assert!((s.marginal_acceptance(1) - 0.50).abs() < 1e-9);
+        assert!((s.marginal_acceptance(2) - 0.10).abs() < 1e-9);
+        // An unseen depth is 0.0, not a divide by zero.
+        assert_eq!(s.marginal_acceptance(9), 0.0);
+    }
+
+    #[test]
+    fn optimal_width_tracks_the_slot_cost() {
+        // Marginal acceptance by depth: 0.90, 0.50, 0.10, 0.05.
+        let s = stats_with(&[100, 100, 100, 100], &[90, 50, 10, 5]);
+        // A cheap slot (bandwidth-bound verify) pays for a deeper spine...
+        assert_eq!(s.optimal_width(0.04, 10), 4);
+        // ...a dearer one stops earlier...
+        assert_eq!(s.optimal_width(0.20, 10), 2);
+        // ...and a slot costing more than any depth returns pays for none.
+        assert_eq!(s.optimal_width(0.95, 10), 0);
+        // Breaking even is not worth it: at r exactly equal to a depth's
+        // marginal acceptance that slot costs precisely what it returns, so the
+        // comparison is strict and depth 3 (0.05) is excluded at r = 0.05.
+        assert_eq!(s.optimal_width(0.05, 10), 3);
+    }
+
+    #[test]
+    fn a_depth_with_too_little_evidence_stops_the_scan() {
+        // Depth 2 is barely sampled, so the curve is not read past it even
+        // though its rate looks fine — the same "no evidence is not evidence"
+        // rule the per-gram bound follows.
+        let s = stats_with(&[100, 100, 3], &[90, 80, 3]);
+        assert_eq!(s.optimal_width(0.10, 10), 2);
+    }
+
+    #[test]
+    fn the_curve_is_a_pure_function_of_counts() {
+        // The point of deriving from counts rather than a clock: identical
+        // inputs give an identical answer, so a replay is bit-identical.
+        let a = stats_with(&[100, 100], &[90, 40]);
+        let b = stats_with(&[100, 100], &[90, 40]);
+        for d in 0..MAX_TRACKED_DEPTH {
+            assert_eq!(a.marginal_acceptance(d), b.marginal_acceptance(d));
+        }
+        assert_eq!(a.optimal_width(0.5, 1), b.optimal_width(0.5, 1));
     }
 }
