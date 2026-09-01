@@ -50,11 +50,26 @@ was passing a flag the tool never read.
 
 ## Things to decide, not just transcribe
 
-**`import gguf` spells its paths `--in`/`--out`; everything else uses
-`--input`/`--output`.** The promoted commands preserve both spellings exactly,
-because scripts already use them. Unifying is a breaking change and wants its
-own decision — a clap `alias` could accept both, at the cost of two documented
-names for one flag.
+**~~`import gguf` spells its paths `--in`/`--out`~~ — DECIDED AND DONE
+2026-09-01: unified on `--input`/`--output`, as a deliberate break.**
+
+The alias option was rejected: two documented names for one flag is a cost
+carried forever, and the inconsistency is the thing being removed.
+
+The break names itself rather than failing blankly, which is the half that
+matters. On the standalone binary, `--in` returns "`--in` was renamed to
+`--input` ... Use `--input <path>`" — rejected BY NAME, because a bare
+"--input is required" against a command line that plainly says `--in` is the
+error that costs someone ten minutes. That mirrors `RENAMED_KEYS` on the config
+side, which honours the old key and says what to write instead.
+
+The promoted `hipfire import gguf` path needed no such shim: clap already
+answers with *"unexpected argument '--in' found — tip: a similar argument
+exists: '--input'"*. Verified on both entry points.
+
+Blast radius was documentation only — no script in the tree passed the old
+spellings. `docs/CLI.md` regenerated; the reference in
+`docs/bugs/2026-08-29-gguf-dequant-q4_0-q5_k.md` updated.
 
 **`artifact inspect` overlap — RESOLVED 2026-08-30, and the duplicate is gone.**
 `hipfire inspect --json` was already a near-superset. The one thing
