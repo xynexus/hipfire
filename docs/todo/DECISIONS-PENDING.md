@@ -203,6 +203,53 @@ the per-tensor rounding applies either way. The allocation SHAPE is the only lev
 
 ---
 
+## 8. The `*-DFlash--bf16.hfq` drafters on `/srv` are unusable — re-cut, or delete?
+
+Found 2026-09-01 while measuring speculative decode.
+
+**Every DFlash artifact on `/srv/hipfire/models` is `arch 1` (qwen2), not
+`arch 20`**, so `DflashConfig::from_hfq` rejects all seven and no DFlash path can
+load from them. They do carry drafter provenance
+(`config.dflash_config` with `mask_token_id` + `target_layer_ids`), just under an
+older key than the loader's top-level `dflash`, and with the wrong arch tag:
+
+| artifact | size | matching HF source on `/srv`? |
+|---|---|---|
+| `Qwen3.6-27B-DFlash--bf16.hfq` | 2.29 GB | **yes** — already re-cut (see below) |
+| `Qwen3.5-122B-A10B-DFlash--bf16.hfq` | 0.68 GB | no |
+| `Qwen3.5-397B-A17B-DFlash--bf16.hfq` | 1.64 GB | no |
+| `Qwen3.5-9B-DFlash--bf16.hfq` | 1.39 GB | no |
+| `Qwen3.6-35B-A3B-DFlash--bf16.hfq` | 0.50 GB | no (the source is Qwen3.**5**-35B-A3B) |
+| `gemma-4-26B-A4B-it-DFlash--bf16.hfq` | 0.57 GB | no |
+| `gemma-4-31B-it-DFlash--bf16.hfq` | 2.04 GB | no |
+
+**Only one of the seven can be regenerated locally.** That one is done —
+`dflash_convert --input /srv/huggingface/models--z-lab--Qwen3.6-27B-DFlash/snapshots/*/`
+produced `~/.hipfire/models/Qwen3.6-27B--dflash.bf16.hfq` (3.46 GB, arch 20), and
+it is what the DDTree-vs-chain numbers in `docs/perf/ddtree-vs-chain-opus.md` were
+measured with.
+
+The decision, and why it is not mine:
+
+- these live on **`/srv`**, the shared NFS mount, which the overnight brief treats
+  as read-only precisely because its contents are often the only copy;
+- **six of the seven have no local source**, so "delete the unusable ones" may be
+  destructive in a way no re-cut can undo. Whether a copy exists elsewhere — an
+  upstream HF repo still published, another machine — is not something I can
+  determine from here.
+
+Options: re-cut the one that can be re-cut and leave the rest (status quo, but the
+directory keeps advertising six drafters that cannot load); fetch the missing
+sources and re-cut all seven; or delete the six as dead weight. The middle option
+depends on whether those upstream repos still exist.
+
+Worth fixing either way, and it is plain work rather than a decision: the loader
+could **name the mismatch** instead of failing with `parse DflashConfig`. It has
+enough information to say "this artifact is arch 1 with a `config.dflash_config`
+block — it looks like a pre-`arch 20` drafter; re-cut it with `dflash_convert`."
+
+---
+
 ## Go / no-go, rather than a design answer
 
 Five documents are unapproved by their own status line, so starting them is a
