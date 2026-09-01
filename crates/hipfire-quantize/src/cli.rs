@@ -7307,8 +7307,9 @@ fn is_embedding_table_name(name: &str) -> bool {
 /// Q8, so callers replace their default Q8 embed emission with a source-precision
 /// gather table; returns `None` only for `q8` (code 0 — the caller keeps its Q8
 /// path, which is also what unconfigured library callers get). Group size is 0
-/// (ungrouped source precision). The runtime gathers these via the raw bf16/f16
-/// embedding kernels (f32 in-kernel, portable across RDNA2/3/4).
+/// (ungrouped source precision) except for `hfq4`, which is 256-grouped. The
+/// runtime gathers these via the raw bf16/f16 embedding kernels (f32 in-kernel,
+/// portable across RDNA2/3/4), or `embedding_lookup_hfq4g256` for `hfq4`.
 fn embed_precision_override(
     raw_data: &[u8],
     dtype: &str,
@@ -7327,6 +7328,23 @@ fn embed_precision_override(
         )),
         // f16 (force): always store as f16 (readers without a bf16 gather path).
         2 => Some((f32_slice_to_f16_bytes(f32_data), QuantType::F16, 0, "F16")),
+        // hfq4 (force): 4-bit FWHT-rotated gather table (HFQ4G256, 136 B/256 =
+        // 4.25 stored bits/weight). The ONE arm here that goes BELOW the Q8
+        // default, and the reason it exists: on a tied-embedding model the embed
+        // table is also the lm_head, and at a 248k vocab it dominates both the
+        // artifact and the decode bandwidth. `embedding_lookup_hfq4g256` gathers
+        // it and `load_weight_tensor_raw` qt 6 serves the tied head from the same
+        // bytes, so nothing new is needed on the runtime side.
+        //
+        // Quant error on the embed is the largest per-tensor KLD cost in a
+        // low-bit model — it seeds the residual UNNORMALIZED — so this is an
+        // explicit opt-in, never a default. Measure before shipping it.
+        4 => Some((
+            quantize_hfq4g256(f32_data),
+            QuantType::HFQ4G256,
+            256,
+            "HFQ4G256",
+        )),
         // source (CLI default): keep the table at its source float precision
         // (bf16 -> bf16, f16 -> f16, f32 -> f32). If the source is ALREADY quantized
         // (e.g. a GGUF / re-quant .hfq with a Q8 embed), keep the caller's default
@@ -7406,14 +7424,17 @@ OPTIONS:
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
                                much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
-    --embed-precision <P>      embedding-table storage: source (default) | q8 | bf16 | f16.
+    --embed-precision <P>      embedding-table storage: source (default) | q8 | bf16 | f16 | hfq4.
                                Default `source` keeps the gather table at the model's source
                                precision (bf16->bf16, f16->f16, f32->f32); `q8` drops it to the
                                ~500 MB-smaller Q8 table; bf16/f16 force a width. The embed seeds
                                the residual stream unnormalized, so its quant error is the largest
                                per-tensor KLD cost in an otherwise low-bit model — hence keeping it
                                at source by default. Raw bf16/f16 gather converts to f32 in-kernel
-                               (portable RDNA2/3/4).
+                               (portable RDNA2/3/4). `hfq4` is the one setting BELOW q8 (4-bit
+                               HFQ4-G256, 4.25 stored bits/weight): on a tied-embedding model at a
+                               large vocab the table dominates the artifact, and this is the only
+                               way to get an average under 4 bits/weight. Opt-in, measure first.
 
   MoE / K-map:
     --kmap-dense               enable K-map promotion on dense models (default: MoE-only)
@@ -7825,8 +7846,11 @@ pub fn main() {
         "q8" => 0u8,
         "bf16" => 1u8,
         "f16" => 2u8,
+        "hfq4" | "q4" => 4u8,
         other => {
-            eprintln!("error: --embed-precision must be one of source|q8|bf16|f16 (got '{other}')");
+            eprintln!(
+                "error: --embed-precision must be one of source|q8|bf16|f16|hfq4 (got '{other}')"
+            );
             std::process::exit(1);
         }
     };
@@ -17953,6 +17977,36 @@ mod codec_golden {
         h("hfq2g128", &quantize_hfq2g128(&x));
         h("hfp4g32_2d", &quantize_hfp4g32_2d(&x, m, k));
         out
+    }
+
+    /// `--embed-precision hfq4` emits bytes the qwen35 loader's qt-6 arm can
+    /// actually serve. The arm is only correct if all three agree: the codec's
+    /// output length, `QuantType::HFQ4G256`'s declared block size, and the qt
+    /// code the loader keys on. A mismatch here is a model that quantizes fine
+    /// and then fails (or worse, silently mis-reads) at load.
+    #[test]
+    fn embed_precision_hfq4_matches_loader_contract() {
+        // The tied-embedding case this exists for: a vocab-shaped gather table.
+        let (rows, dim) = (512usize, 1024usize);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let packed = quantize_hfq4g256(&x);
+
+        // 136 B per 256-weight group == 4.25 stored bits/weight.
+        assert_eq!(QuantType::HFQ4G256.block_bytes(), Some(136));
+        assert_eq!(packed.len(), (rows * dim / 256) * 136);
+        assert_eq!(
+            QuantType::HFQ4G256.tensor_bytes(rows * dim),
+            Some(packed.len())
+        );
+        // qt 6 is what `load_weight_tensor_raw` and `EmbeddingFormat::HFQ4G256`
+        // both key on; the override arm hands back this QuantType by name, so
+        // pin the code the runtime actually sees.
+        assert_eq!(QuantType::HFQ4G256.code(), 6);
+        // 4.25 bits/weight, the number the sub-4-bit budget is built on.
+        let bits = (packed.len() * 8) as f64 / (rows * dim) as f64;
+        assert!((bits - 4.25).abs() < 1e-9, "stored bits/weight = {bits}");
     }
 
     #[test]
