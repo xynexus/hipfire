@@ -10,7 +10,7 @@
 //!   hfq list   <file>                          — arch, metadata keys, tensor table
 //!   hfq extract <in> <out> --tensor <pat> ...  — copy matching tensors to a new HFQ
 //!                                                 (pat: exact, `prefix*`, `*suffix`, `*sub*`)
-//!   hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)
+//!   hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>) [--json]
 //!                                              — set a metadata JSON key (all tensors
 //!                                                copied), e.g. embed a jinja2 template
 //!   hfq meta-get <file> [--key <k>]            — dump metadata JSON (or one key)
@@ -324,9 +324,26 @@ pub fn main_with_args(argv: &[String]) {
             let (arch, meta_json, tensors) = load_all(inp);
             let mut meta: serde_json::Value =
                 serde_json::from_str(&meta_json).unwrap_or(serde_json::json!({}));
+            // `--json` stores the value as PARSED JSON rather than a string.
+            //
+            // The default is a string because the documented use is a jinja chat
+            // template, which is one. But some metadata is structured — the
+            // top-level `dflash` block a drafter needs is an OBJECT, and
+            // `DflashConfig::from_hfq` does `df.get("num_hidden_layers")` on it.
+            // Stored as a string that call returns `None` and the whole parse
+            // fails with no indication which field was at fault.
+            //
+            // Opt-in rather than "parse if it looks like JSON": a template that
+            // happens to be valid JSON must not silently change type.
+            let encoded = if argv.iter().any(|a| a == "--json") {
+                serde_json::from_str::<serde_json::Value>(&value)
+                    .expect("--json given but the value is not valid JSON")
+            } else {
+                serde_json::Value::String(value)
+            };
             meta.as_object_mut()
                 .expect("metadata not an object")
-                .insert(key.to_string(), serde_json::Value::String(value));
+                .insert(key.to_string(), encoded);
             eprintln!(
                 "set metadata[{key}] ({} tensors copied) → {out}",
                 tensors.len()
@@ -379,7 +396,7 @@ pub fn main_with_args(argv: &[String]) {
                 "hfq — HFQ container tool\n\
                  usage:\n  hfq list <file>
   hfq verify <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
-                 \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)\n\
+                 \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>) [--json]\n\
                  \x20 hfq meta-get <file> [--key <k>]\n\
                  \x20 hfq rearch <in> <out> --arch-id <id>"
             );
