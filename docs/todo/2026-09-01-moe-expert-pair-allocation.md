@@ -140,3 +140,63 @@ to reason about: the arena outlives every view by construction.
 Routing expert loads through the GPU pool. `pool.rs::alloc` recycles whole
 buffers rather than sub-allocating from slabs, so per-tensor rounding applies
 either way.
+
+
+---
+
+## ⭐ The mechanism ALREADY EXISTS — this is a wiring job, not a new allocator
+
+Checked the tree before writing an arena, and found one.
+
+`MoeFfnWeights` already carries `raw_expert_storage: Option<RawExpertStorage>`:
+
+```rust
+pub struct RawExpertStorage {
+    pub gate_up: GpuTensor,
+    pub down: GpuTensor,
+}
+```
+
+Its doc: *"Owning storage for source safetensors whose routed experts are stacked
+as `[E, M, K]`. `experts` then contains **non-owning slice aliases** used by the
+existing executor; the two backing allocations are freed once here."*
+
+That is the arena. **Two owning allocations per LAYER** holding all E experts,
+with each `ExpertWeights` a slice alias. It is built today by
+`calibration_stream.rs:1747` for the stacked-safetensors source, and the teardown
+is already correct — `free_moe_ffn_maybe_slab` frees the two backing allocations
+once, and `free_moe_ffn` carries a `debug_assert!` refusing to run on an ffn that
+has one, precisely so the aliases cannot be double-freed.
+
+**The HFQ loader sets `raw_expert_storage: None`** (`loading.rs:1890`) and
+allocates 2xE buffers per layer instead. That is the entire bug.
+
+### Two allocations per layer is already optimal
+
+| | bytes | multiple of 2 MiB | gtt | ratio |
+|---|---|---|---|---|
+| stacked `gate_up` (256 experts) | 545 259 520 | **260.0** | 545 259 520 | **1.0000x** |
+| stacked `down` (256 experts) | 272 629 760 | **130.0** | 272 629 760 | **1.0000x** |
+
+Both land on exact multiples, so there is nothing to gain from a single
+whole-layer arena over the existing two-buffer shape. 35B routed experts:
+**72.0 -> 36.6 GiB, the raw byte count exactly, saving 35.4 GiB.**
+
+### The implementation, without touching the loaders
+
+`load_moe_expert` has three exits and two go through `load_weight_tensor`, which
+every dense tensor shares — restructuring it to return bytes has a wide blast
+radius. It is not necessary. Allocate the two stacked buffers up front (sizes are
+known from the shapes and E), then per expert: load normally, `memcpy_dtod` into
+the stacked buffer at its offset, free the original. Peak overhead is the arena
+plus ONE expert.
+
+Then build each `ExpertWeights` as a `sub_offset` alias and set
+`raw_expert_storage: Some(..)`. The existing free path handles the rest.
+
+### Why this is the safe version of the idea
+
+The ownership hazard that made this a decision — `dispose()` debug-asserts on a
+`NonOwning` buffer, a guard added after #262 put pool scratch over live weights —
+is already solved on this path, by code that ships. Reusing it is strictly safer
+than introducing a second aliasing scheme beside it.

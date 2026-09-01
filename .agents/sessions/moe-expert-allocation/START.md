@@ -34,6 +34,31 @@ The granule is real but charged **per allocation**, so an arena amortises it to
 nothing. On Qwen3.6-35B-A3B: separate 72.0 GiB, pair 48.0, **arena 36.6** — the
 raw byte count exactly, and 11.4 GiB better than pairing.
 
+## ⭐ The mechanism already exists — wire it, do not build it
+
+`MoeFfnWeights.raw_expert_storage: Option<RawExpertStorage { gate_up, down }>`
+is the arena: **two owning allocations per LAYER** holding all E experts, with
+each `ExpertWeights` a non-owning slice alias. Built today by
+`calibration_stream.rs:1747` for stacked safetensors; teardown already correct
+(`free_moe_ffn_maybe_slab` frees the two backings once, and `free_moe_ffn`
+debug-asserts against running on an ffn that has one).
+
+**The HFQ loader sets it to `None` (`loading.rs:1890`) and allocates 2xE buffers
+per layer.** That is the whole bug.
+
+Two-per-layer is already optimal — stacked `gate_up` is 260.0 x 2 MiB and
+stacked `down` is 130.0 x 2 MiB, both exact, both 1.0000x. Nothing to gain from
+a single whole-layer arena.
+
+### Do it without touching the loaders
+
+`load_moe_expert` has three exits, two through `load_weight_tensor` which every
+dense tensor shares — do NOT restructure it to return bytes. Instead: allocate
+the two stacked buffers up front (sizes known from shapes and E), then per
+expert load normally, `memcpy_dtod` into the stacked buffer at its offset, free
+the original. Peak overhead is the arena plus ONE expert. Then build each
+`ExpertWeights` via `sub_offset` and set `raw_expert_storage: Some(..)`.
+
 ## What the implementation still has to solve
 
 **The pointer tables.** `expert_gate_up_ptrs` / `expert_down_ptrs` hold
