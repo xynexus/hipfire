@@ -2769,3 +2769,4 @@ so nothing is recoverable only from `git log`.
 - **bf16 KLD reference artifacts contain chunk 0 replicated 1175×** — RESOLVED 2026-08-29 — damaged artifacts deleted. [archive](docs/bugs/2026-08-29-fixed-archive.md)
 - **Four serving-path lifecycle defects** — FIXED 2026-08-29. [`2026-08-29-serving-lifecycle-defects`](docs/bugs/2026-08-29-serving-lifecycle-defects.md)
 - **Diffusion img2img noise is wrong on BOTH scheduler families** — FIXED 2026-08-29. [`2026-08-29-diffusion-img2img-and-samplers`](docs/bugs/2026-08-29-diffusion-img2img-and-samplers.md)
+- **Drafter-free n-gram spec decode never speculated — the spine was discarded every step (8% slower than plain AR)** — FIXED 2026-09-01. [`2026-09-01-ngram-spine-discarded-by-block-fallback`](docs/bugs/2026-09-01-ngram-spine-discarded-by-block-fallback.md)
