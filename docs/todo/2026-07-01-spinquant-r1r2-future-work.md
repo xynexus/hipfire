@@ -223,6 +223,28 @@ head, so the R1 identity applies per head.
   `baking_against_the_wrong_sign_seeds_does_not_cancel` (right width, wrong
   seeds).
 
+**It transfers to Opus, and the constant needs no change (checked 2026-09-01).**
+`OqPlusCompactG128` — the CLI-reachable Opus 4-bit home for a K that is a
+multiple of 128 — uses a **128-point FWHT with sign seeds 43/1043**, identical to
+the `G128_CODEC` this bake defines for the Magnum path. So
+`bake_for_per_head_codec(&r2, 128, 43, 1043)` is already correct for Opus.
+
+Corroboration worth recording: that codec's own comment warns that passing the
+256 sign pair "reads as plausible garbage rather than an error, so the signs are
+built locally rather than reusing" the 256 table — independently describing the
+exact hazard `baking_against_the_wrong_sign_seeds_does_not_cancel` tests.
+
+Two limits, both stated in the code:
+- **Plain `Oq4` can never carry R2.** `cli.rs`: "`Oq4` is G256-only (its rotate
+  is a 256-point FWHT)." At `head_dim = 128` the Opus vehicle is
+  `OqPlusCompactG128`, which is also the form that carries calibration.
+- **`quantize_oq8g128` is not CLI-reachable** — its only caller is a test
+  (`codecs.rs`), so `Oq8G128` (qt 54, a real dtype in the gemv table) is not the
+  practical route today even though the dtype exists.
+
+R1 needs no transfer at all: `bake_for_oq4_recipe` is 256-wide with seeds
+42/1042, which IS the Oq4G256 codec's rotate — it was built on Opus.
+
 **Still to wire, and it needs a GPU:** route `v_proj`/`o_proj` through the
 128-wide codec on a real model (they currently take the run-wide format), have
 the quantizer accept an R2 alongside `--rotate`, and parity-check against the

@@ -68,8 +68,10 @@ A new `--lib` test, `crates/hipfire-rdna/src/kernel_arity.rs`, now cross-checks
 without a GPU.
 
 **FIXED since:** AWQ-dropped-for-`FwhtG128` and the `qt 52` `Oq8G256` mis-tag
-(both now REFUSE rather than compute silently wrong — no G128 AWQ kernel and no
-`Oq8G128` dtype exist to wire); the DFlash/DDTree Opus lm_head FWHT mismatch (also
+(both now REFUSE rather than compute silently wrong — at the time neither a G128
+AWQ kernel nor an `Oq8G128` dtype existed to wire; **the dtype has since landed**
+— qt 54, present in `hipfire-gpu-types` and the gemv dispatch table — see the
+2026-08-30 update further down, which supersedes this parenthetical); the DFlash/DDTree Opus lm_head FWHT mismatch (also
 refuses); `weight_gemv`'s `row_stride: 0`; AR-decode codepoint destruction;
 DeepSeek's ignored `routed_scaling_factor`; `serve.pid`-before-bind; `"Euler a"`
 silently running plain Euler (now refused AND un-advertised); the image-workload
