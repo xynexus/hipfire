@@ -1,8 +1,11 @@
 # TODO: one GTT allocation per routed expert, not two
 
-**Status:** open, designed, NOT implemented (2026-09-01). Blocked on an ownership
-question that deserves a decision rather than a 4 a.m. patch — registered as
-item 7 in `DECISIONS-PENDING.md`.
+**Status:** DECIDED 2026-09-01 — **per-layer arena**, on the owner's call after
+the 2 MiB granule was re-measured on the live driver. Not implemented.
+
+The title says "pair" because that is where the investigation started. The pair
+shape is now the REJECTED option: it recovers a third of the tax where an arena
+recovers all of it.
 
 ## The win, measured
 
@@ -85,3 +88,55 @@ addresses), so it wants measuring against the indexed MoE kernels first.
 Do not measure this with a first run after rebuilding — kernels JIT-compile
 inside the timed window and cost up to 3.45x. `dflash_spec_demo` now warns
 (`hipfire_rdna::jit_compiles()`).
+
+
+---
+
+## DECIDED: per-layer arena (2026-09-01)
+
+The owner asked the right question first — *does ROCm actually have to round to
+2 MiB?* Re-measured on the live driver with `hipfire-rdna` example
+`gtt_granularity`, which allocates N buffers of a given size and reads the real
+GTT delta:
+
+| allocation shape | bytes requested | GTT consumed | ratio |
+|---|---|---|---|
+| `down_proj` alone | 1 064 960 | 2 092 958 | **1.965x** |
+| `gate_up` alone | 2 129 920 | 4 194 304 | **1.969x** |
+| one per expert (both projections) | 3 194 880 | 4 194 304 | 1.313x |
+| arena, 8 experts | 25 559 040 | 27 262 976 | 1.067x |
+| **arena, 128-expert layer** | 408 944 640 | 408 944 640 | **1.000x** |
+
+**The granule is real and mandatory — but it is charged PER ALLOCATION, so a
+large enough arena amortises it to nothing.** That is what decides the fork.
+
+### Payoff on Qwen3.6-35B-A3B (256 experts x 48 layers)
+
+| shape | resident | vs raw | saving |
+|---|---|---|---|
+| separate (today) | 72.0 GiB | 1.969x | — |
+| one per expert | 48.0 GiB | 1.313x | 24.0 GiB |
+| **per-layer arena** | **36.6 GiB** | **1.000x** | **35.4 GiB** |
+
+The arena saves **11.4 GiB more than pairing — 48% more**, and lands on the raw
+byte count exactly.
+
+### What the arena still has to solve
+
+The pointer tables. `expert_gate_up_ptrs` / `expert_down_ptrs` currently hold
+independent device addresses; under an arena they become base + offset. The
+indexed MoE kernels dereference those slots, so the change must be measured
+against them, not just assumed to be layout-neutral.
+
+The ownership question that blocked the pair shape **does not go away** — an
+arena hands out views too, and `dispose()` still `debug_assert!`s on a
+`NonOwning` buffer (guard added after #262, where an alias returned from the pool
+as scratch over live weights). But it is now ONE owned allocation per layer with
+N views, rather than N allocations each with a view, which is a simpler lifetime
+to reason about: the arena outlives every view by construction.
+
+### Do not re-test
+
+Routing expert loads through the GPU pool. `pool.rs::alloc` recycles whole
+buffers rather than sub-allocating from slabs, so per-tensor rounding applies
+either way.

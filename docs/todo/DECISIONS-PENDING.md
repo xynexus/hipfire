@@ -151,55 +151,30 @@ Hessian per tensor, damping is applied after the rebase).
 
 ---
 
-## 7. MoE routed experts — one allocation per expert, and who owns it?
+## 7. ~~MoE routed experts — one allocation per expert, and who owns it?~~ — DECIDED 2026-09-01
 
-`2026-09-01-moe-expert-pair-allocation.md`
+**Per-layer arena.** Owner's call, made after re-measuring the premise rather
+than accepting it: *does ROCm actually have to round to 2 MiB?*
 
-gfx1151 rounds every GTT allocation, and the qwen35 loader allocates each
-expert's two projections separately, so some models pay the rounding twice.
-Computed from the real artifacts through `gtt_alloc_cost`:
+It does — and that answer chose the shape. Measured live with
+`gtt_granularity`: `down_proj` at 1 064 960 B consumes 2 092 958 (**1.965x**),
+but a 128-expert arena at 408 944 640 B consumes exactly 408 944 640 (**1.000x**).
+The granule is charged **per allocation**, so a large enough arena amortises it
+away entirely.
 
-| model | separate | one/expert | saving |
-|---|---|---|---|
-| Qwen3.6-35B-A3B oq4.25++ | 30.0 GiB | 20.0 GiB | **10.0 GiB (33.3%)** |
-| Qwen3.5-122B-A10B oq4.25++ | 75.8 GiB | 74.5 GiB | 1.3 GiB (1.7%) |
+That makes the pair shape the rejected option: on Qwen3.6-35B-A3B it saves
+24.0 GiB where the arena saves **35.4 GiB** — 11.4 GiB more, landing on the raw
+byte count exactly.
 
-Model-shaped, not universal — it depends where per-expert size sits on the 2 MiB
-grid, and it is **not** a 122B unlock (that model's amplification was the
-compact->Oq8 expansion, already closed by compact-resident being default).
+Design and remaining work: `2026-09-01-moe-expert-pair-allocation.md`.
+Queued: `.agents/sessions/moe-expert-allocation/`.
 
-**The decision is ownership, not effort.** Packing after load is the low-risk
-shape — loaders untouched, correctness is a device-to-device copy — but
-`GpuTensor::sub_offset` yields a `NonOwning` buffer, and `dispose()` carries
-
-```rust
-BufferOrigin::NonOwning => {
-    debug_assert!(false, "dispose() on a non-owning buffer — aliasing bug");
-}
-```
-
-That assert exists because of #262, where an alias went back to the pool and came
-back as scratch over live weights. So packing means `ExpertWeights` must learn
-that `down` is a view and must not be freed — a lifetime change on the load path
-of every MoE model, and one that deliberately routes around a guard added after a
-memory-corruption bug.
-
-The fork:
-
-- **one buffer with two views** — smallest diff, but needs the ownership change
-  above and an explicit exemption from the alias invariant;
-- **a per-layer arena** for all of a layer's experts — amortises the rounding
-  further (512 experts in one allocation rather than 512 allocations), but changes
-  how `expert_gate_up_ptrs` / `expert_down_ptrs` are built, from independent
-  addresses to offsets into one base, so it wants measuring against the indexed
-  MoE kernels first.
-
-Not startable unattended: either branch is a deliberate break of an invariant
-that was added in response to memory corruption, which is an owner call.
-
-Ruled out and not worth re-testing: routing expert loads through the GPU pool.
-`pool.rs::alloc` recycles whole buffers rather than sub-allocating from slabs, so
-the per-tensor rounding applies either way. The allocation SHAPE is the only lever.
+**Still to solve in implementation, not a decision:** the indexed MoE kernels
+read `expert_gate_up_ptrs` / `expert_down_ptrs` as independent addresses; under
+an arena those become base + offset and must be measured against those kernels.
+The `NonOwning`/`dispose()` guard still applies, but an arena is a simpler
+lifetime — one owned allocation per layer that outlives every view by
+construction.
 
 ---
 
