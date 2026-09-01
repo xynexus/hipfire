@@ -551,12 +551,14 @@ impl Qwen35Weights {
         //
         // Safe TODAY only because `load_weights_multi` hardcodes
         // `slab_storage: None` — safe by DATA, not by type, and one loader
-        // change from being live. Guarding the two `free_moe_ffn` calls alone
-        // would be worse than this: it would look like the path had been made
-        // slab-safe while ~40 other frees stayed exposed. Making the path
-        // genuinely slab-safe means threading `slabs` through all of them,
-        // which is a real change and wants its own reasoning; asserting the
-        // assumption is the honest interim.
+        // change from being live. The two MoE-FFN frees DO route through
+        // `free_moe_ffn_maybe_slab` (with `None`) — not to make this path
+        // slab-safe, but because that is the only teardown that knows about
+        // `raw_expert_storage`, whose expert buffers are interior slices of one
+        // stacked allocation. Making the path genuinely slab-safe means
+        // threading `slabs` through the other ~40 frees, which is a real change
+        // and wants its own reasoning; asserting the assumption is the honest
+        // interim.
         assert!(
             self.slab_storage.is_none(),
             "free_gpu_multi: slab-backed weights on the pp>1 path. Every free here \
@@ -614,7 +616,7 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.norm_weight);
                     let _ = gpu.free_tensor(l.wo.buf);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
+                    free_moe_ffn_maybe_slab(gpu, None, l.ffn);
                 }
                 LayerWeights::FullAttnMoe(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
@@ -625,7 +627,7 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.q_norm);
                     let _ = gpu.free_tensor(l.k_norm);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
+                    free_moe_ffn_maybe_slab(gpu, None, l.ffn);
                 }
             }
         }
@@ -656,55 +658,6 @@ pub fn validate_paged_moe_decode_expert_cache(
         .borrow()
         .would_fit_largest_expert_module_set(layer, config.num_experts_per_tok)
         .map_err(|e| format!("paged Qwen35-MoE decode expert cache too small: {e}"))
-}
-
-/// Unguarded MoE-FFN teardown for the `pp > 1` path ONLY.
-///
-/// The guarded version is [`free_moe_ffn_maybe_slab`]; use that one unless you
-/// are `free_gpu_multi`, which asserts `slab_storage.is_none()` precisely so
-/// this is sound. Two aliasing sources make the distinction matter, and neither
-/// is checked here:
-///
-/// * slab-backed tensors — non-owning aliases into a weight slab;
-/// * `raw_expert_storage` — expert buffers that are interior slices of one
-///   stacked allocation, which `free_moe_ffn_maybe_slab` `mem::forget`s.
-///
-/// `paro_shared` IS handled below, which is the tell that the other two were
-/// oversights rather than deliberate: the same function already knows that
-/// freeing a non-owning view is wrong.
-fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
-    debug_assert!(
-        ffn.raw_expert_storage.is_none(),
-        "free_moe_ffn: raw_expert_storage aliases would be double-freed here; \
-         use free_moe_ffn_maybe_slab"
-    );
-    let _ = gpu.free_tensor(ffn.router.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
-    if let Some(t) = ffn.expert_gate_up_strides {
-        let _ = gpu.free_tensor(t);
-    }
-    if let Some(t) = ffn.expert_down_strides {
-        let _ = gpu.free_tensor(t);
-    }
-    let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
-    let _ = gpu.free_tensor(ffn.expert_down_ptrs);
-    for e in ffn.experts {
-        let _ = gpu.free_tensor(e.gate_up.buf);
-        let _ = gpu.free_tensor(e.down.buf);
-    }
-    // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
-    // alias these and must NOT be freed separately — they're non-owning views).
-    if let Some(s) = ffn.paro_shared {
-        let _ = gpu.free_tensor(s.gate_up_pairs);
-        let _ = gpu.free_tensor(s.gate_up_theta);
-        let _ = gpu.free_tensor(s.gate_up_channel_scales);
-        let _ = gpu.free_tensor(s.down_pairs);
-        let _ = gpu.free_tensor(s.down_theta);
-        let _ = gpu.free_tensor(s.down_channel_scales);
-    }
 }
 
 pub struct ModelGpuStorage {
@@ -756,6 +709,15 @@ pub(super) fn free_weight_tensor_maybe_slab(
     free_tensor_maybe_slab(gpu, slabs, wt.buf);
 }
 
+/// The ONE MoE-FFN teardown. Three aliasing sources make a naive per-field free
+/// wrong, and this is the only place that knows all three:
+///
+/// * slab-backed tensors — non-owning aliases into a weight slab;
+/// * `raw_expert_storage` — expert buffers that are interior slices of one
+///   stacked allocation, freed once here;
+/// * `paro_shared` — per-expert `paro` rotations alias these.
+///
+/// `pp > 1` (`free_gpu_multi`) passes `slabs: None`, which it asserts is sound.
 fn free_moe_ffn_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, ffn: MoeFfnWeights) {
     let raw_expert_storage = ffn.raw_expert_storage;
     free_weight_tensor_maybe_slab(gpu, slabs, ffn.router);
@@ -765,11 +727,23 @@ fn free_moe_ffn_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, ffn: 
     free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert.down);
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+    if let Some(t) = ffn.expert_gate_up_strides {
+        let _ = gpu.free_tensor(t);
+    }
+    if let Some(t) = ffn.expert_down_strides {
+        let _ = gpu.free_tensor(t);
+    }
     for e in ffn.experts {
         if raw_expert_storage.is_some() {
-            // These buffers alias slices of the owning stacked allocations.
-            std::mem::forget(e.gate_up.buf);
-            std::mem::forget(e.down.buf);
+            // The weight buffers alias slices of the owning stacked
+            // allocations. The AWQ sidecars do NOT — they stay one small
+            // allocation per expert and still have to be freed.
+            for wt in [e.gate_up, e.down] {
+                if let Some(scale) = wt.awq_scale {
+                    let _ = gpu.free_tensor(scale);
+                }
+                std::mem::forget(wt.buf);
+            }
         } else {
             free_weight_tensor_maybe_slab(gpu, slabs, e.gate_up);
             free_weight_tensor_maybe_slab(gpu, slabs, e.down);
@@ -778,6 +752,16 @@ fn free_moe_ffn_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, ffn: 
     if let Some(storage) = raw_expert_storage {
         let _ = gpu.free_tensor(storage.gate_up);
         let _ = gpu.free_tensor(storage.down);
+    }
+    // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
+    // alias these and must NOT be freed separately — they're non-owning views).
+    if let Some(s) = ffn.paro_shared {
+        let _ = gpu.free_tensor(s.gate_up_pairs);
+        let _ = gpu.free_tensor(s.gate_up_theta);
+        let _ = gpu.free_tensor(s.gate_up_channel_scales);
+        let _ = gpu.free_tensor(s.down_pairs);
+        let _ = gpu.free_tensor(s.down_theta);
+        let _ = gpu.free_tensor(s.down_channel_scales);
     }
 }
 

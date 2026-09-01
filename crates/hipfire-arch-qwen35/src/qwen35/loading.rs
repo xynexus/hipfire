@@ -1790,6 +1790,19 @@ fn paro_load_moe_ffn(
     let groups_per_row_mi = mi / (gs as usize); // 512/128 = 4
     let bytes_per_row_mi = groups_per_row_mi * 72; // 288
 
+    // Two stacked allocations for the whole layer instead of 2xE — see
+    // `load_moe_experts_stacked` for why (the 2 MiB GTT granule makes a routed
+    // expert cost ~1.97x its bytes on its own). No uniformity check is needed
+    // here: both strides are COMPUTED from the layer geometry, not read from a
+    // per-expert header, so every expert has the same one by construction.
+    let gu_stride = 2 * mi * bytes_per_row_hidden;
+    let dn_stride = dim * bytes_per_row_mi;
+    // Slots are spaced to 256 B — see `load_moe_experts_stacked` for why.
+    let gu_pitch = gu_stride.next_multiple_of(256);
+    let dn_pitch = dn_stride.next_multiple_of(256);
+    let gu_stack = gpu.alloc_tensor(&[n_exp * gu_pitch], DType::Raw)?;
+    let dn_stack = gpu.alloc_tensor(&[n_exp * dn_pitch], DType::Raw)?;
+
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
         // Per-expert prefixes (full dot-path is constructed inside the helper).
@@ -1807,11 +1820,15 @@ fn paro_load_moe_ffn(
         let mut gate_up_bytes = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
         gate_up_bytes.extend_from_slice(&gate_bytes);
         gate_up_bytes.extend_from_slice(&up_bytes);
-        let gate_up_buf = gpu.upload_raw(&gate_up_bytes, &[gate_up_bytes.len()])?;
+        gpu.hip
+            .memcpy_htod_offset(&gu_stack.buf, x * gu_pitch, &gate_up_bytes)?;
+        let gate_up_buf = gu_stack.sub_offset(x * gu_pitch, gu_stride);
 
         let down_bytes = paro_repack_moe_projection(source, &down_prefix, dim, mi, gs as usize)?;
-        debug_assert_eq!(down_bytes.len(), dim * bytes_per_row_mi);
-        let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()])?;
+        debug_assert_eq!(down_bytes.len(), dn_stride);
+        gpu.hip
+            .memcpy_htod_offset(&dn_stack.buf, x * dn_pitch, &down_bytes)?;
+        let down_buf = dn_stack.sub_offset(x * dn_pitch, dn_stride);
 
         let gate_up = WeightTensor {
             buf: gate_up_buf,
@@ -1887,7 +1904,10 @@ fn paro_load_moe_ffn(
         expert_gate_up_dtypes,
         expert_down_dtypes,
         paro_shared: Some(shared),
-        raw_expert_storage: None,
+        raw_expert_storage: Some(RawExpertStorage {
+            gate_up: gu_stack,
+            down: dn_stack,
+        }),
     })
 }
 
@@ -6712,6 +6732,183 @@ fn load_moe_expert(
     })
 }
 
+/// Load a layer's routed experts into TWO stacked allocations — one for
+/// `gate_up`, one for `down` — with each `ExpertWeights` a non-owning alias
+/// into them.
+///
+/// gfx1151 rounds every GTT allocation up to a 2 MiB multiple, and a routed
+/// expert sits just over the line: a Qwen3.6-35B-A3B's 1 064 960 B `down_proj`
+/// consumes 2 MiB (1.965x) and its 2 129 920 B `gate_up_proj` consumes 4 MiB
+/// (1.969x). The rule is ALIGNMENT, not size — stacked, both buffers land on
+/// exact 2 MiB multiples and cost their own bytes. Measured over 256 experts x
+/// 48 layers: 72.0 GiB resident -> 36.6 GiB, i.e. 1.000x the raw byte count.
+/// A whole-layer arena would buy nothing further for the same reason.
+///
+/// `Ok((experts, None))` means the layer stayed unstacked and the caller has
+/// today's 2xE separate allocations. Two reasons that happens:
+///
+/// * the experts are slab-backed, so they are already interior views of one big
+///   allocation with no per-expert rounding to remove — and copying them out
+///   would double the resident bytes;
+/// * the layer is not uniform. A stacked buffer has ONE stride, so a single
+///   expert that disagreed would silently misalign every later one. The layout
+///   is all-or-nothing, exactly as `qwen4exp/src/trunk_gpu.rs:295` treats its
+///   own stacking; `expert_*_dtypes` are per-expert VECTORS, so a mixed layer is
+///   structurally representable here and the 122B really does mix compact and
+///   promoted experts across 37 of its 48 layers.
+///
+/// Peak overhead during the load is the two stacked buffers plus ONE expert.
+fn load_moe_experts_stacked(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    slabs: Option<&SlabTensorIndex>,
+    p: &str,
+    config: &Qwen35Config,
+    oq_indexed_decode: bool,
+    layer_compact_dispatchable: bool,
+) -> HipResult<(Vec<ExpertWeights>, Option<RawExpertStorage>)> {
+    let n_exp = config.num_experts;
+    let mi = config.moe_intermediate_size;
+    let load_pair = |gpu: &Gpu, x: usize| -> HipResult<(WeightTensor, WeightTensor)> {
+        Ok((
+            load_moe_expert(
+                hfq,
+                gpu,
+                slabs,
+                &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
+                2 * mi,
+                config.dim,
+                oq_indexed_decode,
+                layer_compact_dispatchable,
+            )?,
+            load_moe_expert(
+                hfq,
+                gpu,
+                slabs,
+                &format!("{p}.mlp.experts.{x}.down_proj.weight"),
+                config.dim,
+                mi,
+                oq_indexed_decode,
+                layer_compact_dispatchable,
+            )?,
+        ))
+    };
+
+    let mut experts: Vec<ExpertWeights> = Vec::with_capacity(n_exp);
+    if n_exp == 0 {
+        return Ok((experts, None));
+    }
+
+    // Expert 0 fixes the stride and dtype for the whole layer.
+    let first = load_pair(gpu, 0)?;
+    let (gu_stride, dn_stride) = (first.0.buf.buf.size(), first.1.buf.buf.size());
+    let (gu_dtype, dn_dtype) = (first.0.gpu_dtype, first.1.gpu_dtype);
+    // Slot PITCH, not the expert's byte length. Each expert used to get its own
+    // `hipMalloc`, which is 256 B aligned; the indexed MoE kernels dereference
+    // those addresses and may vector-load from them. Packing at the raw stride
+    // would hand them whatever alignment the layout happens to have — a compact
+    // expert's stride is `130 + 2*N_out` per group, which is not even a multiple
+    // of 4 — so slots are spaced to keep the guarantee the old shape gave. The
+    // padding costs 256 B per expert against megabytes each.
+    //
+    // The ALIAS still carries the real stride: `stride_of` in `load_moe_ffn`
+    // derives the compact per-group stride from the tensor's own byte count, and
+    // a padded one would silently point it at the neighbouring group's scale.
+    let (gu_pitch, dn_pitch) = (
+        gu_stride.next_multiple_of(256),
+        dn_stride.next_multiple_of(256),
+    );
+    let owned = |wt: &WeightTensor| wt.buf.buf.origin() != hip_bridge::BufferOrigin::NonOwning;
+    let mut stack = if owned(&first.0) && owned(&first.1) {
+        Some((
+            gpu.alloc_tensor(&[n_exp * gu_pitch], DType::Raw)?,
+            gpu.alloc_tensor(&[n_exp * dn_pitch], DType::Raw)?,
+        ))
+    } else {
+        None
+    };
+
+    let mut pending = Some(first);
+    for x in 0..n_exp {
+        let (mut gate_up, mut down) = match pending.take() {
+            Some(pair) => pair,
+            None => load_pair(gpu, x)?,
+        };
+        let uniform = gate_up.buf.buf.size() == gu_stride
+            && down.buf.buf.size() == dn_stride
+            && gate_up.gpu_dtype == gu_dtype
+            && down.gpu_dtype == dn_dtype;
+        if let Some((gu_stack, dn_stack)) = stack.as_ref() {
+            if uniform {
+                restack(gpu, &mut gate_up, gu_stack, x * gu_pitch, gu_stride)?;
+                restack(gpu, &mut down, dn_stack, x * dn_pitch, dn_stride)?;
+            } else {
+                eprintln!(
+                    "  warning: {p}.mlp.experts.{x} does not match expert 0 \
+                     (gate_up {:?}/{} B vs {gu_dtype:?}/{gu_stride} B, down {:?}/{} B vs \
+                     {dn_dtype:?}/{dn_stride} B); unstacking the whole layer, which costs \
+                     ~1.97x its bytes in GTT",
+                    gate_up.gpu_dtype,
+                    gate_up.buf.buf.size(),
+                    down.gpu_dtype,
+                    down.buf.buf.size(),
+                );
+                // Give the experts already aliased into the stack their own
+                // allocations back, then release the two backings.
+                let (gu_backing, dn_backing) = stack.take().expect("matched Some above");
+                unstack(gpu, &mut experts)?;
+                let _ = gpu.free_tensor(gu_backing);
+                let _ = gpu.free_tensor(dn_backing);
+            }
+        }
+        experts.push(ExpertWeights { gate_up, down });
+    }
+
+    let storage = stack.map(|(gate_up, down)| RawExpertStorage { gate_up, down });
+    Ok((experts, storage))
+}
+
+/// Copy one expert into its slot in the stacked buffer, then swap its own
+/// buffer for a non-owning alias at that address and release the original.
+///
+/// The alias is `NonOwning`, so `Gpu::dispose` refuses to hand it back to the
+/// pool — the guard added after #262, where an alias went to the pool and came
+/// back as scratch over live weights. `free_moe_ffn_maybe_slab` frees the two
+/// backings once instead.
+fn restack(
+    gpu: &mut Gpu,
+    wt: &mut WeightTensor,
+    base: &GpuTensor,
+    offset: usize,
+    stride: usize,
+) -> HipResult<()> {
+    gpu.memcpy_dtod_at_auto(&base.buf, offset, &wt.buf.buf, 0, stride)?;
+    let ptr = unsafe { (base.buf.as_ptr() as *mut u8).add(offset) as *mut std::ffi::c_void };
+    let owned = std::mem::replace(&mut wt.buf.buf, unsafe {
+        hip_bridge::DeviceBuffer::from_raw(ptr, stride)
+    });
+    gpu.free_tensor(GpuTensor {
+        buf: owned,
+        shape: vec![stride],
+        dtype: DType::Raw,
+    })
+}
+
+/// Give every already-restacked expert its own allocation back. Used when a
+/// later expert turns out not to share expert 0's stride, which the stacked
+/// layout cannot express.
+fn unstack(gpu: &mut Gpu, experts: &mut [ExpertWeights]) -> HipResult<()> {
+    for e in experts.iter_mut() {
+        for wt in [&mut e.gate_up, &mut e.down] {
+            let stride = wt.buf.buf.size();
+            let own = gpu.alloc_tensor(&[stride], DType::Raw)?;
+            gpu.memcpy_dtod_at_auto(&own.buf, 0, &wt.buf.buf, 0, stride)?;
+            wt.buf.buf = own.buf;
+        }
+    }
+    Ok(())
+}
+
 fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -6738,7 +6935,6 @@ fn load_moe_ffn(
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
-    let mut experts = Vec::with_capacity(n_exp);
     // Repack routed OQ experts into the indexed kernels' block layout ONLY when
     // those kernels can actually run. They are `*_k8_indexed*` — the dispatcher
     // admits them via `use_gpu_topk`, which requires `k_top == INDEXED_MOE_K_TOP`.
@@ -6781,29 +6977,15 @@ fn load_moe_ffn(
                 )
             })
         });
-    for x in 0..n_exp {
-        let gate_up = load_moe_expert(
-            hfq,
-            gpu,
-            slabs,
-            &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
-            2 * mi,
-            config.dim,
-            oq_indexed_decode,
-            layer_compact_dispatchable,
-        )?;
-        let down = load_moe_expert(
-            hfq,
-            gpu,
-            slabs,
-            &format!("{p}.mlp.experts.{x}.down_proj.weight"),
-            config.dim,
-            mi,
-            oq_indexed_decode,
-            layer_compact_dispatchable,
-        )?;
-        experts.push(ExpertWeights { gate_up, down });
-    }
+    let (experts, raw_expert_storage) = load_moe_experts_stacked(
+        hfq,
+        gpu,
+        slabs,
+        p,
+        config,
+        oq_indexed_decode,
+        layer_compact_dispatchable,
+    )?;
 
     // Build the device-side pointer tables consumed by the indexed MoE
     // GEMV kernels. Each slot is an `unsigned long long` (the device
@@ -6908,7 +7090,7 @@ fn load_moe_ffn(
         expert_gate_up_dtypes,
         expert_down_dtypes,
         paro_shared: None,
-        raw_expert_storage: None,
+        raw_expert_storage,
     })
 }
 

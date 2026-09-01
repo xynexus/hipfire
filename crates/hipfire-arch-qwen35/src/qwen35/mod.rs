@@ -4060,9 +4060,21 @@ pub fn shard_moe_experts(
             // These buffers are interior slices of one owning stacked
             // allocation, so freeing them individually would hand `GpuPool` a
             // pointer into the middle of a live block. The owner frees the
-            // whole thing later. Mirrors `free_moe_ffn_maybe_slab`.
-            std::mem::forget(ew.gate_up.buf);
-            std::mem::forget(ew.down.buf);
+            // whole thing later. Mirrors `free_moe_ffn_maybe_slab`, including
+            // the AWQ sidecars, which are per-expert allocations of their own
+            // and DO have to be freed here.
+            //
+            // ponytail: dropping a non-owned expert therefore reclaims nothing
+            // on a stacked layer — the stack keeps all E resident on every rank.
+            // Correct, but it gives up the memory EP sharding used to save. If
+            // that starts mattering, repack the stack down to the owned experts
+            // here rather than un-stacking the loader.
+            for wt in [ew.gate_up, ew.down] {
+                if let Some(scale) = wt.awq_scale {
+                    let _ = gpu.free_tensor(scale);
+                }
+                std::mem::forget(wt.buf);
+            }
         } else {
             // `_maybe_slab`, NOT `free_tensor`: with slab loading on (the
             // default when `gpu.integrated`, i.e. this box and halo) an expert
